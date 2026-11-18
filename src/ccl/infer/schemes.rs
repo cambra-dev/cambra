@@ -4,6 +4,7 @@
 
 use crate::ccl::F_TIME;
 use crate::ccl::F_WRITE;
+use crate::ccl::infer::solver::Solver;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -176,7 +177,7 @@ impl OperatorSchemes {
     /// Build the registry. Schemes are quantified at level 0; their
     /// internal fresh vars live at level 1 so `instantiate(0)` mints
     /// fresh copies at the active inference level.
-    pub fn new() -> Self {
+    pub fn new(solver: &mut Solver) -> Self {
         // Box: ∀δ ε. ((k: δ) ⤇ ε) ⇒ Σ (σ : [δ]). (k: σ) ⤇ ε — the sum over the one
         // candidate δ, the argument's *domain*. `δ` occurs among the candidates, which is
         // an *invariant* position, so the domain is pinned exactly rather than widened on
@@ -200,8 +201,9 @@ impl OperatorSchemes {
         // instantiation enters the binder its copy names into the copy's telescope
         // (`FreshenCache::site_telescope`).
         let elem = crate::ccl::Name::from("__box_k");
-        let delta = fresh_var(BODY_LEVEL);
+        let delta = fresh_var(solver, BODY_LEVEL);
         let epsilon = Type::Infer(crate::ccl::InferVar::fresh_in(
+            solver,
             BODY_LEVEL,
             &crate::ccl::infer_var::Telescope::empty().extended(elem.clone()),
         ));
@@ -230,8 +232,8 @@ impl OperatorSchemes {
         // predicate's domain, which is what resolves the refinement base at the use
         // site — a key domain `{κ | __elem ▷ (𝑚 ▷ collection_contains)}`
         // takes its key type from `𝑚` and needs nothing outside the predicate to pin it.
-        let iota = fresh_var(BODY_LEVEL);
-        let kappa = fresh_var(BODY_LEVEL);
+        let iota = fresh_var(solver, BODY_LEVEL);
+        let kappa = fresh_var(solver, BODY_LEVEL);
         let collection_contains = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
@@ -261,31 +263,31 @@ impl OperatorSchemes {
         // fresh var even though it's unconstrained. The parameter function is a
         // consumer: data by construction, polymorphic in the slot, so a plain
         // collection and a sum satisfy it alike ([`Type::consumer_fun`]).
-        let alpha = fresh_var(BODY_LEVEL);
+        let alpha = fresh_var(solver, BODY_LEVEL);
         let aggregate_sum = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                Type::consumer_fun(alpha.clone(), prim(BaseType::Int)),
+                Type::consumer_fun(solver, alpha.clone(), prim(BaseType::Int)),
                 prim(BaseType::Int),
             ),
         );
 
         // Max: ∀α γ. (α ⤇ γ) → γ. Consumes a collection and folds its
         // codomain γ to a result of the same type.
-        let alpha = fresh_var(BODY_LEVEL);
-        let gamma = fresh_var(BODY_LEVEL);
+        let alpha = fresh_var(solver, BODY_LEVEL);
+        let gamma = fresh_var(solver, BODY_LEVEL);
         let aggregate_max = PolyScheme::poly(
             SCHEME_LEVEL,
-            fun(Type::consumer_fun(alpha, gamma.clone()), gamma),
+            fun(Type::consumer_fun(solver, alpha, gamma.clone()), gamma),
         );
 
         // Min: ∀α γ. (α ⤇ γ) → γ. Consumes a collection and folds its
         // codomain γ to a result of the same type.
-        let alpha = fresh_var(BODY_LEVEL);
-        let gamma = fresh_var(BODY_LEVEL);
+        let alpha = fresh_var(solver, BODY_LEVEL);
+        let gamma = fresh_var(solver, BODY_LEVEL);
         let aggregate_min = PolyScheme::poly(
             SCHEME_LEVEL,
-            fun(Type::consumer_fun(alpha, gamma.clone()), gamma),
+            fun(Type::consumer_fun(solver, alpha, gamma.clone()), gamma),
         );
 
         // Drain: ∀α γ. (α ⤇ γ) → unit. Consumes a collection of any element
@@ -293,8 +295,8 @@ impl OperatorSchemes {
         // uses it to collapse each key's (duplicate-bearing) group to the single
         // `unit` payload of `Set(K)`; consuming the group is also what abstracts its
         // key-dependence, since that is where the sum is consumed.
-        let alpha = fresh_var(BODY_LEVEL);
-        let gamma = fresh_var(BODY_LEVEL);
+        let alpha = fresh_var(solver, BODY_LEVEL);
+        let gamma = fresh_var(solver, BODY_LEVEL);
         let aggregate_drain = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(Type::data_fun(alpha, gamma), prim(BaseType::Unit)),
@@ -304,8 +306,8 @@ impl OperatorSchemes {
         // element, faulting on a collection holding more. `map` uses it to
         // collapse each key's group to that key's single entry; the fault is the
         // duplicate-key rejection.
-        let alpha = fresh_var(BODY_LEVEL);
-        let gamma = fresh_var(BODY_LEVEL);
+        let alpha = fresh_var(solver, BODY_LEVEL);
+        let gamma = fresh_var(solver, BODY_LEVEL);
         let aggregate_sole = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(Type::data_fun(alpha, gamma.clone()), gamma),
@@ -314,8 +316,8 @@ impl OperatorSchemes {
         // FinalOrDefault: ∀α β. ((α ⤇ β), β) → β. The first field is a
         // collection stream. Inline-built (not via `normalize_annotation`) so
         // the codomain of the stream and the default share one variable `β`.
-        let alpha = fresh_var(BODY_LEVEL);
-        let beta = fresh_var(BODY_LEVEL);
+        let alpha = fresh_var(solver, BODY_LEVEL);
+        let beta = fresh_var(solver, BODY_LEVEL);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
         tup.insert(
             FieldKey::Index(0),
@@ -326,8 +328,8 @@ impl OperatorSchemes {
 
         // GetPrevSeq: ∀ι ν. ((ι ⤇ ν), ι, ν) → ν — history (a collection),
         // position, default.
-        let iota = fresh_var(BODY_LEVEL);
-        let nu = fresh_var(BODY_LEVEL);
+        let iota = fresh_var(solver, BODY_LEVEL);
+        let nu = fresh_var(solver, BODY_LEVEL);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
         tup.insert(FieldKey::Index(0), Type::data_fun(iota.clone(), nu.clone()));
         tup.insert(FieldKey::Index(1), iota);
@@ -345,8 +347,8 @@ impl OperatorSchemes {
         // domain) keeps the scheme faithful to the site-indexed stream, so a
         // future routing of it through inference would not reject the real
         // commit view — inline-built like `get_prev_seq`.
-        let iota = fresh_var(BODY_LEVEL);
-        let nu = fresh_var(BODY_LEVEL);
+        let iota = fresh_var(solver, BODY_LEVEL);
+        let nu = fresh_var(solver, BODY_LEVEL);
         let commit_record = Type::Record(vec![(F_TIME, Type::Txn), (F_WRITE, nu.clone())]);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
         // The commit stream (field 0) is a collection — a data function.
@@ -358,7 +360,7 @@ impl OperatorSchemes {
         // AwaitFinal: ∀ν. Mut(ν, Txn) → ν. The domain is the mutable variable
         // **handle**, not a value, and its sequencing domain is the concrete `Txn`
         // rather than a quantified one — see the field's doc for what that pins.
-        let nu = fresh_var(BODY_LEVEL);
+        let nu = fresh_var(solver, BODY_LEVEL);
         let await_final =
             PolyScheme::poly(SCHEME_LEVEL, fun(Type::mutable(Type::Txn, nu.clone()), nu));
 
@@ -447,15 +449,17 @@ impl OperatorSchemes {
     /// be expressed via the generic `Hole → fresh_var` conversion); `None`
     /// for builtins whose pre-stamped `expr.ty` is already monomorphic
     /// (or polymorphic only in independent vars).
-    pub(super) fn builtin(&self, b: Builtin) -> Option<Cow<'_, PolyScheme>> {
+    pub(super) fn builtin(&self, solver: &mut Solver, b: Builtin) -> Option<Cow<'_, PolyScheme>> {
         let stored = match b {
             Builtin::Box => &self.box_intro,
             Builtin::CollectionContains => &self.collection_contains,
-            Builtin::Uncurry(n) => return Some(Cow::Owned(uncurry_scheme(n))),
+            Builtin::Uncurry(n) => return Some(Cow::Owned(uncurry_scheme(solver, n))),
             Builtin::FinalOrDefault => &self.final_or_default,
-            Builtin::CtorIs(ctor) => return ctor_observer_scheme(&ctor, false).map(Cow::Owned),
+            Builtin::CtorIs(ctor) => {
+                return ctor_observer_scheme(solver, &ctor, false).map(Cow::Owned);
+            }
             Builtin::CtorPayload(ctor) => {
-                return ctor_observer_scheme(&ctor, true).map(Cow::Owned);
+                return ctor_observer_scheme(solver, &ctor, true).map(Cow::Owned);
             }
             Builtin::GetPrevSeq => &self.get_prev_seq,
             Builtin::GetPrevTxn => &self.get_prev_txn,
@@ -471,6 +475,7 @@ impl OperatorSchemes {
 /// component opened at the projections before it. The substitution suspends on `𝜈`, so a value
 /// that reads no key is `𝜈` once it resolves.
 pub(super) fn uncurried_value_at_its_tuple(
+    solver: &mut Solver,
     instantiated: Type,
     at: crate::ccl::provenance::NodeId,
 ) -> Type {
@@ -516,13 +521,13 @@ pub(super) fn uncurried_value_at_its_tuple(
         std::collections::HashMap::new();
     for (i, (k, component)) in components.iter().enumerate() {
         let at_earlier = crate::ccl::subst::Subst::discharging(&env, crate::ccl::Ids::Fresh)
-            .apply_type(component);
+            .apply_type_in(solver, component);
         if let Some(k) = k {
             env.insert(k.clone(), project(i, &at_earlier));
         }
     }
-    let read =
-        crate::ccl::subst::Subst::discharging(&env, crate::ccl::Ids::Fresh).apply_type(&value);
+    let read = crate::ccl::subst::Subst::discharging(&env, crate::ccl::Ids::Fresh)
+        .apply_type_in(solver, &value);
     Type::Fun {
         name,
         fun_kind,
@@ -554,7 +559,11 @@ pub(super) fn uncurried_value_at_its_tuple(
 /// `∀𝑃…. N(𝑃…) ⇒ Bool` for [`Builtin::CtorIs`], or `∀𝑃…. N(𝑃…) ⇒ 𝑃ᶜ` for
 /// [`Builtin::CtorPayload`], `𝑃ᶜ` the payload the constructor takes. `None` for a declaration
 /// with a family parameter, whose argument is no variable: such a node keeps its stamped type.
-fn ctor_observer_scheme(ctor: &crate::ccl::CtorRef, payload: bool) -> Option<PolyScheme> {
+fn ctor_observer_scheme(
+    solver: &mut Solver,
+    ctor: &crate::ccl::CtorRef,
+    payload: bool,
+) -> Option<PolyScheme> {
     if ctor.decl.has_family_params() {
         return None;
     }
@@ -562,10 +571,10 @@ fn ctor_observer_scheme(ctor: &crate::ccl::CtorRef, payload: bool) -> Option<Pol
         .decl
         .params
         .iter()
-        .map(|_| fresh_var(BODY_LEVEL))
+        .map(|_| fresh_var(solver, BODY_LEVEL))
         .collect();
     let result = if payload {
-        ctor.payload_at(&args)
+        ctor.payload_at(solver, &args)
     } else {
         prim(BaseType::Bool)
     };
@@ -575,7 +584,7 @@ fn ctor_observer_scheme(ctor: &crate::ccl::CtorRef, payload: bool) -> Option<Pol
     ))
 }
 
-fn uncurry_scheme(n: usize) -> PolyScheme {
+fn uncurry_scheme(solver: &mut Solver, n: usize) -> PolyScheme {
     assert!(
         n >= 2,
         "uncurry flattens at least two collection levels, got {n}"
@@ -587,11 +596,13 @@ fn uncurry_scheme(n: usize) -> PolyScheme {
     let mut keys = Vec::with_capacity(n);
     for name in &names {
         keys.push(Type::Infer(crate::ccl::InferVar::fresh_in(
-            BODY_LEVEL, &telescope,
+            solver, BODY_LEVEL, &telescope,
         )));
         telescope = telescope.extended(name.clone());
     }
-    let value = Type::Infer(crate::ccl::InferVar::fresh_in(BODY_LEVEL, &telescope));
+    let value = Type::Infer(crate::ccl::InferVar::fresh_in(
+        solver, BODY_LEVEL, &telescope,
+    ));
     let nested = names
         .iter()
         .zip(&keys)
@@ -610,18 +621,13 @@ fn uncurry_scheme(n: usize) -> PolyScheme {
     )
 }
 
-impl Default for OperatorSchemes {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::OperatorSchemes;
     use crate::ccl::Occurrence;
     use crate::ccl::RecordEntry;
+    use crate::ccl::infer::solver::Solver;
     use crate::ccl::{
         AggregateKind, BindingTransparency, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode,
     };
@@ -633,11 +639,12 @@ mod tests {
     /// and the carried write value / default / result share one variable `ν`.
     #[test]
     fn get_prev_txn_scheme_shape() {
-        let schemes = OperatorSchemes::new();
+        let solver = &mut Solver::new();
+        let schemes = OperatorSchemes::new(solver);
         let scheme = schemes
-            .builtin(Builtin::GetPrevTxn)
+            .builtin(solver, Builtin::GetPrevTxn)
             .expect("GetPrevTxn has a scheme");
-        let inst = scheme.instantiate(0);
+        let inst = scheme.instantiate(solver, 0);
 
         let Type::Fun {
             domain, codomain, ..

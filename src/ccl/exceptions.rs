@@ -13,6 +13,7 @@
 //! not raise. A `try` matches its body's outcome, running the clause that catches each
 //! exception, and passes the rest on to the `try` around it.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashSet;
 
 use crate::ccl::Duplicate;
@@ -395,6 +396,7 @@ type Arms = [(Label, Type)];
 /// inference decides it (`InferCtx::settle_catches`).
 fn caught(raised: &Type, catches: &Type) -> bool {
     crate::ccl::infer::solver::constrain::constrain_subtype_in(
+        &mut Solver::none(),
         raised,
         catches,
         &mut crate::ccl::infer::solver::constrain::ConstrainCache::new().without_capabilities(),

@@ -50,6 +50,7 @@
 use crate::ccl::Label;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
+use crate::ccl::infer::solver::Solver;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -1992,7 +1993,12 @@ pub(crate) fn loop_domain(iter: &Expr) -> Type {
         .enumerate()
         .fold(domain, |domain, (position, witness)| {
             let projection = crate::ccl::ty::projected_witness(&source, position, witness);
-            crate::ccl::ty::instantiate_witness(&domain, witness.id(), &projection)
+            crate::ccl::ty::instantiate_witness(
+                &mut Solver::none(),
+                &domain,
+                witness.id(),
+                &projection,
+            )
         })
 }
 
@@ -2105,6 +2111,7 @@ fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev
 /// accumulator name, so the view is named too.
 fn writes_key_view(h: &Name, hist_ty: &Type, decision_ty: &Type, acc: &Label, vty: &Type) -> Expr {
     crate::ccl::ccl_utils::pointwise_view(
+        &mut Solver::none(),
         tvar(h, hist_ty.clone()),
         crate::ccl::ccl_utils::write_view_steps(decision_ty, acc, vty),
     )
@@ -2555,7 +2562,7 @@ pub(crate) fn fold_induction_loop(
         let Type::Fun { name, codomain, .. } = &source else {
             panic!("letrec phase: loop source is not a function: {source}")
         };
-        crate::ccl::subst::codomain_renamed(name.as_ref(), &r, codomain)
+        crate::ccl::subst::codomain_renamed(&mut Solver::none(), name.as_ref(), &r, codomain)
     };
     let domain_ty = loop_domain(iter);
     // The writer's argument carries nothing per position but the item, so a body whose value
@@ -2766,7 +2773,11 @@ pub(crate) fn fold_induction_loop(
                 Expr::proj_field(f.field.clone()).with_ty(Type::fun(decision_ty.clone(), tap_ty)),
                 crate::ccl::ccl_utils::fired_project(value_ty.clone()),
             ];
-            let view = crate::ccl::ccl_utils::pointwise_view(tvar(&h, hist_ty.clone()), steps);
+            let view = crate::ccl::ccl_utils::pointwise_view(
+                &mut Solver::none(),
+                tvar(&h, hist_ty.clone()),
+                steps,
+            );
             // This loop's positions are one more level over what the feed held.
             LoopFeed {
                 defer: f.defer.clone(),
@@ -3562,7 +3573,8 @@ impl<'a> WriterWalk<'a> {
                             &self.env,
                             crate::ccl::Ids::Fresh,
                         );
-                        let row = Subst::discharge_env_in_type(&row, &self.env);
+                        let row =
+                            Subst::discharge_env_in_type(&mut Solver::none(), &row, &self.env);
                         self.feed(name, value, row, site, 0, fed_at);
                         self.walk_chain(*body, kept)
                     }

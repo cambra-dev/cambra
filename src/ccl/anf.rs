@@ -178,6 +178,7 @@
 //! buried under a `Let` again, which this pass cannot prevent since it runs
 //! before that substitution exists.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashMap;
 
 use crate::ccl::Duplicate;
@@ -236,13 +237,18 @@ pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
             && binding.name.is_anf_temp()
             && binding.transparency == BindingTransparency::Transparent
         {
-            let mut definition =
-                Subst::discharge_env_in_place((**bound_expr).copied(ids), env, ids);
+            let mut definition = Subst::discharge_env_in_place_in(
+                &mut Solver::scratch(),
+                (**bound_expr).copied(ids),
+                env,
+                ids,
+            );
             // A loop source's `elements` call over a structural collection is the collection,
             // as coalescing reads it.
-            if let Some(collection) =
-                crate::ccl::infer::solve::elements_of_a_collection(&mut definition)
-            {
+            if let Some(collection) = crate::ccl::infer::solve::elements_of_a_collection(
+                &mut Solver::scratch(),
+                &mut definition,
+            ) {
                 definition = collection;
             }
             // An inference error leaves the tree partly typed. A definition has its binder's

@@ -8,6 +8,7 @@
 //! constructor names and whose payloads are the constructors' parameter types. See
 //! `src/ccl/design/nominal-types.md`.
 
+use crate::ccl::infer::solver::Solver;
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
@@ -17,7 +18,7 @@ use chl_parser::ast::Span;
 use smol_str::SmolStr;
 
 use crate::ccl::Duplicate;
-use crate::ccl::ccl_utils::{free_names, strip_refinements};
+use crate::ccl::ccl_utils::{free_names, strip_refinements_in};
 use crate::ccl::constant::{ConstParam, ConstTerm, NoValue};
 use crate::ccl::{
     BaseType, CtorRef, FieldKey, FunKind, Label, Name, Refinement, RefinementSet, Type, TypeKind,
@@ -33,12 +34,12 @@ const STD: &str = "std";
 thread_local! {
     /// `Option`, built once per thread. Its identity is its path, `std::Option`, so this
     /// is a cache: any two builds compare equal.
-    static OPTION_DECL: Rc<NominalDecl> = option_declaration();
+    static OPTION_DECL: Rc<NominalDecl> = option_declaration(&mut Solver::none());
 }
 
 /// `type Option(T): none, some(T)` in `std`, with the constructor names [`V_NONE`] and
 /// [`V_SOME`] that the runtime builds when it answers a checked lookup.
-fn option_declaration() -> Rc<NominalDecl> {
+fn option_declaration(solver: &mut Solver) -> Rc<NominalDecl> {
     let span = Span::new(chl_parser::FileId::ROOT, 0, 0);
     let t = TypeParam::declared("T");
     let decl = NominalDecl::declared_in(
@@ -48,10 +49,13 @@ fn option_declaration() -> Rc<NominalDecl> {
         span,
         false,
     );
-    decl.define(vec![
-        NominalCtor::unwritten(V_NONE.name().into(), span, Vec::new()),
-        NominalCtor::unwritten(V_SOME.name().into(), span, vec![(None, Type::Param(t))]),
-    ])
+    decl.define_in(
+        solver,
+        vec![
+            NominalCtor::unwritten(V_NONE.name().into(), span, Vec::new()),
+            NominalCtor::unwritten(V_SOME.name().into(), span, vec![(None, Type::Param(t))]),
+        ],
+    )
     .expect("`some` names `T`");
     decl
 }
@@ -125,12 +129,12 @@ pub const EFFECT: &str = "Effect";
 pub const CONTEXT: &str = "Context";
 
 thread_local! {
-    static EFFECT_DECL: Rc<NominalDecl> = clause_bound_declaration(EFFECT);
-    static CONTEXT_DECL: Rc<NominalDecl> = clause_bound_declaration(CONTEXT);
+    static EFFECT_DECL: Rc<NominalDecl> = clause_bound_declaration(&mut Solver::none(), EFFECT);
+    static CONTEXT_DECL: Rc<NominalDecl> = clause_bound_declaration(&mut Solver::none(), CONTEXT);
 }
 
 /// `type name` in `std` with no constructor: no value has an effect or a requirement type.
-fn clause_bound_declaration(name: &str) -> Rc<NominalDecl> {
+fn clause_bound_declaration(solver: &mut Solver, name: &str) -> Rc<NominalDecl> {
     let decl = NominalDecl::declared_in(
         vec![SmolStr::new_static(STD)],
         name.into(),
@@ -138,7 +142,7 @@ fn clause_bound_declaration(name: &str) -> Rc<NominalDecl> {
         Span::new(chl_parser::FileId::ROOT, 0, 0),
         false,
     );
-    decl.define(Vec::new())
+    decl.define_in(solver, Vec::new())
         .expect("a declaration with no constructor names no parameter");
     decl
 }
@@ -258,11 +262,12 @@ pub fn ctor_is(
 /// `value ▷ ctor_payload(N::c)`: the payload of `value`, an `N(args)` built by `ctor`
 /// ([`crate::ccl::Builtin::CtorPayload`]).
 pub fn ctor_payload(
+    solver: &mut Solver,
     value: crate::ccl::TypedExpr,
     ctor: &CtorRef,
     args: &[Type],
 ) -> crate::ccl::TypedExpr {
-    let payload = ctor.payload_at(args);
+    let payload = ctor.payload_at(solver, args);
     observe(
         crate::ccl::Builtin::CtorPayload(ctor.clone()),
         value,
@@ -300,6 +305,7 @@ fn observe(
 ///
 /// [`is_term`]: crate::ccl::infer::solver::smt::is_term
 pub fn ctor_refinements(
+    solver: &mut Solver,
     ctor: &CtorRef,
     args: &[Type],
     argument: crate::ccl::TypedExpr,
@@ -317,7 +323,7 @@ pub fn ctor_refinements(
     if takes_argument && crate::ccl::infer::solver::smt::is_term(&argument) {
         refinements.push(born(
             TypedExpr::binop(
-                ctor_payload(elem(), ctor, args),
+                ctor_payload(solver, elem(), ctor, args),
                 BinOpKind::Compare(CompareKind::Equals),
                 argument,
             )
@@ -351,6 +357,7 @@ pub fn states_constructors(decl: &NominalDecl) -> bool {
 ///
 /// [`is_term`]: crate::ccl::infer::solver::smt::is_term
 pub fn arm_facts(
+    solver: &mut Solver,
     scrutinee: &crate::ccl::TypedExpr,
     decl: &Rc<NominalDecl>,
     args: &[Type],
@@ -372,7 +379,7 @@ pub fn arm_facts(
         let bound = TypedExpr::var(binding.name.clone()).with_ty(binding.ty.clone());
         facts.push(
             TypedExpr::binop(
-                ctor_payload(read(), &ctor, args),
+                ctor_payload(solver, read(), &ctor, args),
                 BinOpKind::Compare(CompareKind::Equals),
                 bound,
             )
@@ -390,6 +397,7 @@ pub fn arm_facts(
 /// `None` when `scrutinee` is not a term, as for [`arm_facts`]. A `match` arm has no guard, so an
 /// arm before the default one rejects only the values its constructor did not build.
 pub fn default_arm_facts(
+    solver: &mut Solver,
     scrutinee: &crate::ccl::TypedExpr,
     decl: &Rc<NominalDecl>,
     args: &[Type],
@@ -399,7 +407,7 @@ pub fn default_arm_facts(
     named
         .iter()
         .map(|ctor| {
-            let is = arm_facts(scrutinee, decl, args, ctor, None)?.swap_remove(0);
+            let is = arm_facts(solver, scrutinee, decl, args, ctor, None)?.swap_remove(0);
             Some(TypedExpr::unary(UnaryOpKind::Not, is).with_ty(Type::Base(BaseType::Bool)))
         })
         .collect()
@@ -412,6 +420,7 @@ pub fn default_arm_facts(
 /// For a pass walking a tree inference typed, so the facts' nodes are machinery of the
 /// scrutinee they read.
 pub fn typed_case_facts(
+    solver: &mut Solver,
     scrutinee: &crate::ccl::TypedExpr,
     branches: &[crate::ccl::Branch],
 ) -> Vec<Vec<crate::ccl::TypedExpr>> {
@@ -450,9 +459,9 @@ pub fn typed_case_facts(
                         unreachable!("a `Case` names constructors of one nominal type or tags only")
                     };
                     named.push(ctor.clone());
-                    arm_facts(scrutinee, decl, args, ctor, Some(&pattern.binding))
+                    arm_facts(solver, scrutinee, decl, args, ctor, Some(&pattern.binding))
                 }
-                None => default_arm_facts(scrutinee, decl, args, &named),
+                None => default_arm_facts(solver, scrutinee, decl, args, &named),
             };
             facts.unwrap_or_default()
         })
@@ -463,14 +472,15 @@ impl CtorRef {
     /// The payload the constructor takes, at the declaration's arguments `args`, without its
     /// refinements: the type a predicate's `ctor_payload` read is typed at. What the
     /// refinements state, the refinement encoding reads off the declaration.
-    pub fn payload_at(&self, args: &[Type]) -> Type {
+    pub fn payload_at(&self, solver: &mut Solver, args: &[Type]) -> Type {
         let ctor = self.decl.ctor(&self.ctor).unwrap_or_else(|| {
             panic!(
                 "`{}` declares no constructor `{}`",
                 self.decl.name, self.ctor
             )
         });
-        strip_refinements(&self.decl.instantiate(&ctor.destructured(), args))
+        let payload = self.decl.instantiate(solver, &ctor.destructured(), args);
+        strip_refinements_in(solver, &payload)
     }
 }
 
@@ -960,6 +970,7 @@ impl NominalDecl {
     /// binder and its type.
     pub fn applied_to_params(
         self: &Rc<Self>,
+        solver: &mut Solver,
         mint: &mut dyn FnMut(Name, Type) -> crate::ccl::Expr,
     ) -> Type {
         let args = self
@@ -980,6 +991,7 @@ impl NominalDecl {
                     .map(|(n, d)| Rc::new(mint(n.clone(), d.clone())))
                     .collect();
                 Type::family(
+                    solver,
                     binders,
                     Type::FamilyApp(crate::ccl::ty::FamilyApp::new(Rc::clone(p), terms)),
                 )
@@ -1067,11 +1079,15 @@ impl NominalDecl {
     /// # Panics
     ///
     /// On a declaration defined twice.
-    pub fn define(&self, ctors: Vec<NominalCtor>) -> Result<(), Rc<TypeParam>> {
+    pub fn define_in(
+        &self,
+        solver: &mut Solver,
+        ctors: Vec<NominalCtor>,
+    ) -> Result<(), Rc<TypeParam>> {
         let mut seen: HashMap<TypeParamId, Variance> = HashMap::new();
         for ctor in &ctors {
             for (_, ty) in &ctor.params {
-                occurrences(ty, Variance::Covariant, &mut |id, v| {
+                occurrences(solver, ty, Variance::Covariant, &mut |id, v| {
                     seen.entry(id).and_modify(|w| *w = w.join(v)).or_insert(v);
                 });
             }
@@ -1088,6 +1104,12 @@ impl NominalDecl {
             self.name
         );
         Ok(())
+    }
+
+    /// [`Self::define_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn define(&self, ctors: Vec<NominalCtor>) -> Result<(), Rc<TypeParam>> {
+        self.define_in(&mut Solver::none(), ctors)
     }
 
     /// The constructors and variances.
@@ -1225,7 +1247,7 @@ impl NominalDecl {
     /// replaced by the matching one of `args`: a bipolar parameter by its argument's output
     /// side where it occurs positively and by its input side where it occurs negatively
     /// ([`sides`]).
-    pub fn instantiate(&self, ty: &Type, args: &[Type]) -> Type {
+    pub fn instantiate(&self, solver: &mut Solver, ty: &Type, args: &[Type]) -> Type {
         assert_eq!(
             args.len(),
             self.params.len(),
@@ -1252,11 +1274,11 @@ impl NominalDecl {
             // holds, so the copies keep their identities rather than derive from them.
             let ids = crate::ccl::Ids::Kept;
             let mut opened = crate::ccl::generalize::opened_deep(ty, ids);
-            replace_params(&mut opened, true, &map, ids);
+            replace_params(solver, &mut opened, true, &map, ids);
             crate::ccl::generalize::closed_deep(&opened, ids)
         } else {
             let mut out = ty.clone();
-            replace_params(&mut out, true, &map, crate::ccl::Ids::Fresh);
+            replace_params(solver, &mut out, true, &map, crate::ccl::Ids::Fresh);
             out
         };
         // A type of the module that reaches the same `const` parameters names them as its
@@ -1282,13 +1304,16 @@ impl NominalDecl {
     /// them during inference, and the predicates the declaration holds were never typed:
     /// the constructor's function carries its own copy, which inference types
     /// (`lower::nominal`). A refinement in `args` stays: the use that wrote it typed it.
-    pub fn representation(&self, args: &[Type]) -> Type {
+    pub fn representation(&self, solver: &mut Solver, args: &[Type]) -> Type {
         let mut arms: Vec<(FieldKey, Type)> = self
             .body()
             .ctors
             .iter()
             .map(|c| {
-                let payload = self.instantiate(&strip_refinements(&c.payload()), args);
+                let payload = {
+                    let stripped = strip_refinements_in(solver, &c.payload());
+                    self.instantiate(solver, &stripped, args)
+                };
                 (FieldKey::Name(self.tag(&c.name)), payload)
             })
             .collect();
@@ -1478,7 +1503,12 @@ impl<'a, V> IntoIterator for &'a DeclMap<V> {
 /// covariant. A `SubtypesOf` kind is ordered by its bound covariantly
 /// (`constrain_type_kinds`), and a listed candidate is matched by equality, so it is
 /// invariant. A history is invariant in both children ([`Type::History`]).
-fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)) {
+fn occurrences(
+    solver: &mut Solver,
+    ty: &Type,
+    at: Variance,
+    f: &mut dyn FnMut(TypeParamId, Variance),
+) {
     match ty {
         Type::Param(p) => f(p.id, at),
         // An application of a family parameter is an occurrence of it.
@@ -1487,9 +1517,9 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
         // family does.
         Type::Family { binders, body } => {
             for (_, d) in binders {
-                occurrences(d, Variance::Invariant, f);
+                occurrences(solver, d, Variance::Invariant, f);
             }
-            occurrences(body, at, f);
+            occurrences(solver, body, at, f);
         }
         Type::Fun {
             fun_kind,
@@ -1500,10 +1530,10 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
             if let FunKind::Data(Some(witnesses)) = fun_kind {
                 for w in witnesses.iter() {
                     match &w.type_kind() {
-                        TypeKind::SubtypesOf(bound) => occurrences(bound, at, f),
+                        TypeKind::SubtypesOf(bound) => occurrences(solver, bound, at, f),
                         TypeKind::Enumerated(candidates) => candidates
                             .iter()
-                            .for_each(|c| occurrences(c, Variance::Invariant, f)),
+                            .for_each(|c| occurrences(solver, c, Variance::Invariant, f)),
                         TypeKind::UIntRanges | TypeKind::Type => {}
                         TypeKind::Family { .. } => unreachable!(
                             "a family's kind is a family parameter's, and no witness ranges over it"
@@ -1511,25 +1541,25 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
                     }
                 }
             }
-            let domain_variance = if fun_kind.resolved().is_data() {
+            let domain_variance = if fun_kind.resolved_in(solver).is_data() {
                 Variance::Invariant
             } else {
                 Variance::Contravariant
             };
-            occurrences(domain, at.compose(domain_variance), f);
-            occurrences(codomain, at, f);
+            occurrences(solver, domain, at.compose(domain_variance), f);
+            occurrences(solver, codomain, at, f);
         }
         Type::History { .. } => {
             let (domain, value, _) = ty.history_parts().expect("matched a history");
-            occurrences(value, Variance::Invariant, f);
-            occurrences(domain, Variance::Invariant, f);
+            occurrences(solver, value, Variance::Invariant, f);
+            occurrences(solver, domain, Variance::Invariant, f);
         }
         Type::Nominal(decl, args) => {
             for (arg, v) in args.iter().zip(&decl.body().variances) {
-                occurrences(arg, at.compose(*v), f);
+                occurrences(solver, arg, at.compose(*v), f);
             }
         }
-        _ => ty.walk_children(|child| occurrences(child, at, f)),
+        _ => ty.walk_children(|child| occurrences(solver, child, at, f)),
     }
 }
 
@@ -1540,6 +1570,7 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
 /// argument of a nominal type takes its parameter's variance. An equality position keeps
 /// it; a parameter occurring there is not bipolar, so its two sides are one type.
 fn replace_params(
+    solver: &mut Solver,
     ty: &mut Type,
     pol: bool,
     map: &HashMap<TypeParamId, (&Type, &Type)>,
@@ -1573,6 +1604,7 @@ fn replace_params(
                 .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__family_k")))
                 .collect();
             let opened = crate::ccl::subst::open_family_body(
+                solver,
                 binders.len(),
                 body,
                 |j| crate::ccl::subst::Mapping::Rename(names[j].clone()),
@@ -1580,32 +1612,33 @@ fn replace_params(
             );
             let terms: Vec<Rc<crate::ccl::TypedExpr>> =
                 app.args.iter().map(|a| Rc::clone(&a.term)).collect();
-            *ty = crate::ccl::subst::discharge_binders(&names, &opened, &terms);
+            *ty = crate::ccl::subst::discharge_binders(solver, &names, &opened, &terms);
         }
         Type::Fun {
             fun_kind,
             domain,
             codomain,
             ..
-        } if !fun_kind.resolved().is_data() => {
-            replace_params(domain, !pol, map, ids);
-            replace_params(codomain, pol, map, ids);
+        } if !fun_kind.resolved_in(solver).is_data() => {
+            replace_params(solver, domain, !pol, map, ids);
+            replace_params(solver, codomain, pol, map, ids);
         }
         Type::Nominal(decl, args) => {
             let variances = decl.body().variances.clone();
             for (arg, v) in args.iter_mut().zip(variances) {
-                replace_params(arg, v.polarity(pol), map, ids);
+                replace_params(solver, arg, v.polarity(pol), map, ids);
             }
-            if let Some(instance) = decl.substituted(&mut |arg| replace_params(arg, pol, map, ids))
+            if let Some(instance) =
+                decl.substituted(&mut |arg| replace_params(solver, arg, pol, map, ids))
             {
                 *decl = instance;
             }
         }
         Type::Split { input, output } => {
-            replace_params(input, !pol, map, ids);
-            replace_params(output, pol, map, ids);
+            replace_params(solver, input, !pol, map, ids);
+            replace_params(solver, output, pol, map, ids);
         }
-        _ => ty.walk_children_mut(|child| replace_params(child, pol, map, ids)),
+        _ => ty.walk_children_mut(|child| replace_params(solver, child, pol, map, ids)),
     }
 }
 
@@ -1683,7 +1716,10 @@ mod tests {
 
     /// The variance `define` reads off one constructor whose single parameter has the type
     /// `shape` builds from the declaration's one type parameter.
-    fn variance_of(shape: impl Fn(Type) -> Type) -> Result<Variance, String> {
+    fn variance_of(
+        solver: &mut Solver,
+        mut shape: impl FnMut(&mut Solver, Type) -> Type,
+    ) -> Result<Variance, String> {
         let t = TypeParam::declared("T");
         let decl = NominalDecl::declared(
             "N".into(),
@@ -1694,32 +1730,37 @@ mod tests {
         let ctor = NominalCtor::unwritten(
             "c".into(),
             Span::new(FileId::ROOT, 0, 0),
-            vec![(None, shape(Type::Param(t)))],
+            vec![(None, shape(solver, Type::Param(t)))],
         );
-        decl.define(vec![ctor])
+        decl.define_in(solver, vec![ctor])
             .map_err(|p| p.spelling.to_string())?;
         Ok(decl.body().variances[0])
     }
 
     #[test]
     fn a_payload_position_is_covariant() {
-        assert_eq!(variance_of(|t| t), Ok(Variance::Covariant));
+        let solver = &mut Solver::new();
+        assert_eq!(variance_of(solver, |_, t| t), Ok(Variance::Covariant));
         assert_eq!(
-            variance_of(|t| Type::Tuple(vec![int(), t])),
+            variance_of(solver, |_, t| Type::Tuple(vec![int(), t])),
             Ok(Variance::Covariant)
         );
-        assert_eq!(variance_of(Type::list_of), Ok(Variance::Covariant));
+        assert_eq!(
+            variance_of(solver, |_, t| Type::list_of(t)),
+            Ok(Variance::Covariant)
+        );
     }
 
     /// A compute function's domain flips, and flips back inside another domain.
     #[test]
     fn a_compute_domain_flips() {
+        let solver = &mut Solver::new();
         assert_eq!(
-            variance_of(|t| Type::fun(t, int())),
+            variance_of(solver, |_, t| Type::fun(t, int())),
             Ok(Variance::Contravariant)
         );
         assert_eq!(
-            variance_of(|t| Type::fun(Type::fun(t, int()), int())),
+            variance_of(solver, |_, t| Type::fun(Type::fun(t, int()), int())),
             Ok(Variance::Covariant)
         );
     }
@@ -1728,8 +1769,9 @@ mod tests {
     /// compute function's domain would make it contravariant.
     #[test]
     fn a_data_domain_is_invariant() {
+        let solver = &mut Solver::new();
         assert_eq!(
-            variance_of(|t| Type::full_map_of(t, int())),
+            variance_of(solver, |solver, t| Type::full_map_of(solver, t, int())),
             Ok(Variance::Invariant)
         );
     }
@@ -1738,12 +1780,19 @@ mod tests {
     /// invariant.
     #[test]
     fn two_polarities_join_to_bipolar() {
+        let solver = &mut Solver::new();
         assert_eq!(
-            variance_of(|t| Type::Tuple(vec![t.clone(), Type::fun(t, int())])),
+            variance_of(solver, |_, t| Type::Tuple(vec![
+                t.clone(),
+                Type::fun(t, int())
+            ])),
             Ok(Variance::Bipolar)
         );
         assert_eq!(
-            variance_of(|t| Type::Tuple(vec![t.clone(), Type::full_map_of(t, int())])),
+            variance_of(solver, |solver, t| Type::Tuple(vec![
+                t.clone(),
+                Type::full_map_of(solver, t, int())
+            ])),
             Ok(Variance::Invariant)
         );
     }
@@ -1752,6 +1801,7 @@ mod tests {
     /// its input side at a negative one.
     #[test]
     fn instantiating_reads_each_side_where_it_occurs() {
+        let solver = &mut Solver::new();
         let t = TypeParam::declared("T");
         let decl = NominalDecl::declared(
             "Cell".into(),
@@ -1759,16 +1809,19 @@ mod tests {
             Span::new(FileId::ROOT, 0, 0),
             false,
         );
-        decl.define(vec![NominalCtor::unwritten(
-            "c".into(),
-            Span::new(FileId::ROOT, 0, 0),
-            vec![(None, Type::fun(Type::Param(t.clone()), Type::Param(t)))],
-        )])
+        decl.define_in(
+            solver,
+            vec![NominalCtor::unwritten(
+                "c".into(),
+                Span::new(FileId::ROOT, 0, 0),
+                vec![(None, Type::fun(Type::Param(t.clone()), Type::Param(t)))],
+            )],
+        )
         .expect("`T` is used");
         let (input, output) = (Type::Base(BaseType::Bool), int());
         let arg = split(input.clone(), output.clone());
         assert_eq!(
-            decl.instantiate(&decl.body().ctors[0].payload(), &[arg]),
+            decl.instantiate(solver, &decl.body().ctors[0].payload(), &[arg]),
             Type::fun(input, output)
         );
     }
@@ -1776,7 +1829,8 @@ mod tests {
     /// A parameter inside another nominal type takes that type's parameter variance.
     #[test]
     fn a_nested_nominal_type_composes_its_variance() {
-        let inner = |variance_shape: fn(Type) -> Type| {
+        let solver = &mut Solver::new();
+        let mut inner = |variance_shape: fn(Type) -> Type| {
             let u = TypeParam::declared("U");
             let decl = NominalDecl::declared(
                 "In".into(),
@@ -1784,17 +1838,23 @@ mod tests {
                 Span::new(FileId::ROOT, 0, 0),
                 false,
             );
-            decl.define(vec![NominalCtor::unwritten(
-                "c".into(),
-                Span::new(FileId::ROOT, 0, 0),
-                vec![(None, variance_shape(Type::Param(u)))],
-            )])
+            decl.define_in(
+                solver,
+                vec![NominalCtor::unwritten(
+                    "c".into(),
+                    Span::new(FileId::ROOT, 0, 0),
+                    vec![(None, variance_shape(Type::Param(u)))],
+                )],
+            )
             .expect("U is used");
             decl
         };
         let contra = inner(|u| Type::fun(u, Type::Base(BaseType::Int)));
         assert_eq!(
-            variance_of(|t| Type::fun(Type::Nominal(contra.clone(), vec![t]), int())),
+            variance_of(solver, |_, t| Type::fun(
+                Type::Nominal(contra.clone(), vec![t]),
+                int()
+            )),
             Ok(Variance::Covariant)
         );
     }
@@ -1803,6 +1863,7 @@ mod tests {
     /// which are untyped, and keeps those inside an argument, which the use typed.
     #[test]
     fn the_representation_keeps_only_its_arguments_refinements() {
+        let solver = &mut Solver::new();
         use crate::ccl::{Expr, Refinement, RefinementSet};
         let refine = |base: Type, by: &str| {
             let bool_ty = Type::Base(BaseType::Bool);
@@ -1814,15 +1875,18 @@ mod tests {
         let span = Span::new(FileId::ROOT, 0, 0);
         let t = TypeParam::declared("T");
         let decl = NominalDecl::declared("N".into(), vec![t.clone()], span, false);
-        decl.define(vec![NominalCtor::unwritten(
-            "c".into(),
-            span,
-            vec![(None, refine(int(), "declared")), (None, Type::Param(t))],
-        )])
+        decl.define_in(
+            solver,
+            vec![NominalCtor::unwritten(
+                "c".into(),
+                span,
+                vec![(None, refine(int(), "declared")), (None, Type::Param(t))],
+            )],
+        )
         .expect("`c` names `T`");
         let argument = refine(int(), "written");
         assert_eq!(
-            decl.representation(std::slice::from_ref(&argument)),
+            decl.representation(solver, std::slice::from_ref(&argument)),
             Type::variant(vec![(
                 FieldKey::Name("c".into()),
                 Type::Tuple(vec![int(), argument])
@@ -1832,6 +1896,7 @@ mod tests {
 
     #[test]
     fn an_unused_parameter_is_refused() {
-        assert_eq!(variance_of(|_| int()), Err("T".to_string()));
+        let solver = &mut Solver::new();
+        assert_eq!(variance_of(solver, |_, _| int()), Err("T".to_string()));
     }
 }

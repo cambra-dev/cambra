@@ -941,6 +941,7 @@ mod tests {
     use crate::ccl::BaseType;
     use crate::ccl::Occurrence;
     use crate::ccl::RecordEntry;
+    use crate::ccl::infer::solver::Solver;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, Expr, Lit,
         LogicKind, Refinement, TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode,
@@ -1126,7 +1127,7 @@ mod tests {
     #[case(
         Expr::apply(
             Expr::var("v"),
-            Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+            Expr::lambda("x", Occurrence::mint(), Type::infer(&mut Solver::new()), Expr::var("x")),
         ),
         "v ▷ (λ x → x)"
     )]
@@ -1222,7 +1223,7 @@ mod tests {
     )]
     // Lambda (unannotated)
     #[case(
-        Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+        Expr::lambda("x", Occurrence::mint(), Type::infer(&mut Solver::new()), Expr::var("x")),
         "λ x → x"
     )]
     // Lambda (annotated)
@@ -1459,7 +1460,7 @@ mod tests {
                 Expr::lambda(
                     "y",
                     Occurrence::mint(),
-                    Type::infer(),
+                    Type::infer(&mut Solver::new()),
                     Expr::binop(
                         Expr::var("y"),
                         BinOpKind::Arithmetic(ArithmeticKind::Add),

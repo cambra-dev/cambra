@@ -6,6 +6,7 @@
 //! uniformly across terms, types, refinement predicates, and the suspended
 //! discharge payloads riding bound edges.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -103,18 +104,25 @@ impl PolyScheme {
     /// Called at every use site of the scheme to ensure each occurrence
     /// gets independent constraints (e.g. two uses of `Compare` can
     /// compare `Int`s and `String`s respectively without conflict).
-    pub fn instantiate(&self, current_level: Level) -> Type {
+    pub fn instantiate(&self, solver: &mut Solver, current_level: Level) -> Type {
         #[cfg(debug_assertions)]
         let before = Minted::now();
         let mut cache = FreshenCache::new();
         let ty = freshen_above(
+            solver,
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
             &mut cache,
         );
         #[cfg(debug_assertions)]
-        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
+        assert_copied_apart(
+            solver,
+            self.level,
+            std::slice::from_ref(&ty),
+            &cache,
+            before,
+        );
         ty
     }
 
@@ -132,6 +140,7 @@ impl PolyScheme {
     /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_with_params(
         &self,
+        solver: &mut Solver,
         current_level: Level,
         telescope: &Telescope,
         use_at: crate::ccl::provenance::NodeId,
@@ -143,11 +152,11 @@ impl PolyScheme {
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
-        let ty = freshen_above(self.level, &self.body, at, &mut cache);
+        let ty = freshen_above(solver, self.level, &self.body, at, &mut cache);
         let requires: Vec<TraitRequirement> = self
             .requires
             .iter()
-            .map(|r| r.map_types(|t| freshen_above(self.level, t, at, &mut cache)))
+            .map(|r| r.map_types(|t| freshen_above(solver, self.level, t, at, &mut cache)))
             .collect();
         // A bound can name a parameter nothing freshened yet, which the bound's own
         // freshening then maps, so the parameters are drained until none is new.
@@ -171,7 +180,7 @@ impl PolyScheme {
                     continue;
                 }
                 if let Some(bound) = &param.bound {
-                    let bound = freshen_above(self.level, bound, at, &mut cache);
+                    let bound = freshen_above(solver, self.level, bound, at, &mut cache);
                     bounds.push((instantiation, bound, param.bound_at));
                 }
             }
@@ -182,14 +191,14 @@ impl PolyScheme {
         families.sort_by(|a, b| a.0.cmp(&b.0));
         for (param, names, var) in families {
             if let Some(bound) = &param.bound {
-                let fresh = freshen_above(self.level, bound, at, &mut cache);
-                let bound = crate::ccl::subst::family_at_names(&fresh, &names);
+                let fresh = freshen_above(solver, self.level, bound, at, &mut cache);
+                let bound = crate::ccl::subst::family_at_names(solver, &fresh, &names);
                 bounds.push((var, bound, param.bound_at));
             }
         }
         // The instance is the body, each bound with its instantiation, and each requirement.
         #[cfg(debug_assertions)]
-        assert_copied_apart_from(self.level, &cache, before, &mut |visit| {
+        assert_copied_apart_from(solver, self.level, &cache, before, &mut |visit| {
             visit(&ty);
             for (instantiation, bound, _) in &bounds {
                 visit(instantiation);
@@ -220,19 +229,31 @@ impl PolyScheme {
     /// [`instantiate_with_params`](Self::instantiate_with_params), whose variables keep the
     /// binders the definition's own stood under, entered after the use site's
     /// ([`FreshenCache::use_telescope`]).
-    pub fn instantiate_in(&self, current_level: Level, telescope: &Telescope) -> Type {
+    pub fn instantiate_in(
+        &self,
+        solver: &mut Solver,
+        current_level: Level,
+        telescope: &Telescope,
+    ) -> Type {
         #[cfg(debug_assertions)]
         let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.site_telescope = Some(telescope.clone());
         let ty = freshen_above(
+            solver,
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
             &mut cache,
         );
         #[cfg(debug_assertions)]
-        assert_copied_apart(self.level, std::slice::from_ref(&ty), &cache, before);
+        assert_copied_apart(
+            solver,
+            self.level,
+            std::slice::from_ref(&ty),
+            &cache,
+            before,
+        );
         ty
     }
 }
@@ -266,8 +287,14 @@ impl Minted {
 /// records into every other (`src/ccl/design/type-inference.md`, "Funkind variables are copied by
 /// level").
 #[cfg(debug_assertions)]
-fn assert_copied_apart(lim: Level, roots: &[Type], cache: &FreshenCache, before: Minted) {
-    assert_copied_apart_from(lim, cache, before, &mut |visit| {
+fn assert_copied_apart(
+    solver: &mut Solver,
+    lim: Level,
+    roots: &[Type],
+    cache: &FreshenCache,
+    before: Minted,
+) {
+    assert_copied_apart_from(solver, lim, cache, before, &mut |visit| {
         roots.iter().for_each(visit)
     });
 }
@@ -280,12 +307,14 @@ pub(crate) type Roots<'a> = dyn FnMut(&mut dyn FnMut(&Type)) + 'a;
 /// clone's type slots, walked in place.
 #[cfg(debug_assertions)]
 pub(crate) fn assert_copied_apart_from(
+    solver: &mut Solver,
     lim: Level,
     cache: &FreshenCache,
     before: Minted,
     roots: &mut Roots<'_>,
 ) {
-    struct Audit {
+    struct Audit<'s> {
+        solver: &'s mut Solver,
         lim: Level,
         before: Minted,
         vars: std::collections::HashSet<InferVarId>,
@@ -295,18 +324,21 @@ pub(crate) fn assert_copied_apart_from(
         /// instantiation before `before` (`UseCapabilities::copies`).
         capability_copies: std::collections::HashSet<CapabilityVarId>,
     }
-    impl Audit {
+    impl Audit<'_> {
         fn kind(&mut self, kind: &FunKind) {
             if let FunKind::Var(k) = kind {
+                let level = k.level(self.solver);
                 assert!(
-                    k.uid >= self.before.funkind || k.level().is_some_and(|l| l <= self.lim),
+                    k.uid >= self.before.funkind || level.is_some_and(|l| l <= self.lim),
                     "an instantiation shares a funkind variable above the cutoff {} with its scheme: {k:?}",
                     self.lim
                 );
-                if k.level().is_some_and(|l| l <= self.lim) || !self.kinds.insert(k.uid) {
+                if level.is_some_and(|l| l <= self.lim) || !self.kinds.insert(k.uid) {
                     return;
                 }
-                for (edge, _) in k.lower_edges().into_iter().chain(k.upper_edges()) {
+                let edges = k.lower_edges(self.solver);
+                let upper = k.upper_edges(self.solver);
+                for (edge, _) in edges.into_iter().chain(upper) {
                     self.kind(&edge);
                 }
             }
@@ -328,23 +360,25 @@ pub(crate) fn assert_copied_apart_from(
         }
         fn ty(&mut self, ty: &Type) {
             if let Type::Infer(v) = ty {
+                let level = v.level(self.solver);
                 assert!(
-                    v.uid >= self.before.var || v.level() <= self.lim,
+                    v.uid >= self.before.var || level <= self.lim,
                     "an instantiation shares a variable above the cutoff {} with its scheme: {v:?}",
                     self.lim
                 );
-                if v.level() <= self.lim || !self.vars.insert(v.uid) {
+                if level <= self.lim || !self.vars.insert(v.uid) {
                     return;
                 }
                 self.kind(&FunKind::Var(Rc::clone(&v.fun_kind)));
-                for bound in v
-                    .bounds
-                    .borrow()
+                let bounds = v.bounds(self.solver);
+                let tys: Vec<Type> = bounds
                     .lower()
                     .iter()
-                    .chain(v.bounds.borrow().upper().iter())
-                {
-                    self.ty(&bound.ty);
+                    .chain(bounds.upper().iter())
+                    .map(|b| b.ty.clone())
+                    .collect();
+                for ty in &tys {
+                    self.ty(ty);
                 }
             }
             if let Type::Fun {
@@ -372,6 +406,7 @@ pub(crate) fn assert_copied_apart_from(
         }
     }
     let mut audit = Audit {
+        solver,
         lim,
         before,
         vars: Default::default(),
@@ -546,6 +581,7 @@ impl FreshenLevel {
 /// copied through [`freshen_kind_var`]. Concrete kinds keep their form, with a sum's candidate
 /// types freshened through the same cache.
 fn freshen_fun_kind(
+    solver: &mut Solver,
     fun_kind: &FunKind,
     lim: Level,
     target: FreshenLevel,
@@ -556,15 +592,16 @@ fn freshen_fun_kind(
         FunKind::Data(Some(witnesses)) => FunKind::Data(Some(Rc::new(
             witnesses
                 .iter()
-                .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
+                .map(|w| w.map_types(|t| freshen_above(solver, lim, t, target, cache)))
                 .collect(),
         ))),
-        FunKind::Var(kv) => FunKind::Var(freshen_kind_var(kv, lim, target, cache)),
+        FunKind::Var(kv) => FunKind::Var(freshen_kind_var(solver, kv, lim, target, cache)),
     }
 }
 
 /// A conditional requirement with its operands copied through the function's substitution.
 fn freshen_requirement(
+    solver: &mut Solver,
     lim: Level,
     r: &crate::ccl::capabilities::Requirement,
     target: FreshenLevel,
@@ -582,17 +619,17 @@ fn freshen_requirement(
     let iter = order
         .iter
         .as_ref()
-        .map(|t| freshen_above(lim, t, target, cache));
-    let positions = freshen_above(lim, &order.positions, target, cache);
+        .map(|t| freshen_above(solver, lim, t, target, cache));
+    let positions = freshen_above(solver, lim, &order.positions, target, cache);
     let capabilities = match order.capabilities.repr() {
-        Repr::Var(v) => Capabilities::var(freshen_capability_var(lim, v, target, cache)),
+        Repr::Var(v) => Capabilities::var(freshen_capability_var(solver, lim, v, target, cache)),
         _ => order.capabilities.clone(),
     };
     let assumptions = order
         .assumptions
         .borrow()
         .iter()
-        .map(|r| Rc::new(r.map_types(|t| freshen_above(lim, t, target, cache))))
+        .map(|r| Rc::new(r.map_types(|t| freshen_above(solver, lim, t, target, cache))))
         .collect();
     let (node, source) = cache
         .use_at
@@ -615,6 +652,7 @@ fn freshen_requirement(
 
 /// A per-use copy of a capability variable and its incoming capabilities and bounds.
 fn freshen_capability_var(
+    solver: &mut Solver,
     lim: Level,
     v: &Rc<CapabilityVar>,
     target: FreshenLevel,
@@ -639,7 +677,7 @@ fn freshen_capability_var(
             // A use raises the exception at its own instance of the definition's types, and as
             // an exception of its own: two uses at two types are two exceptions.
             Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
-                let ty = freshen_above(lim, &raised.ty, target, cache);
+                let ty = freshen_above(solver, lim, &raised.ty, target, cache);
                 f.record(crate::ccl::capabilities::ScopedCapability {
                     item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
                         raised.instantiated(ty),
@@ -649,7 +687,7 @@ fn freshen_capability_var(
             }
             Capability::Requires(r) if r.ordering().is_some_and(|o| o.satisfied.get()) => {}
             Capability::Requires(r) if r.ordering().is_some() => {
-                let requirement = freshen_requirement(lim, r, target, cache);
+                let requirement = freshen_requirement(solver, lim, r, target, cache);
                 f.record(crate::ccl::capabilities::ScopedCapability {
                     item: Capability::Requires(requirement),
                     ..capability
@@ -659,14 +697,14 @@ fn freshen_capability_var(
         }
     }
     for (source, mut filter) in v.incoming() {
-        let source = freshen_capability_var(lim, &source, target, cache);
+        let source = freshen_capability_var(solver, lim, &source, target, cache);
         // A use's `try` catches the use's instances of the types its clauses name, as its
         // exceptions are the use's instances of the types they are raised at.
         if let Some(catch) = &filter.catches {
             let clauses = catch
                 .clauses()
                 .iter()
-                .map(|c| freshen_above(lim, c, target, cache))
+                .map(|c| freshen_above(solver, lim, c, target, cache))
                 .collect();
             filter.catches = Some(Rc::new(catch.instantiated(clauses)));
         }
@@ -675,7 +713,7 @@ fn freshen_capability_var(
             .into_iter()
             .map(|item| match item {
                 Capability::Requires(r) => {
-                    Capability::Requires(freshen_requirement(lim, &r, target, cache))
+                    Capability::Requires(freshen_requirement(solver, lim, &r, target, cache))
                 }
                 item => item,
             })
@@ -696,14 +734,13 @@ fn freshen_capability_var(
             .set
             .requires
             .into_iter()
-            .map(|r| freshen_requirement(lim, &r, target, cache))
+            .map(|r| freshen_requirement(solver, lim, &r, target, cache))
             .collect();
         for param in std::mem::take(&mut upper.set.params) {
             if !param.except.is_empty() {
-                upper.set.add_every(
-                    crate::ccl::capabilities::Every::of_direction(param.of_causes)
-                        .less(param.except.iter().cloned()),
-                );
+                let every = crate::ccl::capabilities::Every::of_direction(param.of_causes)
+                    .less(solver, param.except.iter().cloned());
+                upper.set.add_every_in(solver, every);
             } else if param.of_causes {
                 upper.of_causes = false;
             } else {
@@ -722,6 +759,7 @@ fn freshen_capability_var(
 /// the definition's constraints and receives this instantiation's constraints independently.
 /// Caching by `uid` keeps repeated occurrences of one kind variable in a copy identified.
 fn freshen_kind_var(
+    solver: &mut Solver,
     kv: &Rc<FunKindVar>,
     lim: Level,
     target: FreshenLevel,
@@ -733,7 +771,7 @@ fn freshen_kind_var(
     // A funkind variable at or below the cutoff is an enclosing scope's, as a variable there
     // is, and freshens to itself: a copy of a function this freshening copies relates to it as
     // the original did.
-    if kv.level().is_some_and(|l| l <= lim) {
+    if kv.level(solver).is_some_and(|l| l <= lim) {
         return Rc::clone(kv);
     }
     // Each field of the original, and what the copy makes of it.
@@ -743,6 +781,10 @@ fn freshen_kind_var(
         // An annotation's funkind hole is normalized away before inference, so no funkind
         // variable a freshening copies is one.
         hole: (),
+        // The construction stamp, carried below with the recorded one (`stamped`).
+        minted: (),
+        // Minted by this solver.
+        home: (),
         // The target's level for the original's, below.
         level: (),
         // The stamp, the binders and every edge, below.
@@ -753,10 +795,10 @@ fn freshen_kind_var(
         component_at: (),
         // A copy's witness positions belong to its own graph, so start without the cache.
         binder_positions_at: (),
-    } = kv.fields();
-    let f = FunKindVar::fresh();
-    if let Some(l) = kv.level() {
-        f.place_at(target.level_of(l));
+    } = kv.fields(solver);
+    let f = FunKindVar::fresh(solver);
+    if let Some(l) = kv.level(solver) {
+        f.place_at(solver, target.level_of(l));
     }
     // Registered **before** the bounds are carried across: a collection reaches itself
     // through a recurrence, and the cache is what terminates the walk.
@@ -770,23 +812,26 @@ fn freshen_kind_var(
     // collection was built over — a comprehension's instantiation binds one position per
     // position of its sources exactly as the definition does, and a copy that drops the
     // relation is a collection of unknown width that defaults to a compute function.
-    if kv.stamped() == crate::ccl::ty::KindPin::Data {
-        f.stamp_data();
+    if kv.stamped(solver) == crate::ccl::ty::KindPin::Data {
+        f.stamp_data(solver);
     }
     // **The binders come across renamed, before the edges.** A position the original has
     // named is named in the bounds being copied, and the copy binds its own name there, so
     // the rename has to be in the cache when those bounds are freshened. Every binder the
     // original has named, arity known or not: a name is minted ahead of the arity
     // ([`FunKindVar::binder_id_at`]).
-    let _ = kv.binder_ids();
-    for (i, from) in kv.named_binder_ids().into_iter().enumerate() {
-        cache.witnesses.insert(from, f.binder_id_at(i));
+    let _ = kv.binder_ids(solver);
+    for (i, from) in kv.named_binder_ids(solver).into_iter().enumerate() {
+        cache.witnesses.insert(from, f.binder_id_at(solver, i));
     }
     // Each edge's substitution comes across freshened, as a copied bound's does.
-    for (lower, edges) in [(true, kv.lower_edges()), (false, kv.upper_edges())] {
+    for (lower, edges) in [
+        (true, kv.lower_edges(solver)),
+        (false, kv.upper_edges(solver)),
+    ] {
         for (k, edge) in edges {
-            let edge = freshen_subst_payloads(lim, &edge, target, cache);
-            let neighbor = freshen_fun_kind(&k, lim, target, cache);
+            let edge = freshen_subst_payloads(solver, lim, &edge, target, cache);
+            let neighbor = freshen_fun_kind(solver, &k, lim, target, cache);
             // A neighbor this freshening leaves in place, an enclosing scope's funkind variable,
             // is not copied, so its side of the edge is recorded here: the edge is recorded on
             // both ends, and `kv`'s neighbor reads it as it reads its edge to `kv`.
@@ -794,22 +839,24 @@ fn freshen_kind_var(
                 && Rc::ptr_eq(original, kept)
             {
                 let reverse = if lower {
-                    kept.upper_edges()
+                    kept.upper_edges(solver)
                 } else {
-                    kept.lower_edges()
+                    kept.lower_edges(solver)
                 };
                 for (back, back_edge) in reverse {
                     if matches!(&back, FunKind::Var(b) if b.uid == kv.uid) {
-                        let back_edge = freshen_subst_payloads(lim, &back_edge, target, cache);
-                        kept.record_under(FunKind::Var(Rc::clone(&f)), !lower, back_edge);
+                        let back_edge =
+                            freshen_subst_payloads(solver, lim, &back_edge, target, cache);
+                        kept.record_under(solver, FunKind::Var(Rc::clone(&f)), !lower, back_edge);
                     }
                 }
             }
-            f.record_under(neighbor, lower, edge);
+            f.record_under(solver, neighbor, lower, edge);
         }
     }
-    for src in kv.built_over().into_iter().rev() {
-        f.contributes_first(freshen_fun_kind(&src, lim, target, cache));
+    for src in kv.built_over(solver).into_iter().rev() {
+        let kind = freshen_fun_kind(solver, &src, lim, target, cache);
+        f.contributes_first(solver, kind);
     }
     // **And recorded on the copy**, not only in this walk's cache. The cache rewrites the
     // references this instantiation carries and is then gone; a reference written in the
@@ -817,7 +864,7 @@ fn freshen_kind_var(
     // relations are freshened and reach the original nowhere. Recorded as a copy rather than
     // as bounds: what the two share is which binder each position is, not what the kind
     // resolves to, and the decoupling above is the whole point of the fresh variable.
-    f.copied_from(kv);
+    f.copied_from(solver, kv);
 
     f
 }
@@ -846,11 +893,11 @@ fn freshen_kind_var(
 /// The symptom is a duplicate specialization: the clone reaches the same
 /// generalized `let` twice, once through freshened variables and once through
 /// the definition's own.
-fn freshen_level(ty: &Type) -> Level {
-    fn predicate_level(expr: &TypedExpr) -> Level {
+fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
+    fn predicate_level(solver: &mut Solver, expr: &TypedExpr) -> Level {
         let mut lvl = 0;
-        expr.walk_type_slots(|t| lvl = lvl.max(freshen_level(t)));
-        expr.walk_children(|c| lvl = lvl.max(predicate_level(c)));
+        expr.walk_type_slots(|t| lvl = lvl.max(freshen_level(solver, t)));
+        expr.walk_children(|c| lvl = lvl.max(predicate_level(solver, c)));
         lvl
     }
     // One walk, not `type_level` plus a second descent: `walk_children` already
@@ -861,8 +908,8 @@ fn freshen_level(ty: &Type) -> Level {
     // reads its key holds one in a predicate, as the key binder's type, beside
     // nothing else to freshen.
     let mut lvl = match ty {
-        Type::Infer(v) => v.level(),
-        Type::BarrierVar(barrier) => barrier.level(),
+        Type::Infer(v) => v.level(solver),
+        Type::BarrierVar(barrier) => barrier.level(solver),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
@@ -872,7 +919,7 @@ fn freshen_level(ty: &Type) -> Level {
         Type::FamilyApp(app) => app
             .args
             .iter()
-            .map(|a| predicate_level(&a.term))
+            .map(|a| predicate_level(solver, &a.term))
             .fold(app.param.opened_at.unwrap_or(0), Level::max),
         Type::ChanDom(_, l) => l.0,
         // A funkind variable and a capability variable are copied like any variable above the
@@ -885,7 +932,7 @@ fn freshen_level(ty: &Type) -> Level {
             ..
         } => {
             let kind = match fun_kind {
-                FunKind::Var(kind) => kind.level().unwrap_or(Level::MAX),
+                FunKind::Var(kind) => kind.level(solver).unwrap_or(Level::MAX),
                 _ => 0,
             };
             kind.max(capabilities.level())
@@ -893,12 +940,12 @@ fn freshen_level(ty: &Type) -> Level {
         _ => 0,
     };
     for r in ty.refinements() {
-        lvl = lvl.max(predicate_level(&r.predicate));
+        lvl = lvl.max(predicate_level(solver, &r.predicate));
     }
     if let Type::WitnessProjection(p) = ty {
-        lvl = lvl.max(predicate_level(&p.term));
+        lvl = lvl.max(predicate_level(solver, &p.term));
     }
-    ty.walk_children(|c| lvl = lvl.max(freshen_level(c)));
+    ty.walk_children(|c| lvl = lvl.max(freshen_level(solver, c)));
     lvl
 }
 
@@ -912,6 +959,7 @@ fn holds_family_app(ty: &Type) -> bool {
 /// ([`FreshenCache::family_params`]). A parameter this freshening does not instantiate, one
 /// deeper than the cutoff in a specialization clone, is re-minted as a parameter is.
 fn freshen_family_app(
+    solver: &mut Solver,
     lim: Level,
     app: &crate::ccl::ty::FamilyApp,
     target: FreshenLevel,
@@ -923,7 +971,7 @@ fn freshen_family_app(
         .map(|a| {
             let _f = crate::ccl::provenance::copy_frame("infer.freshen_family_arg");
             let mut term = (*a.term).duplicate();
-            freshen_expr_type_slots(&mut term, lim, target, cache);
+            freshen_expr_type_slots(solver, &mut term, lim, target, cache);
             Rc::new(term)
         })
         .collect();
@@ -936,7 +984,7 @@ fn freshen_family_app(
                 let bound = param
                     .bound
                     .as_ref()
-                    .map(|b| freshen_above(lim, b, target, cache));
+                    .map(|b| freshen_above(solver, lim, b, target, cache));
                 let p = crate::ccl::ty::TypeParam::opened_family(
                     param.spelling.clone(),
                     target.level_of(param.level()),
@@ -967,13 +1015,13 @@ fn freshen_family_app(
             FreshenLevel::At(at) => at,
             _ => target.level_of(param.level()),
         };
-        let var = Type::Infer(InferVar::fresh_in(level, &telescope));
+        let var = Type::Infer(InferVar::fresh_in(solver, level, &telescope));
         cache
             .family_params
             .insert(param.id, (Rc::clone(param), names, var));
     }
     let (_, names, var) = &cache.family_params[&param.id];
-    crate::ccl::subst::discharge_binders(names, var, &args)
+    crate::ccl::subst::discharge_binders(solver, names, var, &args)
 }
 
 /// Copy `ty` with every variable introduced above `lim` replaced by a fresh one
@@ -981,6 +1029,7 @@ fn freshen_family_app(
 ///
 /// A type wholly at or below `lim` is returned unchanged.
 pub fn freshen_above(
+    solver: &mut Solver,
     lim: Level,
     ty: &Type,
     target: FreshenLevel,
@@ -995,7 +1044,7 @@ pub fn freshen_above(
     // are different questions). A `WitnessRef` is exempt outright: it is a name holding
     // no variable, so its level is 0 whether or not its binder is quantified, and what
     // decides that is the cache the arm below reads.
-    if !matches!(ty, Type::WitnessRef(_)) && freshen_level(ty) <= lim {
+    if !matches!(ty, Type::WitnessRef(_)) && freshen_level(solver, ty) <= lim {
         return ty.clone();
     }
     match ty {
@@ -1018,7 +1067,7 @@ pub fn freshen_above(
         }
         // A declared family parameter, as a declared parameter is, names no solver content.
         Type::FamilyApp(app) if app.param.opened_at.is_none() => ty.clone(),
-        Type::FamilyApp(app) => freshen_family_app(lim, app, target, cache),
+        Type::FamilyApp(app) => freshen_family_app(solver, lim, app, target, cache),
         // Each binder renamed as a function's is, and the body freshened opened, so an
         // application of a family parameter in it discharges that parameter's binders to the
         // terms by name.
@@ -1040,20 +1089,19 @@ pub fn freshen_above(
                 })
                 .collect();
             let opened = crate::ccl::subst::open_family_body(
+                solver,
                 binders.len(),
                 body,
                 |j| crate::ccl::subst::Mapping::Rename(renamed[j].clone()),
                 crate::ccl::Ids::Fresh,
             );
-            let fresh_body = freshen_above(lim, &opened, target, cache);
-            Type::family(
-                renamed
-                    .into_iter()
-                    .zip(binders)
-                    .map(|(n, (_, t))| (n, freshen_above(lim, t, target, cache)))
-                    .collect(),
-                fresh_body,
-            )
+            let fresh_body = freshen_above(solver, lim, &opened, target, cache);
+            let fresh_binders = renamed
+                .into_iter()
+                .zip(binders)
+                .map(|(n, (_, t))| (n, freshen_above(solver, lim, t, target, cache)))
+                .collect();
+            Type::family(solver, fresh_binders, fresh_body)
         }
         // `uncurry`'s scheme names its components as a function names its binder, so each
         // instantiation names its own, the way the `Fun` arm below renames, and the variables
@@ -1072,7 +1120,7 @@ pub fn freshen_above(
                         ),
                         _ => name.clone(),
                     };
-                    (name, freshen_above(lim, t, target, cache))
+                    (name, freshen_above(solver, lim, t, target, cache))
                 })
                 .collect(),
         ),
@@ -1112,25 +1160,30 @@ pub fn freshen_above(
                 (Some(n), Some(_)) => Some(cache.binder_name(n)),
                 _ => name.clone(),
             };
-            let fun_kind = freshen_fun_kind(fun_kind, lim, target, cache);
-            let domain = freshen_above(lim, d, target, cache);
+            let fun_kind = freshen_fun_kind(solver, fun_kind, lim, target, cache);
+            let domain = freshen_above(solver, lim, d, target, cache);
             let codomain = match &name {
                 // An application of a family parameter discharges that parameter's
                 // binders to its terms by name, so a codomain holding one is freshened
                 // opened at the binder.
                 Some(b) if holds_family_app(c) => {
-                    let opened = crate::ccl::subst::open_pi_binder(
+                    let opened = crate::ccl::subst::open_pi_binder_in(
+                        solver,
                         &crate::ccl::subst::Mapping::Rename(b.clone()),
                         c,
                         crate::ccl::Ids::Fresh,
                     );
-                    crate::ccl::subst::close_pi_binder(
-                        b,
-                        &freshen_above(lim, &opened, target, cache),
-                        crate::ccl::Ids::Fresh,
-                    )
+                    {
+                        let freshened = freshen_above(solver, lim, &opened, target, cache);
+                        crate::ccl::subst::close_pi_binder(
+                            solver,
+                            b,
+                            &freshened,
+                            crate::ccl::Ids::Fresh,
+                        )
+                    }
                 }
-                _ => freshen_above(lim, c, target, cache),
+                _ => freshen_above(solver, lim, c, target, cache),
             };
             let out = Type::Fun {
                 name,
@@ -1139,7 +1192,7 @@ pub fn freshen_above(
                 codomain: Box::new(codomain),
                 capabilities: match capabilities.repr() {
                     Repr::Var(v) => {
-                        Capabilities::var(freshen_capability_var(lim, v, target, cache))
+                        Capabilities::var(freshen_capability_var(solver, lim, v, target, cache))
                     }
                     Repr::Known(_) => capabilities.clone(),
                     Repr::Written(_) => {
@@ -1156,47 +1209,47 @@ pub fn freshen_above(
             } = &out
             {
                 let owned = |v: &InferVar| v.uid >= first_var;
-                InferVar::place_parts_under_where(domain, fun_kind, &owned);
-                InferVar::place_parts_under_where(codomain, fun_kind, &owned);
+                InferVar::place_parts_under_where(solver, domain, fun_kind, &owned);
+                InferVar::place_parts_under_where(solver, codomain, fun_kind, &owned);
             }
             // A scheme binds its witnesses, so each instantiation owes itself its own —
             // `box`'s scheme is one sum, and sharing its binders would make every `box`
             // in a program name the one the scheme was written with, joining two
             // independent conditional collections onto a single witness.
             if out.sum().is_some() {
-                out.alpha_convert_sum()
+                out.alpha_convert_sum(solver)
             } else {
                 out
             }
         }
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
-                .map(|t| freshen_above(lim, t, target, cache))
+                .map(|t| freshen_above(solver, lim, t, target, cache))
                 .collect(),
         ),
         Type::OpenTuple(ts) => Type::OpenTuple(
             ts.iter()
-                .map(|t| freshen_above(lim, t, target, cache))
+                .map(|t| freshen_above(solver, lim, t, target, cache))
                 .collect(),
         ),
         Type::Nominal(decl, args) => Type::Nominal(
             decl.clone(),
             args.iter()
-                .map(|t| freshen_above(lim, t, target, cache))
+                .map(|t| freshen_above(solver, lim, t, target, cache))
                 .collect(),
         ),
         Type::Split { input, output } => Type::Split {
-            input: Box::new(freshen_above(lim, input, target, cache)),
-            output: Box::new(freshen_above(lim, output, target, cache)),
+            input: Box::new(freshen_above(solver, lim, input, target, cache)),
+            output: Box::new(freshen_above(solver, lim, output, target, cache)),
         },
         Type::Record(fs) => Type::Record(
             fs.iter()
-                .map(|(n, t)| (n.clone(), freshen_above(lim, t, target, cache)))
+                .map(|(n, t)| (n.clone(), freshen_above(solver, lim, t, target, cache)))
                 .collect(),
         ),
         Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
-                .map(|(k, t)| (k.clone(), freshen_above(lim, t, target, cache)))
+                .map(|(k, t)| (k.clone(), freshen_above(solver, lim, t, target, cache)))
                 .collect(),
             *openness,
         ),
@@ -1208,7 +1261,10 @@ pub fn freshen_above(
         Type::History {
             function,
             history_kind,
-        } => Type::history_over(freshen_above(lim, function, target, cache), *history_kind),
+        } => Type::history_over(
+            freshen_above(solver, lim, function, target, cache),
+            *history_kind,
+        ),
         // A witness reference names a binder, not a variable, so what freshening owes it
         // is the α-conversion its binder got. A written sum's binder is re-minted by
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
@@ -1221,7 +1277,7 @@ pub fn freshen_above(
         Type::WitnessProjection(p) => {
             let _f = crate::ccl::provenance::copy_frame("infer.freshen_projection");
             let mut term = (*p.term).duplicate();
-            freshen_expr_type_slots(&mut term, lim, target, cache);
+            freshen_expr_type_slots(solver, &mut term, lim, target, cache);
             Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
                 Rc::new(term),
                 p.position,
@@ -1232,7 +1288,7 @@ pub fn freshen_above(
             None => ty.clone(),
         },
         Type::Refinement(inner, refinements) => Type::refined(
-            freshen_above(lim, inner, target, cache),
+            freshen_above(solver, lim, inner, target, cache),
             // Faithfully freshen the predicate's own type slots through the same
             // `cache`, so a specialization's predicate is a proper freshen
             // instance — its slots are the clone's fresh variables, driven
@@ -1241,7 +1297,7 @@ pub fn freshen_above(
             // cannot loop.
             refinements
                 .iter()
-                .map(|r| freshen_refinement_predicate(lim, r, target, cache))
+                .map(|r| freshen_refinement_predicate(solver, lim, r, target, cache))
                 .collect(),
         ),
         // A declared parameter, in an annotation slot a clone copies, names no solver
@@ -1255,11 +1311,12 @@ pub fn freshen_above(
                 .param_telescope
                 .clone()
                 .unwrap_or_else(Telescope::empty);
-            let for_param = |level| {
-                let v = InferVar::fresh_in(level, &telescope);
-                v.mark_stands_for(crate::ccl::infer_var::StandsFor::Param(
-                    param.spelling.clone(),
-                ));
+            let mut for_param = |level| {
+                let v = InferVar::fresh_in(solver, level, &telescope);
+                v.mark_stands_for(
+                    solver,
+                    crate::ccl::infer_var::StandsFor::Param(param.spelling.clone()),
+                );
                 Type::Infer(v)
             };
             let out = match target {
@@ -1269,7 +1326,7 @@ pub fn freshen_above(
                     let bound = param
                         .bound
                         .as_ref()
-                        .map(|b| freshen_above(lim, b, target, cache));
+                        .map(|b| freshen_above(solver, lim, b, target, cache));
                     Type::Param(crate::ccl::ty::TypeParam::opened(
                         param.spelling.clone(),
                         target.level_of(param.level()),
@@ -1291,11 +1348,15 @@ pub fn freshen_above(
         // an instantiated one in a payload, keeps its name in the `Poly`, whose types
         // are what freshening made of it; nothing opens or instantiates that copy.
         Type::Poly(poly) => {
-            let mut out = poly.map_types(|t| freshen_above(lim, t, target, cache));
+            let mut out = poly.map_types(|t| freshen_above(solver, lim, t, target, cache));
             for p in &mut out.params {
-                if let Type::Param(param) =
-                    freshen_above(lim, &Type::Param(Rc::clone(&p.param)), target, cache)
-                {
+                if let Type::Param(param) = freshen_above(
+                    solver,
+                    lim,
+                    &Type::Param(Rc::clone(&p.param)),
+                    target,
+                    cache,
+                ) {
                     p.param = param;
                 }
             }
@@ -1306,13 +1367,13 @@ pub fn freshen_above(
                 return Type::Infer(Rc::clone(existing));
             }
             debug_assert!(
-                tv.fun_kind.level().is_none_or(|level| level > lim),
+                tv.fun_kind.level(solver).is_none_or(|level| level > lim),
                 "a quantified type variable's own funkind is quantified at the same cutoff"
             );
             // Mint the fresh variable at the level `target` dictates: the use
             // site's level (`At`) or the original's own level (`Preserve`), raised
             // (`Raise`).
-            let new_level = target.level_of(tv.level());
+            let new_level = target.level_of(tv.level(solver));
             // A freshened clone stands where the original stood, so it
             // inherits the original's telescope: the bounds copied below were
             // recorded against that scope. The exception is an operator-scheme
@@ -1336,8 +1397,8 @@ pub fn freshen_above(
             let fun_kind = match cache.fun_kind_vars.get(&tv.fun_kind.uid) {
                 Some(existing) => Rc::clone(existing),
                 None => {
-                    let f = FunKindVar::fresh();
-                    f.place_at(new_level);
+                    let f = FunKindVar::fresh(solver);
+                    f.place_at(solver, new_level);
                     cache.fun_kind_vars.insert(tv.fun_kind.uid, Rc::clone(&f));
                     f
                 }
@@ -1368,6 +1429,8 @@ pub fn freshen_above(
                 uid: (),
                 // The target's level for the original's (`new_level`).
                 level: (),
+                // Minted by this solver.
+                home: (),
                 // Rescoped to the use (`telescope`, above).
                 telescope: (),
                 // Freshened below, lower, upper and type kinds.
@@ -1386,15 +1449,16 @@ pub fn freshen_above(
                 stands_for: (),
                 // `inherit_witness_placement_renamed`, below.
                 witness_scopes: (),
-            } = tv.fields();
-            let v = InferVar::fresh_over(new_level, &telescope, fun_kind);
+            } = tv.fields(solver);
+            let v = InferVar::fresh_over(solver, new_level, &telescope, fun_kind);
             // The kinds the original sits under are this copy's kinds, whichever this walk
             // reaches first: a variable copied before the function it is a part of would
             // otherwise sit under the definition's kind, which nothing at the use relates to.
-            for k in tv.witness_scope_kinds() {
-                freshen_kind_var(&k, lim, target, cache);
+            for k in tv.witness_scope_kinds(solver) {
+                freshen_kind_var(solver, &k, lim, target, cache);
             }
             v.inherit_witness_placement_renamed(
+                solver,
                 tv,
                 |k| {
                     cache
@@ -1405,16 +1469,16 @@ pub fn freshen_above(
                 },
                 |w| cache.witnesses.get(w).copied().unwrap_or(*w),
             );
-            if tv.names_domain() {
-                v.mark_named_domain();
+            if tv.names_domain(solver) {
+                v.mark_named_domain(solver);
             }
-            v.inherit_stands_for(tv);
+            v.inherit_stands_for(solver, tv);
             cache.vars.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
             let (lows, ups, kinds) = {
-                let s = tv.bounds.borrow();
+                let s = tv.bounds(solver);
                 (
                     Rc::clone(s.lower()),
                     Rc::clone(s.upper()),
@@ -1430,9 +1494,9 @@ pub fn freshen_above(
                 .iter()
                 .map(|b| Bound {
                     origin: b.origin,
-                    self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
-                    ty: freshen_above(lim, &b.ty, target, cache),
-                    ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+                    self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
+                    ty: freshen_above(solver, lim, &b.ty, target, cache),
+                    ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
                     rendered: Default::default(),
                 })
                 .collect();
@@ -1440,9 +1504,9 @@ pub fn freshen_above(
                 .iter()
                 .map(|b| Bound {
                     origin: b.origin,
-                    self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
-                    ty: freshen_above(lim, &b.ty, target, cache),
-                    ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+                    self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
+                    ty: freshen_above(solver, lim, &b.ty, target, cache),
+                    ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
                     rendered: Default::default(),
                 })
                 .collect();
@@ -1453,16 +1517,17 @@ pub fn freshen_above(
             // the ones that do.
             let new_kinds: Vec<_> = kinds
                 .iter()
-                .map(|k| k.map_children(|t| freshen_above(lim, t, target, cache)))
+                .map(|k| k.map_children(|t| freshen_above(solver, lim, t, target, cache)))
                 .collect();
             // And of the guarded bounds, for the same reason: each instantiation's lower bounds
             // are checked under its own copy. The guard is freshened as the refinement it is, on
             // the copy of the variable it guards.
-            let guarded = tv.bounds.borrow().guarded_upper.clone();
+            let guarded = tv.bounds(solver).guarded_upper.clone();
             let new_guarded: Vec<_> = guarded
                 .iter()
                 .map(|g| {
                     let guarded_ty = freshen_above(
+                        solver,
                         lim,
                         &Type::refined(Type::Infer(Rc::clone(tv)), g.guard.clone()),
                         target,
@@ -1473,20 +1538,27 @@ pub fn freshen_above(
                         bound: Bound {
                             origin: g.bound.origin,
                             self_subst: freshen_subst_payloads(
+                                solver,
                                 lim,
                                 &g.bound.self_subst,
                                 target,
                                 cache,
                             ),
-                            ty: freshen_above(lim, &g.bound.ty, target, cache),
-                            ty_subst: freshen_subst_payloads(lim, &g.bound.ty_subst, target, cache),
+                            ty: freshen_above(solver, lim, &g.bound.ty, target, cache),
+                            ty_subst: freshen_subst_payloads(
+                                solver,
+                                lim,
+                                &g.bound.ty_subst,
+                                target,
+                                cache,
+                            ),
                             rendered: Default::default(),
                         },
                     }
                 })
                 .collect();
             {
-                let mut s = v.bounds.borrow_mut();
+                let s = v.bounds_mut(solver);
                 s.set_lower(new_lows);
                 s.set_upper(new_ups);
                 s.type_kinds = new_kinds;
@@ -1494,14 +1566,15 @@ pub fn freshen_above(
             }
             // A suspension's kinds are decided on it, and so on its copy
             // ([`crate::ccl::infer_var::SuspendedMembership`]).
-            for m in crate::ccl::infer_var::suspended_memberships_of(tv) {
+            for m in crate::ccl::infer_var::suspended_memberships_of(solver, tv) {
                 let kind = m
                     .kind
-                    .map_children(|t| freshen_above(lim, t, target, cache));
+                    .map_children(|t| freshen_above(solver, lim, t, target, cache));
                 let witnesses = m
                     .witnesses
-                    .map_types(|t| freshen_above(lim, t, target, cache));
+                    .map_types(|t| freshen_above(solver, lim, t, target, cache));
                 crate::ccl::infer_var::record_suspended_membership(
+                    solver,
                     crate::ccl::infer_var::SuspendedMembership {
                         var: Rc::clone(&v),
                         kind,
@@ -1513,21 +1586,21 @@ pub fn freshen_above(
             // And a membership recorded on a reading of the original, which only the original's
             // suspensions reach: the copy reads the same way, and the kind is decided on that.
             let readings: Vec<Rc<InferVar>> = tv
-                .suspensions
-                .borrow()
+                .suspensions(solver)
                 .iter()
                 .map(|(_, held)| Rc::clone(held))
-                .filter(|held| crate::ccl::infer_var::has_suspended_memberships(held))
+                .filter(|held| crate::ccl::infer_var::has_suspended_memberships(solver, held))
                 .collect();
             for held in readings {
-                freshen_above(lim, &Type::Infer(held), target, cache);
+                freshen_above(solver, lim, &Type::Infer(held), target, cache);
             }
-            cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind, lim, target);
-            let watches = tv.watches.borrow().clone();
+            cache.relate_kind_copy(solver, &tv.fun_kind, &v.fun_kind, lim, target);
+            let watches = tv.watches(solver).to_vec();
             freshen_watches(
+                solver,
                 lim,
                 watches,
-                &|original, copy, pos| copy.copy_watch(original, pos, tv.uid, &v),
+                &|solver, original, copy, pos| copy.copy_watch(solver, original, pos, tv.uid, &v),
                 target,
                 cache,
             );
@@ -1543,17 +1616,18 @@ pub fn freshen_above(
             }
             // Registered before the bounds are copied, so a bound that reaches this
             // barrier variable again resolves to the copy.
-            let fresh = BarrierVar::fresh(Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
+            let fresh =
+                BarrierVar::fresh(solver, Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
             cache.barrier_vars.insert(barrier.uid, Rc::clone(&fresh));
 
             // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = barrier.lowers.borrow().clone();
-            let ups = barrier.uppers.borrow().clone();
+            let lows = barrier.lowers(solver).to_vec();
+            let ups = barrier.uppers(solver).to_vec();
             let mut freshen_bound = |b: &Bound| Bound {
                 origin: b.origin,
-                self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
-                ty: freshen_above(lim, &b.ty, target, cache),
-                ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+                self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
+                ty: freshen_above(solver, lim, &b.ty, target, cache),
+                ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
                 rendered: Default::default(),
             };
             let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
@@ -1564,15 +1638,16 @@ pub fn freshen_above(
                     report: u.report.clone(),
                 })
                 .collect();
-            *fresh.lowers.borrow_mut() = new_lows;
-            *fresh.uppers.borrow_mut() = new_ups;
+            *fresh.lowers_mut(solver) = new_lows;
+            *fresh.uppers_mut(solver) = new_ups;
             // A barrier variable is never an operand, so the copy records the watch
             // without `TraitObligation::watch`, which would make it one.
-            let watches = barrier.watches.borrow().clone();
+            let watches = barrier.watches(solver).to_vec();
             freshen_watches(
+                solver,
                 lim,
                 watches,
-                &|_, copy, pos| fresh.watches.borrow_mut().push((Rc::clone(copy), pos)),
+                &|solver, _, copy, pos| fresh.watches_mut(solver).push((Rc::clone(copy), pos)),
                 target,
                 cache,
             );
@@ -1604,17 +1679,18 @@ impl FreshenCache {
     /// the whole component across, since an edge is recorded on both ends.
     pub fn relate_kind_copy(
         &mut self,
+        solver: &mut Solver,
         original: &Rc<FunKindVar>,
         copy: &Rc<FunKindVar>,
         lim: Level,
         target: FreshenLevel,
     ) {
-        let mut copied = |k: &FunKind| match k {
-            FunKind::Var(v) => self
+        let copied = |cache: &mut FreshenCache, solver: &mut Solver, k: &FunKind| match k {
+            FunKind::Var(v) => cache
                 .fun_kind_vars
                 .get(&v.uid)
                 .map(|c| FunKind::Var(Rc::clone(c))),
-            concrete => Some(freshen_fun_kind(concrete, lim, target, self)),
+            concrete => Some(freshen_fun_kind(solver, concrete, lim, target, cache)),
         };
         {
             // **A kind that cannot bind a position has no correspondence to carry.** The
@@ -1624,28 +1700,28 @@ impl FreshenCache {
             // kind is included on its stamp rather than its arity: it is a collection by
             // construction ([`FunKind::fresh_data`]) and its width arrives from the
             // collections that reach it, so it can bind a position without stating one yet.
-            let binds_a_position = original.arity().is_some()
-                || !original.built_over().is_empty()
-                || original.stamped() == crate::ccl::ty::KindPin::Data;
+            let binds_a_position = original.arity(solver).is_some()
+                || !original.built_over(solver).is_empty()
+                || original.stamped(solver) == crate::ccl::ty::KindPin::Data;
             if !binds_a_position {
                 return;
             }
-            if original.stamped() == crate::ccl::ty::KindPin::Data {
-                copy.stamp_data();
+            if original.stamped(solver) == crate::ccl::ty::KindPin::Data {
+                copy.stamp_data(solver);
             }
-            for k in original.lower() {
-                if let Some(c) = copied(&k) {
-                    copy.record(c, true);
+            for k in original.lower(solver) {
+                if let Some(c) = copied(self, solver, &k) {
+                    copy.record(solver, c, true);
                 }
             }
-            for k in original.upper() {
-                if let Some(c) = copied(&k) {
-                    copy.record(c, false);
+            for k in original.upper(solver) {
+                if let Some(c) = copied(self, solver, &k) {
+                    copy.record(solver, c, false);
                 }
             }
-            for src in original.built_over().into_iter().rev() {
-                if let Some(c) = copied(&src) {
-                    copy.contributes_first(c);
+            for src in original.built_over(solver).into_iter().rev() {
+                if let Some(c) = copied(self, solver, &src) {
+                    copy.contributes_first(solver, c);
                 }
             }
             // **Which binder each position is, recorded on the copy**, as
@@ -1654,10 +1730,14 @@ impl FreshenCache {
             // original's binder that arrives later has nothing else to relate it to. A copy
             // relation and not an edge — what the two share is which binder each position
             // is, not what the kind resolves to.
-            copy.copied_from(original);
+            copy.copied_from(solver, original);
         }
     }
 }
+
+/// How [`freshen_watches`] records a copy's watch on the freshened variable: given the original
+/// obligation, its copy and the watched position.
+type AttachWatch<'a> = dyn Fn(&mut Solver, &TraitObligation, &Rc<TraitObligation>, u8) + 'a;
 
 /// Copy the trait obligations in `watches`, a variable's watch list, onto its freshened
 /// counterpart: `attach` records the watch of each copy on it, given the original the copy
@@ -1675,22 +1755,23 @@ impl FreshenCache {
 /// operand, each watching a different copy, and neither ever narrowed by both
 /// operands.
 fn freshen_watches(
+    solver: &mut Solver,
     lim: Level,
     watches: Vec<(Rc<TraitObligation>, u8)>,
-    attach: &dyn Fn(&TraitObligation, &Rc<TraitObligation>, u8),
+    attach: &AttachWatch<'_>,
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) {
     for (obligation, pos) in watches {
         if let Some(existing) = cache.obligations.get(&obligation.uid) {
-            attach(&obligation, existing, pos);
+            attach(solver, &obligation, existing, pos);
             continue;
         }
         // Phase 1: a copy carrying the original's candidate set, with the output
         // position still pointing at the definition's — enough to be reachable.
-        let copy = TraitObligation::new_from(&obligation);
+        let copy = TraitObligation::new_from(solver, &obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
-        attach(&obligation, &copy, pos);
+        attach(solver, &obligation, &copy, pos);
         // A specialization clone turns the binding's own type parameters, the ones
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:
@@ -1702,7 +1783,7 @@ fn freshen_watches(
             // What the reset keeps names enclosing definitions' parameters, which
             // freshen to themselves, and nested definitions' ones, which the clone
             // re-mints through this cache.
-            copy.map_assumptions(|t| freshen_above(lim, t, target, cache));
+            copy.map_assumptions(|t| freshen_above(solver, lim, t, target, cache));
         }
         // Phase 2: now that re-entry finds the copy, freshen every operand, and the
         // output and the input expressions a refinement template builds from. An
@@ -1714,13 +1795,13 @@ fn freshen_watches(
         // the copy watches none of them, and it states no requirement of the
         // definition's.
         for operand in obligation.operands().into_iter().flatten() {
-            freshen_above(lim, &operand, target, cache);
+            freshen_above(solver, lim, &operand, target, cache);
         }
         copy.set_assoc_types(
             obligation
                 .assoc_types()
                 .iter()
-                .map(|ty| freshen_above(lim, ty, target, cache))
+                .map(|ty| freshen_above(solver, lim, ty, target, cache))
                 .collect(),
         );
         // What the copy selects is what its copies of the definition's associated effect types
@@ -1729,7 +1810,12 @@ fn freshen_watches(
             obligation
                 .effects()
                 .into_iter()
-                .map(|(assoc, var)| (assoc, freshen_capability_var(lim, &var, target, cache)))
+                .map(|(assoc, var)| {
+                    (
+                        assoc,
+                        freshen_capability_var(solver, lim, &var, target, cache),
+                    )
+                })
                 .collect(),
         );
         let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation_inputs");
@@ -1738,7 +1824,7 @@ fn freshen_watches(
                 operands
                     .into_iter()
                     .map(|mut expr| {
-                        freshen_expr_type_slots(&mut expr, lim, target, cache);
+                        freshen_expr_type_slots(solver, &mut expr, lim, target, cache);
                         expr
                     })
                     .collect(),
@@ -1762,6 +1848,7 @@ fn freshen_watches(
 /// are not. `distinct_predicate_terms_never_share_a_node_id` in
 /// `src/ccl/panes.rs` guards that distinction.
 fn freshen_refinement_predicate(
+    solver: &mut Solver,
     lim: Level,
     r: &Refinement,
     target: FreshenLevel,
@@ -1774,7 +1861,7 @@ fn freshen_refinement_predicate(
     // from the scheme node it was copied from.
     let _f = crate::ccl::provenance::copy_frame("infer.freshen_predicate");
     let mut pred = (*r.predicate).duplicate();
-    freshen_expr_type_slots(&mut pred, lim, target, cache);
+    freshen_expr_type_slots(solver, &mut pred, lim, target, cache);
     Refinement::born(Rc::new(pred))
 }
 
@@ -1793,20 +1880,21 @@ fn freshen_refinement_predicate(
 /// that never appear in its root type; missing them would leave a clone with a
 /// mix of fresh and original variables and coalesce to an unresolved type.
 pub fn freshen_expr_type_slots(
+    solver: &mut Solver,
     expr: &mut TypedExpr,
     lim: Level,
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) {
-    expr.walk_type_slots_mut(|ty| *ty = freshen_above(lim, ty, target, cache));
+    expr.walk_type_slots_mut(|ty| *ty = freshen_above(solver, lim, ty, target, cache));
     // The node's own capabilities, a variable the definition's emission minted: the clone's are the
     // use's copy of it, as its types are.
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
         if let Repr::Var(v) = slot.repr() {
-            *slot = Capabilities::var(freshen_capability_var(lim, v, target, cache));
+            *slot = Capabilities::var(freshen_capability_var(solver, lim, v, target, cache));
         }
     }
-    expr.walk_children_mut(|c| freshen_expr_type_slots(c, lim, target, cache));
+    expr.walk_children_mut(|c| freshen_expr_type_slots(solver, c, lim, target, cache));
 }
 
 /// Structurally pair a use site's resolved instantiation type against the
@@ -1824,13 +1912,14 @@ pub fn freshen_expr_type_slots(
 /// any stale consumer name surfaces at the post-channelize strict typecheck
 /// rather than silently.
 pub fn seed_chan_dom_pairings(
+    solver: &mut Solver,
     use_ty: &Type,
     def_ty: &Type,
     lim: Level,
     out: &mut HashMap<crate::ccl::Name, crate::ccl::Name>,
 ) {
     let mut seen = std::collections::HashSet::new();
-    seed_pairings_go(use_ty, def_ty, lim, out, &mut seen);
+    seed_pairings_go(solver, use_ty, def_ty, lim, out, &mut seen);
 }
 
 /// A type holding bounds that [`seed_pairings_go`] descends through, once each.
@@ -1841,6 +1930,7 @@ enum BoundHolder {
 }
 
 fn seed_pairings_go(
+    solver: &mut Solver,
     use_ty: &Type,
     def_ty: &Type,
     lim: Level,
@@ -1861,11 +1951,11 @@ fn seed_pairings_go(
     if let Type::Infer(dv) = peel(def_ty) {
         if seen.insert(BoundHolder::InferVar(dv.uid)) {
             let (lows, ups) = {
-                let s = dv.bounds.borrow();
+                let s = dv.bounds(solver);
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             for b in lows.iter().chain(ups.iter()) {
-                seed_pairings_go(use_ty, &b.ty, lim, out, seen);
+                seed_pairings_go(solver, use_ty, &b.ty, lim, out, seen);
             }
         }
         return;
@@ -1873,11 +1963,11 @@ fn seed_pairings_go(
     if let Type::Infer(uv) = peel(use_ty) {
         if seen.insert(BoundHolder::InferVar(uv.uid)) {
             let (lows, ups) = {
-                let s = uv.bounds.borrow();
+                let s = uv.bounds(solver);
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             for b in lows.iter().chain(ups.iter()) {
-                seed_pairings_go(&b.ty, def_ty, lim, out, seen);
+                seed_pairings_go(solver, &b.ty, def_ty, lim, out, seen);
             }
         }
         return;
@@ -1887,18 +1977,18 @@ fn seed_pairings_go(
     // add no position to pair.
     if let Type::BarrierVar(dh) = peel(def_ty) {
         if seen.insert(BoundHolder::BarrierVar(dh.uid)) {
-            let lows = dh.lowers.borrow().clone();
+            let lows = dh.lowers(solver).to_vec();
             for b in &lows {
-                seed_pairings_go(use_ty, &b.ty, lim, out, seen);
+                seed_pairings_go(solver, use_ty, &b.ty, lim, out, seen);
             }
         }
         return;
     }
     if let Type::BarrierVar(uh) = peel(use_ty) {
         if seen.insert(BoundHolder::BarrierVar(uh.uid)) {
-            let lows = uh.lowers.borrow().clone();
+            let lows = uh.lowers(solver).to_vec();
             for b in &lows {
-                seed_pairings_go(&b.ty, def_ty, lim, out, seen);
+                seed_pairings_go(solver, &b.ty, def_ty, lim, out, seen);
             }
         }
         return;
@@ -1925,18 +2015,18 @@ fn seed_pairings_go(
                 ..
             },
         ) => {
-            seed_pairings_go(ud, dd, lim, out, seen);
-            seed_pairings_go(uc, dc, lim, out, seen);
+            seed_pairings_go(solver, ud, dd, lim, out, seen);
+            seed_pairings_go(solver, uc, dc, lim, out, seen);
         }
         (Type::Tuple(us), Type::Tuple(ds)) => {
             for (u, d) in us.iter().zip(ds) {
-                seed_pairings_go(u, d, lim, out, seen);
+                seed_pairings_go(solver, u, d, lim, out, seen);
             }
         }
         (Type::Record(us), Type::Record(ds)) => {
             for ((un, u), (dn, d)) in us.iter().zip(ds) {
                 if un == dn {
-                    seed_pairings_go(u, d, lim, out, seen);
+                    seed_pairings_go(solver, u, d, lim, out, seen);
                 }
             }
         }
@@ -1946,7 +2036,7 @@ fn seed_pairings_go(
         (Type::Variant(us, _), Type::Variant(ds, _)) => {
             for ((uk, u), (dk, d)) in us.iter().zip(ds) {
                 if uk == dk {
-                    seed_pairings_go(u, d, lim, out, seen);
+                    seed_pairings_go(solver, u, d, lim, out, seen);
                 }
             }
         }
@@ -1955,13 +2045,13 @@ fn seed_pairings_go(
         // definition still carries the `History`, or the other way round. Either way the
         // functions pair.
         (Type::History { function: uv, .. }, Type::History { function: dv, .. }) => {
-            seed_pairings_go(uv, dv, lim, out, seen)
+            seed_pairings_go(solver, uv, dv, lim, out, seen)
         }
         (Type::Fun { .. }, Type::History { function: dv, .. }) => {
-            seed_pairings_go(use_ty, dv, lim, out, seen)
+            seed_pairings_go(solver, use_ty, dv, lim, out, seen)
         }
         (Type::History { function: uv, .. }, Type::Fun { .. }) => {
-            seed_pairings_go(uv, def_ty, lim, out, seen)
+            seed_pairings_go(solver, uv, def_ty, lim, out, seen)
         }
         _ => {}
     }
@@ -1972,13 +2062,16 @@ fn seed_pairings_go(
 /// [`crate::ccl::subst::Mapping::Discharge`] and keyed [`crate::ccl::subst::Mapping::Join`]
 /// entries are touched.
 fn freshen_subst_payloads(
+    solver: &mut Solver,
     lim: Level,
     subst: &Subst,
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Subst {
     let mut subst = subst.clone();
-    subst.for_each_discharge_term_mut(&mut |t| freshen_expr_type_slots(t, lim, target, cache));
+    subst.for_each_discharge_term_mut(&mut |t| {
+        freshen_expr_type_slots(solver, t, lim, target, cache)
+    });
     // The witness half comes across too: its binders and the kinds it eliminates are this
     // instantiation's, and a discharge's type is freshened as any other type the bound carries.
     let renames = cache.witnesses.clone();
@@ -1986,7 +2079,7 @@ fn freshen_subst_payloads(
     subst.map_witness_half(
         |w| renames.get(w).copied().unwrap_or(*w),
         |k| kinds.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),
-        |t| freshen_above(lim, t, target, cache),
+        |t| freshen_above(solver, lim, t, target, cache),
     )
 }
 
@@ -1999,23 +2092,24 @@ mod tests {
 
     #[test]
     fn freshening_mints_a_distinct_kind_var_per_instantiation() {
+        let solver = &mut Solver::new();
         // A generalized function's kind must be decided per use. Freshening
         // a Fun whose kind is an unpinned var must mint a *new* FunKindVar (the pin
         // copied), not share the original — otherwise pinning one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
-        let kv = FunKindVar::fresh();
-        kv.stamp_data(); // a def-intrinsic answer to carry onto each instantiation
+        let kv = FunKindVar::fresh(solver);
+        kv.stamp_data(solver); // a def-intrinsic answer to carry onto each instantiation
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
         let f = Type::Fun {
             name: None,
             fun_kind: FunKind::Var(Rc::clone(&kv)),
-            domain: Box::new(Type::Infer(InferVar::fresh(5))),
+            domain: Box::new(Type::Infer(InferVar::fresh(solver, 5))),
             codomain: Box::new(Type::Base(BaseType::Int)),
             capabilities: Capabilities::none(),
         };
         let mut cache = FreshenCache::new();
-        let fresh = freshen_above(0, &f, FreshenLevel::At(1), &mut cache);
+        let fresh = freshen_above(solver, 0, &f, FreshenLevel::At(1), &mut cache);
         let Type::Fun {
             fun_kind: FunKind::Var(kv2),
             ..
@@ -2028,14 +2122,14 @@ mod tests {
             "instantiation must mint a distinct kind var"
         );
         assert_eq!(
-            kv2.resolved(),
+            kv2.resolved_in(solver),
             KindPin::Data,
             "the definition's pin is copied to the fresh var"
         );
         // Pinning the fresh instantiation must not reach back to the original.
-        kv2.record(FunKind::Compute, true);
+        kv2.record(solver, FunKind::Compute, true);
         assert_eq!(
-            kv.resolved(),
+            kv.resolved_in(solver),
             KindPin::Data,
             "the original var stays decoupled from this instantiation"
         );
@@ -2045,8 +2139,9 @@ mod tests {
     /// a capability variable is still copied: each use collects its own capabilities.
     #[test]
     fn a_capability_variable_beside_a_shared_funkind_variable_is_copied() {
-        let kind = FunKindVar::fresh();
-        kind.place_at(0);
+        let solver = &mut Solver::new();
+        let kind = FunKindVar::fresh(solver);
+        kind.place_at(solver, 0);
         let quantified = CapabilityVar::fresh(1);
         let ty = Type::Fun {
             name: None,
@@ -2059,7 +2154,7 @@ mod tests {
             fun_kind: FunKind::Var(copied_kind),
             capabilities,
             ..
-        } = PolyScheme::poly(0, ty).instantiate(0)
+        } = PolyScheme::poly(0, ty).instantiate(solver, 0)
         else {
             panic!("expected a function with a funkind variable");
         };
@@ -2092,7 +2187,8 @@ mod tests {
     /// what the real shape has, and what this pins.
     #[test]
     fn a_variable_reachable_only_through_a_predicate_is_freshened() {
-        let quantified = InferVar::fresh(5);
+        let solver = &mut Solver::new();
+        let quantified = InferVar::fresh(solver, 5);
         // A predicate term whose *type slot* holds the quantified variable.
         let predicate = Rc::new(
             TypedExpr::lit(crate::ccl::Lit::Bool(true))
@@ -2110,13 +2206,13 @@ mod tests {
             capabilities: Capabilities::none(),
         };
         assert_eq!(
-            type_level(&ty),
+            type_level(solver, &ty),
             0,
             "precondition: `type_level` cannot see the predicate's variable"
         );
 
         let mut cache = FreshenCache::new();
-        let fresh = freshen_above(0, &ty, FreshenLevel::At(1), &mut cache);
+        let fresh = freshen_above(solver, 0, &ty, FreshenLevel::At(1), &mut cache);
 
         let Type::Fun { domain, .. } = &fresh else {
             panic!("expected a function type");
@@ -2143,7 +2239,8 @@ mod copy_audit_tests {
 
     #[test]
     fn the_copy_audit_enters_every_quoted_type() {
-        let variable = super::super::fresh_var(1);
+        let solver = &mut Solver::new();
+        let variable = super::super::fresh_var(solver, 1);
         let quoted = Rc::new(Expr::var("condition").with_ty(variable));
         let roots = [
             Type::refined_one(
@@ -2160,7 +2257,7 @@ mod copy_audit_tests {
         for root in roots {
             assert!(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    assert_copied_apart(0, &[root], &FreshenCache::new(), before);
+                    assert_copied_apart(solver, 0, &[root], &FreshenCache::new(), before);
                 }))
                 .is_err(),
                 "a quoted variable shared above the cutoff must be rejected"
@@ -2170,29 +2267,30 @@ mod copy_audit_tests {
 
     #[test]
     fn settled_sum_kinds_on_copied_edges_freshen_their_candidates() {
-        let candidate = super::super::fresh_var(1);
+        let solver = &mut Solver::new();
+        let candidate = super::super::fresh_var(solver, 1);
         let sum = Type::sum_over(
             crate::ccl::TypeKind::Enumerated(vec![candidate.clone()]),
             None,
             Type::Base(BaseType::Int),
         );
-        let kind = FunKind::fresh_var();
+        let kind = FunKind::fresh_var(solver);
         let FunKind::Var(k) = &kind else {
             unreachable!()
         };
-        k.record_under(sum.fun_kind().unwrap().clone(), true, Subst::id());
+        k.record_under(solver, sum.fun_kind().unwrap().clone(), true, Subst::id());
         let ty = Type::fun_over(
             Name::fresh("x"),
             Type::Base(BaseType::Int),
             Type::Base(BaseType::Int),
             kind,
         );
-        let variable = InferVar::fresh(1);
+        let variable = InferVar::fresh(solver, 1);
         variable
             .fun_kind
-            .record_under(sum.fun_kind().unwrap().clone(), true, Subst::id());
+            .record_under(solver, sum.fun_kind().unwrap().clone(), true, Subst::id());
         for source in [ty, Type::Infer(variable)] {
-            let instance = PolyScheme::poly(0, source).instantiate(0);
+            let instance = PolyScheme::poly(0, source).instantiate(solver, 0);
             let copied = match &instance {
                 Type::Infer(v) => Rc::clone(&v.fun_kind),
                 ty => match ty.fun_kind().unwrap() {
@@ -2201,7 +2299,7 @@ mod copy_audit_tests {
                 },
             };
             let edge = copied
-                .lower_edges()
+                .lower_edges(solver)
                 .into_iter()
                 .find_map(|(kind, _)| match kind {
                     FunKind::Data(Some(witnesses)) => Some(witnesses),
@@ -2217,11 +2315,12 @@ mod copy_audit_tests {
 
     #[test]
     fn copying_a_function_places_only_its_fresh_variables_under_the_copy() {
-        let captured = InferVar::fresh(0);
-        let quantified = InferVar::fresh(1);
+        let solver = &mut Solver::new();
+        let captured = InferVar::fresh(solver, 0);
+        let quantified = InferVar::fresh(solver, 1);
         let ty = Type::Fun {
             name: None,
-            fun_kind: FunKind::fresh_var(),
+            fun_kind: FunKind::fresh_var(solver),
             domain: Box::new(Type::Tuple(vec![
                 Type::Infer(Rc::clone(&captured)),
                 Type::Infer(quantified),
@@ -2229,7 +2328,7 @@ mod copy_audit_tests {
             codomain: Box::new(Type::Base(BaseType::Int)),
             capabilities: Capabilities::none(),
         };
-        let instance = PolyScheme::poly(0, ty).instantiate(0);
+        let instance = PolyScheme::poly(0, ty).instantiate(solver, 0);
         let Type::Fun {
             fun_kind: FunKind::Var(kind),
             domain,
@@ -2244,11 +2343,11 @@ mod copy_audit_tests {
         let Type::Infer(fresh) = &parts[1] else {
             unreachable!()
         };
-        assert!(captured.witness_scope_kinds().is_empty());
+        assert!(captured.witness_scope_kinds(solver).is_empty());
         assert_eq!(parts[0], Type::Infer(captured));
         assert!(
             fresh
-                .witness_scope_kinds()
+                .witness_scope_kinds(solver)
                 .iter()
                 .any(|k| k.uid == kind.uid)
         );
@@ -2256,12 +2355,13 @@ mod copy_audit_tests {
 
     #[test]
     fn a_funkind_is_copied_even_when_its_function_has_no_type_variables() {
-        let kind = FunKind::fresh_var();
+        let solver = &mut Solver::new();
+        let kind = FunKind::fresh_var(solver);
         let int = Type::Base(BaseType::Int);
         let ty = Type::fun_over(Name::fresh("x"), int.clone(), int, kind.clone());
         let scheme = PolyScheme::poly(0, ty);
-        let a = scheme.instantiate(0);
-        let b = scheme.instantiate(0);
+        let a = scheme.instantiate(solver, 0);
+        let b = scheme.instantiate(solver, 0);
         let kind_id = |t: &Type| match t.fun_kind().unwrap() {
             FunKind::Var(k) => k.uid,
             _ => panic!("an unpinned funkind remains a variable"),

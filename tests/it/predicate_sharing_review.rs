@@ -5,6 +5,7 @@
 //! source-level fixture, so a fix can be verified without reasoning about which
 //! program shape happens to produce the sharing.
 
+use crate::ccl::infer::solver::Solver;
 use cambra::ccl::Occurrence;
 use cambra::ccl::ccl_utils::{
     PredMemo, distinct_predicate_rcs, is_free, walk_refined_predicates_mut,
@@ -60,6 +61,7 @@ fn rewrite_does_not_leak_an_outer_rebuild_into_a_shadowing_scope() {
 
     // [k ↦ 5, j ↦ 6]: `j` keeps the body reachable, `k` is shadowed by the lambda.
     let s = Subst::then(
+        &mut Solver::none(),
         &Subst::discharge("k", int(5)),
         &Subst::discharge("j", int(6)),
     );
@@ -97,6 +99,7 @@ fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
         .with_ty(Type::fun(refined(&outer), Type::Hole));
 
     let s = Subst::then(
+        &mut Solver::none(),
         &Subst::discharge("k", int(5)),
         &Subst::discharge("j", int(6)),
     );

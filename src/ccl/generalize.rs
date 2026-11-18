@@ -9,6 +9,7 @@
 //! also reads a binder of the type's own is a family over that binder, applied to it:
 //! `∀ (D, D1(_)). ((k : D) ⤇ (D1(k) ⤇ Int)) ⇒ …`.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -186,7 +187,8 @@ pub(crate) fn opened_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
         }
         // A family's body reads its binders by their names.
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
-            let opened = crate::ccl::subst::opened_family_body(binders, body, ids);
+            let opened =
+                crate::ccl::subst::opened_family_body(&mut Solver::none(), binders, body, ids);
             Type::Family {
                 binders: binders
                     .iter()
@@ -199,6 +201,7 @@ pub(crate) fn opened_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
         // codomain's to its function's binder. A tuple naming each component has them.
         Type::DepTuple(cs) if cs.iter().all(|(n, _)| n.is_some()) => {
             let opened = crate::ccl::subst::open_tuple_components(
+                &mut Solver::none(),
                 cs,
                 |j, _| {
                     crate::ccl::subst::Mapping::Rename(
@@ -236,6 +239,7 @@ pub(crate) fn closed_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
             codomain,
             ..
         } => Type::pi_kinded_with_ids(
+            &mut Solver::none(),
             b.clone(),
             closed_deep(domain, ids),
             closed_deep(codomain, ids),
@@ -244,6 +248,7 @@ pub(crate) fn closed_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
         ),
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
             Type::family_with_ids(
+                &mut Solver::none(),
                 binders
                     .iter()
                     .map(|(n, t)| (n.clone().expect("matched named"), closed_deep(t, ids)))
@@ -254,6 +259,7 @@ pub(crate) fn closed_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
         }
         // Closed over the components' names, and the plain tuple where none reads another.
         Type::DepTuple(cs) => Type::dep_tuple_with_ids(
+            &mut Solver::none(),
             cs.iter()
                 .map(|(n, t)| (n.clone(), closed_deep(t, ids)))
                 .collect(),
@@ -375,6 +381,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
         // read none is the plain tuple still ([`Type::closed_dep_tuple`]).
         (Type::Tuple(subs), Type::DepTuple(sups)) if subs.len() == sups.len() => {
             Type::closed_dep_tuple(
+                &mut Solver::none(),
                 subs.iter()
                     .zip(sups)
                     .map(|(a, (name, b))| (name.clone(), align_sub(a, b)))
@@ -1310,11 +1317,12 @@ fn quantified(
         // application's result reads the part at the argument, `__args.0`, where the function
         // it applies reads it at its own binder.
         for args in index_instances(&body, &indices, &own) {
-            let instance = crate::ccl::subst::discharge_binders(&indices, &group, &args);
+            let instance =
+                crate::ccl::subst::discharge_binders(&mut Solver::none(), &indices, &group, &args);
             if instance == group {
                 continue;
             }
-            let at = crate::ccl::subst::discharge_binders(&indices, &d, &args);
+            let at = crate::ccl::subst::discharge_binders(&mut Solver::none(), &indices, &d, &args);
             body = abstract_deep(&body, &instance, &at, out_of_scope);
         }
         params.push(crate::ccl::ty::PolyParam {

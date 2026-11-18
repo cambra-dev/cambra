@@ -277,12 +277,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
     }
     let stmts = parse_module(code);
     let mut expr = lower_uniquified(&stmts, &mut lctx);
-    let out = infer(&mut expr, &mut ictx);
-    #[cfg(debug_assertions)]
-    if std::env::var_os("DUMP_KINDS").is_some() {
-        eprintln!("=== kind graph ===\n{}", cambra::ccl::dump_kind_vars());
-    }
-    out.expect("inference failed")
+    infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
 /// Like [`infer_program`] but expects inference to fail and returns all errors.

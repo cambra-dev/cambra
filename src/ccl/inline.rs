@@ -74,6 +74,7 @@
 //! [`Feed`]: crate::ccl::TypedExprNode::Feed
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::{
     BindingTransparency, Expr, FunKind, Lit, Name, ProjKey, Refinement, Type, TypedBinding,
     TypedExprNode,
@@ -1008,7 +1009,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         } => {
             let scrutinee = scrutinee.map(|s| Box::new(inline_impl(*s, scope, channels)));
             let facts = match scrutinee.as_deref() {
-                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                Some(s) => crate::ccl::nominal::typed_case_facts(&mut Solver::none(), s, &branches),
                 None => std::iter::repeat_with(Vec::new)
                     .take(branches.len())
                     .collect(),
@@ -1373,7 +1374,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
 /// `e`'s capabilities answer: a lambda raises where it is applied, so its body's `Raise` is not
 /// the lambda's, and a call holds what its function causes.
 fn may_raise(e: &Expr) -> bool {
-    e.capabilities.set().may_raise()
+    e.capabilities.set().may_raise(&mut Solver::none())
 }
 
 /// Whether moving `definiens`, which causes something, to its use in `body` could carry its
@@ -1671,7 +1672,7 @@ fn inline_and_beta_reduce(
             let scrutinee =
                 scrutinee.map(|s| Box::new(inline_and_beta_reduce(*s, name, lambda, scope, memo)));
             let facts = match scrutinee.as_deref() {
-                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                Some(s) => crate::ccl::nominal::typed_case_facts(&mut Solver::none(), s, &branches),
                 None => std::iter::repeat_with(Vec::new)
                     .take(branches.len())
                     .collect(),
@@ -2079,7 +2080,7 @@ fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeE
     // The base the query runs over is the argument's value, so the `Mut` stamp comes
     // off here for the reason it does above.
     let base = arg_ty.mut_value_type().unwrap_or(arg_ty).peel_refinements();
-    match smt_sub(base, &supplied, &demanded, scope) {
+    match smt_sub(&mut Solver::none(), base, &supplied, &demanded, scope) {
         Ok(entailed) => entailed,
         // A predicate the encoder cannot read leaves the entailment undecided, which
         // is the structural answer: the demand is not discharged, and the caller's

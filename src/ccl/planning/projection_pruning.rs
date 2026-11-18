@@ -34,6 +34,7 @@
 
 use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{apply_primitive, is_builtin};
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::lambda_elim::id;
 use crate::ccl::planning::{replace_constant_domain_type, set_domain_ty};
 use crate::ccl::provenance;
@@ -145,7 +146,7 @@ fn prune(source: &mut Expr, head: &mut Expr) -> Option<Plan> {
     }
     let plan = Plan::serving(&reads)?;
     let domain = source.ty.domain()?;
-    let ty = Type::fun_like_or_hole(&source.ty, &domain, &plan.value);
+    let ty = Type::fun_like_or_hole(&mut Solver::none(), &source.ty, &domain, &plan.value);
     if ty.is_unresolved() {
         return None;
     }

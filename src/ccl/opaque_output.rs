@@ -221,7 +221,7 @@ fn wrap(body: Expr, opaque: Rc<[Name]>) -> Expr {
     let output = Name::output();
     // Minted without bounds: normalizing the annotation replaces it with a fresh
     // barrier variable, which gathers the bounds during inference.
-    let barrier = Type::BarrierVar(BarrierVar::fresh(opaque, Vec::new(), Vec::new()));
+    let barrier = Type::BarrierVar(BarrierVar::unowned(opaque));
     let binding = TypedBinding::new_annotated(
         output.clone(),
         Occurrence::mint(),

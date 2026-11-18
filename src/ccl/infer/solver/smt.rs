@@ -55,6 +55,7 @@
 //! mid-query, an `unknown`. An `Err` is not a mismatch: nothing decided the
 //! entailment.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::{HashMap, HashSet};
 use std::io;
 
@@ -206,7 +207,7 @@ pub trait ScopeEnv {
     /// Owned, because during emission the slot a binder holds is an inference
     /// variable and answering means resolving it — there is no settled `Type` in
     /// the scope to hand out a borrow of.
-    fn binder_type(&self, name: &Name) -> Option<Type>;
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type>;
     /// What the scope knows beyond its binders' types: `Bool` terms over the names it binds,
     /// each of which holds wherever the query runs. A `match` arm's facts about the value it
     /// matched are the case (`src/ccl/design/type-inference.md`, "Arm facts").
@@ -256,12 +257,12 @@ struct Frame {
 
 impl Frame {
     /// The type a query assumes for the binder.
-    fn assumed(&self) -> &Type {
+    fn assumed(&self, solver: &mut Solver) -> &Type {
         match &self.definition {
             None => &self.ty,
             Some(definition) => self
                 .assumed
-                .get_or_init(|| defined_as(self.ty.clone(), definition)),
+                .get_or_init(|| defined_as(solver, self.ty.clone(), definition)),
         }
     }
 }
@@ -349,12 +350,12 @@ impl BinderScope {
 }
 
 impl ScopeEnv for BinderScope {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
         self.frames
             .iter()
             .rev()
             .find(|f| &f.name == name)
-            .map(Frame::assumed)
+            .map(|f| f.assumed(solver))
             .or_else(|| self.opaque_binders.get(name))
             .cloned()
     }
@@ -374,7 +375,7 @@ impl ScopeEnv for BinderScope {
 pub struct NoScope;
 
 impl ScopeEnv for NoScope {
-    fn binder_type(&self, _name: &Name) -> Option<Type> {
+    fn binder_type(&self, _solver: &mut Solver, _name: &Name) -> Option<Type> {
         None
     }
     fn is_skip_smt(&self) -> bool {
@@ -396,11 +397,11 @@ impl ScopeEnv for NoScope {
 /// back, so a check after that pass assumes what inference assumed.
 ///
 /// [`normal_form`]: crate::ccl::ccl_utils::normal_form
-pub fn defined_as(ty: Type, definition: &TypedExpr) -> Type {
+pub fn defined_as(solver: &mut Solver, ty: Type, definition: &TypedExpr) -> Type {
     let definition = if in_term_fragment(definition) {
         definition.clone_preserving_ids()
     } else {
-        let normal = crate::ccl::ccl_utils::normal_form(definition);
+        let normal = crate::ccl::ccl_utils::normal_form_in(solver, definition);
         if !in_term_fragment(&normal) {
             return ty;
         }
@@ -612,7 +613,7 @@ pub(crate) fn equal_to(term: &TypedExpr) -> Refinement {
 ///
 /// A constructor's payload is read at the declaration's own payload type, refinements
 /// included: what [`Encode::assume_along`] assumes of it, under the constructor's tag.
-fn field_type(ty: &Type, key: &Key) -> Option<Type> {
+fn field_type(solver: &mut Solver, ty: &Type, key: &Key) -> Option<Type> {
     match (ty.peel_refinements(), key) {
         (Type::Record(fields), Key::Proj(ProjKey::Field(name))) => fields
             .iter()
@@ -621,7 +622,7 @@ fn field_type(ty: &Type, key: &Key) -> Option<Type> {
         (Type::Tuple(elems), Key::Proj(ProjKey::Index(i))) => elems.get(*i).cloned(),
         (Type::Nominal(decl, _), Key::Tag) => Some(Type::UIntRange(decl.ctor_count() as u64)),
         (Type::Nominal(decl, args), Key::Payload(ctor)) => {
-            Some(decl.instantiate(&decl.ctor(ctor)?.destructured(), args))
+            Some(decl.instantiate(solver, &decl.ctor(ctor)?.destructured(), args))
         }
         _ => None,
     }
@@ -660,12 +661,13 @@ fn ctor_position(ty: &Type, ctor: &str) -> Option<usize> {
 ///
 /// [`REFINEMENT_BINDER`]: crate::ccl::REFINEMENT_BINDER
 pub fn smt_sub(
+    solver: &mut Solver,
     base: &Type,
     lhs: &[Refinement],
     rhs: &[Refinement],
     scope: &dyn ScopeEnv,
 ) -> Result<bool, SmtError> {
-    smt_sub_guarded(base, lhs, &[], rhs, scope)
+    smt_sub_guarded(solver, base, lhs, &[], rhs, scope)
 }
 
 /// [`smt_sub`] for a guarded bound's check (`src/ccl/design/type-inference.md`, "A variable
@@ -674,6 +676,7 @@ pub fn smt_sub(
 /// scope assumption is: `{Int | __elem == 1}` under the guard `__elem in kvs` is below
 /// `{Int | __elem > 0}` by its own predicate, and the membership has no encoding.
 pub fn smt_sub_guarded(
+    solver: &mut Solver,
     base: &Type,
     lhs: &[Refinement],
     guard: &[Refinement],
@@ -683,7 +686,7 @@ pub fn smt_sub_guarded(
     if rhs.is_empty() {
         return Ok(true);
     }
-    with_solver(|ctx| check(ctx, base, None, lhs, guard, rhs, scope))
+    with_solver(|ctx| check(solver, ctx, base, None, lhs, guard, rhs, scope))
 }
 
 /// Whether every value of `base` satisfying all of `lhs` is a value of `target` satisfying
@@ -695,13 +698,14 @@ pub fn smt_sub_guarded(
 /// is an [`SmtError::Encoding`]. `{UInt | 𝑝} <: 0..𝑛` is the query this answers: the
 /// subject is a `UInt` assumed to satisfy `𝑝` and demanded to be below `𝑛`.
 pub fn smt_sub_at(
+    solver: &mut Solver,
     base: &Type,
     target: &Type,
     lhs: &[Refinement],
     rhs: &[Refinement],
     scope: &dyn ScopeEnv,
 ) -> Result<bool, SmtError> {
-    with_solver(|ctx| check(ctx, base, Some(target), lhs, &[], rhs, scope))
+    with_solver(|ctx| check(solver, ctx, base, Some(target), lhs, &[], rhs, scope))
 }
 
 /// Whether `scope`'s binders and facts are contradictory: whether `Γ` entails `false`.
@@ -709,13 +713,14 @@ pub fn smt_sub_at(
 /// `Ok(true)` is the solver's proof that no value reaches a position under `scope`. What `Γ`
 /// holds is demand-driven, as in every query: the facts are translated first, and the types of
 /// the names they read join `Γ` as they are read.
-pub fn refuted(scope: &dyn ScopeEnv) -> Result<bool, SmtError> {
+pub fn refuted(solver: &mut Solver, scope: &dyn ScopeEnv) -> Result<bool, SmtError> {
     let goal = TypedExpr::throwaway(TypedExprNode::Lit(Lit::Bool(false)))
         .with_ty(Type::Base(BaseType::Bool));
     let goal = Refinement::born(std::rc::Rc::new(goal));
     let base = Type::Base(BaseType::Bool);
     with_solver(|ctx| {
         check(
+            solver,
             ctx,
             &base,
             None,
@@ -734,8 +739,8 @@ pub struct WithFacts<'a> {
 }
 
 impl ScopeEnv for WithFacts<'_> {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
-        self.inner.binder_type(name)
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
+        self.inner.binder_type(solver, name)
     }
     fn facts(&self) -> Vec<TypedExpr> {
         let mut facts = self.inner.facts();
@@ -749,7 +754,12 @@ impl ScopeEnv for WithFacts<'_> {
 
 /// One query: build it, then run it inside a `push`/`pop` scope so the constants
 /// it declares and the formula it asserts leave no trace for the next query.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's solver, the Z3 context, and the query's base, target and three refinement lists"
+)]
 fn check(
+    solver: &mut Solver,
     ctx: &mut Context,
     base: &Type,
     target: Option<&Type>,
@@ -761,7 +771,7 @@ fn check(
     // Encoding is pure and can bail; bailing before the `push` leaves no scope to
     // unwind.
     let mut enc = Encode::new(ctx, scope, base);
-    let formula = enc.query(target, lhs, assumed, rhs)?;
+    let formula = enc.query(solver, target, lhs, assumed, rhs)?;
     let decls = enc.decls;
 
     ctx.push().map_err(exchange_failure)?;
@@ -906,19 +916,23 @@ impl<'a> Encode<'a> {
     /// `𝑡` is the subject's membership in `target` ([`smt_sub_at`]), or `true` without one.
     fn query(
         &mut self,
+        solver: &mut Solver,
         target: Option<&Type>,
         lhs: &[Refinement],
         assumed: &[Refinement],
         rhs: &[Refinement],
     ) -> Result<SExpr, SmtError> {
-        self.declare_subject(lhs, rhs)?;
-        let mut conjuncts: Vec<SExpr> = lhs.iter().map(|r| self.claim(&r.predicate)).collect();
-        conjuncts.extend(self.antecedent(assumed));
+        self.declare_subject(solver, lhs, rhs)?;
+        let mut conjuncts: Vec<SExpr> = lhs
+            .iter()
+            .map(|r| self.claim(solver, &r.predicate))
+            .collect();
+        conjuncts.extend(self.antecedent(solver, assumed));
         for fact in self.scope.facts() {
-            let fact = self.claim(&fact);
+            let fact = self.claim(solver, &fact);
             self.assumptions.push(fact);
         }
-        let mut goals = self.conjuncts(rhs)?;
+        let mut goals = self.conjuncts(solver, rhs)?;
         if let Some(target) = target {
             goals.extend(self.target_membership(target, lhs, rhs)?);
         }
@@ -972,10 +986,15 @@ impl<'a> Encode<'a> {
     /// its scalars by projection, so each such path is declared where it is read
     /// ([`Encode::leaf`]). A base that is neither defeats every predicate about it,
     /// so the first body reports it rather than each one failing on its own mention.
-    fn declare_subject(&mut self, lhs: &[Refinement], rhs: &[Refinement]) -> Result<(), SmtError> {
+    fn declare_subject(
+        &mut self,
+        solver: &mut Solver,
+        lhs: &[Refinement],
+        rhs: &[Refinement],
+    ) -> Result<(), SmtError> {
         match self.sort(self.base) {
             Some(sort) => {
-                self.declare(Path::subject(), sort);
+                self.declare(solver, Path::subject(), sort);
                 Ok(())
             }
             None if matches!(
@@ -1004,7 +1023,7 @@ impl<'a> Encode<'a> {
     /// fact that `x.b` is `3` can be written on `x` (`{{b: Int} | __elem.b == 3}`)
     /// as much as on its `b` field (`{b: Int@3}`). Visiting every prefix and not
     /// the leaf alone is what makes those two spellings one assumption.
-    fn assume_along(&mut self, path: &Path) {
+    fn assume_along(&mut self, solver: &mut Solver, path: &Path) {
         for len in 0..=path.keys.len() {
             let prefix = Path {
                 root: path.root.clone(),
@@ -1015,16 +1034,16 @@ impl<'a> Encode<'a> {
             if !self.assumed.insert(prefix.clone()) {
                 continue;
             }
-            let Some(ty) = self.path_type(&prefix) else {
+            let Some(ty) = self.path_type(solver, &prefix) else {
                 continue;
             };
             // A prefix whose guard has no encoding assumes nothing: its refinements hold only
             // under that guard, and assuming them bare is unsound ("Nominal values").
-            let Ok(guard) = self.payload_guard(&prefix) else {
+            let Ok(guard) = self.payload_guard(solver, &prefix) else {
                 continue;
             };
             let start = self.assumptions.len();
-            self.assume_refinements(&prefix, &ty);
+            self.assume_refinements(solver, &prefix, &ty);
             if let Some(guard) = guard {
                 for assumption in &mut self.assumptions[start..] {
                     *assumption = self.ctx.imp(guard, *assumption);
@@ -1037,7 +1056,7 @@ impl<'a> Encode<'a> {
     /// constructor payload `path` reads through, that its value's tag is that constructor's
     /// ("Nominal values"). `Ok(None)` for a path that reads through no payload. `Err` when a
     /// payload's value has no constructor tag to state the condition on.
-    fn payload_guard(&mut self, path: &Path) -> Result<Option<SExpr>, String> {
+    fn payload_guard(&mut self, solver: &mut Solver, path: &Path) -> Result<Option<SExpr>, String> {
         let mut guards = Vec::new();
         for (i, key) in path.keys.iter().enumerate() {
             let Key::Payload(ctor) = key else {
@@ -1048,22 +1067,22 @@ impl<'a> Encode<'a> {
                 keys: path.keys[..i].to_vec(),
             };
             let position = self
-                .path_type(&value)
+                .path_type(solver, &value)
                 .and_then(|ty| ctor_position(&ty, ctor))
                 .ok_or_else(|| format!("{value} has no constructor `{ctor}`"))?;
-            let tag = self.tag(value)?;
+            let tag = self.tag(solver, value)?;
             guards.push(self.ctx.eq(tag, self.ctx.numeral(position)));
         }
         Ok((!guards.is_empty()).then(|| self.ctx.and_many(guards)))
     }
 
     /// The constant for the constructor tag of the nominal value at `value`.
-    fn tag(&mut self, value: Path) -> Result<SExpr, String> {
+    fn tag(&mut self, solver: &mut Solver, value: Path) -> Result<SExpr, String> {
         let tag = value.then(Key::Tag);
         let ty = self
-            .path_type(&tag)
+            .path_type(solver, &tag)
             .ok_or_else(|| format!("{value} is not a value of a nominal type"))?;
-        self.leaf_at(tag, &ty)
+        self.leaf_at(solver, tag, &ty)
     }
 
     /// Record what the type at `path` claims about it: each refinement that type
@@ -1078,10 +1097,10 @@ impl<'a> Encode<'a> {
     /// A body outside the fragment is dropped rather than reported. An assumption
     /// left out only weakens the antecedent, and a query the encoding can
     /// otherwise translate must not fail because of what else is in scope.
-    fn assume_refinements(&mut self, path: &Path, ty: &Type) {
+    fn assume_refinements(&mut self, solver: &mut Solver, path: &Path, ty: &Type) {
         let enclosing = self.subject.replace(path.clone());
         for r in ty.refinements() {
-            let e = self.claim(&r.predicate);
+            let e = self.claim(solver, &r.predicate);
             self.assumptions.push(e);
         }
         self.subject = enclosing;
@@ -1090,23 +1109,23 @@ impl<'a> Encode<'a> {
     /// A `Bool` term that the query assumes, with each atom outside the fragment a fresh
     /// constant ("Antecedents outside the fragment"). The logical connectives are read
     /// through, so an atom the encoding has no rule for costs only itself.
-    fn claim(&mut self, e: &TypedExpr) -> SExpr {
+    fn claim(&mut self, solver: &mut Solver, e: &TypedExpr) -> SExpr {
         match &e.node {
             TypedExprNode::UnaryOp(op, operand) if op.unrefined() == UnaryOpKind::Not => {
-                let operand = self.claim(operand);
+                let operand = self.claim(solver, operand);
                 return self.ctx.not(operand);
             }
             TypedExprNode::BinOp { left, op, right }
                 if matches!(op.unrefined(), BinOpKind::BoolLogic(_)) =>
             {
-                let (l, r) = (self.claim(left), self.claim(right));
+                let (l, r) = (self.claim(solver, left), self.claim(solver, right));
                 return self
                     .binop(*op, left, right, l, r)
                     .expect("a logical connective has an encoding");
             }
             _ => {}
         }
-        match self.proposition(e) {
+        match self.proposition(solver, e) {
             Ok(encoded) => encoded,
             Err(message) => {
                 log::debug!("abstracting an antecedent atom: {message}");
@@ -1131,12 +1150,12 @@ impl<'a> Encode<'a> {
     /// A body that fails can do so after it declared a leaf or gathered an assumption, so the
     /// encoder's state is put back as it was before that body: nothing a dropped body met
     /// reaches the query.
-    fn antecedent(&mut self, refs: &[Refinement]) -> Vec<SExpr> {
+    fn antecedent(&mut self, solver: &mut Solver, refs: &[Refinement]) -> Vec<SExpr> {
         refs.iter()
             .filter_map(|r| {
                 let (vars, assumed) = (self.vars.clone(), self.assumed.clone());
                 let (decls, assumptions) = (self.decls.len(), self.assumptions.len());
-                let encoded = self.proposition(&r.predicate);
+                let encoded = self.proposition(solver, &r.predicate);
                 if encoded.is_err() {
                     self.vars = vars;
                     self.assumed = assumed;
@@ -1148,10 +1167,14 @@ impl<'a> Encode<'a> {
             .collect()
     }
 
-    fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<SExpr>, SmtError> {
+    fn conjuncts(
+        &mut self,
+        solver: &mut Solver,
+        refs: &[Refinement],
+    ) -> Result<Vec<SExpr>, SmtError> {
         refs.iter()
             .map(|r| {
-                self.proposition(&r.predicate)
+                self.proposition(solver, &r.predicate)
                     .map_err(|message| SmtError::Encoding {
                         body: r.clone(),
                         message,
@@ -1180,8 +1203,8 @@ impl<'a> Encode<'a> {
 
     /// A predicate term as an s-expression, or a description of the part with no
     /// encoding. The caller pairs that description with the body it came from.
-    fn expr(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
-        if let Some(equal) = self.structural_equality(e) {
+    fn expr(&mut self, solver: &mut Solver, e: &TypedExpr) -> Result<SExpr, String> {
+        if let Some(equal) = self.structural_equality(solver, e) {
             return equal;
         }
         match &e.node {
@@ -1202,7 +1225,7 @@ impl<'a> Encode<'a> {
                 let [int, uint] = operands.as_slice() else {
                     return Err(unencodable(e));
                 };
-                let (int, uint) = (self.expr(int)?, self.expr(uint)?);
+                let (int, uint) = (self.expr(solver, int)?, self.expr(solver, uint)?);
                 Ok(self.ctx.eq(int, uint))
             }
             // Which constructor built a nominal value: its tag ("Nominal values").
@@ -1222,7 +1245,7 @@ impl<'a> Encode<'a> {
                 }
                 let value = Path::of(argument).ok_or_else(|| unencodable(e))?;
                 let value = self.reroot(value);
-                let tag = self.tag(value)?;
+                let tag = self.tag(solver, value)?;
                 Ok(self.ctx.eq(tag, self.ctx.numeral(c.index())))
             }
             // A name, or a read through one: a field, a position or a constructor's payload.
@@ -1230,11 +1253,11 @@ impl<'a> Encode<'a> {
             // that leaf. An `Apply` that is not such a chain addresses no leaf and falls
             // through.
             TypedExprNode::Var(_) | TypedExprNode::Apply { .. } => match Path::of(e) {
-                Some(path) => self.leaf(path, &e.ty),
+                Some(path) => self.leaf(solver, path, &e.ty),
                 None => Err(unencodable(e)),
             },
             TypedExprNode::UnaryOp(op, inner) => {
-                let operand = self.expr(inner)?;
+                let operand = self.expr(solver, inner)?;
                 self.settled_operand(e, inner, operand)?;
                 // `^not` computes what `not` computes, as a binary `^` sibling does.
                 Ok(match op.unrefined() {
@@ -1244,7 +1267,7 @@ impl<'a> Encode<'a> {
                 })
             }
             TypedExprNode::BinOp { left, op, right } => {
-                let (l, r) = (self.expr(left)?, self.expr(right)?);
+                let (l, r) = (self.expr(solver, left)?, self.expr(solver, right)?);
                 // Equality is the one operation an uninterpreted sort has; the cross-sort
                 // check below rejects comparing it with any other sort.
                 if !matches!(
@@ -1272,7 +1295,11 @@ impl<'a> Encode<'a> {
 
     /// `𝑙 == 𝑟` or `𝑙 != 𝑟` for two paths to a product or a nominal value, which have no
     /// sort: equal reads at every leaf ([`Encode::paths_equal`]). `None` for any other term.
-    fn structural_equality(&mut self, e: &TypedExpr) -> Option<Result<SExpr, String>> {
+    fn structural_equality(
+        &mut self,
+        solver: &mut Solver,
+        e: &TypedExpr,
+    ) -> Option<Result<SExpr, String>> {
         let TypedExprNode::BinOp { left, op, right } = &e.node else {
             return None;
         };
@@ -1283,25 +1310,32 @@ impl<'a> Encode<'a> {
         };
         let (l, r) = (Path::of(left)?, Path::of(right)?);
         let (l, r) = (self.reroot(l), self.reroot(r));
-        let ty = self.path_type(&l).or_else(|| self.path_type(&r))?;
+        let ty = self
+            .path_type(solver, &l)
+            .or_else(|| self.path_type(solver, &r))?;
         if !matches!(
             ty.peel_refinements(),
             Type::Record(_) | Type::Tuple(_) | Type::Nominal(..)
         ) {
             return None;
         }
-        Some(self.paths_equal(&l, &r, &ty).map(
-            |equal| {
-                if negated { self.ctx.not(equal) } else { equal }
-            },
-        ))
+        Some(
+            self.paths_equal(solver, &l, &r, &ty)
+                .map(|equal| if negated { self.ctx.not(equal) } else { equal }),
+        )
     }
 
     /// That the values at the paths `l` and `r`, both of type `ty`, are equal: a product's
     /// components pairwise, a nominal value's tags and, under each tag, that constructor's
     /// payloads, and a scalar's constants. Lowering refuses a declaration that reaches itself
     /// through its constructors, so the recursion ends.
-    fn paths_equal(&mut self, l: &Path, r: &Path, ty: &Type) -> Result<SExpr, String> {
+    fn paths_equal(
+        &mut self,
+        solver: &mut Solver,
+        l: &Path,
+        r: &Path,
+        ty: &Type,
+    ) -> Result<SExpr, String> {
         let components: Vec<(Key, Type)> = match ty.peel_refinements() {
             Type::Record(fields) => fields
                 .iter()
@@ -1313,15 +1347,16 @@ impl<'a> Encode<'a> {
                 .map(|(i, ty)| (Key::Proj(ProjKey::Index(i)), ty.clone()))
                 .collect(),
             Type::Nominal(decl, args) => {
-                let (lt, rt) = (self.tag(l.clone())?, self.tag(r.clone())?);
+                let (lt, rt) = (self.tag(solver, l.clone())?, self.tag(solver, r.clone())?);
                 let mut conjuncts = vec![self.ctx.eq(lt, rt)];
                 for (position, ctor) in decl.body().ctors.iter().enumerate() {
                     if ctor.params.is_empty() {
                         continue;
                     }
                     let key = Key::Payload(ctor.name.clone());
-                    let payload = decl.instantiate(&ctor.destructured(), args);
-                    let equal = self.paths_equal(&l.then(key.clone()), &r.then(key), &payload)?;
+                    let payload = decl.instantiate(solver, &ctor.destructured(), args);
+                    let equal =
+                        self.paths_equal(solver, &l.then(key.clone()), &r.then(key), &payload)?;
                     let built = self.ctx.eq(lt, self.ctx.numeral(position));
                     conjuncts.push(self.ctx.imp(built, equal));
                 }
@@ -1330,7 +1365,10 @@ impl<'a> Encode<'a> {
             // Each leaf takes its sort from its own path, so an unsolved variable on one side
             // can sort a leaf whose counterpart is settled.
             _ => {
-                let (lv, rv) = (self.leaf_at(l.clone(), ty)?, self.leaf_at(r.clone(), ty)?);
+                let (lv, rv) = (
+                    self.leaf_at(solver, l.clone(), ty)?,
+                    self.leaf_at(solver, r.clone(), ty)?,
+                );
                 let (ls, rs) = (&self.constant_sorts[&lv], &self.constant_sorts[&rv]);
                 if ls != rs {
                     return Err(format!(
@@ -1342,7 +1380,7 @@ impl<'a> Encode<'a> {
         };
         let mut conjuncts = vec![self.ctx.true_()];
         for (key, ty) in components {
-            conjuncts.push(self.paths_equal(&l.then(key.clone()), &r.then(key), &ty)?);
+            conjuncts.push(self.paths_equal(solver, &l.then(key.clone()), &r.then(key), &ty)?);
         }
         Ok(self.ctx.and_many(conjuncts))
     }
@@ -1367,8 +1405,8 @@ impl<'a> Encode<'a> {
 
     /// [`Encode::expr`] for a term in a proposition's position: a refinement body or an
     /// operand of a logical connective.
-    fn proposition(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
-        let encoded = self.expr(e)?;
+    fn proposition(&mut self, solver: &mut Solver, e: &TypedExpr) -> Result<SExpr, String> {
+        let encoded = self.expr(solver, e)?;
         self.settled_operand(e, e, encoded)?;
         Ok(encoded)
     }
@@ -1472,18 +1510,20 @@ impl<'a> Encode<'a> {
     /// variable falls back the same way when the slot is settled, since the slot's sort
     /// says more than an uninterpreted one; when neither is settled, the path's
     /// variable gives the leaf its sort ([`Sort::Uninterpreted`]).
-    fn leaf(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
+    fn leaf(&mut self, solver: &mut Solver, path: Path, ty: &Type) -> Result<SExpr, String> {
         let path = self.reroot(path);
-        self.leaf_at(path, ty)
+        self.leaf_at(solver, path, ty)
     }
 
     /// [`Encode::leaf`] for a path already in the query's frame ([`Encode::reroot`]).
-    fn leaf_at(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
+    fn leaf_at(&mut self, solver: &mut Solver, path: Path, ty: &Type) -> Result<SExpr, String> {
         if let Some(e) = self.vars.get(&path) {
             return Ok(*e);
         }
         let settled = |sort: &Sort| !matches!(sort, Sort::Uninterpreted(_));
-        let path_sort = self.path_type(&path).and_then(|bound| self.sort(&bound));
+        let path_sort = self
+            .path_type(solver, &path)
+            .and_then(|bound| self.sort(&bound));
         let path_sort = match path_sort {
             Some(sort) if !settled(&sort) && self.sort(ty).is_some_and(|s| settled(&s)) => None,
             other => other,
@@ -1493,15 +1533,15 @@ impl<'a> Encode<'a> {
                 // Declared before the types along the path are read, so a scope
                 // whose binders reference each other terminates rather than
                 // recurring through this arm.
-                let leaf = self.declare(path.clone(), sort);
-                self.assume_along(&path);
+                let leaf = self.declare(solver, path.clone(), sort);
+                self.assume_along(solver, &path);
                 Ok(leaf)
             }
             None => {
                 let sort = self
                     .sort(ty)
                     .ok_or_else(|| format!("{path} is typed {ty}, which has no SMT sort"))?;
-                Ok(self.declare(path, sort))
+                Ok(self.declare(solver, path, sort))
             }
         }
     }
@@ -1531,11 +1571,11 @@ impl<'a> Encode<'a> {
     /// A subject-rooted path reaching here is the *query's* subject —
     /// [`Encode::reroot`] has already replaced any other — so the base is what
     /// types it.
-    fn path_type(&self, path: &Path) -> Option<Type> {
+    fn path_type(&self, solver: &mut Solver, path: &Path) -> Option<Type> {
         let mut ty = if path.rooted_at_subject() {
             self.base.clone()
         } else {
-            self.scope.binder_type(&path.root)?
+            self.scope.binder_type(solver, &path.root)?
         };
         // A mutable variable mention in a predicate is a *read*, so what the path
         // denotes is the value the history holds and the facts it carries are that
@@ -1547,7 +1587,7 @@ impl<'a> Encode<'a> {
             ty = value.clone();
         }
         for key in &path.keys {
-            ty = field_type(&ty, key)?;
+            ty = field_type(solver, &ty, key)?;
         }
         Some(ty)
     }
@@ -1560,7 +1600,7 @@ impl<'a> Encode<'a> {
     ///
     /// A constant on a path through a constructor's payload is in its sort only under that
     /// constructor's tag ("Nominal values"), so its sort constraint joins `Γ` guarded.
-    fn declare(&mut self, path: Path, sort: Sort) -> SExpr {
+    fn declare(&mut self, solver: &mut Solver, path: Path, sort: Sort) -> SExpr {
         let symbol = format!("v!{}", self.decls.len());
         let e = self.ctx.atom(symbol.as_str());
         let constrained = !path.keys.iter().any(|k| matches!(k, Key::Payload(_)));
@@ -1579,7 +1619,7 @@ impl<'a> Encode<'a> {
         // constant outside its sort rather than asserting membership bare.
         if !constrained
             && let Some(membership) = membership
-            && let Ok(Some(guard)) = self.payload_guard(&path)
+            && let Ok(Some(guard)) = self.payload_guard(solver, &path)
         {
             self.assumptions.push(self.ctx.imp(guard, membership));
         }
@@ -1683,6 +1723,7 @@ mod tests {
     /// `__elem == (𝑎 op 𝑏)` entail each other, for every operator with a `^` sibling.
     #[test]
     fn a_caret_operator_encodes_as_its_sibling() {
+        let solver = &mut Solver::new();
         use crate::ccl::{LogicKind, UnaryOpKind};
         let boolean = || Type::Base(BaseType::Bool);
         let flag = |name: &str| TypedExpr::var(Name::raw(name)).with_ty(boolean());
@@ -1733,8 +1774,8 @@ mod tests {
         for (base, caret, plain) in cases {
             let caret = [equal_to(base.clone(), caret)];
             let plain = [equal_to(base.clone(), plain)];
-            assert!(smt_sub(&base, &caret, &plain, &NoScope).unwrap());
-            assert!(smt_sub(&base, &plain, &caret, &NoScope).unwrap());
+            assert!(smt_sub(solver, &base, &caret, &plain, &NoScope).unwrap());
+            assert!(smt_sub(solver, &base, &plain, &caret, &NoScope).unwrap());
         }
     }
 
@@ -1742,29 +1783,33 @@ mod tests {
     /// compare unequal as terms and denote one value.
     #[test]
     fn equal_sums_entail_each_other() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(
             CompareKind::Equals,
             add(add(lit(1), lit(3)), lit(2)),
         )];
         let rhs = [elem_cmp(CompareKind::Equals, add(lit(1), lit(5)))];
-        assert!(smt_sub(&int(), &lhs, &rhs, &NoScope).unwrap());
-        assert!(smt_sub(&int(), &rhs, &lhs, &NoScope).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &NoScope).unwrap());
+        assert!(smt_sub(solver, &int(), &rhs, &lhs, &NoScope).unwrap());
     }
 
     #[test]
     fn unequal_sums_entail_neither_way() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(CompareKind::Equals, add(lit(1), lit(3)))];
         let rhs = [elem_cmp(CompareKind::Equals, add(lit(1), lit(5)))];
-        assert!(!smt_sub(&int(), &lhs, &rhs, &NoScope).unwrap());
-        assert!(!smt_sub(&int(), &rhs, &lhs, &NoScope).unwrap());
+        assert!(!smt_sub(solver, &int(), &lhs, &rhs, &NoScope).unwrap());
+        assert!(!smt_sub(solver, &int(), &rhs, &lhs, &NoScope).unwrap());
     }
 
     /// A singleton entails every bound it satisfies, and no bound it violates.
     #[test]
     fn a_singleton_entails_the_bounds_it_satisfies() {
+        let solver = &mut Solver::new();
         let five = [elem_cmp(CompareKind::Equals, lit(5))];
         assert!(
             smt_sub(
+                solver,
                 &int(),
                 &five,
                 &[elem_cmp(CompareKind::GreaterOrEq, lit(1))],
@@ -1774,6 +1819,7 @@ mod tests {
         );
         assert!(
             smt_sub(
+                solver,
                 &int(),
                 &five,
                 &[elem_cmp(CompareKind::NotEquals, lit(0))],
@@ -1783,6 +1829,7 @@ mod tests {
         );
         assert!(
             !smt_sub(
+                solver,
                 &int(),
                 &five,
                 &[elem_cmp(CompareKind::Less, lit(1))],
@@ -1795,6 +1842,7 @@ mod tests {
     /// Entailment is over the whole set on each side, conjunctively.
     #[test]
     fn both_sides_are_conjunctions() {
+        let solver = &mut Solver::new();
         let bounded = [
             elem_cmp(CompareKind::GreaterOrEq, lit(3)),
             elem_cmp(CompareKind::LessOrEq, lit(4)),
@@ -1803,21 +1851,32 @@ mod tests {
             elem_cmp(CompareKind::NotEquals, lit(0)),
             elem_cmp(CompareKind::Less, lit(10)),
         ];
-        assert!(smt_sub(&int(), &bounded, &weaker, &NoScope).unwrap());
-        assert!(!smt_sub(&int(), &weaker, &bounded, &NoScope).unwrap());
+        assert!(smt_sub(solver, &int(), &bounded, &weaker, &NoScope).unwrap());
+        assert!(!smt_sub(solver, &int(), &weaker, &bounded, &NoScope).unwrap());
     }
 
     /// A free name is universally quantified, so a claim that holds only for some
     /// of its values is not an entailment.
     #[test]
     fn a_free_name_is_universally_quantified() {
+        let solver = &mut Solver::new();
         let t = TypedExpr::var(Name::raw("t")).with_ty(int());
         let lhs = [elem_cmp(CompareKind::Equals, add(t.duplicate(), lit(3)))];
         // `__elem == t + 3` gives `__elem > t`, and gives nothing about `__elem`
         // against a constant.
-        assert!(smt_sub(&int(), &lhs, &[elem_cmp(CompareKind::Greater, t)], &NoScope).unwrap());
+        assert!(
+            smt_sub(
+                solver,
+                &int(),
+                &lhs,
+                &[elem_cmp(CompareKind::Greater, t)],
+                &NoScope
+            )
+            .unwrap()
+        );
         assert!(
             !smt_sub(
+                solver,
                 &int(),
                 &lhs,
                 &[elem_cmp(CompareKind::Greater, lit(3))],
@@ -1831,8 +1890,16 @@ mod tests {
     /// of two SMT sorts rather than sending the solver a query it rejects.
     #[test]
     fn a_comparison_across_sorts_is_not_encoded() {
+        let solver = &mut Solver::new();
         let refs = [elem_cmp(CompareKind::Equals, lit(5))];
-        let err = smt_sub(&Type::Base(BaseType::String), &refs, &refs, &NoScope).unwrap_err();
+        let err = smt_sub(
+            solver,
+            &Type::Base(BaseType::String),
+            &refs,
+            &refs,
+            &NoScope,
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, SmtError::Encoding { .. }),
             "expected an encoding error, got: {err:?}"
@@ -1855,21 +1922,23 @@ mod tests {
     /// equality is decided.
     #[test]
     fn an_unsolved_variable_has_equality() {
-        let var = Type::Infer(crate::ccl::InferVar::fresh(1));
+        let solver = &mut Solver::new();
+        let var = Type::Infer(crate::ccl::InferVar::fresh(solver, 1));
         let scope = scoped("x", var.clone());
         let equal = [unsolved_cmp(&var, CompareKind::Equals)];
         let unequal = [unsolved_cmp(&var, CompareKind::NotEquals)];
-        assert!(smt_sub(&var, &equal, &equal, &scope).unwrap());
-        assert!(!smt_sub(&var, &equal, &unequal, &scope).unwrap());
+        assert!(smt_sub(solver, &var, &equal, &equal, &scope).unwrap());
+        assert!(!smt_sub(solver, &var, &equal, &unequal, &scope).unwrap());
     }
 
     /// An uninterpreted sort has no order, and no value of it compares with an `Int`.
     #[test]
     fn an_unsolved_variable_has_no_order_and_no_integer() {
-        let var = Type::Infer(crate::ccl::InferVar::fresh(1));
+        let solver = &mut Solver::new();
+        let var = Type::Infer(crate::ccl::InferVar::fresh(solver, 1));
         let scope = scoped("x", var.clone());
         let ordered = [unsolved_cmp(&var, CompareKind::Less)];
-        let err = smt_sub(&var, &[], &ordered, &scope).unwrap_err();
+        let err = smt_sub(solver, &var, &[], &ordered, &scope).unwrap_err();
         assert!(
             matches!(&err, SmtError::Encoding { .. }),
             "expected an encoding error, got: {err:?}"
@@ -1882,7 +1951,7 @@ mod tests {
             )
             .with_ty(Type::Base(BaseType::Bool)),
         ))];
-        let err = smt_sub(&var, &[], &integer, &scope).unwrap_err();
+        let err = smt_sub(solver, &var, &[], &integer, &scope).unwrap_err();
         assert!(
             matches!(&err, SmtError::Encoding { .. }),
             "expected an encoding error, got: {err:?}"
@@ -1893,12 +1962,14 @@ mod tests {
     /// came from rather than the query.
     #[test]
     fn an_unencodable_term_is_not_an_answer() {
+        let solver = &mut Solver::new();
         let opaque = TypedExpr::lit(Lit::String("s".into())).with_ty(Type::Base(BaseType::String));
         let rhs = [
             elem_cmp(CompareKind::GreaterOrEq, lit(1)),
             elem_cmp(CompareKind::Equals, opaque),
         ];
         match smt_sub(
+            solver,
             &int(),
             &[elem_cmp(CompareKind::Equals, lit(5))],
             &rhs,
@@ -1913,6 +1984,7 @@ mod tests {
     /// around it still decide the query.
     #[test]
     fn an_unencodable_antecedent_atom_is_abstracted() {
+        let solver = &mut Solver::new();
         let opaque = TypedExpr::lit(Lit::String("s".into())).with_ty(Type::Base(BaseType::String));
         let lhs = [
             elem_cmp(CompareKind::Equals, lit(5)),
@@ -1920,11 +1992,11 @@ mod tests {
         ];
         let goal = |n| [elem_cmp(CompareKind::GreaterOrEq, lit(n))];
         assert!(matches!(
-            smt_sub(&int(), &lhs, &goal(1), &NoScope),
+            smt_sub(solver, &int(), &lhs, &goal(1), &NoScope),
             Ok(true)
         ));
         assert!(matches!(
-            smt_sub(&int(), &lhs, &goal(6), &NoScope),
+            smt_sub(solver, &int(), &lhs, &goal(6), &NoScope),
             Ok(false)
         ));
     }
@@ -1933,6 +2005,7 @@ mod tests {
     /// excluded because SMT-LIB's `div` is Euclidean, not floor division.
     #[test]
     fn an_unencodable_operator_is_not_an_answer() {
+        let solver = &mut Solver::new();
         let quotient = TypedExpr::binop(
             TypedExpr::var(Name::raw("t")).with_ty(int()),
             BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
@@ -1940,6 +2013,7 @@ mod tests {
         )
         .with_ty(int());
         let err = smt_sub(
+            solver,
             &int(),
             &[elem_cmp(CompareKind::GreaterOrEq, lit(0))],
             &[elem_cmp(CompareKind::Equals, quotient)],
@@ -1956,13 +2030,15 @@ mod tests {
     /// for the next query.
     #[test]
     fn an_encoding_failure_does_not_poison_the_solver() {
+        let solver = &mut Solver::new();
         let opaque = TypedExpr::lit(Lit::String("s".into())).with_ty(Type::Base(BaseType::String));
         let unencodable = [elem_cmp(CompareKind::Equals, opaque)];
-        assert!(smt_sub(&int(), &unencodable, &unencodable, &NoScope).is_err());
+        assert!(smt_sub(solver, &int(), &unencodable, &unencodable, &NoScope).is_err());
 
         let five = [elem_cmp(CompareKind::Equals, lit(5))];
         assert!(
             smt_sub(
+                solver,
                 &int(),
                 &five,
                 &[elem_cmp(CompareKind::GreaterOrEq, lit(1))],
@@ -1975,14 +2051,15 @@ mod tests {
     /// Nothing demanded is nothing to prove.
     #[test]
     fn an_empty_demand_holds() {
-        assert!(smt_sub(&int(), &[], &[], &NoScope).unwrap());
+        let solver = &mut Solver::new();
+        assert!(smt_sub(solver, &int(), &[], &[], &NoScope).unwrap());
     }
 
     /// A scope binding exactly one name.
     struct One(Name, Type);
 
     impl ScopeEnv for One {
-        fn binder_type(&self, name: &Name) -> Option<Type> {
+        fn binder_type(&self, _solver: &mut Solver, name: &Name) -> Option<Type> {
             (self.0 == *name).then(|| self.1.clone())
         }
         fn is_skip_smt(&self) -> bool {
@@ -2026,6 +2103,7 @@ mod tests {
     /// `x`'s `b` is `3`.
     #[test]
     fn a_field_refinement_is_an_assumption() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(
             CompareKind::Equals,
             add(var("t"), field("x", "b")),
@@ -2036,20 +2114,22 @@ mod tests {
             ("b".into(), singleton(3)),
         ]);
 
-        assert!(smt_sub(&int(), &lhs, &rhs, &scoped("x", rec)).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &scoped("x", rec)).unwrap());
         // The same query with nothing in scope: `x.b` is universally quantified.
-        assert!(!smt_sub(&int(), &lhs, &rhs, &NoScope).unwrap());
+        assert!(!smt_sub(solver, &int(), &lhs, &rhs, &NoScope).unwrap());
     }
 
     /// One path is one constant, so a predicate relating two reads of it holds
     /// whatever the field is — and a predicate relating it to a constant does not.
     #[test]
     fn two_reads_of_one_path_are_one_constant() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(CompareKind::Equals, field("x", "b"))];
         let unrefined = Type::Record(vec![("b".into(), int())]);
         let scope = scoped("x", unrefined);
         assert!(
             smt_sub(
+                solver,
                 &int(),
                 &lhs,
                 &[elem_cmp(CompareKind::LessOrEq, field("x", "b"))],
@@ -2059,6 +2139,7 @@ mod tests {
         );
         assert!(
             !smt_sub(
+                solver,
                 &int(),
                 &lhs,
                 &[elem_cmp(CompareKind::LessOrEq, lit(0))],
@@ -2074,6 +2155,7 @@ mod tests {
     /// and establishes `__elem.y == 0`.
     #[test]
     fn a_product_subject_is_read_through_its_fields() {
+        let solver = &mut Solver::new();
         let base = Type::Record(vec![("x".into(), singleton(1)), ("y".into(), singleton(0))]);
         let refutes = [Refinement::born(Rc::new(
             TypedExpr::binop(
@@ -2091,8 +2173,8 @@ mod tests {
             )
             .with_ty(Type::Base(BaseType::Bool)),
         ))];
-        assert!(!smt_sub(&base, &[], &refutes, &NoScope).unwrap());
-        assert!(smt_sub(&base, &[], &holds, &NoScope).unwrap());
+        assert!(!smt_sub(solver, &base, &[], &refutes, &NoScope).unwrap());
+        assert!(smt_sub(solver, &base, &[], &holds, &NoScope).unwrap());
     }
 
     /// A refinement carried by a product states its predicate about that product,
@@ -2100,6 +2182,7 @@ mod tests {
     /// type `x` is bound at is an assumption about `x.b`.
     #[test]
     fn a_read_inside_a_binders_refinement_reroots_onto_the_binder() {
+        let solver = &mut Solver::new();
         let refined_rec = Type::refined(
             Type::Record(vec![("b".into(), int())]),
             Refinement::born(Rc::new(
@@ -2114,7 +2197,7 @@ mod tests {
         );
         let lhs = [elem_cmp(CompareKind::Equals, field("x", "b"))];
         let rhs = [elem_cmp(CompareKind::Equals, lit(3))];
-        assert!(smt_sub(&int(), &lhs, &rhs, &scoped("x", refined_rec)).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &scoped("x", refined_rec)).unwrap());
     }
 
     /// A read no product settles falls back to the slot on the read itself, with
@@ -2122,11 +2205,12 @@ mod tests {
     /// unencodable.
     #[test]
     fn a_read_of_an_unsettled_path_falls_back_to_the_occurrence() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(CompareKind::Equals, add(field("x", "b"), lit(1)))];
         let rhs = [elem_cmp(CompareKind::Greater, field("x", "b"))];
         // `x` is bound at a scalar, so `.b` addresses no field of it.
-        assert!(smt_sub(&int(), &lhs, &rhs, &scoped("x", int())).unwrap());
-        assert!(smt_sub(&int(), &lhs, &rhs, &NoScope).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &scoped("x", int())).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &NoScope).unwrap());
     }
 
     /// A refinement on the type a name is bound at is an assumption about that
@@ -2134,13 +2218,14 @@ mod tests {
     /// says `x` is `2`.
     #[test]
     fn a_scope_refinement_is_an_assumption() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(CompareKind::Equals, add(var("t"), var("x")))];
         let rhs = [elem_cmp(CompareKind::Equals, add(var("t"), lit(2)))];
         let two = Type::refined(int(), elem_cmp(CompareKind::Equals, lit(2)).into());
 
-        assert!(smt_sub(&int(), &lhs, &rhs, &scoped("x", two)).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &scoped("x", two)).unwrap());
         // The same query with nothing in scope: `x` is universally quantified.
-        assert!(!smt_sub(&int(), &lhs, &rhs, &NoScope).unwrap());
+        assert!(!smt_sub(solver, &int(), &lhs, &rhs, &NoScope).unwrap());
     }
 
     /// A name the scope binds at a type with no sort is declared at the sort of
@@ -2148,6 +2233,7 @@ mod tests {
     /// answered rather than reported as unencodable.
     #[test]
     fn a_scope_type_with_no_sort_falls_back_to_the_occurrence() {
+        let solver = &mut Solver::new();
         let lhs = [elem_cmp(CompareKind::Equals, add(var("f"), lit(1)))];
         let rhs = [elem_cmp(CompareKind::Greater, var("f"))];
         let opaque = Type::Fun {
@@ -2157,13 +2243,14 @@ mod tests {
             codomain: Box::new(int()),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
-        assert!(smt_sub(&int(), &lhs, &rhs, &scoped("f", opaque)).unwrap());
+        assert!(smt_sub(solver, &int(), &lhs, &rhs, &scoped("f", opaque)).unwrap());
     }
 
     /// A binder whose predicate is outside the fragment contributes its constant
     /// and no assumption, rather than defeating the query.
     #[test]
     fn an_unencodable_scope_predicate_is_dropped() {
+        let solver = &mut Solver::new();
         // `q : {Int | __elem // 2 == 1}` — `//` has no encoding, so nothing about
         // `q` reaches the solver and `__elem == q` proves only what a free name
         // does.
@@ -2185,6 +2272,7 @@ mod tests {
         let scope = scoped("q", unencodable);
         assert!(
             smt_sub(
+                solver,
                 &int(),
                 &lhs,
                 &[elem_cmp(CompareKind::LessOrEq, var("q"))],
@@ -2194,6 +2282,7 @@ mod tests {
         );
         assert!(
             !smt_sub(
+                solver,
                 &int(),
                 &lhs,
                 &[elem_cmp(CompareKind::GreaterOrEq, lit(2))],
@@ -2207,13 +2296,14 @@ mod tests {
     /// target's bound joins the goal, and an rhs with no refinement still asks it.
     #[test]
     fn a_target_range_bounds_the_subject() {
+        let solver = &mut Solver::new();
         let uint = Type::Base(BaseType::UInt);
         let range = Type::UIntRange(3);
         let eq = |n| [elem_cmp(CompareKind::Equals, lit(n))];
-        assert!(smt_sub_at(&uint, &range, &eq(1), &[], &NoScope).unwrap());
-        assert!(!smt_sub_at(&uint, &range, &eq(3), &[], &NoScope).unwrap());
+        assert!(smt_sub_at(solver, &uint, &range, &eq(1), &[], &NoScope).unwrap());
+        assert!(!smt_sub_at(solver, &uint, &range, &eq(3), &[], &NoScope).unwrap());
         assert!(
-            !smt_sub_at(&uint, &range, &eq(1), &eq(2), &NoScope).unwrap(),
+            !smt_sub_at(solver, &uint, &range, &eq(1), &eq(2), &NoScope).unwrap(),
             "the rhs refinements are still demanded beside the bound"
         );
     }
@@ -2221,8 +2311,10 @@ mod tests {
     /// A target encoded at a different SMT sort has no membership to state about the subject.
     #[test]
     fn a_target_of_another_sort_is_an_encoding_error() {
+        let solver = &mut Solver::new();
         let eq = [elem_cmp(CompareKind::Equals, lit(1))];
         let err = smt_sub_at(
+            solver,
             &Type::Base(BaseType::UInt),
             &Type::Base(BaseType::Bool),
             &eq,

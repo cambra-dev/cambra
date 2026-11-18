@@ -4,6 +4,7 @@
 
 use crate::ccl::Label;
 use crate::ccl::RecordEntry;
+use crate::ccl::infer::solver::Solver;
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
@@ -145,10 +146,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             match ctx.scopes.lookup(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => {
-                    let instance =
-                        binding
-                            .scheme
-                            .instantiate_with_params(ctx.level, &ctx.telescope, node_id);
+                    let instance = binding.scheme.instantiate_with_params(
+                        &mut ctx.solver,
+                        ctx.level,
+                        &ctx.telescope,
+                        node_id,
+                    );
                     // The specialization this use mints takes its copies of the definition's
                     // capability variables (`capabilities::UseCapabilities`).
                     ctx.use_capabilities
@@ -222,15 +225,16 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             let c = Name::fresh("__boxed");
             let arg = ctx.fresh();
             if let Type::Infer(v) = &arg {
-                v.fun_kind.stamp_data();
+                v.fun_kind.stamp_data(ctx.solver());
             }
             let term = std::rc::Rc::new(Expr::var(c.clone()).with_ty(arg.clone()));
-            let result = crate::ccl::subst::Subst::eliminating(term).apply_type(&arg);
-            Type::pi(c, arg, result)
+            let result =
+                crate::ccl::subst::Subst::eliminating(term).apply_type_in(ctx.solver(), &arg);
+            Type::pi_in(ctx.solver(), c, arg, result)
         }
 
         TypedExprNode::Builtin(b) => {
-            if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
+            if let Some(scheme) = ctx.schemes.builtin(&mut ctx.solver, b.clone()) {
                 // Through [`Typing::instantiate`], which stamps the *use site's*
                 // telescope: an operator template's variables stand nowhere, and a
                 // refinement flowing into an operand variable (a filtered
@@ -241,6 +245,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 match b {
                     crate::ccl::Builtin::Uncurry(_) => {
                         crate::ccl::infer::schemes::uncurried_value_at_its_tuple(
+                            ctx.solver(),
                             instantiated,
                             expr.node_id(),
                         )
@@ -576,7 +581,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // `data_fun(_, _)` annotation, and here we set that kind concretely on the
         // node's own type (see `stamp_fun_kind_from`). `bind_annotation` below still
         // reconciles the domain/codomain.
-        stamp_fun_kind_from(&mut ty, &annotation);
+        stamp_fun_kind_from(ctx.solver(), &mut ty, &annotation);
         ctx.bind_annotation(&ty, &annotation)?;
     }
 
@@ -603,7 +608,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 /// a coercion). A concrete `Data` kind here is always lowering-internal or a
 /// declared carrier type — user function annotations are `Compute`/unkinded — so
 /// this never silently relabels a user's kind.
-fn stamp_fun_kind_from(target: &mut Type, reference: &Type) {
+fn stamp_fun_kind_from(solver: &mut Solver, target: &mut Type, reference: &Type) {
     use crate::ccl::ty::FunKind;
     if let Some(ref_kind) = reference.fun_kind()
         && let Type::Fun { fun_kind, .. } = target
@@ -626,7 +631,7 @@ fn stamp_fun_kind_from(target: &mut Type, reference: &Type) {
         }
         *fun_kind = match ref_kind {
             FunKind::Data(_) => FunKind::Data(None),
-            FunKind::Var(v) if v.resolved().is_data() => ref_kind.clone(),
+            FunKind::Var(v) if v.resolved_in(solver).is_data() => ref_kind.clone(),
             FunKind::Var(_) => return,
             other => other.clone(),
         };
@@ -683,7 +688,8 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             match name {
                 Some(b) if crate::ccl::subst::references_enclosing_function(c) => {
                     let bound = ctx.normalize(&ctx.refinement_domain(d));
-                    let mut opened = crate::ccl::subst::open_pi_binder(
+                    let mut opened = crate::ccl::subst::open_pi_binder_in(
+                        ctx.solver(),
                         &crate::ccl::subst::Mapping::Rename(b.clone()),
                         c,
                         crate::ccl::Ids::Fresh,
@@ -691,7 +697,12 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                     ctx.scoped(b, &bound, |ctx| {
                         emit_annotation_predicates(&mut opened, ctx)
                     })?;
-                    **c = crate::ccl::subst::close_pi_binder(b, &opened, crate::ccl::Ids::Fresh);
+                    **c = crate::ccl::subst::close_pi_binder(
+                        ctx.solver(),
+                        b,
+                        &opened,
+                        crate::ccl::Ids::Fresh,
+                    );
                     Ok(())
                 }
                 _ => emit_annotation_predicates(c, ctx),
@@ -717,9 +728,13 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 .iter()
                 .map(|(_, t)| ctx.normalize(&ctx.refinement_domain(t)))
                 .collect();
-            let mut opened =
-                crate::ccl::subst::opened_family_body(binders, body, crate::ccl::Ids::Fresh)
-                    .unwrap_or_else(|| (**body).clone());
+            let mut opened = crate::ccl::subst::opened_family_body(
+                ctx.solver(),
+                binders,
+                body,
+                crate::ccl::Ids::Fresh,
+            )
+            .unwrap_or_else(|| (**body).clone());
             fn under<C: Typing>(
                 scope: &[(Name, Type)],
                 body: &mut Type,
@@ -735,8 +750,12 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             let scope: Vec<(Name, Type)> = names.iter().cloned().zip(bounds).collect();
             under(&scope, &mut opened, ctx)?;
             let enclosing: Vec<Option<Name>> = names.into_iter().map(Some).collect();
-            **body =
-                crate::ccl::subst::close_pi_binders(&enclosing, &opened, crate::ccl::Ids::Fresh);
+            **body = crate::ccl::subst::close_pi_binders(
+                ctx.solver(),
+                &enclosing,
+                &opened,
+                crate::ccl::Ids::Fresh,
+            );
             Ok(())
         }
         // A family's arguments are terms the declaration writes, typed where they stand.
@@ -924,7 +943,7 @@ fn apply_unary_scheme<C: Typing>(
 /// cannot flow into its annotation at all is already an `AnnotationMismatch`, so
 /// there is no second diagnosis to make here.
 ///
-fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
+fn complete_annotation(solver: &mut Solver, ann: &Type, inferred: &Type) -> Type {
     match (ann, inferred) {
         (Type::Hole, _) => inferred.clone(),
         // A refinement's base can be the unspecified part (`{_ | p}`); the
@@ -932,7 +951,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
         // on the inferred side because its own refinements describe the *value*,
         // and this is filling in a *shape*.
         (Type::Refinement(base, refinements), _) => Type::refined(
-            complete_annotation(base, inferred.peel_refinements()),
+            complete_annotation(solver, base, inferred.peel_refinements()),
             refinements.clone(),
         ),
         // The binder and kind come from the *annotation*, per the rule
@@ -960,14 +979,20 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             // initializer's name free rather than bound. Binders are uid-unique, so a
             // nested arm's alignment targets a disjoint name and the two commute.
             let aligned = crate::ccl::subst::Subst::id().aligned(inn, an);
-            let cod = complete_annotation(ac, &aligned.apply_type(ic));
+            let cod = {
+                let applied = aligned.apply_type_in(solver, ic);
+                complete_annotation(solver, ac, &applied)
+            };
             debug_assert!(
                 inn.as_ref()
                     .is_none_or(|i| !crate::ccl::subst::type_free_vars(&cod).contains(i)),
                 "a filled codomain still references the initializer's binder {inn:?}, so \
                  the alignment did not reach it: {cod}",
             );
-            Type::fun_like(ann, complete_annotation(ad, id), cod)
+            {
+                let completed = complete_annotation(solver, ad, id);
+                Type::fun_like_in(solver, ann, completed, cod)
+            }
         }
         // A nominal type's arguments are left to normalization, which makes each hole a
         // variable the initializer bounds. Filled from the initializer here, a family argument
@@ -985,7 +1010,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             if part.binders.iter().any(|(a, i)| i.is_some() && a != i) {
                 part.left.clone()
             } else {
-                complete_annotation(part.left, part.right)
+                complete_annotation(solver, part.left, part.right)
             }
         }),
     }
@@ -1094,7 +1119,7 @@ pub(super) fn emit_lambda<C: Typing>(
     if stamped
         .unwrap_or(recorded)
         .fun_kind()
-        .is_some_and(|k| k.resolved().is_data())
+        .is_some_and(|k| k.resolved_in(ctx.solver()).is_data())
     {
         ctx.note_data_loop(ctx.current_node(), &ty);
     }
@@ -1193,7 +1218,7 @@ pub(super) fn emit_cast<C: Typing>(
     // the preserved binder close here. Idempotent when `v` came out of a
     // closed function (its references are already indices).
     let v = match &name {
-        Some(k) => crate::ccl::subst::close_pi_binder(k, &v, crate::ccl::Ids::Fresh),
+        Some(k) => crate::ccl::subst::close_pi_binder(ctx.solver(), k, &v, crate::ccl::Ids::Fresh),
         None => v,
     };
     // The re-viewed value does what the value does, settled by the target's kind: a
@@ -1468,7 +1493,7 @@ fn emit_lookup_checked<C: Typing>(
     key_ty: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let (keys, binder, codomain) = keyed_access_types(collection)
+    let (keys, binder, codomain) = keyed_access_types(ctx.solver(), collection)
         .ok_or_else(|| not_a_keyed_access(collection, "checked lookup `c[k]`"))
         .map_err(|e| ctx.raise(e))?;
     let value = ctx.keyed_value_at(&codomain, binder.as_ref(), key, &function.ty);
@@ -1516,7 +1541,7 @@ fn emit_keyed_write(
     let key_ty = key_ty
         .as_ref()
         .expect("a keyed write emits its key's type alongside the key");
-    let (keys, binder, value) = keyed_access_types(collection)
+    let (keys, binder, value) = keyed_access_types(ctx.solver(), collection)
         .ok_or_else(|| {
             if matches!(collection, Type::Infer(_) | Type::Hole) {
                 return InferError::Unsupported(format!(
@@ -1589,14 +1614,17 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
 /// Return the binder without discharging it: `Typing::keyed_value_at` owns that step.
 /// This helper checks the function shape, not the function kind or runtime answer extent.
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
-fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
+fn keyed_access_types(
+    solver: &mut Solver,
+    collection: &Type,
+) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
     let viewed = match collection.sum() {
         Some([witness, ..]) => {
             let crate::ccl::ty::TypeKind::SubtypesOf(key) = witness.type_kind() else {
                 return None;
             };
-            collection.instantiate_sum(&key)
+            collection.instantiate_sum_in(solver, &key)
         }
         _ => collection.clone(),
     };
@@ -1653,6 +1681,7 @@ fn require_single_obligation<C: Typing>(
             ctx.require_trait(trait_, operator_node_id, operand_types, None, at)?;
             let result = Type::Base(base.clone());
             Ok(refine_result(
+                ctx.solver(),
                 operator_node_id,
                 *refinement,
                 result,
@@ -1669,6 +1698,7 @@ fn require_single_obligation<C: Typing>(
 /// scheme stating a refinement is monomorphic (`and`, `or`, `not`), so its result base is the
 /// innermost codomain of its body.
 fn refine_scheme_result(
+    solver: &mut Solver,
     operator_node_id: NodeId,
     scheme: &PolyScheme,
     result: Type,
@@ -1686,12 +1716,19 @@ fn refine_scheme_result(
         matches!(base, Type::Base(_)),
         "a scheme stating a refinement of its result has a base result, not `{base}`"
     );
-    refine_result(operator_node_id, refinement, base.clone(), operand_exprs)
+    refine_result(
+        solver,
+        operator_node_id,
+        refinement,
+        base.clone(),
+        operand_exprs,
+    )
 }
 
 /// `result` refined by `refinement` applied to the operand terms, under a recording naming the
 /// operator: the predicate copies the operand nodes.
 fn refine_result(
+    solver: &mut Solver,
     operator_node_id: NodeId,
     refinement: Option<crate::ccl::RefinementTemplate>,
     result: Type,
@@ -1707,7 +1744,7 @@ fn refine_result(
     );
     let operands: Vec<crate::ccl::TypedExpr> =
         operand_exprs.iter().map(|e| (*e).duplicate()).collect();
-    refinement.refine(result, &operands)
+    refinement.refine(solver, result, &operands)
 }
 
 /// The declared parameter type an argument is passed at, or `None` when the callee is
@@ -1760,6 +1797,7 @@ pub(super) fn emit_binop<C: Typing>(
         OpSignature::Scheme(scheme, refinement) => {
             let result = apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at)?;
             Ok(refine_scheme_result(
+                ctx.solver(),
                 operator_node_id,
                 scheme,
                 result,
@@ -1796,6 +1834,7 @@ pub(super) fn emit_unary<C: Typing>(
         OpSignature::Scheme(scheme, refinement) => {
             let result = apply_unary_scheme(ctx, scheme, &inner_ty, &at)?;
             Ok(refine_scheme_result(
+                ctx.solver(),
                 operator_node_id,
                 scheme,
                 result,
@@ -2247,7 +2286,8 @@ pub(super) fn emit_disjoint_join<C: Typing>(
         })?;
         let cod = match &binder {
             Some(b) if crate::ccl::subst::references_enclosing_function(&cod) => {
-                crate::ccl::subst::open_pi_binder(
+                crate::ccl::subst::open_pi_binder_in(
+                    ctx.solver(),
                     &crate::ccl::subst::Mapping::Rename(b.clone()),
                     &cod,
                     crate::ccl::Ids::Fresh,
@@ -2785,9 +2825,18 @@ fn emit_let_bound<C: Typing>(
         // where the element reads it (`src/ccl/design/type-inference.md`, "A history's
         // value may depend on its position").
         let key = Name::fresh("__key");
-        let domain = Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level()));
+        let domain = Type::ChanDom(
+            binding.name.clone(),
+            crate::ccl::ChanLevel(dv.level(ctx.solver())),
+        );
         let element = ctx.scoped(&key, &domain, |ctx| ctx.fresh());
-        let handle = Type::history_keyed(key, domain, element, crate::ccl::HistoryKind::Append);
+        let handle = Type::history_keyed(
+            ctx.solver(),
+            key,
+            domain,
+            element,
+            crate::ccl::HistoryKind::Append,
+        );
         let body = body.expect("a `defer` is bound by a `let`, which has a body");
         ctx.note_feed_places(&binding.name, feed_places(&binding.name, body));
         bound_expr.ty = handle.clone();
@@ -2867,7 +2916,7 @@ fn emit_let_bound<C: Typing>(
         Some(Type::Poly(poly)) => {
             poisoned = false;
             at_annotation = true;
-            let declared = complete_annotation(&poly.body, &bound_ty);
+            let declared = complete_annotation(ctx.solver(), &poly.body, &bound_ty);
             // The annotation as written, over the completed body, for a mismatch.
             let shown = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
                 body: declared.clone(),
@@ -2899,7 +2948,7 @@ fn emit_let_bound<C: Typing>(
                 _ => {
                     // An annotation that is all hole declares the right-hand side's type.
                     at_annotation = !matches!(ann, Type::Hole);
-                    complete_annotation(ann, &bound_ty)
+                    complete_annotation(ctx.solver(), ann, &bound_ty)
                 }
             };
             match ctx.bind_annotation(&bound_ty, &declared) {
@@ -3028,8 +3077,8 @@ pub(super) fn emit_letrec<C: Typing>(
             // domain), it declares the value lambda's kind by provenance — stamp
             // it, so a `Compute`-by-construction accumulator body reconciles rather
             // than tripping the kind-mismatch reject in `require_sub`.
-            stamp_fun_kind_from(&mut def_ty, &declared[i].1);
-            stamp_fun_kind_from(&mut def.ty, &declared[i].1);
+            stamp_fun_kind_from(ctx.solver(), &mut def_ty, &declared[i].1);
+            stamp_fun_kind_from(ctx.solver(), &mut def.ty, &declared[i].1);
             let label = b.name.clone();
             ctx.require_sub(&def_ty, &declared[i].1, &|| {
                 format!("LetRec binding `{label}`")
@@ -3294,7 +3343,7 @@ pub(super) fn emit_proj<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (domain, codomain) = ctx.provide_function(node_ty, &|| projection(key))?;
-    let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
+    let codomain = crate::ccl::subst::open_codomain_in(ctx.solver(), node_ty, &codomain);
     // A dependent tuple's component is its type opened at the earlier components
     // of the projected value (`src/ccl/design/type-inference.md`, "Projection"),
     // and the projection's Pi binder names that value.
@@ -3321,7 +3370,7 @@ pub(super) fn emit_proj<C: Typing>(
         );
         // An index past the last component has no type; it falls to the plain tuple's
         // requirement below, which reports it as it does an index past a `Tuple`'s end.
-        if let Some(component) = domain.component_type(*k, |j, ty| {
+        if let Some(component) = domain.component_type_in(ctx.solver(), *k, |j, ty| {
             Expr::apply(
                 Expr::var(&binder).with_ty(domain.clone()),
                 Expr::proj_index(j).with_ty(Type::fun(domain.clone(), ty.clone())),
@@ -3527,19 +3576,26 @@ pub(super) fn emit_case<C: Typing>(
                 };
                 named.push(ctor.clone());
                 let _g = arm_facts_recording(scrut);
-                crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, Some(&p.binding))
-                    .unwrap_or_default()
+                crate::ccl::nominal::arm_facts(
+                    ctx.solver(),
+                    scrut,
+                    decl,
+                    args,
+                    ctor,
+                    Some(&p.binding),
+                )
+                .unwrap_or_default()
             }
             (Some((scrut, decl, args)), None) => {
                 let _g = arm_facts_recording(scrut);
-                crate::ccl::nominal::default_arm_facts(scrut, decl, args, &named)
+                crate::ccl::nominal::default_arm_facts(ctx.solver(), scrut, decl, args, &named)
                     .unwrap_or_default()
             }
             (None, _) => Vec::new(),
         };
         let narrowing = matched
             .as_ref()
-            .and_then(|(scrut, ..)| narrowing_of(scrut, &facts));
+            .and_then(|(scrut, ..)| narrowing_of(ctx.solver(), scrut, &facts));
         let emit_arm = |ctx: &mut C| match scope_info {
             Some((name, ty)) => {
                 let body_ty = ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?;
@@ -3558,7 +3614,7 @@ pub(super) fn emit_case<C: Typing>(
         .filter(|(_, decl, _)| crate::ccl::nominal::states_constructors(decl))
         .and_then(|(scrut, decl, args)| {
             let _g = arm_facts_recording(scrut);
-            derived_case_refinement(scrut, decl, args, branches, &result_ty)
+            derived_case_refinement(ctx.solver(), scrut, decl, args, branches, &result_ty)
         });
     Ok(match derived {
         Some(refinement) => Type::refined_one(result_ty, refinement),
@@ -3572,7 +3628,11 @@ pub(super) fn emit_case<C: Typing>(
 /// A scrutinee read through a projection, `𝑝.0`, narrows nothing: a refinement of `𝑝`'s type
 /// would ride the projection's recorded domain, and a call inlined later replaces `𝑝` with a
 /// term whose type a check derives without it. The arm's facts still hold in `Γ`.
-fn narrowing_of(scrut: &Expr, facts: &[Expr]) -> Option<(Name, Vec<Refinement>)> {
+fn narrowing_of(
+    solver: &mut Solver,
+    scrut: &Expr,
+    facts: &[Expr],
+) -> Option<(Name, Vec<Refinement>)> {
     let TypedExprNode::Var(root) = &scrut.node else {
         return None;
     };
@@ -3585,8 +3645,9 @@ fn narrowing_of(scrut: &Expr, facts: &[Expr]) -> Option<(Name, Vec<Refinement>)>
     let refinements = facts
         .iter()
         .map(|fact| {
-            let about_elem =
-                crate::ccl::lambda_elim::substitute(fact.clone_preserving_ids(), &root, &elem);
+            // Through this run's solver, as the facts' types hold its variables.
+            let mut about_elem = fact.clone_preserving_ids();
+            crate::ccl::subst::Subst::discharge_in_place_in(solver, &mut about_elem, &root, &elem);
             Refinement::born(std::rc::Rc::new(about_elem))
         })
         .collect();
@@ -3619,6 +3680,7 @@ fn arm_facts_recording(scrut: &Expr) -> crate::ccl::provenance::RecordingGuard {
 /// [`is_term`]: crate::ccl::infer::solver::smt::is_term
 /// [`arm_facts`]: crate::ccl::nominal::arm_facts
 fn derived_case_refinement(
+    solver: &mut Solver,
     scrut: &Expr,
     decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
     args: &[Type],
@@ -3640,28 +3702,38 @@ fn derived_case_refinement(
                     unreachable!("a `Case` names constructors of one nominal type or tags only")
                 };
                 named.push(ctor.clone());
-                let mut facts = crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, None)?;
-                let payload =
-                    crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, Some(&p.binding))?
-                        .into_iter()
-                        .nth(1)
-                        .and_then(|fact| match fact.node {
-                            TypedExprNode::BinOp { left, .. } => Some(*left),
-                            _ => None,
-                        });
-                let body = match payload {
-                    Some(payload) => crate::ccl::lambda_elim::substitute(
-                        b.body.clone_preserving_ids(),
+                let mut facts =
+                    crate::ccl::nominal::arm_facts(solver, scrut, decl, args, ctor, None)?;
+                let payload = crate::ccl::nominal::arm_facts(
+                    solver,
+                    scrut,
+                    decl,
+                    args,
+                    ctor,
+                    Some(&p.binding),
+                )?
+                .into_iter()
+                .nth(1)
+                .and_then(|fact| match fact.node {
+                    TypedExprNode::BinOp { left, .. } => Some(*left),
+                    _ => None,
+                });
+                // Discharged through this run's solver: the body's types hold its variables, and
+                // a suspension minted for one belongs with them.
+                let mut body = b.body.clone_preserving_ids();
+                if let Some(payload) = payload {
+                    crate::ccl::subst::Subst::discharge_in_place_in(
+                        solver,
+                        &mut body,
                         &p.binding.name,
                         &payload,
-                    ),
-                    None => b.body.clone_preserving_ids(),
-                };
+                    );
+                }
                 (std::mem::take(&mut facts), body)
             }
             // A default arm: no named constructor built the value.
             None => (
-                crate::ccl::nominal::default_arm_facts(scrut, decl, args, &named)?,
+                crate::ccl::nominal::default_arm_facts(solver, scrut, decl, args, &named)?,
                 b.body.clone_preserving_ids(),
             ),
         };
@@ -3726,7 +3798,7 @@ fn emit_nominal_scrutinee<C: Typing>(
             let tag = decl.tag(&c.name);
             let facts = {
                 let _g = arm_facts_recording(scrut);
-                crate::ccl::nominal::arm_facts(scrut, decl, &args, &c.name, None)
+                crate::ccl::nominal::arm_facts(ctx.solver(), scrut, decl, &args, &c.name, None)
             };
             if facts.is_some_and(|facts| ctx.refutes(facts, recorded.contains(&tag))) {
                 refuted.push(tag);
@@ -3760,7 +3832,7 @@ fn emit_nominal_scrutinee<C: Typing>(
                 decl.name
             )
         });
-        let mut payload = decl.instantiate(&ctor.destructured(), &args);
+        let mut payload = decl.instantiate(ctx.solver(), &ctor.destructured(), &args);
         ctx.type_annotation_predicates(&mut payload)?;
         let payload = ctx.normalize(&payload);
         let slot = ctx.binding_slot(&mut p.binding.ty);
@@ -3885,9 +3957,12 @@ pub(super) fn bind_selected_instance_function(
     else {
         return Ok(());
     };
-    let gathered: Option<Vec<Type>> = operands.iter().map(gathered_type).collect();
+    let gathered: Option<Vec<Type>> = operands
+        .iter()
+        .map(|x| gathered_type(ctx.solver(), x))
+        .collect();
     let at_own_types = gathered
-        .and_then(|operands| instance.bind(&operands))
+        .and_then(|operands| instance.bind(ctx.solver(), &operands))
         .is_some_and(|bound| {
             instance.params.iter().all(|p| {
                 bound
@@ -3902,10 +3977,10 @@ pub(super) fn bind_selected_instance_function(
 }
 
 /// The type `ty` states: itself, or the first bound its variable has gathered.
-fn gathered_type(ty: &Type) -> Option<Type> {
+fn gathered_type(solver: &mut Solver, ty: &Type) -> Option<Type> {
     use std::ops::ControlFlow;
     match ty.peel_refinements() {
-        Type::Infer(var) => for_each_gathered_bound(var, |b| ControlFlow::Break(b.clone())),
+        Type::Infer(var) => for_each_gathered_bound(solver, var, |b| ControlFlow::Break(b.clone())),
         Type::Hole | Type::SharedHole(_) => None,
         other => Some(other.clone()),
     }
@@ -3933,7 +4008,7 @@ fn require_stated(
             );
             TraitRequirement {
                 binders: Vec::new(),
-                ..r.with_binders_named(&fresh)
+                ..r.with_binders_named(&mut ctx.solver, &fresh)
             }
         };
         return under_binders(&fresh, ctx, &mut |ctx: &mut InferCtx| {
@@ -3988,7 +4063,7 @@ fn resolve_method<C: Typing>(
         unreachable!("`resolve_method` is called on a `Method`")
     };
     let receiver_ty = if *args > 0 {
-        first_component(arg_ty)
+        first_component(ctx.solver(), arg_ty)
     } else {
         Some(arg_ty.clone())
     };
@@ -3999,7 +4074,7 @@ fn resolve_method<C: Typing>(
     let Some(receiver_ty) = receiver_ty else {
         return Err(ctx.raise(unresolved(None)));
     };
-    let decl = match nominal_head(&read_through(&receiver_ty)) {
+    let decl = match nominal_head(ctx.solver(), &read_through(&receiver_ty)) {
         Head::Nominal(decl) => decl,
         Head::Unknown => return ctx.defer_method(function, &receiver_ty),
         Head::Other(ty) => return Err(ctx.raise(unresolved(Some(ty)))),
@@ -4020,9 +4095,10 @@ fn resolve_method<C: Typing>(
         unreachable!("`resolve_method` is called on a `Method`")
     };
     let Some(at) = reached_candidate(candidates, &decl, ctx) else {
+        let receiver = method_receiver(ctx.solver(), &decl, node);
         return Err(ctx.raise(InferError::UnresolvedMethod {
             method: name.clone(),
-            receiver: Some(method_receiver(&decl, node)),
+            receiver: Some(receiver),
         }));
     };
     let chosen = candidates.swap_remove(at);
@@ -4056,13 +4132,17 @@ fn reached_candidate<C: Typing>(
 /// `decl` applied to its own type parameters, the receiver an unresolved method call on it
 /// names. A family parameter is applied to terms naming its binders, which mint under the
 /// call's node.
-fn method_receiver(decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>, call: NodeId) -> Type {
+fn method_receiver(
+    solver: &mut Solver,
+    decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    call: NodeId,
+) -> Type {
     let _g = crate::ccl::provenance::enter(
         call,
         "infer.method_receiver",
         crate::ccl::provenance::Nature::Machinery,
     );
-    decl.applied_to_params(&mut |n, ty| Expr::var(n).with_ty(ty))
+    decl.applied_to_params(solver, &mut |n, ty| Expr::var(n).with_ty(ty))
 }
 
 /// Defer the method call whose placeholder is `function` until its receiver's type,
@@ -4104,7 +4184,7 @@ pub(super) fn defer_method(
             Some(at) => reached_target(&candidates[at], &name, args, ctx),
             None => Err(Box::new(InferError::UnresolvedMethod {
                 method: name.clone(),
-                receiver: Some(method_receiver(&decl, node)),
+                receiver: Some(method_receiver(ctx.solver(), &decl, node)),
             })),
         };
         reached_at.extend(at);
@@ -4202,6 +4282,7 @@ pub(super) fn instantiate_selected_methods(ctx: &mut InferCtx) -> Result<(), Loc
 /// refinements peeled. `f` sees every bound that is not a variable, and ends the walk with
 /// `Break`.
 fn for_each_gathered_bound<B>(
+    solver: &mut Solver,
     var: &std::rc::Rc<crate::ccl::InferVar>,
     mut f: impl FnMut(&Type) -> std::ops::ControlFlow<B>,
 ) -> Option<B> {
@@ -4211,7 +4292,7 @@ fn for_each_gathered_bound<B>(
         if !seen.insert(v.uid) {
             continue;
         }
-        let bounds = v.bounds.borrow();
+        let bounds = v.bounds(solver);
         for b in bounds.lower().iter().chain(bounds.upper().iter()) {
             match b.ty.peel_refinements() {
                 Type::Infer(next) => stack.push(std::rc::Rc::clone(next)),
@@ -4229,11 +4310,11 @@ fn for_each_gathered_bound<B>(
 /// The first component of the tuple `ty` is: directly, or through the bounds its variable
 /// has gathered, as when the argument tuple is named by a binding. `None` where nothing
 /// states a tuple yet.
-fn first_component(ty: &Type) -> Option<Type> {
+fn first_component(solver: &mut Solver, ty: &Type) -> Option<Type> {
     use std::ops::ControlFlow;
     match ty.peel_refinements() {
         Type::Tuple(elts) => elts.first().cloned(),
-        Type::Infer(var) => for_each_gathered_bound(var, |b| match b {
+        Type::Infer(var) => for_each_gathered_bound(solver, var, |b| match b {
             Type::Tuple(elts) => ControlFlow::Break(elts.first().cloned()),
             _ => ControlFlow::Continue(()),
         })
@@ -4258,13 +4339,13 @@ enum Head {
 
 /// The nominal type `ty` names: directly, or through the bounds its variable has
 /// gathered.
-fn nominal_head(ty: &Type) -> Head {
+fn nominal_head(solver: &mut Solver, ty: &Type) -> Head {
     use std::ops::ControlFlow;
     match ty.peel_refinements() {
         Type::Nominal(decl, _) => Head::Nominal(decl.clone()),
         Type::Infer(var) => {
             let mut found: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>> = None;
-            let two = for_each_gathered_bound(var, |b| match (b, &found) {
+            let two = for_each_gathered_bound(solver, var, |b| match (b, &found) {
                 (Type::Nominal(decl, _), Some(first)) if first != decl => {
                     ControlFlow::Break(Head::Two(first.clone(), decl.clone()))
                 }
@@ -4374,8 +4455,8 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
         )
     });
     let args = fresh_nominal_args(decl, ctx);
-    let expected =
-        crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&declared.payload(), &args));
+    let instantiated = decl.instantiate(ctx.solver(), &declared.payload(), &args);
+    let expected = crate::ccl::ccl_utils::strip_refinements_in(ctx.solver(), &instantiated);
     let expected = ctx.normalize(&expected);
     ctx.require_sub(&payload_ty, &expected, &|| {
         format!("the argument of constructor `{}::{ctor}`", decl.name)
@@ -4394,8 +4475,12 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
         decl: decl.clone(),
         ctor: ctor.into(),
     };
-    let refinements =
-        crate::ccl::nominal::ctor_refinements(&ctor, &args, payload.clone_preserving_ids());
+    let refinements = crate::ccl::nominal::ctor_refinements(
+        ctx.solver(),
+        &ctor,
+        &args,
+        payload.clone_preserving_ids(),
+    );
     Ok(Type::refined(
         Type::Nominal(decl.clone(), args),
         refinements,
@@ -4439,7 +4524,7 @@ fn fresh_nominal_args<C: Typing>(
             .map(|d| (Name::fresh("__family_k"), d))
             .collect();
         let body = under(&binders, ctx);
-        args[i] = Type::family(binders, body);
+        args[i] = Type::family(ctx.solver(), binders, body);
     }
     args
 }
@@ -4510,7 +4595,7 @@ fn compose_chain<C: Typing>(
             format!("Compose[{i}]")
         })?;
     }
-    let cod = crate::ccl::subst::open_codomain(&ty, &cod);
+    let cod = crate::ccl::subst::open_codomain_in(ctx.solver(), &ty, &cod);
     let own = match ty.peel_refinements() {
         Type::Fun { name, .. } => name.clone(),
         _ => None,
@@ -4594,20 +4679,28 @@ pub(super) fn emit_compose<C: Typing>(
     let last = elts.len() - 1;
     let cod = match &binders[last] {
         Some((x, item)) if *x != position => {
-            let at =
-                crate::ccl::ccl_utils::predicate_term(&crate::ccl::ccl_utils::read_at_position(
-                    &elts[..last],
-                    &position,
-                    &first_dom,
-                    item,
-                ));
+            let read = crate::ccl::ccl_utils::read_at_position(
+                ctx.solver(),
+                &elts[..last],
+                &position,
+                &first_dom,
+                item,
+            );
+            let at = crate::ccl::ccl_utils::predicate_term(ctx.solver(), &read);
             ctx.scoped(&position, &first_dom, |ctx| {
                 ctx.apply(&last_ty, item, &at, None, &|| "this expression".to_string())
             })?
         }
         _ => cod,
     };
-    let cod = crate::ccl::ccl_utils::over_input(elts, &binders[..last], &position, &first_dom, cod);
+    let cod = crate::ccl::ccl_utils::over_input(
+        ctx.solver(),
+        elts,
+        &binders[..last],
+        &position,
+        &first_dom,
+        cod,
+    );
     let names_position = crate::ccl::subst::type_free_vars(&cod).contains(&position)
         || (read && crate::ccl::subst::type_contains_infer(&cod));
     // A sum's binders are what its domain is under, and the chain's domain is its head's, so
@@ -4650,7 +4743,8 @@ pub(super) fn emit_compose<C: Typing>(
     let parts: Vec<Type> = elts.iter().map(|e| e.ty.clone()).collect();
     let capabilities = ctx.composed_capabilities(stamped.unwrap_or(recorded), &parts);
     let chain = if names_position {
-        Type::pi_kinded(position, first_dom, cod, fun_kind).with_capabilities(capabilities)
+        Type::pi_kinded_in(ctx.solver(), position, first_dom, cod, fun_kind)
+            .with_capabilities(capabilities)
     } else {
         Type::Fun {
             name: None,
@@ -4695,6 +4789,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 /// The terms the history types quote are minted for the `Transact` at `node_id`, whose type
 /// carries them into the tree.
 pub(super) fn writer_tap_histories(
+    solver: &mut Solver,
     domain: &Type,
     body_ty: &Type,
     source: &Expr,
@@ -4710,7 +4805,7 @@ pub(super) fn writer_tap_histories(
     else {
         return Vec::new();
     };
-    let codom = crate::ccl::subst::open_codomain(body_ty, codomain);
+    let codom = crate::ccl::subst::open_codomain_in(solver, body_ty, codomain);
     let Type::Record(fields) = codom.peel_refinements() else {
         return Vec::new();
     };
@@ -4811,7 +4906,7 @@ pub(super) fn writer_tap_histories(
             );
             (
                 f.clone(),
-                Type::pi_kinded(position, domain.clone(), t, FunKind::Data(None)),
+                Type::pi_kinded_in(solver, position, domain.clone(), t, FunKind::Data(None)),
             )
         })
         .collect()
@@ -4836,7 +4931,7 @@ fn emit_transact_writer<C: Typing>(
     // collection's own key its second.
     let pair = parameter.map(|p| (Name::fresh("__pair"), p));
     let body = writer.body.node_id();
-    let half = |i: usize| -> Option<std::rc::Rc<Expr>> {
+    let half = |ctx: &mut C, i: usize| -> Option<std::rc::Rc<Expr>> {
         let (pair, p) = pair.as_ref()?;
         // The reads are minted for the writer's body, whose input they type.
         let _g = crate::ccl::provenance::enter(
@@ -4851,6 +4946,7 @@ fn emit_transact_writer<C: Typing>(
                 let first =
                     std::rc::Rc::new(projected(whole.duplicate(), 0, enclosing_component(p)));
                 crate::ccl::subst::open_tuple_components(
+                    ctx.solver(),
                     parts,
                     |_, _| crate::ccl::subst::Mapping::Discharge(std::rc::Rc::clone(&first)),
                     crate::ccl::Ids::Fresh,
@@ -4874,9 +4970,9 @@ fn emit_transact_writer<C: Typing>(
             let codomain = ctx
                 .as_function(&s_ty, &|| "the transaction's source".to_string())?
                 .1;
-            match (s_ty.peel_refinements(), half(0)) {
+            match (s_ty.peel_refinements(), half(ctx, 0)) {
                 (Type::Fun { name: Some(e), .. }, Some(first)) => {
-                    crate::ccl::subst::discharge_codomain(e, &first, &codomain)
+                    crate::ccl::subst::discharge_codomain_in(ctx.solver(), e, &first, &codomain)
                 }
                 _ => codomain,
             }
@@ -4884,9 +4980,9 @@ fn emit_transact_writer<C: Typing>(
         None => s_ty,
     };
     let (_d, item) = ctx.as_function(&s_ty, &|| "the transaction's source".to_string())?;
-    let item = match (s_ty.peel_refinements(), half(1)) {
+    let item = match (s_ty.peel_refinements(), half(ctx, 1)) {
         (Type::Fun { name: Some(k), .. }, Some(second)) => {
-            crate::ccl::subst::discharge_codomain(k, &second, &item)
+            crate::ccl::subst::discharge_codomain_in(ctx.solver(), k, &second, &item)
         }
         _ => item,
     };
@@ -4945,7 +5041,10 @@ fn emit_transact_writer<C: Typing>(
     // alongside the slots, which is the term as elimination leaves it.
     let expected = match &pair {
         Some((pair, p)) => fun(
-            Type::dep_tuple(vec![(Some(pair.clone()), (*p).clone()), (None, body_dom)]),
+            Type::dep_tuple_in(
+                ctx.solver(),
+                vec![(Some(pair.clone()), (*p).clone()), (None, body_dom)],
+            ),
             decision_codom,
         ),
         None => fun(body_dom, decision_codom),
@@ -4989,7 +5088,7 @@ pub(super) fn emit_transact<C: Typing>(
     // parameter's position component, which reads the enclosing value by the parameter's name.
     let (enclosing, domain) = match parameter {
         Some(p) => {
-            let (name, position) = nested_parameter_parts(p);
+            let (name, position) = nested_parameter_parts(ctx.solver(), p);
             (name.unwrap_or_else(|| Name::fresh("__enclosing")), position)
         }
         None => (Name::fresh("__enclosing"), domain.clone()),
@@ -5031,6 +5130,7 @@ pub(super) fn emit_transact<C: Typing>(
         // writer's item for a transaction and by the loop's position for an induction.
         let enclosing_value = parameter.map(|p| (&enclosing, enclosing_component(p)));
         fields.extend(writer_tap_histories(
+            ctx.solver(),
             domain,
             &w.body.ty,
             &w.source,
@@ -5046,14 +5146,20 @@ pub(super) fn emit_transact<C: Typing>(
         None => Type::Record(fields),
         Some(p) => {
             let record = Type::Record(fields);
-            Type::fun_over(enclosing, enclosing_component(p), record, FunKind::Compute)
+            Type::fun_over_in(
+                ctx.solver(),
+                enclosing,
+                enclosing_component(p),
+                record,
+                FunKind::Compute,
+            )
         }
     })
 }
 
 /// The name a nested `Transact`'s `(enclosing, position)` parameter gives its enclosing value,
 /// if the position reads it, and the position's domain, reading it by that name.
-fn nested_parameter_parts(parameter: &Type) -> (Option<Name>, Type) {
+fn nested_parameter_parts(solver: &mut Solver, parameter: &Type) -> (Option<Name>, Type) {
     match parameter.peel_refinements() {
         Type::Tuple(parts) => (None, parts[1].clone()),
         Type::DepTuple(parts) => {
@@ -5062,6 +5168,7 @@ fn nested_parameter_parts(parameter: &Type) -> (Option<Name>, Type) {
                 .clone()
                 .unwrap_or_else(|| Name::fresh("__enclosing"));
             let position = crate::ccl::subst::open_tuple_components(
+                solver,
                 parts,
                 |_, _| crate::ccl::subst::Mapping::Rename(enclosing.clone()),
                 crate::ccl::Ids::Fresh,
@@ -5112,6 +5219,7 @@ pub(super) fn paths_are_canonical(paths: &[Vec<ProjKey>]) -> bool {
 /// several. An empty list is the registered type. The error is the key a path steps through
 /// that the type it steps from does not carry, with that type.
 pub(super) fn projected_source_type(
+    solver: &mut Solver,
     registered: &Type,
     paths: &[Vec<ProjKey>],
 ) -> Result<Type, (FieldKey, Type)> {
@@ -5136,7 +5244,12 @@ pub(super) fn projected_source_type(
         [only] => only.clone(),
         _ => Type::Tuple(leaves),
     };
-    Ok(Type::fun_like(registered, (**domain).clone(), value))
+    Ok(Type::fun_like_in(
+        solver,
+        registered,
+        (**domain).clone(),
+        value,
+    ))
 }
 
 /// The type of the field `key` of a tuple or a record of type `ty`.
@@ -5199,7 +5312,7 @@ mod review_tests {
 
         // Our stack seeds the blame cursor at construction; this unit test has no
         // enclosing tree, so the predicate term itself is the root to blame.
-        let mut ctx = InferCtx::new(HashMap::new(), shared.node_id());
+        let mut ctx = InferCtx::new(Solver::new(), HashMap::new(), shared.node_id());
         let d1 = ctx.fresh();
         let d2 = ctx.fresh();
         emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");
@@ -5209,7 +5322,7 @@ mod review_tests {
             let Type::Infer(v) = t else {
                 panic!("fresh() yields a variable");
             };
-            let b = v.bounds.borrow();
+            let b = v.bounds(&ctx.solver);
             b.lower().len() + b.upper().len()
         };
         assert!(
