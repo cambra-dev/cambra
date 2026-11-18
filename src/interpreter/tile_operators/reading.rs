@@ -402,6 +402,13 @@ impl TileProducer for ReadingsProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        if let Some(input) = &mut self.input {
+            visit("input", &mut **input);
+        }
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let Some(input) = &mut self.input else {
             if self.base.obsolete_guard.is_universal() {
