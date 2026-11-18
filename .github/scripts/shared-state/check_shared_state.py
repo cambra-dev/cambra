@@ -88,9 +88,15 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/mod.rs", "shared cell of `C`"),
     # `Notified::Flag`, the one-bit input-notified flag; see its type doc.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
-    # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
-    # type doc. The notification carries a region, which a one-bit flag cannot hold.
-    ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
+    # `DirtyRegion`, the regions a `Memo` must read: what it has not read and what its input
+    # has notified since; see its type doc. The input's consumer and the memo share it so a
+    # notification marks the region at once, and a notification carries a region, which a one-bit
+    # flag cannot hold.
+    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Projection`"),
+    # `BreakerHandle`, the cell owning one breaker subscription, shared by the breaker's reader,
+    # which pulls it, and the plan that drives its consumes; see its type doc. What crosses it is
+    # a call, and every value reaches the reader through `get`.
+    ("src/interpreter/tile_operators/breaker_reader.rs", "shared cell of `dyn BreakingProducer`"),
     # `Admission`'s region passed since the last pull, shared by an operator's gate and the
     # forwarders that read it on reentry, while the consumer behind the gate is borrowed.
     ("src/interpreter/scheduler.rs", "shared cell of `Projection`"),
