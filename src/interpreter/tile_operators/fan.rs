@@ -2,6 +2,7 @@
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use bit_set::BitSet;
 
@@ -26,7 +27,7 @@ pub struct Zip {
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<SmolStr>,
     /// The input collections to pair.
-    inputs: Vec<Box<dyn TileOperator>>,
+    inputs: Vec<Arc<dyn TileOperator>>,
     /// The level the record sits at — the values every standing level is over.
     level: CurryLevel,
 }
@@ -52,7 +53,7 @@ impl Zip {
     /// are the ones the operands were applied over. Two arms that agree beneath them (two
     /// projections of one grouped row, say) look pairable all the way down, and two that
     /// differ there are the collection-valued component case.
-    pub fn new_at(names: Vec<SmolStr>, ops: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Self {
+    pub fn new_at(names: Vec<SmolStr>, ops: Vec<Arc<dyn TileOperator>>, level: CurryLevel) -> Self {
         assert!(!ops.is_empty(), "Zip requires at least one input");
         assert!(
             level != CurryLevel::OUTERMOST,
@@ -109,29 +110,29 @@ impl Zip {
 /// them. See the "CCL types vs. tilings" section of
 /// [`design-operators.md`](./design-operators.md) for why the same CCL-level `zip` compiles
 /// to two different tile operators.
-pub fn zip_arms_at(inputs: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Box<dyn TileOperator> {
+pub fn zip_arms_at(inputs: Vec<Arc<dyn TileOperator>>, level: CurryLevel) -> Arc<dyn TileOperator> {
     if inputs.iter().all(|op| op.tiling().is_scalar()) {
-        return Box::new(MakeRecord::new(inputs));
+        return Arc::new(MakeRecord::new(inputs));
     }
     let names = (0..inputs.len()).map(tuple_field).collect();
-    Box::new(Zip::new_at(names, inputs, level))
+    Arc::new(Zip::new_at(names, inputs, level))
 }
 
 /// Named-field variant of [`zip_arms_at`], for record literals.
 pub fn zip_arms_named_at(
-    inputs: Vec<(SmolStr, Box<dyn TileOperator>)>,
+    inputs: Vec<(SmolStr, Arc<dyn TileOperator>)>,
     level: CurryLevel,
-) -> Box<dyn TileOperator> {
+) -> Arc<dyn TileOperator> {
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
-        return Box::new(MakeRecord::new_named(inputs));
+        return Arc::new(MakeRecord::new_named(inputs));
     }
     // A lone arm over a collection has nothing to pair with, so its values are wrapped in place.
     let inputs = match <[_; 1]>::try_from(inputs) {
-        Ok([(name, input)]) => return Box::new(RecordWrap::new_at(name, input, level)),
+        Ok([(name, input)]) => return Arc::new(RecordWrap::new_at(name, input, level)),
         Err(inputs) => inputs,
     };
     let (names, ops) = inputs.into_iter().unzip();
-    Box::new(Zip::new_at(names, ops, level))
+    Arc::new(Zip::new_at(names, ops, level))
 }
 
 /// The values at `level` of its input, wrapped in a one-field record, under the levels
@@ -147,14 +148,14 @@ pub struct RecordWrap {
     /// Output tiling: the standing levels, with a one-field `Record` where the values sat.
     base: OperatorBase,
     name: SmolStr,
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The level the record sits at — the values every standing level is over.
     level: CurryLevel,
 }
 
 impl RecordWrap {
     /// Wrap the values `input` holds at `level` as the field `name`.
-    pub fn new_at(name: SmolStr, input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+    pub fn new_at(name: SmolStr, input: Arc<dyn TileOperator>, level: CurryLevel) -> Self {
         assert!(
             level != CurryLevel::OUTERMOST,
             "RecordWrap wraps the values of a collection, beneath at least one standing level"
@@ -186,21 +187,22 @@ impl TileOperator for RecordWrap {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let consumer =
             crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
-        let input = self
-            .input
-            .subscribe(self.input.tiling().universal_guard(), consumer, cx);
+        let input =
+            self.input
+                .clone()
+                .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(RecordWrapProducer {
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             name: self.name.clone(),
@@ -278,7 +280,7 @@ impl TileOperator for Zip {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -288,16 +290,16 @@ impl TileOperator for Zip {
         let shared = shared_consumer(consumer);
         Box::new(ZipProducer {
             dropped_rows: Default::default(),
-            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), self.clone(), cx),
             names: self.names.clone(),
             level: self.level,
-            held: RefCell::new(vec![HashSet::new(); self.inputs.len()]),
-            emitted: RefCell::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); self.inputs.len()]),
+            emitted: RwLock::new(Predicate::False),
             inputs: self
                 .inputs
-                .iter_mut()
+                .iter()
                 // Every arm is pulled at the projection: the arms share the pair's keys.
-                .map(|i| subscribe_forwarding_keeping_keys(&mut **i, &shared, cx))
+                .map(|i| subscribe_forwarding_keeping_keys(i, &shared, cx))
                 .collect(),
         })
     }
@@ -325,7 +327,7 @@ fn qualify_beneath(tile: &mut Tile, rows: &Predicate) {
 struct ZipProducer {
     // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
     // no other operator holds it.
-    dropped_rows: RefCell<HashMap<usize, TileGuard>>,
+    dropped_rows: RwLock<HashMap<usize, TileGuard>>,
     base: ProducerBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<SmolStr>,
@@ -337,12 +339,12 @@ struct ZipProducer {
     /// arm gives back only a row it held.
     // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
     // no other operator holds it.
-    held: RefCell<Vec<HashSet<Vec<Value>>>>,
+    held: RwLock<Vec<HashSet<Vec<Value>>>>,
     /// The keys of the pairs a flat zip has emitted, whose cells a consumer may give back
     /// field by field ([`ZipProducer::release_impl`]).
     // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
     // no other operator holds it.
-    emitted: RefCell<Predicate>,
+    emitted: RwLock<Predicate>,
 }
 
 impl TileProducer for ZipProducer {
@@ -413,7 +415,8 @@ impl TileProducer for ZipProducer {
             .collect();
         // A release covering a row the arm never held, one its input never had, gives
         // nothing back: the row is absent from that arm, and so from the pair.
-        let mut held = std::mem::take(&mut *self.held.borrow_mut());
+        let mut held =
+            std::mem::take(&mut *self.held.write().unwrap_or_else(PoisonError::into_inner));
         if let Some(rows_level) = self.level.enclosing() {
             for (arm, tile) in tiles.iter().enumerate() {
                 if tile.is_data_function() {
@@ -678,7 +681,10 @@ impl TileProducer for ZipProducer {
                 for (arm, dropped) in dropped.into_iter().enumerate() {
                     if let Some(dropped) = dropped {
                         held[arm].retain(|path| !dropped.covers_path(path));
-                        let mut dropped_rows = self.dropped_rows.borrow_mut();
+                        let mut dropped_rows = self
+                            .dropped_rows
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner);
                         let released = match dropped_rows.remove(&arm) {
                             Some(before) => before.union(&dropped),
                             None => dropped,
@@ -742,7 +748,7 @@ impl TileProducer for ZipProducer {
                     let vouched = held.union(domain_predicate);
                     qualify_beneath(out.values_at_mut(self.level), &vouched);
                 }
-                *self.held.borrow_mut() = held;
+                *self.held.write().unwrap_or_else(PoisonError::into_inner) = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
                 if !self.base.obsolete_guard.is_empty() {
@@ -751,9 +757,10 @@ impl TileProducer for ZipProducer {
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
                     let emitted = self
                         .emitted
-                        .borrow()
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .union(&Predicate::from_column_value(domain));
-                    *self.emitted.borrow_mut() = emitted;
+                    *self.emitted.write().unwrap_or_else(PoisonError::into_inner) = emitted;
                 }
                 // The completeness intersected above is each arm's, which an arm restating fewer
                 // levels than the projection's states over the region it was pulled at, so it is
@@ -766,7 +773,11 @@ impl TileProducer for ZipProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        for (arm, dropped) in std::mem::take(self.dropped_rows.get_mut()) {
+        for (arm, dropped) in std::mem::take(
+            self.dropped_rows
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
             self.inputs[arm].release(dropped);
         }
 
@@ -780,7 +791,10 @@ impl TileProducer for ZipProducer {
         // levels only whole pairs are passed on.
         let delivered = match level {
             1 => obsolete_guard.intersect(&TileGuard::Function(FunctionGuard::Domain(
-                self.emitted.borrow().clone(),
+                self.emitted
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
             ))),
             _ => self.base.tiling.empty_guard(),
         };
@@ -807,14 +821,24 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
-        for paths in self.held.get_mut() {
+        for paths in self.held.get_mut().unwrap_or_else(PoisonError::into_inner) {
             paths.retain(|path| !whole.covers_path(path));
         }
         if whole.is_universal() {
-            *self.emitted.get_mut() = Predicate::False;
+            *self
+                .emitted
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner) = Predicate::False;
         } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
-            let emitted = self.emitted.borrow().minus(keys);
-            *self.emitted.get_mut() = emitted;
+            let emitted = self
+                .emitted
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .minus(keys);
+            *self
+                .emitted
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner) = emitted;
         }
     }
 }
@@ -891,14 +915,14 @@ pub struct MakeRecord {
     base: OperatorBase,
     /// Field names in input order, used when producing `Tile::Record` tiles.
     names: Vec<SmolStr>,
-    inputs: Vec<Box<dyn TileOperator>>,
+    inputs: Vec<Arc<dyn TileOperator>>,
 }
 
 impl MakeRecord {
     /// Construct a `MakeRecord` whose fields are `inputs`, named `_0`, `_1`, … in order.
     ///
     /// Each field keeps its input's tiling, whatever that is.
-    pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
+    pub fn new(inputs: Vec<Arc<dyn TileOperator>>) -> Self {
         assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let names = (0..inputs.len()).map(tuple_field).collect();
         Self::new_impl(names, inputs)
@@ -908,13 +932,13 @@ impl MakeRecord {
     ///
     /// Like [`Self::new`] but uses the caller-supplied field names instead of
     /// the synthetic `_0`, `_1`, … names used for tuples.
-    pub fn new_named(inputs: Vec<(SmolStr, Box<dyn TileOperator>)>) -> Self {
+    pub fn new_named(inputs: Vec<(SmolStr, Arc<dyn TileOperator>)>) -> Self {
         assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let (names, ops) = inputs.into_iter().unzip();
         Self::new_impl(names, ops)
     }
 
-    fn new_impl(names: Vec<SmolStr>, inputs: Vec<Box<dyn TileOperator>>) -> Self {
+    fn new_impl(names: Vec<SmolStr>, inputs: Vec<Arc<dyn TileOperator>>) -> Self {
         let tiling = Tiling::Record(
             names
                 .iter()
@@ -940,7 +964,7 @@ impl TileOperator for MakeRecord {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -950,14 +974,14 @@ impl TileOperator for MakeRecord {
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             names: self.names.clone(),
             inputs: self
                 .inputs
-                .iter_mut()
-                .map(|i| subscribe_forwarding(&mut **i, &shared, cx))
+                .iter()
+                .map(|i| subscribe_forwarding(i, &shared, cx))
                 .collect(),
         })
     }
@@ -1046,7 +1070,7 @@ impl TileProducer for MakeRecordProducer {
 pub struct SelectField {
     base: OperatorBase,
     /// The product whose field this selects.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The field's name — `_0`, `_1`, … for a tuple.
     name: SmolStr,
 }
@@ -1130,7 +1154,7 @@ impl SelectField {
     /// # Panics
     ///
     /// Panics unless `input`'s deepest values are a `Tiling::Record` holding `name`.
-    pub fn new(input: Box<dyn TileOperator>, name: impl Into<SmolStr>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, name: impl Into<SmolStr>) -> Self {
         let name = name.into();
         let tiling = select_field_tiling(input.tiling(), &name);
         Self {
@@ -1149,7 +1173,7 @@ impl TileOperator for SelectField {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -1159,7 +1183,7 @@ impl TileOperator for SelectField {
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
-        let input_producer = self.input.subscribe(
+        let input_producer = self.input.clone().subscribe(
             input_tiling.universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
             cx,
@@ -1169,7 +1193,7 @@ impl TileOperator for SelectField {
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             input: input_producer,
@@ -1309,15 +1333,15 @@ mod nested_projection_tests {
         ProjectionSpyOp, assert_conforms_beneath, two_levels_of_ints,
     };
 
-    fn spy() -> Box<dyn TileOperator> {
+    fn spy() -> Arc<dyn TileOperator> {
         let (tile, tiling) = two_levels_of_ints();
-        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+        Arc::new(ProjectionSpyOp::new(tile, tiling).0)
     }
 
     #[test]
     fn a_wrap_beneath_two_levels_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
-            Box::new(RecordWrap::new_at("a".into(), spy(), CurryLevel::new(2)))
+            Arc::new(RecordWrap::new_at("a".into(), spy(), CurryLevel::new(2)))
         });
     }
 
@@ -1330,27 +1354,32 @@ mod nested_projection_tests {
     #[test]
     fn a_zip_restates_an_arms_inner_rows_as_the_groups_it_pairs() {
         use crate::interpreter::tile_operators::test_helpers::{
-            InputConsumer, NotifyingOp, RegionLog, notify_input,
+            InputConsumer, NotifyingOp, RegionLog, notify_input, subscribed,
         };
         use crate::interpreter::{Predicate, Value};
         let (tile, tiling) = two_levels_of_ints();
         let (left, left_consumer) = NotifyingOp::new(tile.clone(), tiling.clone());
         let (right, _) = NotifyingOp::new(tile, tiling.clone());
-        let mut zip = Zip::new_at(
+        let zip = Arc::new(Zip::new_at(
             vec!["a".into(), "b".into()],
-            vec![Box::new(left), Box::new(right)],
+            vec![Arc::new(left), Arc::new(right)],
             CurryLevel::new(1),
-        );
+        ));
         let (log, regions) = RegionLog::new();
         let mut cx = SubscribeContext::new();
-        let _producer = zip.subscribe(tiling.empty_guard(), Box::new(log), &mut cx);
+        let _producer = zip
+            .clone()
+            .subscribe(tiling.empty_guard(), Box::new(log), &mut cx);
         let row = Projection::of_path(&[Value::UInt(0), Value::UInt(1)]);
         let group = Projection::admitting(Predicate::point(Value::UInt(0)));
 
-        regions.borrow_mut().clear();
+        regions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         notify_input(&left_consumer, &row);
         assert_eq!(
-            *regions.borrow(),
+            *regions.read().unwrap_or_else(PoisonError::into_inner),
             std::slice::from_ref(&group),
             "a change of a row names its group"
         );
@@ -1359,23 +1388,25 @@ mod nested_projection_tests {
             let mut landing = crate::interpreter::dispatcher::Landing::probe_complete(
                 crate::interpreter::dispatcher::PipelineId(0),
             );
-            consumer
-                .borrow_mut()
-                .as_mut()
-                .expect("the arm was subscribed")
-                .notify(region, &mut landing);
+            subscribed(consumer).notify(region, &mut landing);
         };
-        regions.borrow_mut().clear();
+        regions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         complete(&left_consumer, &row);
         assert_eq!(
-            *regions.borrow(),
+            *regions.read().unwrap_or_else(PoisonError::into_inner),
             [Projection::Nothing],
             "a complete row of a group completes no group"
         );
-        regions.borrow_mut().clear();
+        regions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         complete(&left_consumer, &group);
         assert_eq!(
-            *regions.borrow(),
+            *regions.read().unwrap_or_else(PoisonError::into_inner),
             [group],
             "a complete group completes the pair's group"
         );
@@ -1384,7 +1415,7 @@ mod nested_projection_tests {
     #[test]
     fn a_zip_beneath_two_levels_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
-            Box::new(Zip::new_at(
+            Arc::new(Zip::new_at(
                 vec!["a".into(), "b".into()],
                 vec![spy(), spy()],
                 CurryLevel::new(2),
@@ -1401,13 +1432,12 @@ mod tests {
     };
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
-    use std::cell::RefCell;
 
     fn record_wrap_over(
         input_tile: Tile,
         input_tiling: Tiling,
         name: &str,
-    ) -> (RecordWrapProducer, Rc<RefCell<Vec<TileGuard>>>) {
+    ) -> (RecordWrapProducer, Arc<RwLock<Vec<TileGuard>>>) {
         let (spy, log) = ReleaseSpy::new(input_tile, input_tiling.clone());
         let level = CurryLevel::new(1);
         let record = Tiling::Record(
@@ -1467,9 +1497,12 @@ mod tests {
         let (mut producer, log) = record_wrap_over(tile, tiling, "f");
         producer.release(producer.tiling().universal_guard());
         assert!(
-            log.borrow().iter().any(|g| g.is_universal()),
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|g| g.is_universal()),
             "the universal release reaches the input, saw {:?}",
-            log.borrow()
+            log.read().unwrap_or_else(PoisonError::into_inner)
         );
     }
 
@@ -1481,7 +1514,7 @@ mod tests {
         let key_zero = Predicate::at_or_below(Value::UInt(0));
         producer.release(TileGuard::Function(FunctionGuard::Domain(key_zero.clone())));
         assert_eq!(
-            *log.borrow(),
+            *log.read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Domain(key_zero))],
             "key 0 of the record is key 0 of the input"
         );
@@ -1507,7 +1540,7 @@ mod tests {
             field,
         ))));
         assert_eq!(
-            *log.borrow(),
+            *log.read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Codomain(Box::new(
                 key_zero.clone()
             )))],
@@ -1539,7 +1572,7 @@ mod tests {
 
         producer.release(out_tiling.universal_guard());
         for (i, log) in logs.iter().enumerate() {
-            let seen = log.borrow();
+            let seen = log.read().unwrap_or_else(PoisonError::into_inner);
             assert!(
                 seen.iter().any(|g| g.is_universal()),
                 "operand {i} should have been released universally, saw {seen:?}"
@@ -1561,7 +1594,9 @@ mod tests {
 
         producer.release(out_tiling.empty_guard());
         assert!(
-            log.borrow().is_empty(),
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
             "an empty release names nothing to free, so nothing is forwarded"
         );
     }
@@ -1607,14 +1642,18 @@ mod tests {
         producer.release(partial);
 
         assert_eq!(
-            *logs[0].borrow(),
+            *logs[0].read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Scalar(Predicate::True)],
             "the named field's operand is released",
         );
         assert!(
-            logs[1].borrow().iter().all(TileGuard::is_empty),
+            logs[1]
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .all(TileGuard::is_empty),
             "the other operand is not, got {:?}",
-            logs[1].borrow(),
+            logs[1].read().unwrap_or_else(PoisonError::into_inner),
         );
     }
 
@@ -1649,7 +1688,7 @@ mod tests {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -1667,7 +1706,7 @@ mod tests {
     #[test]
     fn select_field_extends_its_input_correlation_by_the_field() {
         let select = SelectField::new(
-            Box::new(Correlated {
+            Arc::new(Correlated {
                 tiling: record_under_a_level(),
                 correlation: vec![TilePathStep::Codomain],
             }),
@@ -1703,7 +1742,10 @@ mod tests {
             0,
         ))));
         producer.release(rows.clone());
-        assert_eq!(*log.borrow(), vec![rows]);
+        assert_eq!(
+            *log.read().unwrap_or_else(PoisonError::into_inner),
+            vec![rows]
+        );
     }
 
     #[test]
@@ -1799,15 +1841,21 @@ mod tests {
             input_tiling,
         };
         producer.read_in_pipeline(producer.tiling().universal_guard());
-        assert!(log.borrow().is_empty(), "reads must not release inputs");
+        assert!(
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "reads must not release inputs"
+        );
         producer.release(Projection::Nothing.guard(producer.tiling()));
         assert!(
-            log.borrow()
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| matches!(g, TileGuard::Record(fields)
                 if fields.get("xs").is_some_and(|g| names_key(g, 1, 0)))),
             "the field's row 1 is released: {:?}",
-            log.borrow(),
+            log.read().unwrap_or_else(PoisonError::into_inner),
         );
     }
 
@@ -1886,20 +1934,32 @@ mod tests {
         let mut zip = ZipProducer {
             dropped_rows: Default::default(),
             level: CurryLevel::new(1),
-            held: RefCell::new(vec![HashSet::new(); 2]),
-            emitted: RefCell::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".into(), "b".into()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
         zip.read_in_pipeline(zip.tiling().universal_guard());
-        assert!(log_a.borrow().is_empty() && log_b.borrow().is_empty());
+        assert!(
+            log_a
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && log_b
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
         zip.release(Projection::Nothing.guard(zip.tiling()));
         for log in [log_a, log_b] {
             assert!(
-                log.borrow().iter().any(|g| names_key(g, 1, 0)),
+                log.read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|g| names_key(g, 1, 0)),
                 "each input's row 1 is released: {:?}",
-                log.borrow(),
+                log.read().unwrap_or_else(PoisonError::into_inner),
             );
         }
     }
@@ -1939,8 +1999,8 @@ mod tests {
         let mut zip = ZipProducer {
             dropped_rows: Default::default(),
             level: CurryLevel::new(1),
-            held: RefCell::new(vec![HashSet::new(); 2]),
-            emitted: RefCell::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".into(), "b".into()],
             inputs: vec![
@@ -2023,8 +2083,8 @@ mod tests {
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            emitted: RefCell::new(Predicate::False),
-            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
         };
         let Tile::DataFunction { absent_keys, .. } =
             zip.read_in_pipeline(out_tiling.universal_guard())
@@ -2080,8 +2140,8 @@ mod tests {
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            held: RefCell::new(vec![HashSet::new(); 2]),
-            emitted: RefCell::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
         };
         let out = zip.read_in_pipeline(out_tiling.universal_guard());
         let guard = out.to_guard();
@@ -2090,20 +2150,21 @@ mod tests {
         // value there is whole once delivered, so it is released at its row — for that arm,
         // its key 0 — and the collection arm is released the inner key it delivered beneath
         // key 0.
-        let covers = |log: &Rc<RefCell<Vec<TileGuard>>>, path: &[Value]| {
-            log.borrow()
+        let covers = |log: &Arc<RwLock<Vec<TileGuard>>>, path: &[Value]| {
+            log.read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
         };
         assert!(
             covers(&released0, &[Value::UInt(0)]),
             "the scalar arm was not released its taken value: {:?}, from {guard:?}",
-            released0.borrow()
+            released0.read().unwrap_or_else(PoisonError::into_inner)
         );
         assert!(
             covers(&released1, &[Value::UInt(0), Value::UInt(3)]),
             "the collection arm was not released its inner key: {:?}, from {guard:?}",
-            released1.borrow()
+            released1.read().unwrap_or_else(PoisonError::into_inner)
         );
         // The row stays while its collection is open, holding no cell of the scalar field.
         let Tile::DataFunction {
@@ -2126,7 +2187,7 @@ mod tests {
             Predicate::point(Value::UInt(0)),
         )));
         for (log, tiling) in [(&released0, &arm0_tiling), (&released1, &arm1_tiling)] {
-            for g in log.borrow().iter() {
+            for g in log.read().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(
                     g.check_from(tiling),
                     "{g:?} is not a guard over the arm's tiling {tiling}"
@@ -2135,7 +2196,7 @@ mod tests {
             assert!(
                 covers(log, &[Value::UInt(0)]),
                 "an arm was not released key 0: {:?}",
-                log.borrow()
+                log.read().unwrap_or_else(PoisonError::into_inner)
             );
         }
     }
@@ -2176,8 +2237,8 @@ mod tests {
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            held: RefCell::new(vec![HashSet::new(); 2]),
-            emitted: RefCell::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
         // A consumer done with field `_0` at every row.
@@ -2189,19 +2250,20 @@ mod tests {
         ))));
         let covers = |path: &[Value]| {
             released0
-                .borrow()
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
         };
         assert!(
             covers(&[Value::UInt(0)]),
             "arm 0 was not released the row the pair emitted: {:?}",
-            released0.borrow()
+            released0.read().unwrap_or_else(PoisonError::into_inner)
         );
         assert!(
             !covers(&[Value::UInt(1)]),
             "arm 0 was released row 1, which arm 1 has not reached: {:?}",
-            released0.borrow()
+            released0.read().unwrap_or_else(PoisonError::into_inner)
         );
         let other_field = TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
@@ -2214,29 +2276,43 @@ mod tests {
         zip.release(other_field.intersect(&first_row));
         assert!(
             zip.held
-                .borrow()
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .all(|paths| !paths.contains(&vec![Value::UInt(0)])),
             "a released pair must leave the row-tracking state"
         );
         assert!(
-            zip.held.borrow()[0].contains(&vec![Value::UInt(1)]),
+            zip.held.read().unwrap_or_else(PoisonError::into_inner)[0]
+                .contains(&vec![Value::UInt(1)]),
             "an unpaired row stays held until released"
         );
         assert!(
-            !zip.emitted.borrow().contains(&Value::UInt(0)),
+            !zip.emitted
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&Value::UInt(0)),
             "a released pair must leave the emitted-key predicate"
         );
         zip.release(out_tiling.universal_guard());
-        assert!(zip.held.borrow().iter().all(HashSet::is_empty));
-        assert_eq!(*zip.emitted.borrow(), Predicate::False);
+        assert!(
+            zip.held
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .all(HashSet::is_empty)
+        );
+        assert_eq!(
+            *zip.emitted.read().unwrap_or_else(PoisonError::into_inner),
+            Predicate::False
+        );
     }
 
     /// An arm whose tile a test sets between pulls, returned as it stands, deleted rows
     /// included.
     struct Scripted {
         base: ProducerBase,
-        tile: Rc<RefCell<Tile>>,
+        tile: Arc<RwLock<Tile>>,
     }
 
     impl TileProducer for Scripted {
@@ -2247,7 +2323,10 @@ mod tests {
         }
 
         fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
-            self.tile.borrow().clone()
+            self.tile
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -2270,8 +2349,8 @@ mod tests {
             )
         };
         // Arm 0 holds rows 0 and 1, arm 1 row 0.
-        let arm0 = Rc::new(RefCell::new(rows(vec![0, 1], BitSet::new())));
-        let arm1 = Rc::new(RefCell::new(rows(vec![0], BitSet::new())));
+        let arm0 = Arc::new(RwLock::new(rows(vec![0, 1], BitSet::new())));
+        let arm1 = Arc::new(RwLock::new(rows(vec![0], BitSet::new())));
         let out_tiling = Tiling::data_function(
             uint(),
             Tiling::Record(HashMap::from([
@@ -2279,10 +2358,10 @@ mod tests {
                 (tuple_field(1), Tiling::Scalar(int())),
             ])),
         );
-        let scripted = |tile: &Rc<RefCell<Tile>>| -> Box<dyn TileProducer> {
+        let scripted = |tile: &Arc<RwLock<Tile>>| -> Box<dyn TileProducer> {
             Box::new(Scripted {
                 base: ProducerBase::unowned(Scripted::alloc_id(), &arm_tiling),
-                tile: Rc::clone(tile),
+                tile: Arc::clone(tile),
             })
         };
         let mut zip = ZipProducer {
@@ -2291,19 +2370,27 @@ mod tests {
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![scripted(&arm0), scripted(&arm1)],
             level: CurryLevel::new(1),
-            held: RefCell::new(vec![HashSet::new(); 2]),
-            emitted: RefCell::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
-        assert!(zip.held.borrow()[0].contains(&vec![Value::UInt(1)]));
+        assert!(
+            zip.held.read().unwrap_or_else(PoisonError::into_inner)[0]
+                .contains(&vec![Value::UInt(1)])
+        );
         // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
-        *arm0.borrow_mut() = rows(vec![0, 1], BitSet::from_iter([1]));
+        *arm0.write().unwrap_or_else(PoisonError::into_inner) =
+            rows(vec![0, 1], BitSet::from_iter([1]));
         zip.read_in_pipeline(out_tiling.universal_guard());
         zip.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::exactly(&[Value::UInt(0)]),
         )));
         assert!(
-            zip.held.borrow().iter().all(HashSet::is_empty),
+            zip.held
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .all(HashSet::is_empty),
             "a deleted row stays tracked: {:?}",
             zip.held
         );
@@ -2361,10 +2448,10 @@ mod tests {
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(2),
-            emitted: RefCell::new(Predicate::False),
+            emitted: RwLock::new(Predicate::False),
             // Arm `_0` held both rows before the consumer released its field, so it gives them
             // back rather than lacking them.
-            held: RefCell::new(vec![
+            held: RwLock::new(vec![
                 HashSet::from([
                     vec![Value::UInt(0), Value::UInt(7)],
                     vec![Value::UInt(1), Value::UInt(7)],
@@ -2483,8 +2570,8 @@ mod tests {
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(2),
-            emitted: RefCell::new(Predicate::False),
-            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RwLock::new(Predicate::False),
+            held: RwLock::new(vec![HashSet::new(); 2]),
         };
         let Tile::DataFunction { domain, .. } = zip.read_in_pipeline(out_tiling.universal_guard())
         else {
@@ -2557,7 +2644,10 @@ mod projection_tests {
             panic!("a collection")
         };
         assert_eq!(domain.len(), 3);
-        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 4)]
+        );
     }
 
     #[test]
@@ -2618,7 +2708,10 @@ mod projection_tests {
         let (mut select, pulled) = amounts_of_records();
         let morsel = select.read_in_pipeline(keys_between(1, 3));
         assert_eq!(int_entries(&morsel), [(1, 101), (2, 102), (3, 103)]);
-        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 3)]
+        );
     }
 
     #[test]
@@ -2664,7 +2757,10 @@ mod projection_tests {
         let (mut select, pulled) = make();
         let morsel = select.read_in_pipeline(keys_between(2, 3));
         assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
-        assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [product_tiling.universal_guard()]
+        );
         assert_conforms(|| Box::new(make().0), keys_between(2, 3));
     }
 
@@ -2691,8 +2787,8 @@ mod projection_tests {
                 names: vec![tuple_field(0), tuple_field(1)],
                 inputs: vec![Box::new(a), Box::new(b)],
                 level: CurryLevel::new(1),
-                emitted: RefCell::new(Predicate::False),
-                held: RefCell::new(vec![HashSet::new(); 2]),
+                emitted: RwLock::new(Predicate::False),
+                held: RwLock::new(vec![HashSet::new(); 2]),
             },
             a_pulled,
             b_pulled,
@@ -2717,8 +2813,14 @@ mod projection_tests {
             unreachable!("a morsel is a domain guard")
         };
         assert_eq!(*domain_predicate, stated);
-        assert_eq!(*a_pulled.borrow(), [keys_between(2, 4)]);
-        assert_eq!(*b_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(
+            *a_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 4)]
+        );
+        assert_eq!(
+            *b_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 4)]
+        );
     }
 
     /// An arm that has delivered less pairs only the keys both hold, and the pair is complete
@@ -2756,7 +2858,16 @@ mod projection_tests {
         let (zip, a_pulled, b_pulled) = pair(ROWS as usize);
         let nothing = zip.tiling().empty_guard();
         assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
-        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+        assert!(
+            a_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && b_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     /// `(a: 1, b: 2)`: a record of two values, each pulled whole.
@@ -2793,8 +2904,14 @@ mod projection_tests {
         };
         assert_eq!(fields.len(), 2);
         let scalar = Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard();
-        assert_eq!(*a_pulled.borrow(), std::slice::from_ref(&scalar));
-        assert_eq!(*b_pulled.borrow(), [scalar]);
+        assert_eq!(
+            *a_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            std::slice::from_ref(&scalar)
+        );
+        assert_eq!(
+            *b_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [scalar]
+        );
     }
 
     #[test]
@@ -2802,7 +2919,16 @@ mod projection_tests {
         let (record, a_pulled, b_pulled) = two_values();
         let nothing = record.tiling().empty_guard();
         assert_eq!(record.get(nothing), record.tiling().empty_tile());
-        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+        assert!(
+            a_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && b_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     #[test]
@@ -2817,6 +2943,11 @@ mod projection_tests {
         let (wrap, pulled) = wrapped();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }
