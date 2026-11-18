@@ -127,11 +127,6 @@ struct ConverseProducer {
     /// only the rows a region names, so the rows of earlier pulls are kept: a release of a group
     /// names rows no later pull may read again.
     held: RwLock<Vec<HeldRow>>,
-    /// At the outermost level, the input keys the answers read state complete, together, and the
-    /// values those answers held. A group is the rows whose value is its key, so once every input
-    /// key is complete a value never seen has no group: it is stated absent.
-    read: RwLock<Predicate>,
-    seen: RwLock<Predicate>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
     /// The inverted level to answer with where no enclosing row has been reached.
@@ -153,8 +148,6 @@ impl ConverseProducer {
             base,
             input,
             held: RwLock::new(Vec::new()),
-            read: RwLock::new(Predicate::False),
-            seen: RwLock::new(Predicate::False),
             level,
             empty_level,
         }
@@ -474,27 +467,6 @@ impl TileProducer for ConverseProducer {
             (None, Some(_)) => projection.above(self.level).guard(self.input.tiling()),
         };
         let input_tile = self.input.get(input_guard);
-        if self.level == CurryLevel::OUTERMOST
-            && let Tile::DataFunction {
-                codomain,
-                domain_predicate,
-                ..
-            } = &input_tile
-            && let Tile::Scalar(values) = &**codomain
-        {
-            let read = self
-                .read
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .union(domain_predicate);
-            *self.read.write().unwrap_or_else(PoisonError::into_inner) = read;
-            let seen = self
-                .seen
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .union(&Predicate::from_column_value(values));
-            *self.seen.write().unwrap_or_else(PoisonError::into_inner) = seen;
-        }
         let (mut out, read) = self.invert(input_tile);
         self.remember(read);
         // `release_impl` frees the rows held, the standing keys named, and the input keys
@@ -507,18 +479,16 @@ impl TileProducer for ConverseProducer {
             out.remove_guarded(released);
         }
         out.restrict_to(&projection, self.tiling());
-        // A value never seen once every input key is complete has no group anywhere: it is
-        // absent in every region, so it is recorded apart from the statement, which the cut
-        // and every later cut keep to the region pulled.
-        if self
-            .read
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_true()
-            && let Tile::DataFunction { absent_keys, .. } = &mut out
+        // A group is the input rows whose value is its key, and each input key stands beneath
+        // one value, so the groups' keys follow the input keys beneath them: once a reader holds
+        // every input key complete, a value no row carried has no group.
+        if self.level == CurryLevel::OUTERMOST
+            && let Tile::DataFunction {
+                keys_follow_beneath,
+                ..
+            } = &mut out
         {
-            *absent_keys =
-                Predicate::True.minus(&self.seen.read().unwrap_or_else(PoisonError::into_inner));
+            *keys_follow_beneath = true;
         }
         out
     }
@@ -5504,20 +5474,25 @@ mod converse_pull_tests {
         assert_eq!(released_keys(&source), BTreeSet::from([0]));
     }
 
-    /// Once every input key is read complete, a value no row holds has no group, and the answer
-    /// records it absent; the values rows hold stay groups.
+    /// The groups' keys follow the input keys beneath them: answers of pulls one level in each
+    /// state part of the level beneath, and once a reader holds them all, a value no row holds is
+    /// complete with no group, and every group is complete.
     #[test]
-    fn a_value_no_row_holds_is_recorded_absent_once_every_key_is_read() {
+    fn groups_follow_the_input_keys_beneath_them() {
         let source = source_of(0..KEYS, group_of);
         let mut converse = converse_over(&source);
-        let answer = converse.read_in_pipeline(out_tiling().universal_guard());
-        let Tile::DataFunction { absent_keys, .. } = &answer else {
-            panic!("a collection of groups, got {answer:?}")
-        };
-        assert!(absent_keys.contains(&Value::Int(5)), "{answer:?}");
-        for held in 0..3 {
-            assert!(!absent_keys.contains(&Value::Int(held)), "{answer:?}");
-        }
+        let mut answer = converse.read_in_pipeline(keys_one_level_in(0, 4));
+        assert!(
+            !answer.level_statement().contains(&Value::Int(5)),
+            "a part states no group set: {answer:?}"
+        );
+        let rest = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4)))),
+        ))));
+        answer.merge(converse.read_in_pipeline(rest));
+        let stated = answer.level_statement();
+        assert!(stated.contains(&Value::Int(5)), "{answer:?}");
+        assert!(stated.contains(&Value::Int(0)), "{answer:?}");
     }
 
     /// A released group stays released across pulls: each row of it a later pull reads is

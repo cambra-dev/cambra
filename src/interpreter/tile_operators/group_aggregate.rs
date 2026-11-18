@@ -257,13 +257,7 @@ impl GroupAggregateProducer {
             self.name()
         );
         for (level, stated) in state.enclosing_stated.iter_mut().enumerate() {
-            let Tile::DataFunction {
-                domain_predicate, ..
-            } = rows.values_at(CurryLevel::new(level))
-            else {
-                unreachable!("every level above the rows is a collection")
-            };
-            *stated = stated.union(domain_predicate);
+            *stated = stated.union(&rows.values_at(CurryLevel::new(level)).level_statement());
         }
         state.rows_complete = state
             .rows_complete

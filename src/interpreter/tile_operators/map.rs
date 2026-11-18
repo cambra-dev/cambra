@@ -661,6 +661,7 @@ impl MapResultProducer {
                 }
             }
             *input_tile.values_at_mut(self.level) = gathered;
+            input_tile.unfollow_values_at(self.level);
             return input_tile;
         }
 
@@ -690,6 +691,7 @@ impl MapResultProducer {
                 apply_function_tile(function_tile, values, f_domain_extent, f_codomain_extent)
             })
         };
+        input_tile.unfollow_values_at(level);
         input_tile
     }
 }
@@ -1106,6 +1108,7 @@ impl MapResultToConstProducer {
             MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
             MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
         };
+        output.unfollow_values_at(self.level);
         if let Some(live) = &growing {
             self.open_live_rows(live, &mut output);
         }

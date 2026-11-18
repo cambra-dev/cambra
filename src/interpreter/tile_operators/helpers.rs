@@ -357,7 +357,7 @@ pub(crate) fn process_tile_result(
             codomain,
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         } => Tile::DataFunction {
             row_starts,
             domain,
@@ -368,7 +368,7 @@ pub(crate) fn process_tile_result(
             )),
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         },
         _ => panic!("Cannot apply Map to {input_tile:?}"),
     }
