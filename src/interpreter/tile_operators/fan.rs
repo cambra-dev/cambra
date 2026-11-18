@@ -233,7 +233,7 @@ impl TileProducer for RecordWrapProducer {
     }
 
     /// Wrapping keeps the input's keys, so the input is pulled at the projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -326,11 +326,12 @@ impl TileOperator for Zip {
             })
             .collect();
         Box::new(ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx),
             names: self.names.clone(),
             level: self.level,
-            held: vec![HashSet::new(); arms],
-            emitted: Predicate::False,
+            held: RefCell::new(vec![HashSet::new(); arms]),
+            emitted: RefCell::new(Predicate::False),
             inputs,
         })
     }
@@ -356,6 +357,9 @@ fn qualify_beneath(tile: &mut Tile, rows: &Predicate) {
 
 /// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
 struct ZipProducer {
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    dropped_rows: RefCell<HashMap<usize, TileGuard>>,
     base: ProducerBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<SmolStr>,
@@ -365,10 +369,14 @@ struct ZipProducer {
     level: CurryLevel,
     /// The paths of the rows each arm has held at the pair's enclosing level, on any pull: an
     /// arm gives back only a row it held.
-    held: Vec<HashSet<Vec<Value>>>,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    held: RefCell<Vec<HashSet<Vec<Value>>>>,
     /// The keys of the pairs a flat zip has emitted, whose cells a consumer may give back
     /// field by field ([`ZipProducer::release_impl`]).
-    emitted: Predicate,
+    // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
+    // no other operator holds it.
+    emitted: RefCell<Predicate>,
 }
 
 impl TileProducer for ZipProducer {
@@ -392,7 +400,7 @@ impl TileProducer for ZipProducer {
     }
 
     /// The arms share the pair's keys, so each arm is pulled at the projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -406,7 +414,7 @@ impl TileProducer for ZipProducer {
         // arrive there, so it is not.
         let (mut tiles, dropped): (Vec<Tile>, Vec<Option<TileGuard>>) = self
             .inputs
-            .iter_mut()
+            .iter()
             .map(|i| {
                 let mut tile = i.get(projection.guard(i.tiling()));
                 let dropped = tile.deleted_keys_guard();
@@ -439,7 +447,7 @@ impl TileProducer for ZipProducer {
             .collect();
         // A release covering a row the arm never held, one its input never had, gives
         // nothing back: the row is absent from that arm, and so from the pair.
-        let mut held = std::mem::take(&mut self.held);
+        let mut held = std::mem::take(&mut *self.held.borrow_mut());
         if let Some(rows_level) = self.level.enclosing() {
             for (arm, tile) in tiles.iter().enumerate() {
                 if tile.is_data_function() {
@@ -701,10 +709,15 @@ impl TileProducer for ZipProducer {
                 };
                 // A row an arm deleted reaches no consumer, so no consumer releases it: the arm
                 // gives it back here and stops tracking it.
-                for (arm, (input, dropped)) in self.inputs.iter_mut().zip(dropped).enumerate() {
+                for (arm, dropped) in dropped.into_iter().enumerate() {
                     if let Some(dropped) = dropped {
                         held[arm].retain(|path| !dropped.covers_path(path));
-                        input.release(dropped);
+                        let mut dropped_rows = self.dropped_rows.borrow_mut();
+                        let released = match dropped_rows.remove(&arm) {
+                            Some(before) => before.union(&dropped),
+                            None => dropped,
+                        };
+                        dropped_rows.insert(arm, released);
                     }
                 }
                 let mut out = skeleton;
@@ -763,14 +776,18 @@ impl TileProducer for ZipProducer {
                     let vouched = held.union(domain_predicate);
                     qualify_beneath(out.values_at_mut(self.level), &vouched);
                 }
-                self.held = held;
+                *self.held.borrow_mut() = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
                 if !self.base.obsolete_guard.is_empty() {
                     out.remove_guarded(self.base.obsolete_guard.clone());
                 }
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
-                    self.emitted = self.emitted.union(&Predicate::from_column_value(domain));
+                    let emitted = self
+                        .emitted
+                        .borrow()
+                        .union(&Predicate::from_column_value(domain));
+                    *self.emitted.borrow_mut() = emitted;
                 }
                 // The completeness intersected above is each arm's, which an arm restating fewer
                 // levels than the projection's states over the region it was pulled at, so it is
@@ -783,6 +800,10 @@ impl TileProducer for ZipProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        for (arm, dropped) in std::mem::take(self.dropped_rows.get_mut()) {
+            self.inputs[arm].release(dropped);
+        }
+
         let level = self.level.index();
         let pair = self.base.tiling.values_at(self.level).empty_guard();
         // An arm takes the pairs released whole, and a field of a pair it has emitted. A
@@ -793,7 +814,7 @@ impl TileProducer for ZipProducer {
         // levels only whole pairs are passed on.
         let delivered = match level {
             1 => obsolete_guard.intersect(&TileGuard::Function(FunctionGuard::Domain(
-                self.emitted.clone(),
+                self.emitted.borrow().clone(),
             ))),
             _ => self.base.tiling.empty_guard(),
         };
@@ -820,13 +841,14 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
-        for paths in &mut self.held {
+        for paths in self.held.get_mut() {
             paths.retain(|path| !whole.covers_path(path));
         }
         if whole.is_universal() {
-            self.emitted = Predicate::False;
+            *self.emitted.get_mut() = Predicate::False;
         } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
-            self.emitted = self.emitted.minus(keys);
+            let emitted = self.emitted.borrow().minus(keys);
+            *self.emitted.get_mut() = emitted;
         }
     }
 }
@@ -1015,7 +1037,7 @@ impl TileProducer for MakeRecordProducer {
 
     /// A record of values has no keys to project: the projection names each field's part, and
     /// each operand is pulled at its field's part. A guard naming keys is a consumer's bug.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if let Projection::Keys { .. } = projection {
             panic!(
@@ -1028,7 +1050,7 @@ impl TileProducer for MakeRecordProducer {
         let fields: HashMap<SmolStr, Tile> = self
             .names
             .iter()
-            .zip(self.inputs.iter_mut())
+            .zip(self.inputs.iter())
             .map(|(name, input)| {
                 let field = projection.field(name);
                 let tile = match field {
@@ -1202,6 +1224,7 @@ impl TileOperator for SelectField {
             .input
             .subscribe(input_tiling.universal_guard(), consumer, cx);
         Box::new(SelectFieldProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),
                 self.tiling(),
@@ -1234,6 +1257,7 @@ impl TileOperator for SelectField {
 /// its record. A release names this field's part; enclosing keys release their whole records
 /// ([`guard_at_field`]).
 struct SelectFieldProducer {
+    dropped_rows: DroppedRows,
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     name: SmolStr,
@@ -1272,7 +1296,7 @@ impl TileProducer for SelectFieldProducer {
     /// A stream of records keeps its keys under the field, so the input is pulled at the
     /// projection. A product of collections has no keys of its own: it is pulled at the selected
     /// field's part of the projection ([`Projection::of_field`]), and the field cut after.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1322,7 +1346,7 @@ impl TileProducer for SelectFieldProducer {
         tile.compact();
         if let Some(dropped) = dropped {
             let at_field = self.at_field(dropped);
-            self.input.release(at_field);
+            self.dropped_rows.remember(at_field);
         }
         // A row is complete for this field once the field's value is, where the input states a
         // row complete only once all its fields are. A plain field is complete once held, so each
@@ -1333,6 +1357,7 @@ impl TileProducer for SelectFieldProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&mut *self.input);
         let released = self.at_field(obsolete_guard);
         self.input.release(released);
     }
@@ -1669,6 +1694,7 @@ mod tests {
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
         let mut producer = SelectFieldProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
             name: "a".into(),
@@ -1767,12 +1793,15 @@ mod tests {
             input_tiling.clone(),
         );
         let mut producer = SelectFieldProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(spy),
             name: "xs".into(),
             input_tiling,
         };
         producer.read_in_pipeline(producer.tiling().universal_guard());
+        assert!(log.borrow().is_empty(), "reads must not release inputs");
+        producer.release(Projection::Nothing.guard(producer.tiling()));
         assert!(
             log.borrow()
                 .iter()
@@ -1821,6 +1850,7 @@ mod tests {
             BitSet::new(),
         );
         let mut producer = SelectFieldProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(TestTileProducer::new(input, input_tiling.clone())),
             name: "a".into(),
@@ -1873,6 +1903,7 @@ mod tests {
         };
         let (input, cell) = ScriptedProducer::new(part(earlier, 0), input_tiling.clone());
         let mut producer = SelectFieldProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(input),
             name: "a".into(),
@@ -1947,14 +1978,17 @@ mod tests {
         let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
         let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             level: CurryLevel::new(1),
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RefCell::new(Predicate::False),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".into(), "b".into()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
         zip.read_in_pipeline(zip.tiling().universal_guard());
+        assert!(log_a.borrow().is_empty() && log_b.borrow().is_empty());
+        zip.release(Projection::Nothing.guard(zip.tiling()));
         for log in [log_a, log_b] {
             assert!(
                 log.borrow().iter().any(|g| names_key(g, 1, 0)),
@@ -1997,9 +2031,10 @@ mod tests {
             ])),
         );
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             level: CurryLevel::new(1),
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RefCell::new(Predicate::False),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".into(), "b".into()],
             inputs: vec![
@@ -2077,12 +2112,13 @@ mod tests {
         );
         let (spy1, _) = QuietSpy::new(arm(vec![50, 60], Predicate::False), arm_tiling);
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            emitted: Predicate::False,
-            held: vec![HashSet::new(); 2],
+            emitted: RefCell::new(Predicate::False),
+            held: RefCell::new(vec![HashSet::new(); 2]),
         };
         let Tile::DataFunction { absent_keys, .. } =
             zip.read_in_pipeline(out_tiling.universal_guard())
@@ -2133,12 +2169,13 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm0_tiling.clone());
         let (spy1, released1) = QuietSpy::new(arm1, arm1_tiling.clone());
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RefCell::new(Predicate::False),
         };
         let out = zip.read_in_pipeline(out_tiling.universal_guard());
         let guard = out.to_guard();
@@ -2228,12 +2265,13 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm_tiling);
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RefCell::new(Predicate::False),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
         // A consumer done with field `_0` at every row.
@@ -2270,21 +2308,22 @@ mod tests {
         zip.release(other_field.intersect(&first_row));
         assert!(
             zip.held
+                .borrow()
                 .iter()
                 .all(|paths| !paths.contains(&vec![Value::UInt(0)])),
             "a released pair must leave the row-tracking state"
         );
         assert!(
-            zip.held[0].contains(&vec![Value::UInt(1)]),
+            zip.held.borrow()[0].contains(&vec![Value::UInt(1)]),
             "an unpaired row stays held until released"
         );
         assert!(
-            !zip.emitted.contains(&Value::UInt(0)),
+            !zip.emitted.borrow().contains(&Value::UInt(0)),
             "a released pair must leave the emitted-key predicate"
         );
         zip.release(out_tiling.universal_guard());
-        assert!(zip.held.iter().all(HashSet::is_empty));
-        assert_eq!(zip.emitted, Predicate::False);
+        assert!(zip.held.borrow().iter().all(HashSet::is_empty));
+        assert_eq!(*zip.emitted.borrow(), Predicate::False);
     }
 
     /// An arm whose tile a test sets between pulls, returned as it stands, deleted rows
@@ -2301,7 +2340,7 @@ mod tests {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.borrow().clone()
         }
 
@@ -2341,15 +2380,16 @@ mod tests {
             })
         };
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![scripted(&arm0), scripted(&arm1)],
             level: CurryLevel::new(1),
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: RefCell::new(vec![HashSet::new(); 2]),
+            emitted: RefCell::new(Predicate::False),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
-        assert!(zip.held[0].contains(&vec![Value::UInt(1)]));
+        assert!(zip.held.borrow()[0].contains(&vec![Value::UInt(1)]));
         // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
         *arm0.borrow_mut() = rows(vec![0, 1], BitSet::from_iter([1]));
         zip.read_in_pipeline(out_tiling.universal_guard());
@@ -2357,7 +2397,7 @@ mod tests {
             Predicate::exactly(&[Value::UInt(0)]),
         )));
         assert!(
-            zip.held.iter().all(HashSet::is_empty),
+            zip.held.borrow().iter().all(HashSet::is_empty),
             "a deleted row stays tracked: {:?}",
             zip.held
         );
@@ -2410,20 +2450,21 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0_tiling.empty_tile(), arm0_tiling.clone());
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(2),
-            emitted: Predicate::False,
+            emitted: RefCell::new(Predicate::False),
             // Arm `_0` held both rows before the consumer released its field, so it gives them
             // back rather than lacking them.
-            held: vec![
+            held: RefCell::new(vec![
                 HashSet::from([
                     vec![Value::UInt(0), Value::UInt(7)],
                     vec![Value::UInt(1), Value::UInt(7)],
                 ]),
                 HashSet::new(),
-            ],
+            ]),
         };
         // The consumer reads field `_1` only, so it releases field `_0` at every path.
         let every_path = |field: TileGuard| {
@@ -2531,12 +2572,13 @@ mod tests {
         let (spy0, _) = QuietSpy::new(arm0, arm0_tiling);
         let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(2),
-            emitted: Predicate::False,
-            held: vec![HashSet::new(); 2],
+            emitted: RefCell::new(Predicate::False),
+            held: RefCell::new(vec![HashSet::new(); 2]),
         };
         let Tile::DataFunction { domain, .. } = zip.read_in_pipeline(out_tiling.universal_guard())
         else {
@@ -2655,6 +2697,7 @@ mod projection_tests {
         let (input, pulled, _) = ProjectionSpy::new(rows, in_tiling.clone());
         (
             SelectFieldProducer {
+                dropped_rows: Default::default(),
                 base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
                 input: Box::new(input),
                 name: SmolStr::new("amount"),
@@ -2703,6 +2746,7 @@ mod projection_tests {
             let (input, pulled, _) = ProjectionSpy::new(product, product_tiling.clone());
             (
                 SelectFieldProducer {
+                    dropped_rows: Default::default(),
                     base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
                     input: Box::new(input),
                     name: SmolStr::new("a"),
@@ -2742,12 +2786,13 @@ mod projection_tests {
         );
         (
             ZipProducer {
+                dropped_rows: Default::default(),
                 base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
                 names: vec![tuple_field(0), tuple_field(1)],
                 inputs: vec![Box::new(a), Box::new(b)],
                 level: CurryLevel::new(1),
-                emitted: Predicate::False,
-                held: vec![HashSet::new(); 2],
+                emitted: RefCell::new(Predicate::False),
+                held: RefCell::new(vec![HashSet::new(); 2]),
             },
             a_pulled,
             b_pulled,
@@ -2808,7 +2853,7 @@ mod projection_tests {
 
     #[test]
     fn nothing_pairs_nothing() {
-        let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
+        let (zip, a_pulled, b_pulled) = pair(ROWS as usize);
         let nothing = zip.tiling().empty_guard();
         assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
         assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
@@ -2840,7 +2885,7 @@ mod projection_tests {
 
     #[test]
     fn a_record_of_values_pulls_each_value_whole() {
-        let (mut record, a_pulled, b_pulled) = two_values();
+        let (record, a_pulled, b_pulled) = two_values();
         let whole = record.tiling().universal_guard();
         let tile = record.get(whole);
         let Tile::Record { fields, .. } = &tile else {
@@ -2854,7 +2899,7 @@ mod projection_tests {
 
     #[test]
     fn nothing_makes_no_record_and_pulls_no_value() {
-        let (mut record, a_pulled, b_pulled) = two_values();
+        let (record, a_pulled, b_pulled) = two_values();
         let nothing = record.tiling().empty_guard();
         assert_eq!(record.get(nothing), record.tiling().empty_tile());
         assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
@@ -2869,7 +2914,7 @@ mod projection_tests {
 
     #[test]
     fn nothing_wraps_nothing() {
-        let (mut wrap, pulled) = wrapped();
+        let (wrap, pulled) = wrapped();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
