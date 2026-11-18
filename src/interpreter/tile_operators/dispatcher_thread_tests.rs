@@ -395,7 +395,7 @@ struct ScriptBreaker {
     base: ProducerBase,
     input: Tiling,
     keep: u64,
-    consumed: u64,
+    consumed: AtomicU64,
 }
 
 impl TileProducer for ScriptBreaker {
@@ -405,12 +405,13 @@ impl TileProducer for ScriptBreaker {
         self.tiling().empty_tile()
     }
 
-    fn release_impl(&mut self, _guard: TileGuard) {}
+    fn release_impl(&self, _guard: TileGuard) {}
 }
 
 impl Breaker for ScriptBreaker {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        self.consumed |= mask_of(&guard);
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        self.consumed
+            .fetch_or(mask_of(&guard), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -428,7 +429,10 @@ impl Breaker for ScriptBreaker {
 
 impl BreakingProducer for ScriptBreaker {
     fn complete(&self) -> TileGuard {
-        guard_of(kept(self.consumed, self.keep))
+        guard_of(kept(
+            self.consumed.load(std::sync::atomic::Ordering::Relaxed),
+            self.keep,
+        ))
     }
 
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
@@ -460,7 +464,7 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
                 base: ProducerBase::unowned(ScriptBreaker::alloc_id(), &keys_tiling(UNIVERSE)),
                 input,
                 keep: script.keep[p],
-                consumed: 0,
+                consumed: AtomicU64::new(0),
             }));
             breaker
         })
@@ -1476,11 +1480,11 @@ impl TileProducer for SharedHeld {
         self.tiling().empty_tile()
     }
 
-    fn release_impl(&mut self, _guard: TileGuard) {}
+    fn release_impl(&self, _guard: TileGuard) {}
 }
 
 impl Breaker for SharedHeld {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
         self.consumed.fetch_or(mask_of(&guard), SeqCst);
     }
 

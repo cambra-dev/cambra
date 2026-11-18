@@ -2517,8 +2517,7 @@ mod tests {
         const ROWS: u64 = 16;
         const MORSEL: u64 = 4;
         let values: Vec<i64> = (0..ROWS as i64).collect();
-        let (mut spy, _, _) =
-            ProjectionSpy::new(ints_by_position(&values, true), ints_tiling(ROWS));
+        let (spy, _, _) = ProjectionSpy::new(ints_by_position(&values, true), ints_tiling(ROWS));
         for first in (0..ROWS).step_by(MORSEL as usize) {
             let morsel = keys_between(first, first + MORSEL - 1);
             assert_eq!(int_entries(&spy.get(morsel.clone())).len(), MORSEL as usize);
