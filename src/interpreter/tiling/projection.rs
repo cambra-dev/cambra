@@ -88,8 +88,8 @@ impl Projection {
 
     /// The guard an operator answering this projection pulls an input with `tiling` at.
     ///
-    /// A collection input is pulled at this projection's guard. An input with no keys to project
-    /// is read whole, and the operator cuts its answer after.
+    /// A collection input (`Tiling::is_data_function`) is pulled at this projection's guard. Any
+    /// other input has no keys to project and is read whole.
     pub fn input_guard(&self, tiling: &Tiling) -> TileGuard {
         match tiling.is_data_function() {
             true => self.guard(tiling),
