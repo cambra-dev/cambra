@@ -743,10 +743,12 @@ impl TileGuard {
         // Leaving them apart would make a guard's shape depend on how it was assembled,
         // and a consumer that matches on the shape reads that as a different guard.
         let mut merged: Vec<TileGuard> = Vec::with_capacity(flat.len());
+        let mut combined = false;
         for arm in flat {
             match merged.iter().position(|g| same_place(g, &arm)) {
                 Some(i) => {
                     merged[i] = union_in_place(&merged[i], &arm);
+                    combined = true;
                 }
                 None => merged.push(arm),
             }
@@ -756,6 +758,15 @@ impl TileGuard {
         // positions beneath, so without this every row it finishes leaves an arm behind and
         // the guard — and every union into it — grows with the number of rows run.
         let merged = without_covered_arms(merged);
+        // Combining two arms can make one name everything beneath some keys where neither part
+        // did, so the arms are lifted again. Each lift that changes an arm moves part of it to a
+        // shallower level, so the recursion ends within the guard's depth.
+        if combined {
+            let relifted: Vec<TileGuard> = merged.iter().cloned().flat_map(lift).collect();
+            if relifted != merged {
+                return Self::flatten_or(relifted);
+            }
+        }
         match merged.len() {
             0 => unreachable!("flatten_or called with no arms"),
             1 => merged.into_iter().next().unwrap(),
@@ -1450,6 +1461,35 @@ mod tests {
             TileGuard::flatten_or(vec![key_0, field_under(1)]),
             TileGuard::Or(_)
         ));
+    }
+
+    /// Two arms beneath the same keys that together name everything beneath them name the
+    /// keys, as one arm naming everything beneath them does.
+    #[test]
+    fn flatten_or_lifts_arms_whose_merge_names_whole_rows() {
+        let rows = || Predicate::point(Value::UInt(1)).union(&Predicate::point(Value::UInt(2)));
+        let beneath = |here: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(rows(), here)),
+            ))))
+        };
+        let low = Predicate::at_or_below(Value::UInt(20));
+        let high = Predicate::True.minus(&low);
+        let key_0 = TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(0))));
+        let keys_0_to_2 = TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::UInt(0)).union(&rows()),
+        ));
+        let assembled = TileGuard::flatten_or(vec![key_0.clone(), beneath(low.clone())])
+            .union(&beneath(high.clone()));
+        assert!(assembled.subsumes(&keys_0_to_2) && keys_0_to_2.subsumes(&assembled));
+        assert!(
+            matches!(&assembled, TileGuard::Function(FunctionGuard::Domain(_))),
+            "{assembled:?}"
+        );
+        assert_eq!(
+            TileGuard::flatten_or(vec![key_0, beneath(low), beneath(high)]),
+            assembled
+        );
     }
 
     mod subsumes {
