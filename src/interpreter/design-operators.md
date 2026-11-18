@@ -2258,3 +2258,25 @@ Consumption and native release callbacks reclaim retained state. Repeated and em
 deliveries also run native reclamation, because a later read can discover additional rows belonging
 to a region already released. Fan-out intersections suppress unchanged upstream releases at shared
 and cyclic boundaries.
+
+## Concurrent native consumption
+
+Memo caches, aggregate accumulators, and map-aggregate group state use canonical `RwLock`s.
+Their immutable `consume_impl` reads the existing input, integrates the received tile into
+shared state, drops its output lock, and releases consumed input through native `release(&self)`.
+Parallel dispatcher claims call the same method under a shared breaker handle; the coordinator
+publishes completion before acknowledging each claim.
+
+There is no producer-wide lock around `get` or `release`. Shared caches, accumulated obsolete
+guards, correlations and read validation history synchronize their own state. Reads obtain owned
+snapshots before computing; memo reclamation drops its cache lock before releasing inputs.
+The producer wrapper therefore does not serialize computation on unrelated morsels.
+Canonical breaker handles use shared access for both reads and releases; control breakers retain
+a mutex around the state consumption and reclamation mutate. There are no worker retention pins,
+deferred releases, per-worker producer graphs, read contexts, or worker-local aggregate maps.
+
+Control producers implement their native methods directly. Their mutexes hold plain mutable
+data, without another producer implementation or a second `ProducerBase`. Immutable
+configuration stays on the producer; loop and transaction scopes stay on the canonical store.
+Helpers borrow the already locked data rather than reacquiring its mutex. Completion pushes
+happen after the data lock is dropped.

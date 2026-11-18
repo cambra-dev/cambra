@@ -872,18 +872,18 @@ impl TileProducer for UnionProducer {
         merged
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         match obsolete_guard {
             g if g.is_empty() => {}
             g if g.is_universal() => {
-                for input in &mut self.inputs {
+                for input in &self.inputs {
                     input.release(input.tiling().universal_guard());
                 }
             }
             // Strip the outer arm tag from every qualified path, including releases
             // beneath the outermost keys and inside record fields.
             g if !self.flat => {
-                for (tag, input) in self.tags.iter().zip(self.inputs.iter_mut()) {
+                for (tag, input) in self.tags.iter().zip(self.inputs.iter()) {
                     input.release(
                         g.map_level_predicates(&mut |depth, pred| under_arm(pred, depth, tag)),
                     );
@@ -901,7 +901,7 @@ impl TileProducer for UnionProducer {
             // representations, so a release reaches each arm's values only whole.
             g if self.flat => {
                 let levels = self.tiling().levels();
-                for input in &mut self.inputs {
+                for input in &self.inputs {
                     let guard = crate::interpreter::tiling::through_shared_levels(
                         g.clone(),
                         levels,
@@ -1019,7 +1019,7 @@ mod tests {
                 self.input.get(guard)
             }
 
-            fn release_impl(&mut self, guard: TileGuard) {
+            fn release_impl(&self, guard: TileGuard) {
                 self.input.release(guard);
             }
         }
@@ -1667,7 +1667,7 @@ mod tests {
             fn get_impl(&self, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
-            fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            fn release_impl(&self, obsolete_guard: TileGuard) {
                 self.log
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1711,7 +1711,7 @@ mod tests {
     /// An empty guard is a no-op: no release signal reaches any input.
     #[test]
     fn union_producer_release_empty_is_noop() {
-        let (mut producer, log0, log1) = make_union_producer_with_spies();
+        let (producer, log0, log1) = make_union_producer_with_spies();
         producer.release(producer.tiling().empty_guard());
         assert!(
             log0.read()
@@ -1730,7 +1730,7 @@ mod tests {
     /// A universal guard forwards a universal guard to every input.
     #[test]
     fn union_producer_release_universal_forwards_to_all_inputs() {
-        let (mut producer, log0, log1) = make_union_producer_with_spies();
+        let (producer, log0, log1) = make_union_producer_with_spies();
         producer.release(producer.tiling().universal_guard());
         let l0 = log0.read().unwrap_or_else(PoisonError::into_inner);
         let l1 = log1.read().unwrap_or_else(PoisonError::into_inner);
@@ -1749,7 +1749,7 @@ mod tests {
     /// A `Predicate::Union` guard splits per-variant predicates to the correct inputs.
     #[test]
     fn union_producer_release_union_pred_routes_to_correct_inputs() {
-        let (mut producer, log0, log1) = make_union_producer_with_spies();
+        let (producer, log0, log1) = make_union_producer_with_spies();
 
         let pred0 = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2]));
         let pred1 = Predicate::from_column_value(&ColumnValue::Ints(vec![3, 4]));
@@ -1915,7 +1915,7 @@ mod tests {
     /// A tagged pull naming an arm released whole answers nothing of it, and states it decided.
     #[test]
     fn a_tagged_pull_of_a_released_arm_answers_it_decided_and_empty() {
-        let (mut producer, pulled, _) = union_logging_pulls();
+        let (producer, pulled, _) = union_logging_pulls();
         producer.release(tagged_guard(vec![Predicate::True, Predicate::False]));
         let tile = producer.get(tagged_guard(vec![Predicate::True, Predicate::False]));
         assert!(
@@ -1975,7 +1975,7 @@ mod tests {
     #[test]
     fn a_release_closing_the_guard_reaches_release_impl_whole() {
         let (union, _, _) = union_logging_pulls();
-        let (mut spy, _, released) =
+        let (spy, _, released) =
             ProjectionSpy::new(union.tiling().empty_tile(), union.tiling().clone());
         spy.release(tagged_guard(vec![Predicate::True, Predicate::False]));
         spy.release(tagged_guard(vec![Predicate::False, Predicate::True]));

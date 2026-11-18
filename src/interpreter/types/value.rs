@@ -645,6 +645,69 @@ impl Value {
             _ => panic!("Not function: {self:?}"),
         }
     }
+
+    /// This value with every collection's bindings in key order, at every depth.
+    ///
+    /// A collection is a map from its keys, so the order of its bindings states nothing. A sink
+    /// fed by several workers merges each package's answer in the order the packages land, so a
+    /// reader of the output takes it in key order. A collection whose keys do not compare with
+    /// one another keeps its order ([`keys_compare`]).
+    pub fn in_key_order(self) -> Value {
+        match self {
+            Value::Function(bindings) => {
+                let mut bindings: Vec<FuncBinding> = bindings
+                    .into_iter()
+                    .map(|binding| FuncBinding {
+                        input: binding.input,
+                        output: binding.output.in_key_order(),
+                    })
+                    .collect();
+                if keys_compare(&bindings) {
+                    bindings.sort_by(|a, b| {
+                        a.input
+                            .partial_cmp(&b.input)
+                            .expect("`keys_compare` checked that every key compares")
+                    });
+                }
+                Value::Function(bindings)
+            }
+            Value::Record(fields) => Value::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, field)| (name, field.in_key_order()))
+                    .collect(),
+            ),
+            Value::Union { tag, inner } => Value::Union {
+                tag,
+                inner: Box::new(inner.in_key_order()),
+            },
+            scalar => scalar,
+        }
+    }
+}
+
+/// Whether the keys of `bindings` compare with one another, so sorting by key is a total order.
+///
+/// [`Value`]'s comparison is defined for no function, and for records only of one field set.
+/// Checking each key against the first is complete only for keys of one type: two union keys
+/// whose tag differs from the first key's are compared by payload, which the check never reads,
+/// and they compare where the union's arms each store one type. A collection's keys are values of
+/// its key type, which meets that bound.
+fn keys_compare(bindings: &[FuncBinding]) -> bool {
+    fn orderable(value: &Value) -> bool {
+        match value {
+            Value::Function(_) | Value::ComputableFunction(_) => false,
+            Value::Record(fields) => fields.values().all(orderable),
+            Value::Union { inner, .. } => orderable(inner),
+            _ => true,
+        }
+    }
+    let Some(first) = bindings.first() else {
+        return true;
+    };
+    bindings.iter().all(|binding| {
+        orderable(&binding.input) && binding.input.partial_cmp(&first.input).is_some()
+    })
 }
 
 #[cfg(test)]
@@ -735,6 +798,56 @@ mod tests {
             },
         ]);
         assert_eq!(f.to_string(), "Function [ u0 -> 10, u2 -> 20 ]");
+    }
+
+    fn collection(bindings: impl IntoIterator<Item = (Value, Value)>) -> Value {
+        Value::Function(
+            bindings
+                .into_iter()
+                .map(|(input, output)| FuncBinding { input, output })
+                .collect(),
+        )
+    }
+
+    /// Key order sorts each collection by its keys at every depth, a union's keys by tag and then
+    /// payload, and leaves a collection keyed by functions as it is.
+    #[test]
+    fn key_order_sorts_every_collection_by_its_keys() {
+        let arm = |tag: usize, key: u64| Value::Union {
+            tag: FieldKey::Index(tag),
+            inner: Box::new(Value::UInt(key)),
+        };
+        let nested = collection([
+            (
+                Value::UInt(1),
+                collection([
+                    (Value::UInt(1), Value::Int(4)),
+                    (Value::UInt(0), Value::Int(3)),
+                ]),
+            ),
+            (
+                Value::UInt(0),
+                collection([(Value::UInt(0), Value::Int(2))]),
+            ),
+        ]);
+        assert_eq!(
+            nested.in_key_order().to_string(),
+            "Function [ Function [ 2 ], Function [ 3, 4 ] ]"
+        );
+        let union = collection([
+            (arm(1, 0), Value::Int(7)),
+            (arm(0, 1), Value::Int(4)),
+            (arm(0, 0), Value::Int(2)),
+        ]);
+        assert_eq!(
+            union.in_key_order().to_string(),
+            "Function [ `0(u0) -> 2, `0(u1) -> 4, `1(u0) -> 7 ]"
+        );
+        let by_function = collection([
+            (collection([(Value::UInt(0), Value::Int(1))]), Value::Int(1)),
+            (collection([]), Value::Int(0)),
+        ]);
+        assert_eq!(by_function.clone().in_key_order(), by_function);
     }
 
     #[test]
