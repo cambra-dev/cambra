@@ -2314,7 +2314,7 @@ impl TraitObligation {
             operands[pos as usize] = Some(ty.clone());
         }
         #[cfg(debug_assertions)]
-        register_watch(self, pos, ty);
+        register_watch(solver, self, pos, ty);
     }
 
     /// Copy a variable's watch while retaining which variable is the obligation's operand.
@@ -3196,7 +3196,7 @@ impl TraitObligation {
             // contributes, so only a shrink is worth policing.
             #[cfg(debug_assertions)]
             if candidates.len() < before {
-                assert_post_emission_narrowing_selects(self, pos, head, &accepted);
+                assert_post_emission_narrowing_selects(solver, self, pos, head, &accepted);
             }
             drop(candidates);
             self.narrowed.set(true);
@@ -3856,25 +3856,18 @@ impl fmt::Debug for TraitObligation {
     }
 }
 
+/// Record a watch in the run's audit trail ([`Solver`]'s `watch_log`), `(obligation,
+/// position, operand type)`, which [`verify_narrowing_is_complete`] checks.
+///
+/// Debug-only, and wider than [`TraitObligation::operands`], which holds the current
+/// type at each position because answering a product needs it. This keeps the whole
+/// history — every contribution at every position, in arrival order — which is what a
+/// delivery question is asked of, and which no production path may read.
 #[cfg(debug_assertions)]
-thread_local! {
-    /// Every watch established during this inference run, as `(obligation, position,
-    /// operand type)` — the audit trail [`verify_narrowing_is_complete`] checks.
-    ///
-    /// Debug-only, and wider than [`TraitObligation::operands`], which holds the current
-    /// type at each position because answering a product needs it. This keeps the whole
-    /// history — every contribution at every position, in arrival order — which is what a
-    /// delivery question is asked of, and which no production path may read.
-    static WATCH_LOG: RefCell<Vec<(Rc<TraitObligation>, u8, Type)>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-#[cfg(debug_assertions)]
-fn register_watch(obligation: &Rc<TraitObligation>, pos: u8, ty: &Type) {
-    WATCH_LOG.with(|log| {
-        log.borrow_mut()
-            .push((Rc::clone(obligation), pos, ty.clone()))
-    });
+fn register_watch(solver: &mut Solver, obligation: &Rc<TraitObligation>, pos: u8, ty: &Type) {
+    solver
+        .watch_log
+        .push((Rc::clone(obligation), pos, ty.clone()));
 }
 
 /// Record that `obligation` holds an answer for [`settle_held_answers`] to deposit.
@@ -3915,13 +3908,6 @@ pub fn settle_held_answers(
     Ok(())
 }
 
-/// Discard the audit trail. Called when an inference run begins, so one run's
-/// obligations are never checked against another's graph.
-#[cfg(debug_assertions)]
-pub fn clear_watch_log() {
-    WATCH_LOG.with(|log| log.borrow_mut().clear());
-}
-
 /// Check that eager narrowing saw everything the finished graph knows — the
 /// invariant the whole mechanism rests on: **every concrete type reaching an operand
 /// variable reaches its obligation**.
@@ -3957,8 +3943,9 @@ pub fn verify_narrowing_is_complete(
     solver: &mut Solver,
     resolve: impl Fn(&mut Solver, &Type) -> Option<Type>,
 ) {
-    WATCH_LOG.with(|log| {
-        for (obligation, pos, operand) in log.borrow().iter() {
+    {
+        let log = solver.watch_log.clone();
+        for (obligation, pos, operand) in &log {
             let Some(resolved) = resolve(solver, operand) else {
                 // A position the program left conflicting: coalesce reports it, and
                 // there is no single base narrowing could have been offered.
@@ -3981,56 +3968,32 @@ pub fn verify_narrowing_is_complete(
                  its watches (see `verify_narrowing_is_complete`)",
             );
         }
-    });
+    }
 }
 
-#[cfg(debug_assertions)]
-thread_local! {
-    /// The obligation-counter high-water mark at the moment the requirement sweep
-    /// finished, or `None` before it runs.
-    ///
-    /// [`resolve_operand_requirements`] reads candidate sets as final. They are, *for
-    /// the obligations that matter*: a generalized definition's subtree is never
-    /// coalesced in place, so its variables take no new bounds afterwards, and the
-    /// narrowing that does continue during coalesce acts on the per-instantiation
-    /// clones `freshen_watches` mints — obligations that did not exist when the sweep
-    /// ran, and the one pass that does narrow an emission-era obligation afterwards only
-    /// ever *selects* from a set the sweep read. The mark is what makes that checkable
-    /// rather than merely argued: see [`assert_post_emission_narrowing_selects`].
-    static EMISSION_MARK: Cell<Option<u32>> = const { Cell::new(None) };
-}
-
-/// Open the narrowing window, discarding any previous run's mark.
+/// Close the narrowing window: record in the run's `emission_mark` the obligation-counter
+/// high-water mark at the moment the requirement sweep finished.
 ///
-/// Called from [`InferArena::new`](crate::ccl::infer::InferArena::new), which is the
-/// construct whose lifetime this state shares: the mark is per-run. Resetting it is not
-/// optional bookkeeping. The mark is a
-/// high-water mark of a *process-global* counter, so a stale one left by an earlier run
-/// on this thread sits below every obligation the current run mints, and
-/// [`assert_post_emission_narrowing_selects`] would pass vacuously instead of being inert —
-/// checking nothing, and silently, which is the failure mode it exists to prevent.
-#[cfg(debug_assertions)]
-pub fn unseal_emission() {
-    EMISSION_MARK.with(|m| m.set(None));
-}
-
-/// Close it, recording which obligations existed at that point.
+/// [`resolve_operand_requirements`] reads candidate sets as final. They are, *for
+/// the obligations that matter*: a generalized definition's subtree is never
+/// coalesced in place, so its variables take no new bounds afterwards, and the
+/// narrowing that does continue during coalesce acts on the per-instantiation
+/// clones `freshen_watches` mints — obligations that did not exist when the sweep
+/// ran, and the one pass that does narrow an emission-era obligation afterwards only
+/// ever *selects* from a set the sweep read. The mark is what makes that checkable
+/// rather than merely argued: see [`assert_post_emission_narrowing_selects`].
 ///
-/// Asserts the window was open, so the pairing with [`unseal_emission`] is checked
-/// rather than remembered: a run that reached here without opening one is a run whose
-/// mark belongs to a different run.
+/// The mark is a high-water mark of a process-global counter, so it is the run's own: one
+/// held over from an earlier run would sit below every obligation this run mints, and
+/// [`assert_post_emission_narrowing_selects`] would pass without checking.
 #[cfg(debug_assertions)]
-pub fn seal_emission() {
-    EMISSION_MARK.with(|m| {
-        debug_assert!(
-            m.get().is_none(),
-            "sealing a window that was never opened — this run inherited mark {:?} from \
-             an earlier run on this thread, so `unseal_emission` did not run at arena \
-             entry",
-            m.get(),
-        );
-        m.set(Some(OBLIGATION_COUNTER.load(Ordering::Relaxed)));
-    });
+pub fn seal_emission(solver: &mut Solver) {
+    debug_assert!(
+        solver.emission_mark.is_none(),
+        "sealing a window this run already sealed, at mark {:?}",
+        solver.emission_mark,
+    );
+    solver.emission_mark = Some(OBLIGATION_COUNTER.load(Ordering::Relaxed));
 }
 
 /// After emission, a narrowing may only **select**: an obligation minted during
@@ -4061,13 +4024,14 @@ pub fn seal_emission() {
 /// — see `src/ccl/design/type-inference.md`, "Requirements are read together, once".
 #[cfg(debug_assertions)]
 fn assert_post_emission_narrowing_selects(
+    solver: &Solver,
     obligation: &Rc<TraitObligation>,
     pos: u8,
     head: &InstanceHead,
     accepted: &[InstanceHead],
 ) {
-    EMISSION_MARK.with(|m| {
-        let Some(mark) = m.get() else {
+    {
+        let Some(mark) = solver.emission_mark else {
             return;
         };
         debug_assert!(
@@ -4078,7 +4042,7 @@ fn assert_post_emission_narrowing_selects(
              now stale. Either the check has to move later, or this write belongs in \
              emission.",
         );
-    });
+    }
 }
 
 /// One requirement a single operand carries: which trait asked, at which of its
@@ -5449,9 +5413,6 @@ mod tests {
             copied.watch(solver, &copied_value, 0);
             (Rc::downgrade(&original), Rc::downgrade(&copied))
         };
-        // The debug audit retains its own handles until the next run starts.
-        #[cfg(debug_assertions)]
-        clear_watch_log();
         assert!(original.upgrade().is_none());
         assert!(copied.upgrade().is_none());
     }

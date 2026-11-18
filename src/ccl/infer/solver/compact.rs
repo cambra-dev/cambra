@@ -857,26 +857,15 @@ fn projects_a_uint_range(solver: &mut Solver, p: &crate::ccl::ty::WitnessProject
     let Type::Infer(v) = p.term.ty.peel_refinements() else {
         return false;
     };
-    thread_local! {
-        /// The variables whose sums are being read, so a cycle through them answers no.
-        static READING: std::cell::RefCell<HashSet<InferVarId>> =
-            std::cell::RefCell::new(HashSet::new());
-    }
-    /// Removes its variable from `READING` on drop, so a `compact_type` that unwinds leaves no
-    /// entry behind for a later read on the same thread.
-    struct Reading(InferVarId);
-    impl Drop for Reading {
-        fn drop(&mut self) {
-            READING.with(|r| r.borrow_mut().remove(&self.0));
-        }
-    }
-    if !READING.with(|r| r.borrow_mut().insert(v.uid)) {
+    // The variables whose sums are being read, so a cycle through them answers no. A
+    // `compact_type` that unwinds leaves its entry behind in a run that is ending.
+    if !solver.reading_sums.insert(v.uid) {
         return false;
     }
-    let reading = Reading(v.uid);
-    // This query runs under `READING`, so its result must not enter the batch's root cache.
+    // This query runs while `reading_sums` holds `v`, which answers a cycle through it, so its
+    // result must not enter a fixed-graph batch's memo ([`with_fixed_graph_compactions`]).
     let term = compact_type_with(solver, &p.term.ty, true, false).term;
-    drop(reading);
+    solver.reading_sums.remove(&v.uid);
     term.fun
         .and_then(|f| f.binders.get(p.position).map(|w| w.type_kind.clone()))
         .is_some_and(|k| match k {
@@ -3265,7 +3254,7 @@ fn capabilities_at(
         && let crate::ccl::capabilities::Repr::Var(v) = capabilities.repr()
     {
         set.vars = if pol {
-            v.reaching()
+            v.reaching(solver)
         } else {
             std::iter::once((v.uid, Rc::clone(v))).collect()
         };
@@ -5061,7 +5050,6 @@ mod tests {
     #[test]
     fn final_graph_compactions_are_isolated_between_batches_and_modes() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
@@ -5137,7 +5125,6 @@ mod tests {
     #[test]
     fn final_graph_compactions_release_their_graph_on_unwind() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
@@ -5243,7 +5230,6 @@ mod tests {
     #[test]
     fn final_graph_compactions_collect_memberships_on_every_read() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
@@ -5256,10 +5242,11 @@ mod tests {
             .push(crate::ccl::ty::TypeKind::Type);
         with_fixed_graph_compactions(solver, |solver| {
             for _ in 0..2 {
-                let (resolved, pending) = super::super::coalesce::collecting_memberships(|| {
-                    let graph = compact_type(solver, &variable);
-                    coalesce_compact(solver, &graph)
-                });
+                let (resolved, pending) =
+                    super::super::coalesce::collecting_memberships(solver, |solver| {
+                        let graph = compact_type(solver, &variable);
+                        coalesce_compact(solver, &graph)
+                    });
                 assert_eq!(resolved.unwrap(), Type::Base(BaseType::Int));
                 assert_eq!(pending.len(), 1);
                 assert_eq!(pending[0].found, Type::Base(BaseType::Int));
@@ -5272,7 +5259,6 @@ mod tests {
     fn bound_eligibility_is_shared_across_views_and_polarities() {
         use crate::ccl::infer_var::{InferVar, Telescope};
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let x = Name::raw("x");
         let telescope = Telescope::empty().extended(x.clone());
         let variable = InferVar::fresh_in(solver, 0, &telescope);

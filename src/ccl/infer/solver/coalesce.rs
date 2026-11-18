@@ -1007,7 +1007,7 @@ fn coalesce_compact_go(
     // reaches carries.
     if !matches!(out.peel_refinements(), Type::Infer(_)) {
         for k in &ct.kinds {
-            record_membership(&out, k, scope, FailedPosition::of(ct));
+            record_membership(solver, &out, k, scope, FailedPosition::of(ct));
         }
     }
     Ok(out)
@@ -1211,38 +1211,36 @@ pub(crate) struct PendingMembership {
     pub position: FailedPosition,
 }
 
-thread_local! {
-    /// One list per materialization in progress, innermost last.
-    static PENDING_MEMBERSHIPS: std::cell::RefCell<Vec<Vec<PendingMembership>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Run `f`, a materialization, collecting the memberships its positions require.
-pub(crate) fn collecting_memberships<R>(f: impl FnOnce() -> R) -> (R, Vec<PendingMembership>) {
-    PENDING_MEMBERSHIPS.with(|p| p.borrow_mut().push(Vec::new()));
-    let out = f();
-    let pending = PENDING_MEMBERSHIPS
-        .with(|p| p.borrow_mut().pop())
+/// Run `f`, a materialization, collecting the memberships its positions require: one list per
+/// materialization in progress, innermost last, in the solver's `pending_memberships`.
+pub(crate) fn collecting_memberships<R>(
+    solver: &mut Solver,
+    f: impl FnOnce(&mut Solver) -> R,
+) -> (R, Vec<PendingMembership>) {
+    solver.pending_memberships.push(Vec::new());
+    let out = f(solver);
+    let pending = solver
+        .pending_memberships
+        .pop()
         .expect("the list pushed above");
     (out, pending)
 }
 
 fn record_membership(
+    solver: &mut Solver,
     found: &Type,
     kind: &crate::ccl::ty::TypeKind,
     witnesses: &[crate::ccl::ty::Witness],
     position: FailedPosition,
 ) {
-    PENDING_MEMBERSHIPS.with(|p| {
-        if let Some(top) = p.borrow_mut().last_mut() {
-            top.push(PendingMembership {
-                found: found.clone(),
-                kind: kind.clone(),
-                witnesses: witnesses.to_vec(),
-                position,
-            });
-        }
-    });
+    if let Some(top) = solver.pending_memberships.last_mut() {
+        top.push(PendingMembership {
+            found: found.clone(),
+            kind: kind.clone(),
+            witnesses: witnesses.to_vec(),
+            position,
+        });
+    }
 }
 
 #[cfg(test)]
