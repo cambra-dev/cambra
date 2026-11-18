@@ -4,7 +4,6 @@ use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
-use log::trace;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -89,7 +88,9 @@ struct AggregateProducer {
     /// The aggregation operation.
     kind: AggregateKind,
     /// Running accumulation state; updated in place on each `get`.
-    accumulator: Tile,
+    // shared-state-ok: this producer's own state, which `get`, `consume_impl` and `release` change
+    // through `&self` on any worker thread; no other operator holds it.
+    accumulator: RwLock<Tile>,
 }
 
 /// An aggregate over `input` that nothing subscribed, for a test that builds a chain of pipelines
@@ -154,38 +155,30 @@ impl AggregateProducer {
             base,
             input,
             kind,
-            accumulator,
+            accumulator: RwLock::new(accumulator),
         }
     }
 
     /// Pull the input at `guard`, fold what it answers into the accumulator, and release the
     /// input at what the answer stated. The accumulator is terminal once the input is released
     /// whole.
-    fn fold_input(&mut self, guard: TileGuard) {
-        let mut input_result = self.input.get(guard);
-        let upstream_guard = input_result.to_guard();
-        input_result.compact();
-        let Tile::DataFunction { codomain, .. } = input_result else {
-            panic!("Aggregate expected a collection, got {input_result:?}");
+    fn fold_input(&self, guard: TileGuard) -> TileGuard {
+        let mut input = self.input.get(guard);
+        let released = input.to_guard();
+        input.compact();
+        let Tile::DataFunction { codomain, .. } = input else {
+            panic!("Aggregate expected a collection, got {input:?}");
         };
-        self.input.release(upstream_guard);
-        let values = *codomain;
-
-        let is_terminal = self.input.obsolete_guard().is_universal();
-        trace!(
-            "Aggregate input is_terminal: {is_terminal} from guard {:?}",
-            self.input.obsolete_guard()
-        );
-        let Tile::Aggregation {
-            kind: _,
-            ref mut accumulator,
-            terminal: ColumnValue::Bools(ref mut terminal),
-        } = self.accumulator
-        else {
-            panic!("Accumulator must be Aggregation tile")
+        let mut shared = self
+            .accumulator
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Tile::Aggregation { accumulator, .. } = &mut *shared else {
+            unreachable!()
         };
-        self.kind.accumulate(accumulator, &values, 0, values.rows());
-        terminal[0] = is_terminal;
+        self.kind
+            .accumulate(accumulator, &codomain, 0, codomain.rows());
+        released
     }
 
     /// The accumulator, or nothing while it holds no value: no terminal flag can be emitted
@@ -194,13 +187,17 @@ impl AggregateProducer {
     /// is a value, a group, which holds an element, it reaches the map aggregate rather than
     /// this one.
     fn answer(&self) -> Tile {
+        let shared = self
+            .accumulator
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let Tile::Aggregation {
-            ref accumulator,
-            terminal: ColumnValue::Bools(ref terminal),
+            accumulator,
+            terminal: ColumnValue::Bools(terminal),
             ..
-        } = self.accumulator
+        } = &*shared
         else {
-            panic!("Accumulator must be Aggregation tile")
+            unreachable!()
         };
         if accumulator.rows() == 0 {
             if terminal[0] {
@@ -208,13 +205,18 @@ impl AggregateProducer {
             }
             return self.tiling().empty_tile();
         }
-        self.accumulator.clone()
+        shared.clone()
     }
 }
 
 impl TileProducer for AggregateProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.accumulator.cell_count())
+        ProducerStateInfo::holding(
+            self.accumulator
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .cell_count(),
+        )
     }
 
     impl_producer_base!();
@@ -249,11 +251,25 @@ impl TileProducer for AggregateProducer {
         self.answer()
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Universal release also covers input not yet delivered. Per-delivery releases in
-        // `get_impl` cover only the received tiles.
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
+    fn release_impl(&self, guard: TileGuard) {
+        if guard.expect_universal_or_empty(&self.name()) {
             self.input.release(self.input.tiling().universal_guard());
+        }
+    }
+}
+
+impl AggregateProducer {
+    /// State the accumulator terminal: its input is released whole, so no element is left to fold.
+    fn mark_terminal(&self) {
+        if let Tile::Aggregation {
+            terminal: ColumnValue::Bools(terminal),
+            ..
+        } = &mut *self
+            .accumulator
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            terminal[0] = true;
         }
     }
 }
@@ -261,18 +277,24 @@ impl TileProducer for AggregateProducer {
 impl Breaker for AggregateProducer {
     /// Folds what the input answers at `guard`, a guard of the input's tiling, into the
     /// accumulator, and releases the input at what the answer stated.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        debug_assert!(
-            guard.check_from(self.input.tiling()),
-            "{} consumes a guard of its input's tiling: {guard:?}",
-            self.name()
-        );
-        if self.obsolete_guard().is_universal()
-            || guard.projection(&self.input.name()) == Projection::Nothing
-        {
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        assert!(guard.check_from(self.input.tiling()));
+        if self.obsolete_guard().is_universal() || guard.is_empty() {
             return;
         }
-        self.fold_input(guard);
+        let released = self.fold_input(guard);
+        self.input.release(released);
+        if self.input.obsolete_guard().is_universal() {
+            self.mark_terminal();
+        }
+    }
+
+    fn finish_parallel_input(&mut self) {
+        self.input.release(self.input.tiling().universal_guard());
+        self.mark_terminal();
+    }
+    fn consumes_concurrently(&self) -> bool {
+        !matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -297,7 +319,11 @@ impl Breaker for AggregateProducer {
             self.name()
         );
         if !self.obsolete_guard().is_universal() {
-            let Tile::Aggregation { accumulator, .. } = &self.accumulator else {
+            let Tile::Aggregation { accumulator, .. } = &*self
+                .accumulator
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+            else {
                 unreachable!()
             };
             if accumulator.rows() == 0 {
@@ -317,7 +343,11 @@ impl BreakingProducer for AggregateProducer {
     /// whole, and once it holds a value ([`answer`](Self::answer)). A partial accumulator is held
     /// by no guard, so nothing reads it as final.
     fn complete(&self) -> TileGuard {
-        let Tile::Aggregation { accumulator, .. } = &self.accumulator else {
+        let Tile::Aggregation { accumulator, .. } = &*self
+            .accumulator
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+        else {
             panic!("Accumulator must be Aggregation tile")
         };
         if !self.input.obsolete_guard().is_universal() {
@@ -396,6 +426,11 @@ struct ExtractAggregateProducer {
     input: Box<dyn TileProducer>,
     kind: AggregateKind,
     only_terminal: bool,
+    // shared-state-ok: this producer's own state, which `get`, `consume_impl` and `release` change
+    // through `&self` on any worker thread; no other operator holds it.
+    state: Mutex<ExtractedAggregate>,
+}
+struct ExtractedAggregate {
     /// The value a consume extracted from a terminal input, until the consumer releases the
     /// output. Empty before then.
     extracted: Tile,
@@ -406,13 +441,15 @@ struct ExtractAggregateProducer {
 impl ExtractAggregateProducer {
     fn new(base: ProducerBase, input: Box<dyn TileProducer>, kind: AggregateKind) -> Self {
         let extracted = base.tiling.empty_tile();
-        Self {
+        ExtractAggregateProducer {
             base,
             input,
             kind,
             only_terminal: true,
-            extracted,
-            complete: false,
+            state: Mutex::new(ExtractedAggregate {
+                extracted,
+                complete: false,
+            }),
         }
     }
 
@@ -465,52 +502,32 @@ impl TileProducer for ExtractAggregateProducer {
     }
 
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         let projection =
             projection_of_one_value(&self.name(), "extracts one value", &projection_guard);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
         // An extracted record of values is pulled at a part of it as any record is.
-        let mut tile = self.extracted.clone();
+        let mut tile = state.extracted.clone();
         tile.restrict_to(&projection, self.tiling());
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.extracted = self.tiling().empty_tile();
+            state.extracted = self.tiling().empty_tile();
             self.input.release(self.input.tiling().universal_guard());
         }
     }
 }
 
 impl Breaker for ExtractAggregateProducer {
-    /// Pulls the input at `guard`, a guard of the aggregation, and extracts its value once the
-    /// input is terminal. A terminal input is released at what it stated, which is all of it. A
-    /// partial one states nothing releasable, so it is left for the next consume. Once the value
-    /// is extracted, or the output released, the input is not pulled again.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        debug_assert!(
-            guard.check_from(self.input.tiling()),
-            "{} consumes a guard of its input's tiling: {guard:?}",
-            self.name()
-        );
-        if !self.extracted.is_empty()
-            || self.obsolete_guard().is_universal()
-            || guard.projection(&self.input.name()) == Projection::Nothing
-        {
-            return;
-        }
-        let input_result = self.input.get(guard);
-        let upstream_guard = input_result.to_guard();
-        let value = self.extract(input_result);
-        if !value.is_empty() {
-            self.extracted = value;
-            self.complete = true;
-        }
-        self.input.release(upstream_guard);
-    }
-
     fn input_tiling(&self, _: InputId) -> Tiling {
         self.input.tiling().clone()
     }
@@ -522,12 +539,44 @@ impl Breaker for ExtractAggregateProducer {
     fn as_producer(&self) -> Option<&dyn BreakingProducer> {
         Some(self)
     }
+
+    /// Pulls the input at `guard`, a guard of the aggregation, and extracts its value once the
+    /// input is terminal. A terminal input is released at what it stated, which is all of it. A
+    /// partial one states nothing releasable, so it is left for the next consume. Once the value
+    /// is extracted, or the output released, the input is not pulled again.
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        debug_assert!(
+            guard.check_from(self.input.tiling()),
+            "{} consumes a guard of its input's tiling: {guard:?}",
+            self.name()
+        );
+        if !state.extracted.is_empty()
+            || self.obsolete_guard().is_universal()
+            || guard.projection(&self.input.name()) == Projection::Nothing
+        {
+            return;
+        }
+        let input_result = self.input.get(guard);
+        let upstream_guard = input_result.to_guard();
+        let value = self.extract(input_result);
+        if !value.is_empty() {
+            state.extracted = value;
+            state.complete = true;
+        }
+        self.input.release(upstream_guard);
+    }
 }
 
 impl BreakingProducer for ExtractAggregateProducer {
     /// The extracted value, once there is one.
     fn complete(&self) -> TileGuard {
-        match self.complete {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        match state.complete {
             false => self.tiling().empty_guard(),
             true => self.tiling().universal_guard(),
         }
@@ -685,7 +734,7 @@ impl TileProducer for MapExtractAggregateProducer {
 
     /// Restates releases through the unchanged collection levels. Releasing part of an
     /// extracted value does not release its input aggregation.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -901,19 +950,17 @@ impl TileOperator for MapAggregate {
 /// Producer for [`MapAggregate`].
 struct MapAggregateProducer {
     base: ProducerBase,
-    /// The subscribed lookup-function producer.
     input: Box<dyn TileProducer>,
-    /// The aggregation operation.
+    // shared-state-ok: this producer's own state, which `get`, `consume_impl` and `release` change
+    // through `&self` on any worker thread; no other operator holds it.
+    state: RwLock<MapAggregateState>,
+}
+
+/// Group accumulators and completeness protected by the canonical breaker lock.
+pub(crate) struct MapAggregateState {
     kind: AggregateKind,
-    /// Running accumulators indexed by complete paths, outermost key first.
     accumulators: HashMap<Vec<Value>, Tile>,
-    /// Keys above the accumulators that hold none, by path. Such a key arrives with nothing
-    /// beneath it, an empty collection of groups. Or a release takes every accumulator beneath
-    /// it without the key itself, which leaves the key in place holding nothing unreleased
-    /// (`src/interpreter/design-operators.md`, "The completeness contract"). No accumulator's
-    /// path names either kind, so the output keeps them from here.
     keys_with_nothing_beneath: HashSet<Vec<Value>>,
-    /// What the answers consumed state about completeness, together.
     stated: Option<Stated>,
 }
 
@@ -937,29 +984,21 @@ impl MapAggregateProducer {
         Self {
             base,
             input,
+            state: RwLock::new(MapAggregateState::new(kind)),
+        }
+    }
+}
+
+impl MapAggregateState {
+    pub(crate) fn new(kind: AggregateKind) -> Self {
+        Self {
             kind,
             accumulators: HashMap::new(),
             keys_with_nothing_beneath: HashSet::new(),
             stated: None,
         }
     }
-
-    /// Pull the input at `guard`, fold what it answers into the accumulators, and release the
-    /// input at what the answer stated. What the answer states about completeness comes back.
-    fn read_input(&mut self, guard: TileGuard) -> Stated {
-        let mut input_tile = self.input.get(guard);
-        trace!("{} received {input_tile:?}", self.name());
-        let upstream_guard = input_tile.to_guard();
-        input_tile.compact();
-        let stated = self.fold(&input_tile);
-        // Release received values
-        self.input.release(upstream_guard);
-        stated
-    }
-
-    /// Fold the groups of `input_tile` into the accumulators.
-    fn fold(&mut self, input_tile: &Tile) -> Stated {
-        let obsolete = self.obsolete_guard().clone();
+    fn fold(&mut self, input_tile: &Tile, tiling: &Tiling, obsolete: &TileGuard) -> Stated {
         let Tile::DataFunction {
             domain_predicate,
             absent_keys,
@@ -971,14 +1010,10 @@ impl MapAggregateProducer {
         // A group known absent is complete: it has no element to fold, in any region.
         let domain_predicate = domain_predicate.union(absent_keys);
 
-        // The collection being folded is the innermost one, and the rows it stands over
-        // are the groups: `parent_paths` names them, one path per group.
-        //
-        // Every level above it states its own completion, which is collected here: a level
-        // says which of *its* keys are closed, and no other level says it for it.
-        let depth = input_tile.innermost_depth().unwrap_or_else(|| {
-            panic!("MapAggregate folds a collection of collections, got {input_tile:?}")
-        });
+        // The output's levels above Aggregation name the groups. Its accumulator may itself
+        // contain collections (Sole), whose levels belong to the value rather than this fold.
+        let (group_extents, output_tiling) = folded_shape(tiling);
+        let depth = group_extents.len();
         assert!(
             depth >= 1,
             "MapAggregate folds a collection of collections, so the fold sits under a \
@@ -1022,7 +1057,6 @@ impl MapAggregateProducer {
         // element the folded level calls complete.
         let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let values = (**codomain).clone();
-        let (_, output_tiling) = folded_shape(self.tiling());
 
         // Fold each group into its row's accumulator. A group is a contiguous run of the
         // folded collection's values, so the fold stays vectorized.
@@ -1060,15 +1094,35 @@ impl MapAggregateProducer {
         .settled(self.accumulators.keys())
     }
 
-    /// The output over every accumulator held, with the completeness `stated` names, cut to
-    /// `projection`.
-    fn build(&self, stated: &Stated, projection: &Projection) -> Tile {
+    pub(crate) fn release(&mut self, obsolete: &TileGuard) {
+        let removed: Vec<_> = self
+            .accumulators
+            .keys()
+            .filter(|path| obsolete.covers_path(path))
+            .cloned()
+            .collect();
+        self.accumulators
+            .retain(|path, _| !obsolete.covers_path(path));
+        for path in removed {
+            for len in 1..path.len() {
+                if !obsolete.covers_path(&path[..len]) {
+                    self.keys_with_nothing_beneath.insert(path[..len].to_vec());
+                }
+            }
+        }
+        self.keys_with_nothing_beneath
+            .retain(|path| !obsolete.covers_path(path));
+    }
+}
+
+impl MapAggregateState {
+    fn build(&self, stated: &Stated, projection: &Projection, tiling: &Tiling) -> Tile {
         let Stated {
             level_predicates,
             complete,
             ..
         } = stated;
-        let (extents, output_tiling) = folded_shape(self.tiling());
+        let (extents, output_tiling) = folded_shape(tiling);
         let kind = &self.kind;
         // Completion is per path. An inner group can be complete while its enclosing
         // collections remain open; `complete` combines the statements at every level.
@@ -1127,7 +1181,7 @@ impl MapAggregateProducer {
                 *domain_predicate = stated.clone();
             }
         }
-        out.restrict_to(projection, self.tiling());
+        out.restrict_to(projection, tiling);
         out
     }
 }
@@ -1197,12 +1251,13 @@ impl Stated {
 
 impl TileProducer for MapAggregateProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        let accumulators: usize = self
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        let accumulators: usize = state
             .accumulators
             .iter()
             .map(|(path, acc)| path.len() + acc.cell_count())
             .sum();
-        ProducerStateInfo::holding(accumulators + self.keys_with_nothing_beneath.len())
+        ProducerStateInfo::holding(accumulators + state.keys_with_nothing_beneath.len())
     }
 
     impl_producer_base!();
@@ -1225,65 +1280,35 @@ impl TileProducer for MapAggregateProducer {
         Restates::Every
     }
 
-    fn answers_from_state(&self) -> bool {
-        true
-    }
-
     /// The keys at every level are the input's, with each group beneath one whole, so the input
     /// is pulled at the projection and the answer is cut to it: accumulators for keys pulled
     /// earlier stay held, and a pull names the keys it wants. What the answers state is kept
     /// across pulls with the accumulators, since a pull beneath the groups' keys states only the
     /// elements it reads (`Stated::settled`).
-    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection_for(self);
-        if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
-        }
-        match &self.stated {
+    fn answers_from_state(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        let projection = guard.projection_for(self);
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        match &state.stated {
+            Some(stated) => state.build(stated, &projection, self.tiling()),
             None => self.tiling().empty_tile(),
-            Some(stated) => self.build(stated, &projection),
         }
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let obsolete = self.obsolete_guard().clone();
-        // Remove covered accumulators before another pull rebuilds the output from this map.
-        match obsolete_guard {
-            g if g.is_empty() => {}
-            g if g.is_universal() => {
-                self.accumulators.clear();
-                self.keys_with_nothing_beneath.clear();
-                self.input.release(self.input.tiling().universal_guard());
-            }
-            // Preserve unreleased ancestor keys even when their last accumulator is removed.
-            // The input has a collection where the output has an accumulator, so restate
-            // the guard through their shared levels rather than forwarding it unchanged.
-            g => {
-                let released: Vec<Vec<Value>> = self
-                    .accumulators
-                    .keys()
-                    .filter(|path| obsolete.covers_path(path))
-                    .cloned()
-                    .collect();
-                self.accumulators
-                    .retain(|path, _| !obsolete.covers_path(path));
-                for path in released {
-                    for len in 1..path.len() {
-                        let key = &path[..len];
-                        if !obsolete.covers_path(key) {
-                            self.keys_with_nothing_beneath.insert(key.to_vec());
-                        }
-                    }
-                }
-                self.keys_with_nothing_beneath
-                    .retain(|key| !obsolete.covers_path(key));
-                let levels = self.tiling().levels();
-                let input = self.input.tiling();
-                self.input
-                    .release(crate::interpreter::tiling::through_shared_levels(
-                        g, levels, input,
-                    ));
-            }
+    fn release_impl(&self, guard: TileGuard) {
+        self.state
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(&self.obsolete_guard());
+        {
+            let input_guard = crate::interpreter::tiling::through_shared_levels(
+                guard,
+                self.tiling().levels(),
+                self.input.tiling(),
+            );
+            self.input.release(input_guard);
         }
     }
 }
@@ -1292,20 +1317,29 @@ impl Breaker for MapAggregateProducer {
     /// Folds the groups the input answers at `guard`, a guard of the input's tiling, into the
     /// accumulators, releases the input at what the answer stated, and keeps what the answers
     /// state about completeness, together.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        debug_assert!(
-            guard.check_from(self.input.tiling()),
-            "{} consumes a guard of its input's tiling: {guard:?}",
-            self.name()
-        );
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        assert!(guard.check_from(self.input.tiling()));
         if guard.is_empty() {
             return;
         }
-        let stated = self.read_input(guard);
-        self.stated = Some(match self.stated.take() {
-            Some(before) => before.union(&stated).settled(self.accumulators.keys()),
+        let mut tile = self.input.get(guard);
+        let released = tile.to_guard();
+        tile.compact();
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        let stated = state.fold(&tile, self.tiling(), &self.obsolete_guard());
+        state.stated = Some(match state.stated.take() {
+            Some(before) => before.union(&stated).settled(state.accumulators.keys()),
             None => stated,
         });
+        drop(state);
+        self.input.release(released);
+    }
+
+    fn finish_parallel_input(&mut self) {
+        self.input.release(self.input.tiling().universal_guard());
+    }
+    fn consumes_concurrently(&self) -> bool {
+        !folded_shape(self.tiling()).1.holds_a_level()
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1334,21 +1368,24 @@ impl BreakingProducer for MapAggregateProducer {
     /// a push names it once its input is complete, and a reader that read it before reads it again
     /// then (`Pushes::push_final` pushes each region once).
     fn complete(&self) -> TileGuard {
-        let Some(stated) = &self.stated else {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(stated) = &state.stated else {
             return self.tiling().empty_guard();
         };
-        let built = self.build(stated, &Projection::Everything).to_guard();
-        let folding: Vec<Predicate> = self
+        let built = state
+            .build(stated, &Projection::Everything, self.tiling())
+            .to_guard();
+        let folding: Vec<Predicate> = state
             .accumulators
             .keys()
             .filter(|path| !stated.complete.contains_path(path))
             .map(|path| Predicate::exactly(path))
             .collect();
-        let Some(depth) = self.accumulators.keys().next().map(Vec::len) else {
+        let Some(depth) = state.accumulators.keys().next().map(Vec::len) else {
             return built;
         };
         debug_assert!(
-            self.accumulators.keys().all(|path| path.len() == depth),
+            state.accumulators.keys().all(|path| path.len() == depth),
             "every group of a map aggregate is keyed at the same depth"
         );
         match Projection::keys_at(CurryLevel::new(depth - 1), Predicate::union_all(folding)) {
@@ -1359,10 +1396,11 @@ impl BreakingProducer for MapAggregateProducer {
 
     /// Cut at the groups the accumulators hold.
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
-        let Some(stated) = &self.stated else {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(stated) = &state.stated else {
             return vec![guard.clone()];
         };
-        let output = self.build(stated, &Projection::Everything);
+        let output = state.build(stated, &Projection::Everything, self.tiling());
         let keys = output.live_keys().into_iter().flatten();
         cut_at_keys(guard, keys.map(|(_, key)| key), rows, self.tiling())
     }
@@ -1631,7 +1669,7 @@ mod tests {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
-        let mut producer = AggregateProducer::new(
+        let producer = AggregateProducer::new(
             ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
             Box::new(spy),
         );
@@ -2932,7 +2970,7 @@ mod aggregate_consuming_tests {
             accumulator,
             terminal: ColumnValue::Bools(terminal),
             ..
-        } = &aggregate.accumulator
+        } = &*aggregate.accumulator.read().unwrap()
         else {
             panic!("an accumulator, got {:?}", aggregate.accumulator)
         };
@@ -2998,7 +3036,7 @@ mod aggregate_consuming_tests {
         assert_eq!(aggregate.final_guard(), sum_tiling().universal_guard());
         assert_eq!(
             aggregate.get(sum_tiling().universal_guard()),
-            aggregate.accumulator,
+            aggregate.accumulator.read().unwrap().clone(),
             "the offer is the accumulator"
         );
     }
@@ -3779,7 +3817,10 @@ mod map_aggregate_consuming_tests {
 
     /// The group sums the accumulators hold, by key.
     fn held(map: &MapAggregateProducer) -> BTreeMap<u64, i64> {
-        map.accumulators
+        map.state
+            .read()
+            .unwrap()
+            .accumulators
             .iter()
             .map(|(path, accumulator)| {
                 let Value::UInt(key) = path[0] else {

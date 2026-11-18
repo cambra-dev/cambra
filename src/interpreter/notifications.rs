@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
@@ -36,8 +37,10 @@ impl Drop for Notifying {
     }
 }
 
-/// Notify `shared` of `region`. A notification that reaches a shared consumer this thread is
-/// already notifying calls [`Landing::reentered`] instead.
+/// Notify `shared` of the part of `region` it has not been notified of in this landing
+/// ([`Landing::unjoined`]). A shared consumer is where an operator's input paths meet, so a push
+/// that reaches it by two paths is passed on once. A notification that reaches a shared consumer
+/// this thread is already notifying calls [`Landing::reentered`] instead.
 ///
 /// It takes no lock: a consumer guards its own state and releases it before it forwards a
 /// notification. Two threads can notify one consumer at once.
@@ -47,7 +50,11 @@ pub(crate) fn notify_shared<C: Consumer + ?Sized>(
     landing: &mut Landing<'_>,
 ) {
     match Notifying::enter(shared) {
-        Some(_notifying) => C::notify(shared, region, landing),
+        Some(notifying) => {
+            if let Some(region) = landing.unjoined(notifying.0, region) {
+                C::notify(shared, &region, landing);
+            }
+        }
         None => landing.reentered(),
     }
 }
@@ -434,7 +441,9 @@ pub(crate) struct Delivered {
 type RecordDelivery = Box<dyn FnOnce(&mut Delivered)>;
 
 /// [`Delivered`], shared by the consumers in front of one pairing operator's inputs.
-pub(crate) type SharedDelivered = Arc<std::sync::Mutex<Delivered>>;
+// shared-state-ok: the regions a pairing's inputs have delivered, which the consumers in front of
+// its inputs read and grow on each delivery; what crosses it is predicates, never a tile.
+pub(crate) type SharedDelivered = Arc<Mutex<Delivered>>;
 
 /// A [`Delivered`] with nothing delivered yet of a side whose keys arrive by a push, and
 /// everything of a side no push reaches, which holds all its keys from the start
@@ -444,7 +453,7 @@ pub(crate) fn nothing_delivered(rows_arrive: bool, partners_arrive: bool) -> Sha
         true => crate::interpreter::Predicate::False,
         false => crate::interpreter::Predicate::True,
     };
-    Arc::new(std::sync::Mutex::new(Delivered {
+    Arc::new(Mutex::new(Delivered {
         rows: held(rows_arrive),
         partners: held(partners_arrive),
     }))
@@ -509,35 +518,71 @@ pub(crate) struct AlignedDelivered {
 }
 
 /// [`AlignedDelivered`], shared by the consumers in front of one operator's arms.
-pub(crate) type SharedAligned = Arc<std::sync::Mutex<AlignedDelivered>>;
+// shared-state-ok: the rows each arm has delivered, which the consumers in front of the arms read
+// and grow on each delivery; what crosses it is predicates, never a tile.
+type SharedAligned = Arc<Mutex<AlignedDelivered>>;
 
-/// An [`AlignedDelivered`] with nothing delivered of each arm whose keys arrive from a source, and
-/// every row of each arm that reads none, in arm order.
-pub(crate) fn nothing_aligned(arrive: impl IntoIterator<Item = bool>) -> SharedAligned {
-    let arms = arrive
-        .into_iter()
-        .map(|arrives| match arrives {
-            true => crate::interpreter::Predicate::False,
-            false => crate::interpreter::Predicate::True,
-        })
-        .collect();
-    Arc::new(std::sync::Mutex::new(AlignedDelivered { arms }))
+/// How the region of an input of a row-aligned operator names the operator's rows
+/// ([`AlignedInputs::consumer`]).
+#[derive(Clone, Copy)]
+pub(crate) enum InputRows {
+    /// The input's keys are the operator's, so its region names the operator's rows.
+    Keys,
+    /// The operator reads the input whole at every row, so any region of it names every row.
+    Whole,
 }
 
-/// `consumer` behind a consumer that passes on a delivery of arm `arm` only under the rows of
-/// level `at` that every other arm has delivered ([`AlignedDelivered`]).
-pub(crate) fn aligned(
-    arm: usize,
+/// The consumers in front of the inputs of one operator whose row exists once every input has
+/// delivered it ([`AlignedDelivered`]), at level `at`: `Zip`, `Filter`, a flat `Union`,
+/// `MapResult`, `MapResultToConst` at the outermost level, and `CheckedLookup`. Each operator that
+/// joins inputs at shared rows builds one, so a row is announced once, by the delivery that
+/// completes it. A pairing operator restates deliveries as pairs instead ([`Delivered`]).
+pub(crate) struct AlignedInputs {
     at: CurryLevel,
     delivered: SharedAligned,
-    consumer: Box<dyn Consumer>,
-) -> Box<dyn Consumer> {
-    Box::new(Aligned {
-        arm,
-        at,
-        delivered,
-        consumer,
-    })
+}
+
+impl AlignedInputs {
+    /// For `inputs` in arm order. An input whose keys arrive by no push holds every row from the
+    /// start
+    /// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
+    pub(crate) fn new<'a>(
+        at: CurryLevel,
+        inputs: impl IntoIterator<Item = &'a Arc<dyn crate::interpreter::tile_operators::TileOperator>>,
+    ) -> Self {
+        let arms = inputs
+            .into_iter()
+            .map(|input| match input.keys_arrive_by_push() {
+                true => crate::interpreter::Predicate::False,
+                false => crate::interpreter::Predicate::True,
+            })
+            .collect();
+        Self {
+            at,
+            delivered: Arc::new(Mutex::new(AlignedDelivered { arms })),
+        }
+    }
+
+    /// `consumer` behind the consumer of input `arm`, which passes on a delivery only under the
+    /// rows every other input has delivered. A region of an input read whole names every row
+    /// (`rows`).
+    pub(crate) fn consumer(
+        &self,
+        arm: usize,
+        rows: InputRows,
+        consumer: Box<dyn Consumer>,
+    ) -> Box<dyn Consumer> {
+        let aligned = Box::new(Aligned {
+            arm,
+            at: self.at,
+            delivered: self.delivered.clone(),
+            consumer,
+        });
+        match rows {
+            InputRows::Keys => aligned,
+            InputRows::Whole => widening(aligned),
+        }
+    }
 }
 
 struct Aligned {
@@ -609,6 +654,54 @@ impl Consumer for Aligned {
             return;
         }
         self.consumer.notify(&restated, landing);
+    }
+}
+
+/// `consumer` behind a consumer that passes on a region of a record of values, whose fields arrive
+/// independently, only once every field has delivered: from the delivery that completes the
+/// record on. A reader that computes from the whole record has nothing to read before then, and a
+/// delivery of one field is otherwise passed on once per field. `fields` names each field and
+/// whether it arrives by a push; one that does not holds its value from the start. Each field's
+/// record grows only on a delivery ([`Landing::is_delivery`]).
+pub(crate) fn whole_once_complete(
+    fields: Vec<(smol_str::SmolStr, bool)>,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    let delivered = fields.iter().map(|(_, arrives)| !arrives).collect();
+    Box::new(WholeOnceComplete {
+        names: fields.into_iter().map(|(name, _)| name).collect(),
+        delivered: Mutex::new(delivered),
+        consumer,
+    })
+}
+
+struct WholeOnceComplete {
+    names: Vec<smol_str::SmolStr>,
+    // shared-state-ok: which of the record's fields have delivered, set by each field's
+    // notification on any worker thread; what crosses it is one flag per field, never a tile.
+    delivered: Mutex<Vec<bool>>,
+    consumer: Box<dyn Consumer>,
+}
+
+impl Consumer for WholeOnceComplete {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        if !landing.is_delivery() {
+            self.consumer.notify(region, landing);
+            return;
+        }
+        let complete = {
+            let mut delivered = self
+                .delivered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (name, field) in self.names.iter().zip(delivered.iter_mut()) {
+                *field |= region.field(name) != Projection::Nothing;
+            }
+            delivered.iter().all(|field| *field)
+        };
+        if complete {
+            self.consumer.notify(region, landing);
+        }
     }
 }
 

@@ -142,11 +142,11 @@ impl TileProducer for Scripted {
         self.tiling().empty_tile()
     }
 
-    fn release_impl(&mut self, _guard: TileGuard) {}
+    fn release_impl(&self, _guard: TileGuard) {}
 }
 
 impl Breaker for Scripted {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
         self.input.get(guard);
         if let Some(released) = &self.releases {
             self.input.release(released.clone());
@@ -605,7 +605,7 @@ impl TileProducer for Positions {
         self.tiling().empty_tile()
     }
 
-    fn release_impl(&mut self, _guard: TileGuard) {}
+    fn release_impl(&self, _guard: TileGuard) {}
 }
 
 /// Finish source pipeline 0 after it consumed row 0 of a `Positions` input whole and the input
@@ -885,10 +885,8 @@ fn an_extraction_over_a_memo_extracts_at_every_morsel_size() {
 
 /// A source over a finite range of positions starts with morsels of `rows` positions, the last
 /// one partial when `rows` does not divide the range; each is consumed once, and the input is
-/// pulled once at each. The memo releases the input twice at each morsel: at what the answer
-/// states, then at the morsel's keys the cache states complete, and a repeated release reaches
-/// the input. The last morsel releases the input whole, so both its releases reach it as the
-/// universal guard.
+/// pulled and released once at each. The last morsel releases the input whole, so its release
+/// reaches the input as the universal guard.
 #[test]
 fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
     let source = source(SPARSE);
@@ -914,19 +912,18 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
         "one pull per morsel"
     );
     let (_, before) = morsels.split_last().expect("three morsels");
-    let released_twice: Vec<_> = before
+    let released: Vec<_> = before
         .iter()
         .cloned()
         .chain([ints().universal_guard()])
-        .flat_map(|morsel| [morsel.clone(), morsel])
         .collect();
     assert_eq!(
         source
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .released,
-        released_twice,
-        "two releases per morsel"
+        released,
+        "one release per morsel"
     );
 }
 
