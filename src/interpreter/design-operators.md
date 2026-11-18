@@ -534,7 +534,8 @@ above the declaration, as `Uncurry` does for pairs named by their first componen
   output keys are not its input's keys, such as a `Converse` inverting its outermost collection,
   pulls the input in full and cuts its own output. An operator that cannot restate 𝑝 for an input
   pulls the input in full and still cuts its output: pulling more is sound for a `get`, where a
-  release that names more is not.
+  release that names more is not. An operator that pulls through `Projection::input_guard` reads
+  an input that is not a collection whole, because that input has no keys to project.
 - **Completeness between pulls.** The completeness contract compares a producer's answers inside the
   region pulled, and a pull of one projection states completeness over its keys only, so a pull of
   another region withdraws nothing it said of the first. The debug check keeps the last statement of

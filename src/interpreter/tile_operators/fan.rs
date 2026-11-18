@@ -1147,11 +1147,7 @@ impl TileProducer for SelectFieldProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let input_guard = match self.input.tiling().is_data_function() {
-            true => projection.guard(self.input.tiling()),
-            false => self.input.tiling().universal_guard(),
-        };
-        let mut tile = self.input.get(input_guard);
+        let mut tile = self.input.get(projection.input_guard(self.input.tiling()));
         // A row holding no cell of this field gave that cell back to this reader's release
         // (`Tile::Record`'s `absent`), and the field is the whole value here, so the row
         // leaves with it. The record gathers its other fields' cells along.

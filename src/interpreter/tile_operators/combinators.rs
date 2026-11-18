@@ -1073,12 +1073,8 @@ impl FilterProducer {
 
     /// The input's rows the predicate keeps, for the keys `projection` names.
     fn filtered(&mut self, projection: &Projection) -> Tile {
-        let guard_for = |tiling: &Tiling| match tiling.is_data_function() {
-            true => projection.guard(tiling),
-            false => tiling.universal_guard(),
-        };
-        let pred_guard = guard_for(self.predicate.tiling());
-        let i_guard = guard_for(self.input.tiling());
+        let pred_guard = projection.input_guard(self.predicate.tiling());
+        let i_guard = projection.input_guard(self.input.tiling());
         let predicate_result = self.predicate.get(pred_guard);
         let input_result = self.input.get(i_guard);
 
@@ -1936,8 +1932,30 @@ mod nested_projection_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
-    use crate::interpreter::{BaseType, ColumnValue, Extent, domain_prefix};
+    use crate::interpreter::tile_operators::test_helpers::{ProjectionSpyOp, TestTileProducer};
+    use crate::interpreter::{
+        BaseType, ColumnValue, Extent, FunctionDef, UnaryOpKind, domain_prefix,
+    };
+
+    /// A function-valued predicate has no keys to project, so it is read whole.
+    #[test]
+    fn a_function_predicate_is_read_whole_under_a_projection_of_keys() {
+        let bool_ = || Extent::Base(BaseType::Bool);
+        let flags = Tiling::data_function(bool_(), Tiling::Scalar(bool_()));
+        let (input, input_pulled, _) = ProjectionSpyOp::new(flags.empty_tile(), flags.clone());
+        let not = Value::ComputableFunction(FunctionDef::UnaryOp(UnaryOpKind::Not));
+        let not_tiling = Tiling::Scalar(Extent::function(bool_(), bool_()));
+        let (predicate, predicate_pulled, _) =
+            ProjectionSpyOp::new(Tile::Scalar(ColumnValue::single(not)), not_tiling.clone());
+        let keys =
+            || TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::Bool(false))));
+        let mut filter =
+            Filter::new_at(Box::new(input), Box::new(predicate), CurryLevel::OUTERMOST);
+        let mut producer = filter.subscribe(keys(), Box::new(|| {}), &mut Scheduler::new());
+        producer.get(keys());
+        assert_eq!(*input_pulled.borrow(), [keys()]);
+        assert_eq!(*predicate_pulled.borrow(), [not_tiling.universal_guard()]);
+    }
 
     /// A release of the paired level beneath a standing level arrives as a path prefix
     /// (`domain_prefix`): the standing rows before the running one whole, and under the
