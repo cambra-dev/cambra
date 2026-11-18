@@ -1,30 +1,64 @@
-use std::sync::{Arc, PoisonError};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::sync::PoisonError;
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing};
 
-/// A consumer handle shared by notification forwarders.
-/// It carries notifications, not tile data.
-pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
+// The shared consumers this thread is notifying, by address, which `notify_shared` checks a
+// notification against to find re-entry.
+//
+// shared-state-ok: a per-thread record of the consumers a notification is passing through. What
+// crosses it is a consumer's address, never a tile.
+thread_local! {
+    static NOTIFYING: std::cell::RefCell<std::collections::HashSet<usize>> = Default::default();
+}
 
-/// Notify `shared`, or fail the push where `shared` is notifying already: a push that re-enters a
-/// consumer it is passing through closes a cycle, which only a store closes.
-pub(crate) fn notify_shared(
-    shared: &SharedConsumer,
-    region: &Projection,
-    landing: &mut Landing<'_>,
-) {
-    match shared.try_borrow_mut() {
-        Ok(mut consumer) => consumer.notify(region, landing),
-        Err(_) => landing.reentered(),
+/// Marks a shared consumer as being notified on this thread until it is dropped.
+struct Notifying(usize);
+
+impl Notifying {
+    /// The mark for `shared`, or `None` where this thread is already notifying it.
+    fn enter<C: ?Sized>(shared: &Arc<C>) -> Option<Self> {
+        let identity = Arc::as_ptr(shared) as *const () as usize;
+        NOTIFYING
+            .with(|notifying| notifying.borrow_mut().insert(identity))
+            .then_some(Notifying(identity))
     }
 }
 
+impl Drop for Notifying {
+    fn drop(&mut self) {
+        NOTIFYING.with(|notifying| {
+            notifying.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+/// Notify `shared` of `region`. A notification that reaches a shared consumer this thread is
+/// already notifying calls [`Landing::reentered`] instead.
+///
+/// It takes no lock: a consumer guards its own state and releases it before it forwards a
+/// notification. Two threads can notify one consumer at once.
+pub(crate) fn notify_shared<C: Consumer + ?Sized>(
+    shared: &Arc<C>,
+    region: &Projection,
+    landing: &mut Landing<'_>,
+) {
+    match Notifying::enter(shared) {
+        Some(_notifying) => C::notify(shared, region, landing),
+        None => landing.reentered(),
+    }
+}
+
+/// A consumer handle shared by notification forwarders.
+/// It carries notifications, not tile data.
+pub type SharedConsumer = Arc<dyn Consumer>;
+
 /// Share a consumer between its input paths. Pipeline entries end notification propagation.
 pub fn shared_consumer(consumer: Box<dyn Consumer>) -> SharedConsumer {
-    Rc::new(RefCell::new(consumer))
+    Arc::from(consumer)
 }
 
 /// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
@@ -79,7 +113,7 @@ struct ThroughValues {
 }
 
 impl Consumer for ThroughValues {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         self.downstream.notify(&region.above(self.level), landing);
     }
 }
@@ -88,7 +122,7 @@ struct Widening(Box<dyn Consumer>);
 
 impl Consumer for Widening {
     /// A change widens to every key.
-    fn notify(&mut self, _region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, _region: &Projection, landing: &mut Landing<'_>) {
         self.0.notify(&Projection::Everything, landing);
     }
 }
@@ -97,16 +131,19 @@ impl Consumer for Widening {
 /// keeps its input's keys under another spelling, as `Uncurry`
 /// names an outer and an inner key as one pair, restates both exactly.
 pub fn restating(
-    restate: Box<dyn Fn(&Projection) -> Projection>,
+    restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     Box::new(Restating(restate, consumer))
 }
 
-struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
+struct Restating(
+    Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
+    Box<dyn Consumer>,
+);
 
 impl Consumer for Restating {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&(self.0)(region), landing);
     }
 }
@@ -126,7 +163,7 @@ pub fn fielding(
 struct Fielding(smol_str::SmolStr, Vec<smol_str::SmolStr>, Box<dyn Consumer>);
 
 impl Consumer for Fielding {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         if *region != Projection::Nothing {
             let record = Projection::of_field(&self.0, region.clone()).over_fields(&self.1);
             self.2.notify(&record, landing);
@@ -145,7 +182,7 @@ pub fn selecting_field(name: smol_str::SmolStr, consumer: Box<dyn Consumer>) -> 
 struct SelectingField(smol_str::SmolStr, Box<dyn Consumer>);
 
 impl Consumer for SelectingField {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let field = region.field(&self.0);
         if field != Projection::Nothing {
             self.1.notify(&field, landing);
@@ -163,7 +200,7 @@ pub fn tagging(tag: FieldKey, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> 
 struct Tagging(FieldKey, Box<dyn Consumer>);
 
 impl Consumer for Tagging {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&region.tagged(&self.0), landing);
     }
 }
@@ -178,11 +215,8 @@ struct Forwarding {
 impl Consumer for Forwarding {
     /// A push is passed on at once. A push climbs from one breaker to the next, so
     /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        match self.shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(region, landing),
-            Err(_) => landing.reentered(),
-        }
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        notify_shared(&self.shared, region, landing);
     }
 }
 
@@ -219,7 +253,7 @@ impl Consumer for OneLevelIn {
     /// A region of the standing levels passes as it is, and one of the keys at level `at` passes
     /// one level in. One that names keys beneath level `at` passes as every key: which output
     /// keys an input row stands beneath depends on its values, which no region carries.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         match self.restated(region) {
             Some(restated) => self.consumer.notify(&restated, landing),
             None => self.consumer.notify(&Projection::Everything, landing),
@@ -230,22 +264,26 @@ impl Consumer for OneLevelIn {
 /// Source handles registered by subscriptions, for source-window inspection and route retirement.
 #[derive(Default)]
 pub struct SourceRegistry {
-    source_handles: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    source_handles: HashMap<String, Arc<RwLock<dyn DataSourceDomainExtentImpl>>>,
 }
 
 impl SourceRegistry {
     pub fn sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> + '_ {
+    ) -> impl Iterator<Item = (&str, &Arc<RwLock<dyn DataSourceDomainExtentImpl>>)> + '_ {
         self.source_handles
             .iter()
             .map(|(name, source)| (name.as_str(), source))
     }
-    pub fn add_source_handle(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
-        let id = source.borrow().get_id().to_string();
+    pub fn add_source_handle(&mut self, source: Arc<RwLock<dyn DataSourceDomainExtentImpl>>) {
+        let id = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_id()
+            .to_string();
         if let Some(existing) = self.source_handles.get(&id) {
             assert!(
-                Rc::ptr_eq(existing, &source),
+                Arc::ptr_eq(existing, &source),
                 "two sources are registered as `{id}`"
             );
         } else {
@@ -267,14 +305,14 @@ mod tests {
         use crate::interpreter::dispatcher::PipelineId;
         struct Entry;
         impl Consumer for Entry {
-            fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
+            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
                 landing.queue(
                     PipelineId(0),
                     &crate::interpreter::TileGuard::Scalar(crate::interpreter::Predicate::True),
                 );
             }
         }
-        let mut consumer = through_values(CurryLevel::OUTERMOST, Box::new(Entry));
+        let consumer = through_values(CurryLevel::OUTERMOST, Box::new(Entry));
         let mut landing = Landing::route();
         consumer.notify(
             &Projection::admitting(crate::interpreter::Predicate::point(
@@ -292,11 +330,14 @@ mod tests {
         let shared = shared_consumer(Box::new(log));
         let keys = Projection::of(&keys_between(2, 4)).unwrap();
         crate::interpreter::dispatcher::notify_for_test(
-            &mut *forwarding_consumer_keeping_keys(&shared),
+            &*forwarding_consumer_keeping_keys(&shared),
             &keys,
         );
-        crate::interpreter::dispatcher::notify_for_test(&mut *forwarding_consumer(&shared), &keys);
-        assert_eq!(*received.borrow(), [keys, Projection::Everything]);
+        crate::interpreter::dispatcher::notify_for_test(&*forwarding_consumer(&shared), &keys);
+        assert_eq!(
+            *received.read().unwrap_or_else(PoisonError::into_inner),
+            [keys, Projection::Everything]
+        );
     }
 }
 
@@ -459,7 +500,7 @@ fn rows_reached(region: &Projection, at: CurryLevel) -> Option<crate::interprete
 }
 
 impl Consumer for Aligned {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         // A landing that queues nothing states what is decided rather than what arrived, so it is
         // cut by nothing.
         if !landing.is_delivery() {
@@ -526,7 +567,7 @@ impl SelectingFieldBeneathKeys {
 }
 
 impl Consumer for SelectingFieldBeneathKeys {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let restated = self.restated(region);
         if restated == Projection::Nothing
             && *region != Projection::Nothing
@@ -640,7 +681,7 @@ impl Consumer for FieldBeneathRows {
     /// the row's reader pulls. A change of one field names the rows it runs through. A complete
     /// region names the rows whose field it completes whole, which says this arm's part of those
     /// rows is final; the reader joins it with the other inputs it reads.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let restated = self.restated(region);
         let rows = restated.rows();
         if rows == Projection::Nothing && landing.is_delivery() {
@@ -689,7 +730,7 @@ impl Consumer for WholeValuesAt {
     /// values beneath them. A region naming part of some values names the input's values, which
     /// the function replaces, so it passes on as the rows it runs through: the value there is
     /// read again whole, and what of it is final is stated in the tile the reader pulls.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         match region.names_part_of_values() {
             false => self.0.notify(region, landing),
             true => self.0.notify(&region.rows(), landing),
@@ -801,7 +842,7 @@ impl Pairing {
     /// region is passed on unmarked: both inputs of a pairing read what one push brings in the
     /// same landing, so each pair's halves complete together, and halves from different
     /// pipelines are joined by the reader's record per read.
-    fn pass_on(&mut self, restated: &Projection, landing: &mut Landing<'_>) {
+    fn pass_on(&self, restated: &Projection, landing: &mut Landing<'_>) {
         self.consumer.notify(restated, landing);
     }
 }
@@ -809,7 +850,7 @@ impl Pairing {
 impl Consumer for Pairing {
     /// Restates a region of one input as the pairs it reaches ([`Delivered`]), passed on as
     /// [`pass_on`](Self::pass_on) says.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         // A delivery grows what has been delivered and is cut by it: a landing that queues
         // packages, a breaker's push or a range's arrival ([`Landing::is_delivery`]). Any other
         // landing states what is decided rather than what arrived, so it is cut by nothing and

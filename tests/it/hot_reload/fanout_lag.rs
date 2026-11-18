@@ -102,15 +102,15 @@ fn a_stdin_feed_resumes_after_the_cut_when_its_other_writer_is_edited() {
 fn feed_across_reloads(reads_n: bool, cuts: &[usize], morsel_rows: usize) -> Vec<String> {
     use cambra::ccl::Type;
     use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource, Value};
-    use std::{cell::RefCell, rc::Rc};
+    use std::sync::PoisonError;
 
     let items = ["a", "b", "c", "d", "e", "f", "g", "h"];
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
-    )));
+    );
     ctx.register_source(source.clone());
     let mut live = LiveProgram::start_text(&mut ctx, &feed("source1()", reads_n, ""), &no_main)
         .expect("v1 compiles");
@@ -140,14 +140,19 @@ fn feed_across_reloads(reads_n: bool, cuts: &[usize], morsel_rows: usize) -> Vec
             .expect("only the second writer changed");
         }
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .add_data(&[(Value::uint_from_row(at), Value::String((*item).into()))]);
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(at)));
         emitted.extend(run(&mut live));
     }
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     emitted.extend(run(&mut live));
     emitted
 }

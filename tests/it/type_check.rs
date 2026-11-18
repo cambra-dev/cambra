@@ -13,7 +13,6 @@
 
 use cambra::chl_parser::FileId;
 use std::collections::HashSet;
-use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
     Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode, anf,
@@ -264,11 +263,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
             Type::Base(bt) => Extent::Base(bt.clone()),
             _ => panic!("infer_program_with_sources: unsupported elem_ty {elem_ty:?}"),
         };
-        let stub = Rc::new(RefCell::new(TestDataSource::new(
-            name,
-            elem_ty.clone(),
-            output_extent,
-        )));
+        let stub = TestDataSource::new(name, elem_ty.clone(), output_extent);
         lctx.register_source(*name, stub);
         // Registered by element type; the data-function type (`DataSource(name)
         // ⤇ elem_ty`, `Data`) is constructed inside `register_source_type`.
@@ -304,11 +299,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
             Type::Base(bt) => Extent::Base(bt.clone()),
             _ => panic!("infer_program_with_sources_err: unsupported elem_ty {elem_ty:?}"),
         };
-        let stub = Rc::new(RefCell::new(TestDataSource::new(
-            name,
-            elem_ty.clone(),
-            output_extent,
-        )));
+        let stub = TestDataSource::new(name, elem_ty.clone(), output_extent);
         lctx.register_source(*name, stub);
         ictx.register_source_type(name, elem_ty.clone());
     }
