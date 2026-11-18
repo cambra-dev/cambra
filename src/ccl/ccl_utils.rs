@@ -304,10 +304,11 @@ pub(crate) fn tap_gated(fire: Expr, value: Expr, value_ty: Type) -> Expr {
 }
 
 /// `value` kept at the positions where `condition` holds, over an unrefined domain:
-/// `` source ≫ (λ binder → {condition → `fired(value); true → `idle}) ≫ variant_project(`fired) ``,
-/// or the step and the projection alone where there is no `source`. `around` wraps the tap in
+/// `` source ≫ (λ binder → {condition → `fired(value); true → `idle} ▷ variant_project(`fired)) ``,
+/// or `` step ≫ variant_project(`fired) `` where there is no `source`. `around` wraps the tap in
 /// what the step binds ahead of it, such as the `let`s ahead of a feed, and `fun_kind` is the
-/// step's kind.
+/// step's kind. The projection stays inside the step, so loop extraction can bind the source's
+/// position around a step whose input type depends on it.
 ///
 /// The form a condition takes where a refinement of the domain would state it in a type that
 /// cannot: a site in a branch, whose condition reads the bindings around it
@@ -325,11 +326,16 @@ pub(crate) fn gate_values(
     let value_ty = value.ty.clone();
     assert!(
         !crate::ccl::subst::type_free_vars(&value_ty).contains(&binder.name),
-        "a gated value's type reads the gate's binder `{}`, which the projection out of the \
-         gate cannot state: {value_ty}",
+        "a gated value's type reads the gate's binder `{}`; value gating currently requires \
+         a uniform payload type: {value_ty}",
         binder.name
     );
     let body = around(tap_gated(condition, value, value_ty.clone()));
+    let body = if source.is_some() {
+        Expr::apply(body, fired_project(value_ty.clone())).with_ty(value_ty.clone())
+    } else {
+        body
+    };
     let ty = Type::pi_if_dependent(
         binder.name.clone(),
         binder.ty.clone(),
@@ -343,12 +349,12 @@ pub(crate) fn gate_values(
         body,
     )
     .with_ty(ty);
-    compose_typed_or_hole(
-        source
-            .into_iter()
-            .chain([step, fired_project(value_ty)])
-            .collect(),
-    )
+    match source {
+        Some(source) => compose_typed_or_hole(vec![source, step]),
+        // The source-less data lambda lifts one total row. Projection then filters that
+        // collection, rather than making its row's value partial.
+        None => compose_typed_or_hole(vec![step, fired_project(value_ty)]),
+    }
 }
 
 /// The type of a **history**: the total function `𝐷 ⤇ 𝑉` a mutable variable, a feed
@@ -578,8 +584,9 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 ///   and a `Realize` as the conditional it stages;
 /// - a projection out of a tuple or record former reads the component.
 ///
-/// Type-blind, as predicate equality is: type slots ride along, and the nodes the rewrite
-/// builds carry none it needs. It mints no node identity, so an equality can run it.
+/// The result is compared without type slots. Read-back keeps a collection's domain filter as
+/// a cast, since its keys are part of its value; other type slots ride along as metadata.
+/// It mints no node identity, so an equality can run it.
 pub(crate) fn normal_form(term: &Expr) -> Expr {
     let mut fuel = NORMAL_FORM_STEPS;
     normalize(term.clone_preserving_ids(), &mut fuel)
@@ -692,6 +699,48 @@ fn reduce_application(
             function: combinator,
         } => match &combinator.node {
             TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
+            TypedExprNode::Builtin(Builtin::Converse) => {
+                let position = Name::fresh("__fiber_position");
+                let read =
+                    Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
+                let element = Expr::throwaway(TypedExprNode::Var(Name::elem())).with_ty(Type::Hole);
+                let (key_function, at_key) = crate::ccl::provenance::preserving_ids(|| {
+                    (
+                        crate::ccl::subst::shift_elems(inner, 1),
+                        crate::ccl::subst::shift_elems(argument, 1),
+                    )
+                });
+                let key = applied(element, key_function, Type::Hole, fuel);
+                let predicate = Expr::throwaway(TypedExprNode::BinOp {
+                    left: Box::new(key),
+                    op: BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+                    right: Box::new(at_key),
+                })
+                .with_ty(Type::Base(BaseType::Bool));
+                let domain = Type::refined_one(
+                    inner.ty.domain().unwrap_or(Type::Hole),
+                    Refinement::born(Rc::new(predicate)),
+                );
+                let lambda = normal_lambda(position, read, ty);
+                Some(normal_cast_collection(lambda, domain, ty))
+            }
+            TypedExprNode::Builtin(Builtin::Map) => {
+                let position = Name::fresh("__mapped_position");
+                let read =
+                    Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
+                let value = applied(read, a(), Type::Hole, fuel);
+                let body = applied(value, inner.clone_preserving_ids(), Type::Hole, fuel);
+                let mapped = normal_function_value(function, argument, ty, position, body);
+                Some(if let TypedExprNode::Cast { target, .. } = &argument.node {
+                    let lambda = match mapped.node {
+                        TypedExprNode::Cast { value, .. } => *value,
+                        _ => mapped,
+                    };
+                    normal_cast_collection(lambda, target.domain().unwrap_or(Type::Hole), ty)
+                } else {
+                    mapped
+                })
+            }
             // `zip` fans its input out to each component, of a tuple or of a record.
             TypedExprNode::Builtin(Builtin::Zip) => {
                 let mut at = |f: &Expr| applied(a(), f.clone_preserving_ids(), codomain(f), fuel);
@@ -777,21 +826,7 @@ fn reduce_application(
                 let both =
                     Expr::throwaway(TypedExprNode::Tuple(vec![a(), y_var])).with_ty(Type::Hole);
                 let body = applied(both, inner, Type::Hole, fuel);
-                let param = TypedBinding {
-                    name: y,
-                    occurrence: Occurrence::PLACEHOLDER,
-                    ty: Type::Hole,
-                    user_annotation: None,
-                    transparency: BindingTransparency::Transparent,
-                    site: None,
-                };
-                Some(
-                    Expr::throwaway(TypedExprNode::Lambda {
-                        param,
-                        body: Box::new(body),
-                    })
-                    .with_ty(ty.clone()),
-                )
+                Some(normal_function_value(function, argument, ty, y, body))
             }
             // At a tuple `(𝑘₁, …, 𝑘ₙ)`, `uncurry(𝑛)` of `𝑔` reads `𝑘ₙ ▷ (… ▷ (𝑘₁ ▷ 𝑔))`.
             TypedExprNode::Builtin(Builtin::Uncurry(n)) => {
@@ -856,6 +891,81 @@ fn reduce_application(
         },
         _ => None,
     }
+}
+
+/// A function-valued application read as a lambda. A collection's filtered domain is data,
+/// so its normal form keeps that filter as a cast rather than dropping it with type slots.
+fn normal_function_value(
+    function: &Expr,
+    argument: &Expr,
+    ty: &Type,
+    name: Name,
+    body: Expr,
+) -> Expr {
+    let lambda = normal_lambda(name, body, ty);
+    let (binder, mut result_ty) =
+        crate::ccl::provenance::preserving_ids(|| match function.ty.peel_refinements() {
+            Type::Fun {
+                name: Some(b),
+                codomain,
+                ..
+            } => (
+                Some(b.clone()),
+                crate::ccl::subst::open_codomain(&function.ty, codomain),
+            ),
+            Type::Fun { codomain, .. } => (None, (**codomain).clone()),
+            _ => (None, ty.clone()),
+        });
+    if result_ty.fun_kind().is_some_and(|k| k.resolved().is_data())
+        && cast_target_refinement(&result_ty).is_some()
+    {
+        // Normalization creates untyped intermediate terms. Only the domain's predicates
+        // denote data here; transport their values without traversing inference metadata.
+        if let Some(binder) = binder
+            && let Type::Fun { domain, .. } = &mut result_ty
+            && let Type::Refinement(_, refinements) = domain.as_mut()
+        {
+            let mut substitution = Substitution {
+                x: &binder,
+                replacement: argument,
+                free: None,
+                elem_depth: 0,
+                rewritten: HashMap::new(),
+            };
+            refinements.rewrite_each(|_, r| *r = substitution.refinement(r));
+        }
+        Expr::throwaway(TypedExprNode::Cast {
+            value: Box::new(lambda),
+            target: result_ty,
+        })
+        .with_ty(ty.clone())
+    } else {
+        lambda
+    }
+}
+
+fn normal_lambda(name: Name, body: Expr, ty: &Type) -> Expr {
+    let param = TypedBinding {
+        name,
+        occurrence: Occurrence::PLACEHOLDER,
+        ty: Type::Hole,
+        user_annotation: None,
+        transparency: BindingTransparency::Transparent,
+        site: None,
+    };
+    Expr::throwaway(TypedExprNode::Lambda {
+        param,
+        body: Box::new(body),
+    })
+    .with_ty(ty.clone())
+}
+
+fn normal_cast_collection(value: Expr, domain: Type, ty: &Type) -> Expr {
+    Expr::throwaway(TypedExprNode::Cast {
+        value: Box::new(value),
+        target: Type::data_fun(domain, Type::Hole),
+    })
+    .with_ty(ty.clone())
 }
 
 /// `op operand`, built without an identity.
@@ -1326,6 +1436,7 @@ fn substitute_term(body: Expr, x: &Name, replacement: &Expr) -> Expr {
         x,
         replacement,
         free: None,
+        elem_depth: 0,
         rewritten: HashMap::new(),
     }
     .term(body)
@@ -1338,17 +1449,23 @@ struct Substitution<'a> {
     /// The names `replacement` reads, which no binder the walk enters may bind; computed when
     /// the walk first meets a binder.
     free: Option<BTreeSet<Name>>,
+    /// Refinements crossed since the replacement was read.
+    elem_depth: u32,
     /// The cast-target predicates rewritten so far, by allocation, so a predicate shared
     /// across occurrences is rewritten once and stays shared. Each entry holds its origin,
     /// so the address it is keyed by is not reused while the walk lasts.
-    rewritten: HashMap<PredicateId, (Rc<Expr>, Refinement)>,
+    rewritten: HashMap<(PredicateId, u32), (Rc<Expr>, Refinement)>,
 }
 
 impl Substitution<'_> {
     fn term(&mut self, mut body: Expr) -> Expr {
         let x = self.x;
         match &mut body.node {
-            TypedExprNode::Var(n) if n == x => return self.replacement.clone_preserving_ids(),
+            TypedExprNode::Var(n) if n == x => {
+                return crate::ccl::provenance::preserving_ids(|| {
+                    crate::ccl::subst::shift_elems(self.replacement, self.elem_depth)
+                });
+            }
             // A `let` binding `x` shadows it in its body only.
             TypedExprNode::Let {
                 binding,
@@ -1396,12 +1513,15 @@ impl Substitution<'_> {
     /// `r` with the substitution applied to its predicate, the same allocation where the
     /// predicate does not read `x`.
     fn refinement(&mut self, r: &Refinement) -> Refinement {
-        let key = Rc::as_ptr(&r.predicate);
+        let key = (Rc::as_ptr(&r.predicate), self.elem_depth);
         if let Some((_, done)) = self.rewritten.get(&key) {
             return done.clone();
         }
         let done = if count_free(self.x, &r.predicate) > 0 {
-            Refinement::born(Rc::new(self.term(r.predicate.clone_preserving_ids())))
+            self.elem_depth += 1;
+            let term = self.term(r.predicate.clone_preserving_ids());
+            self.elem_depth -= 1;
+            Refinement::born(Rc::new(term))
         } else {
             r.clone()
         };
@@ -3501,6 +3621,44 @@ mod tests {
     use super::*;
     use crate::ccl::ty::TypeKind;
     use crate::ccl::{AggregateKind, CompareKind};
+
+    #[test]
+    fn normalization_keeps_an_outer_element_outside_a_nested_filter() {
+        let uint = Type::Base(BaseType::UInt);
+        let limit = Name::fresh("limit");
+        let predicate = Expr::binop(
+            Expr::var(Name::elem()).with_ty(uint.clone()),
+            BinOpKind::Compare(CompareKind::Greater),
+            Expr::var(&limit).with_ty(uint.clone()),
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let target = Type::data_fun(
+            Type::refined_one(Type::UIntRange(3), Refinement::born(Rc::new(predicate))),
+            uint.clone(),
+        );
+        let identity = Expr::lambda(
+            "i",
+            Occurrence::mint(),
+            Type::UIntRange(3),
+            Expr::var("i").with_ty(uint.clone()),
+        )
+        .with_ty(Type::data_fun(Type::UIntRange(3), uint.clone()));
+        let body = Expr::cast(identity, target.clone());
+        let function = Expr::lambda(&limit, Occurrence::mint(), uint.clone(), body)
+            .with_ty(Type::pi(&limit, uint.clone(), target));
+        let normalized = normal_form(&Expr::apply(
+            Expr::var(Name::elem()).with_ty(uint),
+            function,
+        ));
+        let TypedExprNode::Cast { target, .. } = &normalized.node else {
+            panic!("the filtered collection keeps its cast");
+        };
+        let refinements = cast_target_refinement(target).expect("the domain is filtered");
+        assert_eq!(
+            crate::ccl::subst::free_elem_indices(&refinements.as_slice()[0].predicate),
+            [0, 1].into_iter().collect(),
+        );
+    }
 
     /// A cast target's predicate reading a `let` is compared at the `let`'s definition, so two
     /// refinements filtering one collection by different bounds stay apart.

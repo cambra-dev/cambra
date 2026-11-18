@@ -768,17 +768,23 @@ block's values, all read out of a `letrec` the declaration encloses, and a `let`
 A feed under a condition reading such a value gates its values instead, as a tap of a recurrence or
 a transaction does. Its contribution keeps the source's unrefined domain:
 
-``source ≫ (λ 𝑝 → {𝑐 → `fired(𝑣); true → `idle}) ≫ variant_project(`fired)``
+``source ≫ (λ 𝑝 → {𝑐 → `fired(𝑣); true → `idle} ▷ variant_project(`fired))``
 
-Outside a loop the source is the one-row lift of the unit. The projection keeps the positions where
+Outside a loop, a data lambda lifts one total row over unit and projection filters the resulting
+collection: ``(λ () → {𝑐 → `fired(𝑣); true → `idle}) ≫ variant_project(`fired)``.
+The projection keeps the positions where
 `𝑐` holds, so the channel holds the rows a refinement would give it, and its type, `𝐷 ⤇ 𝑉`, reads
-nothing the declaration cannot see (`ccl_utils::gate_values`). Every other condition keeps the
-refinement.
+nothing the declaration cannot see (`ccl_utils::gate_values`). The projection stays inside the
+step, so loop extraction can bind its source position around a step whose input type depends on
+that position. An aggregate condition takes this path too where the fed type is uniform: its
+nested collection filters compile as code once, rather than being copied through the channel's
+domain types. Other conditions keep the refinement.
 
-The projection states `𝑉` outside the step, so a value whose type reads the step's position or a
-`let` ahead of the feed has no type there: `out << [y for y in ys if y < r]` under such a
-condition, in a loop over `r`. `channelize` refuses that feed at the feed as not compiled yet
-(`DeferError::GatedValueReadsItsIteration`).
+Value gating currently accepts only a uniform payload type `𝑉`, independent of the step's binding
+and the `let`s ahead of the feed. A dependent payload keeps the refined-source path where the
+condition permits it. Under a condition reading a recursive value, `channelize` still refuses
+such a feed as not compiled yet (`DeferError::GatedValueReadsItsIteration`), for example
+`out << [y for y in ys if y < r]` in a loop over `r`.
 
 ### How many commit stores a program has
 

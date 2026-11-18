@@ -1224,13 +1224,16 @@ fn rebind_after(expr: &mut Expr, from: usize, rebinding: Rebinding) {
     let Some((x, components)) = rebinding else {
         return;
     };
-    fn in_expr(e: &mut Expr, x: &Name, components: &[Expr]) {
-        e.walk_type_slots_mut(|t| crate::ccl::subst::rewrite_pairing_projections(x, components, t));
-        e.walk_children_mut(|c| in_expr(c, x, components));
+    fn in_expr(e: &mut Expr, x: &Name, components: &[Expr], memo: &PredMemo) {
+        e.walk_type_slots_mut(|t| {
+            crate::ccl::subst::rewrite_pairing_projections_memo(x, components, t, memo);
+        });
+        e.walk_children_mut(|c| in_expr(c, x, components, memo));
     }
+    let memo = PredMemo::new();
     if let TypedExprNode::Compose(elts) = &mut expr.node {
         for e in elts.iter_mut().skip(from) {
-            in_expr(e, &x, &components);
+            in_expr(e, &x, &components, &memo);
         }
     }
 }

@@ -1400,6 +1400,10 @@ give the same value at every argument the term is applied at.
   it holds at a key unchanged;
 - an applied eliminated combinator reads back to the term it stands for: `id`, `const`, a `zip`
   pairing, `apply`, a binary or unary operator, a chain, `curry` and `uncurry`;
+- a curried collection keeps its domain filter as a cast around the recovered lambda. A fiber
+  read from `converse` is the identity collection filtered by its key, and `map` preserves that
+  collection's filter while mapping its values. These collection-valued forms matter inside an
+  aggregate: their keys are part of the value being compared;
 - an applied value `Case` that lambda elimination fanned out over its input,
   `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`. Leg `𝑖` filters by
   the first-match predicate `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`, and peeling the earlier guards off it
@@ -2235,6 +2239,10 @@ Predicate interiors can subsequently be coalesced; they are not excluded from th
 Capture avoidance depends on the binder discipline and the substitution's scope handling.
 Assertions check violations instead of silently alpha-renaming arbitrary input trees. This is an
 implementation contract, not a proof that malformed substitutions cannot be represented.
+
+A refinement's discharge postcondition uses the substitution inside its predicate, with element
+indices shifted by one. A discharged name can remain when a replacement term introduces it from
+the destination scope. Simultaneous substitutions insert their replacement terms as written.
 
 #### Native bound edges and closure
 
@@ -3838,6 +3846,10 @@ Where the pair is iterated, planning applies the lifted filter (`emit_pair_filte
 states it: exponential beta rewrites `⟨𝑔, curry(ℎ)⟩ ≫ apply` to `⟨id, 𝑔⟩ ≫ ℎ` and refines the
 zip's pairs with `ℎ`'s domain refinements (`simplify::stating_domain_of`), since every pair it
 gives, `(𝑥, 𝑔(𝑥))`, is one `ℎ` was applied to.
+
+Eta expansion opens that collection's codomain at its fresh element binder and binds the name
+in the lambda's type. Lifted filters read pair components through `pair_projection`. If the
+selected component reads an earlier component, the projection's function type binds the pair.
 
 ### Iterating a dependent tuple
 

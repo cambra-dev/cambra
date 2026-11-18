@@ -1627,8 +1627,16 @@ fn reads_any(e: &Expr, names: &HashSet<Name>) -> bool {
             .any(|n| names.contains(n))
 }
 
+/// Whether a condition computes an aggregate, whose collection filters belong in code
+/// rather than being copied into every occurrence of the channel's domain type.
+fn has_aggregate(e: &Expr) -> bool {
+    let mut found = matches!(e.node, TypedExprNode::Aggregate { .. });
+    e.walk_children(|child| found |= !found && has_aggregate(child));
+    found
+}
+
 /// A conditional feed's contribution where its condition cannot be a refinement of the
-/// channel's domain: `source ≫ (λ 𝑝 → {𝑐 → `fired(𝑣); true → `idle}) ≫ variant_project(`fired)`,
+/// channel's domain: `source ≫ (λ 𝑝 → {𝑐 → `fired(𝑣); true → `idle} ▷ variant_project(`fired))`,
 /// with the `let`s ahead of the feed bound around both.
 ///
 /// A refinement is a type, and the channel's type stands where the deferred collection is
@@ -1636,6 +1644,9 @@ fn reads_any(e: &Expr, names: &HashSet<Name>) -> bool {
 /// a recursive group computes, has no spelling there, so the contribution keeps the source's
 /// unrefined domain and gates its values, as a tap of a recurrence or a transaction does
 /// (`src/ccl/design/mutability.md`, "A condition the channel's type cannot state").
+/// Aggregate conditions use this path too where the fed type reads no iteration binding:
+/// their nested collection filters are compiled as code once, rather than quoted in every
+/// occurrence of the channel's domain.
 fn gated_contribution(
     source: Expr,
     param: &TypedBinding,
@@ -3476,15 +3487,16 @@ fn extract_for_defer_impl(
                                     // value)` off the two elements' concrete
                                     // types; there is no re-derivation pass
                                     // to fill a `Hole` in.
+                                    let read = crate::ccl::subst::type_free_vars(&value.ty);
+                                    let reads_iteration = read.contains(&param.name)
+                                        || lets.iter().any(|(b, _)| read.contains(&b.name));
                                     let channel_expr =
-                                        if reads_any(&pred_on_source, cx.recursive_values) {
-                                            // The gate's projection states the value's type
-                                            // outside the iteration it is fed in: the step's
-                                            // parameter and the `let`s ahead of the feed.
-                                            let read = crate::ccl::subst::type_free_vars(&value.ty);
-                                            if read.contains(&param.name)
-                                                || lets.iter().any(|(b, _)| read.contains(&b.name))
-                                            {
+                                        if reads_any(&pred_on_source, cx.recursive_values)
+                                            || (!reads_iteration && has_aggregate(&condition))
+                                        {
+                                            // Value gating currently accepts a uniform payload
+                                            // type, independent of the step and its locals.
+                                            if reads_iteration {
                                                 return Err(Located::new(
                                                     DeferError::GatedValueReadsItsIteration(
                                                         defer_name.clone(),

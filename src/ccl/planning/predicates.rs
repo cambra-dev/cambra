@@ -179,6 +179,7 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 
 /// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
 /// bare predicate `__elem ▷ p` (the inverse of [`ccl_utils::bare_predicate_of_fn`]).
+/// Join-condition sides use the same operation with any codomain.
 /// Fast-pathed when the bare predicate is already that single application; otherwise
 /// η-expands to `λ 𝑒 → bare[__elem ↦ 𝑒]`, `𝑒` fresh, and lambda-eliminates to point-free.
 ///
@@ -191,7 +192,7 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 /// `p` stays as it stands unless it holds a `defer`, from a generator called in the key, which
 /// [`eliminate_lifted`] channelizes.
 ///
-/// The function is a **collection**: it yields one `Bool` per element of what the refinement
+/// For a refinement, the function is a **collection**: it yields one `Bool` per element of what it
 /// refines, and the runtime `Restrict` evaluates it over the extent
 /// (`src/ccl/design/type-inference.md`, "A refinement predicate is a data function"). The
 /// η-expanded form is where that is said, the binder being the one place a kind is written,
