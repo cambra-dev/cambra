@@ -206,7 +206,7 @@ fn complete_and_empty(tiling: &Tiling) -> Option<Tile> {
             domain,
             codomain,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
             ..
         } => Some(Tile::DataFunction {
             row_starts,
@@ -214,7 +214,7 @@ fn complete_and_empty(tiling: &Tiling) -> Option<Tile> {
             codomain,
             domain_predicate: Predicate::True,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         }),
         _ => None,
     }

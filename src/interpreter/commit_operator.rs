@@ -6465,18 +6465,11 @@ impl InductionDriverProducer {
                 .get(state.source_producer.tiling().universal_guard());
             state.source = DecodedSource::read(&src, levels_above);
             if levels_above == 0 {
-                let Tile::DataFunction {
-                    domain,
-                    domain_predicate,
-                    absent_keys,
-                    ..
-                } = &src
-                else {
+                let Tile::DataFunction { domain, .. } = &src else {
                     unreachable!("a drive's source is a collection")
                 };
                 state.source_absent = state.source_absent.union(
-                    &domain_predicate
-                        .union(absent_keys)
+                    &src.level_statement()
                         .minus(&Predicate::from_column_value(domain)),
                 );
             }
@@ -6485,13 +6478,9 @@ impl InductionDriverProducer {
             // the other. Read at the level itself: a standing level's rows are not the level
             // beneath's, and each level's completion is its own statement.
             for level in 0..state.source_producer.tiling().levels() {
-                if let Tile::DataFunction {
-                    domain_predicate,
-                    absent_keys,
-                    ..
-                } = src.values_at(CurryLevel::new(level))
-                {
-                    let complete = domain_predicate.union(absent_keys);
+                let at = src.values_at(CurryLevel::new(level));
+                if let Tile::DataFunction { .. } = at {
+                    let complete = at.level_statement();
                     match state.source_complete.get_mut(level) {
                         Some(known) => *known = known.union(&complete),
                         None => state.source_complete.push(complete),
@@ -7117,14 +7106,10 @@ impl TransactDriverProducer {
                 .source_producer
                 .get(state.source_producer.tiling().universal_guard());
             state.source = DecodedSource::read(&src, 0);
-            // An absent key is complete wherever completeness is read
-            // (`src/interpreter/design-operators.md`, "Absent keys").
+            // A level whose keys follow the level beneath is complete once that level is
+            // (`src/interpreter/design-operators.md`, "Keys that follow the level beneath").
             let source_complete = match &src {
-                Tile::DataFunction {
-                    domain_predicate,
-                    absent_keys,
-                    ..
-                } => domain_predicate.union(absent_keys),
+                Tile::DataFunction { .. } => src.level_statement(),
                 _ => Predicate::False,
             };
             // A source may honour a release a pull late, so a read can still show what the
@@ -12069,7 +12054,7 @@ mod tests {
             codomain: Box::new(Tile::Scalar(ColumnValue::from_ints(values))),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: crate::interpreter::tiling::KeysFollow::Unstated,
         };
         let store = |state: Tile| Tile::Store {
             state: Box::new(state),

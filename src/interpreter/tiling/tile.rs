@@ -17,6 +17,20 @@ use crate::{
     },
 };
 
+/// What a collection level states about its keys through the level beneath it
+/// (`src/interpreter/design-operators.md`, "Keys that follow the level beneath").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeysFollow {
+    /// A key arrives at the level only with a key beneath it, so the level states every key
+    /// complete where the level beneath states every key under every path complete.
+    Follows,
+    /// The level can gain a key that no key beneath it brings.
+    DoesNot,
+    /// The tile states neither. A collection constructor states nothing, so this is every
+    /// collection's state until an operator states one.
+    Unstated,
+}
+
 /// A materialized data tile produced by a [`TileProducer`](crate::interpreter::tile_operators::TileProducer).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tile {
@@ -55,11 +69,9 @@ pub enum Tile {
         /// preserved so `to_guard` can report every key ever seen, enabling complete source
         /// releasing.
         deleted: BitSet,
-        /// The paths of this level known absent everywhere: keys that have no value in any
-        /// region, not only in the region this tile answers. A cut keeps it whole, since an
-        /// absent key has no path in any region, where it cuts `domain_predicate` to the region
-        /// kept (`src/interpreter/design-operators.md`, "Absent keys").
-        absent_keys: Predicate,
+        /// Whether this level gains no key once the level beneath is complete under every path.
+        /// A cut keeps it, and a merge unites the sides' statements ([`merged_follow`]).
+        keys_follow_beneath: KeysFollow,
     },
     /// A Tile representing the state of a scalar aggregation.
     Aggregation {
@@ -387,11 +399,7 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record { fields: m, .. } => m.values().all(Tile::is_terminal),
-            Tile::DataFunction {
-                domain_predicate,
-                absent_keys,
-                ..
-            } => domain_predicate.union(absent_keys).is_true(),
+            Tile::DataFunction { .. } => self.level_statement().is_true(),
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
@@ -488,6 +496,8 @@ impl Tile {
     /// For a whole value the keys join its one row's run. Otherwise `other`'s rows follow
     /// this tile's, each run shifted past the keys already here.
     fn append_keys(&mut self, other: Tile, whole: bool) {
+        let (s_through_flag, o_through_flag) =
+            (self.stated_through_flag(), other.stated_through_flag());
         let (
             Tile::DataFunction {
                 row_starts: s_starts,
@@ -495,7 +505,7 @@ impl Tile {
                 codomain: s_codomain,
                 domain_predicate: s_pred,
                 deleted: s_deleted,
-                absent_keys: s_absent,
+                keys_follow_beneath: s_follow,
             },
             Tile::DataFunction {
                 row_starts: o_starts,
@@ -503,12 +513,13 @@ impl Tile {
                 codomain: o_codomain,
                 domain_predicate: o_pred,
                 deleted: o_deleted,
-                absent_keys: o_absent,
+                keys_follow_beneath: o_follow,
             },
         ) = (&mut *self, other)
         else {
             panic!("append_keys appends one collection to another")
         };
+        let follow = merged_follow(*s_follow, s_domain.len(), o_follow, o_domain.len());
         let shift = s_domain.len();
         if whole {
             assert_eq!(
@@ -535,8 +546,13 @@ impl Tile {
              neither empty nor one value per row over {} rows: {s_codomain:?}",
             s_domain.len(),
         );
-        *s_pred = s_pred.union(&o_pred);
-        *s_absent = s_absent.union(&o_absent);
+        *s_pred = match follow {
+            KeysFollow::Follows => s_pred.union(&o_pred),
+            _ => s_through_flag
+                .unwrap_or_else(|| s_pred.clone())
+                .union(&o_through_flag.unwrap_or(o_pred)),
+        };
+        *s_follow = follow;
         s_deleted.extend(o_deleted.iter().map(|i| i + shift));
     }
 
@@ -875,7 +891,7 @@ impl Tile {
             codomain,
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
             ..
         } = self
         else {
@@ -902,7 +918,7 @@ impl Tile {
             codomain: Box::new(codomain.select_rows(&picked)),
             domain_predicate: domain_predicate.clone(),
             deleted: moved,
-            absent_keys: absent_keys.clone(),
+            keys_follow_beneath: *keys_follow_beneath,
         };
         debug_assert!(
             valid_over(&regrouped, level_offsets_of(&regrouped).len()),
@@ -931,15 +947,54 @@ impl Tile {
                     .map(|path| Predicate::exactly(&path[..=depth]))
                     .collect(),
             );
-            let Tile::DataFunction {
-                domain_predicate, ..
-            } = self.values_at_mut(CurryLevel::new(depth))
-            else {
-                unreachable!("every level down to {level} is a collection")
-            };
-            *domain_predicate = domain_predicate.minus(&prefixes);
+            if prefixes.is_false() {
+                continue;
+            }
+            self.unstate_at(CurryLevel::new(depth), &prefixes);
         }
         self.values_at_mut(level).retain_keys(keep);
+    }
+
+    /// `self` with the collection at `level` stating `follows` of its keys, for a test that
+    /// builds the tile an operator answers.
+    ///
+    /// # Panics
+    ///
+    /// When `values_at(level)` is no collection.
+    #[cfg(test)]
+    pub(crate) fn with_keys_follow(mut self, level: CurryLevel, follows: KeysFollow) -> Tile {
+        let Tile::DataFunction {
+            keys_follow_beneath,
+            ..
+        } = self.values_at_mut(level)
+        else {
+            panic!("with_keys_follow sets a collection's flag at {level:?}")
+        };
+        *keys_follow_beneath = follows;
+        self
+    }
+
+    /// Take `region` out of what the collection at `level` states, as
+    /// [`level_statement`](Self::level_statement) reads it, and state that its keys do not follow
+    /// the level beneath (`KeysFollow::DoesNot`): the level beneath keeps its statement, which
+    /// would widen the level back over `region`, and a merge with a side that follows would too.
+    /// Every operator that narrows a level's statement in place narrows it through this.
+    ///
+    /// # Panics
+    ///
+    /// When `values_at(level)` is no collection.
+    pub(crate) fn unstate_at(&mut self, level: CurryLevel, region: &Predicate) {
+        let stated = self.values_at(level).level_statement();
+        let Tile::DataFunction {
+            domain_predicate,
+            keys_follow_beneath,
+            ..
+        } = self.values_at_mut(level)
+        else {
+            unreachable!("`level_statement` has read a collection at {level}")
+        };
+        *domain_predicate = stated.minus(region);
+        *keys_follow_beneath = KeysFollow::DoesNot;
     }
 
     /// Keep the keys `mask` names, dropping the rest — a filter along the *key* axis,
@@ -1252,13 +1307,9 @@ impl Tile {
             // a `Codomain` guard reads. A collection in a record's field is a level under the
             // key like any other ([`Tile::holds_a_level`]).
             Tile::DataFunction {
-                domain,
-                codomain,
-                domain_predicate,
-                absent_keys,
-                ..
+                domain, codomain, ..
             } => {
-                let complete = domain_predicate.union(absent_keys);
+                let complete = self.level_statement();
                 let domain_predicate = &complete;
                 if domain_predicate.is_true() {
                     return TileGuard::Function(FunctionGuard::Domain(Predicate::True));
@@ -1280,11 +1331,7 @@ impl Tile {
                 );
                 let beneath = codomain.stated_by_path(1);
                 if let Some(held) = self.held_prefix(&row_paths[0]) {
-                    return TileGuard::flatten_or(vec![
-                        held.guard(),
-                        beneath,
-                        TileGuard::Function(FunctionGuard::Domain(absent_keys.clone())),
-                    ]);
+                    return TileGuard::flatten_or(vec![held.guard(), beneath]);
                 }
                 // The codomain arm names what the **open** keys hold. A key the predicate
                 // calls whole is released by its own key, and a codomain guard is read
@@ -1381,7 +1428,7 @@ impl Tile {
             codomain,
             domain_predicate,
             deleted,
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         debug_assert!(
             valid_over(&result, level_offsets_of(&result).len()),
@@ -1585,18 +1632,103 @@ impl Tile {
     /// A statement beneath the keys can finish a held row without asserting that an
     /// enclosing key which has not arrived will never arrive.
     pub(crate) fn complete_keys(&self) -> Predicate {
-        let Tile::DataFunction {
-            domain,
+        let Tile::DataFunction { domain, .. } = self else {
+            panic!("complete_keys reads a collection")
+        };
+        self.level_statement()
+            .union(&Predicate::from_column_value(domain).intersect(&self.to_guard().whole_keys()))
+    }
+
+    /// State that the keys of the level whose values `values_at(level)` are do not follow the
+    /// level beneath (`KeysFollow::DoesNot`), writing what it states through the flag into its
+    /// `domain_predicate` first: an operator that replaces those values leaves that level's keys
+    /// following nothing it now holds. It is called before
+    /// the values are replaced, since the statement is read from them. At level 0 the values are
+    /// the whole tile, which no level stands above.
+    pub(crate) fn unfollow_values_at(&mut self, level: CurryLevel) {
+        let Some(above) = level.index().checked_sub(1) else {
+            return;
+        };
+        let above = CurryLevel::new(above);
+        if !matches!(self.values_at(above), Tile::DataFunction { .. }) {
+            return;
+        }
+        // What the level states through the flag stays stated: only the values beneath it
+        // change, not which of its keys are complete.
+        let stated = self.values_at(above).level_statement();
+        if let Tile::DataFunction {
             domain_predicate,
-            absent_keys,
+            keys_follow_beneath,
+            ..
+        } = self.values_at_mut(above)
+        {
+            *domain_predicate = stated;
+            *keys_follow_beneath = KeysFollow::DoesNot;
+        }
+    }
+
+    /// What this collection level states complete where its keys follow the level beneath, `None`
+    /// where they do not, in which case its `domain_predicate` is its statement. A merge whose
+    /// level does not follow writes a following side's statement into the merged predicate with
+    /// this ([`merged_follow`]), so the merge unites the sides' statements whether a side spells
+    /// its statement in the flag or in its predicate.
+    fn stated_through_flag(&self) -> Option<Predicate> {
+        matches!(
+            self,
+            Tile::DataFunction {
+                keys_follow_beneath: KeysFollow::Follows,
+                ..
+            }
+        )
+        .then(|| self.level_statement())
+    }
+
+    /// The keys this collection level states complete: its `domain_predicate`, and every key
+    /// where the level's keys follow the level beneath (`keys_follow_beneath`) and the level
+    /// beneath states every key under every path complete
+    /// (`src/interpreter/design-operators.md`, "Keys that follow the level beneath").
+    ///
+    /// # Panics
+    ///
+    /// When the tile is no collection.
+    pub(crate) fn level_statement(&self) -> Predicate {
+        let Tile::DataFunction {
+            codomain,
+            domain_predicate,
+            keys_follow_beneath,
             ..
         } = self
         else {
-            panic!("complete_keys reads a collection")
+            panic!("level_statement reads a collection: {self:?}")
         };
-        domain_predicate
-            .union(absent_keys)
-            .union(&Predicate::from_column_value(domain).intersect(&self.to_guard().whole_keys()))
+        let beneath_whole = *keys_follow_beneath == KeysFollow::Follows
+            && matches!(&**codomain, Tile::DataFunction { .. })
+            && codomain.level_statement().is_true();
+        match beneath_whole {
+            true => Predicate::True,
+            false => domain_predicate.clone(),
+        }
+    }
+
+    /// Write each collection level's [`level_statement`](Self::level_statement) into its
+    /// `domain_predicate`, beneath first, in every field of a record: a cut narrows statements to
+    /// the region it keeps, which would leave a level beneath that no longer states every path,
+    /// and the level above would lose what it stated through the flag.
+    pub(crate) fn state_derived(&mut self) {
+        match self {
+            Tile::DataFunction { codomain, .. } => {
+                codomain.state_derived();
+                let stated = self.level_statement();
+                if let Tile::DataFunction {
+                    domain_predicate, ..
+                } = self
+                {
+                    *domain_predicate = stated;
+                }
+            }
+            Tile::Record { fields, .. } => fields.values_mut().for_each(Tile::state_derived),
+            _ => {}
+        }
     }
 
     /// Which paths through `level` are complete, over whole paths: those `level` calls
@@ -1609,21 +1741,12 @@ impl Tile {
         let mut node = self;
         let mut complete = Predicate::False;
         for depth in 0..=level.index() {
-            let Tile::DataFunction {
-                codomain,
-                domain_predicate,
-                absent_keys,
-                ..
-            } = node
-            else {
+            let Tile::DataFunction { codomain, .. } = node else {
                 panic!("{level} of {self:?} has no level there")
             };
             complete = match depth {
-                0 => domain_predicate.union(absent_keys),
-                _ => complete
-                    .descend(1)
-                    .union(domain_predicate)
-                    .union(absent_keys),
+                0 => node.level_statement(),
+                _ => complete.descend(1).union(&node.level_statement()),
             };
             node = codomain;
         }
@@ -2213,20 +2336,15 @@ impl Tile {
     }
 
     /// Every statement this tile carries, as a guard at its own position, where it stands at
-    /// `level` of the tile: a collection's `domain_predicate` with its `absent_keys`, and beneath
+    /// `level` of the tile: a collection's [`level_statement`](Self::level_statement), and beneath
     /// it its codomain's, at every depth and in every field of a record. A part qualified by whole
     /// paths states keys complete under the rows it names and no other; a part unqualified at a
     /// level above states them under every row there, those not yet delivered included, so the
     /// guard names it there too.
     fn statements_guard(&self, level: usize) -> TileGuard {
         match self {
-            Tile::DataFunction {
-                codomain,
-                domain_predicate,
-                absent_keys,
-                ..
-            } => {
-                let complete = domain_predicate.union(absent_keys);
+            Tile::DataFunction { codomain, .. } => {
+                let complete = self.level_statement();
                 debug_assert!(
                     super::projection::qualifying_levels(&complete) <= level,
                     "a statement at level {level} names a path through at most {level} levels \
@@ -2260,15 +2378,10 @@ impl Tile {
     /// Rows stated alike are named together, as
     /// [`unstated_held_keys`](Self::unstated_held_keys) names rows holding alike.
     fn stated_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
-        let Tile::DataFunction {
-            domain_predicate,
-            absent_keys,
-            ..
-        } = self
-        else {
+        let Tile::DataFunction { .. } = self else {
             panic!("stated_keys is a collection's: {self:?}")
         };
-        let complete = domain_predicate.union(absent_keys);
+        let complete = self.level_statement();
         let domain_predicate = &complete;
         let mut groups: Vec<(Predicate, Vec<usize>)> = Vec::new();
         for (row, path) in row_paths.iter().enumerate() {
@@ -2336,16 +2449,10 @@ impl Tile {
     /// appears, so a column whose rows hold alike costs one arm however many rows it has
     /// and the region is spelled the same way each time.
     fn unstated_held_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
-        let Tile::DataFunction {
-            domain,
-            domain_predicate,
-            absent_keys,
-            ..
-        } = self
-        else {
+        let Tile::DataFunction { domain, .. } = self else {
             panic!("unstated_held_keys is a collection's: {self:?}")
         };
-        let stated = domain_predicate.union(absent_keys);
+        let stated = self.level_statement();
         let mut group_of: HashMap<Vec<Value>, usize> = HashMap::new();
         let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
         for (row, path) in row_paths.iter().enumerate() {
@@ -2931,6 +3038,30 @@ fn merged_cells(
     (combined.select_indices(picked.into_iter(), n), missing)
 }
 
+/// What the level two merged sides make states about its keys, given each side's flag and how
+/// many keys it holds there. A side that states its keys do not follow keeps the merged level from
+/// following, and two that state nothing leave it unstated. Beside a side that follows, a side
+/// holding keys under `KeysFollow::Unstated` holds keys of a producer that stated nothing about
+/// them, so the merged level does not follow; one holding no key adds none. A merge of rows can
+/// join collections of different producers, as a union's arms are. The answer does not depend on
+/// the order of the sides.
+pub(crate) fn merged_follow(
+    left: KeysFollow,
+    left_keys: usize,
+    right: KeysFollow,
+    right_keys: usize,
+) -> KeysFollow {
+    use KeysFollow::{DoesNot, Follows, Unstated};
+    match (left, right) {
+        (DoesNot, _) | (_, DoesNot) => DoesNot,
+        (Unstated, Unstated) => Unstated,
+        (Follows, Follows) => Follows,
+        (Follows, Unstated) if right_keys == 0 => Follows,
+        (Unstated, Follows) if left_keys == 0 => Follows,
+        (Follows, Unstated) | (Unstated, Follows) => DoesNot,
+    }
+}
+
 /// `left` and `right` standing over the rows `order` names, each row taking its content
 /// from whichever side delivered it.
 ///
@@ -3010,7 +3141,7 @@ fn merged_rows(
                 codomain: l_codomain,
                 domain_predicate: l_pred,
                 deleted: l_deleted,
-                absent_keys: l_absent,
+                keys_follow_beneath: l_follow,
             },
             Tile::DataFunction {
                 row_starts: r_starts,
@@ -3018,7 +3149,7 @@ fn merged_rows(
                 codomain: r_codomain,
                 domain_predicate: r_pred,
                 deleted: r_deleted,
-                absent_keys: r_absent,
+                keys_follow_beneath: r_follow,
             },
         ) => {
             let l_offsets = l_starts;
@@ -3084,6 +3215,7 @@ fn merged_rows(
                         path
                     })
                     .collect();
+            let follow = merged_follow(*l_follow, l_domain.len(), *r_follow, r_domain.len());
             let key_settled: Vec<bool> = keys
                 .iter()
                 .zip(&key_paths)
@@ -3127,9 +3259,19 @@ fn merged_rows(
                     &key_settled,
                     &key_paths,
                 )),
-                domain_predicate: l_pred.union(r_pred),
+                domain_predicate: match follow {
+                    KeysFollow::Follows => l_pred.union(r_pred),
+                    _ => left
+                        .stated_through_flag()
+                        .unwrap_or_else(|| l_pred.clone())
+                        .union(
+                            &right
+                                .stated_through_flag()
+                                .unwrap_or_else(|| r_pred.clone()),
+                        ),
+                },
                 deleted,
-                absent_keys: l_absent.union(r_absent),
+                keys_follow_beneath: follow,
             }
         }
         // An aggregation stands over rows without keys of its own. A row one side delivered
@@ -3371,8 +3513,15 @@ fn valid_over_settled(
             codomain,
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         } => {
+            // A level's keys follow a level beneath it, so a level whose values are no
+            // collection has nothing to follow.
+            if *keys_follow_beneath == KeysFollow::Follows
+                && !matches!(&**codomain, Tile::DataFunction { .. })
+            {
+                return false;
+            }
             let starts = row_starts;
             // A run per row, beginning at 0, non-decreasing, and ending inside `domain`.
             if starts.len() != rows
@@ -3386,22 +3535,6 @@ fn valid_over_settled(
                 return false;
             }
             let key_paths = row_paths.map(|paths| tile.key_paths(paths));
-            // A key held is never recorded absent. Each key is read at its path where the rows
-            // above give one; without paths only the arms naming no enclosing path can be read.
-            let absent_held = match &key_paths {
-                Some(paths) => paths
-                    .iter()
-                    .enumerate()
-                    .any(|(i, path)| !deleted.contains(i) && absent_keys.contains_path(path)),
-                None => {
-                    let unqualified = absent_keys.unqualified_arms();
-                    (0..domain.len())
-                        .any(|i| !deleted.contains(i) && unqualified.contains(&domain.index_at(i)))
-                }
-            };
-            if absent_held {
-                return false;
-            }
             // Keys are unique *within* a row; a key may repeat across rows, since each row
             // has a collection of its own.
             let all: Vec<Value> = domain.clone().drain_to_value_iter().collect();
@@ -3546,7 +3679,7 @@ mod tests {
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
             domain_predicate: Predicate::point(Value::UInt(5)),
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         tile.state_held_values_complete();
         let Tile::DataFunction {
@@ -3578,7 +3711,7 @@ mod tests {
                 codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
                 domain_predicate: stated.clone(),
                 deleted: BitSet::new(),
-                absent_keys: Predicate::False,
+                keys_follow_beneath: KeysFollow::Unstated,
             }),
             Predicate::False,
             BitSet::new(),
@@ -3611,7 +3744,7 @@ mod tests {
                 codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
                 domain_predicate: Predicate::False,
                 deleted: BitSet::new(),
-                absent_keys: Predicate::False,
+                keys_follow_beneath: KeysFollow::Unstated,
             }),
             Predicate::False,
             BitSet::new(),
@@ -3651,7 +3784,7 @@ mod tests {
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 20, 21]))),
             domain_predicate: Predicate::False,
             deleted: deleted.iter().copied().collect(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         }
     }
 
@@ -4236,11 +4369,11 @@ mod tests {
                 codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
                 domain_predicate: inner_statement,
                 deleted: BitSet::new(),
-                absent_keys: Predicate::False,
+                keys_follow_beneath: KeysFollow::Unstated,
             }),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         assert!(
             !valid_over(&tile(Predicate::True), 1),
@@ -4308,7 +4441,7 @@ mod tests {
             codomain: c_values,
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         let b = Tile::DataFunction {
             row_starts,
@@ -4316,7 +4449,7 @@ mod tests {
             codomain: Box::new(short),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         assert!(
             !valid_over(&b, 1),
@@ -4669,7 +4802,7 @@ mod tests {
             }),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         assert!(
             !validate_tile(&overfull),
@@ -5507,7 +5640,7 @@ mod tests {
             codomain,
             domain_predicate: Predicate::True,
             deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+            keys_follow_beneath: KeysFollow::Unstated,
         };
         assert!(!validate_tile(&mismatched));
     }
@@ -6687,55 +6820,31 @@ mod tests {
             let complete: [u64; 3] = std::array::from_fn(|_| rng.next(64));
             let global = rng.next(64);
             let whole_groups = rng.next(8);
-            let absent_rows = rng.next(8);
-            let global_absent = rng.next(2) != 0;
-            let absent_group = rng.next(2) != 0;
             let mut statements = vec![keys(global)];
-            let mut absences = vec![if global_absent {
-                Predicate::point(Value::UInt(7))
-            } else {
-                Predicate::False
-            }];
             let (mut starts, mut members) = (Vec::new(), Vec::new());
             for (row, mask) in held.iter().enumerate() {
                 starts.push(members.len());
                 members.extend((0..6).filter(|key| mask & (1 << key) != 0));
                 let parent = Predicate::exactly(&[Value::UInt(row as u64)]);
-                statements.push(Predicate::qualified(parent.clone(), keys(complete[row])));
-                if absent_rows & (1 << row) != 0 {
-                    absences.push(Predicate::qualified(
-                        parent,
-                        Predicate::point(Value::UInt(6)),
-                    ));
-                }
+                statements.push(Predicate::qualified(parent, keys(complete[row])));
             }
             let deleted = (0..members.len()).filter(|_| rng.next(3) == 0).collect();
-            let mut inner = Tile::grouped(
+            let inner = Tile::grouped(
                 starts,
                 ColumnValue::UInts(members.clone()),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1; members.len()]))),
                 Predicate::union_all(statements),
                 deleted,
             );
-            let Tile::DataFunction { absent_keys, .. } = &mut inner else {
-                unreachable!()
-            };
-            *absent_keys = Predicate::union_all(absences);
-            let mut tile = Tile::data_function(
+            let tile = Tile::data_function(
                 ColumnValue::UInts(vec![0, 1, 2]),
                 Box::new(inner),
                 keys(whole_groups),
                 BitSet::new(),
             );
-            let Tile::DataFunction { absent_keys, .. } = &mut tile else {
-                unreachable!()
-            };
-            if absent_group {
-                *absent_keys = Predicate::point(Value::UInt(3));
-            }
             let guard = tile.to_guard();
             for row in 0..5 {
-                let whole = whole_groups & (1 << row) != 0 || row == 3 && absent_group;
+                let whole = whole_groups & (1 << row) != 0;
                 assert_eq!(
                     guard.covers_path(&[Value::UInt(row)]),
                     whole,
@@ -6744,10 +6853,8 @@ mod tests {
                 for key in 0..9 {
                     let expected = whole
                         || global & (1 << key) != 0
-                        || global_absent && key == 7
                         || row < 3
-                            && (held[row as usize] | complete[row as usize]) & (1 << key) != 0
-                        || row < 3 && absent_rows & (1 << row) != 0 && key == 6;
+                            && (held[row as usize] | complete[row as usize]) & (1 << key) != 0;
                     assert_eq!(
                         guard.covers_path(&[Value::UInt(row), Value::UInt(key)]),
                         expected,
@@ -7422,154 +7529,283 @@ mod tests {
         ));
     }
 
-    /// Two groups beneath the outermost keys `0` and `1`, with every key from `5` recorded absent.
-    fn groups_with_absent_keys() -> Tile {
+    /// Groups `0` and `1` holding the keys `3` and `4` beneath them, whose keys follow the level
+    /// beneath, with that level stating `beneath`.
+    fn groups_following(beneath: Predicate) -> Tile {
         let mut tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 vec![0, 1],
                 ColumnValue::UInts(vec![3, 4]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
-                Predicate::False,
+                beneath,
                 BitSet::new(),
             )),
             Predicate::False,
             BitSet::new(),
         );
-        let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+        let Tile::DataFunction {
+            keys_follow_beneath,
+            ..
+        } = &mut tile
+        else {
             unreachable!("a collection")
         };
-        *absent_keys = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4)));
+        *keys_follow_beneath = KeysFollow::Follows;
         tile
     }
 
+    /// A level whose keys follow the level beneath is complete once the level beneath is
+    /// complete under every path, at every key, those not held included; before that it states
+    /// what its `domain_predicate` does.
     #[test]
-    fn absent_keys_are_complete_at_their_level_and_beneath_it() {
-        let tile = groups_with_absent_keys();
-        assert!(tile.to_guard().whole_keys().contains(&Value::UInt(7)));
+    fn keys_that_follow_the_level_beneath_are_complete_once_it_is() {
+        let open = groups_following(Predicate::at_or_below(Value::UInt(3)));
+        assert!(open.level_statement().is_false(), "{open:?}");
+        assert!(!open.is_terminal());
+        let whole = groups_following(Predicate::True);
+        assert!(whole.level_statement().is_true(), "{whole:?}");
+        assert!(whole.is_terminal());
         assert!(
-            tile.completion_at(CurryLevel::OUTERMOST)
+            whole
+                .completion_at(CurryLevel::OUTERMOST)
                 .contains(&Value::UInt(7))
         );
-        assert!(
-            tile.completion_at(CurryLevel::new(1))
-                .contains_path(&[Value::UInt(7), Value::UInt(3)])
-        );
-        assert!(!tile.complete_keys().contains(&Value::UInt(0)));
+        assert!(whole.to_guard().whole_keys().contains(&Value::UInt(7)));
     }
 
+    /// An operator that replaces the values beneath a following level, such as a per-group
+    /// function, sets the flag to `KeysFollow::DoesNot` and keeps what the level stated through
+    /// it: a level complete through the flag stays complete, and one that was not gains nothing.
     #[test]
-    fn released_groups_and_absent_keys_close_the_collection() {
-        use crate::interpreter::BaseType;
-        let mut tile = groups_with_absent_keys();
-        if let Tile::DataFunction {
-            absent_keys,
-            codomain,
+    fn replacing_the_values_beneath_a_following_level_clears_it() {
+        let follows = |tile: &Tile| {
+            matches!(
+                tile,
+                Tile::DataFunction {
+                    keys_follow_beneath: KeysFollow::Follows,
+                    ..
+                }
+            )
+        };
+        let mut whole = groups_following(Predicate::True);
+        whole.unfollow_values_at(CurryLevel::new(1));
+        assert!(!follows(&whole), "{whole:?}");
+        assert!(whole.level_statement().is_true(), "{whole:?}");
+        let mut open = groups_following(Predicate::at_or_below(Value::UInt(3)));
+        open.unfollow_values_at(CurryLevel::new(1));
+        assert!(!follows(&open), "{open:?}");
+        assert!(open.level_statement().is_false(), "{open:?}");
+    }
+
+    /// A withheld key's prefix is stated incomplete, and the level stops following the level
+    /// beneath, whose statement would otherwise widen it back over the key withheld.
+    #[test]
+    fn withholding_a_key_of_a_following_level_takes_it_out_of_the_statement() {
+        let mut tile = groups_following(Predicate::True);
+        let withheld: &[Value] = &[Value::UInt(1)];
+        tile.withhold(CurryLevel::OUTERMOST, &[true, false], &[withheld]);
+        let stated = tile.level_statement();
+        assert!(!stated.contains(&Value::UInt(1)), "{tile:?}");
+        assert!(stated.contains(&Value::UInt(0)), "{tile:?}");
+    }
+
+    /// A cut to some of a following level's keys keeps what the level stated through the flag,
+    /// over the keys kept: a key with no group among them is still complete.
+    #[test]
+    fn a_cut_of_a_following_level_keeps_its_derived_statement() {
+        let mut tile = groups_following(Predicate::True);
+        tile.restrict_to_paths(
+            CurryLevel::OUTERMOST,
+            &Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(7))),
+        );
+        let stated = tile.level_statement();
+        assert!(stated.contains(&Value::UInt(7)), "{tile:?}");
+        assert!(!stated.contains(&Value::UInt(1)), "{tile:?}");
+    }
+
+    /// Narrowing a following level takes the region out of what it stated through the flag and
+    /// sets the flag to `KeysFollow::DoesNot`, so the complete level beneath does not widen it
+    /// back.
+    #[test]
+    fn narrowing_a_following_level_takes_the_region_out_of_its_derived_statement() {
+        let mut tile = groups_following(Predicate::True);
+        tile.unstate_at(CurryLevel::OUTERMOST, &Predicate::point(Value::UInt(1)));
+        let Tile::DataFunction {
+            keys_follow_beneath,
             ..
-        } = &mut tile
-        {
-            *absent_keys = Predicate::True
-                .minus(&Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(1))));
-            if let Tile::DataFunction {
-                domain_predicate, ..
-            } = &mut **codomain
-            {
-                *domain_predicate = Predicate::True;
-            }
-        }
-        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::point(Value::UInt(0)).union(&Predicate::point(Value::UInt(1))),
-        )));
-        tile.compact();
-        let tiling = Tiling::data_function(
-            Extent::Base(BaseType::UInt),
-            Tiling::data_function(
-                Extent::Base(BaseType::UInt),
-                Tiling::Scalar(Extent::Base(BaseType::Int)),
-            ),
-        );
-        assert!(tile.closed_over(&tiling).is_terminal());
-    }
-
-    /// A cut beneath the outermost keys keeps the keys recorded absent: they have no path in any
-    /// region, where the statement is cut to the region kept.
-    #[test]
-    fn a_cut_beneath_the_keys_keeps_the_keys_recorded_absent() {
-        let mut tile = groups_with_absent_keys();
-        tile.restrict_to_paths(CurryLevel::new(1), &Predicate::point(Value::UInt(3)));
-        let Tile::DataFunction { absent_keys, .. } = &tile else {
+        } = &tile
+        else {
             unreachable!("a collection")
         };
-        assert!(absent_keys.contains(&Value::UInt(7)), "{tile:?}");
+        assert_eq!(*keys_follow_beneath, KeysFollow::DoesNot, "{tile:?}");
+        let stated = tile.level_statement();
+        assert!(!stated.contains(&Value::UInt(1)), "{tile:?}");
+        assert!(stated.contains(&Value::UInt(7)), "{tile:?}");
     }
 
-    /// A merge records absent the keys either side records absent.
+    /// A level's keys follow a collection beneath it, so a flag over values that are no
+    /// collection is invalid.
     #[test]
-    fn a_merge_unites_the_keys_recorded_absent() {
-        let mut tile = groups_with_absent_keys();
-        let mut other = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+    fn a_level_following_no_collection_is_invalid() {
+        let flat = |follows: KeysFollow| Tile::DataFunction {
+            row_starts: vec![0],
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+            keys_follow_beneath: follows,
+        };
+        assert!(validate_tile(&flat(KeysFollow::Unstated)));
+        assert!(validate_tile(&flat(KeysFollow::DoesNot)));
+        assert!(!validate_tile(&flat(KeysFollow::Follows)));
+        assert!(validate_tile(&groups_following(Predicate::True)));
+    }
+
+    /// A cut keeps a level following the level beneath. A merge keeps it beside a side holding no
+    /// key, and drops it beside a side holding keys that does not follow.
+    #[test]
+    fn a_cut_keeps_a_following_level_and_a_merge_keeps_it_where_both_sides_do() {
+        let follows = |tile: &Tile| match tile {
+            Tile::DataFunction {
+                keys_follow_beneath,
+                ..
+            } => *keys_follow_beneath == KeysFollow::Follows,
+            other => panic!("a collection, got {other:?}"),
+        };
+        let mut tile = groups_following(Predicate::at_or_below(Value::UInt(3)));
+        tile.restrict_to_paths(CurryLevel::new(1), &Predicate::point(Value::UInt(3)));
+        assert!(follows(&tile), "{tile:?}");
+        let other = Tile::data_function(
+            ColumnValue::UInts(vec![2]),
             Box::new(Tile::grouped(
-                vec![0, 1],
-                ColumnValue::UInts(vec![8, 9]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![80, 90]))),
+                vec![0],
+                ColumnValue::UInts(vec![5]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![50]))),
                 Predicate::False,
                 BitSet::new(),
             )),
             Predicate::False,
             BitSet::new(),
         );
-        if let Tile::DataFunction { absent_keys, .. } = &mut other {
-            *absent_keys = Predicate::point(Value::UInt(2));
-        }
-        if let Tile::DataFunction { absent_keys, .. } = &mut tile {
-            *absent_keys = Predicate::False;
-        }
-        tile.merge(other);
-        let Tile::DataFunction { absent_keys, .. } = &tile else {
-            unreachable!("a collection")
-        };
-        assert!(absent_keys.contains(&Value::UInt(2)), "{tile:?}");
-    }
-
-    /// Groups beneath the outermost keys `0` and `1` holding `3` and `4`, with `absent` recorded
-    /// absent at the inner level.
-    fn groups_with_inner_absent(absent: Predicate) -> Tile {
-        let mut inner = Tile::grouped(
-            vec![0, 1],
-            ColumnValue::UInts(vec![3, 4]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
+        let empty = Tile::data_function(
+            ColumnValue::UInts(vec![]),
+            Box::new(Tile::grouped(
+                vec![],
+                ColumnValue::UInts(vec![]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
             Predicate::False,
             BitSet::new(),
         );
-        let Tile::DataFunction { absent_keys, .. } = &mut inner else {
-            unreachable!("a collection")
-        };
-        *absent_keys = absent;
-        // Built field by field: `Tile::data_function` asserts the validity this checks.
-        Tile::DataFunction {
-            row_starts: vec![0],
-            domain: ColumnValue::UInts(vec![0, 1]),
-            codomain: Box::new(inner),
-            domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
-            absent_keys: Predicate::False,
+        let mut beside_empty = tile.clone();
+        beside_empty.merge(empty.clone());
+        assert!(follows(&beside_empty), "{beside_empty:?}");
+        let mut reversed = other.clone();
+        reversed.merge(tile.clone());
+        assert!(!follows(&reversed), "{reversed:?}");
+        let mut empty_first = beside_empty.clone();
+        empty_first.merge(other.clone());
+        let mut empty_last = tile.clone();
+        empty_last.merge(other.clone());
+        empty_last.merge(empty);
+        assert_eq!(
+            follows(&empty_first),
+            follows(&empty_last),
+            "a three-way merge states the same whichever two merge first"
+        );
+        assert_eq!(empty_first.level_statement(), empty_last.level_statement());
+        tile.merge(other);
+        assert!(!follows(&tile), "{tile:?}");
+    }
+
+    /// A merge unites what the sides state, whether a side states its keys through the flag or in
+    /// its predicate: a following level complete through the flag, merged with an empty level
+    /// that does not follow, stays complete, as the same level with its statement written into its
+    /// predicate does, in either order.
+    #[test]
+    fn a_merge_that_does_not_follow_keeps_what_a_following_side_states() {
+        let through_flag = groups_following(Predicate::True);
+        let mut in_predicate = through_flag.clone();
+        in_predicate.state_derived();
+        let not_following = Tile::data_function(
+            ColumnValue::UInts(vec![]),
+            Box::new(Tile::grouped(
+                vec![],
+                ColumnValue::UInts(vec![]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        )
+        .with_keys_follow(CurryLevel::new(0), KeysFollow::DoesNot);
+        for side in [through_flag, in_predicate] {
+            let mut after = side.clone();
+            after.merge(not_following.clone());
+            let mut before = not_following.clone();
+            before.merge(side.clone());
+            for merged in [after, before] {
+                assert!(merged.level_statement().is_true(), "{side:?}: {merged:?}");
+            }
         }
     }
 
-    /// A key held at a path recorded absent beneath an enclosing key is invalid: the record is
-    /// read at each key's path, not at the key alone.
+    /// A merge of two sides holding no key states what the sides state, in either order. One that
+    /// states its keys do not follow keeps the merged level from following, so the level beneath
+    /// completes nothing more of it; what a following side states through the flag stays stated.
+    /// One that states nothing leaves the other's flag.
     #[test]
-    fn a_key_held_at_a_path_recorded_absent_is_invalid() {
-        let absent_under_0 = Predicate::qualified(
-            Predicate::point(Value::UInt(0)),
-            Predicate::point(Value::UInt(3)),
-        );
-        assert!(!validate_tile(&groups_with_inner_absent(absent_under_0)));
-        let absent_under_1 = Predicate::qualified(
-            Predicate::point(Value::UInt(1)),
-            Predicate::point(Value::UInt(3)),
-        );
-        assert!(validate_tile(&groups_with_inner_absent(absent_under_1)));
+    fn an_empty_side_that_does_not_follow_keeps_a_merge_from_following() {
+        use KeysFollow::{DoesNot, Follows, Unstated};
+        // No key at either level, the level beneath stating `beneath`.
+        let empty = |follows: KeysFollow, beneath: Predicate| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![]),
+                Box::new(Tile::grouped(
+                    vec![],
+                    ColumnValue::UInts(vec![]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+                    beneath,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )
+            .with_keys_follow(CurryLevel::new(0), follows)
+        };
+        let follows = |tile: &Tile| match tile {
+            Tile::DataFunction {
+                keys_follow_beneath,
+                ..
+            } => *keys_follow_beneath,
+            other => panic!("a collection, got {other:?}"),
+        };
+        let both_orders = |a: Tile, b: Tile| {
+            let mut ab = a.clone();
+            ab.merge(b.clone());
+            let mut ba = b;
+            ba.merge(a);
+            [ab, ba]
+        };
+        let not_following = empty(DoesNot, Predicate::False);
+        for merged in both_orders(not_following.clone(), empty(Follows, Predicate::True)) {
+            assert_eq!(follows(&merged), DoesNot, "{merged:?}");
+            assert!(merged.level_statement().is_true(), "{merged:?}");
+        }
+        for merged in both_orders(not_following, empty(Follows, Predicate::False)) {
+            assert_eq!(follows(&merged), DoesNot, "{merged:?}");
+            assert!(merged.level_statement().is_false(), "{merged:?}");
+        }
+        for merged in both_orders(
+            empty(Unstated, Predicate::False),
+            empty(Follows, Predicate::True),
+        ) {
+            assert_eq!(follows(&merged), Follows, "{merged:?}");
+            assert!(merged.level_statement().is_true(), "{merged:?}");
+        }
     }
 }
