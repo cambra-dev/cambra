@@ -6113,7 +6113,6 @@ fn apply_aggregate(
     Ok(Box::new(ExtractAggregate::new(
         Box::new(Aggregate::new(input, op)),
         op,
-        true,
     )))
 }
 
