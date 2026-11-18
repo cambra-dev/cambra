@@ -26,7 +26,7 @@ Locations refer to `{{CHANGE}}`.
    outside the budget, the fix changes behaviour, or the finding is wrong about the code.
    Declining an `incorrect` finding ends the attempt: say so in the report.
 3. The rules from your original procedure still hold:
-   - no inspector golden fixture or pinned expectation moves;
+   - no pinned expectation moves, the frontend tests' included;
    - no diagnostic text, `Display` output or iteration order changes;
    - no assertion is weakened;
    - a test you add for a finding passes on `{{CHANGE}}` unless the finding is a bug in it.

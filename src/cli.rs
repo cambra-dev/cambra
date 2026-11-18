@@ -412,8 +412,8 @@ enum Mode {
     /// no execution to attach to.
     InspectOnly { port: u16 },
     /// Print the `/api/snapshot` payload for the program and exit. The one-shot
-    /// form of `InspectOnly`, for the golden-fixture corpus (whose server would
-    /// never exit).
+    /// form of `InspectOnly`, whose server never exits: the frontend's tests read
+    /// these dumps.
     DumpSnapshot,
 }
 

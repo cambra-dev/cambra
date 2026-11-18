@@ -63,14 +63,7 @@ pub fn snapshot_json_at_version(compiled: &CompiledProgram, name: &str, version:
     serde_json::to_string(&payload).expect("snapshot payload serializes")
 }
 
-/// Pretty-printed [`snapshot_json`] — the byte format of the committed golden
-/// fixtures (`web/src/__fixtures__/`).
-///
-/// The binary owns these bytes deliberately: the fixtures are byte-compared by
-/// `ci.sh`'s `ci_fixtures` gate, so their formatter must be pinned by
-/// Cargo.lock, not an external tool. Piping through `python3 -m json.tool` made
-/// the corpus a function of the local Python version, and of `FORCE_COLOR` —
-/// either silently rewrites every fixture and the gate reads it as drift.
+/// Pretty-printed [`snapshot_json`], which `--dump-snapshot` prints.
 pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str) -> String {
     let inspected = InspectedProgram::new(compiled);
     let payload = inspected.build_payload(name);

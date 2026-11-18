@@ -478,8 +478,8 @@ pub struct Meta {
     /// Which version of the `main` branch this payload describes: the branch
     /// table's version number (`LiveProgram::program`), which starts at `1`.
     ///
-    /// `0` for a payload no run produced — `--inspect-only`, `--dump-snapshot`
-    /// and a degraded payload — which is every committed fixture. Distinct from
+    /// `0` for a payload no run produced: `--inspect-only`, `--dump-snapshot`
+    /// and a degraded payload, so every payload the frontend's tests read. Distinct from
     /// [`schema`](Self::schema), which versions the wire format rather than the
     /// program.
     ///
