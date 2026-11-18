@@ -9,12 +9,10 @@
 //! `is_free_in_value` is the right probe — unlike `is_free` it threads no
 //! `visited` set, so nothing but the walk itself can allocate.
 //!
-//! The counter is `tests/alloc_probe/mod.rs`, which measures per thread and
+//! The counter is `tests/it/alloc_probe.rs`, which measures per thread and
 //! documents why that is the measurement this assertion wants.
 
-mod alloc_probe;
-
-use alloc_probe::allocations;
+use crate::it::alloc_probe::allocations;
 use cambra::ccl::Occurrence;
 use cambra::ccl::TypedBinding;
 use cambra::ccl::ccl_utils::is_free_in_value;

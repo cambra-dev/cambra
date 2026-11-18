@@ -848,7 +848,7 @@ pub struct SourceSinkRegistry {
     /// Registry state rather than per-pass state because a sink outlives a version, as a
     /// route's reply sink does: a replacement version writes to the sink its predecessor
     /// wrote to, so what the sink holds accumulates across a reload.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 }
 
@@ -972,7 +972,7 @@ impl SourceSinkRegistry {
                 .map(|(n, r)| (n.clone(), r.route.clone())),
             self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
         );
-        #[cfg(any(test, feature = "test-helpers"))]
+        #[cfg(test)]
         lowering.adopt_test_sinks(self.test_sinks.iter().map(|(n, s)| (n.clone(), s.clone())));
         lowering
     }
@@ -1242,7 +1242,7 @@ impl GlobalContext {
     /// the positions that version handled. Two programs compiled here without a reload
     /// between them both write the whole of their output to it, and the keys they share
     /// collide.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub fn register_test_sink(
         &mut self,
         name: impl Into<String>,
@@ -1728,7 +1728,7 @@ pub(crate) fn provenance_capture_enabled() -> bool {
 /// `gate_leaks` asserts only in debug builds, so a build without debug assertions would
 /// materialize pairs and check nothing.
 fn provenance_gate_every_compile() -> bool {
-    let default = cfg!(all(debug_assertions, any(test, feature = "test-helpers")));
+    let default = cfg!(all(debug_assertions, test));
     let gated = match std::env::var(PROVENANCE_GATE_ENV) {
         Ok(v) => v != "0",
         Err(_) => default,

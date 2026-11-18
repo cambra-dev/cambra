@@ -5,9 +5,9 @@
 # The root package is edition 2024, whose default resolver is 3, but a workspace
 # table overrides the member's edition default — so leaving this unset or at 2
 # silently downgrades the whole build. 3 is MSRV-aware version selection (it
-# respects `rust-version` when picking a dependency version); the feature
-# unification `ci_clippy_lib` relies on arrived in 2 and is unchanged in 3, so
-# that gate is not what this setting decides.
+# respects `rust-version` when picking a dependency version); feature
+# unification arrived in 2 and is unchanged in 3, so no gate depends on this
+# setting.
 resolver = "3"
 members = ["chl-parser", "chl-interp", "cambra-lsp"]
 # A bare `cargo test` or `cargo clippy` at the root covers every member.
@@ -25,9 +25,10 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-# Expose test-only helpers (counter resets, etc.) to integration tests that
-# link against the compiled library. Add `cambra = { features = ["test-helpers"] }`
-# to a crate's dev-dependencies to enable.
+# Expose the compact-type merges `CompactType::merge_bounds` and `CompactTypeKind::merge_kinds`
+# to the differential oracle (`[[test]]` below), which links the compiled library rather than
+# being part of its test build, and requires this feature. Every other test-only item is
+# `cfg(test)`: the suite is the library's test build.
 test-helpers = []
 # Turn on `REFINE_OPS` (`src/ccl/ops.rs`): every operator with a `^` sibling refines its
 # result as that sibling does. Temporary scaffolding, removed with the `^` siblings
@@ -38,9 +39,12 @@ refine-ops = []
 # The differential interpreter, for the differential suite. A dev-dependency because only the
 # tests compare the two; the library must not consult the interpreter it is checked against.
 chl-interp = { path = "chl-interp" }
-# Self dev-dependency so the integration tests (separate crates) can see the
-# `test-helpers`-gated helpers. Cargo unifies this with the library under test.
-cambra = { path = ".", features = ["test-helpers"] }
+# Runs the test executable as the `cambra` command line before libtest's `main` when a test
+# spawns it (`tests/it/mod.rs`, `cli`).
+ctor = "1.0.14"
+# The command line ignores `SIGPIPE` as an executable's `main` would, which that early start
+# precedes (`tests/it/mod.rs`, `cli`).
+libc = "0.2.191"
 microbench = "0.5.0"
 rstest = { version = "0.26.1", features = ["async-timeout"] }
 rstest-log = "0.2.0"
@@ -99,24 +103,30 @@ overflow-checks = false
 # No one runs a debugger on this tree: 11G with full debug info, 2.7G without.
 debug = false
 
-# Every top-level `tests/*.rs` is a test binary of its own, linking the whole library,
-# so each is declared here with the reason it cannot be a module of `tests/it/main.rs`;
-# `tests/it/test_layout.rs` fails on one that is not.
+# The suite is the library's own test build: `tests/it/mod.rs` is a `cfg(test)` module of the
+# library (`src/lib.rs`), so one compile of the library carries its unit tests and the
+# integration tests both. A target linking the library instead would need a second compile of
+# it, so every top-level `tests/*.rs` is declared here with the reason it cannot be part of
+# the suite; `tests/it/test_layout.rs` fails on one that is not.
 #
-# `alloc_probe` installs a counting `#[global_allocator]`, and an allocator is
-# per-process, so each binary that measures allocations is its own target.
-[[test]]
-name = "dead_code_specialization_cost"
-[[test]]
-name = "scope_walk_allocations"
-[[test]]
-name = "nested_extract_allocations"
+# The executable's tests would be such a target, and it has none: its `main` only calls
+# `cambra::cli::main`, and the suite runs the command line as the test executable.
+# Doctests are the same kind of target: rustdoc compiles each against the library built
+# without `cfg(test)`. An example a test should check goes in the suite instead.
+[lib]
+doctest = false
+
+[[bin]]
+name = "cambra"
+path = "src/main.rs"
+test = false
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something
 # `ci.sh formal` already checks. `test = false` keeps it out of a bare
-# `cargo test`; `cargo test --test differential_oracle`, which is what
-# `ci_formal` runs, still names it explicitly and builds it.
+# `cargo test`; `cargo test --features test-helpers --test differential_oracle`, which is
+# what `ci_formal` runs, still names it explicitly and builds it.
 [[test]]
 name = "differential_oracle"
 test = false
+required-features = ["test-helpers"]

@@ -275,7 +275,7 @@ fn a_misused_use_item_is_refused(#[case] root: &str, #[case] needle: &str) {
 fn a_use_name_spelled_like_a_source_is_refused() {
     use cambra::ccl::{BaseType, Type};
     use cambra::interpreter::{Extent, TestDataSource};
-    let mut ctx = cambra::ccl::context::GlobalContext::default();
+    let mut ctx = GlobalContext::default();
     ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
         TestDataSource::new(
             "orders",

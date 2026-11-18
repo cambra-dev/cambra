@@ -250,8 +250,8 @@ does not list. The table lists the sources every `GlobalContext` registers, and
 `default_sources_are_the_listed_sources` in `src/ccl/context.rs` holds the two sets equal. Lowering
 does not check a source call's argument count against the table.
 
-`test_sink` is listed unconditionally. Lowering recognizes it only under `cfg(test)` or the
-`test-helpers` feature, and the interpreter recognizes it always. Gating the row would need a
+`test_sink` is listed unconditionally. Lowering recognizes it only under `cfg(test)`, and the
+interpreter recognizes it always. Gating the row would need a
 feature on this crate that only one of its consumers enables.
 
 ### Rows that differ from the spec
@@ -766,4 +766,4 @@ cannot exhaust the stack. The grammar does not specify a portable maximum nestin
   assert the AST shape only at the level required to catch regressions.
 
 Run with `cargo test -p chl-parser` for the unit tests and
-`cargo test --test it chl_parser_roundtrip::` for the integration tests.
+`cargo test -p cambra --lib chl_parser_roundtrip::` for the integration tests.

@@ -179,7 +179,7 @@ pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Laun
 /// of its own.
 pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
     use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     // The process id keeps two test binaries apart, the counter two tests in one.
     static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -190,7 +190,7 @@ pub(crate) fn launch_with(program: &str, args: &[String]) -> Spawned {
     std::fs::write(&v1, program).expect("write v1");
 
     let mut program = RunningProgram {
-        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+        child: crate::it::cli::command()
             .args(args)
             .arg(&v1)
             .stdin(Stdio::piped())

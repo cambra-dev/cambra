@@ -356,8 +356,7 @@ impl Drop for ReportPanic {
 /// Reserve a port for a test program's `http_serve`, held against every other
 /// concurrent test — thread or process — for the rest of this process's life.
 ///
-/// **Test-only.** Shared through the default-off `test-helpers` feature so the
-/// integration-test crates hold one implementation rather than a copy each.
+/// **Test-only.** Built under `cfg(test)`, which the suite builds under.
 ///
 /// The obvious allocator — bind `:0`, read the port the kernel assigned,
 /// close — is unsound here, and flakily so.  Closing makes the port a *hint*
@@ -386,7 +385,7 @@ impl Drop for ReportPanic {
 /// another process would.  That property is what
 /// `tests/it/reserve_port.rs` pins: were it to lapse, this allocator would go back
 /// to handing one port to two callers, and the flakiness would return unchanged.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 pub fn reserve_test_port() -> u16 {
     use std::{fs::File, net::TcpListener, sync::Mutex};
 

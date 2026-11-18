@@ -177,8 +177,7 @@ route, and `responses` is the sink's name for compilation, so the program's sink
 channel whatever `𝑝` binds.
 
 `out = test_sink()` binds a response `Defer` to a `TestSink` registered by the test through
-`GlobalContext::register_test_sink`. This form exists only under `cfg(test)` or the `test-helpers`
-feature. `sink_declaration` in `lower/sinks.rs` recognizes both sink declarations; non-top-level
+`GlobalContext::register_test_sink`. This form exists only under `cfg(test)`. `sink_declaration` in `lower/sinks.rs` recognizes both sink declarations; non-top-level
 blocks reject them because the program's sink record reads only top-level bindings.
 
 ### The `channelize` step (feed channelization)

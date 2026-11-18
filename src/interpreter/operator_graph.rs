@@ -191,16 +191,16 @@ impl OperatorGraph {
     }
 }
 
-/// In debug and test builds, check edge targets, exclusive ownership, and reachability from
+/// In debug builds, check edge targets, exclusive ownership, and reachability from
 /// [`OperatorGraph::walk_starts`] through `Value` edges. Together these require a value-edge
 /// forest.
 /// A value-edge cycle has no root and cannot be entered by another value edge without violating
 /// exclusive ownership. The check covers recorded nodes, not operators omitted from the graph.
 ///
-/// The item exists in every build so release callers compile; the body returns immediately when
-/// neither `debug_assertions` nor `test` is enabled.
+/// The item exists in every build so release callers compile; the body returns immediately
+/// without `debug_assertions`.
 pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
-    if !cfg!(any(debug_assertions, test)) {
+    if !cfg!(debug_assertions) {
         return;
     }
     let ids: std::collections::HashSet<NodeId> = graph.ids().collect();

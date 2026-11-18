@@ -1,6 +1,6 @@
 //! Recognizing and lowering `out = test_sink()`.
 //!
-//! Built only under `cfg(test)` or the `test-helpers` feature, and absent from
+//! Built only under `cfg(test)`, and absent from
 //! `docs/chl-spec.md`; elsewhere `test_sink()` is an unbound name. The statement takes no
 //! arguments and binds a [`Defer`](crate::ccl::TypedExprNode::Defer) channel that is also a
 //! program output. Its name is the sink's: the key

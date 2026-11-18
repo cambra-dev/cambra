@@ -4260,7 +4260,7 @@ mod binder_slot_records_the_bound_at_type {
         assert!(
             matches!(
                 b.ty,
-                cambra::ccl::Type::History {
+                Type::History {
                     history_kind: HistoryKind::Overwrite,
                     ..
                 }
@@ -5946,7 +5946,7 @@ fn a_nested_sum_is_consumed_by_an_aggregate() {
             sum([x + y for x in a for y in b])"#});
     assert_eq!(
         ty,
-        Type::Base(cambra::ccl::BaseType::Int),
+        Type::Base(BaseType::Int),
         "aggregating over two conditional sources is an `Int`, the witnesses consumed: {ty}"
     );
 }
@@ -5983,7 +5983,7 @@ fn no_sum_quantifies_an_index() {
         ty.walk_children(|c| found |= quantifies_an_index(c));
         found
     }
-    fn walk(expr: &cambra::ccl::Expr, out: &mut Vec<Type>) {
+    fn walk(expr: &Expr, out: &mut Vec<Type>) {
         expr.walk_type_slots(|ty| {
             if quantifies_an_index(ty) {
                 out.push(ty.clone());

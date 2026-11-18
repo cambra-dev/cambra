@@ -60,7 +60,7 @@ pub(crate) fn operator_kinds_over_source1(code: &str) -> Vec<&'static str> {
     let mut ctx = GlobalContext::default();
     ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
         "source1",
-        Type::Base(cambra::ccl::BaseType::Int),
+        Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     ))));
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -250,8 +250,8 @@ pub(crate) fn check_program_scalar(program: &LoadedProgram, expected: Value) {
 /// as the differential interpreter's value: keyed, with entries in key order, so the order rows
 /// arrive in is not part of it.
 pub(crate) fn check_sink(code: &str, expected: &str) {
-    match crate::differential::run_compiled(code) {
-        crate::differential::Compiled::Value(v) => {
+    match crate::it::differential::run_compiled(code) {
+        crate::it::differential::Compiled::Value(v) => {
             assert_eq!(v.to_string(), expected, "program:\n{code}")
         }
         other => panic!("the program produced no value: {other}\n  program:\n{code}"),

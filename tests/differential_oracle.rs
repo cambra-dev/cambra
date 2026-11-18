@@ -20,9 +20,7 @@ use cambra::ccl::infer::solver::compact::{
 };
 use cambra::ccl::infer::solver::constrain::admits_resolved;
 use cambra::ccl::infer::solver::smt::NoScope;
-use cambra::ccl::infer::solver::{
-    CoalesceError, CompactGraph, ConstrainCache, coalesce_compact, constrain_subtype,
-};
+use cambra::ccl::infer::solver::{CoalesceError, ConstrainCache, constrain_subtype};
 use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, Lit, Name, Openness, ProjKey, Refinement,
     Type, TypeKind, TypedExpr, TypedExprNode, ccl_utils,

@@ -16,7 +16,7 @@ pub(super) enum SinkDecl {
     /// `𝑝 = http_serve(port, method, path)`, for any pattern `𝑝`.
     Http(Box<HttpServeDecl>),
     /// `name = test_sink()`.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     Test { name: String },
 }
 
@@ -25,7 +25,7 @@ impl SinkDecl {
     fn builtin(&self) -> SurfaceBuiltin {
         match self {
             Self::Http(_) => SurfaceBuiltin::HttpServe,
-            #[cfg(any(test, feature = "test-helpers"))]
+            #[cfg(test)]
             Self::Test { .. } => SurfaceBuiltin::TestSink,
         }
     }
@@ -36,14 +36,14 @@ impl SinkDecl {
 /// `http_serve` is recognized by `value` alone, since its tuple is taken apart by an
 /// ordinary pattern; `test_sink` names its sink after `target`.
 #[cfg_attr(
-    not(any(test, feature = "test-helpers")),
+    not(test),
     allow(unused_variables, reason = "only `test_sink` reads the target")
 )]
 pub(super) fn sink_declaration(
     target: &Spanned<AssignTarget>,
     value: &Spanned<ChlExpr>,
 ) -> Option<SinkDecl> {
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     if let Some(name) = test_sink_name(target, value) {
         return Some(SinkDecl::Test { name });
     }

@@ -13,8 +13,8 @@ The change is the commit with change id `{{CHANGE}}` in the jj workspace `{{WS}}
 `jj -R {{WS}} diff -r {{CHANGE}}`, then read the surrounding code in `{{WS}}`. You may run tests
 with `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test …`, which uses the workspace's
 cargo target and a timeout. Scope each run to the one test binary that holds the test:
-`cargo test --test it <name>` for an integration test, `cargo test -p <crate> --lib <name>` for a
-unit test ("Build and Test Scope" in `{{WS}}/.claude/skills/staff-rust-review/SKILL.md`).
+`cargo test -p <crate> --lib <name>` for a unit test or, in `cambra`, an integration test under
+`tests/it/`, which is part of the library's test build ("Build and Test Scope" in `{{WS}}/.claude/skills/staff-rust-review/SKILL.md`).
 
 Where no existing test settles a behaviour risk, write one. Try it in temporary commits on
 `{{CHANGE}}` and on its parent, as "Trying a test in a temporary commit" in the same skill

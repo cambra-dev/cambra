@@ -137,9 +137,9 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         entry("await_final", B::AwaitFinal, Exact(1), Function),
         entry("begin", B::Begin, Exact(0), TransactionMarker),
         entry("http_serve", B::HttpServe, Exact(3), SinkDeclaration),
-        // Listed unconditionally. The `cambra` crate recognizes it only under `cfg(test)` or
-        // its `test-helpers` feature, and the differential interpreter always does; each
-        // consumer gates its own recognition.
+        // Listed unconditionally. The `cambra` crate recognizes it only under `cfg(test)`,
+        // and the differential interpreter always does; each consumer gates its own
+        // recognition.
         entry("test_sink", B::TestSink, Exact(0), SinkDeclaration),
         entry("stdin", B::Stdin, Exact(0), Source),
         entry("summon", B::Summon, Exact(1), Qualifier),

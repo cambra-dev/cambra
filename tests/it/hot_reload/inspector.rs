@@ -388,7 +388,7 @@ fn a_finished_program_takes_no_reload() {
 #[test]
 fn port_zero_prints_the_port_the_os_picked() {
     use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::mpsc;
 
     let dir = std::env::temp_dir().join(format!("cambra-port-zero-{}", std::process::id()));
@@ -396,7 +396,7 @@ fn port_zero_prints_the_port_the_os_picked() {
     let source = dir.join("v1.cambra");
     std::fs::write(&source, "[line for line in stdin()]\n").expect("write v1");
     let mut program = RunningProgram {
-        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+        child: crate::it::cli::command()
             .args(["--inspect=0", "--control=0"])
             .arg(&source)
             .stdin(Stdio::piped())

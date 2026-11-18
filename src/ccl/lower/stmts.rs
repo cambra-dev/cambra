@@ -757,7 +757,7 @@ pub(super) fn lower_middle_stmt(
                 return Err(sink_not_top_level(&decl, stmt.span));
             }
             match decl {
-                #[cfg(any(test, feature = "test-helpers"))]
+                #[cfg(test)]
                 SinkDecl::Test { name } => lower_test_sink(name, target.span, stmt.span, body, ctx),
                 SinkDecl::Http(decl) => lower_http_serve(
                     *decl,

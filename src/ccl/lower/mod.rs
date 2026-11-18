@@ -77,7 +77,7 @@
 //! - [`transactions`] — `with begin():` transaction-block lowering, standalone and as a
 //!   loop body.
 //! - `test_sink` — `out = test_sink()` recognition and lowering, built only under
-//!   `cfg(test)` or the `test-helpers` feature.
+//!   `cfg(test)`.
 
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
@@ -118,7 +118,7 @@ pub mod modules;
 mod nominal;
 mod sinks;
 mod stmts;
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 mod test_sink;
 mod traits;
 mod transactions;
@@ -142,7 +142,7 @@ use http::*;
 use loops::*;
 use sinks::*;
 use stmts::*;
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(test)]
 use test_sink::*;
 use transactions::*;
 
@@ -507,7 +507,7 @@ pub struct LoweringContext {
     /// A test reads a sink back through a handle it holds before the program that writes
     /// to it exists, so `test_sink()` binds the sink registered under its binding name and
     /// refuses a name nothing registered.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub(super) test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 
     /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
@@ -815,7 +815,7 @@ enum DeclaredSink {
         args_span: Span,
     },
     /// `name = test_sink()` at `span`.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     Test { name: String, span: Span },
 }
 
@@ -825,7 +825,7 @@ impl DeclaredSink {
     fn binding(&self) -> &str {
         match self {
             DeclaredSink::Http { responses, .. } => responses,
-            #[cfg(any(test, feature = "test-helpers"))]
+            #[cfg(test)]
             DeclaredSink::Test { name, .. } => name,
         }
     }
@@ -877,7 +877,7 @@ fn sinks_at(
                     .with_related(*args_span, "the route's address"),
                 ),
             },
-            #[cfg(any(test, feature = "test-helpers"))]
+            #[cfg(test)]
             DeclaredSink::Test { .. } => out.push(sink.clone()),
         }
     }
@@ -1015,7 +1015,7 @@ impl LoweringContext {
     }
 
     /// Seed this context with the test sinks a registry holds.
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub fn adopt_test_sinks(
         &mut self,
         test_sinks: impl IntoIterator<Item = (String, Arc<crate::interpreter::TestSink>)>,
@@ -1093,7 +1093,7 @@ impl LoweringContext {
                     *span,
                     self.register_route(route, *args_span, run),
                 ),
-                #[cfg(any(test, feature = "test-helpers"))]
+                #[cfg(test)]
                 DeclaredSink::Test { name, span } => {
                     let found = self.test_sinks.get(&key(name)).cloned().ok_or_else(|| {
                         LoweringError::unsupported(
