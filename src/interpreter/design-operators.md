@@ -637,6 +637,7 @@ Each operator answers a projection as its row of this table states.
 | `Aggregate` | Admits `Everything` and `Nothing`: the accumulator has no keys, and the input is read whole whatever the consumer asks. A key projection panics. |
 | `ExtractAggregate` | Admits `Everything` and `Nothing`: one extracted value has no keys. A key projection panics. |
 | `MapAggregate` | Pulls the input at the projection, at any level (`Restates::Every`), and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and from what every pull's answer stated, and each group beneath a key is whole. |
+| `GroupAggregate` | Answers from its accumulators and cuts the answer to the projection at any level (`Restates::Every`). An inline read folds what the input answers at the universal guard first. |
 | `MapExtractAggregate` | Pulls the input at the projection, at any level of the input (`Restates::Above`). The answer keeps the input's keys, and only unfinished groups drop. The terminal mask applies at the input's innermost level. Extraction can expose collection levels inside the accumulator; their completion statements are qualified by the finished groups' paths, preserving the input's enclosing statements. |
 
 ### Producer attribution and probes
@@ -854,6 +855,7 @@ pulls.
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
 | `RekeySorted` | the pairs | widens at its input entry | Its pipeline consumes commit ticks, then publishes the output keys retained from those pairs. |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
+| `GroupAggregate` | the rows | keeps beneath enclosing keys, widens at depth 0 | The enclosing levels are the input's; without them the outermost keys are the groups', which no region of the rows names. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
 `Memo` and its input consumer share one dirty region containing unread keys and keys announced
@@ -964,6 +966,34 @@ accumulator is not terminal, less the guard released. The dispatcher pushes each
 (`Pushes::push_final`), so a group still folding at one finish is pushed at the finish where it is
 final, and a reader that kept the row open reads it again then. A release of the output drops the
 accumulators it covers and forwards to the input.
+
+### GroupAggregate
+
+`GroupAggregate` is the conversion of `rows ▷ group_fold(agg)`, which planning writes where an
+aggregation folds a group-by's groups (`src/ccl/planning/group_fold.rs`). A group-by of any other
+shape keeps its `Converse`. Planning fuses three shapes:
+
+- the chain `groupby.rs` writes, `𝐾 ▷ converse ≫ 𝐶 ▷ map ≫ 𝑠₁ ▷ map ≫ … ≫ agg`, where each step
+  `𝑠ᵢ` maps or filters a group's elements one at a time, and `agg` is one aggregation or a `zip`
+  of several, each with steps of its own;
+- the same chain read through a let-bound group-by;
+- a group-by whose key reads an enclosing row, as `correlated` planning leaves it.
+
+The rows are records beneath enclosing keys: the key the group-by reads, then per aggregation the
+value its mapping steps produce and one flag per filter on the elements (`GroupedFold`). Each
+enclosing path groups its own rows. Every row registers its key's group, and a row folds into an
+aggregation only where every flag of that aggregation holds, so a group whose rows a filter drops
+answers the fold of nothing. The output replaces the rows' level by `key ⤇ result`, the result
+being the one aggregation's or the tuple of every aggregation's.
+
+A consume folds the rows the input answers at the guard and releases the input at what the answer
+stated, so no row is folded twice. An enclosing path is settled once the rows beneath it are
+complete, united across consumes; at depth 0 the one path is settled once every row is. The output
+holds the groups of settled paths only, since a partial accumulator is no result, and states each
+settled path complete at the level of its last key: every group beneath it is a key some row
+carries, and every row has been read. It records no absent keys ([Absent keys](#absent-keys)).
+Beneath enclosing keys the groups are a region beneath the outermost keys, so it answers
+`pushes_while_consuming` with `false` and pushes at the pipeline's finish, as `MapAggregate` does.
 
 ### Converse
 
@@ -1255,6 +1285,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `Aggregate` | Collection with values supported by the aggregate kind | `Aggregation` | Folds the collection's values into one accumulator; see [Aggregation and extraction](#aggregation-and-extraction). |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts a terminal result. Partial-result extraction is unsupported. |
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
+| `GroupAggregate` | Enclosing levels over a collection of records: a key, then per aggregation a value and its keep flags | Enclosing levels over `key ⤇ result` | Groups the rows by key and folds each group's kept values; see [GroupAggregate](#groupaggregate). |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
 | `Memo` | `*` | Same as input | Caches input tiles and releases the regions consumed. A placed memo answers its cache; an unplaced memo reads regions marked dirty by notifications or `read_again`. See [Memo](#memo). |

@@ -2375,6 +2375,34 @@ fn convert_impl_inner(
             convert_lifted(argument, Some(expect_input(input, "map")?), ctx)
         }
 
+        // `rows ▷ group_fold(agg)`: the rows are a collection of `(key, value, keep…)` records, under
+        // the enclosing keys they stand beneath.
+        TypedExprNode::Apply { argument, function }
+            if let Some(Builtin::GroupFold(folds, rows)) = as_builtin(function) =>
+        {
+            Ok(match rows {
+                // Rows that read the outer row take the input, one collection of rows per row of
+                // it.
+                crate::ccl::GroupRows::PerRow => {
+                    Arc::new(crate::interpreter::tile_operators::GroupAggregate::new(
+                        convert_impl(argument, input, ctx)?,
+                        folds,
+                    ))
+                }
+                // Rows of their own are enumerated once and folded at every row of the input.
+                crate::ccl::GroupRows::Enumerated => {
+                    let fused = Arc::new(crate::interpreter::tile_operators::GroupAggregate::new(
+                        group_fold_rows(argument, ctx)?,
+                        folds,
+                    ));
+                    match input {
+                        Some(input) => Arc::new(MapResult::new_at(input, fused, ctx.level())),
+                        None => fused,
+                    }
+                }
+            })
+        }
+
         // converse translates 1:1 to the Converse operator
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Converse) =>
@@ -7039,4 +7067,41 @@ mod variant_ctor_tests {
             }
         );
     }
+}
+
+/// The rows `head ≫ (𝑐₀, 𝑐₁, …) ▷ zip` a `group_fold` folds: each column applied to the rows
+/// `head` enumerates, paired by row.
+fn group_fold_rows(
+    rows: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
+    let unexpected = || {
+        ConversionError::Unsupported(format!(
+            "group_fold over rows {}, which are not `head ≫ (…) ▷ zip`",
+            symbolic(rows)
+        ))
+    };
+    let TypedExprNode::Compose(elems) = &rows.node else {
+        return Err(unexpected());
+    };
+    let [head, zipped] = elems.as_slice() else {
+        return Err(unexpected());
+    };
+    let TypedExprNode::Apply { argument, function } = &zipped.node else {
+        return Err(unexpected());
+    };
+    let TypedExprNode::Tuple(columns) = &argument.node else {
+        return Err(unexpected());
+    };
+    if as_builtin(function) != Some(Builtin::Zip) {
+        return Err(unexpected());
+    }
+    // Each column enumerates the rows afresh, so each is one chain from the index, as a
+    // group-by's key is.
+    let mut ops = Vec::with_capacity(columns.len());
+    for column in columns {
+        let enumerated = convert_impl(head, None, ctx)?;
+        ops.push(convert_impl(column, Some(enumerated), ctx)?);
+    }
+    Ok(zip_arms_at(ops, ctx.level()))
 }

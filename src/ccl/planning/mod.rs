@@ -40,6 +40,7 @@ use crate::ccl::{
 mod conditionals;
 mod const_fold;
 mod correlated;
+mod group_fold;
 mod groupby;
 mod iterate;
 mod join;
@@ -234,6 +235,10 @@ pub(super) enum PlanningPhase {
     /// `converse` chain it splices into. Bottom-up: it inserts a filter after walking the
     /// site's children.
     InsertPerGroupFilters,
+    /// Fuse a group-by with the aggregation that folds its groups
+    /// ([`group_fold::fuse_group_aggregates`]). It runs after the per-group filters, which
+    /// become keep columns of the fused rows. Bottom-up.
+    FuseGroupAggregates,
     /// `simplify` again, absorbing the `id` leaves and nested `Compose` that
     /// [`join::try_hash_join_rewrite`] emits through [`replace_tuple_project_with_id`].
     /// `simplify` is marker-aware: its structural-discard rules do not drop or move an
@@ -243,7 +248,7 @@ pub(super) enum PlanningPhase {
 }
 
 impl PlanningPhase {
-    const ALL: [PlanningPhase; 10] = [
+    const ALL: [PlanningPhase; 11] = [
         PlanningPhase::RealizeConditionals,
         PlanningPhase::RecognizeGroupBy,
         PlanningPhase::EmitCorrelatedFilters,
@@ -253,6 +258,7 @@ impl PlanningPhase {
         PlanningPhase::MarkIterationSites,
         PlanningPhase::CompilePredicates,
         PlanningPhase::InsertPerGroupFilters,
+        PlanningPhase::FuseGroupAggregates,
         PlanningPhase::Cleanup,
     ];
 
@@ -273,6 +279,7 @@ impl PlanningPhase {
             PlanningPhase::Simplify
             | PlanningPhase::FoldConstants
             | PlanningPhase::CompilePredicates
+            | PlanningPhase::FuseGroupAggregates
             | PlanningPhase::Cleanup => unreachable!("planning's `{self:?}` lifts no term"),
         }
     }
@@ -345,6 +352,7 @@ fn run_phases(
                 Root::Lifted => iterate::insert_iterate_recurse(&mut term, ctx, &memo)?,
             },
             PlanningPhase::CompilePredicates => compile_refinement_predicates(&mut term, &memo),
+            PlanningPhase::FuseGroupAggregates => group_fold::fuse_group_aggregates(&mut term),
             PlanningPhase::InsertPerGroupFilters => {
                 per_group_filter::insert_per_group_filters(&mut term, ctx)?;
                 per_group_filter::reject_unmaterialized_narrowings(&term)?;

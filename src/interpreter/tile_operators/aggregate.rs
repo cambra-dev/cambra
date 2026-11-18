@@ -743,7 +743,7 @@ impl TileProducer for MapExtractAggregateProducer {
 /// comparison would fall through to the next component and sort a parent's children apart,
 /// leaving the rebuild to emit one key twice. `MapResult` makes the same demand of a domain
 /// it sorts (`Tile::DataFunction`'s keys, `map.rs`).
-fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
+pub(super) fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
         match x.partial_cmp(y) {
             Some(Ordering::Equal) => continue,
@@ -763,7 +763,7 @@ fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
 /// Each level nests inside the one above it, so a new key at a level starts its run of
 /// children where the level below has reached. The paths must arrive sorted: a parent's
 /// children are contiguous only then.
-fn build_levels_from_paths(
+pub(super) fn build_levels_from_paths(
     paths: &[&[Value]],
     extents: &[Extent],
     codomain: Tile,

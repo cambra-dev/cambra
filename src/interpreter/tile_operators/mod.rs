@@ -61,6 +61,7 @@ mod fan;
 pub(crate) mod fanout;
 #[cfg(test)]
 mod forwarding_tests;
+mod group_aggregate;
 #[cfg(test)]
 mod growing;
 mod helpers;
@@ -84,6 +85,7 @@ pub use cycle_slot::*;
 pub use extract_final::*;
 pub use fan::*;
 pub use fanout::*;
+pub(crate) use group_aggregate::GroupAggregate;
 pub use helpers::*;
 pub use iterate::*;
 pub use lookup::*;

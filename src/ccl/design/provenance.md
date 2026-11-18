@@ -621,7 +621,8 @@ A recording does not manufacture an ancestry edge merely to make the enclosing c
 `Machinery` identifies an implementation strategy or administrative transformation.
 The choice is made at each recording site and carried into attribution.
 
-`planning.groupby` is `Expansion`: its bucketize chain implements the meaning of `groupby`.
+`planning.groupby` is `Expansion`: its bucketize chain, and the `group_fold` that fuses the chain
+with the aggregation over its groups, implement the meaning of `groupby`.
 `planning.hash_join` is `Machinery`: an equality-refined comprehension admits that strategy,
 with iteration and restriction as the fallback when recognition does not apply.
 `lambda_elim.filter` is `Expansion` because the guard becomes a domain refinement;

@@ -408,9 +408,7 @@ fn two_aggregates_of_one_binding() {
     );
 }
 
-/// A group-by's memo reads its input's memo and the `Converse` keying the groups, which reads that
-/// memo too and is no breaker. The input memo's push reaches the group-by's memo widened, so it
-/// holds its rows until that memo has decided them.
+/// A group-by whose groups are summed folds as one `GroupAggregate` over the rows.
 #[test]
 fn a_group_by() {
     let source = indoc! {"
@@ -419,13 +417,75 @@ fn a_group_by() {
         g = groupby(xs, \\x -> x > 2)
         out << sum([sum(v) for v in g])
     "};
-    answers(source, "10", &["Memo"]);
+    answers(source, "10", &["GroupAggregate"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
-        planned
+        !planned
             .iter()
-            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
-        "the group-by's memo holds its rows until their inputs complete: {planned:?}"
+            .any(|plan| plan.name.starts_with("MapAggregate")),
+        "the group-by and its sums fold as one breaker: {planned:?}"
+    );
+}
+
+/// A group-by an aggregation folds runs as one `GroupAggregate` over the rows
+/// (`src/interpreter/design-operators.md`, "GroupAggregate"). A filter on a group's elements keeps
+/// the group, which folds nothing where the filter drops every element.
+#[rstest_log::rstest]
+#[case::each_group_s_max(indoc! {"
+    out = test_sink()
+    out << sum([max(g) for g in groupby([1, 2, 3, 4], \\e -> e // 2)])
+"}, "8")]
+#[case::a_filter_that_empties_a_group(indoc! {"
+    out = test_sink()
+    out << [sum([s for s in g if s > 1]) for g in groupby([1, 2, 3, 4], \\e -> e // 2)]
+"}, "Function [ 0 -> 0, 1 -> 5, 2 -> 4 ]")]
+#[case::a_map_then_a_filter_on_the_mapped_value(indoc! {"
+    out = test_sink()
+    out << sum([sum([s * 3 for s in g if s > 1]) for g in groupby([1, 2, 3, 4], \\e -> e // 2)])
+"}, "27")]
+#[case::two_aggregates_of_each_group(indoc! {"
+    out = test_sink()
+    out << [(sum(g), max(g)) for g in groupby([1, 2, 3, 4], \\e -> e // 2)]
+"}, "Function [ 0 -> {1, 1}, 1 -> {5, 3}, 2 -> {4, 4} ]")]
+#[case::two_aggregates_with_steps_of_their_own(indoc! {"
+    out = test_sink()
+    out << [(sum([s * 3 for s in g]), sum([s for s in g if s > 1])) for g in groupby([1, 2, 3, 4], \\e -> e // 2)]
+"}, "Function [ 0 -> {3, 0}, 1 -> {15, 5}, 2 -> {12, 4} ]")]
+#[case::a_key_reading_the_enclosing_row(indoc! {"
+    out = test_sink()
+    out << sum([sum([max(g) for g in groupby([1, 2, 3, 4], \\e -> e // i)]) for i in [1, 2]])
+"}, "18")]
+#[case::a_key_reading_the_enclosing_row_s_second_field(indoc! {"
+    out = test_sink()
+    out << sum([sum([max(g) for g in groupby([1, 2, 3, 4], \\e -> (r.1 + e) // 3)]) for r in [(1, 2), (3, 1)]])
+"}, "12")]
+fn a_group_by_folded_as_one_breaker(#[case] source: &str, #[case] expected: &str) {
+    answers(source, expected, &["GroupAggregate"]);
+}
+
+/// A group-by whose fold `GroupAggregate` does not run keeps its `Converse`
+/// (`src/ccl/design/optimization.md`, "A group-by folded as one aggregation"): the `map`
+/// constructor's `sole`, a count spelled through `curry_over`, and a tuple of one aggregation.
+#[rstest_log::rstest]
+#[case::the_map_constructor(indoc! {"
+    out = test_sink()
+    out << map([(x, x * 10) for x in [1, 2, 3]])
+"})]
+#[case::a_count_through_curry_over(indoc! {"
+    out = test_sink()
+    out << [sum([1 for s in g]) for g in groupby([1, 2, 3, 4], \\e -> e // 2)]
+"})]
+#[case::a_tuple_of_one_aggregation(indoc! {"
+    out = test_sink()
+    out << [(sum(g),) for g in groupby([1, 2, 3, 4], \\e -> e // 2)]
+"})]
+fn a_group_by_left_unfused(#[case] source: &str) {
+    let (_, planned) = dispatched(source, 1);
+    assert!(
+        !planned
+            .iter()
+            .any(|plan| plan.name.starts_with("GroupAggregate")),
+        "{source} keeps its `Converse`: {planned:?}"
     );
 }
 

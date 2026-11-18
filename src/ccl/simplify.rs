@@ -1047,6 +1047,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::MapDomain
         | Builtin::Compose
         | Builtin::Converse
+        | Builtin::GroupFold(..)
         | Builtin::Uncurry(_)
         | Builtin::Restrict
         | Builtin::Iterate

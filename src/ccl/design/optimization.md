@@ -390,8 +390,10 @@ engine during operator conversion. `planning::run` then performs these rewrites 
 6. Compile remaining refinement predicates throughout the tree.
 7. Insert `map(filter_values(𝑞))` for supported refinements on inner, per-group collections, and
    refuse a narrowing none materializes (`reject_unmaterialized_narrowings`).
-8. Simplify the planned expression again.
-9. Prune projections: push the leaves each source's chain reads into the source.
+8. Fuse a group-by with the aggregation that folds its groups into one `group_fold`
+   ([A group-by folded as one aggregation](#a-group-by-folded-as-one-aggregation)).
+9. Simplify the planned expression again.
+10. Prune projections: push the leaves each source's chain reads into the source.
 
 Constant folding evaluates supported operations through the runtime's `src/scalar_ops.rs` kernel
 on one-element columns. `src/ccl/planning/const_fold.rs` defines which expressions are excluded;
@@ -594,6 +596,36 @@ refuses a narrowing no per-group filter materializes, at every element of a chai
 standing alone, since operator conversion would compile the site without its filter. A
 `curry_over` site whose morphism begins with `filter_values`, a correlated filter on the pair,
 performs its narrowing.
+
+### A group-by folded as one aggregation
+
+`group_fold::fuse_group_aggregates` rewrites a group-by whose groups an aggregation folds into one
+`group_fold` over the ungrouped rows:
+
+```text
+𝐾 ▷ converse ≫ 𝐶 ▷ map ≫ 𝑠₁ ▷ map ≫ … ≫ agg
+    ⟹  (head ≫ (𝐶 ≫ key, 𝐶 ≫ value, 𝐶 ≫ keep…) ▷ zip) ▷ group_fold(agg)
+```
+
+Each step `𝑠ᵢ` is `id`, an element map `𝑓 ▷ map`, a scalar morphism applied to each element, or a
+per-group filter `𝑞 ▷ filter_values` from [Per-group value filters](#per-group-value-filters). The
+maps compose into the value column, and each filter becomes a keep column reading the values its
+step sees. `agg` is one aggregation, or a `zip` of two or more whose arms `𝑡₁ ≫ … ≫ aggⱼ` add
+steps of their own; each aggregation gets a value column and keep columns of its own, after the
+steps every arm shares (`GroupedFold`). A `zip` of one aggregation answers a one-field record and is
+not fused. A filter keeps its group: a group is a key some row carries, whether or not a row passes,
+so filtering the rows before grouping would drop the group instead. `𝐾` reads the grouped
+collection `𝐶` as its head or after the `iterate` that enumerates its rows, and a reader
+`𝑔 ≫ … ≫ agg` of a let-bound group-by fuses with `𝑔`'s chain in its place. A group-by whose key reads an
+enclosing row reaches the phase as `correlated` planning leaves it, `curry_over` of the group keys
+and a per-group fold, and fuses into a `group_fold` over the rows of each enclosing row
+(`GroupRows::PerRow`).
+
+The phase fuses only what `GroupAggregate` runs: a scalar key, a scalar result, and an aggregation
+that folds. `sole`, and `max` or `min` over a nominal type, which orders by a key op-conversion
+derives, keep the `converse` chain, as does a step that is not element-wise, such as a nested
+comprehension over the group. Planning compares terms by printed form and type (`same_term`): it
+has no structural equality that ignores node identity.
 
 ### Projection pruning
 

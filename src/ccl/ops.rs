@@ -378,6 +378,24 @@ pub enum UnaryOpKind {
     NotRefined,
 }
 
+/// Where a `group_fold`'s rows come from, which decides how op-conversion reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GroupRows {
+    /// `head ≫ (key, value, keep…) ▷ zip`: rows of their own, enumerated by `head` and read the
+    /// same at every row of the fold's input.
+    Enumerated,
+    /// Rows per row of the fold's input, which the rows' morphism reads.
+    PerRow,
+}
+
+/// One aggregation of a `group_fold`: its kind, and how many keep columns follow its value column
+/// in each row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupedFold {
+    pub kind: AggregateKind,
+    pub keeps: usize,
+}
+
 impl UnaryOpKind {
     /// Whether this is the `^` sibling of another operator, whose result type records the
     /// operation.
@@ -542,6 +560,12 @@ pub enum Builtin {
     Compose,
     /// `converse : (A → K) → (K → (A → A))` — group-by-key combinator.
     Converse,
+    /// `group_fold(agg₁, …) : (A ⤇ (K, V₁, Bool…, V₂, Bool…, …)) ⇒ (K ⤇ R)` — a group-by and
+    /// its aggregations in one: each row registers its key's group, and each aggregation folds its
+    /// value column into the group where every keep column after it holds. `R` is the one
+    /// aggregation's result, or the tuple of every aggregation's. Planning mints it
+    /// (`planning::group_fold`); the keys read are the whole group set.
+    GroupFold(Vec<GroupedFold>, GroupRows),
     /// `uncurry(𝑛) : ((𝑘₁ : 𝐴₁) ⤇ (… ⤇ ((𝑘ₙ : 𝐴ₙ) ⤇ 𝑉))) ⇒ (((𝑘₁ : 𝐴₁) × … × 𝐴ₙ) ⤇ 𝑉)`, for
     /// `𝑛 ≥ 2`, each `𝐴ᵢ` reading the keys outside it — flatten `𝑛` collection levels into one
     /// collection keyed by the tuple of their keys, a dependent tuple where a level's keys read
@@ -1036,6 +1060,7 @@ impl Builtin {
             Self::MapDomain => "map_domain",
             Self::Compose => "compose",
             Self::Converse => "converse",
+            Self::GroupFold(..) => "group_fold",
             Self::Uncurry(_) => "uncurry",
             Self::Restrict => "restrict",
             Self::Iterate => "iterate",
@@ -1149,6 +1174,7 @@ impl Builtin {
             || matches!(
                 self,
                 Self::Converse
+                    | Self::GroupFold(..)
                     | Self::MapDomain
                     | Self::Uncurry(_)
                     | Self::PermuteDomain

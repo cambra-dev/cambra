@@ -379,6 +379,18 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("uncurry({n})"))
         }
 
+        // A fused fold names its aggregations, which its rows' columns alone do not say.
+        TypedExprNode::Builtin(Builtin::GroupFold(folds, _)) => {
+            let kinds: Vec<&str> = folds
+                .iter()
+                .map(|fold| Builtin::for_aggregate(fold.kind).name())
+                .collect();
+            (
+                Precedence::Atom,
+                format!("group_fold({})", kinds.join(", ")),
+            )
+        }
+
         TypedExprNode::Builtin(Builtin::VariantIs(tag)) => {
             (Precedence::Atom, format!("variant_is(`{tag})"))
         }

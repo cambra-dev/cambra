@@ -509,10 +509,10 @@ fn a_bare_groupby_tail_is_driven() {
     // by membership in what this group-by's key morphism produces, rather than the old
     // imprecise total `Int` (see `src/ccl/design/collections.md`, "`groupby`'s exact
     // type"). It rides this type annotation only; it is never executed (the group-by
-    // is realized as `converse`), and the compiled tile below is unchanged. The
+    // is realized as `group_fold`), and the compiled tile below is unchanged. The
     // morphism inside it stays **pointful** — planning point-frees the predicates it
     // reifies into a `Restrict`, and this one it never reaches.
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ ((λ __iter_record : 0..4 → __iter_record ▷ [1, 2, 3, 4] ▷ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
+    "(iterate ≫ ([1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div, [1, 2, 3, 4]) ▷ zip) ▷ group_fold(sum):({Int | __elem ▷ ((λ __iter_record : 0..4 → __iter_record ▷ [1, 2, 3, 4] ▷ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
     Tile::data_function(ColumnValue::Ints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))), Predicate::True, BitSet::new()))]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
