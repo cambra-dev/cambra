@@ -80,6 +80,11 @@ JUSTIFICATION = re.compile(r"//\s*shared-state-ok:\s*\S")
 # Duplicate entries are meaningful — two sites in one file with the same shape are
 # two exceptions. Test code is not listed: `_blank_test_items` skips it entirely.
 EXPECTED_EXCEPTIONS = [
+    # A Cartesian iteration's state, twice: the producer's field and the field of its own leaf
+    # consumer (`CartesianSource`), which ingests arrivals from data sources at the I/O boundary into
+    # it. No other operator reaches the cell.
+    ("src/interpreter/tile_operators/iterate/cartesian.rs", "shared cell of `CartesianIteration`"),
+    ("src/interpreter/tile_operators/iterate.rs", "shared cell of `CartesianIteration`"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `RouteTable`"),
     # The test sink's accumulator: a sink is a terminal consumer at the I/O boundary,
