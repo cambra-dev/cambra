@@ -1,14 +1,14 @@
 //! The dispatcher of `crate::interpreter::dispatcher` shared by worker threads that run scripted
-//! work: each worker claims packages and finishes, and records what it did in plain data. The
-//! breakers are not `Send`, so no breaker runs on a worker; the single-threaded run the results
-//! are compared with drives breakers that follow the same script.
+//! work: each worker claims packages and finishes, and records what it did in plain data. No
+//! breaker runs on a worker; the single-threaded run the results are compared with drives
+//! breakers that follow the same script.
 //!
 //! Every scenario runs under a watchdog, so a deadlock fails the test instead of hanging it, and
 //! a failing scenario prints its seed and thread count.
 
-use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::rc::Rc;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -466,7 +466,7 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
                 true => keys_tiling(script.positions[p]),
                 false => keys_tiling(UNIVERSE),
             };
-            let breaker: BreakerHandle = Rc::new(RefCell::new(ScriptBreaker {
+            let breaker: BreakerHandle = Arc::new(RwLock::new(ScriptBreaker {
                 base: ProducerBase::unowned(ScriptBreaker::alloc_id(), &keys_tiling(UNIVERSE)),
                 input,
                 keep: script.keep[p],
@@ -485,7 +485,10 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
             consumed[pipeline.0].push(guard.clone());
         }
     }
-    let held = breakers.iter().map(|b| b.borrow().complete()).collect();
+    let held = breakers
+        .iter()
+        .map(|b| b.read().unwrap_or_else(PoisonError::into_inner).complete())
+        .collect();
     (Outcome { consumed, held }, events.len())
 }
 

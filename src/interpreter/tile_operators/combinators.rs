@@ -4,6 +4,7 @@ use bit_set::BitSet;
 use log::trace;
 use std::collections::HashMap;
 use std::iter::repeat_n;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -22,21 +23,21 @@ pub struct Converse {
     /// beneath the standing levels above `level`.
     base: OperatorBase,
     /// The function input to invert.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
 }
 
 impl Converse {
     /// Create a `Converse` operator that inverts `input`.
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>) -> Self {
         Self::new_at(input, CurryLevel::OUTERMOST)
     }
 
     /// [`Converse::new`] at `level`, leaving every level above it standing: each enclosing
     /// row's collection is inverted on its own. A group-by whose source varies per row of
     /// an enclosing collection is this.
-    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+    pub fn new_at(input: Arc<dyn TileOperator>, level: CurryLevel) -> Self {
         let (domain, codomain) = input
             .tiling()
             .values_at(level)
@@ -70,7 +71,7 @@ impl TileOperator for Converse {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -81,7 +82,7 @@ impl TileOperator for Converse {
         // (`ConverseProducer::held`, `read`, `seen`).
         let shared = shared_consumer(consumer);
 
-        let input = self.input.subscribe(
+        let input = self.input.clone().subscribe(
             self.input.tiling().universal_guard(),
             crate::interpreter::notifications::one_level_in(
                 self.level,
@@ -90,7 +91,12 @@ impl TileOperator for Converse {
             cx,
         );
         Box::new(ConverseProducer::new(
-            ProducerBase::new(ConverseProducer::alloc_id(), self.tiling(), &self.base, cx),
+            ProducerBase::new(
+                ConverseProducer::alloc_id(),
+                self.tiling(),
+                self.clone(),
+                cx,
+            ),
             input,
             self.level,
             self.tiling().values_at(self.level).empty_at_no_rows(),
@@ -122,16 +128,16 @@ struct ConverseProducer {
     /// names rows no later pull may read again.
     // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
     // no other operator holds it.
-    held: RefCell<Vec<HeldRow>>,
+    held: RwLock<Vec<HeldRow>>,
     /// At the outermost level, the input keys the answers read state complete, together, and the
     /// values those answers held. A group is the rows whose value is its key, so once every input
     /// key is complete a value never seen has no group: it is stated absent.
     // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
     // no other operator holds it.
-    read: RefCell<Predicate>,
+    read: RwLock<Predicate>,
     // shared-state-ok: this producer's own state, which `get` and `release` change through `&self`;
     // no other operator holds it.
-    seen: RefCell<Predicate>,
+    seen: RwLock<Predicate>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
     /// The inverted level to answer with where no enclosing row has been reached.
@@ -152,9 +158,9 @@ impl ConverseProducer {
         Self {
             base,
             input,
-            held: RefCell::new(Vec::new()),
-            read: RefCell::new(Predicate::False),
-            seen: RefCell::new(Predicate::False),
+            held: RwLock::new(Vec::new()),
+            read: RwLock::new(Predicate::False),
+            seen: RwLock::new(Predicate::False),
             level,
             empty_level,
         }
@@ -233,10 +239,11 @@ impl ConverseProducer {
     fn remember(&self, read: Vec<HeldRow>) {
         let again: std::collections::HashSet<&Vec<Value>> =
             read.iter().map(|(_, input)| input).collect();
-        self.held
-            .borrow_mut()
-            .retain(|(_, input)| !again.contains(input));
-        self.held.borrow_mut().extend(read);
+        // One lock across both steps: a pull on another thread that reads the same rows would
+        // otherwise drop them before this one adds them, and both would add them.
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        held.retain(|(_, input)| !again.contains(input));
+        held.extend(read);
     }
 }
 
@@ -406,7 +413,13 @@ fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
 
 impl TileProducer for ConverseProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(2 * self.held.borrow().len())
+        ProducerStateInfo::holding(
+            2 * self
+                .held
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+        )
     }
 
     impl_producer_base!();
@@ -472,13 +485,16 @@ impl TileProducer for ConverseProducer {
             } = &input_tile
             && let Tile::Scalar(values) = &**codomain
         {
-            let read = self.read.borrow().union(domain_predicate);
-            *self.read.borrow_mut() = read;
-            let seen = self
-                .seen
-                .borrow()
-                .union(&Predicate::from_column_value(values));
-            *self.seen.borrow_mut() = seen;
+            // Each union runs under one write guard, so concurrent pulls lose none of each other's
+            // keys or values. Both only grow, `seen` before `read`, and the check below reads
+            // `read` first: a pull that finds every input key read finds the values of every pull
+            // that read them, and states no seen value absent.
+            {
+                let mut seen = self.seen.write().unwrap_or_else(PoisonError::into_inner);
+                *seen = seen.union(&Predicate::from_column_value(values));
+            }
+            let mut read = self.read.write().unwrap_or_else(PoisonError::into_inner);
+            *read = read.union(domain_predicate);
         }
         let (mut out, read) = self.invert(input_tile);
         self.remember(read);
@@ -495,10 +511,15 @@ impl TileProducer for ConverseProducer {
         // A value never seen once every input key is complete has no group anywhere: it is
         // absent in every region, so it is recorded apart from the statement, which the cut
         // and every later cut keep to the region pulled.
-        if self.read.borrow().is_true()
+        if self
+            .read
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_true()
             && let Tile::DataFunction { absent_keys, .. } = &mut out
         {
-            *absent_keys = Predicate::True.minus(&self.seen.borrow());
+            *absent_keys =
+                Predicate::True.minus(&self.seen.read().unwrap_or_else(PoisonError::into_inner));
         }
         out
     }
@@ -510,7 +531,10 @@ impl TileProducer for ConverseProducer {
     fn release_impl(&mut self, _obsolete_guard: TileGuard) {
         let obsolete_guard = self.obsolete_guard().clone();
         if obsolete_guard.is_universal() {
-            self.held.get_mut().clear();
+            self.held
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
             return self.input.release(self.input.tiling().universal_guard());
         }
         // A member `[𝑠…, value, key]` is the smallest region an input row stands at, so a guard
@@ -563,11 +587,12 @@ impl TileProducer for ConverseProducer {
             },
         );
         let held = self.input_rows(Self::held_rows_covered(
-            &self.held.borrow(),
+            &self.held.read().unwrap_or_else(PoisonError::into_inner),
             &obsolete_guard,
         ));
         self.held
             .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|(output, _)| !obsolete_guard.covers_path(output));
         self.input
             .release(TileGuard::flatten_or(vec![standing, held]));
@@ -584,20 +609,20 @@ pub struct MapDomain {
     /// standing levels above `level`.
     base: OperatorBase,
     /// The function input.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The level whose values are replaced — see [`MapDomain::new_at`].
     level: CurryLevel,
 }
 
 impl MapDomain {
     /// Create a `MapDomain` operator that replaces the codomain with the domain values.
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>) -> Self {
         Self::new_at(input, CurryLevel::OUTERMOST)
     }
 
     /// [`MapDomain::new`] at `level`, leaving every level above it standing: each enclosing
     /// row's collection is re-viewed at its own keys.
-    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+    pub fn new_at(input: Arc<dyn TileOperator>, level: CurryLevel) -> Self {
         let Tiling::DataFunction { domain, .. } = input.tiling().values_at(level) else {
             panic!(
                 "MapDomain expected a function tiling at {level}, got {:?}",
@@ -626,16 +651,22 @@ impl TileOperator for MapDomain {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Every level's keys stand.
         Box::new(MapDomainProducer {
-            base: ProducerBase::new(MapDomainProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(
+                MapDomainProducer::alloc_id(),
+                self.tiling(),
+                self.clone(),
+                cx,
+            ),
             input: self
                 .input
+                .clone()
                 .subscribe(self.tiling().universal_guard(), consumer, cx),
             level: self.level,
         })
@@ -708,14 +739,14 @@ pub struct Uncurry {
     /// beneath the standing levels above `level`.
     base: OperatorBase,
     /// The two-level input.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The level the pair is formed at — see [`Uncurry::new_at`].
     level: CurryLevel,
 }
 
 impl Uncurry {
     /// Create an `Uncurry` operator that flattens two collection levels into one.
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>) -> Self {
         Self::new_at(input, CurryLevel::OUTERMOST)
     }
 
@@ -724,7 +755,7 @@ impl Uncurry {
     /// A nest three deep pairs the innermost loop's positions with the loop around them,
     /// under the outermost as a standing level — so which two levels pair is the caller's
     /// to say, not always the top two.
-    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+    pub fn new_at(input: Arc<dyn TileOperator>, level: CurryLevel) -> Self {
         // Flattening pairs a collection with the one inside it, so it takes exactly that:
         // a collection whose values are a collection. A deeper one flattens a level at a
         // time.
@@ -769,7 +800,7 @@ impl TileOperator for Uncurry {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -789,9 +820,10 @@ impl TileOperator for Uncurry {
             ),
         };
         Box::new(UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling(), self.clone(), cx),
             input: self
                 .input
+                .clone()
                 .subscribe(self.tiling().universal_guard(), consumer, cx),
             level: self.level,
             empty_pair: self.tiling().values_at(self.level).empty_at_no_rows(),
@@ -1116,9 +1148,9 @@ pub struct Filter {
     /// Output tiling, equal to the input tiling (filtering preserves the type).
     base: OperatorBase,
     /// The function input to filter.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The boolean predicate applied to each domain element.
-    predicate: Box<dyn TileOperator>,
+    predicate: Arc<dyn TileOperator>,
     /// The level whose keys the mask names.
     level: CurryLevel,
 }
@@ -1130,8 +1162,8 @@ impl Filter {
     /// at the outermost level, and a collection whose innermost level is `level`, of an
     /// input that holds it.
     pub fn new_at(
-        input: Box<dyn TileOperator>,
-        predicate: Box<dyn TileOperator>,
+        input: Arc<dyn TileOperator>,
+        predicate: Arc<dyn TileOperator>,
         level: CurryLevel,
     ) -> Self {
         let tiling = input.tiling().clone();
@@ -1172,7 +1204,7 @@ impl TileOperator for Filter {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -1182,18 +1214,18 @@ impl TileOperator for Filter {
         // side that is not is read whole.
         let predicate_producer = subscribe_forwarding_keeping_keys_if(
             self.predicate.tiling().is_data_function(),
-            &mut *self.predicate,
+            &self.predicate,
             &shared,
             cx,
         );
         let input_producer = subscribe_forwarding_keeping_keys_if(
             self.input.tiling().is_data_function(),
-            &mut *self.input,
+            &self.input,
             &shared,
             cx,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), self.clone(), cx),
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
@@ -1459,14 +1491,14 @@ pub struct Restrict {
     /// Output tiling — `DataFunction(D, D)` mirroring an [`IterateExtent`] over D.
     base: OperatorBase,
     /// The boolean predicate over the domain to restrict.
-    predicate: Box<dyn TileOperator>,
+    predicate: Arc<dyn TileOperator>,
 }
 
 impl Restrict {
     /// Create a `Restrict` from a predicate operator.
     ///
     /// Panics unless `predicate` has a one-level `DataFunction` tiling.
-    pub fn new(predicate: Box<dyn TileOperator>) -> Self {
+    pub fn new(predicate: Arc<dyn TileOperator>) -> Self {
         let domain_extent = match predicate.tiling() {
             Tiling::DataFunction { domain, codomain } if !codomain.holds_a_level() => {
                 domain.clone()
@@ -1489,17 +1521,24 @@ impl TileOperator for Restrict {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The restricted domain is the predicate's keys that pass, so a region of them is a region of the result's.
-        let predicate_producer =
-            self.predicate
-                .subscribe(self.predicate.tiling().universal_guard(), consumer, cx);
+        let predicate_producer = self.predicate.clone().subscribe(
+            self.predicate.tiling().universal_guard(),
+            consumer,
+            cx,
+        );
         Box::new(RestrictProducer {
-            base: ProducerBase::new(RestrictProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(
+                RestrictProducer::alloc_id(),
+                self.tiling(),
+                self.clone(),
+                cx,
+            ),
             predicate: predicate_producer,
         })
     }
@@ -1738,9 +1777,9 @@ pub struct Product {
     /// The level the pairing adds ([`Product::per_row_at`]).
     paired: CurryLevel,
     /// The outer collection, one row per group.
-    outer: Box<dyn TileOperator>,
+    outer: Arc<dyn TileOperator>,
     /// The per-row collections, aligned with `outer` row for row.
-    inner: Box<dyn TileOperator>,
+    inner: Arc<dyn TileOperator>,
     /// What each pair holds beside the outer row's value.
     second: Paired,
 }
@@ -1754,8 +1793,8 @@ impl Product {
     /// binding holding one per row, lifted into the loop beneath — so `outer` can carry
     /// levels below the row that the pairing does not go beneath.
     pub fn per_row_at(
-        outer: Box<dyn TileOperator>,
-        inner: Box<dyn TileOperator>,
+        outer: Arc<dyn TileOperator>,
+        inner: Arc<dyn TileOperator>,
         paired: CurryLevel,
     ) -> Self {
         let row_domain = Self::per_row_domain(&*inner, paired);
@@ -1793,8 +1832,8 @@ impl Product {
     /// keys as the paired level, so each row's result is a collection over its own
     /// collection's domain.
     pub fn per_row_values_at(
-        outer: Box<dyn TileOperator>,
-        inner: Box<dyn TileOperator>,
+        outer: Arc<dyn TileOperator>,
+        inner: Arc<dyn TileOperator>,
         paired: CurryLevel,
     ) -> Self {
         let row_domain = Self::per_row_domain(&*inner, paired);
@@ -1802,8 +1841,8 @@ impl Product {
     }
 
     fn build(
-        outer: Box<dyn TileOperator>,
-        inner: Box<dyn TileOperator>,
+        outer: Arc<dyn TileOperator>,
+        inner: Arc<dyn TileOperator>,
         paired: CurryLevel,
         row_domain: Extent,
         second: Paired,
@@ -1877,7 +1916,7 @@ impl TileOperator for Product {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -1894,14 +1933,15 @@ impl TileOperator for Product {
             self.tiling(),
             outer_consumer,
         );
-        let outer = self
-            .outer
-            .subscribe(self.outer.tiling().universal_guard(), outer_consumer, cx);
+        let outer =
+            self.outer
+                .clone()
+                .subscribe(self.outer.tiling().universal_guard(), outer_consumer, cx);
         Box::new(ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), self.clone(), cx),
             // Both sides are pulled at the projection, aligned row for row.
             outer,
-            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, cx),
+            inner: subscribe_forwarding_keeping_keys(&self.inner, &shared, cx),
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
@@ -2093,17 +2133,19 @@ mod nested_projection_tests {
         let make = || {
             let (tile, tiling) = rows_of_uint_values();
             let (spy, pulled, _) = ProjectionSpyOp::new(tile, tiling);
-            let mut converse = Converse::new_at(Box::new(spy), CurryLevel::new(1));
+            let converse = Arc::new(Converse::new_at(Arc::new(spy), CurryLevel::new(1)));
             let guard = converse.tiling().universal_guard();
             (
-                converse.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new()),
+                converse
+                    .clone()
+                    .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new()),
                 pulled,
             )
         };
         let (producer, pulled) = make();
         producer.get(at_one.clone());
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [TileGuard::Function(FunctionGuard::Domain(
                 Predicate::point(Value::UInt(0))
             ))]
@@ -2127,19 +2169,22 @@ mod nested_projection_tests {
         let (outer, outer_pulled, _) =
             ProjectionSpyOp::new(ints_by_position(&[5, 6], true), outer_tiling);
         let (tile, tiling) = two_levels_of_ints();
-        let mut product = Product::per_row_at(
-            Box::new(outer),
-            Box::new(ProjectionSpyOp::new(tile, tiling).0),
+        let product = Arc::new(Product::per_row_at(
+            Arc::new(outer),
+            Arc::new(ProjectionSpyOp::new(tile, tiling).0),
             CurryLevel::new(1),
-        );
+        ));
         let guard = product.tiling().universal_guard();
-        let producer = product.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let producer =
+            product
+                .clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         producer.get(paths_guard(Predicate::qualified(
             Predicate::point(Value::UInt(0)),
             Predicate::point(Value::UInt(1)),
         )));
         assert_eq!(
-            *outer_pulled.borrow(),
+            *outer_pulled.read().unwrap_or_else(PoisonError::into_inner),
             [TileGuard::Function(FunctionGuard::Domain(
                 Predicate::point(Value::UInt(0))
             ))]
@@ -2162,9 +2207,9 @@ mod nested_projection_tests {
             );
             let outer = ProjectionSpyOp::new(ints_by_position(&[5, 6], true), outer_tiling).0;
             let (tile, tiling) = two_levels_of_ints();
-            Box::new(Product::per_row_at(
-                Box::new(outer),
-                Box::new(ProjectionSpyOp::new(tile, tiling).0),
+            Arc::new(Product::per_row_at(
+                Arc::new(outer),
+                Arc::new(ProjectionSpyOp::new(tile, tiling).0),
                 CurryLevel::new(1),
             ))
         });
@@ -2917,7 +2962,7 @@ mod tests {
             Predicate::point(Value::Int(10)),
         )));
         // Row 0 was released upstream; row 1 joins group 10 and row 2 starts group 20.
-        *next.borrow_mut() = input_at(vec![1, 2], vec![10, 20]);
+        *next.write().unwrap_or_else(PoisonError::into_inner) = input_at(vec![1, 2], vec![10, 20]);
         let mut out = producer.read_in_pipeline(producer.tiling().universal_guard());
         out.compact();
         let Tile::DataFunction { domain, .. } = &out else {
@@ -2998,7 +3043,7 @@ mod tests {
 
     /// A [`nested_converse`] over a [`ScriptedProducer`] answering [`growing_rows`] of rows
     /// `1 ↦ [10, 10, 20]` and `2 ↦ [10]`, and the cell its next pull's answer is written into.
-    pub(super) fn growing_nested_converse() -> (ConverseProducer, Rc<RefCell<Tile>>) {
+    pub(super) fn growing_nested_converse() -> (ConverseProducer, Arc<RwLock<Tile>>) {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
         let (input, next) = ScriptedProducer::new(growing_rows(&[10, 10, 20], &[10]), two_rows().1);
         let mut converse = nested_converse();
@@ -3147,7 +3192,8 @@ mod tests {
         converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
             Predicate::exactly(&[Value::Int(1), Value::Int(10)]),
         ))));
-        *next.borrow_mut() = growing_rows(&[10, 10, 20, 10], &[10]);
+        *next.write().unwrap_or_else(PoisonError::into_inner) =
+            growing_rows(&[10, 10, 20, 10], &[10]);
         let mut out = converse.read_in_pipeline(converse.tiling().universal_guard());
         out.compact();
         assert!(
@@ -3198,10 +3244,10 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         );
-        let mut converse = Converse::new_at(
-            Box::new(Constant::collection(input_tile, input_tiling)),
+        let converse = Arc::new(Converse::new_at(
+            Arc::new(Constant::collection(input_tile, input_tiling)),
             CurryLevel::new(1),
-        );
+        ));
         let int = || Extent::Base(BaseType::Int);
         assert_eq!(
             *converse.tiling(),
@@ -3214,7 +3260,9 @@ mod tests {
         let out_tiling = converse.tiling().clone();
         let mut cx = SubscribeContext::new();
         let mut producer =
-            converse.subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
+            converse
+                .clone()
+                .subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let groups: Vec<(Value, Value, Value)> = out
             .paths_at(CurryLevel::new(2))
@@ -3487,15 +3535,17 @@ mod tests {
                 Tiling::Scalar(Extent::Base(BaseType::Int)),
             ),
         );
-        let mut product = Product::per_row_values_at(
-            Box::new(Constant::collection(outer, outer_tiling)),
-            Box::new(Constant::collection(inner, inner_tiling)),
+        let product = Arc::new(Product::per_row_values_at(
+            Arc::new(Constant::collection(outer, outer_tiling)),
+            Arc::new(Constant::collection(inner, inner_tiling)),
             CurryLevel::new(1),
-        );
+        ));
         let out_tiling = product.tiling().clone();
         let mut cx = SubscribeContext::new();
         let mut producer =
-            product.subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
+            product
+                .clone()
+                .subscribe(out_tiling.universal_guard(), Box::new(|| {}), &mut cx);
         let out = producer.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("Product tiles as a collection of collections, got {out:?}")
@@ -3844,8 +3894,16 @@ mod filter_projection_tests {
         let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
         let morsel = filter.read_in_pipeline(keys_between(2, 5));
         assert_eq!(int_entries(&morsel), [(2, 20), (4, 40)]);
-        assert_eq!(*input_pulled.borrow(), [keys_between(2, 5)]);
-        assert_eq!(*predicate_pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(
+            *input_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 5)]
+        );
+        assert_eq!(
+            *predicate_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 5)]
+        );
         let Tile::DataFunction {
             domain_predicate, ..
         } = &morsel
@@ -3892,8 +3950,18 @@ mod filter_projection_tests {
         assert_eq!(int_entries(&kept), [(0, 0), (2, 20), (4, 40), (6, 60)]);
         filter.release(kept.to_guard());
         let everything = || keys_between(0, ROWS - 1);
-        assert_eq!(*input_released.borrow(), [everything()]);
-        assert_eq!(*predicate_released.borrow(), [everything()]);
+        assert_eq!(
+            *input_released
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            [everything()]
+        );
+        assert_eq!(
+            *predicate_released
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            [everything()]
+        );
     }
 
     /// `[x for x in (evens ++ odds) if p(x)]` while the odd arm has decided only `0..=3`: the
@@ -3978,8 +4046,12 @@ mod filter_projection_tests {
         );
 
         filter.release(first.to_guard());
-        *input_cell.borrow_mut() = column(vec![4, 5, 7], from_4.clone(), value);
-        *predicate_cell.borrow_mut() = column(vec![4, 5, 7], Predicate::True, answer);
+        *input_cell.write().unwrap_or_else(PoisonError::into_inner) =
+            column(vec![4, 5, 7], from_4.clone(), value);
+        *predicate_cell
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) =
+            column(vec![4, 5, 7], Predicate::True, answer);
         let second = filter.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&second), [(5, 50)]);
         let Tile::DataFunction {
@@ -3996,7 +4068,16 @@ mod filter_projection_tests {
         let (filter, input_pulled, predicate_pulled) = keep_even_positions();
         let nothing = filter.tiling().empty_guard();
         assert_eq!(filter.get(nothing), filter.tiling().empty_tile());
-        assert!(input_pulled.borrow().is_empty() && predicate_pulled.borrow().is_empty());
+        assert!(
+            input_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && predicate_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     /// The keys `1 ↦ [10, 20]` and `2 ↦ [10, 30]` over `values`, both levels stated complete.
@@ -4201,7 +4282,10 @@ mod restrict_projection_tests {
         let (mut restrict, pulled) = every_third();
         let morsel = restrict.read_in_pipeline(keys_between(2, 7));
         assert_eq!(live_keys(&morsel), [3, 6]);
-        assert_eq!(*pulled.borrow(), [keys_between(2, 7)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(2, 7)]
+        );
     }
 
     #[test]
@@ -4216,7 +4300,12 @@ mod restrict_projection_tests {
         let (restrict, pulled) = every_third();
         let nothing = restrict.tiling().empty_guard();
         assert_eq!(restrict.get(nothing), restrict.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }
 
@@ -4268,7 +4357,10 @@ mod map_domain_projection_tests {
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![1, 2, 3]));
         assert_eq!(**codomain, Tile::Scalar(ColumnValue::UInts(vec![1, 2, 3])));
-        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 3)]
+        );
     }
 
     /// The groups a `Converse` makes, each member listed by the key it stands at: the outer keys
@@ -4322,7 +4414,10 @@ mod map_domain_projection_tests {
             panic!("a collection")
         };
         assert_eq!(*domain, ColumnValue::Ints(vec![1, 3]));
-        assert_eq!(*pulled.borrow(), [groups_one_and_three()]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [groups_one_and_three()]
+        );
     }
 
     #[test]
@@ -4336,7 +4431,12 @@ mod map_domain_projection_tests {
         let (keys, pulled) = keys_of_a_stream();
         let nothing = keys.tiling().empty_guard();
         assert_eq!(keys.get(nothing), keys.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }
 
@@ -4448,7 +4548,7 @@ mod uncurry_projection_tests {
         let (mut uncurry, pulled) = paired_groups_of_collections();
         uncurry.read_in_pipeline(guard.clone());
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [codomain(codomain(domain(Predicate::qualified(
                 Predicate::qualified(point(2), point(1)),
                 point(5),
@@ -4531,7 +4631,7 @@ mod uncurry_projection_tests {
         let (uncurry, pulled) = make();
         let morsel = uncurry.get(guard.clone());
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [
                 Projection::keys_at(CurryLevel::new(2), path(0, 1).union(&path(1, 0)))
                     .guard(&in_tiling)
@@ -4607,7 +4707,10 @@ mod uncurry_projection_tests {
         impl_producer_base!();
 
         fn get_impl(&self, projection_guard: TileGuard) -> Tile {
-            self.pulled.borrow_mut().push(projection_guard.clone());
+            self.pulled
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(projection_guard.clone());
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.restrict_to(&projection_guard.projection(&self.name()), self.tiling());
@@ -4626,7 +4729,7 @@ mod uncurry_projection_tests {
         let group_one = Predicate::point(Value::Int(1));
         let morsel = uncurry.get(pairs(group_one.clone(), Predicate::point(Value::UInt(2))));
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [TileGuard::Function(FunctionGuard::Domain(group_one))]
         );
         assert_eq!(pair_count(&morsel), 1, "only the pair (1, 2): {morsel:?}");
@@ -4652,7 +4755,12 @@ mod uncurry_projection_tests {
                 Some(level),
                 "{restates}"
             );
-            let [guard] = pulled.borrow().clone().try_into().expect("one pull");
+            let [guard] = pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                .try_into()
+                .expect("one pull");
             assert_eq!(
                 Projection::of(&guard).expect("a projection").level(),
                 Some(level),
@@ -4678,7 +4786,10 @@ mod uncurry_projection_tests {
         whole.compact();
         assert_eq!(pair_count(&whole), 1, "(1, 2) is released: {whole:?}");
         let group = TileGuard::Function(FunctionGuard::Domain(group_one));
-        assert_eq!(*pulled.borrow(), [group.clone(), group.clone(), group]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [group.clone(), group.clone(), group]
+        );
     }
 
     /// Beneath a standing level, a region of the input's inner keys climbs as the pairs they
@@ -4726,7 +4837,7 @@ mod uncurry_projection_tests {
         let morsel = uncurry.read_in_pipeline(guard);
         assert_eq!(pair_count(&morsel), 3);
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [TileGuard::Function(FunctionGuard::Domain(
                 groups_one_and_three()
             ))]
@@ -4742,7 +4853,7 @@ mod uncurry_projection_tests {
         let morsel = uncurry.read_in_pipeline(guard);
         assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [TileGuard::Function(FunctionGuard::Codomain(Box::new(
                 TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(1))))
             )))]
@@ -4767,12 +4878,12 @@ mod uncurry_projection_tests {
             Predicate::True,
             BitSet::new(),
         );
-        let mut uncurry = Uncurry::new(Box::new(Constant::collection(
+        let uncurry = Arc::new(Uncurry::new(Arc::new(Constant::collection(
             groups,
             spied.input.tiling().clone(),
-        )));
+        ))));
         let out = uncurry.tiling().clone();
-        let mut producer = uncurry.subscribe(
+        let mut producer = uncurry.clone().subscribe(
             out.universal_guard(),
             Box::new(|| {}),
             &mut Default::default(),
@@ -4805,7 +4916,12 @@ mod uncurry_projection_tests {
         let (uncurry, pulled) = paired_groups();
         let nothing = uncurry.tiling().empty_guard();
         assert_eq!(uncurry.get(nothing), uncurry.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }
 
@@ -5016,8 +5132,14 @@ mod product_projection_tests {
             panic!("a collection per row")
         };
         assert_eq!(keys.len(), 2 + 3, "rows 1 and 2 hold two and three keys");
-        assert_eq!(*outer_pulled.borrow(), [keys_between(1, 2)]);
-        assert_eq!(*inner_pulled.borrow(), [keys_between(1, 2)]);
+        assert_eq!(
+            *outer_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 2)]
+        );
+        assert_eq!(
+            *inner_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 2)]
+        );
     }
 
     #[test]
@@ -5094,7 +5216,16 @@ mod product_projection_tests {
         let (product, outer_pulled, inner_pulled) = rows_and_their_keys();
         let nothing = product.tiling().empty_guard();
         assert_eq!(product.get(nothing), product.tiling().empty_tile());
-        assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
+        assert!(
+            outer_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && inner_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 }
 
@@ -5197,7 +5328,7 @@ mod converse_projection_tests {
             [(1, vec![0, 2, 5]), (3, vec![3, 6])]
         );
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [converse.input.tiling().universal_guard()]
         );
     }
@@ -5209,7 +5340,10 @@ mod converse_projection_tests {
         let (mut converse, _, released) = bucketize();
         converse.get(groups(&[1]));
         converse.release(groups(&[1]));
-        let freed = released.borrow().clone();
+        let freed = released
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         assert_eq!(freed.len(), 1);
         let TileGuard::Function(FunctionGuard::Domain(rows)) = &freed[0] else {
             panic!("a domain release of the rows, got {freed:?}")
@@ -5272,7 +5406,10 @@ mod converse_projection_tests {
         };
         let (mut converse, pulled) = make();
         converse.read_in_pipeline(keys_between(1, 1));
-        assert_eq!(*pulled.borrow(), [keys_between(1, 1)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 1)]
+        );
         assert_conforms(|| Box::new(make().0), keys_between(1, 1));
     }
 
@@ -5281,7 +5418,12 @@ mod converse_projection_tests {
         let (converse, pulled, _) = bucketize();
         let nothing = converse.tiling().empty_guard();
         assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }
 
@@ -5338,7 +5480,8 @@ mod converse_pull_tests {
     /// The keys of the universe the input has been released at.
     fn released_keys(source: &Shared) -> BTreeSet<u64> {
         source
-            .borrow()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .released
             .iter()
             .flat_map(|guard| {

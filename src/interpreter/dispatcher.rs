@@ -8,17 +8,18 @@
 //! finishes once, after its queue closes and every package is acknowledged. A per-pipeline lock
 //! protects ready and in-flight packages; acknowledgement removes an in-flight entry. Operator
 //! execution holds no queue lock. A worker sleeps while there is nothing to claim, and a change
-//! that can end a sleep wakes the sleepers. The dispatcher holds no breaker, so it is `Sync` while
-//! the breakers are not `Send`. The single-threaded driver, [`run`], reaches the breakers through
+//! that can end a sleep wakes the sleepers. The dispatcher holds no breaker. The single-threaded
+//! driver, [`run`], reaches the breakers through
 //! the handles its caller passes, indexed by pipeline. Nothing outside unit tests calls it, and
 //! only unit tests drive the dispatcher from several threads. See
 //! `src/interpreter/design-dispatcher.md`, "The dispatcher".
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
@@ -2060,8 +2061,7 @@ impl Dispatcher {
             return;
         };
         let mut landing = Landing::new(Target::Change { dispatcher: self }, pipeline);
-        to.borrow_mut()
-            .notify(&Projection::Everything, &mut landing);
+        crate::interpreter::notifications::notify_shared(to, &Projection::Everything, &mut landing);
     }
 
     /// Push `complete`, the region of its keys `pipeline`'s breaker has completed, through `to`, its
@@ -2122,7 +2122,7 @@ impl Dispatcher {
             },
             pipeline,
         );
-        to.borrow_mut().notify(complete, &mut landing);
+        crate::interpreter::notifications::notify_shared(to, complete, &mut landing);
         let Target::Completion { reached, .. } = landing.target else {
             unreachable!("a complete landing stays one");
         };
@@ -2176,7 +2176,7 @@ impl Dispatcher {
                             "pipeline {pipeline} pushes regions of its keys: {why}"
                         ))
                     });
-                    to.borrow_mut().notify(&region, &mut landing);
+                    crate::interpreter::notifications::notify_shared(to, &region, &mut landing);
                 }
             }
             // A test's push ([`Pushes::push`]) names no consumer and lands in each reader as it is.
@@ -2961,20 +2961,31 @@ pub struct Entry {
 /// positions. `None` where nothing records it, as in front of any other pulled input.
 // shared-state-ok: the drive and the entry in front of its source both hold it, the planner
 // writes it before the run, and what crosses it is a pipeline's index and a tiling, never a tile.
-pub type CompletionTarget = Rc<RefCell<Option<(PipelineId, Tiling)>>>;
+pub type CompletionTarget = Arc<RwLock<Option<(PipelineId, Tiling)>>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
 // shared-state-ok: the breaker and the entry at its input both hold it, the planner writes it
 // before the run, and what crosses it is a pipeline's index, never a tile.
-pub type Placement = Rc<Cell<Option<PipelineId>>>;
+#[derive(Clone, Default)]
+pub struct Placement(Arc<RwLock<Option<PipelineId>>>);
+
+impl Placement {
+    pub fn get(&self) -> Option<PipelineId> {
+        *self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set(&self, pipeline: Option<PipelineId>) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = pipeline;
+    }
+}
 
 impl Entry {
     /// The entry of `pipeline`, whose breaker reads `input`, in front of `inner`.
     #[cfg(test)]
     pub fn new(pipeline: PipelineId, input: Tiling) -> Self {
         Entry {
-            pipeline: Rc::new(Cell::new(Some(pipeline))),
+            pipeline: Placement(Arc::new(RwLock::new(Some(pipeline)))),
             input,
             completes: CompletionTarget::default(),
             inline: None,
@@ -2986,7 +2997,7 @@ impl Entry {
     ///
     /// [`ProducerBase::placement`]: crate::interpreter::tile_operators::ProducerBase
     pub fn unplaced(input: Tiling) -> (Self, Placement) {
-        let pipeline: Placement = Rc::new(Cell::new(None));
+        let pipeline = Placement::default();
         let entry = Entry {
             pipeline: pipeline.clone(),
             input,
@@ -3038,7 +3049,7 @@ pub(crate) fn is_in_a_run() -> bool {
 }
 
 impl Consumer for Entry {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some(pipeline) = self.pipeline.get()
             && landing.accepts_entry(pipeline)
         {
@@ -3048,7 +3059,7 @@ impl Consumer for Entry {
             return;
         }
         if self.pipeline.get().is_none() && landing.is_delivery() && !landing.is_complete() {
-            if let Some(inline) = &mut self.inline {
+            if let Some(inline) = &self.inline {
                 inline.notify(region, landing);
             }
             return;
@@ -3056,7 +3067,10 @@ impl Consumer for Entry {
         if !landing.is_complete() {
             return;
         }
-        if let Some((pipeline, input)) = &*self.completes.borrow()
+        if let Some((pipeline, input)) = &*self
+            .completes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             && let Some(guard) = pushed_guard(region, input)
         {
             // The drive's positions are its source's keys, so a region of the source's keys is
@@ -3246,7 +3260,7 @@ fn cuts_every(runs: Vec<(u128, u128)>, rows: usize) -> Vec<Value> {
 /// handle, so the driver borrows it for one call at a time.
 // shared-state-ok: the driver's handle on a breaker it calls, and in a test the handle a reader's
 // input reads the breaker through; no tile passes between operators through it.
-pub type BreakerHandle = Rc<RefCell<dyn BreakingProducer>>;
+pub type BreakerHandle = Arc<RwLock<dyn BreakingProducer>>;
 
 /// What the workers did.
 #[cfg(test)]
@@ -3274,7 +3288,10 @@ pub(crate) enum Event {
 pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
     in_a_run(|| {
         for breaker in breakers {
-            breaker.borrow_mut().begin_run();
+            breaker
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .begin_run();
         }
         assert_eq!(
             breakers.len(),
@@ -3336,7 +3353,7 @@ pub fn read_for_test<P: crate::interpreter::tile_operators::TileProducer + ?Size
 }
 
 #[cfg(test)]
-pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &mut C, region: &Projection) {
+pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &C, region: &Projection) {
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     let mut landing = Landing::new(
         Target::Queue {
@@ -3358,7 +3375,9 @@ type Call<'c> = dyn FnMut(&mut dyn Breaker, InputId) + 'c;
 /// The breakers `breakers` holds, by pipeline, each borrowed for one call.
 fn handles(breakers: &[BreakerHandle]) -> impl FnMut(PipelineId, &mut Call<'_>) {
     move |pipeline, call| {
-        let mut breaker = breakers[pipeline.0].borrow_mut();
+        let mut breaker = breakers[pipeline.0]
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         debug_assert!(
             breaker.as_producer().is_some(),
             "{} answers itself as a producer, so its pushes reach its readers",

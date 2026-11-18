@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
+#[cfg(test)]
+use std::sync::PoisonError;
 
 use super::*;
 use crate::ccl::FieldKey;
@@ -30,7 +32,7 @@ use crate::{
 pub struct UnionOperator {
     base: OperatorBase,
     /// Input operators; each must have a `DataFunction` tiling.
-    inputs: Vec<Box<dyn TileOperator>>,
+    inputs: Vec<Arc<dyn TileOperator>>,
     /// The tag of each input's arm of the coproduct domain, in input order: positional, or
     /// the tags the union node's type names, a channel's sites (`crate::ccl::site`).
     tags: Vec<FieldKey>,
@@ -57,14 +59,14 @@ impl UnionOperator {
     /// ran a second join over a weaker lattice, which disagreed: `Extent` has no
     /// record rule, so arms at different record widths came out a positional sum
     /// where the type layer said `{a: Int}`.
-    pub fn new(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
+    pub fn new(inputs: Vec<Arc<dyn TileOperator>>, declared_codomain: Extent) -> Self {
         let tags = positional(inputs.len());
         Self::new_tagged(inputs, tags, declared_codomain)
     }
 
     /// [`new`](Self::new), each input's arm tagged by `tags` rather than by its position.
     pub fn new_tagged(
-        inputs: Vec<Box<dyn TileOperator>>,
+        inputs: Vec<Arc<dyn TileOperator>>,
         tags: Vec<FieldKey>,
         declared_codomain: Extent,
     ) -> Self {
@@ -81,7 +83,7 @@ impl UnionOperator {
 
     /// The tiling of each input `level` levels in — what the union combines, with the
     /// levels above it left standing.
-    fn inner_tilings(inputs: &[Box<dyn TileOperator>], level: CurryLevel) -> Vec<Tiling> {
+    fn inner_tilings(inputs: &[Arc<dyn TileOperator>], level: CurryLevel) -> Vec<Tiling> {
         inputs
             .iter()
             .map(|op| op.tiling().values_at(level).clone())
@@ -91,7 +93,7 @@ impl UnionOperator {
     /// The tagged coproduct tiling the arms imply: one `Extent::Union` domain,
     /// and the codomain they agree on or the declared one they merge into.
     fn coproduct_tiling(
-        inputs: &[Box<dyn TileOperator>],
+        inputs: &[Arc<dyn TileOperator>],
         tags: &[FieldKey],
         declared_codomain: Extent,
     ) -> Tiling {
@@ -246,7 +248,7 @@ impl UnionOperator {
     /// ([`new_flat_over`](Self::new_flat_over)). (The tagged [`new`](Self::new)
     /// is for a sourceless union whose arms have genuinely distinct extents — a Σ /
     /// C-form dispatch read by `final_or_default`.)
-    pub fn new_flat(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
+    pub fn new_flat(inputs: Vec<Arc<dyn TileOperator>>, declared_codomain: Extent) -> Self {
         Self::new_flat_at(inputs, declared_codomain, CurryLevel::OUTERMOST)
     }
 
@@ -257,7 +259,7 @@ impl UnionOperator {
     /// merged level just as readily as at it, so their own shapes cannot say where the
     /// merge belongs.
     pub fn new_flat_at(
-        inputs: Vec<Box<dyn TileOperator>>,
+        inputs: Vec<Arc<dyn TileOperator>>,
         declared_codomain: Extent,
         level: CurryLevel,
     ) -> Self {
@@ -272,7 +274,7 @@ impl UnionOperator {
     /// keyed as that leg is, under the bound the sum's type declares
     /// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
     pub fn new_flat_over(
-        inputs: Vec<Box<dyn TileOperator>>,
+        inputs: Vec<Arc<dyn TileOperator>>,
         declared_domain: Option<Extent>,
         declared_codomain: Extent,
         level: CurryLevel,
@@ -445,7 +447,7 @@ impl TileOperator for UnionOperator {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -456,19 +458,21 @@ impl TileOperator for UnionOperator {
         let flat = self.flat;
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
-            .iter_mut()
+            .iter()
             .zip(&self.tags)
             .map(|(op, tag)| match flat {
-                true => subscribe_forwarding_keeping_keys(&mut **op, &shared, cx),
+                true => subscribe_forwarding_keeping_keys(op, &shared, cx),
                 false => {
                     let consumer =
                         crate::interpreter::forwarding_consumer_tagging(&shared, tag.clone());
-                    op.subscribe(op.tiling().universal_guard(), consumer, cx)
+                    op.clone()
+                        .clone()
+                        .subscribe(op.tiling().universal_guard(), consumer, cx)
                 }
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling(), self.clone(), cx),
             inputs: input_producers,
             tags: self.tags.clone(),
             flat: self.flat,
@@ -921,8 +925,8 @@ mod tests {
     use crate::ccl::FieldKey;
     use crate::interpreter::tile_operators::test_helpers::{GuardLog, ProjectionSpy};
     use crate::interpreter::{BaseType, ColumnValue, Extent};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::RwLock;
 
     // ── under_arm ────────────────────────────────────────────────────────────
 
@@ -1097,7 +1101,7 @@ mod tests {
             assert!(!complete.contains_path(&[outer(0), Value::UInt(1 - key)]));
             assert!(!complete.contains_path(&[outer(1), Value::UInt(key)]));
             assert_eq!(
-                pulled.borrow().last(),
+                pulled.read().unwrap_or_else(PoisonError::into_inner).last(),
                 Some(
                     &Projection::keys_at(CurryLevel::OUTERMOST, Predicate::point(Value::UInt(0)))
                         .guard(&arm_tiling)
@@ -1111,9 +1115,17 @@ mod tests {
             );
             union.release(guard);
         }
-        assert_eq!(pulled.borrow().len(), 2);
+        assert_eq!(
+            pulled.read().unwrap_or_else(PoisonError::into_inner).len(),
+            2
+        );
         if !flat {
-            assert!(sibling_pulled.borrow().is_empty());
+            assert!(
+                sibling_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+            );
             let path = vec![
                 Value::Union {
                     tag: FieldKey::Index(1),
@@ -1134,7 +1146,7 @@ mod tests {
                     .contains_path(&[outer(0), Value::UInt(0)])
             );
             assert_eq!(
-                pulled.borrow().len(),
+                pulled.read().unwrap_or_else(PoisonError::into_inner).len(),
                 2,
                 "the first arm is not read for its sibling"
             );
@@ -1170,7 +1182,7 @@ mod tests {
             &self.0
         }
         fn subscribe(
-            &mut self,
+            self: std::sync::Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -1187,8 +1199,8 @@ mod tests {
         ))
     }
 
-    fn function_with_codomain(codomain: Extent) -> Box<dyn TileOperator> {
-        Box::new(TilingOnly(Tiling::data_function(
+    fn function_with_codomain(codomain: Extent) -> std::sync::Arc<dyn TileOperator> {
+        std::sync::Arc::new(TilingOnly(Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(codomain),
         )))
@@ -1294,10 +1306,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "arms with differing codomains merge into one column")]
     fn differing_non_scalar_codomains_are_rejected_at_construction() {
-        let nested = Box::new(TilingOnly(Tiling::data_function(
+        let nested = std::sync::Arc::new(TilingOnly(Tiling::data_function(
             Extent::Base(BaseType::UInt),
             int_function_tiling(),
-        ))) as Box<dyn TileOperator>;
+        ))) as std::sync::Arc<dyn TileOperator>;
         let _ = UnionOperator::new(
             vec![function_with_codomain(Extent::Base(BaseType::Int)), nested],
             Extent::Base(BaseType::Int),
@@ -1328,10 +1340,10 @@ mod tests {
     /// the same values, so the union takes both and declares one column of records.
     #[test]
     fn arms_that_lay_out_a_nested_record_differently_merge_into_one_column() {
-        let tiles = Box::new(TilingOnly(Tiling::data_function(
+        let tiles = std::sync::Arc::new(TilingOnly(Tiling::data_function(
             Extent::Base(BaseType::UInt),
             nested_record_of_tiles(),
-        ))) as Box<dyn TileOperator>;
+        ))) as std::sync::Arc<dyn TileOperator>;
         let op = UnionOperator::new(
             vec![function_with_codomain(nested_record()), tiles],
             nested_record(),
@@ -1352,10 +1364,10 @@ mod tests {
                 Tiling::Record(HashMap::from([("c".into(), int_function_tiling())])),
             ),
         ]));
-        let arm = Box::new(TilingOnly(Tiling::data_function(
+        let arm = std::sync::Arc::new(TilingOnly(Tiling::data_function(
             Extent::Base(BaseType::UInt),
             holding,
-        ))) as Box<dyn TileOperator>;
+        ))) as std::sync::Arc<dyn TileOperator>;
         let _ = UnionOperator::new(
             vec![function_with_codomain(nested_record()), arm],
             nested_record(),
@@ -1433,8 +1445,8 @@ mod tests {
     }
 
     /// An arm over `[0, 𝑛)` holding `Int`s, for the tiling a flat merge declares.
-    fn uint_range_arm(n: u64) -> Box<dyn TileOperator> {
-        Box::new(TilingOnly(Tiling::data_function(
+    fn uint_range_arm(n: u64) -> std::sync::Arc<dyn TileOperator> {
+        std::sync::Arc::new(TilingOnly(Tiling::data_function(
             Extent::uint_range(n),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )))
@@ -1638,17 +1650,17 @@ mod tests {
 
     /// Build a `UnionProducer` with two spy inputs that record what guard they receive.
     ///
-    /// Returns the producer plus `Rc<RefCell<Vec<TileGuard>>>` for each input.
+    /// Returns the producer plus `Arc<RwLock<Vec<TileGuard>>>` for each input.
     #[allow(clippy::type_complexity)]
     fn make_union_producer_with_spies() -> (
         UnionProducer,
-        Rc<RefCell<Vec<TileGuard>>>,
-        Rc<RefCell<Vec<TileGuard>>>,
+        Arc<RwLock<Vec<TileGuard>>>,
+        Arc<RwLock<Vec<TileGuard>>>,
     ) {
         struct SpyProducer {
             base: ProducerBase,
             tile: Tile,
-            log: Rc<RefCell<Vec<TileGuard>>>,
+            log: Arc<RwLock<Vec<TileGuard>>>,
         }
 
         impl TileProducer for SpyProducer {
@@ -1660,12 +1672,15 @@ mod tests {
                 self.tile.clone()
             }
             fn release_impl(&mut self, obsolete_guard: TileGuard) {
-                self.log.borrow_mut().push(obsolete_guard);
+                self.log
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(obsolete_guard);
             }
         }
 
-        let log0: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
-        let log1: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
+        let log0: Arc<RwLock<Vec<TileGuard>>> = Arc::new(RwLock::new(Vec::new()));
+        let log1: Arc<RwLock<Vec<TileGuard>>> = Arc::new(RwLock::new(Vec::new()));
 
         let union_tiling = Tiling::data_function(
             Extent::Union(TagMap::from_positional(vec![
@@ -1703,11 +1718,15 @@ mod tests {
         let (mut producer, log0, log1) = make_union_producer_with_spies();
         producer.release(producer.tiling().empty_guard());
         assert!(
-            log0.borrow().is_empty(),
+            log0.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
             "input 0 should receive no release"
         );
         assert!(
-            log1.borrow().is_empty(),
+            log1.read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
             "input 1 should receive no release"
         );
     }
@@ -1717,8 +1736,8 @@ mod tests {
     fn union_producer_release_universal_forwards_to_all_inputs() {
         let (mut producer, log0, log1) = make_union_producer_with_spies();
         producer.release(producer.tiling().universal_guard());
-        let l0 = log0.borrow();
-        let l1 = log1.borrow();
+        let l0 = log0.read().unwrap_or_else(PoisonError::into_inner);
+        let l1 = log1.read().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(l0.len(), 1, "input 0 should receive exactly one release");
         assert_eq!(l1.len(), 1, "input 1 should receive exactly one release");
         assert!(
@@ -1745,8 +1764,8 @@ mod tests {
 
         producer.release(guard);
 
-        let l0 = log0.borrow();
-        let l1 = log1.borrow();
+        let l0 = log0.read().unwrap_or_else(PoisonError::into_inner);
+        let l1 = log1.read().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(l0.len(), 1, "input 0 should receive exactly one release");
         assert_eq!(l1.len(), 1, "input 1 should receive exactly one release");
         assert_eq!(
@@ -1825,9 +1844,15 @@ mod tests {
         let (producer, logs, _) = union_logging_pulls();
         let only_two = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
         let tile = producer.get(tagged_guard(vec![Predicate::False, only_two.clone()]));
-        assert!(logs[0].borrow().is_empty(), "arm 0 is named nothing of");
+        assert!(
+            logs[0]
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "arm 0 is named nothing of"
+        );
         assert_eq!(
-            *logs[1].borrow(),
+            *logs[1].read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Domain(only_two))]
         );
         assert_eq!(keys_of(&tile), vec![tagged_int(1, 2)]);
@@ -1849,11 +1874,11 @@ mod tests {
         let two = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
         let tile = producer.get(tagged_guard(vec![one.clone(), two.clone()]));
         assert_eq!(
-            *logs[0].borrow(),
+            *logs[0].read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Domain(one))]
         );
         assert_eq!(
-            *logs[1].borrow(),
+            *logs[1].read().unwrap_or_else(PoisonError::into_inner),
             vec![TileGuard::Function(FunctionGuard::Domain(two))]
         );
         assert_eq!(keys_of(&tile), vec![tagged_int(0, 1), tagged_int(1, 2)]);
@@ -1880,7 +1905,13 @@ mod tests {
         let (producer, pulled, _) = union_logging_pulls();
         let tile = producer.get(tagged_guard(vec![Predicate::True, Predicate::True]));
         for log in &pulled {
-            assert!(log.borrow().iter().all(TileGuard::is_universal), "{log:?}");
+            assert!(
+                log.read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .all(TileGuard::is_universal),
+                "{log:?}"
+            );
         }
         assert!(tile.is_terminal(), "{tile:?}");
     }
@@ -1891,7 +1922,14 @@ mod tests {
         let (mut producer, pulled, _) = union_logging_pulls();
         producer.release(tagged_guard(vec![Predicate::True, Predicate::False]));
         let tile = producer.get(tagged_guard(vec![Predicate::True, Predicate::False]));
-        assert!(pulled[0].borrow().is_empty(), "{:?}", pulled[0]);
+        assert!(
+            pulled[0]
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "{:?}",
+            pulled[0]
+        );
         assert!(keys_of(&tile).is_empty(), "{tile:?}");
         let Tile::DataFunction {
             domain_predicate, ..
@@ -1946,7 +1984,7 @@ mod tests {
         spy.release(tagged_guard(vec![Predicate::True, Predicate::False]));
         spy.release(tagged_guard(vec![Predicate::False, Predicate::True]));
         spy.release(spy.tiling().universal_guard());
-        let released = released.borrow();
+        let released = released.read().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(released.len(), 3, "{released:?}");
         assert!(released[1].is_universal(), "{released:?}");
         assert!(released[2].is_universal(), "{released:?}");
@@ -2134,8 +2172,14 @@ mod projection_tests {
         let (mut union, even_pulled, odd_pulled) = merged_branches(true);
         let morsel = union.read_in_pipeline(keys_between(2, 5));
         assert_eq!(int_entries(&morsel), vec![(2, 20), (3, 3), (4, 40), (5, 5)]);
-        assert_eq!(*even_pulled.borrow(), vec![keys_between(2, 5)]);
-        assert_eq!(*odd_pulled.borrow(), vec![keys_between(2, 5)]);
+        assert_eq!(
+            *even_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            vec![keys_between(2, 5)]
+        );
+        assert_eq!(
+            *odd_pulled.read().unwrap_or_else(PoisonError::into_inner),
+            vec![keys_between(2, 5)]
+        );
     }
 
     /// The consumer releases a morsel before taking the next, and the branches are released
@@ -2147,7 +2191,10 @@ mod projection_tests {
         union.release(keys_between(0, 3));
         let next = union.read_in_pipeline(keys_between(4, 7));
         assert_eq!(int_entries(&next), vec![(4, 40), (5, 5), (6, 60), (7, 7)]);
-        assert_eq!(even_pulled.borrow()[1], keys_between(4, 7));
+        assert_eq!(
+            even_pulled.read().unwrap_or_else(PoisonError::into_inner)[1],
+            keys_between(4, 7)
+        );
     }
 
     #[test]
@@ -2216,7 +2263,8 @@ mod projection_tests {
             "only the odd arm's decided prefix is complete"
         );
 
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        *odd_cell.write().unwrap_or_else(PoisonError::into_inner) =
+            int_column(vec![1, 3, 5, 7], Predicate::True);
         let second = union.read_in_pipeline(keys_between(0, 7));
         assert_eq!(
             int_entries(&second),
@@ -2262,12 +2310,14 @@ mod projection_tests {
 
         // The odd arm delivers some of what is left without finishing: row 5 arrives, the
         // range stays open, and row 5 is the only row delivered.
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
+        *odd_cell.write().unwrap_or_else(PoisonError::into_inner) =
+            int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
         let partial = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&partial), vec![(5, 5)]);
         union.release(partial.to_guard());
 
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        *odd_cell.write().unwrap_or_else(PoisonError::into_inner) =
+            int_column(vec![1, 3, 5, 7], Predicate::True);
         let last = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&last), vec![(7, 7)]);
         let TileGuard::Function(FunctionGuard::Domain(asked)) = keys_between(0, ROWS - 1) else {
@@ -2278,17 +2328,17 @@ mod projection_tests {
 
     /// A flat union over two scripted arms, subscribed at the universal guard. The even arm
     /// holds `[0, 2, 4, 6]` and the odd arm `odd`, each with its own statement.
-    fn scripted_union(odd: Tile) -> (Box<dyn TileProducer>, Rc<RefCell<Tile>>) {
+    fn scripted_union(odd: Tile) -> (Box<dyn TileProducer>, Arc<RwLock<Tile>>) {
         let (even, _) = ScriptedOp::new(
             int_column(vec![0, 2, 4, 6], Predicate::True),
             stream_tiling(),
         );
         let (odd, odd_cell) = ScriptedOp::new(odd, stream_tiling());
-        let mut operator = UnionOperator::new_flat(
-            vec![Box::new(even), Box::new(odd)],
+        let operator = Arc::new(UnionOperator::new_flat(
+            vec![Arc::new(even), Arc::new(odd)],
             Extent::Base(BaseType::Int),
-        );
-        let union = operator.subscribe(
+        ));
+        let union = operator.clone().subscribe(
             operator.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -2330,7 +2380,7 @@ mod projection_tests {
         if let Tile::DataFunction { codomain, .. } = &mut tile {
             **codomain = Tile::Scalar(ColumnValue::Ints(vec![1, 3, 600]));
         }
-        *odd_cell.borrow_mut() = tile;
+        *odd_cell.write().unwrap_or_else(PoisonError::into_inner) = tile;
         let second = union.read_in_pipeline(keys_between(0, ROWS - 1));
         assert!(
             int_entries(&second).is_empty(),
@@ -2343,7 +2393,16 @@ mod projection_tests {
         let (union, even_pulled, odd_pulled) = merged_branches(true);
         let tile = union.get(stream_tiling().empty_guard());
         assert!(int_entries(&tile).is_empty());
-        assert!(even_pulled.borrow().is_empty() && odd_pulled.borrow().is_empty());
+        assert!(
+            even_pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && odd_pulled
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     /// A tagged union keys its rows by arm, which a projection over plain keys does not

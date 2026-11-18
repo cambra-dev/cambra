@@ -4,9 +4,6 @@
 //! expression, so it compiles down the sink-record path (`convert_record_fields_to_operators`),
 //! which a program otherwise reaches only through `http_serve`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use cambra::ccl::Type;
 use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
 use cambra::ccl::load::LoadedProgram;
@@ -15,6 +12,7 @@ use cambra::interpreter::{
 };
 use cambra::live_program::{LiveProgram, MAIN_BRANCH};
 use indoc::{formatdoc, indoc};
+use std::sync::PoisonError;
 
 /// Run `source` to completion and answer what it wrote to each named sink.
 ///
@@ -464,17 +462,19 @@ fn a_collection_keyed_by_strings() {
 #[test]
 fn a_sink_accumulates_across_two_deliveries() {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let sink = ctx.register_test_sink("out");
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(1))]);
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -495,9 +495,12 @@ fn a_sink_accumulates_across_two_deliveries() {
         "the first delivery is not the whole value"
     );
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(1), Value::Int(2))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     crate::it::serving::dispatch_until_idle(&mut program);
     assert!(program.done.try_recv().is_ok(), "the program completes");
 
@@ -513,11 +516,11 @@ fn a_sink_accumulates_across_two_deliveries() {
 #[test]
 fn a_sink_accumulates_across_a_reload() {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let sink = ctx.register_test_sink("out");
     let consumer = || -> Box<dyn Consumer> { Box::new(|| {}) };
@@ -531,11 +534,14 @@ fn a_sink_accumulates_across_a_reload() {
 
     let mut live = LiveProgram::start(&mut ctx, &LoadedProgram::test(version(10)), &consumer)
         .expect("v1 compiles");
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(1)),
-        (Value::UInt(1), Value::Int(2)),
-    ]);
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(1)),
+            (Value::UInt(1), Value::Int(2)),
+        ]);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     crate::it::serving::dispatch_until_idle(&mut live);
 
@@ -546,11 +552,15 @@ fn a_sink_accumulates_across_a_reload() {
         &consumer,
     )
     .expect("v2 replaces v1");
-    src.borrow_mut().add_data(&[
-        (Value::UInt(2), Value::Int(3)),
-        (Value::UInt(3), Value::Int(4)),
-    ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(2), Value::Int(3)),
+            (Value::UInt(3), Value::Int(4)),
+        ]);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     crate::it::serving::dispatch_until_idle(&mut live);
     assert!(live.poll_finished(), "the replacement completes");
 
@@ -605,17 +615,19 @@ fn a_collection_fed_from_inside_a_loop_does_not_compile() {
 #[test]
 fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let sink = ctx.register_test_sink("out");
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(1))]);
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -639,9 +651,12 @@ fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
     );
     assert_eq!(sink.value(), Err(SinkReadError::Incomplete));
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(1), Value::Int(2))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     crate::it::serving::dispatch_until_idle(&mut program);
     assert!(program.done.try_recv().is_ok(), "the program completes");
 
@@ -687,11 +702,11 @@ fn a_run_that_unwinds_keeps_the_main_producer() {
 
     let mut ctx = GlobalContext::default();
     // A source that has yielded nothing keeps the run open, so its first pass drains.
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src);
     let consumer = || -> Box<dyn Consumer> { Box::new(|| {}) };
     let program = indoc! {"

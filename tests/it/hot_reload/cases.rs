@@ -1,5 +1,6 @@
 //! One case per row of the guard table in `tests/it/hot_reload.rs`.
 
+use std::sync::PoisonError;
 use std::{collections::HashMap, sync::mpsc, thread, time::Duration};
 
 use indoc::{formatdoc, indoc};
@@ -2686,8 +2687,6 @@ fn a_rejected_reload_leaves_the_program_serving() {
 /// register, so its recompile fails while the new version compiles.
 #[test]
 fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
-    use std::{cell::RefCell, rc::Rc};
-
     use cambra::{
         ccl::Type,
         ccl::load::LoadedProgram,
@@ -2702,11 +2701,11 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
         total
     "};
     let mut ctx = GlobalContext::default();
-    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+    ctx.register_source(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    ))));
+    ));
     let live = LiveProgram::start(
         &mut ctx,
         &LoadedProgram::from_text("running.cambra", running),
@@ -3122,8 +3121,8 @@ fn a_program_can_be_reloaded_repeatedly() {
 /// version had committed was offered again — visible here because each `/set`
 /// appends, so a replay leaves a mark.
 ///
-/// The record is handed back from the producer's `Drop`
-/// (`DataSourceDomainExtentImpl::retire_producer`), so this passes only while a
+/// The record is handed back when the producer drops its retirement handle
+/// (`DataSourceDomainExtentImpl::producer_retirement`), so this passes only while a
 /// retired version's operators are actually freed. Two back-edges used to keep
 /// them alive: a fan-out's notification closure held its own shared state, and a
 /// store's driver and writer owned the fan-out whose input chain contains them
@@ -3214,7 +3213,6 @@ fn transactions_across_reloads(
 ) -> (i64, Vec<i64>) {
     use cambra::ccl::Type;
     use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource, Value};
-    use std::{cell::RefCell, rc::Rc};
 
     let program = |mark: usize| {
         format!(
@@ -3236,11 +3234,11 @@ fn transactions_across_reloads(
     let mut ctx = GlobalContext::default();
     let sink = ctx.register_test_sink("out");
     let total = ctx.register_test_sink("total");
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let mut delivered = Predicate::False;
     let mut deliver = |batch: &[(usize, i64)]| {
@@ -3251,7 +3249,7 @@ fn transactions_across_reloads(
         for (at, _) in &rows {
             delivered = delivered.union(&Predicate::point(at.clone()));
         }
-        let mut source = source.borrow_mut();
+        let mut source = source.write().unwrap_or_else(PoisonError::into_inner);
         source.add_data(&rows);
         source.set_yield_predicate(delivered.clone());
     };
@@ -3264,7 +3262,10 @@ fn transactions_across_reloads(
         deliver(batch);
         run_to_idle(&mut live, morsel_rows);
     }
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     run_to_idle(&mut live, morsel_rows);
     let pool = match total.value() {
         Ok(Value::Function(bindings)) if bindings.len() == 1 => match bindings[0].output {
@@ -3906,7 +3907,8 @@ fn a_dispatched_fold_caught_partway_answers_its_pending_request_after_a_reload()
             .filter(|(name, _)| name.starts_with("__http_requests_"))
             .any(|(_, source)| {
                 source
-                    .borrow()
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .get_yield_predicate()
                     .contains(&Value::UInt(0))
             });
@@ -3963,7 +3965,7 @@ fn a_version_installed_before_a_fold_runs_needs_no_new_arrival() {
             .sources()
             .filter(|(name, _)| name.starts_with("__http_requests_"))
         {
-            let mut source = source.borrow_mut();
+            let mut source = source.write().unwrap_or_else(PoisonError::into_inner);
             if source.check_for_new_data() {
                 assert!(
                     source.get_yield_predicate().contains(&Value::UInt(0)),
