@@ -767,6 +767,9 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &Constrai
         (Repr::Written(_), _) | (_, Repr::Written(_)) => {
             unreachable!("written clauses are normalized before the solver relates them")
         }
+        (Repr::Children(_), _) | (_, Repr::Children(_)) => {
+            unreachable!("a union of a node's children's capabilities is in no type")
+        }
     }
 }
 

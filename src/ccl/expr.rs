@@ -1777,8 +1777,8 @@ impl TypedExpr {
     }
 
     /// [`Self::absorbing_children_capabilities`] in place.
-    /// Graph-free: a child's capability variable is resolved by a scratch solver, so an edge
-    /// into it that waits on a kind only the run can read does not hold.
+    /// Graph-free: a child whose capabilities are still a variable leaves the union unread
+    /// ([`crate::ccl::capabilities::of_children`]).
     pub(crate) fn absorb_children_capabilities(&mut self) {
         self.absorb_children_capabilities_in(&mut Solver::scratch());
     }

@@ -5060,11 +5060,15 @@ function does nothing. A function body's frame is its body node's variable seen 
 filter, which keeps out what names a variable the body binds or a parameter, whose history is its
 argument's (`Bound::Parameter`).
 
-Once the walk ends, coalesce gives every node's slots the set its variables resolve to, the nodes of
-each term a type quotes included: a refinement's predicate, a projection's sum, a family's arguments
-(`settle_capabilities` in `solve.rs`). A run that fails before coalesce settles its tree the same way
-(`run_once` in `infer/mod.rs`), since the passes after a failed inference still read it. No node's
-capabilities leave inference as a variable, which debug builds check.
+A node built over its children while one of them still holds a variable holds their union unread
+(`capabilities::Repr::Children`), so building a node reads no variable: a clone takes the copies of
+the variables in the union's parts too, and coalesce resolves the union where it resolves the node's
+type. Once the walk ends, coalesce gives every node's slots the set its variables and unions resolve
+to, children first, the nodes of each term a type quotes included: a refinement's predicate, a
+projection's sum, a family's arguments (`settle_capabilities` in `solve.rs`). A run that fails
+before coalesce settles its tree the same way (`run_once` in `infer/mod.rs`), since the passes after
+a failed inference still read it. No node's capabilities leave inference as a variable or a
+union holding one, which debug builds check.
 
 A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
 arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one

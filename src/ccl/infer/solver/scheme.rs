@@ -1198,6 +1198,9 @@ pub fn freshen_above(
                     Repr::Written(_) => {
                         unreachable!("a scheme's written clauses are normalized when it is bound")
                     }
+                    Repr::Children(_) => {
+                        unreachable!("a union of a node's children's capabilities is in no type")
+                    }
                 },
             };
             // The parts of a function whose kind may bind witnesses sit under those binders.
@@ -1889,9 +1892,10 @@ pub fn freshen_expr_type_slots(
     expr.walk_type_slots_mut(|ty| *ty = freshen_above(solver, lim, ty, target, cache));
     // The node's own capabilities, a variable the definition's emission minted: the clone's are the
     // use's copy of it, as its types are.
+    // A union of its children's, built while one of them was a variable, reads the copies too.
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-        if let Repr::Var(v) = slot.repr() {
-            *slot = Capabilities::var(freshen_capability_var(solver, lim, v, target, cache));
+        if slot.is_pending() {
+            *slot = slot.map_vars(&mut |v| freshen_capability_var(solver, lim, v, target, cache));
         }
     }
     expr.walk_children_mut(|c| freshen_expr_type_slots(solver, c, lim, target, cache));
