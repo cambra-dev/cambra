@@ -3,8 +3,9 @@
 //! `crate::interpreter::dispatcher::loop_scope`, and a transaction store of two writers, each
 //! writer's source an input of its own.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 
 use indoc::indoc;
 
@@ -48,11 +49,11 @@ impl Compiled {
 
     fn over_an_empty_source(source: &str) -> Self {
         Self::with(source, |ctx| {
-            ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+            ctx.register_source(TestDataSource::new(
                 "source1",
                 crate::ccl::Type::Base(BaseType::Int),
                 Extent::Base(BaseType::Int),
-            ))));
+            ));
         })
     }
 
@@ -72,7 +73,7 @@ impl Compiled {
         assert!(stores.next().is_none(), "one store");
         let store = fan.store().expect("the program subscribed its store");
         store
-            .borrow_mut()
+            .write()
             .as_breaking_mut()
             .expect("a store breaks a pipeline")
             .begin_run();
@@ -87,8 +88,12 @@ impl Compiled {
     fn pull_sinks(&self) {
         for output in &self.program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                let root = consumer.borrow().producer_slot().clone();
-                let mut root = root.borrow_mut();
+                let root = consumer
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .producer_slot()
+                    .clone();
+                let mut root = root.write().unwrap_or_else(PoisonError::into_inner);
                 let producer = root.as_mut().unwrap();
                 let guard = producer.tiling().universal_guard();
                 let tile = crate::interpreter::dispatcher::read_for_test(&mut **producer, guard);
@@ -100,7 +105,7 @@ impl Compiled {
     /// Call `f` with the store as a pipeline breaker, placed in a pipeline as a dispatched run puts
     /// it.
     fn breaker<R>(&self, f: impl FnOnce(&mut dyn BreakingProducer) -> R) -> R {
-        let mut store = self.store.borrow_mut();
+        let mut store = self.store.write();
         let store = store
             .as_breaking_mut()
             .expect("a store is a pipeline breaker");
@@ -165,18 +170,21 @@ fn a_consuming_store_answers_from_its_snapshot() {
         let mut pulls = 0;
         compiled
             .store
-            .borrow()
+            .read()
             .visit_input_producers(&mut |role, input| {
                 if role == "body" {
-                    pulls = input.base().reads.get();
+                    pulls = input
+                        .base()
+                        .reads
+                        .load(std::sync::atomic::Ordering::Relaxed);
                 }
             });
         pulls
     };
     let before = body_pulls();
     let snapshot = compiled.snapshot();
-    let whole = compiled.store.borrow().tiling().universal_guard();
-    let pulled = compiled.store.borrow_mut().get(whole);
+    let whole = compiled.store.read().tiling().universal_guard();
+    let pulled = compiled.store.write().get(whole);
     assert_eq!(pulled, snapshot);
     assert_eq!(body_pulls(), before);
 }
@@ -244,8 +252,13 @@ fn input_pulls(compiled: &Compiled) -> u64 {
     let mut pulls = 0;
     compiled
         .store
-        .borrow()
-        .visit_input_producers(&mut |_, input| pulls += input.base().reads.get());
+        .read()
+        .visit_input_producers(&mut |_, input| {
+            pulls += input
+                .base()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
     pulls
 }
 
@@ -258,8 +271,8 @@ fn a_consuming_store_pulled_before_its_first_consume_answers_nothing_final(#[cas
     let compiled = Compiled::of(source);
     compiled.breaker(|_| {});
     let before = input_pulls(&compiled);
-    let whole = compiled.store.borrow().tiling().universal_guard();
-    let pulled = compiled.store.borrow_mut().get(whole);
+    let whole = compiled.store.read().tiling().universal_guard();
+    let pulled = compiled.store.write().get(whole);
     assert!(!pulled.is_terminal(), "{pulled:?}");
     assert_eq!(input_pulls(&compiled), before, "the pull steps nothing");
     if source == TWO_WRITERS {
@@ -374,11 +387,11 @@ fn a_release_reclaims_no_version_a_held_proposal_read() {
 /// A live writer releases a decided-absent key without producing a transaction for it.
 #[test]
 fn a_live_writer_releases_decided_absent_positions() {
-    let feed = Rc::new(RefCell::new(TestDataSource::new(
+    let feed = TestDataSource::new(
         "source1",
         crate::ccl::Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     let registered = feed.clone();
     let compiled = Compiled::with(
         indoc! {"
@@ -395,13 +408,13 @@ fn a_live_writer_releases_decided_absent_positions() {
         |ctx| ctx.register_source(registered),
     );
     {
-        let mut feed = feed.borrow_mut();
+        let mut feed = feed.write().unwrap_or_else(PoisonError::into_inner);
         feed.add_data(&[(Value::UInt(0), Value::Int(5))]);
         feed.set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     }
     compiled.open();
     compiled.consume_whole(writer(0));
-    let source: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = feed.clone();
+    let source: Arc<RwLock<dyn DataSourceDomainExtentImpl>> = feed.runtime();
     compiled.breaker(|store| {
         store.read_source_again(&source);
         store.consume_in_pipeline(InputId(writer(1)), keys_between(0, 1));

@@ -546,7 +546,9 @@ impl Inspection {
         sources
             .sources()
             .filter_map(|(name, handle)| {
-                let source = handle.borrow();
+                let source = handle
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let window = source.retained_window()?;
                 let keys = ColumnValue::from_uints(
                     window_tail(window.clone(), ROWS_PER_READING).collect(),
