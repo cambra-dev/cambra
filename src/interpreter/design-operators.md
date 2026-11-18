@@ -1004,21 +1004,26 @@ input key stands beneath exactly one value. So a region of the input's keys name
 paths it changed, with the value step admitting anything: `Converse` passes its input a consumer
 that restates the region there (`notifications::one_level_in`), and a pull at such a region pulls the
 input at the same keys (`Predicate::without_open_level`) and inverts only those rows. A region of
-the standing keys above the inverted level passes through as it is. It keeps the input rows it read
-and has not released, which a release of a group names by their values. At the outermost level its
-answers' groups follow the input keys beneath them
+the standing keys above the inverted level passes through as it is. It holds no input row. At the
+outermost level its answers' groups follow the input keys beneath them
 ([Keys that follow the level beneath](#keys-that-follow-the-level-beneath)): a group is the rows
 whose value is its key, so once a reader holds every input key complete, a value no row carried
 has no group.
 
 #### A release of a converse group
 
-A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
-the input rows the region covers among those it holds, at once, and each later row of a released
-group on the next release after a read first holds it. An input guard names
-rows by key, and a group is the rows whose value is the group's key, so no input guard names a group
-before its rows are read. The two parts together release exactly the region named, as
-[Guard operations are exact](#guard-operations-are-exact) requires.
+A release of a `Converse` forwards upstream the input keys it names: the standing keys above the
+inverted level, and input keys named one level in beneath every group. A release that names a group
+by its value names no input key. A group is the rows whose value is its key, so which input rows a
+group holds is known only once they are read, and no input guard spells it. `Converse` forwards
+nothing for such a release, a smaller guard than named, against
+[Guard operations are exact](#guard-operations-are-exact).
+
+The rows of a group released by value are released only where the consumer also releases their
+input keys beneath every group, as a breaker does for an answer of a pull one level in. Two
+consumers release by value alone, and leave those rows at the input until a universal release:
+`MapDomain` over a `Converse` (`converse ≫ map_domain`), whose output holds no input key, and the
+consumer of an answer pulled by group, whose cut qualifies the input keys by group.
 
 ### ExtractFinal
 
@@ -1813,11 +1818,10 @@ collection, and op-conversion pairs each row with `𝐹`'s collection for it, `�
 (`src/ccl/design/type-inference.md`, "Iterating a dependent tuple"). A group-by under a loop whose
 key reads the loop's binder has `𝐹 = 𝑀 ≫ converse ≫ map_domain`, the keys of the collection
 `𝑀` builds per row, and `converse` and `map_domain` act at that level, one row's collection at a
-time. A nested `Converse` passes a guard naming standing keys to its input as those keys. A guard
-naming part of one row's inversion names input rows through their values, so the `Converse` records
-each input row it read with the output path `[𝑠…, value, key]` it stands at and its input path
-`[𝑠…, key]`, and releases the input rows whose output path the guard covers. A row read after its
-group was released is retained until the next release reclaims it.
+time. A nested `Converse` passes a guard naming standing keys to its input as those keys, and a
+guard naming input keys beneath every group of a row as those keys under that row. A guard naming
+part of one row's inversion by value names no input key, as at the outermost level
+([A release of a converse group](#a-release-of-a-converse-group)).
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
