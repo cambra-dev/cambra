@@ -4,6 +4,8 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::interpreter::tiling::KeysFollow;
+
 use bit_set::BitSet;
 
 use super::*;
@@ -549,12 +551,7 @@ impl TileProducer for ZipProducer {
                     })
                     .collect();
                 for (arm, t) in tiles.iter().enumerate() {
-                    let Tile::DataFunction {
-                        domain,
-                        domain_predicate,
-                        ..
-                    } = t
-                    else {
+                    let Tile::DataFunction { domain, .. } = t else {
                         panic!("Zip: cannot mix function and non-function tiles")
                     };
                     let mut p = Predicate::from_column_value(domain);
@@ -575,7 +572,7 @@ impl TileProducer for ZipProducer {
                     let complete = if t.values_at(CurryLevel::new(1)).holds_a_level() {
                         t.complete_keys()
                     } else {
-                        domain_predicate.clone()
+                        t.level_statement()
                     };
                     domain_pred = Some(match domain_pred {
                         None => complete.clone(),
@@ -596,15 +593,10 @@ impl TileProducer for ZipProducer {
                 let mut standing: Vec<Predicate> = Vec::new();
                 for mut filtered in tiles.into_iter() {
                     for depth in 1..self.level.index() {
-                        let Tile::DataFunction {
-                            domain_predicate, ..
-                        } = filtered.values_at(CurryLevel::new(depth))
-                        else {
-                            unreachable!("the levels above the pair are collections")
-                        };
+                        let stated = filtered.values_at(CurryLevel::new(depth)).level_statement();
                         match standing.get_mut(depth - 1) {
-                            Some(meet) => *meet = meet.intersect(domain_predicate),
-                            None => standing.push(domain_predicate.clone()),
+                            Some(meet) => *meet = meet.intersect(&stated),
+                            None => standing.push(stated),
                         }
                     }
                     let Tile::DataFunction { domain, .. } = &filtered else {
@@ -690,23 +682,6 @@ impl TileProducer for ZipProducer {
                     }
                     codomains.push(aligned);
                 }
-                // A key an arm knows absent is absent from the pair, which holds a row only where
-                // every arm does, so each level above the pair knows absent what any arm does.
-                let absent_keys: Vec<Predicate> = (0..self.level.index())
-                    .map(|depth| {
-                        Predicate::union_all(
-                            filtered_tiles
-                                .iter()
-                                .filter_map(|tile| match tile.values_at(CurryLevel::new(depth)) {
-                                    Tile::DataFunction { absent_keys, .. } => {
-                                        Some(absent_keys.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect();
                 let skeleton = filtered_tiles.swap_remove(skeleton_at);
 
                 let names = &self.names;
@@ -732,12 +707,16 @@ impl TileProducer for ZipProducer {
                 }
                 let mut out = skeleton;
                 *out.values_at_mut(self.level) = codomain_record;
-                for (depth, known) in absent_keys.into_iter().enumerate() {
-                    if let Tile::DataFunction { absent_keys, .. } =
-                        out.values_at_mut(CurryLevel::new(depth))
-                    {
-                        *absent_keys = known;
-                    }
+                // The pair's enclosing level holds a record of the arms' values beneath it, which
+                // no key of that level follows; the levels above it stand over the skeleton
+                // arm's keys, stated as the arms' meet, and keep its flag.
+                let enclosing = self.level.enclosing().expect("a pair stands beneath a row");
+                if let Tile::DataFunction {
+                    keys_follow_beneath,
+                    ..
+                } = out.values_at_mut(enclosing)
+                {
+                    *keys_follow_beneath = KeysFollow::DoesNot;
                 }
                 for (at, meet) in standing.into_iter().enumerate() {
                     let Tile::DataFunction {
@@ -2020,38 +1999,55 @@ mod tests {
         );
     }
 
-    /// A key one arm records absent is absent from the pair, which holds a row only where every
-    /// arm does, whichever arm the output's keys are taken from.
+    /// A pair's keys are complete where every arm's are, each arm's read through
+    /// `Tile::level_statement`: the collection arm's keys follow its complete level beneath, so the
+    /// pair's keys are complete though no arm's `domain_predicate` says so alone. The pair's level
+    /// follows no level of its own: its values are a record of the arms'.
     #[test]
-    fn a_pair_records_absent_what_any_arm_records_absent() {
+    fn a_pair_states_the_meet_of_its_arms_level_statements() {
         let uint = || Extent::Base(BaseType::UInt);
         let int = || Extent::Base(BaseType::Int);
-        let arm_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
-        let arm = |values: Vec<i64>, absent: Predicate| {
-            let mut tile = Tile::data_function(
-                ColumnValue::from_uints((0..values.len() as u64).collect()),
-                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
-                Predicate::False,
+        let arm0_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let arm1_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let arm0 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut arm1 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30]))),
+                Predicate::True,
                 BitSet::new(),
-            );
-            let Tile::DataFunction { absent_keys, .. } = &mut tile else {
-                unreachable!("a collection")
-            };
-            *absent_keys = absent;
-            tile
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let Tile::DataFunction {
+            keys_follow_beneath,
+            ..
+        } = &mut arm1
+        else {
+            unreachable!("a collection")
         };
+        *keys_follow_beneath = KeysFollow::Follows;
         let out_tiling = Tiling::data_function(
             uint(),
             Tiling::Record(HashMap::from([
                 (tuple_field(0), Tiling::Scalar(int())),
-                (tuple_field(1), Tiling::Scalar(int())),
+                (
+                    tuple_field(1),
+                    Tiling::data_function(uint(), Tiling::Scalar(int())),
+                ),
             ])),
         );
-        let (spy0, _) = QuietSpy::new(
-            arm(vec![5, 6], Predicate::point(Value::UInt(7))),
-            arm_tiling.clone(),
-        );
-        let (spy1, _) = QuietSpy::new(arm(vec![50, 60], Predicate::False), arm_tiling);
+        let (spy0, _) = QuietSpy::new(arm0, arm0_tiling);
+        let (spy1, _) = QuietSpy::new(arm1, arm1_tiling);
         let mut zip = ZipProducer {
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
@@ -2059,12 +2055,17 @@ mod tests {
             level: CurryLevel::new(1),
             state: Mutex::new(ZipState::new(2)),
         };
-        let Tile::DataFunction { absent_keys, .. } =
-            zip.read_in_pipeline(out_tiling.universal_guard())
+        let out = zip.read_in_pipeline(out_tiling.universal_guard());
+        let Tile::DataFunction {
+            domain_predicate,
+            keys_follow_beneath,
+            ..
+        } = &out
         else {
-            panic!("the zip is a collection")
+            panic!("the zip is a collection, got {out:?}")
         };
-        assert!(absent_keys.contains(&Value::UInt(7)), "{absent_keys:?}");
+        assert!(domain_predicate.is_true(), "{out:?}");
+        assert_ne!(*keys_follow_beneath, KeysFollow::Follows, "{out:?}");
     }
 
     /// A release naming part of the pair record reaches each arm as that arm's field, spelled

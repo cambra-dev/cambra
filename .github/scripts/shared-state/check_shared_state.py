@@ -165,8 +165,6 @@ EXPECTED_EXCEPTIONS = [
     # `get` and `release` change it through `&self` under the lock. No other operator holds the
     # producer.
     ("src/interpreter/tile_operators/combinators.rs", "cell of `Vec<HeldRow>`"),
-    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
-    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
     ("src/interpreter/tile_operators/fan.rs", "cell of `ZipState`"),
     ("src/interpreter/tile_operators/map.rs", "cell of `Option<HeldBeneathKeys>`"),
     # Every producer's release state and its debug record of its last output (`ProducerBase`),
