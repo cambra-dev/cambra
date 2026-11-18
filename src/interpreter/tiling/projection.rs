@@ -2583,7 +2583,7 @@ mod tests {
             let morsel = keys_between(first, first + MORSEL - 1);
             assert_eq!(int_entries(&spy.get(morsel.clone())).len(), MORSEL as usize);
             spy.release(morsel);
-            let Some(Tile::DataFunction { domain, .. }) = &spy.base.last_output else {
+            let Some(Tile::DataFunction { domain, .. }) = &*spy.base.last_output.borrow() else {
                 panic!("a pull records the collection it answered")
             };
             assert_eq!(
