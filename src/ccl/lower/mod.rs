@@ -672,6 +672,10 @@ pub struct LoweringContext {
     /// once they are ([`stmts::check_pending_requirements`]).
     pub(super) pending_requirements: Vec<PendingRequirement>,
 
+    /// Nominal applications written before declarations' requirements and the module's
+    /// instances are available. They are checked once both tables are complete.
+    pub(super) pending_nominal_applications: Vec<(Span, Rc<NominalDecl>, Vec<Type>)>,
+
     /// What each `instance` block needs to lower its `def`s where it stands.
     pub(super) instance_blocks: Vec<traits::InstanceBlock>,
 

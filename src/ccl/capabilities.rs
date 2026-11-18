@@ -130,6 +130,7 @@ impl Requirement {
                 terms,
                 effect_assoc: Vec::new(),
                 assoc: Vec::new(),
+                binders: Vec::new(),
                 at: None,
             },
             None,
@@ -152,6 +153,7 @@ impl Requirement {
                 terms: Vec::new(),
                 effect_assoc: Vec::new(),
                 assoc: Vec::new(),
+                binders: Vec::new(),
                 at: None,
             },
             Some(Rc::new(OrderableIfRequiredBy {

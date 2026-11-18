@@ -885,12 +885,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let memo_key = (state.uid, pol, ctx.scope.enclosing().to_vec());
             let under = if subst_acc.is_id() {
                 Some(Subst::id())
-            } else if subst_acc.has_witnesses() {
-                None
             } else {
                 ctx.consulted
                     .below(state, pol)
-                    .map(|names| subst_acc.restricted_to(&names))
+                    .filter(|reads| !subst_acc.has_witnesses() || !reads.witnesses)
+                    .map(|reads| subst_acc.restricted_to(&reads.names))
             };
             if let Some(under) = &under
                 && let Some((_, k)) = ctx
@@ -1171,6 +1170,22 @@ mod tests {
             "{} variables expanded for a chain of {}",
             ctx.visits,
             depth + 1
+        );
+    }
+
+    #[test]
+    fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
+        let kind = crate::ccl::ty::FunKindVar::fresh();
+        let collection = Rc::new(TypedExpr::var("xs"));
+        let edge = Subst::kind_elim(&kind, &collection);
+        let (root, nodes) = super::super::test_helpers::diamond_bound_graph(16, int(), &edge);
+        let mut ctx = fresh_ctx();
+        let result = key_go(&root, true, &Subst::id(), &mut ctx);
+        assert_eq!(result, key_go(&int(), true, &Subst::id(), &mut fresh_ctx()));
+        assert!(
+            ctx.visits <= nodes,
+            "{} expansions for {nodes} variables",
+            ctx.visits
         );
     }
 

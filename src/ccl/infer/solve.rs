@@ -383,28 +383,24 @@ struct ReadRecord {
     label: String,
 }
 
-/// End-of-pass check of the integrated-monomorphization ordering invariant —
-/// **specialization may only add bounds to variables the walk has not yet
-/// read** — via its observable consequence: every type the walk read must
-/// still resolve, against the final graph, to what was stamped. A violation
-/// means some specialization's pin semantically changed a variable an
-/// earlier read had already consumed — a stamped type was derived from state
-/// that later turned out to be stale, exactly the disease the integrated
-/// design exists to rule out.
+/// Verify every recorded read against the final graph. Later specialization pins must
+/// preserve the types the coalesce walk has already consumed.
 #[cfg(debug_assertions)]
 fn assert_reads_stable(reads: &[ReadRecord]) {
-    for r in reads {
-        let now = resolve_var_type(&r.unresolved);
-        debug_assert!(
-            matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t, r.purpose == ReadPurpose::Stamp)),
-            "ordering invariant (specialization may only add bounds to \
+    super::solver::compact::with_fixed_graph_compactions(|| {
+        for r in reads {
+            let now = resolve_var_type(&r.unresolved);
+            debug_assert!(
+                matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t, r.purpose == ReadPurpose::Stamp)),
+                "ordering invariant (specialization may only add bounds to \
              variables the walk has not yet read) violated: `{}` was read as \
              {} during the walk, but the final graph resolves it to {:?}",
-            r.label,
-            r.resolved,
-            now,
-        );
-    }
+                r.label,
+                r.resolved,
+                now,
+            );
+        }
+    });
 }
 
 /// Compare a recorded type's structure with its final-graph resolution.
@@ -3949,6 +3945,35 @@ pub(super) fn specialize_use(
             }
         }
     });
+    // A family parameter of the binding's own is below the bound on its values, at the
+    // binders its variable stands under, as at an instantiation (`PolyScheme::
+    // instantiate_with_params`).
+    let pinned = pinned.and_then(|()| {
+        let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+            unreachable!("lookup_generalized returns indices of Generalized entries only");
+        };
+        let own = Rc::clone(&frame.own_params);
+        let mut families: Vec<_> = fresh
+            .family_params
+            .values()
+            .filter(|(param, _, _)| own.contains(&param.id))
+            .cloned()
+            .collect();
+        families.sort_by(|a, b| a.0.cmp(&b.0));
+        for (param, names, var) in families {
+            if let Some(bound) = &param.bound {
+                let bound = freshen_above(cutoff, bound, target, &mut fresh);
+                let bound = crate::ccl::subst::family_at_names(&bound, &names);
+                constrain_subtype_in(
+                    &var,
+                    &bound,
+                    &mut cache,
+                    &crate::ccl::infer::solver::smt::NoScope,
+                )?;
+            }
+        }
+        Ok(())
+    });
     // An obligation the copy reset, having assumed one of the binding's own type
     // parameters, resolves against its trait's instances at the use's types, which
     // the pin has just delivered to its operands' variables
@@ -3965,7 +3990,8 @@ pub(super) fn specialize_use(
             });
             obligation.assume_more(&ctx.assumptions);
             obligation.redeliver(&mut cache)
-        })
+        })?;
+        crate::ccl::infer::solver::traits::settle_held_answers(None, &mut cache)
     });
     // A parameter standing for an associated type is the instance's type at the clone's
     // operands, which the pin has just delivered: it is defined there, not solved for, so
@@ -4772,6 +4798,28 @@ mod clone_probe {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ordering invariant")]
+    fn final_graph_verification_compares_every_recorded_read() {
+        let ty = Type::Base(BaseType::Int);
+        let reads = vec![
+            super::ReadRecord {
+                purpose: super::ReadPurpose::Stamp,
+                unresolved: ty.clone(),
+                resolved: ty.clone(),
+                label: "first read".into(),
+            },
+            super::ReadRecord {
+                purpose: super::ReadPurpose::Stamp,
+                unresolved: ty,
+                resolved: Type::Base(BaseType::Bool),
+                label: "second read".into(),
+            },
+        ];
+        super::assert_reads_stable(&reads);
+    }
+
     #[test]
     fn unresolved_materialization_preserves_variable_identity() {
         let _arena = crate::ccl::infer::InferArena::new();

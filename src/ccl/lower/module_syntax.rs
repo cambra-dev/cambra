@@ -344,16 +344,10 @@ impl Refusals {
                     }
                 }
             }
-            ChlStmt::TypeDecl(decl) => match &decl.body {
-                TypeDeclBody::Constructors(ctors) => {
-                    for ctor in ctors {
-                        for param in &ctor.params {
-                            self.expr(&param.ty);
-                        }
-                    }
-                }
-                TypeDeclBody::Single(ty) => self.expr(ty),
-            },
+            ChlStmt::TypeDecl(decl) => {
+                self.requires(&decl.requires);
+                self.type_decl_body(&decl.body);
+            }
             // An import's module, arguments, and `use` items resolve against
             // the program (`super::modules`).
             ChlStmt::Import { args, .. } => {
@@ -393,6 +387,19 @@ impl Refusals {
                 Some(KindAnnotation::Kind(ty) | KindAnnotation::Bound(ty)) => self.expr(ty),
                 None => {}
             }
+        }
+    }
+
+    fn type_decl_body(&mut self, body: &TypeDeclBody) {
+        match body {
+            TypeDeclBody::Constructors(ctors) => {
+                for ctor in ctors {
+                    for param in &ctor.params {
+                        self.expr(&param.ty);
+                    }
+                }
+            }
+            TypeDeclBody::Single(ty) => self.expr(ty),
         }
     }
 
