@@ -234,6 +234,32 @@ fn assert_widens(build: &dyn Fn() -> Built, notified: usize) {
     }
 }
 
+fn union(flat: bool) -> Built {
+    let (a, first) = feed(ints());
+    let (b, second) = feed(ints());
+    let arms = vec![a, b];
+    let op: Box<dyn TileOperator> = match flat {
+        true => Box::new(UnionOperator::new_flat(arms, int())),
+        false => Box::new(UnionOperator::new(arms, int())),
+    };
+    (op, vec![first, second])
+}
+
+#[test]
+fn a_flat_union_forwards_the_region_of_each_arm() {
+    for arm in [0, 1] {
+        assert_keeps(&|| union(true), arm);
+    }
+    assert_keeps_without_state(&|| union(true), 1);
+}
+
+/// A tagged union keys its rows by arm, which a region of plain keys does not name.
+#[test]
+fn a_tagged_union_sends_everything_for_any_region() {
+    assert_widens(&|| union(false), 0);
+    assert_widens(&|| union(false), 1);
+}
+
 fn filter(predicate: Tiling) -> Built {
     let (input, data) = feed(ints());
     let (predicate, mask) = feed(predicate);
@@ -528,6 +554,20 @@ fn a_fan_out_suppresses_a_notification_of_keys_it_passed_until_a_pull_reopens_it
 #[test]
 fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     let (mut operator, inputs) = zip();
+    let (log, regions) = RegionLog::new();
+    let guard = operator.tiling().universal_guard();
+    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    regions.borrow_mut().clear();
+    notify_input(&inputs[0], &region());
+    notify_input(&inputs[1], &another_region());
+    assert_eq!(*regions.borrow_mut(), [region(), another_region()]);
+}
+
+/// A flat union's arms notify different keys between pulls, and the union's consumer hears of
+/// each: a memo above it marks both regions dirty.
+#[test]
+fn a_union_passes_the_regions_of_two_arms_between_pulls() {
+    let (mut operator, inputs) = union(true);
     let (log, regions) = RegionLog::new();
     let guard = operator.tiling().universal_guard();
     let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
