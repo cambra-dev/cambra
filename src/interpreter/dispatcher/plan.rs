@@ -355,8 +355,30 @@ fn run_targets(
             TargetEntry::Main(placement) => placement.set(Some(local)),
         }
     }
-    let members = planner.members(None);
+    // The breakers each loop's scope keeps, those of loops nested in a transaction writer's body
+    // included, for the check of their rounds below.
     let mut kept = Vec::new();
+    let transactions: Vec<(StoreCell, usize, transaction_scope::WriterRun)> = planner
+        .scopes
+        .iter()
+        .enumerate()
+        .filter_map(|(scope, planned)| {
+            planned
+                .writer
+                .map(|writer| (scope, writer, planned.store.clone()))
+        })
+        .map(|(scope, writer, store)| {
+            (
+                store,
+                writer,
+                planner.build_transaction(scope, morsel_rows, &mut kept, &mut runs),
+            )
+        })
+        .collect();
+    for (store, writer, run) in transactions {
+        runs.install_transaction(&store, writer, run);
+    }
+    let members = planner.members(None);
     let scopes: Vec<Option<StoreCell>> = members
         .located
         .iter()
@@ -378,6 +400,23 @@ fn run_targets(
     for (pipeline, scope) in scopes.iter().enumerate() {
         if let Some(scope) = scope {
             induction(scope).decide_through_drive(PipelineId(pipeline));
+        }
+    }
+    for (pipeline, located) in members.located.iter().enumerate() {
+        if let Located::Store { store, input, .. } = located {
+            let producer = transaction_scope::transaction(store);
+            if let Some(writer) = producer.writer_of(InputId(*input)) {
+                let run = producer.writer_run(writer);
+                loop_scope::reach_member(&run.members[run.driver.0], &mut |breaker, _| {
+                    if let Some(target) = breaker
+                        .as_producer()
+                        .and_then(|producer| producer.completes_through())
+                    {
+                        *target.borrow_mut() =
+                            Some((PipelineId(pipeline), breaker.input_tiling(InputId::ONLY)));
+                    }
+                });
+            }
         }
     }
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| match &members.located[pipeline.0] {
@@ -707,7 +746,21 @@ fn run_targets(
     for pipeline in 0..members.names.len() {
         reach(PipelineId(pipeline), &mut |breaker, _| breaker.begin_run());
     }
-    let execution = Execution::new(&scopes, &mut dispatcher);
+    let mut execution = Execution::new(&scopes, &mut dispatcher);
+    for (pipeline, located) in members.located.iter().enumerate() {
+        if let Located::Store { store, input, .. } = located {
+            let writer = transaction_scope::transaction(store).writer_of(InputId(*input));
+            if let Some(writer) = writer {
+                execution.attach_transaction(
+                    store,
+                    writer,
+                    InputId(*input),
+                    PipelineId(pipeline),
+                    &mut dispatcher,
+                );
+            }
+        }
+    }
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
@@ -791,6 +844,15 @@ fn run_targets(
             );
         }
     }
+    for (pipeline, located) in members.located.iter().enumerate() {
+        if let Located::Store { store, input, .. } = located {
+            let mut producer = transaction_scope::transaction(store);
+            if let Some(writer) = producer.writer_of(InputId(*input)) {
+                planned[pipeline].rounds =
+                    std::mem::take(&mut producer.writer_run_mut(writer).planned);
+            }
+        }
+    }
     Ok(match done {
         true => Ended::Done(planned),
         false => {
@@ -827,13 +889,39 @@ impl Drop for MainGivenBackOnUnwind<'_> {
 /// Owns installed scheduling metadata from planning through every run exit, including unwinding.
 pub(super) struct InductionRuns {
     stores: Vec<StoreCell>,
+    transactions: Vec<StoreCell>,
 }
 
 impl InductionRuns {
     pub(super) fn new() -> Self {
-        Self { stores: Vec::new() }
+        Self {
+            stores: Vec::new(),
+            transactions: Vec::new(),
+        }
     }
 
+    fn install_transaction(
+        &mut self,
+        store: &StoreCell,
+        writer: usize,
+        run: transaction_scope::WriterRun,
+    ) {
+        let mut producer = transaction_scope::transaction(store);
+        if producer.run.is_none() {
+            self.transactions.push(store.clone());
+            producer.run = Some(transaction_scope::TransactionRun {
+                writers: Vec::new(),
+                stalled: 0,
+            });
+        }
+        let writers = &mut producer.run.as_mut().expect("a transaction run").writers;
+        assert_eq!(
+            writers.len(),
+            writer,
+            "writer bodies are installed in order"
+        );
+        writers.push(run);
+    }
     fn install(&mut self, store: &StoreCell, run: loop_scope::InductionRun) {
         assert!(
             induction(store).run.is_none(),
@@ -846,6 +934,9 @@ impl InductionRuns {
 
 impl Drop for InductionRuns {
     fn drop(&mut self) {
+        for store in &self.transactions {
+            transaction_scope::transaction(store).run = None;
+        }
         for store in &self.stores {
             induction(store).clear_run();
         }
@@ -857,8 +948,152 @@ impl Drop for InductionRuns {
 enum Handler {
     Root,
     Body(BreakerHandle),
-    Request(StoreCell),
-    Step(StoreCell),
+    /// A scope's own pipeline, whose claims are the scope's requests.
+    Request(Scope),
+    /// A scope's step, whose claim ends a round or an attempt.
+    Step(Scope),
+}
+
+/// A scope whose inner pipelines run on the run's shared dispatcher, between its request and
+/// step handlers.
+enum Scope {
+    /// A loop: the store's rounds.
+    Loop(StoreCell),
+    /// One writer of a transaction store: its attempts.
+    Writer { store: StoreCell, writer: usize },
+}
+
+impl Scope {
+    fn reach(&self, call: &mut Call<'_>) {
+        match self {
+            Scope::Loop(store) => call(&mut *induction(store), InputId::ONLY),
+            Scope::Writer { store, writer } => {
+                let mut producer = transaction_scope::transaction(store);
+                let (_, input) = producer.writer_run(*writer).attached();
+                call(&mut *producer, input);
+            }
+        }
+    }
+
+    /// Whether a request is open, whose claim is in flight until it completes.
+    fn has_request(&self) -> bool {
+        match self {
+            Scope::Loop(store) => induction(store).has_package(),
+            Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                .writer_run(*writer)
+                .has_request(),
+        }
+    }
+
+    fn hold_followers(&self, dispatcher: &Dispatcher) {
+        match self {
+            Scope::Loop(store) => induction(store).hold_followers(dispatcher),
+            Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                .writer_run_mut(*writer)
+                .hold_followers(dispatcher),
+        }
+    }
+
+    /// Land and acknowledge a request the scope has completed.
+    fn complete(&self, dispatcher: &Dispatcher, package: Option<WorkPackage>) {
+        let Some(package) = package else { return };
+        let mut pushes = dispatcher.pushes(package.pipeline);
+        match self {
+            Scope::Loop(store) => {
+                let store = induction(store);
+                if store.pushes_while_consuming() {
+                    pushes.push_final(&*store);
+                }
+            }
+            Scope::Writer { store, .. } => {
+                pushes.push_final(&*transaction_scope::transaction(store));
+            }
+        }
+        dispatcher.land(pushes);
+        dispatcher.acknowledge(package);
+    }
+
+    /// Open the request `package`, a claim of the scope's own pipeline.
+    fn begin(&self, dispatcher: &Dispatcher, package: WorkPackage) {
+        match self {
+            Scope::Loop(store) => {
+                let completed = induction(store).begin_shared(dispatcher, package);
+                self.complete(dispatcher, completed);
+            }
+            Scope::Writer { store, writer } => {
+                transaction_scope::transaction(store).begin_request(dispatcher, *writer, package)
+            }
+        }
+    }
+
+    /// End the round or attempt whose step claimed `package`, and start the next or complete
+    /// the request.
+    fn step(&self, dispatcher: &Dispatcher, package: WorkPackage) {
+        let completed = match self {
+            Scope::Loop(store) => {
+                induction(store).complete_round();
+                dispatcher.acknowledge(package);
+                induction(store).queue_package_round(dispatcher)
+            }
+            Scope::Writer { store, writer } => {
+                dispatcher.acknowledge(package);
+                transaction_scope::transaction(store).finish_request(dispatcher, *writer)
+            }
+        };
+        self.complete(dispatcher, completed);
+    }
+
+    fn begin_finish(&self, dispatcher: &Dispatcher, consumed: Option<TileGuard>) {
+        match self {
+            Scope::Loop(store) => induction(store).begin_shared_finish(dispatcher, consumed),
+            Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                .begin_transaction_finish(dispatcher, *writer, consumed),
+        }
+    }
+
+    /// Advance a scope the coordinator found waiting: finish its pipeline once the inner
+    /// pipelines have, or publish what they hold and let their followers run. Whether anything
+    /// changed.
+    fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
+        let mut progressed = false;
+        let finished = match self {
+            Scope::Loop(store) => {
+                progressed |= induction(store).initialize_seed();
+                induction(store).take_shared_finish(dispatcher)
+            }
+            Scope::Writer { store, writer } => {
+                transaction_scope::transaction(store).take_transaction_finish(dispatcher, *writer)
+            }
+        };
+        if let Some((pipeline, consumed)) = finished {
+            finish_with(dispatcher, reach, pipeline, consumed);
+            if let Scope::Loop(store) = self {
+                induction(store).unplace_shared();
+            }
+            return true;
+        }
+        // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
+        let pipelines = match self {
+            Scope::Loop(store) => induction(store).settlement_pipelines(),
+            Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                .writer_run(*writer)
+                .pipelines(),
+        };
+        let before = dispatcher.changes();
+        push_held(dispatcher, reach, pipelines);
+        // No other claim executes during this scope's publication pass on the coordinator, so a
+        // generation change here belongs to these pushes.
+        if dispatcher.changes() != before {
+            return true;
+        }
+        progressed
+            | match self {
+                Scope::Loop(store) => induction(store).release_followers(dispatcher),
+                Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                    .writer_run_mut(*writer)
+                    .release_followers(dispatcher),
+            }
+    }
 }
 
 pub(super) struct Execution {
@@ -872,19 +1107,90 @@ impl Execution {
             handlers: scopes
                 .iter()
                 .map(|scope| match scope {
-                    Some(store) => Handler::Request(store.clone()),
+                    Some(store) => Handler::Request(Scope::Loop(store.clone())),
                     None => Handler::Root,
                 })
                 .collect(),
             roots: scopes.len(),
         };
-        for pipeline in 0..execution.roots {
-            if let Handler::Request(store) = &execution.handlers[pipeline] {
-                let store = store.clone();
-                execution.attach_store(&store, dispatcher, PipelineId(pipeline));
+        for (pipeline, scope) in scopes.iter().enumerate() {
+            if let Some(store) = scope {
+                execution.attach_store(store, dispatcher, PipelineId(pipeline));
             }
         }
         execution
+    }
+
+    /// The handlers of a scope's inner pipelines: a chain's breaker, or a nested loop's scope.
+    fn member_handlers(members: &[Member]) -> impl Iterator<Item = Handler> + '_ {
+        members.iter().map(|member| match member {
+            Member::Chain(handle) => Handler::Body(handle.clone()),
+            Member::Scope(child) => Handler::Request(Scope::Loop(child.clone())),
+        })
+    }
+
+    fn attach_transaction(
+        &mut self,
+        store: &StoreCell,
+        writer: usize,
+        input: InputId,
+        request: PipelineId,
+        dispatcher: &mut Dispatcher,
+    ) {
+        let (graph, members) = {
+            let mut producer = transaction_scope::transaction(store);
+            let run = producer.writer_run_mut(writer);
+            (
+                run.graph.take().expect("an attempt graph is attached once"),
+                run.members.clone(),
+            )
+        };
+        let base = dispatcher.append_graph(graph);
+        assert_eq!(
+            base,
+            self.handlers.len(),
+            "each global pipeline has one handler"
+        );
+        self.handlers[request.0] = Handler::Request(Scope::Writer {
+            store: store.clone(),
+            writer,
+        });
+        self.handlers.extend(Self::member_handlers(&members));
+        for (local, member) in members.iter().enumerate() {
+            let pipeline = PipelineId(base + local);
+            dispatcher.restrict_ingress(pipeline, base..base + members.len());
+            dispatcher.hold_pipeline(pipeline, true);
+            if let Member::Scope(child) = member {
+                self.attach_store(child, dispatcher, pipeline);
+            }
+        }
+        let body: Vec<_> = (base..base + members.len()).map(PipelineId).collect();
+        let step = dispatcher.add_pipeline(body.clone());
+        dispatcher.order(step);
+        dispatcher.take_arrivals(step);
+        for member in body {
+            dispatcher.follow(step, member);
+        }
+        dispatcher.hold_pipeline(step, true);
+        assert_eq!(step.0, self.handlers.len(), "each step has one handler");
+        self.handlers.push(Handler::Step(Scope::Writer {
+            store: store.clone(),
+            writer,
+        }));
+        let mut producer = transaction_scope::transaction(store);
+        let run = producer.writer_run_mut(writer);
+        run.attach(loop_scope::SharedScope::new(request, base, step), input);
+        loop_scope::reach_member(&run.members[run.driver.0], &mut |breaker, _| {
+            for placement in &run.placements[run.driver.0] {
+                placement.set(None);
+            }
+            if let Some(target) = breaker
+                .as_producer()
+                .and_then(|producer| producer.completes_through())
+            {
+                *target.borrow_mut() = Some((request, breaker.input_tiling(InputId::ONLY)));
+            }
+        });
     }
 
     fn attach_store(
@@ -909,11 +1215,7 @@ impl Execution {
             self.handlers.len(),
             "each global pipeline has one handler"
         );
-        self.handlers
-            .extend(members.iter().map(|member| match member {
-                Member::Chain(handle) => Handler::Body(handle.clone()),
-                Member::Scope(child) => Handler::Request(child.clone()),
-            }));
+        self.handlers.extend(Self::member_handlers(&members));
         for (local, member) in members.iter().enumerate() {
             dispatcher.restrict_ingress(PipelineId(base + local), base..base + members.len());
             if let Member::Scope(child) = member {
@@ -933,19 +1235,13 @@ impl Execution {
             self.handlers.len(),
             "each global pipeline has one handler"
         );
-        self.handlers.push(Handler::Step(store.clone()));
+        self.handlers
+            .push(Handler::Step(Scope::Loop(store.clone())));
         induction(store)
             .run
             .as_mut()
             .expect("an induction run is planned")
-            .shared = Some(loop_scope::SharedLoop {
-            pipeline,
-            base,
-            step,
-            active: false,
-            followers_released: false,
-            finishing: None,
-        });
+            .shared = Some(loop_scope::SharedScope::new(pipeline, base, step));
         induction(store).decide_through_drive(pipeline);
     }
 
@@ -953,35 +1249,21 @@ impl Execution {
         match &self.handlers[pipeline.0] {
             Handler::Root => root(pipeline, call),
             Handler::Body(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
-            Handler::Request(store) | Handler::Step(store) => {
-                call(&mut *induction(store), InputId::ONLY)
-            }
+            Handler::Request(scope) | Handler::Step(scope) => scope.reach(call),
         }
     }
 
-    fn scopes(&self) -> impl Iterator<Item = &StoreCell> {
+    /// Every scope, each at its request handler.
+    fn scopes(&self) -> impl Iterator<Item = &Scope> {
         self.handlers.iter().filter_map(|handler| match handler {
-            Handler::Request(store) => Some(store),
+            Handler::Request(scope) => Some(scope),
             _ => None,
         })
     }
 
-    fn complete(&self, dispatcher: &Dispatcher, scope: &StoreCell, package: Option<WorkPackage>) {
-        if let Some(package) = package {
-            let mut pushes = dispatcher.pushes(package.pipeline);
-            let store = induction(scope);
-            if store.pushes_while_consuming() {
-                pushes.push_final(&*store);
-            }
-            drop(store);
-            dispatcher.land(pushes);
-            dispatcher.acknowledge(package);
-        }
-    }
-
     fn hold_followers(&self, dispatcher: &Dispatcher) {
         for scope in self.scopes() {
-            induction(scope).hold_followers(dispatcher);
+            scope.hold_followers(dispatcher);
         }
     }
 
@@ -992,16 +1274,8 @@ impl Execution {
         package: WorkPackage,
     ) {
         match &self.handlers[package.pipeline.0] {
-            Handler::Step(scope) => {
-                induction(scope).complete_round();
-                dispatcher.acknowledge(package);
-                let completed = induction(scope).queue_package_round(dispatcher);
-                self.complete(dispatcher, scope, completed);
-            }
-            Handler::Request(scope) => {
-                let completed = induction(scope).begin_shared(dispatcher, package);
-                self.complete(dispatcher, scope, completed);
-            }
+            Handler::Request(scope) => scope.begin(dispatcher, package),
+            Handler::Step(scope) => scope.step(dispatcher, package),
             Handler::Root | Handler::Body(_) => consume_with(dispatcher, reach, package),
         }
         self.hold_followers(dispatcher);
@@ -1015,8 +1289,8 @@ impl Execution {
         consumed: Option<TileGuard>,
     ) {
         match &self.handlers[pipeline.0] {
+            Handler::Request(scope) => scope.begin_finish(dispatcher, consumed),
             Handler::Step(_) => dispatcher.finish(dispatcher.pushes(pipeline)),
-            Handler::Request(scope) => induction(scope).begin_shared_finish(dispatcher, consumed),
             Handler::Root | Handler::Body(_) => finish_with(dispatcher, reach, pipeline, consumed),
         }
         self.hold_followers(dispatcher);
@@ -1033,8 +1307,10 @@ impl Execution {
                 let kind = match &self.handlers[pipeline] {
                     Handler::Root => "a pipeline of the program",
                     Handler::Body(_) => "a loop body",
-                    Handler::Request(_) => "a loop's store",
-                    Handler::Step(_) => "a loop's step",
+                    Handler::Request(Scope::Loop(_)) => "a loop's store",
+                    Handler::Step(Scope::Loop(_)) => "a loop's step",
+                    Handler::Request(Scope::Writer { .. }) => "a transaction request",
+                    Handler::Step(Scope::Writer { .. }) => "a transaction attempt",
                 };
                 format!("pipeline {pipeline}, {kind}, holds {claim}")
             })
@@ -1049,24 +1325,7 @@ impl Execution {
     pub(super) fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
         let mut progressed = false;
         for scope in self.scopes() {
-            progressed |= induction(scope).initialize_seed();
-            let finished = induction(scope).take_shared_finish(dispatcher);
-            if let Some((pipeline, consumed)) = finished {
-                finish_with(dispatcher, reach, pipeline, consumed);
-                induction(scope).unplace_shared();
-                progressed = true;
-                continue;
-            }
-            let pipelines = induction(scope).settlement_pipelines();
-            let before = dispatcher.changes();
-            push_held(dispatcher, reach, pipelines);
-            // No other claim executes during this scope's publication pass on the serial
-            // coordinator, so a generation change here belongs to these pushes.
-            if dispatcher.changes() != before {
-                progressed = true;
-            } else {
-                progressed |= induction(scope).release_followers(dispatcher);
-            }
+            progressed |= scope.resume(dispatcher, reach);
         }
         progressed
     }
@@ -1079,7 +1338,7 @@ impl Execution {
             .filter(|(pipeline, handler)| {
                 !matches!(handler, Handler::Step(_))
                     && !dispatcher.states[*pipeline].held.load(Ordering::SeqCst)
-                    && !matches!(handler, Handler::Request(scope) if induction(scope).has_package())
+                    && !matches!(handler, Handler::Request(scope) if scope.has_request())
             })
             .map(|(pipeline, _)| PipelineId(pipeline))
             .collect::<Vec<_>>();
@@ -1689,6 +1948,7 @@ enum Located {
 
 /// A loop's scope as the planner walks it.
 pub(super) struct PlannedScope {
+    writer: Option<usize>,
     store: StoreCell,
     /// The id of the store's cyclic fan-out, which the breakers inside its cycle read through a
     /// recurrence slot.
@@ -2079,6 +2339,28 @@ impl Planner {
                 false => writers.push(self.beneath_cycle(producer, read.fan)),
             },
         );
+        let mut writer_scopes = Vec::new();
+        let mut writer = 0;
+        visit_inputs_checked(&mut *store, &mut |role, producer| {
+            if role.starts_with("seed") {
+                return;
+            }
+            let scope = self.scopes.len();
+            self.scopes.push(PlannedScope {
+                writer: Some(writer),
+                store: read.store.clone(),
+                fan: read.fan,
+                pipeline: None,
+                count: 0,
+                depth: 0,
+            });
+            self.walking.push(scope);
+            let body = self.pipelines_under(producer, role);
+            self.walking.pop();
+            writers[writer].pipelines = body.pipelines;
+            writer_scopes.push(scope);
+            writer += 1;
+        });
         assert!(
             !writers.is_empty(),
             "a dispatched transaction store has a writer: its keys are the footprints of its \
@@ -2101,12 +2383,11 @@ impl Planner {
             .unwrap_or_else(|| panic!("{name} is a pipeline breaker"));
         let placements: Vec<Vec<Placement>> = (0..inputs)
             .map(|input| {
-                let placements = breaker.entry_placements(InputId(input));
-                assert!(
-                    !placements.is_empty(),
-                    "{name} is placed in a pipeline by its entry"
-                );
-                placements
+                if seeded && input == 0 {
+                    breaker.entry_placements(InputId(input))
+                } else {
+                    Vec::new()
+                }
             })
             .collect();
         // A store reads each input whole once the pipelines beneath it have finished, so neither
@@ -2137,6 +2418,10 @@ impl Planner {
                         ..Beneath::default()
                     },
                 );
+                if !(seeded && input == 0) {
+                    self.scopes[writer_scopes[input - usize::from(seeded)]].pipeline =
+                        Some(pipeline);
+                }
                 for placement in &placements {
                     placement.set(Some(PipelineId(self.local[pipeline])));
                 }
@@ -2162,6 +2447,7 @@ impl Planner {
     ) -> usize {
         let scope = self.scopes.len();
         self.scopes.push(PlannedScope {
+            writer: None,
             store: read.store.clone(),
             fan: read.fan,
             pipeline: None,
@@ -2612,6 +2898,88 @@ impl Planner {
         runs.install(&store, run);
         kept_scopes.push((scope, induction(&store).chain_breakers()));
         store
+    }
+
+    fn build_transaction(
+        &self,
+        scope: usize,
+        morsel_rows: usize,
+        kept: &mut Vec<(usize, Vec<BreakerHandle>)>,
+        runs: &mut InductionRuns,
+    ) -> transaction_scope::WriterRun {
+        let pipelines = self.members(Some(scope));
+        let members: Vec<Member> = pipelines
+            .located
+            .iter()
+            .map(|located| match located {
+                Located::Chain(handle) => Member::Chain(handle.clone()),
+                Located::Scope { scope, .. } => {
+                    Member::Scope(self.build_scope(*scope, morsel_rows, kept, runs))
+                }
+                _ => unreachable!(
+                    "a transaction body contains native pipelines and nested loop requests"
+                ),
+            })
+            .collect();
+        let placed = ClearsPlacements(&pipelines.placements);
+        for (local, placements) in pipelines.placements.iter().enumerate() {
+            for placement in placements {
+                placement.set(Some(PipelineId(local)));
+            }
+        }
+        for (local, member) in members.iter().enumerate() {
+            if let Member::Scope(store) = member {
+                induction(store).decide_through_drive(PipelineId(local));
+            }
+        }
+        let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
+            loop_scope::reach_member(&members[pipeline.0], call)
+        };
+        let (graph, planned) = plan_edges(
+            &pipelines.reads,
+            &pipelines.names,
+            &pipelines.leaves,
+            &vec![false; members.len()],
+            false,
+            &pipelines.kinds,
+            &(0..members.len()).collect::<Vec<_>>(),
+            &vec![false; members.len()],
+            morsel_rows,
+            &mut reach,
+            &mut |pipeline| match &members[pipeline.0] {
+                Member::Scope(store) => Some(induction(store).pushing_end()),
+                _ => None,
+            },
+        );
+        let drivers: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter_map(|(local, member)| {
+                let mut driver = false;
+                loop_scope::reach_member(member, &mut |breaker, _| {
+                    driver = breaker
+                        .as_producer()
+                        .is_some_and(|producer| producer.next_position().is_some());
+                });
+                driver.then_some(local)
+            })
+            .collect();
+        let [driver] = drivers.as_slice() else {
+            panic!("a writer body has one transaction driver")
+        };
+        for member in &members {
+            if let Member::Scope(store) = member {
+                induction(store).forget_through_drive();
+            }
+        }
+        drop(placed);
+        transaction_scope::WriterRun::new(
+            graph,
+            members,
+            pipelines.placements.clone(),
+            PipelineId(*driver),
+            planned,
+        )
     }
 
     /// Why a round of a scope whose store has rows above its positions breaks the invariant that it
@@ -3393,7 +3761,7 @@ mod tests {
             match dispatcher.try_claim(None) {
                 Next::Package(package) => {
                     let step = match &execution.handlers[package.pipeline.0] {
-                        Handler::Step(owner) => {
+                        Handler::Step(Scope::Loop(owner)) => {
                             (0..2).find(|&index| Rc::ptr_eq(scopes[index].as_ref().unwrap(), owner))
                         }
                         _ => None,

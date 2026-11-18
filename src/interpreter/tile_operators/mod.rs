@@ -1994,6 +1994,13 @@ pub trait TileProducer {
         None
     }
 
+    /// The transaction state behind a cyclic store cell, for dispatcher control.
+    fn as_transaction_store_mut(
+        &mut self,
+    ) -> Option<&mut crate::interpreter::commit_operator::CommitProducer> {
+        None
+    }
+
     /// The concrete induction store behind a cyclic store cell, where this is one.
     fn as_induction_store_mut(
         &mut self,

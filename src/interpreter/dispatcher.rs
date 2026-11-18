@@ -34,6 +34,7 @@ use crate::interpreter::{
 
 pub(crate) mod loop_scope;
 mod plan;
+pub(crate) mod transaction_scope;
 
 #[cfg(test)]
 pub(crate) use plan::walk_routes;
@@ -3217,6 +3218,7 @@ fn finish_with(
             .take()
             .expect("a reach calls the breaker it reaches once");
         let released = breaker.input_released(input);
+        let asked = consumed.clone();
         dispatcher.ensure(
             consumed.is_none_or(|consumed| {
                 unreleased(&consumed, &released, &breaker.input_tiling(input)).is_none()
@@ -3224,7 +3226,11 @@ fn finish_with(
             || {
                 format!(
                     "pipeline {p} finishes after its input has released every guard the \
-                     pipeline consumed"
+                     pipeline consumed: {} released {released:?}, consumed {asked:?}",
+                    breaker
+                        .as_producer()
+                        .map(|producer| producer.name())
+                        .unwrap_or_else(|| "sink".to_owned())
                 )
             },
         );

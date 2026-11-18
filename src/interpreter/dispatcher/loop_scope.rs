@@ -23,7 +23,7 @@ pub(super) enum Member {
 pub(crate) struct InductionRun {
     /// Configured but never executed here; moved into the run before the first request.
     pub(super) body_graph: Option<Dispatcher>,
-    pub(super) shared: Option<SharedLoop>,
+    pub(super) shared: Option<SharedScope>,
     pub(super) members: Vec<Member>,
     /// Entries placed at global body IDs after activation. Explicitly queued source entries
     /// stay unplaced so external source pushes reach their completeness targets.
@@ -35,17 +35,104 @@ pub(crate) struct InductionRun {
     pub(super) planned: Vec<Planned>,
     opened: bool,
     request: Option<Request>,
+    /// The region the scope's pipeline consumed, once its finish has begun and until the inner
+    /// pipelines have finished.
+    finishing: Option<Option<TileGuard>>,
     /// The local drive index resolved while planning the body graph.
     drive: PipelineId,
 }
 
-pub(super) struct SharedLoop {
+/// Where a scope's inner pipelines sit in the run's shared dispatcher, and whether they run: a
+/// loop's body ([`InductionRun`]), or a transaction writer's
+/// ([`WriterRun`](super::transaction_scope::WriterRun)).
+pub(super) struct SharedScope {
+    /// The scope's own pipeline in the dispatcher around it, whose claims are its requests.
     pub(super) pipeline: PipelineId,
+    /// The global id of the scope's first inner pipeline; the others follow it in local order.
     pub(super) base: usize,
+    /// The pipeline that follows every inner one, whose claim ends a round or an attempt.
     pub(super) step: PipelineId,
-    pub(super) active: bool,
-    pub(super) followers_released: bool,
-    pub(super) finishing: Option<Option<TileGuard>>,
+    /// Whether the inner pipelines' entries are placed at their global ids and the pipelines
+    /// run, which they do from the first request on.
+    active: bool,
+    followers_released: bool,
+}
+
+impl SharedScope {
+    pub(super) fn new(pipeline: PipelineId, base: usize, step: PipelineId) -> Self {
+        Self {
+            pipeline,
+            base,
+            step,
+            active: false,
+            followers_released: false,
+        }
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// The global id of the inner pipeline `local`.
+    pub(super) fn global(&self, local: PipelineId) -> PipelineId {
+        PipelineId(self.base + local.0)
+    }
+
+    /// The global ids of the scope's `members` inner pipelines.
+    pub(super) fn pipelines(&self, members: usize) -> impl Iterator<Item = PipelineId> + use<> {
+        (self.base..self.base + members).map(PipelineId)
+    }
+
+    /// The inner pipelines and the step.
+    fn with_step(&self, members: usize) -> impl Iterator<Item = PipelineId> + use<> {
+        self.pipelines(members).chain(std::iter::once(self.step))
+    }
+
+    /// Place each inner pipeline's entries at its global id, except a source's, which stay
+    /// unplaced so a source's pushes reach their completeness targets, and let the inner
+    /// pipelines and the step run. Whether this call activated the scope: it does so once.
+    pub(super) fn activate(
+        &mut self,
+        placements: &[Vec<Placement>],
+        dispatcher: &Dispatcher,
+    ) -> bool {
+        if self.active {
+            return false;
+        }
+        self.active = true;
+        for (local, placements) in placements.iter().enumerate() {
+            let pipeline = self.global(PipelineId(local));
+            for placement in placements {
+                placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
+            }
+            dispatcher.hold_pipeline(pipeline, false);
+        }
+        dispatcher.hold_pipeline(self.step, false);
+        true
+    }
+
+    /// Hold back the pipelines that follow the inner pipelines and the step.
+    pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher, members: usize) {
+        dispatcher.hold_followers(self.with_step(members), true);
+        self.followers_released = false;
+    }
+
+    /// Let the pipelines that follow the inner pipelines and the step run, unless they already
+    /// may. Whether this call released them.
+    pub(super) fn release_followers(&mut self, dispatcher: &Dispatcher, members: usize) -> bool {
+        if self.followers_released {
+            return false;
+        }
+        dispatcher.hold_followers(self.with_step(members), false);
+        self.followers_released = true;
+        true
+    }
+
+    /// Whether the inner pipelines and the step have all finished.
+    pub(super) fn finished(&self, dispatcher: &Dispatcher, members: usize) -> bool {
+        self.with_step(members)
+            .all(|pipeline| dispatcher.states[pipeline.0].phase.load() == Phase::Finished)
+    }
 }
 
 struct Request {
@@ -74,6 +161,7 @@ impl InductionRun {
             planned,
             opened: false,
             request: None,
+            finishing: None,
             drive,
         }
     }
@@ -111,71 +199,45 @@ impl InductionStoreProducer {
 
     fn activate(&mut self, dispatcher: &Dispatcher) {
         let run = self.run_mut();
-        let shared = run
+        let activated = run
             .shared
             .as_mut()
-            .expect("an induction run has global pipelines");
-        if shared.active {
-            return;
+            .expect("an induction run has global pipelines")
+            .activate(&run.placements, dispatcher);
+        if activated {
+            self.hold_followers(dispatcher);
         }
-        shared.active = true;
-        for (local, placements) in run.placements.iter().enumerate() {
-            let pipeline = PipelineId(shared.base + local);
-            for placement in placements {
-                placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
-            }
-            dispatcher.hold_pipeline(pipeline, false);
-        }
-        dispatcher.hold_pipeline(shared.step, false);
-        self.hold_followers(dispatcher);
     }
 
     pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
         let run = self.run_mut();
-        let Some(shared) = &mut run.shared else {
-            return;
-        };
-        if !shared.active {
-            return;
+        let members = run.members.len();
+        if let Some(shared) = run.shared.as_mut().filter(|shared| shared.is_active()) {
+            shared.hold_followers(dispatcher, members);
         }
-        dispatcher.hold_followers(
-            (shared.base..shared.base + run.members.len())
-                .map(PipelineId)
-                .chain(std::iter::once(shared.step)),
-            true,
-        );
-        shared.followers_released = false;
     }
 
     pub(super) fn settlement_pipelines(&self) -> Vec<PipelineId> {
         let Some(shared) = &self.run().shared else {
             return Vec::new();
         };
-        if !shared.active || self.run().request.is_none() {
+        if !shared.is_active() || self.run().request.is_none() {
             return Vec::new();
         }
         (0..self.run().members.len()).filter(|&local| {
             !matches!(&self.run().members[local], Member::Scope(scope) if induction(scope).has_package())
-        }).map(|local| PipelineId(shared.base + local)).collect()
+        }).map(|local| shared.global(PipelineId(local))).collect()
     }
 
     pub(super) fn release_followers(&mut self, dispatcher: &Dispatcher) -> bool {
         let run = self.run_mut();
-        let Some(shared) = &mut run.shared else {
-            return false;
-        };
-        if !shared.active || run.request.is_none() || shared.followers_released {
-            return false;
-        }
+        let members = run.members.len();
+        let requesting = run.request.is_some();
         // The serial coordinator takes one claim before holding followers again.
-        dispatcher.hold_followers(
-            (shared.base..shared.base + run.members.len())
-                .map(PipelineId)
-                .chain(std::iter::once(shared.step)),
-            false,
-        );
-        shared.followers_released = true;
-        true
+        run.shared
+            .as_mut()
+            .filter(|shared| shared.is_active() && requesting)
+            .is_some_and(|shared| shared.release_followers(dispatcher, members))
     }
 
     pub(super) fn begin_shared(
@@ -198,11 +260,7 @@ impl InductionStoreProducer {
             "a scope finishes after completing its requests"
         );
         self.activate(dispatcher);
-        self.run_mut()
-            .shared
-            .as_mut()
-            .expect("a shared scope has global pipelines")
-            .finishing = Some(consumed);
+        self.run_mut().finishing = Some(consumed);
         for &local in &self.run().starts {
             if dispatcher.is_source(self.pipeline(local)) {
                 dispatcher.close(self.pipeline(local));
@@ -215,17 +273,13 @@ impl InductionStoreProducer {
         dispatcher: &Dispatcher,
     ) -> Option<(PipelineId, Option<TileGuard>)> {
         let run = self.run_mut();
-        let shared = run.shared.as_mut()?;
-        if shared.finishing.is_none()
-            || !(shared.base..shared.base + run.members.len())
-                .chain(std::iter::once(shared.step.0))
-                .all(|pipeline| dispatcher.states[pipeline].phase.load() == Phase::Finished)
-        {
+        let shared = run.shared.as_ref()?;
+        if run.finishing.is_none() || !shared.finished(dispatcher, run.members.len()) {
             return None;
         }
         Some((
             shared.pipeline,
-            shared.finishing.take().expect("the finish is pending"),
+            run.finishing.take().expect("the finish is pending"),
         ))
     }
 
@@ -241,7 +295,7 @@ impl InductionStoreProducer {
             .run()
             .shared
             .as_ref()
-            .is_some_and(|shared| shared.active)
+            .is_some_and(SharedScope::is_active)
         {
             return run(self);
         }
