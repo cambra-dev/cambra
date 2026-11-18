@@ -1,10 +1,13 @@
 def make_totals(xs):
     t: Feed(_)
     t << sum(xs)
-    t
+    saved = t
+    saved
 
 readings = [1, 2, 3, 4]
-totals = make_totals(readings)
+initial = make_totals(readings)
+totals: Feed(Int)
+totals << max(initial)
 for x in readings:
     totals << x
 max(totals)

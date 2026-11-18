@@ -58,6 +58,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
             head_occurrence: Occurrence::mint(),
             head: cambra::ccl::PatternHead::Tag(tag.into()),
             binding: TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: binding.into(),
                 ty: Type::Hole,
@@ -172,6 +173,7 @@ fn variant_param_accepts_subtype() {
     let param_ty = variant(&[("some", int()), ("none", unit_ty())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         params: vec![TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
@@ -194,6 +196,7 @@ fn variant_extra_tag_rejected() {
     let param_ty = variant(&[("some", int())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         params: vec![TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
@@ -277,6 +280,7 @@ fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
 fn value_ascription_accepts_widening() {
     let expr = TypedExpr::new(TypedExprNode::Let {
         binding: TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: "x".into(),
             ty: Type::Hole,
@@ -466,6 +470,7 @@ fn match_empty_arms_rejected() {
 fn lambda_returns_variant() {
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         params: vec![TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: "x".into(),
             ty: int(),
@@ -531,6 +536,7 @@ fn payload_covariance_accept() {
     let param_ty = variant(&[("a", int()), ("b", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         params: vec![TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
@@ -551,6 +557,7 @@ fn payload_mismatch_reject() {
     let param_ty = variant(&[("a", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         params: vec![TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),

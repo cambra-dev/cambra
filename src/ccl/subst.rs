@@ -1152,12 +1152,13 @@ impl Subst {
         }
     }
 
-    /// Whether this discharges a binder to a value: a term whose type is no mutable variable's
-    /// or feed's handle. A handle passed to a parameter is the parameter, which a closure may
+    /// Whether this discharges a binder to a value: a term whose type is no place, a mutable
+    /// variable's or feed's. A place lent to a parameter is the parameter, which a closure may
     /// read as a correspondence; a value is not.
     pub fn discharges_a_value(&self) -> bool {
         self.binders.values().any(|m| {
-            matches!(m, Mapping::Discharge(term) if term.ty.peel_refinements().history_parts().is_none())
+            matches!(m, Mapping::Discharge(term)
+                if term.ty.peel_refinements().history_parts().is_none() && !term.ty.is_place())
         })
     }
 
@@ -2035,13 +2036,13 @@ impl Subst {
                 target: target.clone(),
             },
 
-            // The target name is a *use* of the defer-handle binder (these
+            // The target name is a *use* of the feed-place binder (these
             // nodes exist only pre-channelize; transport runs during inference,
             // but the uniform engine handles them for the pre-inference
-            // ports). A var-shaped mapping renames the handle; a discharge
+            // ports). A var-shaped mapping renames the place; a discharge
             // to a non-variable term has no Feed/Define shape to land in, so
-            // the stale handle is kept for channelize's own
-            // `UnboundDeferHandle` boundary to report (feeding a lambda
+            // the stale place is kept for channelize's own
+            // `UnboundDeferPlace` boundary to report (feeding a lambda
             // parameter is user-reachable: `\d, v -> d << v`).
             Feed {
                 name_occurrence,
@@ -2050,7 +2051,7 @@ impl Subst {
                 row,
                 site,
             } => {
-                let (name, value) = self.apply_handle_use(name, value);
+                let (name, value) = self.apply_place_use(name, value);
                 Feed {
                     name_occurrence: name_occurrence.clone(),
                     name,
@@ -2064,7 +2065,7 @@ impl Subst {
                 name,
                 value,
             } => {
-                let (name, value) = self.apply_handle_use(name, value);
+                let (name, value) = self.apply_place_use(name, value);
                 Define {
                     name_occurrence: name_occurrence.clone(),
                     name,
@@ -2082,7 +2083,7 @@ impl Subst {
                 value,
             } => {
                 let key = key.as_ref().map(|k| Box::new(self.apply_expr(k)));
-                let (name, value) = self.apply_handle_use(name, value);
+                let (name, value) = self.apply_place_use(name, value);
                 MutWrite {
                     name_occurrence: name_occurrence.clone(),
                     name,
@@ -2224,15 +2225,15 @@ impl Subst {
         }
     }
 
-    /// Rewrite a `Feed`/`Define` handle use (see the `Feed` arm above for
+    /// Rewrite a `Feed`/`Define` place use (see the `Feed` arm above for
     /// the non-variable-discharge rationale).
-    fn apply_handle_use(&self, name: &Name, value: &TypedExpr) -> (Name, Box<TypedExpr>) {
-        (self.handle_target(name), Box::new(self.apply_expr(value)))
+    fn apply_place_use(&self, name: &Name, value: &TypedExpr) -> (Name, Box<TypedExpr>) {
+        (self.place_target(name), Box::new(self.apply_expr(value)))
     }
 
     /// The name this substitution retargets a *name position* to, or `None` when
     /// it leaves the position alone: an unmapped name, or one mapped to a
-    /// non-variable term (a handle or a channel domain can only hold a name, so
+    /// non-variable term (a place target or a channel domain can only hold a name, so
     /// a compound discharge has nothing to write there — see the `Feed` arm of
     /// [`Self::apply_expr_inner`]).
     ///
@@ -2243,10 +2244,10 @@ impl Subst {
         self.binders.get(name)?.var_target()
     }
 
-    /// The handle-rename half of [`Self::apply_handle_use`], shared with the
+    /// The place-rename half of [`Self::apply_place_use`], shared with the
     /// type-slot walks: [`Self::retarget`] with the unchanged case spelled out
     /// as the original name, for the rebuilding callers that need a value.
-    fn handle_target(&self, name: &Name) -> Name {
+    fn place_target(&self, name: &Name) -> Name {
         self.retarget(name).unwrap_or_else(|| name.clone())
     }
 
@@ -2451,7 +2452,7 @@ impl Subst {
                 }
             }
             ScopedItemMut::Child(child) => scoped.rewrite_expr_go(child, memo),
-            // A handle node's write target is a *use* of the binder that
+            // A place node's write target is a *use* of the binder that
             // introduced it, so a var-shaped mapping retargets it. (A `Var`
             // occurrence the substitution maps never reaches here — it was
             // replaced wholesale above — and `retarget` leaves an unmapped one
@@ -2540,12 +2541,12 @@ impl Subst {
                 .for_each(|t| self.rewrite_type_go(t, memo)),
 
             // a nominal channel domain names its defer
-            // binder, so a handle rename (`x ↦ y` on beta-reduction /
+            // binder, so a place rename (`x ↦ y` on beta-reduction /
             // alias-inlining) must retarget it exactly like a `Feed` target —
             // otherwise the type slot would keep naming the dead binder.
-            Type::ChanDom(name, _) => *name = self.handle_target(name),
+            Type::ChanDom(name, _) => *name = self.place_target(name),
 
-            // A transient history handle (an `Overwrite` erased by the unified phase,
+            // A transient place type (an `Overwrite` erased by the unified phase,
             // a `Feed` by `channelize`): rewrite both children in place. Renaming
             // does not cross the kind — the value and domain are ordinary types.
             Type::History { function, .. } => self.rewrite_type_go(function, memo),
@@ -2999,7 +3000,7 @@ impl Subst {
 
             // rename the named defer binder, mirroring the
             // in-place mode (`rewrite_type_go`).
-            Type::ChanDom(name, lvl) => Type::ChanDom(self.handle_target(name), *lvl),
+            Type::ChanDom(name, lvl) => Type::ChanDom(self.place_target(name), *lvl),
 
             Type::Fun {
                 binder: FunBinder::None,
@@ -4692,7 +4693,7 @@ impl<'a> PiWalk<'a> {
             ScopedItemMut::Child(child) => self.expr(child, depth),
             // A `VarRef` here is either this node's own `Var` — already
             // converted above, since `expr` is called on every child — or a
-            // handle node's write target, which names a mutable variable. A
+            // place node's write target, which names a mutable variable. A
             // `KeyRef` names a record field. Neither of the latter two is a Pi
             // binder reference.
             ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
@@ -5349,7 +5350,7 @@ mod tests {
     }
 
     // A `Feed`'s row is a type slot `map_children` cannot reach, so the transport
-    // path rewrites it alongside the handle.
+    // path rewrites it alongside the place.
     #[test]
     fn apply_expr_renames_in_the_feed_row() {
         let row = Type::refined_one(
@@ -6038,10 +6039,10 @@ mod rewrite_tests {
         assert!(!is_free(&x, &open), "free occurrences are discharged");
     }
 
-    // Feed/Define handles rename through var-shaped mappings and survive a
+    // Feed/Define places rename through var-shaped mappings and survive a
     // non-variable discharge for channelize's own boundary to diagnose.
     #[test]
-    fn rewrite_renames_feed_handles() {
+    fn rewrite_renames_feed_places() {
         let mut e = TypedExpr::feed("d", Occurrence::mint(), var("d"));
         Subst::rename("d", "q").rewrite_expr(&mut e);
         let TypedExprNode::Feed { name, value, .. } = &e.node else {
@@ -6058,7 +6059,7 @@ mod rewrite_tests {
         assert_eq!(
             name,
             &Name::raw("d"),
-            "a non-variable discharge keeps the handle for UnboundDeferHandle to report"
+            "a non-variable discharge keeps the place for UnboundDeferPlace to report"
         );
     }
 
@@ -6150,12 +6151,12 @@ mod rewrite_tests {
     /// Substitution retargets every variable occurrence the scoped walk
     /// surfaces. `crate::ccl::scope`'s corpus test checks the two walks agree on
     /// what those occurrences *are*; this checks the descent acts on all of
-    /// them — the end-to-end half, across `Var` and the three handle nodes.
+    /// them — the end-to-end half, across `Var` and the three place nodes.
     #[test]
     fn a_rename_retargets_every_varref_the_scoped_walk_surfaces() {
         use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 
-        let handle_nodes = [
+        let place_nodes = [
             TypedExpr::new(TypedExprNode::Feed {
                 name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
@@ -6177,7 +6178,7 @@ mod rewrite_tests {
             var("h"),
         ];
 
-        for original in handle_nodes {
+        for original in place_nodes {
             let before: Vec<Name> = varrefs(&original);
             assert!(
                 before.contains(&Name::raw("h")),

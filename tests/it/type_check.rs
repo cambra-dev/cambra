@@ -20,8 +20,8 @@ use cambra::ccl::{
     chl_print::NOT_PRINTABLE,
     comprehension,
     infer::{
-        InferError, LocatedInferError, TypeInferenceContext, check_pre_channelize, infer,
-        lit_singleton,
+        InferError, LocatedInferError, PlaceDefect, TypeInferenceContext, check_pre_channelize,
+        infer, lit_singleton,
     },
     load::LoadedProgram,
     lower::{LoweringContext, modules::lower_program},
@@ -837,15 +837,15 @@ fn a_concrete_operand_reaches_its_obligation(#[case] code: &str) {
 //
 // Each program below ends in a bare read of its mutable variable, and a tail position emits its
 // continuation as a *value* operand, so the program denotes the mutable variable's **value** —
-// the handle stops at the read. That makes the program type the value type directly,
+// the place type stops at the read. That makes the program type the value type directly,
 // and it is also why a `History` here is a failure rather than the expected shape: it
-// would mean a handle escaped a tail position, where the sequencing domain (an `Infer`
+// would mean a place type escaped a tail position, where the sequencing domain (an `Infer`
 // until the mutability-elimination phases resolve it) would ride along with it.
 fn mut_var_value_type(code: &str) -> Type {
     match infer_program(code) {
         ty @ Type::History { .. } => {
             panic!(
-                "a tail read must denote the mutable variable's value, got the handle {ty} for `{code}`"
+                "a tail read must denote the mutable variable's value, got the place type {ty} for `{code}`"
             )
         }
         value => value,
@@ -1092,6 +1092,27 @@ fn the_requirement_list_reads_the_same_in_both_spellings() {
         format!("{curried:?}"),
         format!("{uncurried:?}"),
         "the same conflict, spelled two ways, must read identically",
+    );
+}
+
+/// Functions are uncurried: a call passing another number of arguments than its function's
+/// parameters is refused by that count, not as a mismatch between a value and a tuple
+/// (`docs/chl-spec.md`, "3.8 Function calls").
+#[rstest]
+#[case::too_few("def add(a, b):\n    a + b\nadd(1)", "`add` takes 2 arguments, got 1")]
+#[case::too_many(
+    "def add(a, b):\n    a + b\nadd(1, 2, 3)",
+    "`add` takes 2 arguments, got 3"
+)]
+#[case::through_another_name(
+    "def add(a, b):\n    a + b\nplus = add\nplus(1)",
+    "`plus` takes 2 arguments, got 1"
+)]
+fn a_call_supplies_every_argument(#[case] code: &str, #[case] expected: &str) {
+    let errors = infer_program_err(code);
+    assert!(
+        errors.iter().any(|e| format!("{e:?}").contains(expected)),
+        "expected `{expected}`, got {errors:?}",
     );
 }
 
@@ -1396,7 +1417,8 @@ fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
         s := 0
         for i in [1, 2, 3]:
             s := s + i
-        s
+        saved = s
+        saved
 "#})]
 #[case::generator(indoc! {r#"
     def f(a):
@@ -1406,7 +1428,8 @@ fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
 #[case::mut_param(indoc! {r#"
     def f(x: Mut(Int)):
         x := 1
-        x
+        saved = x
+        saved
 "#})]
 #[case::equal_length_conditional_collections(indoc! {r#"
     def f(a):
@@ -3708,7 +3731,7 @@ fn an_inner_filter_stays_with_its_own_arm(#[case] code: &str) {
 // the `Defer`/`Feed`/`Define` typing rules directly: a defer binding types
 // as a feed history `feed(δ ⤇ value)`, feeds contribute `Fun(δ, elem)` channel
 // shapes into it, defines set the whole collection outright, and reads discharge
-// transparently through the handle as that collection. A channel's *domain* is a
+// transparently through the feed place as that collection. A channel's *domain* is a
 // rigid nominal `Type::ChanDom(d)` minted at the `let d: Feed(_)` site, so
 // reads type concretely against that name at inference (no `Infer` residue);
 // `channelize` later substitutes the assembled channel domain for `ChanDom`.
@@ -3717,11 +3740,9 @@ fn an_inner_filter_stays_with_its_own_arm(#[case] code: &str) {
 /// channel's element type `value`; panics otherwise. A feed reads as its whole
 /// collection, so its element type is the history's `value` slot directly (there is
 /// no separate scalar payload to peel — scalar `<<=` is rejected by typing).
-fn feed_value(ty: &Type) -> &Type {
-    match ty {
-        Type::History { .. } => ty.as_feed().expect("a feed handle").1,
-        _ => panic!("expected a feed handle, got {ty}"),
-    }
+fn feed_value(ty: &Type) -> Type {
+    ty.codomain()
+        .unwrap_or_else(|| panic!("expected a collection value read, got {ty}"))
 }
 
 #[test]
@@ -3732,7 +3753,7 @@ fn test_defined_defer_is_feed_of_collection() {
         x: Feed(_)
         x <<= [1,2,3]
         x"#});
-    assert_eq!(*feed_value(&ty), int());
+    assert_eq!(feed_value(&ty), int());
 }
 
 #[test]
@@ -3755,7 +3776,7 @@ fn test_fed_defer_is_feed_of_channel() {
         x: Feed(_)
         [x << i for i in [1,2,3]]
         x"#});
-    assert_eq!(*feed_value(&ty), int());
+    assert_eq!(feed_value(&ty), int());
 }
 
 #[test]
@@ -3765,12 +3786,12 @@ fn test_scalar_feeds_join_in_channel() {
         x << 1
         x << 2
         x"#});
-    assert_eq!(*feed_value(&ty), int());
+    assert_eq!(feed_value(&ty), int());
 }
 
 #[test]
 fn test_defined_defer_reads_through_aggregate() {
-    // A collection define sets the channel outright; `sum` reads the handle as
+    // A collection define sets the channel outright; `sum` reads the feed as
     // that collection and aggregates it to a scalar.
     assert_eq!(
         infer_program(indoc::indoc! {r#"
@@ -3783,7 +3804,7 @@ fn test_defined_defer_reads_through_aggregate() {
 
 #[test]
 fn test_fed_defer_reads_through_aggregate() {
-    // `sum` consumes the feed handle as its read view `(α ⤇ γ)`.
+    // `sum` consumes the feed as its read view `(α ⤇ γ)`.
     assert_eq!(
         infer_program(indoc::indoc! {r#"
         x: Feed(_)
@@ -3805,7 +3826,7 @@ fn test_defer_chain_flattens_feeds() {
         x <<= y
         y <<= [0, 1]
         x"#});
-    assert_eq!(*feed_value(&ty), int());
+    assert_eq!(feed_value(&ty), int());
 }
 
 #[test]
@@ -3829,11 +3850,11 @@ fn test_feed_through_param_flows_back_to_caller() {
     // String contribution collides with the direct Int feed.
     let errs = infer_program_err(indoc::indoc! {r#"
 
-            def g(c):
+            def g(c: Feed(_)):
               c << "s"
               c
             x: Feed(_)
-            g(x)
+            g(&x)
             x << 1
             x"#});
     assert!(
@@ -3847,29 +3868,33 @@ fn test_feed_through_param_compatible_types_ok() {
     // Same shape with compatible contributions: both land in ρ_x as Int.
     let ty = infer_program(indoc::indoc! {r#"
 
-            def g(c):
+            def g(c: Feed(_)):
               c << 100
-              c
             x: Feed(_)
-            g(x)
+            g(&x)
             x << 1
             x"#});
-    assert_eq!(*feed_value(&ty), int());
+    assert_eq!(feed_value(&ty), int());
 }
 
 #[test]
 fn test_plain_value_to_feeding_param_errors() {
-    // `g(5)` where g feeds its parameter: a feed handle cannot be
-    // conjured from a plain value (`NotAFeed` at the call edge).
+    // `g(5)` where g feeds its parameter: a plain value reaches a parameter that borrows.
     let errs = infer_program_err(indoc::indoc! {r#"
 
-            def g(c):
+            def g(c: Feed(_)):
               c << 1
               c
             g(5)"#});
     assert!(
-        !errs.is_empty(),
-        "feeding through a non-feed argument must error"
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::Place {
+                defect: PlaceDefect::BorrowMissing,
+                ..
+            }
+        )),
+        "a value passed to a feeding parameter must report the missing borrow, got {errs:?}"
     );
 }
 
@@ -3886,24 +3911,25 @@ fn test_unbound_feed_target_errors() {
 #[test]
 fn test_generalized_defer_function_specializes_per_element_type() {
     // A defer minted inside a generalized function instantiates a fresh
-    // feed handle (and element type) per call site — monomorphize then
+    // feed place (and element type) per call site — monomorphize then
     // specializes per resolved Feed type.
     let ty = infer_program(indoc::indoc! {r#"
 
             def make(v):
               x: Feed(_)
               x << v
-              x
+              saved = x
+              saved
             a = make(1)
             b = make("s")
             (a, b)"#});
     let Type::Tuple(elems) = &ty else {
-        panic!("expected a pair of feed handles, got {ty}");
+        panic!("expected a pair of collection values, got {ty}");
     };
-    // The contributed value's type flows into the channel whole, so each handle's
+    // The contributed value's type flows into the channel whole, so each feed's
     // element type is the literal that was fed to it.
-    assert_eq!(*feed_value(&elems[0]), int_lit(1));
-    assert_eq!(*feed_value(&elems[1]), str_lit("s"));
+    assert_eq!(feed_value(&elems[0]), int_lit(1));
+    assert_eq!(feed_value(&elems[1]), str_lit("s"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4156,6 +4182,7 @@ mod letrec_typing {
 
     fn typed_binding(name: &str, ty: Type) -> TypedBinding {
         TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: name.into(),
             ty,
@@ -4577,13 +4604,13 @@ fn a_single_type_fault_prints_no_demand() {
 }
 
 /// A mutable variable mention in an operand position yields its **value type**, never the
-/// handle — and it does so because the emitting rule derefs, not because subtyping
+/// place type — and it does so because the emitting rule derefs, not because subtyping
 /// says a mutable variable is a subtype of its value.
 ///
 /// `cnt + 1` is the case that pins the placement: `+` is `∀α. α → α → α`, so the
 /// operand meets a *fresh inference variable*. While the deref lived in the subtyping
 /// relation this worked only because that arm was ordered before the `Infer` arms — and
-/// that same ordering is what made a pass-by-reference argument indistinguishable from
+/// that same ordering is what made a borrowed argument indistinguishable from
 /// a read, since it too meets a fresh variable.
 #[test]
 fn a_mut_var_read_yields_its_value_in_a_value_position() {
@@ -4597,7 +4624,7 @@ fn a_mut_var_read_yields_its_value_in_a_value_position() {
     );
     // The value still has to satisfy the operand's demand: what reaches the operator's
     // obligation is `String`, the *value* the read yielded, so the implementation table
-    // rejects it at that operand position. A handle arriving here instead would offer no
+    // rejects it at that operand position. A place type arriving here instead would offer no
     // base at all and the obligation would have nothing to reject.
     let errs = format!(
         "{:?}",
@@ -4614,13 +4641,13 @@ fn a_mut_var_read_yields_its_value_in_a_value_position() {
 }
 
 /// A **tail** position denotes its continuation's value, so a program ending in a bare
-/// read of its mutable variable denotes that mutable variable's value rather than the handle.
+/// read of its mutable variable denotes that mutable variable's value rather than the place.
 ///
 /// The type a node reports and the type its rule derives have to agree, and a tail's
 /// rule emits its continuation in a value position (`emit_expr_stmt` / `emit_mut_decl`).
 /// A lift that copied the continuation's type verbatim would re-stamp the node with the
-/// handle the read just looked through, and the wall that re-runs the rule would then be
-/// asked to accept a value against a handle — which is not a subtyping fact.
+/// place type the read just looked through, and the wall that re-runs the rule would then be
+/// asked to accept a value against a place type — which is not a subtyping fact.
 #[test]
 fn a_tail_read_denotes_the_mut_vars_value() {
     assert_eq!(
@@ -4642,7 +4669,7 @@ fn a_tail_read_denotes_the_mut_vars_value() {
         int()
     );
     // With no write at all the value is the seed's singleton, and the tail reports
-    // *that* — still the value, not the handle.
+    // *that* — still the value, not the place.
     assert_eq!(
         infer_program(indoc! {r#"
         a := 7
@@ -4655,12 +4682,12 @@ fn a_tail_read_denotes_the_mut_vars_value() {
 
 /// A `Case` arm is a **value** position: rule 2 keeps `Mut` out of every composite and a
 /// join is one, so a conditional over two mutable variables denotes the join of their *values*.
-/// A handle surviving the join would be a `Mut` with no traceable writer — and it would
+/// A place type surviving the join would be a `Mut` with no traceable writer — and it would
 /// reach positions rule 2 exists to keep it out of, which is what the tuple here pins.
 #[test]
 fn a_conditional_over_two_mut_vars_denotes_their_values() {
     // `Int` in the first slot is the join of the two mutable variables' values (`1` ⊔ `2`); a
-    // surviving handle would render `Mut(…)` there. The literal keeps its singleton.
+    // surviving place type would render `Mut(…)` there. The literal keeps its singleton.
     assert_eq!(
         infer_program(indoc! {r#"
             x := 1
@@ -4900,7 +4927,7 @@ mod annotation_kinds {
             let ty = infer_program(code);
             assert!(
                 ty.mut_value_type().is_none(),
-                "a tail read denotes the mutable variable's value, got the handle {ty}"
+                "a tail read denotes the mutable variable's value, got the place type {ty}"
             );
             ty
         };

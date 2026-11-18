@@ -72,9 +72,9 @@
 //! behind them. The `Lambda` arm of [`normalize_node`] asserts the shape
 //! survives.
 //!
-//! A **handle** position holds the variable rather than its value, so the
+//! A **place** position holds the variable rather than its value, so the
 //! mention there is not a read and stays where it stands
-//! ([`atomize_handle`]).
+//! ([`atomize_place`]).
 //!
 //! **A read that reaches a predicate is renamed, not hoisted** ([`name_reads`]).
 //! A comprehension's guards and sources become its cast's refinement predicate,
@@ -94,18 +94,10 @@
 //! general treatment every other node kind gets from [`normalize`] and
 //! [`atomize`]. The other three are not named at all.
 //!
-//! **The application spine.** An n-ary surface call lowers to a **curried**
-//! `Apply` spine — `f(a, b)` is `Apply(Apply(f, a), b)` — and
-//! `crate::ccl::infer::emit`'s `parameter_type` walks that nesting directly
-//! to find which declared parameter an argument lands on, which is how
-//! `emit_apply` detects a pass-by-reference `Mut` parameter past the first
-//! argument. Naively atomizing every `Apply`'s `function` position — even
-//! when it is itself part of the same curried call — would wedge a `Let`
-//! between two levels of one call and collapse the spine `parameter_type`
-//! walks, silently breaking pass-by-reference detection for calls like
-//! `bump(a + b, cnt)`. [`normalize_apply_spine`] atomizes the whole spine as
-//! one unit instead: the ultimate head and every argument are atomized
-//! independently, and their bindings thread up to wrap the whole spine.
+//! **The application spine.** A call with several parameters has one tuple argument.
+//! `normalize_apply_spine` atomizes its components while keeping borrowed operands as
+//! places, then threads their bindings around the call. Place checking sees the loans
+//! and captured capabilities of that call together.
 //!
 //! **A statement's effect.** `MutWrite`, `For`, `Case`, `Feed` and `Define`
 //! mean nothing except as the `expr` an `ExprStmt` sequences — `mut_elim`
@@ -383,6 +375,7 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
     }
     match &e.node {
         TypedExprNode::Lit(_)
+        | TypedExprNode::Borrow(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
@@ -602,6 +595,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
         TypedExprNode::Lit(_)
+        | TypedExprNode::Borrow(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
@@ -1027,33 +1021,51 @@ fn bind_sources_ahead(
 /// comprehension's guard or source, which `crate::ccl::comprehension` places in
 /// one, and a refined cast, whose target holds a copy of its value. The rename
 /// reaches the predicates `e`'s types carry, so a cast's two copies stay equal.
-/// Every mention is a read, the [`atomize_handle`] positions included: a
-/// pass-by-reference callee writes, and neither term performs a write.
+/// Borrow operands and `await_final` operands retain their place identity.
+/// Ordinary variable occurrences and quoted value terms become named reads.
 fn name_reads(e: &mut Expr, muts: &Muts, reads: &mut Vec<(Name, Name)>) {
-    let mut read: Vec<&Name> = muts.iter().filter(|m| is_free(m, e)).collect();
-    if read.is_empty() {
-        return;
+    fn walk(
+        e: &mut Expr,
+        muts: &Muts,
+        reads: &mut Vec<(Name, Name)>,
+        memo: &crate::ccl::ccl_utils::PredMemo,
+    ) -> bool {
+        if matches!(e.node, TypedExprNode::Borrow(_))
+            || matches!(&e.node, TypedExprNode::Apply { function, .. }
+                if matches!(function.node, TypedExprNode::Builtin(crate::ccl::Builtin::AwaitFinal)))
+        {
+            return false;
+        }
+        let mut changed = false;
+        if let TypedExprNode::Var(name) = &mut e.node
+            && muts.contains(name)
+        {
+            let temp = match reads.iter().find(|(variable, _)| variable == name) {
+                Some((_, temp)) => temp.clone(),
+                None => {
+                    let temp = Name::anf_temp();
+                    reads.push((name.clone(), temp.clone()));
+                    temp
+                }
+            };
+            *name = temp;
+            changed = true;
+        }
+        e.walk_children_mut(|child| changed |= walk(child, muts, reads, memo));
+        e.walk_type_slots_mut(|ty| {
+            changed |=
+                crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |term, memo| {
+                    walk(term, muts, reads, memo)
+                });
+        });
+        changed
     }
-    // Sorted, so the bindings land in an order the program decides.
-    read.sort();
-    let mut rename = Subst::id();
-    for variable in read {
-        let temp = match reads.iter().find(|(r, _)| r == variable) {
-            Some((_, temp)) => temp.clone(),
-            None => {
-                let temp = Name::anf_temp();
-                reads.push((variable.clone(), temp.clone()));
-                temp
-            }
-        };
-        rename = rename.extended_rename(variable.clone(), temp);
-    }
-    rename.rewrite_expr(e);
+    walk(e, muts, reads, &crate::ccl::ccl_utils::PredMemo::new());
 }
 
 /// Replace each `await_final` of a mutable variable in `muts` within `e` by a reference to
 /// a fresh binder, adding to `awaits` the binding of that binder to the await, for a term
-/// [`name_reads`] names the reads of. The await's operand is the variable's handle, which
+/// [`name_reads`] names the reads of. The await's operand is the variable's place, which
 /// no read may replace, and its value is an ordinary value.
 fn name_awaits(e: &mut Expr, muts: &Muts, awaits: &mut Vec<(TypedBinding, Expr)>) {
     if let TypedExprNode::Apply { argument, function } = &e.node
@@ -1157,11 +1169,11 @@ fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
     }
 }
 
-/// [`atomize`], except at a **handle position**: a bare reference to a mutable
+/// [`atomize`], except at a **place position**: a bare reference to a mutable
 /// variable is left exactly where it stands.
 ///
 /// A read is named to put it in sequence with the writes around it
-/// ([`is_atomic`]), but two of the three positions a handle survives in are not
+/// ([`is_atomic`]), but two of the three positions a place variable survives in are not
 /// reads at all (`src/ccl/design/mutability.md`, "A mutable variable read is an
 /// explicit operation"): an application's argument, where `emit_apply` relates
 /// a bare reference to a `Mut` parameter, and an application's function, which
@@ -1169,15 +1181,15 @@ fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// the recognizer a `Var` it cannot read through, so each keeps whatever ordering
 /// it had.
 ///
-/// Which argument positions are pass-by-reference is not knowable here —
+/// Which argument positions borrow is not knowable here —
 /// it is a question about the callee's parameter, and inference has not run
 /// (`crate::ccl::mut_read`, "What ends a segment"). So a read in an argument
 /// position is still performed at the call, after any write an argument beside
-/// it performs. A call of several arguments to a callee that may take one by reference
-/// keeps its argument tuple in place, each component a handle position
-/// ([`Muts::passes_by_reference`]); any other call's tuple is one compound operand, its
+/// it performs. A call of several arguments to a callee that may borrow one
+/// keeps its argument tuple in place, each component a place position
+/// ([`Muts::borrows`]); any other call's tuple is one compound operand, its
 /// reads named in written order.
-fn atomize_handle(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
+fn atomize_place(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     if is_mut_var(&e, muts) {
         return (Vec::new(), e);
     }
@@ -1398,16 +1410,10 @@ fn atomize_tuple_elements(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
 }
 
 /// Atomize `e`, a call's argument list ([`TypedExprNode::Arguments`]), in place: each argument
-/// passes to one parameter, so the list stays where it stands with each argument atomized. Where the callee
-/// may take an argument by reference (`by_reference`, [`Muts::passes_by_reference`]), a
-/// component is atomized as one argument is ([`atomize_handle`]), since a mutable variable
-/// passed to a `Mut` parameter is a handle, not a read. Elsewhere a mutable variable is read,
+/// passes to one parameter, so the list stays where it stands with each argument atomized as an
+/// operand ([`atomize`]). A mutable variable is read,
 /// and its read is named in written order as any operand's is.
-fn atomize_arguments(
-    e: Expr,
-    by_reference: bool,
-    muts: &Muts,
-) -> (Vec<(TypedBinding, Expr)>, Expr) {
+fn atomize_arguments(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     let id = e.node_id();
     let ty = e.ty;
     let annotation = e.user_annotation;
@@ -1417,11 +1423,7 @@ fn atomize_arguments(
     let mut binds = Vec::new();
     let mut out = Vec::with_capacity(elts.len());
     for elt in elts {
-        let (elt_binds, elt) = if by_reference {
-            atomize_handle(elt, muts)
-        } else {
-            atomize(elt, muts)
-        };
+        let (elt_binds, elt) = atomize(elt, muts);
         binds.extend(elt_binds);
         out.push(elt);
     }
@@ -1441,7 +1443,7 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
         // The spine bottoms out at a non-`Apply` head: atomize it like any
         // other value in a position that must be atomic (its own bindings,
         // if any, still thread up rather than sealing here).
-        return atomize_handle(e, muts);
+        return atomize_place(e, muts);
     }
     let id = e.node_id();
     let ty = e.ty.clone();
@@ -1454,10 +1456,14 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
     let (arg_binds, argument) = if takes_its_argument_as_a_tuple_term(&function) {
         atomize_tuple_elements(*argument, muts)
     } else if matches!(argument.node, TypedExprNode::Arguments(_)) {
-        let by_reference = muts.passes_by_reference(&function);
-        atomize_arguments(*argument, by_reference, muts)
+        atomize_arguments(*argument, muts)
+    } else if matches!(
+        function.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::AwaitFinal)
+    ) {
+        atomize_place(*argument, muts)
     } else {
-        atomize_handle(*argument, muts)
+        atomize(*argument, muts)
     };
     binds.extend(arg_binds);
     let mut rebuilt = Expr::preserve(
@@ -1483,8 +1489,7 @@ fn debug_assert_flat_spines(e: &Expr) {
     // A refined `Cast`'s value is left exactly as lowering built it (see the
     // `Cast` arm), so this pass has no claim to make about the spines inside
     // it — a `Case`-headed application there is the shape lowering emits for a
-    // conditional generator source, and `parameter_type` reads such a head's
-    // own `.ty`. What the assertion is about is a wrapper *this pass* minted.
+    // conditional generator source. The assertion concerns wrappers this pass mints.
     if let TypedExprNode::Cast { target, .. } = &e.node
         && target.carries_refinement()
     {
@@ -1502,7 +1507,7 @@ fn debug_assert_flat_spines(e: &Expr) {
                     | TypedExprNode::For { .. }
             ),
             "anf: a Let/statement wrapper reached an Apply's function position at {:?} — \
-             this wedges the application spine that infer::emit's parameter_type walks",
+             borrowing calls must retain their complete application spine",
             function.node.kind_name()
         );
     }
@@ -1691,12 +1696,14 @@ mod tests {
         );
     }
 
-    /// An application's argument is a handle position: a bare read there is
-    /// what `emit_apply` relates to a `Mut` parameter, so it stays.
+    /// A borrow preserves its place while an ordinary argument names a value read.
     #[test]
-    fn a_read_in_an_argument_position_stays_bare() {
+    fn a_borrow_in_an_argument_position_stays_bare() {
         let x = Name::fresh("x");
-        let out = run(accumulator(&x, Expr::apply(Expr::var(x.clone()), var("g"))));
+        let out = run(accumulator(
+            &x,
+            Expr::apply(Expr::borrow(Expr::var(x.clone())), var("g")),
+        ));
         let s = symbolic(&out);
         assert!(!s.contains("__anf"), "nothing is named: {s}");
     }

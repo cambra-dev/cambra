@@ -985,14 +985,14 @@ fn a_site_added_elsewhere_keeps_a_channels_tags() {
         "#},
         indoc! {r#"
             out: Feed(_)
-            def note(x):
+            def note(x, out: Feed(_)):
                 out << x
             n := 0
             for line in stdin():
                 n := n + 1
                 out << n
                 out << n * 10
-                note(n * 100)
+                note(n * 100, &out)
             out
         "#},
         "a\nb",
@@ -1330,11 +1330,14 @@ fn a_port_a_refused_version_adds_is_released() {
     let adds_a_port = source("guestbook-retypes-state", port).replace(
         "for entry in sign_reqs:",
         indoc! {r#"
-            other_reqs, other_resps = http_serve("{PORT}", "GET", "/other")
+            run std::http(port="{PORT}", method="GET", path="/other") as http_other_resps
+            http_other_resps_replies: Feed(String)
+            other_reqs = http_other_resps::requests
 
             for req in other_reqs:
-                other_resps << "other\n"
+                http_other_resps_replies << "other\n"
 
+            http_other_resps::respond(http_other_resps_replies)
             for entry in sign_reqs:
         "#}
         .replace("{PORT}", &added.to_string())
@@ -1568,11 +1571,14 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
     let base = |port: u16| {
         format!(
             indoc! {r#"
-                reqs, resps = http_serve("{port}", "POST", "/bump")
+                run std::http(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(String)
+                reqs = http_resps::requests
                 n := (tag="x", count=0)
                 for r in reqs:
                     n := (tag=n.tag + "!", count=n.count + 1)
-                    resps << n.tag + "\n"
+                    http_resps_replies << n.tag + "\n"
+                http_resps::respond(http_resps_replies)
             "#},
             port = port,
         )
@@ -1581,13 +1587,16 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
     let whole = |port: u16| {
         format!(
             indoc! {r#"
-                reqs, resps = http_serve("{port}", "POST", "/bump")
+                run std::http(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(String)
+                reqs = http_resps::requests
                 @LoadFrom(n)
                 held <: {{tag: String, count: Int}}
                 m := held
                 for r in reqs:
                     m := (tag=m.tag + "?", count=m.count + 1)
-                    resps << m.tag + "\n"
+                    http_resps_replies << m.tag + "\n"
+                http_resps::respond(http_resps_replies)
             "#},
             port = port,
         )
@@ -1596,13 +1605,16 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
     let one_field = |port: u16| {
         format!(
             indoc! {r#"
-                reqs, resps = http_serve("{port}", "POST", "/bump")
+                run std::http(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(String)
+                reqs = http_resps::requests
                 @LoadFrom(n)
                 s: {{tag: String, count: Int}}
                 m := s.tag + "?"
                 for r in reqs:
                     m := m + "!"
-                    resps << m + "\n"
+                    http_resps_replies << m + "\n"
+                http_resps::respond(http_resps_replies)
             "#},
             port = port,
         )
@@ -1641,11 +1653,14 @@ fn a_loaded_record_annotated_at_one_field_is_refused() {
     let base = |port: u16| {
         format!(
             indoc! {r#"
-                reqs, resps = http_serve("{port}", "POST", "/bump")
+                run std::http(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(String)
+                reqs = http_resps::requests
                 n := (tag="x", count=0)
                 for r in reqs:
                     n := (tag=n.tag + "!", count=n.count + 1)
-                    resps << n.tag + "\n"
+                    http_resps_replies << n.tag + "\n"
+                http_resps::respond(http_resps_replies)
             "#},
             port = port,
         )
@@ -1653,13 +1668,16 @@ fn a_loaded_record_annotated_at_one_field_is_refused() {
     let one_field = |port: u16| {
         format!(
             indoc! {r#"
-                reqs, resps = http_serve("{port}", "POST", "/bump")
+                run std::http(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(String)
+                reqs = http_resps::requests
                 @LoadFrom(n)
                 held <: {{tag: String}}
                 m := held.tag + "?"
                 for r in reqs:
                     m := m + "!"
-                    resps << m + "\n"
+                    http_resps_replies << m + "\n"
+                http_resps::respond(http_resps_replies)
             "#},
             port = port,
         )
@@ -2539,11 +2557,14 @@ fn a_version_naming_an_unbindable_port_is_refused() {
     let adds_a_held_port = source("guestbook", port).replace(
         "for entry in sign_reqs:",
         indoc! {r#"
-            other_reqs, other_resps = http_serve("{PORT}", "GET", "/other")
+            run std::http(port="{PORT}", method="GET", path="/other") as http_other_resps
+            http_other_resps_replies: Feed(String)
+            other_reqs = http_other_resps::requests
 
             for req in other_reqs:
-                other_resps << "other\n"
+                http_other_resps_replies << "other\n"
 
+            http_other_resps::respond(http_other_resps_replies)
             for entry in sign_reqs:
         "#}
         .replace("{PORT}", &taken.to_string())
@@ -2964,22 +2985,34 @@ fn a_port_whose_last_route_goes_is_released() {
     let kept = reserve_test_port();
     let dropped = reserve_test_port();
     let two_ports = indoc! {r#"
-        a_reqs, a_resps = http_serve("{KEPT}", "GET", "/a")
-        b_reqs, b_resps = http_serve("{DROPPED}", "GET", "/b")
-        c_reqs, c_resps = http_serve("{KEPT}", "GET", "/c")
+        run std::http(port="{KEPT}", method="GET", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(String)
+        a_reqs = http_a_resps::requests
+        run std::http(port="{DROPPED}", method="GET", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(String)
+        b_reqs = http_b_resps::requests
+        run std::http(port="{KEPT}", method="GET", path="/c") as http_c_resps
+        http_c_resps_replies: Feed(String)
+        c_reqs = http_c_resps::requests
         for r in a_reqs:
-            a_resps << "a\n"
+            http_a_resps_replies << "a\n"
         for r in b_reqs:
-            b_resps << "b\n"
+            http_b_resps_replies << "b\n"
         for r in c_reqs:
-            c_resps << "c\n"
+            http_c_resps_replies << "c\n"
+        http_a_resps::respond(http_a_resps_replies)
+        http_b_resps::respond(http_b_resps_replies)
+        http_c_resps::respond(http_c_resps_replies)
     "#}
     .replace("{KEPT}", &kept.to_string())
     .replace("{DROPPED}", &dropped.to_string());
     let one_port = indoc! {r#"
-        a_reqs, a_resps = http_serve("{KEPT}", "GET", "/a")
+        run std::http(port="{KEPT}", method="GET", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(String)
+        a_reqs = http_a_resps::requests
         for r in a_reqs:
-            a_resps << "a\n"
+            http_a_resps_replies << "a\n"
+        http_a_resps::respond(http_a_resps_replies)
     "#}
     .replace("{KEPT}", &kept.to_string());
 
@@ -3656,11 +3689,14 @@ fn fold_behind_a_route(step: &str, port: u16) -> String {
     format!(
         indoc! {r#"
             n := ""
-            reqs, resps = http_serve("{port}", "POST", "/read")
+            run std::http(port="{port}", method="POST", path="/read") as http_resps
+            http_resps_replies: Feed(String)
+            reqs = http_resps::requests
             for x in {items}:
                 {step}
             for r in reqs:
-                resps << n + "\n"
+                http_resps_replies << n + "\n"
+            http_resps::respond(http_resps_replies)
         "#},
         port = port,
         items = TWENTY,

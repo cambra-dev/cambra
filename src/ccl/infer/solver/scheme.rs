@@ -498,6 +498,36 @@ impl FreshenCache {
         Self::default()
     }
 
+    /// The scope a copy of a variable minted in `original` stands in. A freshened clone stands
+    /// where its original stood: the bounds copied onto it were recorded against that scope. An
+    /// operator-scheme instantiation's template stands nowhere but under its own functions, so
+    /// its copy takes the site's scope with those functions' binders entered after it
+    /// ([`site_telescope`](Self::site_telescope)). A let-generalized instantiation stands at the use
+    /// with the binders its original stood under entered after it
+    /// ([`use_telescope`](Self::use_telescope)), and a specialization clone where its original
+    /// stood with the binders its use entered ([`entered_binders`](Self::entered_binders)).
+    pub(crate) fn copied_telescope(&mut self, original: &Telescope) -> Telescope {
+        match &self.site_telescope {
+            Some(site) => {
+                let site = site.clone();
+                let mut template: Vec<_> = original.iter().cloned().collect();
+                template.reverse();
+                template
+                    .into_iter()
+                    .fold(site, |t, n| t.extended(self.binder_name(&n)))
+            }
+            None => match &self.use_telescope {
+                Some(site) => {
+                    let mut inside: Vec<_> = original.iter().cloned().collect();
+                    inside.reverse();
+                    site.rescoped(|_| false, inside)
+                }
+                None if self.entered_binders.is_empty() => original.clone(),
+                None => original.rescoped(|_| false, self.entered_binders.iter().cloned()),
+            },
+        }
+    }
+
     /// The name a copied function binder `n` takes in this copy, minted on first use. The copy's
     /// `Type::Fun` binder and the telescopes of the variables standing under it must agree on
     /// it, so both ask here.
@@ -625,7 +655,8 @@ fn freshen_capability_var(
     if let Some(f) = cache.capability_vars.get(&v.uid) {
         return Rc::clone(f);
     }
-    let f = CapabilityVar::fresh(target.level_of(v.level()));
+    let telescope = cache.copied_telescope(v.telescope());
+    let f = CapabilityVar::fresh(target.level_of(v.level()), &telescope);
     f.open_input.set(v.open_input.get());
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.capability_vars.insert(v.uid, Rc::clone(&f));
@@ -639,7 +670,7 @@ fn freshen_capability_var(
             // an exception of its own: two uses at two types are two exceptions.
             Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
                 let ty = freshen_above(lim, &raised.ty, target, cache);
-                f.record(crate::ccl::capabilities::ScopedCapability {
+                f.record(crate::ccl::capabilities::LocatedCapability {
                     item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
                         raised.instantiated(ty),
                     )),
@@ -649,7 +680,7 @@ fn freshen_capability_var(
             Capability::Requires(r) if r.ordering().is_some_and(|o| o.satisfied.get()) => {}
             Capability::Requires(r) if r.ordering().is_some() => {
                 let requirement = freshen_requirement(lim, r, target, cache);
-                f.record(crate::ccl::capabilities::ScopedCapability {
+                f.record(crate::ccl::capabilities::LocatedCapability {
                     item: Capability::Requires(requirement),
                     ..capability
                 });
@@ -1335,26 +1366,7 @@ pub fn freshen_above(
                     f
                 }
             };
-            let telescope = match &cache.site_telescope {
-                Some(site) => {
-                    let mut template: Vec<_> = tv.telescope.iter().cloned().collect();
-                    template.reverse();
-                    template
-                        .into_iter()
-                        .fold(site.clone(), |t, n| t.extended(cache.binder_name(&n)))
-                }
-                None => match &cache.use_telescope {
-                    Some(site) => {
-                        let mut inside: Vec<_> = tv.telescope.iter().cloned().collect();
-                        inside.reverse();
-                        site.rescoped(|_| false, inside)
-                    }
-                    None if cache.entered_binders.is_empty() => tv.telescope.clone(),
-                    None => tv
-                        .telescope
-                        .rescoped(|_| false, cache.entered_binders.iter().cloned()),
-                },
-            };
+            let telescope = cache.copied_telescope(&tv.telescope);
             // Each field of the original, and what the copy makes of it.
             let crate::ccl::infer_var::InferVarFields {
                 // The copy's own.
@@ -1943,7 +1955,7 @@ fn seed_pairings_go(
                 }
             }
         }
-        // A feed handle reads through to its read view, its `function`, during coalescing
+        // A feed place type reads through to its read view, its `function`, during coalescing
         // (`dissolve_read_feeds`), so the use side may be the dissolved `Fun` where the
         // definition still carries the `History`, or the other way round. Either way the
         // functions pair.
@@ -2040,7 +2052,7 @@ mod tests {
     fn a_capability_variable_beside_a_shared_funkind_variable_is_copied() {
         let kind = FunKindVar::fresh();
         kind.place_at(0);
-        let quantified = CapabilityVar::fresh(1);
+        let quantified = CapabilityVar::fresh(1, &Telescope::empty());
         let ty = Type::Fun {
             binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&kind)),

@@ -310,7 +310,7 @@ impl Uniquifier {
                 }
             }
 
-            // The target name is a use of the defer-handle binder
+            // The target name is a use of the feed-place binder
             // (Feed/Define) or of the mutable variable's `let` (MutWrite).
             TypedExprNode::Feed {
                 name_occurrence: _,
@@ -963,7 +963,7 @@ mod tests {
         );
     }
 
-    // Feed/Define target names are uses of the defer-handle binder.
+    // Feed/Define target names are uses of the feed-place binder.
     #[test]
     fn feed_target_resolves_to_defer_binder() {
         let inner = Expr::expr_stmt(

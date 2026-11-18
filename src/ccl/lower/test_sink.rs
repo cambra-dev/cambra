@@ -3,9 +3,9 @@
 //! Built only under `cfg(test)`, and absent from
 //! `docs/chl-spec.md`; elsewhere `test_sink()` is an unbound name. The statement takes no
 //! arguments and binds a [`Defer`](crate::ccl::TypedExprNode::Defer) channel that is also a
-//! program output. Its name is the sink's: the key
-//! [`sink_bindings`](super::LoweringContext::sink_bindings) uses, the field the program's sink
-//! record carries, and the name a test registers the sink under with
+//! program output. The source name is the sink's registration key; the compiler channel is the
+//! binding read by the output record. The registration key is also the sink record's field and
+//! the name supplied to
 //! [`GlobalContext::register_test_sink`](crate::ccl::context::GlobalContext::register_test_sink).
 //! [`sink_declaration`](super::sink_declaration) recognizes it through [`test_sink_name`], and
 //! [`lower_middle_stmt`](super::lower_middle_stmt) lowers it through [`lower_test_sink`] at the
@@ -34,9 +34,7 @@ pub(super) fn test_sink_name(
     (is_test_sink && SurfaceBuiltin::TestSink.arity().accepts(args.len())).then(|| name.to_string())
 }
 
-/// Lower `name = test_sink()` at `span` in front of `body`: `let name = Defer in body`, with
-/// the sink registered under `name` bound to the channel. The binding name is the sink's name,
-/// so the sink record's field for it is the name the program already wrote to.
+/// Bind `name` to the deferred place registered as the sink's program output.
 pub(super) fn lower_test_sink(
     name: String,
     name_span: Span,
@@ -46,8 +44,13 @@ pub(super) fn lower_test_sink(
 ) -> Result<Expr, LoweringError> {
     // Each run of the module binds the sink registered under its key
     // ([`LoweringContext::register_sinks`]).
+    ctx.minted_channels.insert(
+        name.clone(),
+        format!("the feed `{name}` declared by `test_sink()`"),
+    );
     ctx.declared_sinks.push(super::DeclaredSink::Test {
         name: name.clone(),
+        channel: name.clone(),
         span,
     });
     let defer = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, super::SINK_BINDING);

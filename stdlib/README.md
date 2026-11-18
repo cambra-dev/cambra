@@ -22,13 +22,14 @@ and `src/std.cambra` is `std`, the core module. `tests/` holds the programs that
 | -- | -- | -- | -- |
 | `std` | [src/std.cambra](src/std.cambra) | the prelude | `Option` with its methods `is_none`, `value` and `unwrap_or`, and the traits operators, loops and aggregates require, with their `@Builtin` instances for base types |
 | `std::random` | [src/std/random.cambra](src/std/random.cambra) | `import std::random` | `next()`, a random `Int` read once per position |
-| `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, `alarms`, durations, and conversions to integer counts and Unix time |
+| `std::http` | [src/std/http.cambra](src/std/http.cambra) | `run std::http(…) as server` | A route's request collection and response consumer |
+| `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, durations, and conversions to integer counts and Unix time |
 
 - **A module whose top level requires or causes something is run; every other module is imported.**
   Importing asserts that a module is shareable: its top level reads nothing from outside the program
   and leaves behind no output and no state another module could reach
   ([9.7 Importing asserts a shareable module](../docs/chl-spec.md#97-importing-asserts-a-shareable-module)).
-  A function that performs IO when called, such as `time::now()` or `time::alarms()`, leaves its
+  A function that performs IO when called, such as `time::now()`, leaves its
   module importable: the IO belongs to the module whose top level calls it.
 - **The core module holds what every program names:** the types, traits and functions the
   language's own constructs answer or require, such as `Option` and `Addable`. The prelude imports
@@ -38,11 +39,11 @@ and `src/std.cambra` is `std`, the core module. `tests/` holds the programs that
   instance's primitives ([9.16 The std root](../docs/chl-spec.md#916-the-std-root)). Only a std
   module declares one, and only `std` a `@Builtin` trait or instance.
 - **Every other module holds one concept, named by a noun:** `time`, `http`. A module's members
-  read qualified, `time::now()`, so a member does not repeat the module's name: `time::alarms`, not
-  `time::time_alarms`.
+  read qualified, `time::now()`, so a member does not repeat the module's name: `time::seconds`, not
+  `time::time_seconds`.
 - **Names follow the language.** Types are capitalized nouns (`Instant`, `Duration`), and
   functions, sources and parameters are lowercase with underscores (`now`, `as_seconds`). A type
-  parameter is capitalized (`R` in `alarms`).
+  parameter is capitalized.
 - **A function's name says what it acts on.** `time::as_seconds(d)` converts a `Duration` and
   `time::unix_seconds(t)` an `Instant`.
 
@@ -115,6 +116,6 @@ compiler's std root, which holds only the modules that compile, with the compile
 program, and every std module it reaches, must parse and resolve its module paths. A module that no
 program loads fails the test.
 
-The programs are not compiled, since each reaches a module that does not compile. The `[proposed]`
-lines are the record of what each module waits on. The compiler's own tests compile the embedded
-modules through the prelude, `Option`'s in `tests/it/compilation_pipeline/nominal_types.rs`.
+HTTP runtime tests compile and exercise the embedded module. Other proposed modules are only
+loaded. The `[proposed]` lines record what each module waits on. The compiler's tests compile
+`Option` and the compiler traits through the prelude.

@@ -41,12 +41,13 @@ folds:
 == tests/programs/defer_lift/program.cambra
 diagnostics:
 symbols:
-  function make_totals 1:1-4:6 (name 1:5-1:16)
-  variable readings 6:1-6:24 (name 6:1-6:9)
-  variable totals 7:1-7:31 (name 7:1-7:7)
+  function make_totals 1:1-5:10 (name 1:5-1:16)
+  variable readings 7:1-7:24 (name 7:1-7:9)
+  variable initial 8:1-8:32 (name 8:1-8:8)
+  variable totals 9:1-9:18 (name 9:1-9:7)
 folds:
-  1-4
-  8-9
+  1-5
+  11-12
 == tests/programs/discount_contract/program.cambra
 diagnostics:
   10:12-10:17 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', '!', ',', ':', ':=', '::', or ';'
@@ -69,14 +70,14 @@ folds:
 == tests/programs/fanout/program.cambra
 diagnostics:
 symbols:
-  function fanout 9:1-14:6 (name 9:5-9:11)
-  variable log 16:1-16:34 (name 16:1-16:4)
-  variable out 17:1-17:35 (name 17:1-17:4)
+  function fanout 3:1-8:6 (name 3:5-3:11)
+  variable log 10:1-10:18 (name 10:1-10:4)
+  variable out 11:1-11:18 (name 11:1-11:4)
+  variable head 12:1-12:26 (name 12:1-12:5)
 folds:
-  1-7 comment
-  9-14
-  11-13
-  18-19
+  3-8
+  5-7
+  13-14
 == tests/programs/filter_and_aggregate/program.cambra
 diagnostics:
 symbols:
@@ -116,62 +117,72 @@ folds:
 diagnostics:
 symbols:
   variable entries 1:1-1:14 (name 1:1-1:8)
-  variable sign_reqs 3:1-3:62 (name 3:1-3:10)
-  variable sign_resps 3:1-3:62 (name 3:12-3:22)
-  variable peek_reqs 4:1-4:61 (name 4:1-4:10)
-  variable peek_resps 4:1-4:61 (name 4:12-4:22)
+  module http_sign_resps 3:1-3:77 (name 3:62-3:77)
+  variable http_sign_resps_replies 4:1-4:38 (name 4:1-4:24)
+  variable sign_reqs 5:1-5:38 (name 5:1-5:10)
+  module http_peek_resps 6:1-6:76 (name 6:61-6:76)
+  variable http_peek_resps_replies 7:1-7:38 (name 7:1-7:24)
+  variable peek_reqs 8:1-8:38 (name 8:1-8:10)
 folds:
-  6-8
-  10-11
+  10-12
+  14-15
 == tests/programs/hot_reload/reloaded.cambra
 diagnostics:
 symbols:
   variable entries 1:1-1:14 (name 1:1-1:8)
-  variable sign_reqs 3:1-3:62 (name 3:1-3:10)
-  variable sign_resps 3:1-3:62 (name 3:12-3:22)
-  variable peek_reqs 4:1-4:61 (name 4:1-4:10)
-  variable peek_resps 4:1-4:61 (name 4:12-4:22)
+  module http_sign_resps 3:1-3:77 (name 3:62-3:77)
+  variable http_sign_resps_replies 4:1-4:38 (name 4:1-4:24)
+  variable sign_reqs 5:1-5:38 (name 5:1-5:10)
+  module http_peek_resps 6:1-6:76 (name 6:61-6:76)
+  variable http_peek_resps_replies 7:1-7:38 (name 7:1-7:24)
+  variable peek_reqs 8:1-8:38 (name 8:1-8:10)
 folds:
-  6-8
-  10-11
+  10-12
+  14-15
 == tests/programs/http_accumulator/program.cambra
 diagnostics:
 symbols:
   variable entries 16:1-16:14 (name 16:1-16:8)
-  variable sign_reqs 18:1-18:62 (name 18:1-18:10)
-  variable sign_resps 18:1-18:62 (name 18:12-18:22)
+  module http_sign_resps 18:1-18:77 (name 18:62-18:77)
+  variable http_sign_resps_replies 19:1-19:38 (name 19:1-19:24)
+  variable sign_reqs 20:1-20:38 (name 20:1-20:10)
 folds:
   1-14 comment
-  20-22
+  22-24
 == tests/programs/http_counter/program.cambra
 diagnostics:
 symbols:
-  variable set_reqs 24:1-24:59 (name 24:1-24:9)
-  variable set_resps 24:1-24:59 (name 24:11-24:20)
-  variable get_reqs 25:1-25:58 (name 25:1-25:9)
-  variable get_resps 25:1-25:58 (name 25:11-25:20)
-  variable latest 27:1-27:37 (name 27:1-27:7)
+  module http_set_resps 24:1-24:75 (name 24:61-24:75)
+  variable http_set_resps_replies 25:1-25:37 (name 25:1-25:23)
+  variable set_reqs 26:1-26:36 (name 26:1-26:9)
+  module http_get_resps 27:1-27:74 (name 27:60-27:74)
+  variable http_get_resps_replies 28:1-28:37 (name 28:1-28:23)
+  variable get_reqs 29:1-29:36 (name 29:1-29:9)
+  variable latest 31:1-31:37 (name 31:1-31:7)
 folds:
   1-22 comment
-  29-32
-  30-31
-  34-36
-  35-36
+  33-36
+  34-35
+  38-40
+  39-40
 == tests/programs/http_greeter/program.cambra
 diagnostics:
 symbols:
   variable prefix 9:1-9:19 (name 9:1-9:7)
-  variable greet_reqs 11:1-11:64 (name 11:1-11:11)
-  variable greet_resps 11:1-11:64 (name 11:13-11:24)
-  variable echo_reqs 12:1-12:62 (name 12:1-12:10)
-  variable echo_resps 12:1-12:62 (name 12:12-12:22)
-  variable shout_reqs 13:1-13:65 (name 13:1-13:11)
-  variable shout_resps 13:1-13:65 (name 13:13-13:24)
+  module http_greet_resps 11:1-11:78 (name 11:62-11:78)
+  variable http_greet_resps_replies 12:1-12:39 (name 12:1-12:25)
+  variable greet_reqs 13:1-13:40 (name 13:1-13:11)
+  module http_echo_resps 14:1-14:77 (name 14:62-14:77)
+  variable http_echo_resps_replies 15:1-15:38 (name 15:1-15:24)
+  variable echo_reqs 16:1-16:38 (name 16:1-16:10)
+  module http_shout_resps 17:1-17:79 (name 17:63-17:79)
+  variable http_shout_resps_replies 18:1-18:39 (name 18:1-18:25)
+  variable shout_reqs 19:1-19:40 (name 19:1-19:11)
 folds:
   1-7 comment
-  15-16
-  18-19
   21-22
+  24-25
+  27-28
 == tests/programs/inner_join/program.cambra
 diagnostics:
 symbols:
@@ -199,11 +210,10 @@ folds:
 diagnostics:
 symbols:
   variable ledger 10:1-10:28 (name 10:1-10:7)
-  module std::http 12:1-12:17 (name 12:8-12:17)
-  variable deposit_reqs 14:1-14:69 (name 14:1-14:13)
-  variable deposit_resps 14:1-14:69 (name 14:15-14:28)
-  variable balance_reqs 15:1-15:68 (name 15:1-15:13)
-  variable balance_resps 15:1-15:68 (name 15:15-15:28)
+  module deposit 12:1-12:70 (name 12:63-12:70)
+  variable deposit_replies 13:1-13:30 (name 13:1-13:16)
+  module balance_route 14:1-14:75 (name 14:62-14:75)
+  variable balance_route_replies 15:1-15:36 (name 15:1-15:22)
 folds:
   1-8 comment
   17-20
@@ -406,29 +416,28 @@ folds:
 == tests/programs/txn_kv/program.cambra
 diagnostics:
 symbols:
-  module std::http 16:1-16:17 (name 16:8-16:17)
-  variable get_reqs 18:1-18:61 (name 18:1-18:9)
-  variable get_resps 18:1-18:61 (name 18:13-18:22)
-  variable set_reqs 19:1-19:61 (name 19:1-19:9)
-  variable set_resps 19:1-19:61 (name 19:13-19:22)
-  variable stats_reqs 20:1-20:63 (name 20:1-20:11)
-  variable stats_resps 20:1-20:63 (name 20:13-20:24)
-  variable store 22:1-22:43 (name 22:1-22:6)
-  function put 24:1-25:24 (name 24:5-24:8)
+  module get_route 16:1-16:67 (name 16:58-16:67)
+  variable get_route_replies 17:1-17:32 (name 17:1-17:18)
+  module set_route 18:1-18:68 (name 18:59-18:68)
+  variable set_route_replies 19:1-19:32 (name 19:1-19:18)
+  module stats_route 20:1-20:71 (name 20:60-20:71)
+  variable stats_route_replies 21:1-21:34 (name 21:1-21:20)
+  variable store 23:1-23:43 (name 23:1-23:6)
+  function put 25:1-26:24 (name 25:5-25:8)
 folds:
   1-14 comment
-  24-25
-  27-36
-  28-35
-  29-31 comment
-  32-35
-  33-34
-  38-43
-  39-40
-  41-43
-  45-47 comment
-  48-51
-  49-51
+  25-26
+  28-37
+  29-36
+  30-32 comment
+  33-36
+  34-35
+  39-44
+  40-41
+  42-44
+  46-48 comment
+  49-52
+  50-52
 == tests/programs/txn_multi_read/program.cambra
 diagnostics:
 symbols:
@@ -460,10 +469,10 @@ symbols:
 folds:
 == editors/sample-lexes-only.cambra
 diagnostics:
-  5:5-5:6 found '>', expected expression, or '-'
+  5:5-5:6 found '>', expected expression, '-', or '&'
     5:1-5:8 while parsing statement
     5:1-5:5 while parsing expression
-  6:5-6:6 found '>', expected expression, or '-'
+  6:5-6:6 found '>', expected expression, '-', or '&'
     6:1-6:8 while parsing statement
     6:1-6:5 while parsing expression
 symbols:

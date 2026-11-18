@@ -358,6 +358,10 @@ fn fmt(expr: &Expr, min_prec: Precedence, opts: &SymbolicOpts) -> String {
 /// Returns `(self_prec, rendered_text)` without outer parentheses.
 fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
     let res = match &expr.node {
+        TypedExprNode::Borrow(place) => (
+            Precedence::Unary,
+            format!("&{}", fmt(place, Precedence::Atom, opts)),
+        ),
         // Surface form: the element, then each generator followed by its
         // guards, which is CHL's own spelling. The comprehension phase turns
         // this into the `cast`/`λ`/`▷` encoding, so a tree that still carries
@@ -1435,11 +1439,12 @@ mod tests {
         Expr::letrec(
             vec![(
                 TypedBinding { occurrence: Occurrence::mint(),
+                    parameter_mode: Default::default(),
                     name: "x".into(),
                     ty: Type::Base(BaseType::Int),
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent, site: None,
-                    },
+                },
                 Expr::lit(Lit::Int(0)),
             )],
             Expr::var("x"),

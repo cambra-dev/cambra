@@ -1771,11 +1771,13 @@ impl<'a> ProgramLowering<'a> {
         }
         // Each sink the run declares is read at the program's tail through the
         // binder its chain minted.
-        for (key, binder) in sinks {
+        for sink in sinks {
             let name = names
-                .get(&QualifiedName::new(binder.as_str()))
-                .unwrap_or_else(|| panic!("the run `{path}`'s chain binds its sink `{binder}`"));
-            ctx.run_sink_names.insert(key, name.clone());
+                .get(&QualifiedName::new(sink.binding.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("the run `{path}`'s chain binds its sink `{}`", sink.binding)
+                });
+            ctx.sink_reads.insert(sink.key, (name.clone(), sink.label));
         }
         Some(Created {
             chain: uniquified,

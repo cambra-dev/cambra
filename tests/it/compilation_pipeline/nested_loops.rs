@@ -1604,7 +1604,7 @@ fn an_inner_seed_combines_the_carried_value_with_an_enclosing_binding() {
 
 /// The nested shapes lowering admits, run: a `yield` in the inner loop feeds the
 /// enclosing generator once per inner iteration (10, 30, 50, 90); each branch's own `y`;
-/// a pass-by-reference writer on a body-introduced variable (3 then 4); two sibling inner
+/// a borrowing writer on a body-introduced variable (3 then 4); two sibling inner
 /// loops; and writes on both sides of an inner loop.
 #[rstest]
 #[case::a_yield_in_the_inner_loop(indoc! {r"
@@ -1638,7 +1638,7 @@ fn an_inner_seed_combines_the_carried_value_with_an_enclosing_binding() {
     for i in [1, 2]:
         y := i
         for k in [10, 20]:
-            bump(y)
+            bump(&y)
         t += y
     t
 "}, 7)]

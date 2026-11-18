@@ -1,10 +1,4 @@
-# A sink constructor (NOT Unix tee): `fanout` returns the writable *head* of
-# a fan-out pipe — each element fed to the head is duplicated to both
-# downstream sinks.  Polymorphic in the element type with no explicit type
-# parameters: the inner `_`s on the `Feed(_)` types unify through inference.
-#
-# `h: Feed(_)` with no initializer is a forward declaration — legal because
-# `Feed` is the type that supports define-after-declare.
+# A function returns collection data. Its caller cannot append through that result.
 
 def fanout(a: Feed(_), b: Feed(_)):
     h: Feed(_)
@@ -13,7 +7,8 @@ def fanout(a: Feed(_), b: Feed(_)):
         b << x
     h
 
-log: Feed(_) = open("fanout.log") # TODO: handle file modes
-out: Feed(_) = fanout(stdout, log)
-for line in stdin():
-    out << line
+log: Feed(String)
+out: Feed(String)
+head = fanout(&out, &log)
+for line in ["one", "two"]:
+    head << line

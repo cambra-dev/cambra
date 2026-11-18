@@ -103,7 +103,7 @@ pub enum CompileError {
         related: Vec<(Span, String)>,
     },
     /// Defer/Feed/Define channelization rejected the program (e.g. a defer
-    /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
+    /// binding with no feeds, mixed `<<`/`<<=` on the same feed place, or a
     /// `<<=` inside a non-top-level scope).
     ///
     /// Channelization runs after inference (so type errors report against
@@ -862,7 +862,7 @@ impl SourceSinkRegistry {
     fn absorb(&mut self, lowering: &mut LoweringContext) {
         self.sources.extend(
             lowering
-                .registered_sources()
+                .runtime_sources()
                 .map(|(n, s)| (n.to_string(), s.clone())),
         );
         self.shared_servers.extend(lowering.take_servers());
@@ -2641,7 +2641,7 @@ struct Obstacle {
 /// (`span`). `None` when it is shareable.
 fn obstacle(
     statements: &[crate::ccl::lower::modules::ModuleStatement],
-    top_level: &[crate::ccl::capabilities::ScopedCapability],
+    top_level: &[crate::ccl::capabilities::LocatedCapability],
     span: impl Fn(NodeId) -> Span,
 ) -> Option<Obstacle> {
     if let Some(run) = statements.iter().find(|s| s.runs) {
@@ -3154,7 +3154,7 @@ fn run_passes(
     // channelize routes feeds and before the unified letrec phase folds writers,
     // both of which need their targets lexically present. Inlining runs on the
     // still-defer-bearing tree (Defer/Feed nodes and `Feed` types present) via
-    // the defer-aware `Subst` engine (which renames a fed-to handle on
+    // the defer-aware `Subst` engine (which renames a fed-to place on
     // beta-reduction) and preserves defer-returning generators, so the
     // post-inline wall is the relaxed `check_pre_channelize`, not strict
     // `typecheck`.
@@ -3973,7 +3973,7 @@ Error: parse error
    │      │ │
    │      ╰──── while parsing expression
    │        │
-   │        ╰── found 'newline', expected expression, or '-'
+   │        ╰── found 'newline', expected expression, '-', or '&'
 ───╯
 Error: lowering error
    ╭─[<test>:2:5]
@@ -4212,14 +4212,12 @@ Error: lowering error
         x += 2
         x
         "#}, "x += 2", 0)]
-    #[case::mut_rule_1(indoc::indoc! {r#"
-        def bump(c: Mut(Int)):
-            c += 1
-        x := 0
-        y := 1
-        bump(x if True else y)
-        x
-        "#}, "x if True else y", 0)]
+    #[case::borrow_outside_a_call(indoc::indoc! {r#"
+        def g(n):
+            z := n
+            &z
+        g(5)
+        "#}, "&z", 0)]
     // An undetermined type is reported at the innermost node holding it, the first read of `x`.
     #[case::ambiguous_program(indoc::indoc! {r#"
         f = \x -> [x, x]

@@ -391,7 +391,7 @@ declared. The bound holds in three places:
   before that member, so every bound names only parameters opened before it.
 
 The collection rule is a candidate beside the rows when a requirement is checked for
-satisfiability (`Trait::collection_rule_admits`), as it is at inference: a requirement of
+satisfiability (`Trait::structural_rule_admits`), as it is at inference: a requirement of
 `Iterable` on a type parameter is satisfiable by a structural collection whatever instances the
 module declares.
 

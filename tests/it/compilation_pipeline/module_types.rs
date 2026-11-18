@@ -60,16 +60,71 @@ const RELAY: &str = indoc! {"
 
 /// A module that publishes a feed and its total.
 const AUDIT: &str = indoc! {"
-    pub events: Feed(_)
+    _events: Feed(_)
+    pub events = _events
+    pub def emit(value):
+        _events << value
+        0
     pub total = sum([e for e in events])
 "};
 
 /// A module that feeds the feed of the module it takes.
 const LOGGER: &str = indoc! {"
-    param log: Module{events: Feed(Int)}
+    param log: Module{emit: (Int => Int causes Append(*))}
     for x in [1, 2, 3]:
-        log::events << x
+        log::emit(x)
 "};
+
+#[test]
+fn an_exported_feed_value_is_not_writable() {
+    assert_refused(
+        &program(
+            indoc! {"
+                run audit as a
+                run export_ref(log=a) as e
+                e::forwarded << 1
+                a::total
+            "},
+            &[
+                ("audit", AUDIT),
+                (
+                    "export_ref",
+                    indoc! {"
+                    param log: Module{events: _ |=> Int}
+                    pub forwarded = log::events
+                "},
+                ),
+            ],
+        ),
+        "a feed is required here",
+    );
+}
+
+#[test]
+fn two_module_parameters_can_call_the_same_feed_writer() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                run audit as a
+                run duplicate(first=a, second=a) as d
+                a::total
+            "},
+            &[
+                ("audit", AUDIT),
+                (
+                    "duplicate",
+                    indoc! {"
+                    param first: Module{emit: (Int => Int causes Append(*))}
+                    param second: Module{emit: (Int => Int causes Append(*))}
+                    first::emit(1)
+                    second::emit(2)
+                "},
+                ),
+            ],
+        ),
+        Value::Int(3),
+    );
+}
 
 /// A module that returns a run it declares, by binding it to a member.
 const HOLDER: &str = indoc! {"
@@ -401,7 +456,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
         run loud(log=a) as l
         a::total
     "},
-    "annotated as Feed(String), but inferred as Feed(Int)"
+    "annotated as String => Int causes Append(*), but inferred as Int =>"
 )]
 #[case::an_import_passed_to_a_feed_entry(
     indoc! {"
@@ -409,7 +464,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
         run logger(log=audit) as l
         1
     "},
-    "module `audit` is run, since its top level causes `Append(events)`, so importing it is an \
+    "module `audit` is run, since its top level causes `Append(_events)`, so importing it is an \
      error: run it instead"
 )]
 #[case::imports_passing_each_other(
@@ -597,8 +652,8 @@ fn a_misused_module_type_is_refused(#[case] root: &str, #[case] needle: &str) {
                 (
                     "loud",
                     indoc! {r#"
-                        param log: Module{events: Feed(String)}
-                        log::events << "x"
+                        param log: Module{emit: (String => Int causes Append(*))}
+                        log::emit("x")
                     "#},
                 ),
             ],

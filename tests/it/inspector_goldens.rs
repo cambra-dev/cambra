@@ -43,6 +43,10 @@
 
 use std::path::{Path, PathBuf};
 
+use cambra::ccl::{
+    context::{GlobalContext, Phase},
+    load::{DiskFiles, LoadedProgram},
+};
 use serde_json::Value;
 
 /// One corpus row: the fixture basename and the example-program basename.
@@ -689,13 +693,23 @@ const COMPILE_FAILS: &[&str] = &[
     "nonneg_inventory",
     "reachability",
     "refinement",
-    // A program of two modules: the dump refuses a program of several files,
-    // and `lines.cambra`, a module, ends in no program value.
+    // The auxiliary `lines.cambra` is a module and ends in no program value.
+    // Its main program compiles and appears in MULTI_MODULE_DUMPS.
     "source_two_runs",
     "storefront",
     "txn_kv",
     "type_error",
     "while_counter",
+];
+
+/// Programs that compile but reach the inspector's one-file restriction.
+/// The sweep checks their compiler result separately from the degraded payload.
+const MULTI_MODULE_DUMPS: &[&str] = &[
+    "hot_reload",
+    "http_accumulator",
+    "http_counter",
+    "http_greeter",
+    "source_two_runs",
 ];
 
 /// Every `*.cambra` source under `tests/programs/`, as (program-directory name,
@@ -775,6 +789,7 @@ fn dump_source(path: &Path) -> Option<Vec<u8>> {
 fn every_gallery_program_produces_a_valid_payload() {
     let mut panicked = Vec::new();
     let mut degraded = Vec::new();
+    let mut multi_module = Vec::new();
     for (name, path) in gallery_sources() {
         let Some(raw) = dump_source(&path) else {
             panicked.push(name);
@@ -793,8 +808,28 @@ fn every_gallery_program_produces_a_valid_payload() {
                 cambra::inspector_server::wire_check::assert_snapshot_shape_at(&v, &at)
             }
             Some("failed") => {
-                degraded.push(name);
-                cambra::inspector_server::wire_check::assert_degraded_snapshot_shape_at(&v, &at)
+                cambra::inspector_server::wire_check::assert_degraded_snapshot_shape_at(&v, &at);
+                let one_file_only = v["diagnostics"].as_array().is_some_and(|ds| {
+                    ds.len() == 1
+                        && ds[0]["message"] == "the inspector shows a program of one file, and a program of several modules is not supported yet"
+                });
+                if one_file_only {
+                    let (mut root, mut files) =
+                        DiskFiles::open(&path).expect("reading the gallery source");
+                    root.text = root.text.replace("{PORT}", "0");
+                    let program = LoadedProgram::load(root, &mut files);
+                    let context = GlobalContext::default();
+                    let compiled = context
+                        .sources_and_sinks()
+                        .compile_to(&program, Phase::Planning);
+                    assert!(
+                        compiled.is_ok(),
+                        "{at}: the program must compile despite the inspector restriction: {compiled:?}"
+                    );
+                    multi_module.push(name);
+                } else {
+                    degraded.push(name);
+                }
             }
             other => panic!("{at}: unknown payloadKind {other:?}"),
         }
@@ -812,6 +847,11 @@ fn every_gallery_program_produces_a_valid_payload() {
         "the set of gallery programs that do not compile changed. A program that \
          now compiles must be removed from COMPILE_FAILS; one that newly fails is \
          a regression, not a list entry."
+    );
+    assert_eq!(
+        pinned(&mut multi_module),
+        listed(MULTI_MODULE_DUMPS),
+        "the set of programs reaching the inspector's one-file restriction changed"
     );
 }
 

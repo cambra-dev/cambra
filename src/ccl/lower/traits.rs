@@ -23,8 +23,8 @@ use smol_str::SmolStr;
 use super::*;
 use crate::ccl::infer::solver::traits::{
     Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
-    StdTrait, Supplier, Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value,
-    entailed, replace_params, unify_all,
+    StdTrait, StructuralReading, Supplier, Trait, TraitDecl, TraitFunction, TraitInstance,
+    compares_by_value, entailed, replace_params, unify_all,
 };
 use crate::ccl::nominal::WrittenOrder;
 use crate::ccl::ty::{FieldKey, PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
@@ -102,15 +102,14 @@ pub(super) fn refuse_trait_member(trait_: &Trait, q: &QualifiedName, span: Span)
 }
 
 /// The function `function` of `instance`, the instance not yet chosen: a [`TraitFn`] at the
-/// instance's types, the number of arguments the function takes, and whether one of them is
-/// passed by reference.
+/// instance's types, with the number of arguments the function takes.
 ///
 /// [`TraitFn`]: TypedExprNode::TraitFn
 fn instance_function(
     instance: &TraitRequirement,
     function: &Spanned<SmolStr>,
     ctx: &mut LoweringContext,
-) -> Result<(Expr, usize, bool), LoweringError> {
+) -> Result<(Expr, usize), LoweringError> {
     let trait_ = &instance.trait_;
     let Some(declared) = trait_.function(&function.node) else {
         return Err(LoweringError::unsupported(
@@ -122,7 +121,7 @@ fn instance_function(
     // refuses it: left to inference, it is an obligation with nothing to accept.
     if ctx.instances_declared
         && ctx.instances.instances(trait_).is_empty()
-        && !trait_.collection_rule_admits(&instance.args, &instance.assoc)
+        && !trait_.structural_rule_admits(&instance.args, &instance.assoc)
     {
         return Err(unsatisfiable_requirement(
             trait_,
@@ -131,19 +130,13 @@ fn instance_function(
         ));
     }
     let arity = declared.signature.inputs.len();
-    // A pass-by-reference argument is lowered as one, a bare mutable variable or feed.
-    let by_reference = declared
-        .signature
-        .inputs
-        .iter()
-        .any(|t| t.history_parts().is_some());
     let node = Expr::new(TypedExprNode::TraitFn {
         trait_: trait_.clone(),
         function: declared.name.clone(),
         operands: instance.args.clone(),
         assoc: instance.assoc.clone(),
     });
-    Ok((ctx.tag_image(node, function.span), arity, by_reference))
+    Ok((ctx.tag_image(node, function.span), arity))
 }
 
 /// `i::f`, the function of an instance as a value.
@@ -163,7 +156,7 @@ pub(super) fn lower_instance_member_call(
     args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let (f, arity, by_reference) = instance_function(instance, function, ctx)?;
+    let (f, arity) = instance_function(instance, function, ctx)?;
     if arity != args.len() {
         return Err(LoweringError::unsupported(
             span,
@@ -176,8 +169,7 @@ pub(super) fn lower_instance_member_call(
             ),
         ));
     }
-    let passing = Passing::of(by_reference);
-    apply_to_args(args, span, passing, ctx, |_| Ok(f))
+    apply_to_args(args, span, ctx, |_| Ok(f))
 }
 
 /// What lowering keeps of an instance a module declares, for its `instance` block's `def`s,
@@ -522,7 +514,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         requires,
         named,
         products,
-        reads_collections,
+        structural_reading: reads_collections.then_some(StructuralReading::CollectionElements),
         method: false,
         prelude_shadowed,
     }))
@@ -806,8 +798,8 @@ fn signature_types(
 }
 
 /// A parameter's type in a trait's signature. `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
-/// pass-by-reference parameter, as they do on a `def`'s: the caller's variable or feed is the
-/// argument, and the function writes it (`docs/chl-spec.md`, "Declaring a trait").
+/// borrowed parameter, as they do on a `def`'s: the caller lends its place as the argument, and
+/// the function writes it (`docs/chl-spec.md`, "Declaring a trait").
 fn signature_input(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
@@ -829,7 +821,9 @@ fn parameter_type(
             value,
         ));
     }
-    if is_feed_type(annotation) {
+    if matches!(&annotation.node, ChlExpr::Call { func, .. }
+        if matches!(&func.node, ChlExpr::Name(head) if head == "Feed"))
+    {
         let ChlExpr::Call { args, .. } = &annotation.node else {
             unreachable!("`is_feed_type` matched a call")
         };
@@ -839,7 +833,9 @@ fn parameter_type(
                 "`Feed` takes one type argument: `Feed(T)`",
             ));
         };
-        return Ok(Type::feed(Type::Hole, lower(value, ctx)?));
+        let value_ty = lower(value, ctx)?;
+        refuse_misplaced_place(&value_ty, false, value.span)?;
+        return Ok(Type::feed(Type::Hole, value_ty));
     }
     lower(annotation, ctx)
 }
@@ -1991,7 +1987,7 @@ fn lower_instance_def(
         match &p.annotation {
             None => {
                 let alias = signature_alias(i);
-                // A pass-by-reference parameter is recognized by its written annotation
+                // A borrowed parameter is recognized by its written annotation
                 // (`Mut(V, Txn)`, `Feed(V)`), so the instance's parameter states the
                 // signature's history type that way, over an alias of its value type.
                 let ty = if let Some((domain, value, kind)) = stated.history_parts() {

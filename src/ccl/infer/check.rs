@@ -27,7 +27,7 @@ use super::emit::{
     emit_unary, emit_variant_ctor, paths_are_canonical, projected_source_type,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::{LetScheme, TempNames, Typing};
+use super::typing::{LetScheme, Typing};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceHead, InstanceTable, StdTrait, Trait, compares_by_value, offered_head,
@@ -71,9 +71,6 @@ use std::rc::Rc;
 /// refinements still chain. (Previously this gap was papered over by a
 /// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
 pub(super) struct CheckCtx {
-    /// The parameters each call's argument tuple about to be emitted passes its components to
-    /// ([`Typing::pass_arguments`]).
-    arguments: HashMap<NodeId, Vec<Type>>,
     /// The types of the registered data sources, where the caller states them. A projected
     /// source's recorded type is verified against its registered one; without a registry the
     /// recorded type is trusted, as every other leaf's is.
@@ -86,8 +83,6 @@ pub(super) struct CheckCtx {
     /// reason [`Typing::raise`] attributes at the raise site.
     errors: Vec<LocatedInferError>,
     pred_memo: TermMemo,
-    /// What each A-normalization temp walked so far names ([`Typing::note_temp`]).
-    temps_written: HashMap<Name, TempNames>,
     /// **Γ — what the witnesses in scope range over** at the current position
     /// (`src/ccl/design/type-inference.md`, "The witness context").
     ///
@@ -207,13 +202,11 @@ impl CheckCtx {
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
         Self {
-            arguments: HashMap::new(),
             sources: None,
             schemes: OperatorSchemes::new(),
             level: 0,
             errors: Vec::new(),
             pred_memo: Default::default(),
-            temps_written: HashMap::new(),
             witness_ctx: Default::default(),
             current_node: root,
             telescope: Telescope::empty(),
@@ -300,19 +293,15 @@ impl Typing for CheckCtx {
         crate::unexpected_error_node!()
     }
 
-    fn note_temp(&mut self, temp: &Name, written: TempNames) {
-        self.temps_written.insert(temp.clone(), written);
-    }
-
-    fn temp_written(&self, temp: &Name) -> Option<TempNames> {
-        self.temps_written.get(temp).cloned()
-    }
-
     fn poisoned_reads(&self) -> usize {
         0
     }
 
     fn binds(&self, _: &Name) -> bool {
+        false
+    }
+
+    fn binds_place(&self, _: &Name) -> bool {
         false
     }
 
@@ -495,7 +484,7 @@ impl Typing for CheckCtx {
                 }
                 return Ok(assoc.map(|_| self.fresh()));
             }
-            // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
+            // Pre-channelize residue (a `Feed` place type, an un-eliminated `Mut`, a
             // still-`Infer` position under `Strictness::PreChannelize`) is not something
             // this rule can judge — the strictness wall decides whether a residual
             // type is tolerable at this point in the pipeline.
@@ -704,14 +693,6 @@ impl Typing for CheckCtx {
         crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body_ty)
     }
 
-    fn pass_arguments(&mut self, tuple: NodeId, params: Vec<Type>) {
-        self.arguments.insert(tuple, params);
-    }
-
-    fn take_arguments(&mut self, tuple: NodeId) -> Option<Vec<Type>> {
-        self.arguments.remove(&tuple)
-    }
-
     fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
         if !crate::ccl::subst::type_free_vars(&body_ty).contains(binder) {
             return body_ty;
@@ -768,7 +749,7 @@ impl Typing for CheckCtx {
         // reads as the collection, a defer's channel as the collection it accumulates.
         // That mirrors the solver's transparent-read rule Emit applies when it
         // destructures the same position, so Check and Emit agree at the consistency
-        // wall; post-channelize/-erasure trees carry neither handle type.
+        // wall; post-channelize/-erasure trees carry neither place type.
         match t.read_view().as_ref() {
             // A sum destructures like the function it is: the consumer's domain is a name
             // for whichever domain the witness picked — the sum's own domain, which its
@@ -891,7 +872,7 @@ impl Typing for CheckCtx {
     ) -> Result<Type, LocatedInferError> {
         // **One read view for the whole rule.** An application consumes the function's
         // shape three times — the shape edge, the argument edge, and the discharge — and a
-        // handle looked through at one and not another leaves them disagreeing about
+        // place type looked through at one and not another leaves them disagreeing about
         // whether a channel is a function ([`Type::read_view`]). A comprehension over a
         // channel applies it, so the disagreement is reachable.
         let function = fn_ty.read_view();
@@ -1026,6 +1007,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {
+        TypedExprNode::Borrow(place) => ctx.subexpr(place)?,
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
@@ -1474,6 +1456,7 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                 let bound_ty = Type::fun((**base).clone(), body.ty.clone());
                 let mut bound = Expr::throwaway(TypedExprNode::Lambda {
                     params: vec![TypedBinding {
+                        parameter_mode: Default::default(),
                         name: param,
                         occurrence: crate::ccl::Occurrence::PLACEHOLDER,
                         ty: (**base).clone(),

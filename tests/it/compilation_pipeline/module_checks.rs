@@ -1012,16 +1012,17 @@ const PRICING: &str = indoc! {"
 const LEDGER: &str = indoc! {"
     import pricing
     param fee: Int
-    pub balance: Mut(Int, Txn) := 0
+    _balance: Mut(Int, Txn) := 0
     for amount in [100, 250]:
         with begin():
-            balance += pricing::with_fee(amount, fee)
+            _balance += pricing::with_fee(amount, fee)
+    pub balance = await_final(_balance)
 "};
 
 /// A module that runs `ledger`, so that a run of it runs `ledger` in turn.
 const WALLET: &str = indoc! {"
     run ledger(fee=1) as eu
-    pub total = await_final(eu::balance)
+    pub total = eu::balance
 "};
 
 /// The modules a root reaches through `wallet` or `ledger`.
@@ -1033,7 +1034,7 @@ const RUN_MODULES: [(&str, &str); 3] =
 #[rstest]
 #[case::directly(indoc! {"
     run ledger(fee=1) as eu
-    await_final(eu::balance)
+    eu::balance
 "})]
 #[case::through_another_run(indoc! {"
     run wallet as w
@@ -1055,7 +1056,7 @@ fn a_check_reaches_the_imports_of_each_module_it_runs(#[case] root: &str) {
 #[case::from_a_root_with_a_parameter(indoc! {"
     param base: Int = 0
     run ledger(fee=1) as eu
-    await_final(eu::balance) + base
+    eu::balance + base
 "})]
 #[timeout(Duration::from_secs(10))]
 fn a_program_runs_a_module_that_imports_another(#[case] root: &str) {

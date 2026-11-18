@@ -63,6 +63,7 @@ pub(super) fn predicate_children(expr: &Expr) -> Vec<&Expr> {
 pub(super) fn node_label(node: &TypedExprNode) -> String {
     use TypedExprNode::*;
     match node {
+        Borrow(_) => "Borrow".to_string(),
         Comprehension { .. } => "Comprehension".to_string(),
         Lit(l) => format!("Lit({l:?})"),
         Var(n) => format!("Var({n})"),

@@ -136,6 +136,24 @@ pub fn is_annotated_result(expr: &Expr) -> bool {
     annotated_result(expr).is_some()
 }
 
+/// Give a checked written result a compiler output name.
+/// Written annotations first enforce their value-read semantics during inference; later
+/// effect normalization can peel either wrapper through `output_body`.
+pub(super) fn canonicalize_written_result(expr: &mut Expr) {
+    let Some(expr) = annotated_result_mut(expr) else {
+        return;
+    };
+    let TypedExprNode::Let { binding, body, .. } = &mut expr.node else {
+        unreachable!("an annotated result is a let");
+    };
+    if matches!(&binding.name, Name::Unique { base, .. } if base == crate::ccl::lower::OUTPUT_BINDER)
+    {
+        let output = Name::written_output();
+        crate::ccl::subst::Subst::rename(binding.name.clone(), output.clone()).rewrite_expr(body);
+        binding.name = output;
+    }
+}
+
 /// Whether `expr` ends in an annotated result ([`annotated_result`]) whose
 /// annotation holds no position left to inference.
 fn has_concrete_result_annotation(expr: &Expr) -> bool {

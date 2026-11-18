@@ -9,18 +9,20 @@
 
 ledger: Feed({amount: Int})
 
-import std::http
+run std::http(port="8080", method="POST", path="/deposit") as deposit
+deposit_replies: Feed(String)
+run std::http(port="8080", method="GET", path="/balance") as balance_route
+balance_route_replies: Feed(String)
 
-deposit_reqs, deposit_resps = http.serve("8080", "POST", "/deposit")
-balance_reqs, balance_resps = http.serve("8080", "GET", "/balance")
-
-for req in deposit_reqs:
+for req in deposit::requests:
     with begin():
         ledger << (amount=req.body.amount)
-    deposit_resps[req.id] = "ok"
+    deposit_replies[req.id] = "ok"
 
-for req in balance_reqs:
+for req in balance_route::requests:
     with txn = begin():
         deposits = ledger.restrict(\e -> e.time < txn::now())
         balance = sum([e.amount for e in deposits])
-    balance_resps[req.id] = balance
+    balance_route_replies[req.id] = balance
+deposit::respond(deposit_replies)
+balance_route::respond(balance_route_replies)

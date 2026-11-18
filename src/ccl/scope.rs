@@ -39,7 +39,7 @@
 //!   one binder appears in several of a comprehension's scopes.
 //! - [`Feed`](TypedExprNode::Feed) / [`Define`](TypedExprNode::Define) /
 //!   [`MutWrite`](TypedExprNode::MutWrite) — the `name` field is a *use* of the
-//!   defer handle / mutable variable bound elsewhere, not a binder. It is
+//!   feed place / mutable variable bound elsewhere, not a binder. It is
 //!   surfaced as a [`ScopedItem::VarRef`].
 //! - [`Transact`](TypedExprNode::Transact) — its `keys` name mutable variable fields of the
 //!   record the node denotes, and a writer's `read_keys`/`write_keys` are references to
@@ -355,7 +355,7 @@ where
             open(f, left);
             open(f, right);
         }
-        N::UnaryOp(_, inner) => open(f, inner),
+        N::UnaryOp(_, inner) | N::Borrow(inner) => open(f, inner),
         N::Aggregate { input, .. } => open(f, input),
         N::VariantCtor { payload, .. } | N::NominalCtor { payload, .. } => open(f, payload),
         N::Method { candidates, .. } => {
@@ -399,8 +399,8 @@ where
         // caller's type walk.
         N::LetType { body, .. } | N::Run { body, .. } => open(f, body),
 
-        // The write target is a *use* of the binder that introduced the defer
-        // handle / mutable variable, so it resolves like any variable.
+        // The write target is a *use* of the binder that introduced the feed
+        // place / mutable variable, so it resolves like any variable.
         N::Feed {
             name_occurrence: _,
             name,
@@ -704,6 +704,7 @@ where
         | N::Cast { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
+        | N::Borrow(_)
         | N::Aggregate { .. }
         | N::VariantCtor { .. }
         | N::NominalCtor { .. }
@@ -776,6 +777,7 @@ mod tests {
                 var("r"),
             ),
             node(N::UnaryOp(crate::ccl::UnaryOpKind::Neg, Box::new(var("u")))),
+            TypedExpr::borrow(var("borrowed")),
             TypedExpr::lambda("p", Occurrence::mint(), Type::Hole, var("p")),
             node(N::Aggregate {
                 input: Box::new(var("agg")),
@@ -989,6 +991,7 @@ mod tests {
     variants! {
         N::Lit(_) => "Lit",
         N::Var(_) => "Var",
+        N::Borrow(_) => "Borrow",
         N::Builtin(_) => "Builtin",
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",

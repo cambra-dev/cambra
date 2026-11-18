@@ -661,7 +661,7 @@ program, or an exception
 The effecting forms:
 
 - **Feed `<<`** (§3.7) appends its right-hand side to a feed.
-- **A call to an effecting function** — one that writes a `Mut(…)` parameter (pass-by-reference,
+- **A call to an effecting function** — one that writes a `Mut(…)` parameter (a borrowed parameter,
   §6.2) or writes a transactional mutable variable in a `with begin():` block of its own or in the
   block that calls it (§8, §8.7) — performs that function's writes. A function's effects are always
   visible in its type: its `causes` clause states them, written or inferred. There are **no
@@ -1045,10 +1045,9 @@ target << value
 denotes. The expression itself returns the unit value `()`; its
 purpose is the append.
 
-`target` must be a **feed**, a value of type `Feed(V)`: a name declared
-`h: Feed(V)` ([Declaring a feed](#declaring-a-feed)), a `Feed(V)`
-parameter, or the response half of `http_serve` (§7.3). Feeding any
-other value is a compile-time error.
+`target` must name a Feed place: a declaration `h: Feed(V)`
+([Declaring a feed](#declaring-a-feed)) or a borrowed `Feed(V)` parameter.
+Feeding an ordinary collection value is a compile-time error.
 
 Feeds against a given target are visible to anything that consumes
 that target: a downstream comprehension iterating the stream, a sink
@@ -1089,8 +1088,8 @@ dependency between them, the implementation may run them in any
 order or in parallel. Ordering only becomes observable when
 something else in the program forces sequencing (a loop-carried
 accumulator, or a sink whose own contract pairs feed-values with
-their triggering inputs — e.g. `http_serve` pairs each response
-with its request).
+their triggering inputs — e.g. an HTTP route's `respond` pairs each
+response with its request).
 
 `<<` is **not** a bitwise-shift operator (CHL has no bitwise shifts).
 Despite the token reuse, this is its only meaning.
@@ -1106,45 +1105,78 @@ for x in [1, 2, 3]:
 sum(out)                 # 60
 ```
 
-The feeds of `out`, or its one `<<=` (§4.4), give it its value. A declaration is a statement, so a
-feed may be declared wherever a statement stands, a function body included, and a function may
-return the feed it declares. A declaration introduces a feed each time it runs: one per iteration of
-the loops around it and one per call of the function it is in. `Feed(_)` infers the value type; a
-written one is exact, the type every contribution has. The declaration is written with `:`: `Feed`
-is invariant in its value type, so `out <: Feed(V)` would claim nothing `:` does not, and is a
-compile-time error. Any annotation other than `Feed(…)` needs a value: `x: Int` with nothing after
-it is a compile-time error.
+The feeds of `out`, or its one `<<=` (§4.4), define its collection. A declaration introduces a
+Feed each time its containing block runs, including each loop iteration and each function call.
+`Feed(_)` infers the element type; a written element type is exact. `Feed` is invariant in its
+element type, so `out <: Feed(V)` is a compile-time error. Any annotation other than `Feed(…)`
+requires an initializer.
 
-`Feed(V)` is written at a binder, as `Mut(V)` is (§6.2): a declaration, a parameter, or an
-annotated binding of a feed, `log: Feed(_) = out`. At a parameter or a binding it is optional: a
-feed is a value, so a parameter bound to one is fed as the feed it names is:
+A feed is a deferred collection: a place whose value its contributions define, with no history
+([8.4 Deferred collections](#84-deferred-collections)). `out` is a place variable. It is never
+stored in data, returned or aliased, and using it as a value copies its final collection:
+`saved = out` binds that collection and leaves `out` the only name of the feed, so
+`saved << value` is a compile-time error, including when `saved` has a `Feed(…)` annotation.
+
+A function contributes to a caller's feed through a parameter that borrows it, passed `&out` at the
+call ([Places and values](#places-and-values)). Two borrows of one feed in one call are both
+contributors, and their contributions are not ordered. A callback cannot retain a borrowed or local
+feed beyond that feed's scope, including through helpers and collection or nominal wrappers. A
+callback capturing one can be passed to a function that calls it within that scope. Passing it to
+a function not known where it is called, or to a recursive one, is **[Planned]**.
 
 ```python
-def fanout(a, b):
-    h: Feed(_)
-    for x in h:
+def emit(out: Feed(Int), value: Int):
+    out << value
+
+out: Feed(Int)
+saved = out
+emit(&out, 1)
+emit(&out, 2)
+sum(saved)                     # 3
+```
+
+A fan-out takes the collection it fans out as an argument and contributes to the feeds it is lent.
+It returns no feed:
+
+```python
+def fanout(xs, a, b):
+    for x in xs:
         a << x
         b << x
-    h
+
+left: Feed(Int)
+right: Feed(Int)
+fanout([1, 2], &left, &right)
+sum(left) + sum(right)         # 6
+```
+
+Feed and Mut declarations cannot be public. A module exports a collection read with an ordinary
+value binding. Its exported functions may contribute to the private Feed.
+
+```python
+# audit.cambra
+_events: Feed(Int)
+pub events = _events
+pub def emit(value):
+    _events << value
+```
+
+```python
+# main.cambra
+run audit as log
+log::emit(1)
+log::emit(2)
+sum(log::events)                # 3
 ```
 
 > **Direction.** **[Tentative]**: `<<` additionally becoming the general
-> append operator for lists/sets/collections. **[Open]**: whether the
-> `<<=` define-statement (§4.4) survives alongside declared feeds.
+> append operator for lists/sets/collections.
 
-#### A deferred collection inside a data structure [Open]
+#### A deferred collection inside a data structure
 
-A feed handle is a value: `http_serve` returns one as half of a tuple (§7.3). A tuple or record
-literal can hold a handle beside other values. A projection or a tuple pattern (§4.3.1) that
-selects the handle out of such a literal denotes the same deferred collection, including where the
-literal is built in a loop body or passed to a function. A literal's components are evaluated
-once, where the literal is built. Selecting the handle evaluates no other component again, and a
-component that reads a mutable variable keeps the value read where the literal is built.
-
-A deferred collection's contributions are gathered where it is declared. What a program means is
-open where it feeds a handle chosen at run time, such as by a conditional, and where a handle is
-carried beyond its declaration's scope. Giving those programs a meaning needs a mechanism that
-follows where a handle goes, such as an effect system or affine or linear types for feed handles.
+A deferred collection nests in nothing: a tuple, record, nominal value or collection holds a feed's
+final collection, never the feed. A field initialized with `out` holds that collection and cannot
+be a feed target. A module exports the collection with an ordinary public binding.
 
 ### 3.8 Function calls
 
@@ -1689,26 +1721,17 @@ result. That statement may be an expression, `return`, a terminal `if`, `match` 
 value-producing `with begin():` block (**[Decided]**). Each follows the
 [block-value rule](#a-block-is-also-the-value-it-computes).
 
-A function value captures the values of free names in its surrounding
-scope at definition time (lexical capture). A captured mutable variable is
-the exception: a call reads it at the call's own position in its history.
+A function value captures the values of free names in its surrounding scope at definition time
+(lexical capture). Capturing an ordinary read of a place captures data
+([Declaring a feed](#declaring-a-feed)).
+Recursion through self-reference is **[Planned]**; for now each
+function must be definable without referring to its own name.
 
-```python
-cnt := 10
-def f(x):
-    cnt + x
-cnt := 20
-f(0)          # 20
-```
-
-A function cannot rebind a captured immutable name. It may read a captured induction variable while
-inside its scope, or read and write a captured transactional variable. A transactional read or write
-requires `Transaction`, which an enclosing `with begin():` block supplies, either in the function or
-at its call. The function's contract records its reads and writes
-([Capabilities](#69-capabilities)).
-
-Recursion through self-reference is **[Planned]**; each function must be definable without referring
-to its own name.
+A function writes a caller's place through a borrowed parameter, supplied with `&`. Its body
+infers borrowing, and a place annotation asserts it. It cannot write a captured induction Mut.
+A function may capture its module's transactional state, currently spelled `Mut(V, Txn)`, and
+write it in a transaction. It may also capture and contribute to a Feed in its declaring scope.
+Borrowed parameters retain their call lifetime in both cases.
 
 `=>` is the function-type arrow. `f: (T => U) = \t -> …` checks a lambda against the function type
 `T => U`, which requires and causes nothing. A `def f(t: T) => U:` fixes its parameter and result
@@ -1941,7 +1964,7 @@ result <<= computation
 `<<=` gives a feed its value outright. Semantics:
 
 - The name on the LHS must be a feed (§3.7): a name declared
-  `result: Feed(V)`, or the response half of `http_serve` (§7.3).
+  `result: Feed(V)`, or a borrowed Feed parameter.
 - `<<=` ties the feed to the RHS: from this point on, every consumer of
   the feed sees the value computed by `computation`.
 - It is a compile-time error to `<<=` a name that is not a feed, or to
@@ -1955,8 +1978,8 @@ forms.
 `<<=` is **not** an augmented assignment — the grammar recognises it
 as its own statement form.
 
-> **Direction.** Whether the define-outright form survives beside
-> declared feeds, and under what spelling, is **[Open]**.
+`<<=` is a contribution, as `<<` is: it stands in the feed's declaring scope, or in a function that
+scope lends the feed to with `&` ([8.4 Deferred collections](#84-deferred-collections)).
 
 ### 4.5 `if` / `elif` / `else`
 
@@ -2383,7 +2406,7 @@ See [Assignment forms](#43-assignment-forms), including the open question about 
 under the decided timeless-equation model.
 
 There is no `global` or `nonlocal` declaration. Functions access enclosing value bindings
-through lexical capture, whose current write restrictions and decided extension are specified
+through lexical capture, whose write restrictions are specified
 under [function definitions](#41-def--function-definition).
 
 > **Direction [Decided].** The top-level scope is its module's. Import
@@ -2674,14 +2697,13 @@ written, so a `def` parameter takes `c: Mut(V)` and not `c <: Mut(V)`.
 
 Whether a value is mutable / feedable / transactional is a property of its
 **type**, expressed as a wrapper: `Mut(V)`, `Feed(V)`, `Mut(V, Txn)`.
-Wrappers have to appear in function signatures and inside data structures
-regardless (a function taking a mutable variable, a map *of* feeds), so
-they are types rather than introducer keywords.
+Wrappers appear in function and module parameter signatures. Writable references cannot be
+stored inside data structures; their value reads can.
 
 `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` are **implemented**. Mutation and
 transactions are specified in §8, feeds in §3.7, and the two supporting
 rules below hold. `Feed(V)` is written at a binder: a declaration, a
-parameter, or an annotated binding
+or an explicitly annotated parameter
 ([Declaring a feed](#declaring-a-feed)).
 
 Two supporting rules (implemented):
@@ -2694,8 +2716,8 @@ Two supporting rules (implemented):
   `List(_)`.
 
 For ergonomics, an initialising `:=` alone marks a variable mutable
-(`total := 0`); a `Mut(_)` annotation is mandatory only where there is no
-initialiser — e.g. a `Mut` parameter (§4.3, §8.1).
+(`total := 0`). Parameter borrowing infers from writes and explicit forwarding; a
+`Mut(_)` annotation can assert it (§4.3, §8.1).
 
 ### Joining the types of several values
 
@@ -3675,9 +3697,9 @@ the context supplies. An effect is an output.
 
 | Effect | Caused by |
 | --- | --- |
-| `WriteTxn(x)` | a write to the transactional mutable variable `x`: `x := e` or a compound assignment, passing `x` to a `Mut` parameter, or a call to a function that writes `x` |
-| `Write(x)` | a write to the induction variable `x`: `x := e`, a compound assignment, passing `x` to a `Mut` parameter, or a call to a function that writes `x` |
-| `Append(f)` | a contribution to the feed `f`: `f << e`, `f <<= e`, passing `f` to a `Feed` parameter, or a call to a function that appends to `f` |
+| `WriteTxn(x)` | a write to the transactional mutable variable `x`: `x := e` or a compound assignment, passing `&x` to a `Mut` parameter, or a call to a function that writes `x` |
+| `Write(x)` | a write to the induction variable `x`: `x := e`, a compound assignment, passing `&x` to a `Mut` parameter, or a call to a function that writes `x` |
+| `Append(f)` | a contribution to the feed `f`: `f << e`, `f <<= e`, passing `&f` to a `Feed` parameter, or a call to a function that appends to `f` |
 | `RunTransaction` | a `with begin():` block ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)) |
 | `AffectWorld` | an output outside the program ([Output outside the program](#output-outside-the-program)) |
 | `Raise(E)` | `raise e` with `e` of type `E` ([Exceptions](#exceptions)) |
@@ -3890,12 +3912,11 @@ footprints and `await_final` dependencies even when the body makes no assignment
   counts as the body does: a call of a function whose clause states `WriteTxn(x)` writes `x` for
   these rules whether or not its body does, and one whose clause holds a top writes every variable
   the top holds.
-- **A public feed belongs to the run too.** A feed is the run's when other modules may append to
-  it: a public feed, or a private one that a public function appends to. No scope's end drops
-  `Append` of it.
-- **A `Mut` or `Feed` parameter's reads and writes are the caller's.** A call passing `a` to a `Mut`
-  parameter requires `Read(a)` and causes `Write(a)`, or `ReadTxn(a)` and `WriteTxn(a)` for a
-  transactional `a`, and one passing `a` to a `Feed` parameter causes `Append(a)`, whether or not
+- **A feed with an exported writer belongs to the run.** A public function may append to a
+  private feed. No scope's end drops `Append` of that feed. The declaration itself stays private.
+- **A `Mut` or `Feed` parameter's reads and writes are the caller's.** A call passing `&a` to a
+  `Mut` parameter requires `Read(a)` and causes `Write(a)`, or `ReadTxn(a)` and `WriteTxn(a)` for a
+  transactional `a`, and one passing `&a` to a `Feed` parameter causes `Append(a)`, whether or not
   the callee reads or writes it. The callee's reads and writes of its own `Mut` or `Feed` parameter
   are not in its type, since the parameter's type states them.
 - **Nothing that leaves a scope names a variable whose history the scope ends.** A scope drops the
@@ -3918,10 +3939,9 @@ footprints and `await_final` dependencies even when the body makes no assignment
   out a function naming a variable whose history the scope ends is. **[Decided]**
 - **Another module writes a run's state through the run.** A module calling `inv::reserve`, which
   writes `inv`'s private `stock`, cannot write `WriteTxn(inv::stock)`, though its diagnostics print
-  it. It writes `WriteTxn(inv::*)`, `inv`'s top, which loses only what it cannot name. A public
-  variable is named as it is reached, `WriteTxn(inv::stock)` for `pub stock`
-  ([9.5 Visibility](#95-visibility)). A Module type's entry writes the private state of the module
-  it describes as `Module::*`, so
+  it. It writes `WriteTxn(inv::*)`, `inv`'s top, which loses only what it cannot name. Place
+  declarations stay private ([9.5 Visibility](#95-visibility)). A Module type's entry writes the
+  private state of the module it describes as `Module::*`, so
   `Module{reserve: Int => {} causes WriteTxn(Module::*), RunTransaction}` is met by a run whose
   `reserve` commits a write to its own state, and a call through a parameter `counter` of that type
   causes `WriteTxn(counter::*)`: the state of the run the parameter takes, which stays abstract
@@ -3990,8 +4010,7 @@ causes `AffectWorld`. A call that sends a request out and returns the reply caus
 requires `ObserveWorld`.
 
 No construct discharges `AffectWorld`. An output inside a `with begin():` block is sent only if the
-block commits ([8.4 Feeds are the second form of
-mutability](#84-feeds-are-the-second-form-of-mutability)).
+block commits ([8.4 Deferred collections](#84-deferred-collections)).
 
 #### Exceptions
 
@@ -4529,7 +4548,7 @@ trait Scales(V, F):
 - **A signature may refine its parameter and result types.** Each call satisfies the parameter
   refinements. Each instance's function satisfies the result refinement. Refinements are
   instantiated at each use of the signature's type parameters.
-- **A parameter may be pass-by-reference.** `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
+- **A parameter may borrow.** `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
   parameter as they do on a `def` ([6.2 Non-purity as type
   wrappers](#62-non-purity-as-type-wrappers)): the caller's variable or feed is the argument, and an
   instance's function writes it. A signature states them nowhere else, neither nested in a type nor
@@ -4939,67 +4958,53 @@ what `groupby` is primarily designed to support.
 
 ### 7.3 Sources
 
-Sources are built-in functions registered at compile time. A source
-call denotes the entire stream the source will produce. `http_serve` is
-both a source and a sink: it returns a source of requests and a sink for the
-responses ([10. Sinks](#10-sinks)).
-
-| Call | Source | Domain |
-|---|---|---|
-| `stdin()` | Process standard input | One element per line of UTF-8 text. |
-| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a feed. Called only as the whole right-hand side of a top-level `=` (see below). |
-
-Additional sources may be pre-registered by the host embedding (testing,
-demos, etc.). `std::time` adds a clock read and an alarm source and sink
-([7.5 Time [Decided]](#75-time-decided)).
+A source denotes the collection of data arriving from outside the program. `stdin()` supplies
+one element per line of UTF-8 input. HTTP routes expose a request collection and accept a response
+collection ([10. Sinks](#10-sinks)).
 
 Opening a source requires `ObserveWorld`, and binding a sink causes `AffectWorld`
 ([Inputs from outside the program](#inputs-from-outside-the-program),
 [Output outside the program](#output-outside-the-program)). A reading, such as the clock, is a call
 of a `@Builtin` function a std module declares ([9.16 The std root](#916-the-std-root)).
 
-`http_serve` opens its route when the program starts, so a call is the
-whole right-hand side of a `=` in the top-level block, and its three
-arguments are string constants ([9.19 Constants](#919-constants)): a module
-takes its route's address from a `const param`, and each run serves the
-address its arguments give. The target is any pattern (§4.3), and a tuple
-pattern names the two sides:
 
 ```python
-reqs, resps = http_serve(port, method, path)
+run std::http(port="8080", method="POST", path="/echo") as server
+replies: Feed(String)
+for request in server::requests:
+    replies << request
+server::respond(replies)
 ```
 
-- the `reqs` side is a streaming source: each element is the
-  body of one incoming request to `(method, path)` on `port`.
-- the `resps` side is a sink, a feed: feeds into it
-  (via `<<` from a request-handler `for` loop, or via `<<=` once)
-  become the response bodies. The sink pairs each response with its
-  triggering request — the request that was bound to the loop
-  variable in the iteration that produced the response.
+`std::http` takes three string constants, `port`, `method`, and `path`
+([9.19 Constants](#919-constants)). Each run opens its route when the program starts.
+`requests` contains incoming request bodies as Strings. `respond(values)` consumes an ordinary
+String collection. Each response's position pairs it with the request that triggered that
+iteration. The module keeps its writable response place private.
 
-Multiple `http_serve` calls in the same program that share a `port`
-share an HTTP listener; the `(port, method, path)` triple must be
-unique across the program, across all its runs.
+Runs sharing a port share an HTTP listener. The `(port, method, path)` triple must be unique
+across all runs in the program. A module can take an address from `const param` declarations
+and run `std::http` with those arguments. The internal `http_serve` declaration primitive is
+reserved for the embedded standard module and is unavailable to user code.
 
-> **Direction [Open].** The HTTP module design is deliberately parked
-> (2026-06-29, Open/deferred):
-> how responses carry status codes, the structured-request surface
+Additional sources can be registered for tests and demos. The proposed `std::time` API adds a
+clock read ([7.5 Time [Decided]](#75-time-decided)).
+
+> **Direction [Open].** The HTTP module exposes request bodies and String responses. Extensions
+> for status codes, the structured-request surface
 > (`req.body`, `req.query`, `req.time`, headers), response pairing via
 > feed-at-index (`resps[req.id] = …`, as the north-star `txn_kv`
-> writes it), and multi-endpoint multiplexing are all sketches, not
-> decisions — closing any of them out means designing the HTTP
-> library. The sketch the north-star `storefront` handlers are
+> writes it), and structured response serialization remain unspecified. The sketch the
+> north-star `storefront` handlers are
 > written against: a response is a record,
 > `{code: {Int where 100 <= _ <= 599}, body: String}`, and the status
 > constructors are ordinary library functions over it
 > (`def not_found(body): (code=404, body=body)`, likewise `ok` /
 > `bad_request` / `conflict`), with the record literal as the escape
-> hatch for other codes — no new language surface. They live in an
-> **`http` module** (**[Decided]**): programs write `import std::http`,
-> which binds `http`, then `http::ok(…)` / `http::not_found(…)`, and
-> address the source the same way, `http::serve(…)`. `std::http` is a
-> module of the std root ([9.16 The std root](#916-the-std-root)).
-> The north-star programs still spell these `http.ok` and `http.serve`.
+> hatch for other codes. The HTTP module is a module of the std root
+> ([9.16 The std root](#916-the-std-root)). It is run to
+> expose its request collection and response function. A function may return collection values.
+> The location of pure response constructors remains to be specified.
 > A response feed's
 > element type would be per-endpoint: a bare serializable value,
 > answered as a 200 carrying it (`txn_kv` writes `String` bodies; the
@@ -5112,8 +5117,8 @@ filtered box is not a `List(T)`, because a filtered range of positions has gaps:
 **[Decided]** — the rules of this section. **[Planned]** — `std::time` as a module of the std
 root ([9.16 The std root](#916-the-std-root)).
 
-`std::time` provides a reading of the wall clock, `time::now()`, and an alarm source and sink,
-`time::alarms()`. Its other members are library functions over the two types it declares:
+`std::time` provides a reading of the wall clock, `time::now()`. Alarms require a separate
+module interface, which remains open. The other time members are library functions over two types:
 `time::Instant`, a point on the UTC timeline counted in nanoseconds since the Unix epoch, and
 `time::Duration`, a length of time in nanoseconds. `Instant` is unrelated to the builtin `Time`, a
 position in the commit order ([6. Types (informal sketch)](#6-types-informal-sketch)).
@@ -5143,55 +5148,22 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
   through a function, requires `ObserveWorld` and is run
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 
-#### `time::alarms()`
+#### Alarms
 
-`time::alarms()` returns a source and a sink. Each row fed to the sink is held, and comes out of
-the source once the clock reads at or after the row's `time::at` field. `std::time` declares it as:
+**[Open]**
 
-```python
-def alarms(R <: {at: Instant}) => {Source(R), Feed(R)}
-```
+Alarms expose a source and a sink through a module. Each row fed to the sink is held and
+arrives on the source once the clock reads at or after the row's `time::at` field.
 
-```python
-import std::time
-
-expiries, set_expiry = time::alarms()
-
-sessions: Mut(Map(String, time::Instant), Txn) := Map::empty   # session id -> expiry
-expired: Feed(_)
-
-for r in requests:
-    with begin():
-        expiry = time::now() + time::minutes(30)
-        sessions[r.session] := expiry
-        set_expiry << (session=r.session, time::at=expiry)
-
-for r in logouts:
-    with begin():
-        sessions[r.session] := time::now()
-
-for e in expiries:
-    with begin():
-        match sessions[e.session]:
-            case Option::some(expiry):
-                if expiry == e.time::at:
-                    expired << (session=e.session)
-            case Option::none:
-                pass
-```
-
-- **Binding.** The call is bound at a module's top level by tuple destructuring, as `http_serve` is
-  ([7.3 Sources](#73-sources)). The call opens a source, so the calling module's top level requires
-  `ObserveWorld`, and `std::time` itself stays shareable.
-- **Rows.** `R` is the row type, bounded by `{at: Instant}`
-  ([Kinds and bounds](#kinds-and-bounds)), so a row is the caller's own record with a field
-  `time::at: time::Instant`. The label belongs to `std::time` ([9.12 Field labels and tags belong
+- **Binding [Open].** Alarms require a module API, as HTTP does
+  ([7.3 Sources](#73-sources)). The module interface remains to be specified. Its run opens
+  a source and performs IO; `std::time` itself stays importable.
+- **Rows.** A row is the caller's own record with a field `time::at: time::Instant`. The label
+  belongs to `std::time` ([9.12 Field labels and tags belong
   to a module](#912-field-labels-and-tags-belong-to-a-module)), and every other field is the
-  caller's. The call's uses determine `R`, as any type parameter's uses do
-  ([Type parameters](#type-parameters)): the rows the program feeds the sink and its loops over the
-  source. `Source(R)` is a source whose elements are `R`s.
+  caller's.
 - **Holding.** A row fed inside a `with begin():` block is held only if the transaction commits
-  ([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)). A
+  ([8.4 Deferred collections](#84-deferred-collections)). A
   row whose `at` has passed when it is held comes out at once.
 - **Release.** The runtime releases a row once its clock reads at or after the row's `at`. A
   reading in the transaction handling the row has no order relative to the release and can be
@@ -5203,14 +5175,14 @@ for e in expiries:
   A row held after another row's release can arrive after it with an earlier `at`.
 - **A release is a reminder to check, never a decision.** A row comes out whether or not a later
   transaction superseded the decision that held it. The handler's transaction reads the state the
-  row refers to, as the example's comparison of `e.time::at` with the session's current expiry
-  does.
+  row refers to. A session-expiry handler compares `e.time::at` with the session's current
+  expiry before expiring it.
 - **No feed cycle.** A loop over the source that feeds the sink closes no cycle of feeds: the path
   from the sink to the source passes through the runtime, as `http_serve`'s responses and requests
   pass through a client.
-- **Reload keeps held rows; a process exit discards them.** The pair's identity is the module path
-  and name of the binding that holds it, as a mutable variable's is, and a reload that keeps the
-  binding keeps its held rows. Durable state is **[Tentative]** ([8.8 `@LoadFrom`](#88-loadfrom)).
+- **Reload keeps held rows; a process exit discards them.** The run's identity is its module path
+  and name. A reload that keeps the run keeps its held rows. Durable state is **[Tentative]**
+  ([8.8 `@LoadFrom`](#88-loadfrom)).
 
 ### 7.6 `int_to_uint` (temporary)
 
@@ -5283,11 +5255,11 @@ balance: Mut(Int, Txn) := 0    # transactional mutable variable over the commit 
   commitment the program must spell, so a transactional mutable variable is always
   introduced `balance: Mut(V, Txn) := …`.
 - `Mut(…)` is also legal as a function **parameter** annotation —
-  pass-by-reference, so a callee can write the caller's variable
+  a borrowed parameter, so a callee can write the caller's variable
   (§6.2). It carries a **downward-only, no-aliasing** discipline: a `Mut`
-  argument is always a bare variable (never a computed expression), `Mut`
+  argument is always an explicit borrow of a named place, `&x`, `Mut`
   never appears inside a composite type (no tuple/record/list/`Feed` of
-  `Mut`, so it is never returned).
+  `Mut`, so a function returns its read value).
 
   A plain `b = a` off a mutable **reads** it — a snapshot of its current
   value, exactly as `a + 1` or `f(a)` read it. It is not an alias, and not
@@ -5383,8 +5355,7 @@ for req in withdraw_reqs:
   that path computed.
 - **The value is available once the block commits.** Inside a loop, each iteration binds its own
   block's value, so a reply after the block is indexed by the iteration, as any reply outside a
-  block is ([8.4 Feeds are the second form of
-  mutability](#84-feeds-are-the-second-form-of-mutability)).
+  block is ([8.4 Deferred collections](#84-deferred-collections)).
 - **A block that only reads transactional variables is a snapshot read.** It is a transaction like
   any other: it takes its place in the commit order and reads the snapshot there
   ([8.3 Reads](#83-reads)). It reads several variables at one snapshot:
@@ -5415,7 +5386,7 @@ for req in withdraw_reqs:
   the commit order of the variables it mentions, whether or not it writes, and reads the
   commits before that place. A block that only reads is a transaction too:
   `with begin(): resp << balance` reads `balance` as of its own place and replies as any block
-  does ([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)).
+  does ([8.4 Deferred collections](#84-deferred-collections)).
   This is uniform whether the reader is a live request stream, a finite loop, or a standalone
   block.
 - **Terminal read — `await_final(x)`.** `await_final(x)` waits for `x`'s whole
@@ -5423,14 +5394,75 @@ for req in withdraw_reqs:
   terminal read of a mutable variable: every other read is at a transaction's own place in the
   commit order, so a program that means the final value has to say so.
 
-### 8.4 Feeds are the second form of mutability
+### 8.4 Deferred collections
 
-A feed (`<<`, §3.7) is the **same history object** as a mutable variable,
-under the **append-only** merge law: contributions union (`++`), there is
-no carry-forward, and a read yields the whole collection — which is
-exactly why a feed is an unordered bag (§3.7) while a mutable variable
-derefs to a single latest value. `o << e` is surface-impure in the same
-way `x := e` is; the two differ only in that merge law.
+A feed is a **deferred collection**: an immutable place whose value is defined piecewise, by its
+`<<` contributions or its one `<<=` definition, which combine without order. It has no history.
+Its name denotes its final collection, and no read observes it partly defined, wherever the read
+stands. The collection's elements reach its consumers as they are contributed.
+
+The contributions that define a feed are those in its declaring scope, those in a function that
+scope lends it to with `&`, for the duration of that call, and those in a `def` of the declaring
+module that captures it. Nothing else contributes to a feed.
+
+#### Places and values
+
+A **value** is immutable data. A **place** holds a value: a `Mut(V)` is a mutable place, and a
+`Feed(T)` an immutable one whose value is defined piecewise. A variable whose type is `Mut(…)` or
+`Feed(…)` is a **place variable**, and every other variable is a **value variable**. A place type
+nests in nothing, and the value a place holds may be nested to any depth. A place variable is never
+stored in data, returned, aliased or public, and no operation moves it.
+
+Using a place variable as a value copies its value at the reader's position. A `Mut` gives its
+value at that point in the program, and a feed gives its final collection. Assignment, return,
+product fields and arguments to plain parameters are such uses. `saved = out` therefore binds
+collection data, and a function ending in bare `out` returns collection data. Neither exposes the
+feed.
+
+A **borrow**, `&x` at a call, lends a place for the duration of that call. An unmarked argument is
+always a copy. A parameter's borrow mode is part of its type, and the body supplies it: a parameter
+the body writes, feeds or lends on with `&` borrows, and one the body only reads is a plain
+parameter. An explicit `Mut(V)` or `Feed(T)` annotation asserts the mode. Passing `&x` to a plain
+parameter, or an unmarked place to a borrowing one, is a compile-time error.
+
+```python
+def emit(out, value):
+    out << value
+
+out: Feed(Int)
+emit(&out, 7)
+saved = out                 # ordinary collection data
+```
+
+A `Mut(V)` or `Feed(V)` type is well-formed only if no function type in `V` causes an effect on a
+place: an append to a feed or a write of a mutable variable. No place is inside a place, as a
+function type causing `Append(out)` would carry `out` into the value. The function type may be `V`
+itself or nested in a product, a nominal type or a collection. A function type that only requires
+reading a place may be in `V`. A collection type's own effects are the ones that ran where it was
+built, so they do not count. A write or an append handing a place such a function is an error, as
+the place's type would not be well-formed.
+
+```python
+out: Feed(Int)
+def emit(value: Int):
+    out << value
+saved := emit               # error: `Mut(Int => {} causes Append(out))` is not well-formed
+callbacks: Feed(Int => {})
+callbacks << emit           # error: `callbacks` would hold a function causing `Append(out)`
+```
+
+Mutable borrows are exclusive during one call. Deferred borrows are shared and unordered: a function
+may receive `&out` twice and contribute through both parameters. A borrowed place cannot escape
+through a returned or stored callback. A function in a Feed's declaring module may
+capture it and contribute. Captured induction Mut writers are rejected; captured transactional
+state, currently spelled `Mut(V, Txn)`, supports writes in transactions. Place declarations cannot
+be public. A module exports a Feed read explicitly, `pub values = out`, and other modules contribute
+through functions that capture the private place.
+
+Prefix `&` binds tighter than postfix access: `&xs.push(v)` has receiver `&xs`. A borrow is
+written only as a call argument or a method receiver. A borrowed method receiver and a borrow of a
+projected part of a place, `&r.f`, are **[Planned]**; a function takes a named place through an
+explicit argument.
 
 Two feed shapes interact with transactions, and the difference is
 observable:
@@ -5919,7 +5951,7 @@ import audit_api
 
 param port: String
 param region: String = "us"
-param audit: audit_api::AuditLog   # Module{events: Feed(audit_api::Event)}
+param audit: audit_api::AuditLog   # Module{emit: audit_api::Event => {}}
 param Receipt <: {id: String}
 param payments: Module{charge: {amount: Int} => Receipt}
 ```
@@ -5991,25 +6023,12 @@ pub type Price = {amount: Int}
 pub def Price::discounted(self, pct: Int) => Price: …
 ```
 
-`pub` on a transactional mutable variable:
-
-```python
-pub stock: Mut(Map(String, Int), Txn) := Map::empty
-```
-
-**[Planned]** A declaration loaded with `@LoadFrom` is an ordinary declaration without an
-initializer ([8.8 `@LoadFrom`](#88-loadfrom)), so its `pub` stands at the head of the declaration's
-line, below the decorator:
-
-```python
-@LoadFrom(qty)
-pub held: Int
-```
+Mut and Feed declarations cannot be public. An ordinary public value binding reads a private
+place explicitly, for example `out: Feed(Int)` followed by `pub values = out`. An exported
+function may contribute to a private Feed.
 
 - A member without `pub` is private. Only its own module can name it.
-- `pub` on `:=` is accepted on the statement that introduces a `Txn` mutable variable, which states
-  its type `Mut(V, Txn)`, and refused on a later write to it. It is refused on an induction variable
-  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+- `pub` is refused on Mut and Feed declarations, including `@LoadFrom` declarations.
 - `pub` is refused on `import`, `run`, `param`, `op=`, `<<=`, `for`, `if`, `match`, `with`,
   expression statements, and anywhere but a module's top level.
 - A public name is bound exactly once at its module's top level. A later binding of the same
@@ -6048,15 +6067,15 @@ parameter of Module type, and a member bound to one of them, `pub audit = a` ([9
 whether reached by its name, through a path of public members, `shop::audit`, or through `use`. `::`
 separates the name from the member, and `.` stays record projection ([3.9 Subscript and attribute
 access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run shop::cart as c`, and
-`param p: Module{count: Mut(Int, Txn)}`:
+`param p: Module{count: Int}`:
 
 | Written | Position | Means |
 | --- | --- | --- |
 | `cart::total` | value | the public member `total` of `shop::cart`'s shared import |
 | `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias or a nominal type |
-| `c::count` | value, write target | the public member `count` of the run `c` |
+| `c::count` | value | the public value member `count` of the run `c` |
 | `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
-| `p::count` | value, write target | the member `count` of the run passed as `p` |
+| `p::count` | value | the public value member `count` of the run passed as `p` |
 | `cart` | value | `shop::cart`'s shared import, as a value of its Module type ([9.8 Module types](#98-module-types)) |
 | `c` | value | the run `c`, as a value of its Module type |
 | `cart::hidden` | any | error: `hidden` is private to `shop::cart`, with a secondary label at its declaration |
@@ -6068,10 +6087,8 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 - An import name is in scope throughout its module, including above the statement: an import is a
   static fact rather than an evaluation, so no order constrains it. A run name is in scope from its
   statement down ([9.3 Runs](#93-runs)).
-- A qualified member is a named callee. `cart::total(x)` is a call to the member it resolves to,
-  including the special forms (**[Planned]**) and `Mut`-parameter call shapes that dispatch on the
-  callee. Through a parameter, `p::f(x)` takes its call shape from `f`'s type in the
-  parameter's Module type (**[Planned]**).
+- A qualified member is a named callee. `cart::total(x)` calls the member it resolves to. Explicit
+  borrow arguments select the call shape, including through Module-typed parameters.
 - A qualified generic member keeps its polymorphism: `n::id(1)` and `n::id("a")` both check.
 - A name an import's `use` clause binds is in scope throughout its module, including above the
   statement, as the import name is. One a run's `use` clause binds is in scope from the `run`
@@ -6129,14 +6146,14 @@ module: a module that serves a route or holds a run's state is run, whatever els
   a sink causes `AffectWorld`. Its module is run.
 - **A transactional mutable variable makes its module a run.** Its declaration writes it, which
   causes `WriteTxn(x)`, and no construct discharges that.
-- **So does a public feed.** Other modules append to it, so declaring it causes `Append`, which
-  the top level's end does not discharge.
+- **A feed with an exported writer makes its module a run.** A public function appends to the
+  private feed, so its `Append` remains beyond the top level's scope.
 - **An induction variable and a private feed do not.** Each one's history ends with the top level,
   so its writes are discharged there, and a module whose only state is induction variables and
   private feeds is shareable when nothing else makes it a run. A public function that reads or
   writes an induction variable names it past its scope, which is an error
   ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
-  A public function that appends to a private feed makes the feed the run's, as a public feed is,
+  A public function that appends to a private feed makes the feed the run's,
   since appends commute and have no order to lose across modules.
 - **`@LoadFrom` is outside this model.** A loaded declaration
   ([8.8 `@LoadFrom`](#88-loadfrom)) binds a plain value the version it replaces carried across the
@@ -6152,15 +6169,13 @@ A **Module type** is the structural type of a module's public members. It is wri
 type, with `Module` before the braces:
 
 ```python
-pub AuditLog = Module{events: Feed(Event)}
+pub AuditLog = Module{emit: Event => {}}
 param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt}
 ```
 
 | Public member | Entry |
 | --- | --- |
 | value, `def` | `name: T`, at its contract, which may be polymorphic |
-| feed | `name: Feed(T)` |
-| `Txn` mutable variable | `name: Mut(V, Txn)` |
 | member bound to a module, `pub audit = a` | `name: Module{…}`, the Module type of the module it is bound to |
 | type alias | `Name = T` for an exact type, `Name <: T` for one known through a bound, or `Name: K` for one known through its kind, any of them followed by a `requires` clause on it (**[Decided]**) |
 | nominal type | `Name = T`, where `T` is the nominal type |
@@ -6187,7 +6202,7 @@ type member satisfies 𝐵's bound. Width subtyping lets a consumer name only th
 
 ```python
 # storefront.cambra
-param audit: audit_api::AuditLog     # Module{events: Feed(audit_api::Event)}
+param audit: audit_api::AuditLog     # Module{emit: audit_api::Event => {}}
 
 # deploy.cambra
 run audit
@@ -6216,29 +6231,12 @@ import holds no state that outlives its top level
 ```python
 run audit
 run storefront(port="8080", audit=audit) as eu
-run storefront(port="8081", audit=audit) as us   # eu and us feed one `audit::events`
+run storefront(port="8081", audit=audit) as us   # eu and us call one `audit::emit`
 ```
 
-A program of modules means what the same code means written in one file, with each member spelled
-by its qualified name. For mutable state, modules add visibility and nothing else:
-
-- A public mutable variable is a `Txn` variable. It is read and written through a qualified
-  reference inside a `with begin():` block, or in a function a block calls ([8.3
-  Reads](#83-reads)), and `await_final(eu::stock)` reads its final value ([8.6
-  `await_final`](#86-await_final)). `=` does not rebind one.
-- A qualified reference is a bare variable reference, so `eu::stock` may be passed to a `Mut`
-  parameter under the downward-only discipline of [8.1 Mutation is explicit: the `:=`
-  operator](#81-mutation-is-explicit-the--operator).
-- A Module type's entry `stock: Mut(V, Txn)` is the variable of the run passed for the parameter,
-  not a copy: `p::stock := e` writes the argument's `stock`. `Mut` is invariant, so the argument's
-  variable has value type `V` exactly.
-- A public feed is fed and read through a qualified reference. Append merges commutatively, so
-  several writers are a feed's semantics.
-- A module that keeps its state private and exports functions over it relies on functions that
-  capture mutable variables ([4.1 `def` — function definition](#41-def--function-definition)) and
-  that run inside their caller's transaction
-  ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
-  Exporting only functions that read is how a module publishes state other modules cannot write.
+A module's Mut and Feed declarations stay private. Public value bindings expose ordinary reads.
+A module may export functions that contribute to its private Feed. A caller invokes those
+functions through the run's qualified name; qualified collection values cannot be fed into.
 
 ### 9.10 Induction variables stay in their module
 
@@ -6263,11 +6261,10 @@ Within one module the source is that order. Between modules no source order exis
 induction variable would have no defined position in its history. A `Txn` variable has no such
 problem: its order is the commit order the transaction engine decides at run time, not program text.
 
-- A module passes its own induction variable to another module's function, `lib::bump(cnt)`. The
+- A module passes its own induction variable to another module's function, `lib::bump(&cnt)`. The
   call sits in the caller's program order, so the writes it makes have their place.
-- A module publishes an induction variable's progression by feeding it out, `pub counts: Feed(Int)`
-  with `counts << cnt` in the loop. A feed's order is its own, and several readers are its
-  semantics.
+- A module publishes an induction variable's progression through a private `_counts: Feed(Int)`
+  with `_counts << cnt` in the loop and an ordinary export, `pub counts = _counts`.
 - A module publishes an induction variable's value at one position by binding it to an immutable
   public member there. The member is an ordinary value, read like any other:
 
@@ -6568,16 +6565,13 @@ that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
 ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), answer that declaration
 in every module, a module that declares its own `Option` included.
 
-**[Planned]** — `std::http` and `std::time`:
-`import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
-Sources](#73-sources)), and `import std::time` binds `time`, then `time::now()` and
-`time::alarms()` ([7.5 Time [Decided]](#75-time-decided)). A builtin source, sink, or
-special form a std module provides is recognized by what a name resolves to, not by how it is
-spelled. After `import std::http as web`, `reqs, resps = web::serve(…)` is the same form as
-`http::serve(…)`, and
-the bare name `http_serve` is gone. Its address arguments are constants
-([9.19 Constants](#919-constants)), so a module that serves a route takes its address as a
-`const param` and each run serves its own.
+`std::http` is embedded in the compiler. `run std::http(…) as server` exposes
+`server::requests` and `server::respond(values)` ([7.3 Sources](#73-sources)). It declares state and
+IO, so it is run rather than imported. Its address arguments are constants
+([9.19 Constants](#919-constants)), and each run serves its own address.
+
+**[Planned]** — `std::time`: `import std::time` binds `time`, then `time::now()`
+([7.5 Time [Decided]](#75-time-decided)).
 
 **[Planned]** — the builtins in the prelude: `sum`, `max`, `groupby`, `stdin`, `box`, `begin`, and
 the rest stay unqualified in every module as prelude names of std modules.
@@ -6750,13 +6744,6 @@ pub type Capped = {Int where _ <= limit}
 
 ### 9.20 Open questions
 
-- **Read-only export.** A public `Txn` variable is writable by every module that reaches it. A
-  modifier such as `pub(read)` would let a module publish it for reading while its writes, and so
-  its invariants, stay local. Until then a module exports functions that read.
-- **An induction variable's final value.** `pub` on an induction variable could export the value
-  after all its writes, which has a position independent of program order. Refused for now. A module
-  binds the value at a position to an immutable public member instead
-  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
 - **Packages.** Dependencies outside the module root, a search path of roots, versioning, and a
   manifest. The rules of [9.15 Module files](#915-module-files) extend to several roots with a
   collision between roots refused.

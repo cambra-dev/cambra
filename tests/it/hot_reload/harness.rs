@@ -287,10 +287,13 @@ pub(crate) mod fixtures {
 
     pub const BUMP_OVER_SOURCE: &str = indoc! {r#"
         n := ""
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
             n := n + "a"
-            resps << n + "\n"
+            http_resps_replies << n + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     /// `BUMP_OVER_SOURCE` with a different declared init, and nothing else
@@ -298,10 +301,13 @@ pub(crate) mod fixtures {
     /// only ever read on a fresh start.
     pub const BUMP_OVER_SOURCE_RESEEDED: &str = indoc! {r#"
         n := "seed"
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
             n := n + "a"
-            resps << n + "\n"
+            http_resps_replies << n + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     /// A record-valued accumulator, and the same program with one field at
@@ -310,153 +316,217 @@ pub(crate) mod fixtures {
     /// only exists between versions.
     pub const RECORD_ACCUMULATOR: &str = indoc! {r#"
         n := (a=0, b=1)
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
             n := (a=n.a + 1, b=n.b)
-            resps << "ok\n"
+            http_resps_replies << "ok\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const RECORD_ACCUMULATOR_RETYPED_FIELD: &str = indoc! {r#"
         n := (a=0, b="x")
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
             n := (a=n.a + 1, b=n.b)
-            resps << "ok\n"
+            http_resps_replies << "ok\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const BUMP_OVER_A_FIXED_LIST: &str = indoc! {r#"
         n := ""
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for x in ["y", "z"]:
             n := n + x
         for r in reqs:
-            resps << n + "\n"
+            http_resps_replies << n + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const BUMP_OVER_A_MARKED_LIST: &str = indoc! {r#"
         n := ""
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for x in ["y", "z"]:
             n := n + x + "!"
         for r in reqs:
-            resps << n + "\n"
+            http_resps_replies << n + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const BUMP_OVER_ANOTHER_FIXED_LIST: &str = indoc! {r#"
         n := ""
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for x in ["p", "q"]:
             n := n + x
         for r in reqs:
-            resps << n + "\n"
+            http_resps_replies << n + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const GUESTBOOK_ADDS_ROUTE: &str = indoc! {r#"
         entries := ""
 
-        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
-        added_reqs, added_resps = http_serve("{PORT}", "GET", "/added")
+        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(String)
+        sign_reqs = http_sign_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(String)
+        peek_reqs = http_peek_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/added") as http_added_resps
+        http_added_resps_replies: Feed(String)
+        added_reqs = http_added_resps::requests
 
         for entry in sign_reqs:
             entries := entries + entry + "\n"
-            sign_resps << entries
+            http_sign_resps_replies << entries
 
         for req in peek_reqs:
-            peek_resps << "peek\n"
+            http_peek_resps_replies << "peek\n"
 
         for req in added_reqs:
-            added_resps << "added\n"
+            http_added_resps_replies << "added\n"
+        http_sign_resps::respond(http_sign_resps_replies)
+        http_peek_resps::respond(http_peek_resps_replies)
+        http_added_resps::respond(http_added_resps_replies)
     "#};
 
     pub const GUESTBOOK_DROPS_ROUTE: &str = indoc! {r#"
         entries := ""
 
-        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(String)
+        sign_reqs = http_sign_resps::requests
 
         for entry in sign_reqs:
             entries := entries + entry + "\n"
-            sign_resps << entries
+            http_sign_resps_replies << entries
+        http_sign_resps::respond(http_sign_resps_replies)
     "#};
 
     pub const GUESTBOOK_DROPS_STATE: &str = indoc! {r#"
-        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(String)
+        sign_reqs = http_sign_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(String)
+        peek_reqs = http_peek_resps::requests
 
         for entry in sign_reqs:
-            sign_resps << entry + "\n"
+            http_sign_resps_replies << entry + "\n"
 
         for req in peek_reqs:
-            peek_resps << "peek\n"
+            http_peek_resps_replies << "peek\n"
+        http_sign_resps::respond(http_sign_resps_replies)
+        http_peek_resps::respond(http_peek_resps_replies)
     "#};
 
     pub const GUESTBOOK_RETYPES_STATE: &str = indoc! {r#"
         entries := 0
 
-        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(String)
+        sign_reqs = http_sign_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(String)
+        peek_reqs = http_peek_resps::requests
 
         for entry in sign_reqs:
             entries := entries + 1
-            sign_resps << "signed\n"
+            http_sign_resps_replies << "signed\n"
 
         for req in peek_reqs:
-            peek_resps << "peek\n"
+            http_peek_resps_replies << "peek\n"
+        http_sign_resps::respond(http_sign_resps_replies)
+        http_peek_resps::respond(http_peek_resps_replies)
     "#};
 
     pub const GUESTBOOK_RETYPES_STATE_ADDS_ROUTE: &str = indoc! {r#"
         entries := 0
 
-        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
-        added_reqs, added_resps = http_serve("{PORT}", "GET", "/added")
+        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(String)
+        sign_reqs = http_sign_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(String)
+        peek_reqs = http_peek_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/added") as http_added_resps
+        http_added_resps_replies: Feed(String)
+        added_reqs = http_added_resps::requests
 
         for entry in sign_reqs:
             entries := entries + 1
-            sign_resps << "signed\n"
+            http_sign_resps_replies << "signed\n"
 
         for req in peek_reqs:
-            peek_resps << "peek\n"
+            http_peek_resps_replies << "peek\n"
 
         for req in added_reqs:
-            added_resps << "added\n"
+            http_added_resps_replies << "added\n"
+        http_sign_resps::respond(http_sign_resps_replies)
+        http_peek_resps::respond(http_peek_resps_replies)
+        http_added_resps::respond(http_added_resps_replies)
     "#};
 
     pub const GUESTBOOK_STATELESS_EDIT: &str = indoc! {r#"
         entries := ""
 
-        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(String)
+        sign_reqs = http_sign_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(String)
+        peek_reqs = http_peek_resps::requests
 
         for entry in sign_reqs:
             entries := entries + entry + "\n"
-            sign_resps << entries
+            http_sign_resps_replies << entries
 
         for req in peek_reqs:
-            peek_resps << "peek edited\n"
+            http_peek_resps_replies << "peek edited\n"
+        http_sign_resps::respond(http_sign_resps_replies)
+        http_peek_resps::respond(http_peek_resps_replies)
     "#};
 
     pub const LATEST_WRITE: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         latest: Mut(String, Txn) := "(none)"
 
         for msg in set_reqs:
             with begin():
                 latest := msg
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << latest
+                http_get_resps_replies << latest
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     /// [`LATEST_WRITE`] with `latest` retired and a new variable seeded from the
     /// value it held. The one program shape the `@LoadFrom` cases vary.
     pub const LATEST_WRITE_MIGRATED: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         @LoadFrom(latest)
         held: String
@@ -466,18 +536,24 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 marked := msg + "!"
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << marked
+                http_get_resps_replies << marked
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     /// [`LATEST_WRITE_MIGRATED`] keeping `latest` as well — the declared-and-loaded
     /// case, where a version seeds a new variable from one it goes on holding.
     pub const LATEST_WRITE_MIGRATED_BESIDE: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         latest: Mut(String, Txn) := "(none)"
         @LoadFrom(latest)
@@ -488,17 +564,23 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 latest := msg
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << latest + "/" + marked
+                http_get_resps_replies << latest + "/" + marked
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     /// [`LATEST_WRITE_MIGRATED`] loading a name no version ever declared.
     pub const LATEST_WRITE_LOADS_A_STRANGER: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         @LoadFrom(nonesuch)
         held: String
@@ -508,18 +590,24 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 marked := msg + "!"
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << marked
+                http_get_resps_replies << marked
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     /// [`LATEST_WRITE_MIGRATED`] reading the loaded value as an `Int`, which is
     /// not what `latest` holds.
     pub const LATEST_WRITE_MIGRATED_RETYPED: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         @LoadFrom(latest)
         held: Int
@@ -529,106 +617,147 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 marked := marked + 1
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << "ok\n"
+                http_get_resps_replies << "ok\n"
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const LATEST_WRITE_WRITER_EDIT: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         latest: Mut(String, Txn) := "(none)"
 
         for msg in set_reqs:
             with begin():
                 latest := msg + "!"
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << latest
+                http_get_resps_replies << latest
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const ONE_STATEFUL_LOOP: &str = indoc! {r#"
         n := ""
-        p, pr = http_serve("{PORT}", "POST", "/p")
-        q, qr = http_serve("{PORT}", "POST", "/q")
+        run std::http(port="{PORT}", method="POST", path="/p") as http_pr
+        http_pr_replies: Feed(String)
+        p = http_pr::requests
+        run std::http(port="{PORT}", method="POST", path="/q") as http_qr
+        http_qr_replies: Feed(String)
+        q = http_qr::requests
         for x in p:
             n := n + "a"
-            pr << n + "\n"
+            http_pr_replies << n + "\n"
         for y in q:
-            qr << "q\n"
+            http_qr_replies << "q\n"
+        http_pr::respond(http_pr_replies)
+        http_qr::respond(http_qr_replies)
     "#};
 
     pub const ONE_STATEFUL_LOOP_BOTH: &str = indoc! {r#"
         n := ""
         m := ""
-        p, pr = http_serve("{PORT}", "POST", "/p")
-        q, qr = http_serve("{PORT}", "POST", "/q")
+        run std::http(port="{PORT}", method="POST", path="/p") as http_pr
+        http_pr_replies: Feed(String)
+        p = http_pr::requests
+        run std::http(port="{PORT}", method="POST", path="/q") as http_qr
+        http_qr_replies: Feed(String)
+        q = http_qr::requests
         for x in p:
             n := n + "a"
-            pr << n + "\n"
+            http_pr_replies << n + "\n"
         for y in q:
             m := m + "b"
-            qr << m + "\n"
+            http_qr_replies << m + "\n"
+        http_pr::respond(http_pr_replies)
+        http_qr::respond(http_qr_replies)
     "#};
 
     pub const ONE_STATEFUL_LOOP_MOVED: &str = indoc! {r#"
         n := ""
-        p, pr = http_serve("{PORT}", "POST", "/p")
-        q, qr = http_serve("{PORT}", "POST", "/q")
+        run std::http(port="{PORT}", method="POST", path="/p") as http_pr
+        http_pr_replies: Feed(String)
+        p = http_pr::requests
+        run std::http(port="{PORT}", method="POST", path="/q") as http_qr
+        http_qr_replies: Feed(String)
+        q = http_qr::requests
         for x in p:
-            pr << "p\n"
+            http_pr_replies << "p\n"
         for y in q:
             n := n + "a"
-            qr << n + "\n"
+            http_qr_replies << n + "\n"
+        http_pr::respond(http_pr_replies)
+        http_qr::respond(http_qr_replies)
     "#};
 
     pub const RUNNING_LOG: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         log: Mut(String, Txn) := ""
 
         for msg in set_reqs:
             with begin():
                 log := log + msg
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << log
+                http_get_resps_replies << log
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const RUNNING_LOG_WRITER_EDIT: &str = indoc! {r#"
-        set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-        get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
 
         log: Mut(String, Txn) := ""
 
         for msg in set_reqs:
             with begin():
                 log := log + "-" + msg
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
 
         for req in get_reqs:
             with begin():
-                get_resps << log
+                http_get_resps_replies << log
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const TWO_ACCUMULATORS: &str = indoc! {r#"
         left := ""
         right := ""
 
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
 
         for x in reqs:
             left := left + "a"
             right := right + "B"
-            resps << left + "|" + right + "\n"
+            http_resps_replies << left + "|" + right + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const TWO_ACCUMULATORS_ADDED: &str = indoc! {r#"
@@ -636,57 +765,75 @@ pub(crate) mod fixtures {
         right := ""
         extra := ""
 
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
 
         for x in reqs:
             left := left + "a"
             right := right + "B"
             extra := extra + "c"
-            resps << left + "|" + right + "|" + extra + "\n"
+            http_resps_replies << left + "|" + right + "|" + extra + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const TWO_ACCUMULATORS_REORDERED: &str = indoc! {r#"
         right := ""
         left := ""
 
-        reqs, resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
 
         for x in reqs:
             right := right + "B"
             left := left + "a"
-            resps << left + "|" + right + "\n"
+            http_resps_replies << left + "|" + right + "\n"
+        http_resps::respond(http_resps_replies)
     "#};
 
     pub const TWO_LOOPS: &str = indoc! {r#"
         a := ""
         b := ""
 
-        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
-        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(String)
+        a_reqs = http_a_resps::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(String)
+        b_reqs = http_b_resps::requests
 
         for x in a_reqs:
             a := a + x + "\n"
-            a_resps << a
+            http_a_resps_replies << a
 
         for y in b_reqs:
             b := b + y + "\n"
-            b_resps << b
+            http_b_resps_replies << b
+        http_a_resps::respond(http_a_resps_replies)
+        http_b_resps::respond(http_b_resps_replies)
     "#};
 
     pub const TWO_LOOPS_ONE_EDITED: &str = indoc! {r#"
         a := ""
         b := ""
 
-        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
-        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(String)
+        a_reqs = http_a_resps::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(String)
+        b_reqs = http_b_resps::requests
 
         for x in a_reqs:
             a := a + x + "\n"
-            a_resps << a
+            http_a_resps_replies << a
 
         for y in b_reqs:
             b := b + "* " + y + "\n"
-            b_resps << b
+            http_b_resps_replies << b
+        http_a_resps::respond(http_a_resps_replies)
+        http_b_resps::respond(http_b_resps_replies)
     "#};
 
     /// `TWO_LOOPS` with each loop reading the other's route, so both
@@ -695,43 +842,66 @@ pub(crate) mod fixtures {
         a := ""
         b := ""
 
-        a_reqs, a_resps = http_serve("{PORT}", "POST", "/a")
-        b_reqs, b_resps = http_serve("{PORT}", "POST", "/b")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(String)
+        a_reqs = http_a_resps::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(String)
+        b_reqs = http_b_resps::requests
 
         for y in b_reqs:
             a := a + y + "\n"
-            b_resps << a
+            http_b_resps_replies << a
 
         for x in a_reqs:
             b := b + x + "\n"
-            a_resps << b
+            http_a_resps_replies << b
+        http_a_resps::respond(http_a_resps_replies)
+        http_b_resps::respond(http_b_resps_replies)
     "#};
 
     pub const ONE_TRANSACTIONAL_LOOP: &str = indoc! {r#"
-        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
-        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
-        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(String)
+        set_a = http_ok_a::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(String)
+        set_b = http_ok_b::requests
+        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(String)
+        get_a = http_out_a::requests
 
         x: Mut(String, Txn) := ""
 
         for m in set_a:
             with begin():
                 x := x + m
-            ok_a << "ok\n"
+            http_ok_a_replies << "ok\n"
 
         for r in get_a:
             with begin():
-                out_a << x
+                http_out_a_replies << x
 
         for m in set_b:
-            ok_b << "b\n"
+            http_ok_b_replies << "b\n"
+        http_ok_a::respond(http_ok_a_replies)
+        http_ok_b::respond(http_ok_b_replies)
+        http_out_a::respond(http_out_a_replies)
     "#};
 
     pub const ONE_TRANSACTIONAL_LOOP_BOTH: &str = indoc! {r#"
-        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
-        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
-        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
-        get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(String)
+        set_a = http_ok_a::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(String)
+        set_b = http_ok_b::requests
+        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(String)
+        get_a = http_out_a::requests
+        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(String)
+        get_b = http_out_b::requests
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -739,27 +909,39 @@ pub(crate) mod fixtures {
         for m in set_a:
             with begin():
                 x := x + m
-            ok_a << "ok\n"
+            http_ok_a_replies << "ok\n"
 
         for r in get_a:
             with begin():
-                out_a << x
+                http_out_a_replies << x
 
         for m in set_b:
             with begin():
                 y := y + m
-            ok_b << "ok\n"
+            http_ok_b_replies << "ok\n"
 
         for r in get_b:
             with begin():
-                out_b << y
+                http_out_b_replies << y
+        http_ok_a::respond(http_ok_a_replies)
+        http_ok_b::respond(http_ok_b_replies)
+        http_out_a::respond(http_out_a_replies)
+        http_out_b::respond(http_out_b_replies)
     "#};
 
     pub const TWO_TRANSACTIONS: &str = indoc! {r#"
-        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
-        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
-        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
-        get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(String)
+        set_a = http_ok_a::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(String)
+        set_b = http_ok_b::requests
+        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(String)
+        get_a = http_out_a::requests
+        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(String)
+        get_b = http_out_b::requests
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -767,27 +949,39 @@ pub(crate) mod fixtures {
         for m in set_a:
             with begin():
                 x := x + m
-            ok_a << "ok\n"
+            http_ok_a_replies << "ok\n"
 
         for r in get_a:
             with begin():
-                out_a << x
+                http_out_a_replies << x
 
         for m in set_b:
             with begin():
                 y := y + m
-            ok_b << "ok\n"
+            http_ok_b_replies << "ok\n"
 
         for r in get_b:
             with begin():
-                out_b << y
+                http_out_b_replies << y
+        http_ok_a::respond(http_ok_a_replies)
+        http_ok_b::respond(http_ok_b_replies)
+        http_out_a::respond(http_out_a_replies)
+        http_out_b::respond(http_out_b_replies)
     "#};
 
     pub const TWO_TRANSACTIONS_SWAPPED: &str = indoc! {r#"
-        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
-        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
-        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
-        get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(String)
+        set_a = http_ok_a::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(String)
+        set_b = http_ok_b::requests
+        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(String)
+        get_a = http_out_a::requests
+        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(String)
+        get_b = http_out_b::requests
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -795,27 +989,39 @@ pub(crate) mod fixtures {
         for m in set_b:
             with begin():
                 x := x + m
-            ok_b << "ok\n"
+            http_ok_b_replies << "ok\n"
 
         for r in get_a:
             with begin():
-                out_a << x
+                http_out_a_replies << x
 
         for m in set_a:
             with begin():
                 y := y + m
-            ok_a << "ok\n"
+            http_ok_a_replies << "ok\n"
 
         for r in get_b:
             with begin():
-                out_b << y
+                http_out_b_replies << y
+        http_ok_a::respond(http_ok_a_replies)
+        http_ok_b::respond(http_ok_b_replies)
+        http_out_a::respond(http_out_a_replies)
+        http_out_b::respond(http_out_b_replies)
     "#};
 
     pub const TWO_TRANSACTIONS_ONE_WRITER_EDITED: &str = indoc! {r#"
-        set_a, ok_a = http_serve("{PORT}", "POST", "/a")
-        set_b, ok_b = http_serve("{PORT}", "POST", "/b")
-        get_a, out_a = http_serve("{PORT}", "GET", "/ga")
-        get_b, out_b = http_serve("{PORT}", "GET", "/gb")
+        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(String)
+        set_a = http_ok_a::requests
+        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(String)
+        set_b = http_ok_b::requests
+        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(String)
+        get_a = http_out_a::requests
+        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(String)
+        get_b = http_out_b::requests
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -823,20 +1029,24 @@ pub(crate) mod fixtures {
         for m in set_a:
             with begin():
                 x := x + "-" + m
-            ok_a << "ok\n"
+            http_ok_a_replies << "ok\n"
 
         for r in get_a:
             with begin():
-                out_a << x
+                http_out_a_replies << x
 
         for m in set_b:
             with begin():
                 y := y + m
-            ok_b << "ok\n"
+            http_ok_b_replies << "ok\n"
 
         for r in get_b:
             with begin():
-                out_b << y
+                http_out_b_replies << y
+        http_ok_a::respond(http_ok_a_replies)
+        http_ok_b::respond(http_ok_b_replies)
+        http_out_a::respond(http_out_a_replies)
+        http_out_b::respond(http_out_b_replies)
     "#};
 
     /// A loop folding a view over its own request source: `seen` is a
@@ -844,45 +1054,60 @@ pub(crate) mod fixtures {
     /// The base for the two cases about a loop that cannot read its collection
     /// from the start.
     pub(crate) const VIEW_FOLD: &str = indoc! {r#"
-        bump_reqs, bump_resps = http_serve("{PORT}", "POST", "/bump")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_bump_resps
+        http_bump_resps_replies: Feed(String)
+        bump_reqs = http_bump_resps::requests
         seen = [r + "!" for r in bump_reqs]
         n := ""
         for x in seen:
             n := n + x
-            bump_resps << n
+            http_bump_resps_replies << n
+        http_bump_resps::respond(http_bump_resps_replies)
     "#};
 
     /// [`VIEW_FOLD`] with `n` moved to a loop of its own and the `seen` loop
     /// carrying a new variable instead. The `seen` loop then carries nothing, so
     /// it would read `seen` from the beginning — which is the refusal.
     pub(crate) const VIEW_FOLD_REVARIABLED: &str = indoc! {r#"
-        bump_reqs, bump_resps = http_serve("{PORT}", "POST", "/bump")
-        tick_reqs, tick_resps = http_serve("{PORT}", "POST", "/tick")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_bump_resps
+        http_bump_resps_replies: Feed(String)
+        bump_reqs = http_bump_resps::requests
+        run std::http(port="{PORT}", method="POST", path="/tick") as http_tick_resps
+        http_tick_resps_replies: Feed(String)
+        tick_reqs = http_tick_resps::requests
         seen = [r + "!" for r in bump_reqs]
         m := ""
         for x in seen:
             m := m + x
-            bump_resps << m
+            http_bump_resps_replies << m
         n := ""
         for z in tick_reqs:
             n := n + z
-            tick_resps << n
+            http_tick_resps_replies << n
+        http_bump_resps::respond(http_bump_resps_replies)
+        http_tick_resps::respond(http_tick_resps_replies)
     "#};
 
     /// [`VIEW_FOLD`] plus a loop over a second route. The added loop reads a
     /// source rather than a collection, so it starts where that source is.
     pub(crate) const VIEW_FOLD_SECOND_ROUTE: &str = indoc! {r#"
-        bump_reqs, bump_resps = http_serve("{PORT}", "POST", "/bump")
-        tick_reqs, tick_resps = http_serve("{PORT}", "POST", "/tick")
+        run std::http(port="{PORT}", method="POST", path="/bump") as http_bump_resps
+        http_bump_resps_replies: Feed(String)
+        bump_reqs = http_bump_resps::requests
+        run std::http(port="{PORT}", method="POST", path="/tick") as http_tick_resps
+        http_tick_resps_replies: Feed(String)
+        tick_reqs = http_tick_resps::requests
         seen = [r + "!" for r in bump_reqs]
         n := ""
         for x in seen:
             n := n + x
-            bump_resps << n
+            http_bump_resps_replies << n
         t := ""
         for z in tick_reqs:
             t := t + z
-            tick_resps << t
+            http_tick_resps_replies << t
+        http_bump_resps::respond(http_bump_resps_replies)
+        http_tick_resps::respond(http_tick_resps_replies)
     "#};
 }
 

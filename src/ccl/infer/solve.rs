@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, canonical_cast_types};
 use crate::ccl::infer::InferError;
-use crate::ccl::infer::emit::{read_mut, read_through};
+use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::coalesce::FailedPosition;
 use crate::ccl::infer::solver::traits::{
@@ -429,16 +429,16 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         }
         t
     }
-    // **Read through a history handle before counting layers.** A handle is
+    // **Read through a place type before counting layers.** A place type is
     // transparent, and the value behind it may itself be refined, so peeling first
     // would compare a refined value's layer count (`{Int | __elem == 0}`, one layer)
-    // against the handle's own (`Mut({Int | __elem == 0}, d)`, zero) and reject a pair
+    // against the place type's own (`Mut({Int | __elem == 0}, d)`, zero) and reject a pair
     // that is in fact the same type. That is what made a mutable variable with a refined value
-    // look like drift. The test is [`Type::is_handle`] rather than a bare `matches!`
-    // for the same reason every other shape test peels: a refined handle is still a
-    // handle, and a *handle-versus-its-read-view* pair is exactly the asymmetry this
+    // look like drift. The test is [`Type::is_place`] rather than a bare `matches!`
+    // for the same reason every other shape test peels: a refined place type is still a
+    // place type, and a *place-versus-its-read-view* pair is exactly the asymmetry this
     // arm exists to allow.
-    if read.is_handle() || now.is_handle() {
+    if read.is_place() || now.is_place() {
         return histories_agree(read, now, refinements);
     }
     let (mut read_layers, mut now_layers) = (0, 0);
@@ -589,35 +589,35 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
 /// **before** the refinement-count comparison (see the call site).
 ///
 /// Two histories of *different* kinds never agree — an `Overwrite` and a `Feed` are
-/// distinct handles even if their read views coincidentally line up. Rejecting that
+/// distinct places even if their read views coincidentally line up. Rejecting that
 /// explicitly is what keeps the read-through below from binding `kind` from whichever
 /// side matched first, which would compare one side's read view against the other's
-/// raw handle: an asymmetric and potentially-permissive result on a mis-kinded tree.
+/// raw place type: an asymmetric and potentially-permissive result on a mis-kinded tree.
 ///
 /// Otherwise a history reads through transparently (the solver's read-through rule,
-/// mirrored in `provide_function`): a read agrees with the handle's read view, and two
-/// handles agree iff their read views do. The read view is kind-specific — a `Feed`
+/// mirrored in `provide_function`): a read agrees with the place's read view, and two
+/// places agree iff their read views do. The read view is kind-specific — a `Feed`
 /// reads as its whole channel `domain ⤇ value`, an `Overwrite` derefs to its
 /// scalar `value`. A `Feed` channel domain is the rigid nominal `ChanDom(d)`,
 /// which `channelize` erases to the concrete channel domain by substitution; the
 /// `ChanDom` arm agrees it by name.
 ///
-/// A **handle's own** outer refinements are peeled and not counted, unlike
+/// A **place type's own** outer refinements are peeled and not counted, unlike
 /// everywhere else in this comparison. They cannot be: the two sides here are legally a
-/// handle and its read view, which sit at different depths, so there is no layer count
-/// to compare. Only the handle side is peeled — the read view carries the value's own
+/// place type and its read view, which sit at different depths, so there is no layer count
+/// to compare. Only the place side is peeled — the read view carries the value's own
 /// refinements, and those are compared by the ordinary rule, layers and all.
 #[cfg(debug_assertions)]
 fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
     use crate::ccl::HistoryKind;
-    fn peel_handle(t: &Type) -> &Type {
-        if t.is_handle() {
+    fn peel_place(t: &Type) -> &Type {
+        if t.is_place() {
             t.peel_refinements()
         } else {
             t
         }
     }
-    let (read, now) = (peel_handle(read), peel_handle(now));
+    let (read, now) = (peel_place(read), peel_place(now));
     if let (
         Type::History {
             history_kind: k0, ..
@@ -702,6 +702,7 @@ struct SpecializeFrame {
     members: Vec<(TypeParamId, Rc<TraitRequirement>, Assoc)>,
     /// The binding's transparency, which every specialization of it carries.
     transparency: BindingTransparency,
+    parameter_mode: crate::ccl::place::ParameterMode,
     /// Whether this binding is itself inside a subtree being discarded — recorded
     /// from [`CoalesceCtx::discarding`] when the frame is pushed, the one moment
     /// the answer is unambiguous.
@@ -873,6 +874,7 @@ struct Placed {
     /// The generalized binder's occurrence ([`SpecializeFrame::occurrence`]).
     occurrence: NodeId,
     transparency: BindingTransparency,
+    parameter_mode: crate::ccl::place::ParameterMode,
     spec: Specialization,
 }
 
@@ -2353,7 +2355,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(left, level, ctx);
             coalesce_node(right, level, ctx);
         }
-        TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, ctx),
+        TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Borrow(inner) => {
+            coalesce_node(inner, level, ctx)
+        }
         TypedExprNode::Lambda { params, body } => {
             // Before the body reads the parameters. In a walk whose types are dropped, an
             // unbounded parameter is the definition's own, and the uses supply it.
@@ -2412,8 +2416,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // type onto it, which is what this did before: the two agree for an
             // unannotated `let` (the binder is bound at its initializer's type)
             // and disagree for the annotated ones — a deref-copy binds at the
-            // value type where the RHS is a handle, and a mutable variable introduction
-            // binds at the handle where the RHS is a value.
+            // value type where the RHS is a place, and a mutable variable introduction
+            // binds at the place type where the RHS is a value.
             let name = binding.name.clone();
             resolve_binder_slot(
                 &mut binding.ty,
@@ -2846,10 +2850,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // expression when the discharge would be vacuous. An opaque binder
             // has no definiens to discharge at all, so its body type lifts with
             // the binder's name still in it (`Typing::close_let_type`). Through the
-            // deref, as for `ExprStmt` below: `emit_let` passes its body along as a value.
+            // body type: an internal `Let` transports its result without reading it.
             // A stand-in definition (`run_with_params`) has no value to discharge, as
             // emission kept the name over it (`ScopeExit::Keep`).
-            let body_ty = read_mut(&body.ty);
+            let body_ty = body.ty.clone();
             if binding.transparency == BindingTransparency::Transparent
                 && !matches!(bound_expr.node, TypedExprNode::Error)
                 && crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name)
@@ -2874,10 +2878,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // effect statement emits its continuation in a value position
         // (`emit_expr_stmt`'s `read_mut`), so a tail that reads a mutable variable denotes
         // the mutable variable's *value*. Lifting `body.ty` verbatim would re-stamp the node
-        // with the handle the read just looked through, contradicting the rule that
+        // with the place type the read just looked through, contradicting the rule that
         // typed it — and the wall that re-runs that rule would then have to accept a
-        // value against a handle.
-        TypedExprNode::ExprStmt { body, .. } => Some(read_mut(&body.ty)),
+        // value against a place.
+        TypedExprNode::ExprStmt { body, .. } => Some(read_through(&body.ty)),
         // A mutable introduction's result type cannot name its binder: every read that
         // reaches a type is named first (`src/ccl/design/mutability.md`, "A read is named
         // while inference runs"), so one that did would be a compiler bug, which the scope
@@ -2885,7 +2889,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::MutDecl { body, .. } => {
             // Dereffed for the same reason as `ExprStmt`: `emit_mut_decl` reports its
             // body in a value position, so `x := 0; …; x` denotes `x`'s value.
-            Some(read_mut(&body.ty))
+            Some(read_through(&body.ty))
         }
         _ => None,
     };
@@ -4260,6 +4264,7 @@ pub(super) fn specialize_use(
             frame_name,
             occurrence: frame.occurrence,
             transparency,
+            parameter_mode: frame.parameter_mode,
             spec: Specialization {
                 key,
                 shareable,
@@ -4389,6 +4394,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             telescope,
             members,
             transparency,
+            parameter_mode: binding.parameter_mode,
             inside_discarded: ctx.discarding,
             held: Vec::new(),
             failed_uses: Vec::new(),
@@ -4501,7 +4507,13 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     );
     let mut result = body;
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
-        result = specialization_let(spec, frame.occurrence, transparency, result);
+        result = specialization_let(
+            spec,
+            frame.occurrence,
+            transparency,
+            frame.parameter_mode,
+            result,
+        );
     }
     *expr = result;
     expr.user_annotation = saved_annotation;
@@ -4512,6 +4524,7 @@ fn specialization_let(
     spec: Specialization,
     occurrence: NodeId,
     transparency: BindingTransparency,
+    parameter_mode: crate::ccl::place::ParameterMode,
     body: Expr,
 ) -> Expr {
     // The discharge only does work when the specialization binder is free
@@ -4527,6 +4540,7 @@ fn specialization_let(
     };
     Expr::new(TypedExprNode::Let {
         binding: TypedBinding {
+            parameter_mode,
             name: spec.name,
             // Each specialization is a copy of the generalized binder.
             occurrence: crate::ccl::Occurrence::copied_from(occurrence),
@@ -4559,7 +4573,13 @@ fn splice_placed(ctx: &mut CoalesceCtx, binders: &[Name], body: &mut Expr) {
     );
     let mut result = std::mem::take(body);
     for placed in here.into_iter().rev().filter(|p| p.spec.referenced) {
-        result = specialization_let(placed.spec, placed.occurrence, placed.transparency, result);
+        result = specialization_let(
+            placed.spec,
+            placed.occurrence,
+            placed.transparency,
+            placed.parameter_mode,
+            result,
+        );
     }
     *body = result;
 }
@@ -4746,11 +4766,11 @@ fn typecheck_discarded_definition(
 ///
 /// `input` is supplied by the use site: the argument at an `Apply`, or the
 /// preceding morphism's codomain inside a `Compose`. At an `Apply` it is the
-/// argument node's type, which can be a mutable variable handle: `emit_apply` reads
-/// through the handle in the `arg <: domain` edge rather than on the node. Rule 2
+/// argument node's type, which can be a mutable variable's place type: `emit_apply` reads
+/// through the place type in the `arg <: domain` edge rather than on the node. Rule 2
 /// keeps `Mut` out of every composite, so a projection reads through a mutable
 /// variable, never into one, and the domain is `input` read through. Without that
-/// read, `acc.0` on a compound accumulator gets the handle as its domain and fails
+/// read, `acc.0` on a compound accumulator gets the place type as its domain and fails
 /// `emit_proj`'s `domain <: {tuple/record}` requirement. No-op unless `morphism` is a
 /// `Proj` whose coalesced type is a function.
 ///
@@ -5001,14 +5021,14 @@ mod tests {
     // ----- the projection's monomorphization (`specialize_projection_domain`) -----
 
     /// The projection's monomorphization overwrites a morphism's domain with the type
-    /// read off the argument **node**, and that type is the mutable variable *handle* —
+    /// read off the argument **node**, and that type is the mutable variable's *place type* —
     /// the read `emit_apply` performed lives in the `arg <: domain` edge, not on the
     /// node. So it has to redo the decision, and for a projection the answer is always
     /// to deref.
     ///
     /// Driven at [`specialize_projection_domain`] rather than through a program because a
     /// projection off a mutable variable needs a compound accumulator, and the wrong
-    /// answer there is silent: the domain re-acquires the handle and fails
+    /// answer there is silent: the domain re-acquires the place type and fails
     /// `emit_proj`'s `domain <: {tuple/record}` requirement at the post-inference
     /// wall rather than at the projection.
     #[test]
@@ -5025,7 +5045,7 @@ mod tests {
             )
         };
         let int = Type::Base(BaseType::Int);
-        let handle = mut_var(int.clone());
+        let place_ty = mut_var(int.clone());
         // The domain starts as a stand-in that no input below equals.
         let specialized_domain = |input: &Type| {
             let mut proj = TypedExpr::proj_index(0).with_ty(Type::fun(Type::Txn, int.clone()));
@@ -5034,11 +5054,11 @@ mod tests {
         };
         let expected = Type::fun(int.clone(), int.clone());
 
-        // The handle reads through to its value type.
-        assert_eq!(specialized_domain(&handle), expected);
-        // A refinement on the handle does not stop it being one (a refined mutable
+        // The place type reads through to its value type.
+        assert_eq!(specialized_domain(&place_ty), expected);
+        // A refinement on the place type does not stop it being one (a refined mutable
         // variable is still a mutable variable), so it still reads through.
-        assert_eq!(specialized_domain(&refined(handle.clone())), expected);
+        assert_eq!(specialized_domain(&refined(place_ty.clone())), expected);
         // A non-mutable variable input is untouched.
         assert_eq!(specialized_domain(&int), expected);
     }
@@ -5077,44 +5097,44 @@ mod tests {
         ));
     }
 
-    /// A **handle reads through** before any layer is counted, and the two sides of
+    /// A **place type reads through** before any layer is counted, and the two sides of
     /// that read are legally at different depths: a mutable variable whose value is refined
     /// agrees with the refined value itself. Counting first compares one layer against
-    /// the handle's own zero and calls the pair drift — which is what made a mutable variable
+    /// the place type's own zero and calls the pair drift — which is what made a mutable variable
     /// with a refined value look unsound.
     ///
-    /// A refinement on the handle *itself* is looked through for the same reason every
+    /// A refinement on the place type *itself* is looked through for the same reason every
     /// other shape test looks through one: a refined mutable variable is still a mutable variable. The
     /// value behind it is still compared layer for layer, so real drift there is caught.
     #[cfg(debug_assertions)]
     #[test]
-    fn a_handle_agrees_with_its_read_view_through_refinements() {
+    fn a_place_agrees_with_its_read_view_through_refinements() {
         use super::types_agree_modulo_unread;
         use crate::ccl::Refinement;
         let refined = refined_int(TypedExpr::lit(Lit::Int(8)));
         let mut_var = |value: Type| Type::mutable(Type::Txn, value);
         let refinement = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
-        let on_the_handle =
+        let on_the_place =
             |t: Type| Type::refined_one(t, Refinement::sharing(&refinement.predicate));
 
         for (read, now) in [
-            // handle vs its read view: the refined value sits one layer deeper.
+            // place type vs its read view: the refined value sits one layer deeper.
             (mut_var(refined.clone()), refined.clone()),
             (refined.clone(), mut_var(refined.clone())),
-            // a claim on the handle is transparent, on either side.
-            (on_the_handle(mut_var(refined.clone())), refined.clone()),
+            // a claim on the place type is transparent, on either side.
+            (on_the_place(mut_var(refined.clone())), refined.clone()),
             (
-                on_the_handle(mut_var(refined.clone())),
+                on_the_place(mut_var(refined.clone())),
                 mut_var(refined.clone()),
             ),
         ] {
             assert!(
                 types_agree_modulo_unread(&read, &now, true),
-                "a handle is transparent to the read it stands for ({read} vs {now})"
+                "a place type is transparent to the read it stands for ({read} vs {now})"
             );
         }
 
-        // Drift *behind* the handle is still drift, and the two kinds still never
+        // Drift *behind* the place type is still drift, and the two kinds still never
         // agree — reading through must not have relaxed either.
         assert!(!types_agree_modulo_unread(
             &mut_var(refined.clone()),
@@ -5646,6 +5666,7 @@ mod tests {
                 head_occurrence: crate::ccl::Occurrence::mint(),
                 head: crate::ccl::PatternHead::Tag(tag.into()),
                 binding: TypedBinding {
+                    parameter_mode: Default::default(),
                     occurrence: crate::ccl::Occurrence::mint(),
                     name: b.into(),
                     ty: Type::Hole,

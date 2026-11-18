@@ -426,7 +426,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             expected: None,
         },
         ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
-            ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
+            ctx: format!("{ctx_label} (a feed is required here, but the value is not one)"),
             found: Box::new(coalesce_for_error(&found)),
             expected: Some(Box::new(coalesce_for_error(&required))),
         },
@@ -1415,11 +1415,12 @@ fn run_once(
         ctx.instances = Rc::clone(instances);
         ctx
     };
+    sub_ctx.public = public.clone();
+    sub_ctx.enter_run_owned(expr);
     let opened = sub_ctx
         .open_module_params(params)
         .map_err(|e| failed(vec![e]))?;
     sub_ctx.reported = reported.clone();
-    sub_ctx.public = public.clone();
     sub_ctx.marks = marks.clone();
 
     // Pass 1: emit constraints. The high-value variants
@@ -1684,7 +1685,7 @@ fn run_once(
     sub_ctx.name_other_feed_places(&mut errors);
     // The mutability rules on resolved types read the tree coalesce left, which is
     // whole past a node coalesce failed at.
-    errors.extend(check_mut_discipline(expr).err().unwrap_or_default());
+    errors.extend(check_places(expr).err().unwrap_or_default());
     if !errors.is_empty() {
         return Err(failed(errors));
     }
@@ -1824,7 +1825,7 @@ pub(crate) struct Inferred {
     pub(crate) opened: OpenedVars,
     /// What the tree's top level requires and causes, less what its scopes discharge, each
     /// label at the node where it entered.
-    pub(crate) top_level: Vec<crate::ccl::capabilities::ScopedCapability>,
+    pub(crate) top_level: Vec<crate::ccl::capabilities::LocatedCapability>,
     /// The expression statements that cause nothing, each an error the caller reports once
     /// the checks that diagnose a statement more precisely have run.
     pub(crate) inert: Vec<LocatedInferError>,
@@ -1962,6 +1963,7 @@ mod tests {
         // λx. x applied to 42 → Int
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
@@ -2008,6 +2010,7 @@ mod tests {
         // let x = 42 in x → Int
         let mut e = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,

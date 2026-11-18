@@ -88,9 +88,9 @@
 //!
 //! - a [`TypedExprNode::MutWrite`]'s target, which is the write itself; and
 //! - a `Var` in an [`TypedExprNode::Apply`]'s function or argument position, or a
-//!   component of the argument tuple of a call that may pass by reference
-//!   ([`crate::ccl::mut_scope::Muts::passes_by_reference`]), which this pass leaves alone
-//!   (below) and which is where a pass-by-reference writer takes its handle.
+//!   component of the argument tuple of a call that may lend a place
+//!   ([`crate::ccl::mut_scope::Muts::borrows`]), which this pass leaves alone
+//!   (below) and which is where a writer's borrowed parameter receives the place.
 //!
 //! The mention is what this pass can read. Whether `f(x)` writes `x` is a
 //! question about `f`'s parameter, and before inference neither that type nor —
@@ -104,12 +104,12 @@
 //!
 //! # Positions this pass does not rewrite
 //!
-//! **An application's function and argument.** A `Mut` handle survives into
+//! **An application's function and argument.** A `Mut` place variable survives into
 //! three positions (`src/ccl/design/mutability.md`, "A mutable variable read is
-//! an explicit operation"), and two of them — a pass-by-reference argument and
+//! an explicit operation"), and two of them — a borrowed argument and
 //! `await_final`'s operand — are an application's argument, which `emit_apply`
 //! relates to the parameter by reading a bare reference there. A proven keyed read of a
-//! mutable collection, `m[k]!`, puts the handle in the function position of the
+//! mutable collection, `m[k]!`, puts the place variable in the function position of the
 //! same node.
 //!
 //! **A refined cast's value.** A cast target that refines its domain holds a
@@ -316,7 +316,7 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
 
         // The block's terminal expression: an operand whose bindings seal around
         // it, since there is no statement after it to scope them over. A bare
-        // reference there is left alone — the tail is the third handle position
+        // reference there is left alone — the tail is the third place position
         // (module docs, "Positions this pass does not rewrite").
         node => {
             let terminal = rebuild(node);
@@ -343,6 +343,7 @@ fn is_await_final_of_mut(e: &Expr, muts: &Muts) -> bool {
 /// first read.
 fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) -> Expr {
     match &mut expr.node {
+        TypedExprNode::Borrow(_) => expr,
         // The read. The node keeps its identity: it is the same reference,
         // resolved to a name that denotes the value rather than the variable.
         TypedExprNode::Var(name) if muts.contains(name) => {
@@ -350,25 +351,19 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
             expr
         }
 
-        // A handle position on both sides — see the module docs. Neither child
+        // A place position on both sides — see the module docs. Neither child
         // is descended into when it is a bare reference; anything else in those
-        // positions is an ordinary operand. A call that may pass an argument by reference
+        // positions is an ordinary operand. A call that may lend a place
         // passes each argument of its list to one parameter, so a bare reference
-        // there is a handle position too.
+        // there is a place position too.
         TypedExprNode::Apply { function, argument } => {
-            let by_reference = muts.passes_by_reference(function);
             if !is_mut_var(function, muts) {
                 **function = operand(std::mem::take(function), muts, open, minted);
             }
-            // An argument list stays where it stands, each argument an operand of its own.
-            if let TypedExprNode::Arguments(components) = &mut argument.node {
-                for c in components
-                    .iter_mut()
-                    .filter(|c| !(by_reference && is_mut_var(c, muts)))
-                {
-                    *c = operand(std::mem::take(c), muts, open, minted);
-                }
-            } else if !is_mut_var(argument, muts) {
+            if !matches!(
+                function.node,
+                TypedExprNode::Builtin(crate::ccl::Builtin::AwaitFinal)
+            ) {
                 **argument = operand(std::mem::take(argument), muts, open, minted);
             }
             expr
@@ -529,28 +524,18 @@ fn loop_body(body: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) -> E
 }
 
 /// Collect the mutable variables `expr` may write: a [`TypedExprNode::MutWrite`]'s
-/// target, and a bare reference in an application's function or argument, or in the
-/// argument tuple of a call that may pass by reference, the positions a pass-by-reference
-/// writer takes its handle from (module docs, "What ends a segment"). The walk reaches every
-/// child, nested blocks included.
+/// target, and a place a call borrows (module docs, "What ends a segment"). The walk reaches
+/// every child, nested blocks included.
 fn writes(expr: &Expr, muts: &Muts, out: &mut HashSet<Name>) {
     match &expr.node {
         TypedExprNode::MutWrite { name, .. } => {
             out.insert(name.clone());
         }
-        TypedExprNode::Apply { function, argument } => {
-            let components: &[Expr] = match &argument.node {
-                TypedExprNode::Arguments(components) if muts.passes_by_reference(function) => {
-                    components
-                }
-                _ => &[],
-            };
-            for handle in [&**function, &**argument].into_iter().chain(components) {
-                if let TypedExprNode::Var(name) = &handle.node
-                    && muts.contains(name)
-                {
-                    out.insert(name.clone());
-                }
+        TypedExprNode::Borrow(place) => {
+            if let TypedExprNode::Var(name) = &place.node
+                && muts.contains(name)
+            {
+                out.insert(name.clone());
             }
         }
         _ => {}
@@ -636,7 +621,7 @@ pub fn read_respelling(expr: &Expr) -> Subst {
 fn respell(expr: &Expr, muts: &Muts, out: &mut Subst) {
     match &expr.node {
         // The two binders that put a mutable variable in scope, each over its
-        // own sub-tree: a declaration over its body, a pass-by-reference
+        // own sub-tree: a declaration over its body, a borrowed
         // parameter over the lambda's.
         TypedExprNode::MutDecl {
             binding,
@@ -853,8 +838,8 @@ fn letrec_binders(e: &Expr, out: &mut HashSet<Name>) {
 /// the value refines is a collection over some subset of the domain's base, which only a term
 /// builds (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). Two values carry
 /// such a type out: a `letrec`'s or `let`'s own result, and a value fed to a channel declared
-/// outside the scope. `channels` holds the channels whose handle type changed, by name, with
-/// that handle type: every handle of the channel in its scope is stated at it.
+/// outside the scope. `channels` holds the channels whose place type changed, by name, with
+/// that place type: every reference to the channel's place in its scope is stated at it.
 fn hide_at_loop_exits(
     e: &mut Expr,
     scope: &mut Vec<Name>,
@@ -864,7 +849,7 @@ fn hide_at_loop_exits(
     let mut changed = false;
     e.walk_type_slots_mut(|ty| {
         if !channels.is_empty() {
-            *ty = handles_restated(ty, channels);
+            *ty = places_restated(ty, channels);
         }
         let out_of_scope = |n: &Name| loops.contains(n) && !scope.contains(n);
         if crate::ccl::subst::type_free_vars(ty)
@@ -925,15 +910,24 @@ fn reads_any(ty: &Type, names: &[Name]) -> bool {
     names.iter().any(|n| free.contains(n))
 }
 
-/// `ty` with each handle of a channel `channels` holds stated at the handle type it holds.
-fn handles_restated(ty: &Type, channels: &HashMap<Name, Type>) -> Type {
-    if let Some((Type::ChanDom(name, _), _)) = ty.as_feed()
-        && let Some(handle) = channels.get(name)
+/// Restate a channel's references and collection reads at its assembled row type.
+fn places_restated(ty: &Type, channels: &HashMap<Name, Type>) -> Type {
+    if let Type::Fun {
+        domain,
+        fun_kind: crate::ccl::FunKind::Data(_),
+        ..
+    } = ty.read_value_type().peel_refinements()
+        && let Type::ChanDom(name, _) = domain.peel_refinements()
+        && let Some(place_ty) = channels.get(name)
     {
-        return handle.clone();
+        return if ty.is_place() {
+            place_ty.clone()
+        } else {
+            place_ty.read_value_type().clone()
+        };
     }
     let mut out = ty.clone();
-    out.walk_children_mut(|c| *c = handles_restated(c, channels));
+    out.walk_children_mut(|c| *c = places_restated(c, channels));
     out
 }
 

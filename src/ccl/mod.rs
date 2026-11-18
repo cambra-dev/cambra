@@ -37,11 +37,13 @@ pub mod observe_world;
 pub mod opaque_output;
 pub(crate) mod pairing;
 pub mod panes;
+pub mod place;
 pub mod planning;
 pub mod provenance;
 pub mod scope;
 pub mod simplify;
 pub mod site;
+
 pub mod subst;
 pub mod symbolic;
 #[cfg(test)]
