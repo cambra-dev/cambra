@@ -284,7 +284,7 @@ participates in the body's pipeline dependencies, so the outer step waits for th
 Static ranges are complete at the start. Live ranges publish their complete extent as it grows.
 Breakers that publish while consuming announce their complete regions after each consume; breakers
 that hold output announce them in a later publication pass. Completion publishes final progress.
-Notifications queue dispatcher work and mark inline caches dirty; no deferred wakeup schedules work.
+Notifications queue dispatcher work; no deferred wakeup schedules work.
 
 ## A widened push
 
