@@ -1640,6 +1640,21 @@ fn deliveries() -> [(&'static str, Vec<Batch>); 3] {
     with_absent_keys(),
     81,
 )]
+#[case::absent_keys_in_a_transaction_beside_a_ready_writer(
+    indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20]:
+            with begin():
+                pool := pool - r
+        for r in source1():
+            with begin():
+                pool := pool - r
+        out << await_final(pool)
+    "},
+    with_absent_keys(),
+    51,
+)]
 #[case::an_item_ahead_of_its_completion(
     indoc! {"
         out = test_sink()
@@ -1969,6 +1984,185 @@ fn a_live_product_writer_beside_an_independent_ready_writer(
         ),
         923
     );
+}
+
+/// Live `TestDataSource`s named `names`, registered with `ctx`, each of `Int`s keyed by `UInt`.
+fn live_int_sources(
+    ctx: &mut GlobalContext,
+    names: &[&str],
+) -> Vec<std::rc::Rc<std::cell::RefCell<crate::interpreter::TestDataSource>>> {
+    use crate::interpreter::{BaseType, Extent, TestDataSource};
+    names
+        .iter()
+        .map(|name| {
+            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )));
+            ctx.register_source(source.clone());
+            source
+        })
+        .collect()
+}
+
+/// Hand `source` the value `value` at `key`, with every key through `key` called complete.
+fn deliver_one(
+    source: &std::cell::RefCell<crate::interpreter::TestDataSource>,
+    key: u64,
+    value: i64,
+) {
+    let mut source = source.borrow_mut();
+    source.add_data(&[(Value::UInt(key), Value::Int(value))]);
+    source.set_yield_predicate(crate::interpreter::Predicate::at_or_below(Value::UInt(key)));
+}
+
+/// A ready writer commits its whole source while its sibling's live source is idle, and the
+/// store stays unsettled: `await_final` answers nothing until the sibling's source yields
+/// everything. The sibling's delivery and close then commit the rest and settle the store.
+#[rstest_log::rstest]
+fn a_ready_writer_commits_beside_an_idle_sibling_and_the_last_to_finish_settles_the_store(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1"]);
+    let commits = ctx.register_test_sink("out");
+    let settled = ctx.register_test_sink("settled");
+    let text = indoc! {"
+        out = test_sink()
+        settled = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20]:
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+        settled << await_final(pool)
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(text), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{text} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let mut idle = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        match idle {
+            0 => {
+                let written = commits
+                    .written_so_far()
+                    .expect("the ready writer commits while its sibling is idle");
+                let mut pools: Vec<_> = written
+                    .as_function()
+                    .iter()
+                    .map(|binding| binding.output.as_int())
+                    .collect();
+                pools.sort();
+                assert_eq!(pools, [70, 90], "{written:?}");
+                assert_eq!(
+                    settled.value(),
+                    Err(crate::interpreter::SinkReadError::Incomplete),
+                    "the store is not settled while a writer's source is open"
+                );
+                assert!(
+                    settled
+                        .written_so_far()
+                        .is_ok_and(|written| written.as_function().is_empty()),
+                    "the settled sink holds no row while a writer's source is open: {:?}",
+                    settled.written_so_far()
+                );
+                deliver_one(&feeds[0], 0, 5);
+            }
+            1 => feeds[0]
+                .borrow_mut()
+                .set_yield_predicate(crate::interpreter::Predicate::True),
+            _ => panic!("the run waits after the source closes"),
+        }
+        idle += 1;
+    })
+    .unwrap();
+    assert_eq!(idle, 2);
+    let Value::Function(bindings) = settled.value().expect("the store settles") else {
+        panic!("a keyed sink")
+    };
+    assert_eq!(bindings[0].output, Value::Int(65));
+}
+
+/// Three live writers draw from one pool through one key, their items delivered one at a time
+/// and interleaved, while a sink in each writer's block reads every commit and releases it. Each
+/// withdrawal lands once, in one serial history, and the pool settles at 100 less the 118
+/// withdrawn.
+#[rstest_log::rstest]
+fn interleaved_live_writers_keep_every_withdrawal(#[values(1, usize::MAX)] rows: usize) {
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1", "source2", "source3"]);
+    let commits = ctx.register_test_sink("out");
+    let settled = ctx.register_test_sink("settled");
+    let text = indoc! {"
+        out = test_sink()
+        settled = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source2():
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in source3():
+            with begin():
+                pool := pool - r
+                out << pool
+        settled << await_final(pool)
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(text), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{text} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    // (source, key, amount), in delivery order: writer 1 takes 10, 20, 30 and 40, writer 2 takes
+    // 1, 2 and 3, writer 3 takes 5 and 7.
+    let deliveries = [
+        (0, 0, 10),
+        (0, 1, 20),
+        (1, 0, 1),
+        (2, 0, 5),
+        (0, 2, 30),
+        (1, 1, 2),
+        (2, 1, 7),
+        (0, 3, 40),
+        (1, 2, 3),
+    ];
+    let (first, rest) = deliveries.split_first().expect("a delivery");
+    deliver_one(&feeds[first.0], first.1, first.2);
+    let mut next = rest.iter();
+    let mut closed = false;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || match next
+        .next()
+    {
+        Some(&(source, key, amount)) => deliver_one(&feeds[source], key, amount),
+        None => {
+            assert!(!closed, "the run waits after every source closes");
+            closed = true;
+            for feed in &feeds {
+                feed.borrow_mut()
+                    .set_yield_predicate(crate::interpreter::Predicate::True);
+            }
+        }
+    })
+    .unwrap();
+    let written = commits.value().expect("every commit is written");
+    assert_eq!(
+        assert_serial_withdrawals(
+            &written,
+            100,
+            &[vec![10, 20, 30, 40], vec![1, 2, 3], vec![5, 7]]
+        ),
+        -18
+    );
+    let Value::Function(bindings) = settled.value().expect("the store settles") else {
+        panic!("a keyed sink")
+    };
+    assert_eq!(bindings[0].output, Value::Int(-18));
 }
 
 /// A concatenation writer progresses beside a live writer without comparing their keys.
