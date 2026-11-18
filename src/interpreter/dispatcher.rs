@@ -8,18 +8,18 @@
 //! finishes once, after its queue closes and every package is acknowledged. A per-pipeline lock
 //! protects ready and in-flight packages; acknowledgement removes an in-flight entry. Operator
 //! execution holds no queue lock. A worker sleeps while there is nothing to claim, and a change
-//! that can end a sleep wakes the sleepers. The dispatcher holds no breaker, so it is `Sync` while
-//! the breakers are not `Send`. The single-threaded driver, [`run`], reaches the breakers through
+//! that can end a sleep wakes the sleepers. The dispatcher holds no breaker. The single-threaded
+//! driver, [`run`], reaches the breakers through
 //! the handles its caller passes, indexed by pipeline. Nothing outside unit tests calls it, and
 //! only unit tests drive the dispatcher from several threads. See
 //! `src/interpreter/design-dispatcher.md`, "The dispatcher".
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
@@ -263,6 +263,11 @@ struct PipelineInfo {
     /// Whether it takes the arrivals of live sources although it reads pipelines
     /// ([`take_arrivals`](Dispatcher::take_arrivals)).
     arrivals: bool,
+    /// The tiling of the breaker input the pipeline consumes, where a planner set it
+    /// ([`consumes_input`](Dispatcher::consumes_input)). An entry of another of the breaker's
+    /// inputs, as a loop's seed is, or beneath a chain that reshapes this one lands regions of
+    /// another tiling, which [`rows_named`](Dispatcher::rows_named) restates as rows of this one.
+    input: Option<Tiling>,
     ingress: Option<std::ops::Range<usize>>,
     /// The pipelines it reads whose pushes the planner walked, each with whether the walk reached
     /// this pipeline's entry ([`plan_route`](Dispatcher::plan_route)).
@@ -417,6 +422,7 @@ impl Dispatcher {
                 limit: usize::MAX,
                 pushes_with: pipeline,
                 arrivals: false,
+                input: None,
                 ingress: None,
                 walked: Vec::new(),
             })
@@ -509,6 +515,7 @@ impl Dispatcher {
             limit: usize::MAX,
             pushes_with: pipeline,
             arrivals: false,
+            input: None,
             ingress: None,
             walked: Vec::new(),
         });
@@ -759,6 +766,21 @@ impl Dispatcher {
                 .store(held, Ordering::SeqCst);
         }
         self.advance();
+    }
+
+    /// Record that `pipeline` consumes a breaker input of `input`'s tiling.
+    pub(crate) fn consumes_input(&mut self, pipeline: PipelineId, input: Tiling) {
+        self.infos[pipeline.0].input = Some(input);
+    }
+
+    /// `guard`, a region an entry of `reader` lands, as rows of the input `reader` consumes. A
+    /// region of another tiling, as of a loop's seed or of an input a chain reshapes, is no region
+    /// of those rows, and a change of it changes every row ([`rows_named_in`]).
+    fn rows_named(&self, reader: usize, guard: &TileGuard) -> TileGuard {
+        match &self.infos[reader].input {
+            Some(input) => rows_named_in(input, guard),
+            None => guard.clone(),
+        }
     }
 
     /// Mark `pipeline` as consuming its morsels one at a time, in the order they were queued, then
@@ -1252,7 +1274,7 @@ impl Dispatcher {
                             "pipeline {pipeline} pushes regions of its keys: {why}"
                         ))
                     });
-                    to.borrow_mut().notify(&region, &mut landing);
+                    crate::interpreter::notifications::notify_shared(to, &region, &mut landing);
                 }
                 // A test's push ([`Pushes::push`]) names no consumer and lands in each reader as
                 // it is.
@@ -1743,12 +1765,11 @@ impl Landing<'_> {
         }
     }
 
-    /// Queue `guard`, a guard of the input `reader`'s breaker consumes, as a package of `reader`.
-    /// An entry whose input differs from the consumed one names rows of that one first
-    /// ([`rows_named_in`]). A push that reaches the pushing pipeline's own entry is kept for it to
-    /// queue once it has dropped what its input released. A reader that follows the pipeline that
-    /// pushed ([`Dispatcher::follow`]) takes no push: a loop's round queues its rows. A probe and a
-    /// routing landing record the arrival and queue nothing.
+    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, named as
+    /// the rows of that input ([`Dispatcher::rows_named`]). A push that reaches the pushing
+    /// pipeline's own entry is kept for it to queue once it has dropped what its input released. A
+    /// reader that follows the pipeline that pushed ([`Dispatcher::follow`]) takes no push: a loop's
+    /// round queues its rows. A probe and a routing landing record the arrival and queue nothing.
     ///
     /// # Panics
     ///
@@ -1774,6 +1795,7 @@ impl Landing<'_> {
             }
         };
         let (from, r) = (self.from, reader.0);
+        let guard = &dispatcher.rows_named(r, guard);
         dispatcher.state(reader);
         dispatcher.ensure(dispatcher.infos[r].reads.contains(&from), || {
             format!("pipeline {from} pushes to pipeline {r}, which reads it")
@@ -1841,7 +1863,7 @@ pub struct Entry {
 /// is offered, as in front of any other pulled input.
 // shared-state-ok: the drive and the entry in front of its source both hold it, the planner
 // writes it before the run, and what crosses it is a scope's intake and a tiling, never a tile.
-pub type CompletionTarget = Rc<RefCell<Option<(Offers, Tiling)>>>;
+pub type CompletionTarget = Arc<RwLock<Option<(Offers, Tiling)>>>;
 
 /// What a scope's input has offered it and the scope has not queued yet: a scope queues a request
 /// only where it can run ([`Body::queue_offered`](loop_scope::Body::queue_offered)), and holds
@@ -1911,34 +1933,29 @@ pub type Offers = Arc<Mutex<Offered>>;
 pub struct Placement {
     // shared-state-ok: the breaker and the entry at its input both hold it, the planner writes it
     // before the run, and what crosses it is a pipeline's index, never a tile.
-    pipeline: Rc<Cell<Option<PipelineId>>>,
+    pipeline: Arc<RwLock<Option<PipelineId>>>,
     /// The intake of the scope whose body or store the entry sits in, which a push the entry's
     /// pipeline does not take wakes ([`Entry::wake`]); `None` outside a scope.
     // shared-state-ok: the scope's run sets it and clears it at the run's end, and what crosses it
     // is the scope's intake of guards of its input, never a tile.
-    scope: Rc<RefCell<Option<Offers>>>,
-    /// The tiling of the input the pipeline consumes, where it can differ from the entry's: the
-    /// entry stands in front of another of its breaker's inputs, as a loop's seed does, or beneath
-    /// a chain that reshapes the input. A push there names rows of the consumed input
-    /// ([`rows_named_in`]). The planner records it for a loop's seed and for a chain breaker's
-    /// entry; `None` elsewhere.
-    // shared-state-ok: the planner writes it before the run, and what crosses it is a tiling,
-    // never a tile.
-    rows: Rc<RefCell<Option<Tiling>>>,
+    scope: Arc<RwLock<Option<Offers>>>,
 }
 
 impl Placement {
     pub fn get(&self) -> Option<PipelineId> {
-        self.pipeline.get()
+        *self.pipeline.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn set(&self, pipeline: Option<PipelineId>) {
-        self.pipeline.set(pipeline);
+        *self
+            .pipeline
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = pipeline;
     }
 
     /// Record `scope`, the intake of the scope the entry sits in ([`Entry::wake`]).
     pub(crate) fn set_scope(&self, scope: Option<Offers>) {
-        let mut held = self.scope.borrow_mut();
+        let mut held = self.scope.write().unwrap_or_else(PoisonError::into_inner);
         debug_assert!(
             match (&*held, &scope) {
                 (Some(before), Some(after)) => Arc::ptr_eq(before, after),
@@ -1951,13 +1968,10 @@ impl Placement {
     }
 
     fn scope(&self) -> Option<Offers> {
-        self.scope.borrow().clone()
-    }
-
-    /// Record `rows`, the tiling of the input the pipeline consumes, for an entry whose own input
-    /// can differ from it ([`rows_named_in`]).
-    pub(crate) fn set_rows(&self, rows: Tiling) {
-        *self.rows.borrow_mut() = Some(rows);
+        self.scope
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -2056,21 +2070,11 @@ pub(crate) fn is_in_a_run() -> bool {
 }
 
 impl Consumer for Entry {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some(pipeline) = self.pipeline.get()
             && landing.accepts_entry(pipeline)
         {
-            // An entry whose input differs from the consumed one names rows of the consumed one.
-            // A range in the pipeline's own chain brings its keys to its own entry, which keeps
-            // them as they are for the pipeline to read ([`Landing::own_arrivals`]).
-            let own = landing.from == pipeline.0;
-            let named = pushed_guard(region, &self.input).map(|guard| {
-                match &*self.pipeline.rows.borrow() {
-                    Some(rows) if !own => rows_named_in(rows, &guard),
-                    _ => guard,
-                }
-            });
-            if let Some(guard) = named {
+            if let Some(guard) = pushed_guard(region, &self.input) {
                 landing.queue(pipeline, &guard);
             }
             return;
@@ -2083,7 +2087,10 @@ impl Consumer for Entry {
         }
         // In front of a drive's source, a push offers its keys to the scope the drive runs in.
         if landing.is_delivery()
-            && let Some((offers, input)) = &*self.completes.borrow()
+            && let Some((offers, input)) = &*self
+                .completes
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
             && let Some(guard) = pushed_guard(region, input)
         {
             let mut offered = offers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2093,7 +2100,7 @@ impl Consumer for Entry {
             });
         }
         if landing.is_delivery()
-            && let Some(inline) = &mut self.inline
+            && let Some(inline) = &self.inline
         {
             inline.notify(region, landing);
         }
@@ -2101,7 +2108,7 @@ impl Consumer for Entry {
 }
 
 /// `guard`, a region an entry lands, as rows of `input`, the breaker input its pipeline consumes
-/// ([`Placement::set_rows`]): itself where it is a guard of `input`, and every row where it is a
+/// ([`Dispatcher::rows_named`]): itself where it is a guard of `input`, and every row where it is a
 /// region of another tiling, as of another of the breaker's inputs or of an input a chain
 /// reshapes.
 pub(crate) fn rows_named_in(input: &Tiling, guard: &TileGuard) -> TileGuard {
@@ -2290,7 +2297,7 @@ fn cuts_every(runs: Vec<(u128, u128)>, rows: usize) -> Vec<Value> {
 /// handle, so the driver borrows it for one call at a time.
 // shared-state-ok: the driver's handle on a breaker it calls, and in a test the handle a reader's
 // input reads the breaker through; no tile passes between operators through it.
-pub type BreakerHandle = Rc<RefCell<dyn BreakingProducer>>;
+pub type BreakerHandle = Arc<RwLock<dyn BreakingProducer>>;
 
 /// What the workers did.
 #[cfg(test)]
@@ -2318,7 +2325,10 @@ pub(crate) enum Event {
 pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
     in_a_run(|| {
         for breaker in breakers {
-            breaker.borrow_mut().begin_run();
+            breaker
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .begin_run();
         }
         assert_eq!(
             breakers.len(),
@@ -2380,7 +2390,7 @@ pub fn read_for_test<P: crate::interpreter::tile_operators::TileProducer + ?Size
 }
 
 #[cfg(test)]
-pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &mut C, region: &Projection) {
+pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &C, region: &Projection) {
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     let mut landing = Landing::new(
         Target::Queue {
@@ -2403,7 +2413,9 @@ type Call<'c> = dyn FnMut(&mut dyn Breaker, InputId) + 'c;
 /// The breakers `breakers` holds, by pipeline, each borrowed for one call.
 fn handles(breakers: &[BreakerHandle]) -> impl FnMut(PipelineId, &mut Call<'_>) {
     move |pipeline, call| {
-        let mut breaker = breakers[pipeline.0].borrow_mut();
+        let mut breaker = breakers[pipeline.0]
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         debug_assert!(
             breaker.as_producer().is_some(),
             "{} answers itself as a producer, so its pushes reach its readers",

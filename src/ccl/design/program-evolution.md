@@ -264,7 +264,7 @@ claims an element for itself. What a client receives when several replies race i
 ### What a branch holds
 
 **An operator lives as long as some branch holds it.** An entry holds each `Recorded::Operator` by
-its `Rc<FanOut>`, and each fan-out owns the chain under it, per [Nothing inside a fan-out owns
+its `Arc<FanOut>`, and each fan-out owns the chain under it, per [Nothing inside a fan-out owns
 it](#nothing-inside-a-fan-out-owns-it). Dropping an operator from one entry therefore frees it only
 when no other entry holds it.
 
@@ -663,11 +663,19 @@ subscriber has said so. Reuse, resumption and retirement all follow from that ru
 
 ### Retention is the agreement, and a record dies with its producer
 
-`retire_producer` is called from a producer's own `Drop`, so a record lasts exactly as long as the
-producer that made it. A record left behind would hold the agreement where a dead producer stopped
-for the life of the process. The input would then retain everything above that point, and hand each
-replacement a starting point below what its predecessor handled, so the program would answer
-requests it answered two versions ago.
+Compiler source registries retain a `SourceDefinition`: the exact compiler `Type` beside an
+`Arc<RwLock<dyn DataSourceDomainExtentImpl>>`. Lowering and inference use the former; native
+operator conversion receives only the latter. This keeps inference ownership on the coordinator
+while runtime source reads, polling and release can synchronize independently. A producer captures a
+`SourceReaderRetirement` during registration. Its destruction removes the reader from an independent
+release ledger without acquiring the source data lock, including during concurrent reads or teardown
+by an operation already holding that lock.
+
+The producer holds that handle, so a record lasts exactly as long as the producer that made it. A
+record left behind would hold the agreement where a dead producer stopped for the life of the
+process. The input would then retain everything above that point, and hand each replacement a
+starting point below what its predecessor handled, so the program would answer requests it answered
+two versions ago.
 
 An operator carried across a reload keeps its producer and its record, which stops the source
 dropping data that operator has not finished with.
@@ -1339,8 +1347,9 @@ weakly.
   side lives in the `FanOutProducer` that slot handed out. A dead slot is skipped and renumbered per
   [Guards intersect at a fan-out](#guards-intersect-at-a-fan-out).
 - **Source release records.** `IterateExtent` registers each producer with the sources it reads
-  through an initial empty release. Dropping the producer calls `retire_producer`, removing its
-  release records so a retired reader no longer constrains the release intersection.
+  through an initial empty release and holds the `SourceReaderRetirement` it captures. Dropping the
+  producer drops it, removing its release records so a retired reader no longer constrains the
+  release intersection.
   `SourceRegistry` keeps strong source handles for inspection and route retirement; it registers
   no notification consumers.
 - **Sink dispatch.** `compile_program` subscribes a sink's operator with a weak handle on the
