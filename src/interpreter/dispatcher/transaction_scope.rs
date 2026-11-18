@@ -3,6 +3,8 @@
 //! As for loop rounds, request and step handlers control the recurrence boundary. The
 //! driver, body breakers and proposal writer are ordinary pipelines between those handlers.
 
+use std::sync::PoisonError;
+
 use super::loop_scope::{Member, reach_member};
 use super::plan::Planned;
 use super::*;
@@ -171,21 +173,29 @@ impl Drop for TransactionRun {
                     .as_producer()
                     .and_then(|producer| producer.completes_through())
                 {
-                    *target.borrow_mut() = None;
+                    *target.write().unwrap_or_else(PoisonError::into_inner) = None;
                 }
             });
         }
     }
 }
 
-pub(super) fn transaction(
-    store: &StoreCell,
-) -> crate::interpreter::tile_operators::StoreBorrow<'_, CommitProducer> {
-    store.borrow_mut().map(|producer| {
-        producer
+pub(super) struct TransactionBorrow<'a>(crate::interpreter::tile_operators::StoreBorrow<'a>);
+impl std::ops::Deref for TransactionBorrow<'_> {
+    type Target = CommitProducer;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_transaction_store().expect("a transaction store")
+    }
+}
+impl std::ops::DerefMut for TransactionBorrow<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
             .as_transaction_store_mut()
             .expect("a transaction store")
-    })
+    }
+}
+pub(super) fn transaction(store: &StoreCell) -> TransactionBorrow<'_> {
+    TransactionBorrow(store.write())
 }
 
 impl CommitProducer {

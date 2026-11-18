@@ -255,10 +255,6 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
         Extent::Base(BaseType::String)
     }
 
-    fn output_type(&self) -> Type {
-        Type::Base(BaseType::String)
-    }
-
     fn check_for_new_data(&mut self) -> bool {
         unreachable!("`{}` was never opened, so nothing drives it", self.id)
     }
@@ -291,6 +287,10 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
 
     fn first_position_for_a_new_producer(&self) -> u64 {
         unreachable!("`{}` was never opened, so it offers no position", self.id)
+    }
+
+    fn producer_retirement(&self, _producer: &str) -> crate::interpreter::SourceReaderRetirement {
+        unreachable!("an unopened route has no readers")
     }
 
     fn retire_producer(&mut self, _producer: &str) {
@@ -574,7 +574,7 @@ pub struct HttpServerDataSource {
 
     /// Requests, with their `tiny_http::Request` handles, from the dispatcher thread, or the
     /// dispatcher's failure.
-    receiver: Receiver<RouteMessage>,
+    receiver: Mutex<Receiver<RouteMessage>>,
 
     /// Shared state for routing responses back to clients.
     shared: Arc<HttpServerSharedState>,
@@ -594,7 +594,7 @@ impl HttpServerDataSource {
 
         Self {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: Mutex::new(receiver),
             shared,
             id,
         }
@@ -623,7 +623,12 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     /// and the shared pending map, after. Both are answered, so the stage a
     /// request happened to be at does not decide what its client sees.
     fn answer_in_flight(&mut self) {
-        while let Ok(RouteMessage::Request(_, request)) = self.receiver.try_recv() {
+        while let Ok(RouteMessage::Request(_, request)) = self
+            .receiver
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_recv()
+        {
             respond_not_found(request);
         }
         self.shared.answer_not_found();
@@ -637,7 +642,12 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     fn check_for_new_data(&mut self) -> bool {
         let mut got_data = false;
         loop {
-            match self.receiver.try_recv() {
+            match self
+                .receiver
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .try_recv()
+            {
                 Ok(RouteMessage::Request(body, request)) => {
                     self.add(body, request);
                     got_data = true;
@@ -689,10 +699,6 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         Extent::Base(BaseType::String)
     }
 
-    fn output_type(&self) -> Type {
-        Type::Base(BaseType::String)
-    }
-
     fn release(&mut self, producer: &str, obsolete: Predicate) {
         self.buf.release(producer, obsolete);
     }
@@ -705,8 +711,23 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         self.buf.first_index_for_a_new_producer()
     }
 
+    fn producer_retirement(&self, producer: &str) -> crate::interpreter::SourceReaderRetirement {
+        self.buf.releases.retirement(producer)
+    }
+
     fn retire_producer(&mut self, producer: &str) {
         self.buf.retire_producer(producer);
+    }
+}
+impl crate::ccl::SourceType for HttpServerDataSource {
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
+    }
+}
+
+impl crate::ccl::SourceType for UnopenedRoute {
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
     }
 }
 
@@ -729,7 +750,7 @@ mod tests {
         }
         HttpServerDataSource {
             buf: UIntStreamBuffer::new(),
-            receiver,
+            receiver: Mutex::new(receiver),
             shared: Arc::new(HttpServerSharedState::new()),
             id: "route".to_string(),
         }

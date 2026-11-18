@@ -1,11 +1,13 @@
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
 #[cfg(test)]
+#[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use log::trace;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::*;
 use crate::interpreter::nest_levels;
@@ -21,7 +23,7 @@ use crate::{
 /// "Aggregation and extraction". [`ExtractAggregate`] reads the terminal result.
 pub struct Aggregate {
     /// The `DataFunction`-typed input whose codomain elements are aggregated.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     base: OperatorBase,
 }
 
@@ -30,7 +32,7 @@ impl Aggregate {
     ///
     /// Panics if `input` does not have a `DataFunction` tiling, or if `kind`
     /// does not support the codomain element type.
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, kind: AggregateKind) -> Self {
         let err = || panic!("Cannot apply {kind:?} to non-function {:?}", input.tiling());
         let values = input.tiling().codomain().unwrap_or_else(err);
         let tiling = Tiling::Aggregation {
@@ -52,7 +54,7 @@ impl TileOperator for Aggregate {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -60,10 +62,16 @@ impl TileOperator for Aggregate {
         let input = BreakerInput::new(consumer, self.input.tiling(), false);
         let input_producer =
             self.input
+                .clone()
                 .subscribe(self.input.tiling().universal_guard(), input.consumer, cx);
         share_breaker(AggregateProducer::new(
-            ProducerBase::new(AggregateProducer::alloc_id(), self.tiling(), &self.base, cx)
-                .breaking(input.downstream, input.placement),
+            ProducerBase::new(
+                AggregateProducer::alloc_id(),
+                self.tiling(),
+                self.clone(),
+                cx,
+            )
+            .breaking(input.downstream, input.placement),
             input_producer,
         ))
     }
@@ -86,7 +94,7 @@ pub(crate) fn aggregate_over(
     input: Box<dyn TileProducer>,
     tiling: &Tiling,
 ) -> crate::interpreter::dispatcher::BreakerHandle {
-    Rc::new(RefCell::new(AggregateProducer::new(
+    Arc::new(RwLock::new(AggregateProducer::new(
         ProducerBase::unowned(AggregateProducer::alloc_id(), tiling),
         input,
     )))
@@ -100,7 +108,7 @@ pub(crate) fn extract_aggregate_over(
     tiling: &Tiling,
     kind: AggregateKind,
 ) -> crate::interpreter::dispatcher::BreakerHandle {
-    Rc::new(RefCell::new(ExtractAggregateProducer::new(
+    Arc::new(RwLock::new(ExtractAggregateProducer::new(
         ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), tiling),
         input,
         kind,
@@ -307,14 +315,14 @@ impl BreakingProducer for AggregateProducer {
 
 /// Extracts a terminal result from an aggregation. Partial-result extraction is unsupported.
 pub struct ExtractAggregate {
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     base: OperatorBase,
     kind: AggregateKind,
     only_terminal: bool,
 }
 
 impl ExtractAggregate {
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind, only_terminal: bool) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, kind: AggregateKind, only_terminal: bool) -> Self {
         let tiling = if only_terminal {
             Tiling::Scalar(input.extent())
         } else {
@@ -337,7 +345,7 @@ impl TileOperator for ExtractAggregate {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -347,11 +355,12 @@ impl TileOperator for ExtractAggregate {
             ProducerBase::new(
                 ExtractAggregateProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(input.downstream, input.placement),
             self.input
+                .clone()
                 .subscribe(self.input.tiling().universal_guard(), input.consumer, cx),
             self.kind,
         );
@@ -505,7 +514,7 @@ impl BreakingProducer for ExtractAggregateProducer {
 /// Preserves the enclosing levels and removes innermost keys whose aggregation is not terminal.
 /// See `src/interpreter/design-operators.md`, "Aggregation and extraction".
 pub struct MapExtractAggregate {
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
     base: OperatorBase,
@@ -516,7 +525,7 @@ impl MapExtractAggregate {
     ///
     /// `input` must be a collection chain ending in `Aggregation { accumulator: A }`, at
     /// whatever depth. The output replaces that aggregation with what it extracts to.
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, kind: AggregateKind) -> Self {
         assert!(
             input.tiling().is_data_function(),
             "MapExtractAggregate expected a collection input, got {}",
@@ -551,7 +560,7 @@ impl TileOperator for MapExtractAggregate {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -559,12 +568,13 @@ impl TileOperator for MapExtractAggregate {
         // The groups keep the input's outermost keys.
         let input_producer =
             self.input
+                .clone()
                 .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(MapExtractAggregateProducer {
             base: ProducerBase::new(
                 MapExtractAggregateProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             input: input_producer,
@@ -749,7 +759,7 @@ fn build_levels_from_paths(
 /// "Aggregation and extraction".
 pub struct MapAggregate {
     /// The lookup-function input to aggregate per key.
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
     base: OperatorBase,
@@ -763,7 +773,7 @@ impl MapAggregate {
     /// `Aggregation` and the levels above it are left as they are
     /// ([`fold_innermost`]), so a two-level input yields
     /// `DataFunction { domain, codomain: Aggregation { .. } }`.
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
+    pub fn new(input: Arc<dyn TileOperator>, kind: AggregateKind) -> Self {
         // A collection whose values are not themselves a collection has no level above the
         // one being folded, which is `Aggregate`'s shape rather than this one's.
         let Tiling::DataFunction { codomain, .. } = input.tiling() else {
@@ -833,7 +843,7 @@ impl TileOperator for MapAggregate {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -842,12 +852,13 @@ impl TileOperator for MapAggregate {
         let input = BreakerInput::new(consumer, self.input.tiling(), true);
         let input_producer =
             self.input
+                .clone()
                 .subscribe(self.input.tiling().universal_guard(), input.consumer, cx);
         share_breaker(MapAggregateProducer::new(
             ProducerBase::new(
                 MapAggregateProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(input.downstream, input.placement),
@@ -884,7 +895,7 @@ pub(crate) fn map_aggregate_over(
     tiling: &Tiling,
     kind: AggregateKind,
 ) -> crate::interpreter::dispatcher::BreakerHandle {
-    Rc::new(RefCell::new(MapAggregateProducer::new(
+    Arc::new(RwLock::new(MapAggregateProducer::new(
         ProducerBase::unowned(MapAggregateProducer::alloc_id(), tiling),
         input,
         kind,
@@ -1385,7 +1396,8 @@ mod tests {
         );
         let key = TileGuard::Function(FunctionGuard::Domain(point(0)));
         sums.read_in_pipeline(key.clone());
-        *cell.borrow_mut() = group(vec![3, 4], vec![4, 5], Predicate::True.minus(&through_two));
+        *cell.write().unwrap_or_else(PoisonError::into_inner) =
+            group(vec![3, 4], vec![4, 5], Predicate::True.minus(&through_two));
         let answer = sums.read_in_pipeline(key);
         let Tile::DataFunction { codomain, .. } = &answer else {
             panic!("a collection of sums, got {answer:?}")
@@ -1588,9 +1600,13 @@ mod tests {
 
         producer.release(tiling.universal_guard());
         assert!(
-            released.borrow().iter().any(TileGuard::is_universal),
+            released
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(TileGuard::is_universal),
             "expected a universal release to reach the input, got {:?}",
-            released.borrow()
+            released.read().unwrap_or_else(PoisonError::into_inner)
         );
         let _ = in_tiling;
     }
@@ -1659,11 +1675,12 @@ mod tests {
         // issued. Which guard covered it is the sibling test's subject, not this one's.
         assert!(
             released
-                .borrow()
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|g| g.is_universal() || *g == key_one),
             "the released key must be covered at the input, got {:?}",
-            released.borrow()
+            released.read().unwrap_or_else(PoisonError::into_inner)
         );
         let second = producer.read_in_pipeline(out_tiling.universal_guard());
         let Tile::DataFunction { domain, .. } = &second else {
@@ -1723,9 +1740,13 @@ mod tests {
         );
         producer.read_in_pipeline(out_tiling.universal_guard());
         assert!(
-            !released.borrow().iter().any(TileGuard::is_universal),
+            !released
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(TileGuard::is_universal),
             "a bounded predicate is not released whole, got {:?}",
-            released.borrow()
+            released.read().unwrap_or_else(PoisonError::into_inner)
         );
 
         let key_two = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
@@ -1736,9 +1757,12 @@ mod tests {
         )));
         producer.release(key_two.clone());
         assert!(
-            released.borrow().contains(&key_two),
+            released
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&key_two),
             "the per-key release must reach the input, got {:?}",
-            released.borrow()
+            released.read().unwrap_or_else(PoisonError::into_inner)
         );
     }
 
@@ -2018,12 +2042,14 @@ mod aggregate_projection_tests {
         );
         let (odd, odd_cell) = ScriptedOp::new(int_column(vec![1, 3], through_3), stream);
         let union = UnionOperator::new_flat(
-            vec![Box::new(even), Box::new(odd)],
+            vec![Arc::new(even), Arc::new(odd)],
             Extent::Base(BaseType::Int),
         );
-        let mut sum = Aggregate::new(Box::new(union), AggregateKind::Sum);
+        let sum = Arc::new(Aggregate::new(Arc::new(union), AggregateKind::Sum));
         let mut cx = SubscribeContext::new();
-        let mut producer = sum.subscribe(sum.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            sum.clone()
+                .subscribe(sum.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let total = |tile: Tile| {
             let Tile::Aggregation {
                 accumulator,
@@ -2051,13 +2077,15 @@ mod aggregate_projection_tests {
         assert_eq!(terminal, open());
 
         // The odd arm delivers row 5 without finishing: the sum takes it once and stays open.
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
+        *odd_cell.write().unwrap_or_else(PoisonError::into_inner) =
+            int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
         let (partial, terminal) = total(producer.read_in_pipeline(sum.tiling().universal_guard()));
         assert_eq!(partial, Tile::Scalar(ColumnValue::Ints(vec![16 + 5])));
         assert_eq!(terminal, open());
 
         // Both arms have now decided every position, so the sum is final.
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        *odd_cell.write().unwrap_or_else(PoisonError::into_inner) =
+            int_column(vec![1, 3, 5, 7], Predicate::True);
         let (last, terminal) = total(producer.read_in_pipeline(sum.tiling().universal_guard()));
         assert_eq!(last, Tile::Scalar(ColumnValue::Ints(vec![(0..8).sum()])));
         assert_eq!(terminal, ColumnValue::Bools(vec![true]));
@@ -2078,8 +2106,11 @@ mod aggregate_projection_tests {
         };
         assert_eq!(*accumulator, Tile::Scalar(ColumnValue::Ints(vec![10])));
         assert_eq!(terminal, ColumnValue::Bools(vec![true]));
-        assert_eq!(pulled.borrow().len(), 1);
-        assert!(pulled.borrow()[0].is_universal());
+        assert_eq!(
+            pulled.read().unwrap_or_else(PoisonError::into_inner).len(),
+            1
+        );
+        assert!(pulled.read().unwrap_or_else(PoisonError::into_inner)[0].is_universal());
     }
 
     #[test]
@@ -2087,7 +2118,12 @@ mod aggregate_projection_tests {
         let (mut sum, pulled) = sum_of_finished_stream();
         let tile = sum.read_in_pipeline(sum.tiling().empty_guard());
         assert_eq!(tile, sum.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2133,7 +2169,7 @@ mod extract_aggregate_projection_tests {
         let (mut extract, pulled) = extract_of_finished_sum();
         let tile = extract.read_in_pipeline(extract.tiling().universal_guard());
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![10])));
-        assert!(pulled.borrow()[0].is_universal());
+        assert!(pulled.read().unwrap_or_else(PoisonError::into_inner)[0].is_universal());
     }
 
     #[test]
@@ -2141,7 +2177,12 @@ mod extract_aggregate_projection_tests {
         let (mut extract, pulled) = extract_of_finished_sum();
         let tile = extract.read_in_pipeline(extract.tiling().empty_guard());
         assert_eq!(tile, extract.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2162,7 +2203,7 @@ mod map_aggregate_nested_projection_tests {
 
     /// `k ⤇ j ⤇ z ⤇ Int`: the keys 0 and 1, each holding the positions 0 to 2, each holding the
     /// positions 0 and 1 valued `100k + 10j + z`, every level stated complete.
-    fn three_levels_of_ints() -> Box<dyn TileOperator> {
+    fn three_levels_of_ints() -> Arc<dyn TileOperator> {
         let tiling = Tiling::data_function(
             Extent::uint_range(2),
             Tiling::data_function(
@@ -2194,7 +2235,7 @@ mod map_aggregate_nested_projection_tests {
             Predicate::True,
             BitSet::new(),
         );
-        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+        Arc::new(ProjectionSpyOp::new(tile, tiling).0)
     }
 
     /// The sum of each `(k, j)`'s positions, pulled at paths of `(k, j)`, answers what the whole
@@ -2202,7 +2243,7 @@ mod map_aggregate_nested_projection_tests {
     #[test]
     fn a_sum_of_each_path_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
-            Box::new(MapAggregate::new(
+            Arc::new(MapAggregate::new(
                 three_levels_of_ints(),
                 AggregateKind::Sum,
             ))
@@ -2214,8 +2255,8 @@ mod map_aggregate_nested_projection_tests {
     #[test]
     fn a_final_sum_of_each_path_answers_a_projection_of_paths() {
         assert_conforms_beneath(|| {
-            Box::new(MapExtractAggregate::new(
-                Box::new(MapAggregate::new(
+            Arc::new(MapExtractAggregate::new(
+                Arc::new(MapAggregate::new(
                     three_levels_of_ints(),
                     AggregateKind::Sum,
                 )),
@@ -2236,17 +2277,23 @@ mod map_aggregate_nested_projection_tests {
                 .union(&Predicate::qualified(point(1), point(0))),
         );
         let subscribe = || {
-            let mut op = MapAggregate::new(three_levels_of_ints(), AggregateKind::Sum);
+            let op = Arc::new(MapAggregate::new(
+                three_levels_of_ints(),
+                AggregateKind::Sum,
+            ));
             let guard = op.tiling().universal_guard();
-            op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
+            op.clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
         };
         let expected = subscribe().read_in_pipeline(paths.clone());
-        let mut input = three_levels_of_ints();
+        let input = three_levels_of_ints();
         let input_guard = input.tiling().universal_guard();
         let out_tiling = fold_innermost(input.tiling(), AggregateKind::Sum);
         let mut consuming = MapAggregateProducer::new(
             ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
-            input.subscribe(input_guard, Box::new(|| {}), &mut SubscribeContext::new()),
+            input
+                .clone()
+                .subscribe(input_guard, Box::new(|| {}), &mut SubscribeContext::new()),
             AggregateKind::Sum,
         );
         consuming.begin_run();
@@ -2267,9 +2314,13 @@ mod map_aggregate_nested_projection_tests {
             ))
         };
         let subscribe = || {
-            let mut op = MapAggregate::new(three_levels_of_ints(), AggregateKind::Sum);
+            let op = Arc::new(MapAggregate::new(
+                three_levels_of_ints(),
+                AggregateKind::Sum,
+            ));
             let guard = op.tiling().universal_guard();
-            op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
+            op.clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
         };
         let expected = subscribe().read_in_pipeline(path(1, 0));
         let mut sums = subscribe();
@@ -2279,7 +2330,7 @@ mod map_aggregate_nested_projection_tests {
 
     /// `k ⤇ j ⤇ z ⤇ w ⤇ Int`: every level holds the positions 0 and 1, the values
     /// `1000k + 100j + 10z + w`, every level stated complete.
-    fn four_levels_of_ints() -> Box<dyn TileOperator> {
+    fn four_levels_of_ints() -> Arc<dyn TileOperator> {
         let level = |inner: Tiling| Tiling::data_function(Extent::uint_range(2), inner);
         let tiling = level(level(level(level(Tiling::Scalar(Extent::Base(
             BaseType::Int,
@@ -2311,7 +2362,7 @@ mod map_aggregate_nested_projection_tests {
             Predicate::True,
             BitSet::new(),
         );
-        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+        Arc::new(ProjectionSpyOp::new(tile, tiling).0)
     }
 
     /// The sum of each `(k, j, z)`'s positions, pulled at paths of `(k, j, z)`, answers what the
@@ -2328,9 +2379,10 @@ mod map_aggregate_nested_projection_tests {
         };
         let paths = path(0, 1, 1).union(&path(1, 0, 0));
         let make = || {
-            let mut op = MapAggregate::new(four_levels_of_ints(), AggregateKind::Sum);
+            let op = Arc::new(MapAggregate::new(four_levels_of_ints(), AggregateKind::Sum));
             let guard = op.tiling().universal_guard();
-            op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
+            op.clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
         };
         let mut whole = make();
         assert!(
@@ -2521,7 +2573,10 @@ mod map_aggregate_projection_tests {
             sums(&morsel),
             vec![(Value::UInt(1), 3), (Value::UInt(2), 9)]
         );
-        assert_eq!(*pulled.borrow(), vec![keys_between(1, 2)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            vec![keys_between(1, 2)]
+        );
     }
 
     /// The consumer releases a morsel before the next, which drops the first morsel's
@@ -2540,7 +2595,12 @@ mod map_aggregate_projection_tests {
         let (mut sums_of, pulled) = sums_of_groups();
         let tile = sums_of.read_in_pipeline(sums_of.tiling().empty_guard());
         assert_eq!(tile, sums_of.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2679,7 +2739,10 @@ mod map_extract_aggregate_projection_tests {
         let (mut extract, pulled) = finished_sums();
         let morsel = extract.read_in_pipeline(keys_between(1, 2));
         assert_eq!(extracted(&morsel), vec![(Value::UInt(1), 3)]);
-        assert_eq!(*pulled.borrow(), vec![keys_between(1, 2)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            vec![keys_between(1, 2)]
+        );
     }
 
     /// Group 2 is still open, so it is not emitted and the statement, the input's, does not
@@ -2726,7 +2789,12 @@ mod map_extract_aggregate_projection_tests {
         let (mut extract, pulled) = finished_sums();
         let tile = extract.read_in_pipeline(extract.tiling().empty_guard());
         assert_eq!(tile, extract.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(
+            pulled
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2799,8 +2867,17 @@ mod aggregate_consuming_tests {
         aggregate.begin_run();
         aggregate.consume_in_pipeline(InputId::ONLY, keys_between(2, 5));
         assert_eq!(held(&aggregate), (sum_of(2..=5), false));
-        assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
-        assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
+        assert_eq!(
+            source.read().unwrap_or_else(PoisonError::into_inner).pulled,
+            vec![keys_between(2, 5)]
+        );
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .released,
+            vec![keys_between(2, 5)]
+        );
     }
 
     /// A second disjoint region adds its rows, and an overlapping one adds only the rows the
@@ -2845,7 +2922,13 @@ mod aggregate_consuming_tests {
         let mut aggregate = sum_over(&source);
         aggregate.begin_run();
         aggregate.consume_in_pipeline(InputId::ONLY, ints().empty_guard());
-        assert!(source.borrow().pulled.is_empty());
+        assert!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .is_empty()
+        );
         assert_eq!(held(&aggregate), (0, false));
     }
 
@@ -2903,11 +2986,22 @@ mod aggregate_consuming_tests {
         let mut aggregate = sum_over(&source);
         aggregate.begin_run();
         aggregate.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        let pulls = source.borrow().pulled.len();
+        let pulls = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pulled
+            .len();
         for _ in 0..3 {
             aggregate.get(sum_tiling().universal_guard());
         }
-        assert_eq!(source.borrow().pulled.len(), pulls);
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .len(),
+            pulls
+        );
     }
 
     /// A breaker placed in a pipeline answers a pull before its first consume with the fold of
@@ -2920,14 +3014,26 @@ mod aggregate_consuming_tests {
         aggregate.begin_run();
         let tile = aggregate.get(sum_tiling().universal_guard());
         assert!(!tile.is_terminal(), "{tile:?}");
-        assert!(source.borrow().pulled.is_empty());
+        assert!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .is_empty()
+        );
         let mut extract = extract_over(&source);
         extract.begin_run();
         assert_eq!(
             scalar_of(&extract.get(scalar_tiling().universal_guard())),
             None
         );
-        assert!(source.borrow().pulled.is_empty());
+        assert!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .is_empty()
+        );
     }
 
     /// A growing input withholds a key it does not hold yet: the release leaves it, and a row that
@@ -2938,11 +3044,33 @@ mod aggregate_consuming_tests {
         let mut aggregate = sum_over(&source);
         aggregate.begin_run();
         aggregate.consume_in_pipeline(InputId::ONLY, keys_between(0, 5));
-        assert!(!predicate(&source.borrow().released[0]).contains(&Value::UInt(3)));
-        source.borrow_mut().rows.insert(3, value(3));
+        assert!(
+            !predicate(
+                &source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .released[0]
+            )
+            .contains(&Value::UInt(3))
+        );
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .rows
+            .insert(3, value(3));
         aggregate.consume_in_pipeline(InputId::ONLY, keys_between(0, 5));
         assert_eq!(held(&aggregate).0, sum_of(0..=5));
-        assert!(predicate(source.borrow().released.last().unwrap()).contains(&Value::UInt(3)));
+        assert!(
+            predicate(
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .released
+                    .last()
+                    .unwrap()
+            )
+            .contains(&Value::UInt(3))
+        );
     }
 
     /// A consume after the output was released pulls nothing: the input was released whole.
@@ -2953,10 +3081,24 @@ mod aggregate_consuming_tests {
         aggregate.begin_run();
         aggregate.consume_in_pipeline(InputId::ONLY, keys_between(0, 1));
         aggregate.release(sum_tiling().universal_guard());
-        let pulls = source.borrow().pulled.len();
+        let pulls = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pulled
+            .len();
         aggregate.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        assert_eq!(source.borrow().pulled.len(), pulls);
-        assert_eq!(source.borrow().wasted, 0);
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .len(),
+            pulls
+        );
+        assert_eq!(
+            source.read().unwrap_or_else(PoisonError::into_inner).wasted,
+            0
+        );
     }
 
     /// The model of a run over a growing input: which rows were folded, whether the output was
@@ -2992,12 +3134,19 @@ mod aggregate_consuming_tests {
             match step {
                 Add(key) => {
                     if self.input.add(key) {
-                        self.sut_source.borrow_mut().rows.insert(key, value(key));
+                        self.sut_source
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .rows
+                            .insert(key, value(key));
                     }
                 }
                 Close => {
                     self.input.closed = true;
-                    self.sut_source.borrow_mut().closed = true;
+                    self.sut_source
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .closed = true;
                 }
                 // The aggregate listens to no region: its input's notifications reach its
                 // consumer widened.
@@ -3183,10 +3332,18 @@ mod aggregate_consuming_tests {
         extract.release(scalar_tiling().universal_guard());
         assert_eq!(extract.complete(), scalar_tiling().universal_guard());
         assert_eq!(extract.final_guard(), scalar_tiling().empty_guard());
-        let pulls = source.borrow().pulled.len();
+        let pulls = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pulled
+            .len();
         extract.get(scalar_tiling().universal_guard());
         assert_eq!(
-            source.borrow().pulled.len(),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .len(),
             pulls,
             "the offer pulls nothing"
         );
@@ -3217,14 +3374,30 @@ mod aggregate_consuming_tests {
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
         let pulls = (
-            extract.input.base().reads.get(),
-            source.borrow().pulled.len(),
+            extract
+                .input
+                .base()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .len(),
         );
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
         assert_eq!(
             (
-                extract.input.base().reads.get(),
-                source.borrow().pulled.len()
+                extract
+                    .input
+                    .base()
+                    .reads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                source
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pulled
+                    .len()
             ),
             pulls
         );
@@ -3238,9 +3411,20 @@ mod aggregate_consuming_tests {
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
         extract.release(scalar_tiling().universal_guard());
-        let pulls = extract.input.base().reads.get();
+        let pulls = extract
+            .input
+            .base()
+            .reads
+            .load(std::sync::atomic::Ordering::Relaxed);
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
-        assert_eq!(extract.input.base().reads.get(), pulls);
+        assert_eq!(
+            extract
+                .input
+                .base()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            pulls
+        );
     }
 
     #[test]
@@ -3259,9 +3443,19 @@ mod aggregate_consuming_tests {
         let mut extract = extract_over(&source);
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().empty_guard());
-        assert!(source.borrow().pulled.is_empty());
+        assert!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .is_empty()
+        );
         assert_eq!(
-            extract.input.base().reads.get(),
+            extract
+                .input
+                .base()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "the input is not pulled either"
         );
@@ -3299,7 +3493,10 @@ mod aggregate_consuming_tests {
             "nothing is released"
         );
 
-        source.borrow_mut().closed = true;
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
         assert_eq!(
             scalar_of(&extract.get(scalar_tiling().universal_guard())),
@@ -3349,14 +3546,21 @@ mod aggregate_consuming_tests {
                 Add(key) => {
                     if self.input.add(key) {
                         for source in [&self.sut_source, &self.twin_source] {
-                            source.borrow_mut().rows.insert(key, value(key));
+                            source
+                                .write()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .rows
+                                .insert(key, value(key));
                         }
                     }
                 }
                 Close => {
                     self.input.closed = true;
                     for source in [&self.sut_source, &self.twin_source] {
-                        source.borrow_mut().closed = true;
+                        source
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .closed = true;
                     }
                 }
                 Notify(_) => unreachable!("an extraction listens to no region"),
@@ -3548,7 +3752,8 @@ mod map_aggregate_consuming_tests {
 
     fn released_keys(source: &Shared) -> BTreeSet<u64> {
         source
-            .borrow()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .released
             .iter()
             .flat_map(outer_keys)
@@ -3564,7 +3769,13 @@ mod map_aggregate_consuming_tests {
         sums.begin_run();
         let tile = sums.get(out_tiling().universal_guard());
         assert!(tile.is_empty() && !tile.is_terminal(), "{tile:?}");
-        assert!(source.borrow().pulled.is_empty());
+        assert!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3574,7 +3785,10 @@ mod map_aggregate_consuming_tests {
         map.begin_run();
         map.consume_in_pipeline(InputId::ONLY, input_guard(Keys(2, 5)));
         assert_eq!(held(&map), sums_of(2..=5));
-        assert_eq!(source.borrow().pulled, vec![input_guard(Keys(2, 5))]);
+        assert_eq!(
+            source.read().unwrap_or_else(PoisonError::into_inner).pulled,
+            vec![input_guard(Keys(2, 5))]
+        );
         assert_eq!(released_keys(&source), (2..=5).collect());
     }
 
@@ -3600,7 +3814,13 @@ mod map_aggregate_consuming_tests {
         let mut map = sums_over(&source);
         map.begin_run();
         map.consume_in_pipeline(InputId::ONLY, nested_tiling().empty_guard());
-        assert!(source.borrow().pulled.is_empty());
+        assert!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .is_empty()
+        );
         assert!(held(&map).is_empty());
     }
 
@@ -3640,12 +3860,23 @@ mod map_aggregate_consuming_tests {
         let mut map = sums_over(&source);
         map.begin_run();
         map.consume_in_pipeline(InputId::ONLY, nested_tiling().universal_guard());
-        let pulls = source.borrow().pulled.len();
+        let pulls = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pulled
+            .len();
         for _ in 0..3 {
             map.get(out_tiling().universal_guard());
             map.get(keys_between(1, 3));
         }
-        assert_eq!(source.borrow().pulled.len(), pulls);
+        assert_eq!(
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pulled
+                .len(),
+            pulls
+        );
     }
 
     /// What the answers state is united: an offer at an earlier region still states its keys
@@ -3724,7 +3955,11 @@ mod map_aggregate_consuming_tests {
             !released_keys(&source).contains(&3),
             "the input did not answer group 3"
         );
-        source.borrow_mut().rows.insert(3, value(3));
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .rows
+            .insert(3, value(3));
         map.consume_in_pipeline(InputId::ONLY, input_guard(Keys(0, 5)));
         assert_eq!(held(&map), sums_of(0..=5));
     }
@@ -3740,9 +3975,16 @@ mod map_aggregate_consuming_tests {
         assert!(
             released_keys(&source).is_empty(),
             "no group key is released: {:?}",
-            source.borrow().released
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .released
         );
-        source.borrow_mut().members.insert(3, 4);
+        source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .members
+            .insert(3, 4);
         map.consume_in_pipeline(InputId::ONLY, input_guard(Keys(2, 5)));
         let mut expected = sums_of(2..=5);
         expected.insert(3, members_of(3, 4).iter().sum());
@@ -3821,13 +4063,20 @@ mod map_aggregate_consuming_tests {
                 Add(key) => {
                     self.rows.insert(key);
                     for source in [&self.sut_source, &self.twin_source] {
-                        source.borrow_mut().rows.insert(key, value(key));
+                        source
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .rows
+                            .insert(key, value(key));
                     }
                 }
                 Close => {
                     self.closed = true;
                     for source in [&self.sut_source, &self.twin_source] {
-                        source.borrow_mut().closed = true;
+                        source
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .closed = true;
                     }
                 }
                 Notify(_) => unreachable!("a map aggregate listens to no region"),

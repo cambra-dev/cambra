@@ -3,7 +3,9 @@
 //! sink's own pipeline pulls its producer one package at a time. Each answer is checked against
 //! a fixed expected value.
 
+use crate::interpreter::TestDataSource;
 use indoc::{formatdoc, indoc};
+use std::sync::PoisonError;
 
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
@@ -69,10 +71,16 @@ fn dispatched_with(
     );
     let roots: Vec<_> = consumers
         .iter()
-        .map(|consumer| consumer.borrow().producer_slot().clone())
+        .map(|consumer| {
+            consumer
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .producer_slot()
+                .clone()
+        })
         .collect();
     for (name, root) in names.iter().zip(&roots) {
-        let root = root.borrow();
+        let root = root.read().unwrap_or_else(PoisonError::into_inner);
         let producer = root.as_ref().expect("a root holds its producer");
         assert!(
             producer.obsolete_guard().is_universal(),
@@ -110,7 +118,10 @@ fn dispatched_with(
 fn pulls_beneath_breakers(roots: &[crate::interpreter::sinks::ProducerSlot]) -> u64 {
     fn walk(producer: &mut dyn TileProducer, beneath: bool) -> u64 {
         let own = if beneath {
-            producer.base().reads.get()
+            producer
+                .base()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed)
         } else {
             0
         };
@@ -122,7 +133,7 @@ fn pulls_beneath_breakers(roots: &[crate::interpreter::sinks::ProducerSlot]) -> 
     roots
         .iter()
         .map(|root| {
-            let mut root = root.borrow_mut();
+            let mut root = root.write().unwrap_or_else(PoisonError::into_inner);
             walk(
                 root.as_mut().expect("a root holds its producer").as_mut(),
                 false,
@@ -197,13 +208,11 @@ fn a_sum_of_a_constant_over_rows_is_one_aggregate() {
 fn operator_graph(source: &str, live: bool) -> crate::interpreter::operator_graph::OperatorGraph {
     let mut ctx = GlobalContext::default();
     if live {
-        ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::interpreter::TestDataSource::new(
-                "source1",
-                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-            ),
-        )));
+        ctx.register_source(TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ));
     }
     let _sink = ctx.register_test_sink("out");
     let loaded = LoadedProgram::test(source);
@@ -1907,11 +1916,11 @@ fn a_live_product_writer_beside_an_independent_ready_writer(
     let feeds: Vec<_> = ["source1", "source2"]
         .into_iter()
         .map(|name| {
-            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+            let source = TestDataSource::new(
                 name,
                 crate::ccl::Type::Base(BaseType::Int),
                 Extent::Base(BaseType::Int),
-            )));
+            );
             ctx.register_source(source.clone());
             source
         })
@@ -1933,7 +1942,7 @@ fn a_live_product_writer_beside_an_independent_ready_writer(
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap();
     let _operators = ctx.take_operator_map();
     let deliver = |side: usize, key: u64, value: i64| {
-        let mut source = feeds[side].borrow_mut();
+        let mut source = feeds[side].write().unwrap_or_else(PoisonError::into_inner);
         source.add_data(&[(Value::UInt(key), Value::Int(value))]);
         source.set_yield_predicate(Predicate::at_or_below(Value::UInt(key)));
     };
@@ -1953,10 +1962,12 @@ fn a_live_product_writer_beside_an_independent_ready_writer(
             1 => deliver(0, 1, 5),
             2 => deliver(1, 1, 7),
             3 => feeds[usize::from(!close_left_first)]
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .set_yield_predicate(Predicate::True),
             4 => feeds[usize::from(close_left_first)]
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .set_yield_predicate(Predicate::True),
             _ => panic!("run waits after both sources close"),
         }
@@ -2124,7 +2135,7 @@ fn a_loop_over_a_let_bound_live_list_steps_before_the_source_ends(
     }
     let mut decided = Vec::new();
     let (value, _) = dispatched_live_observed(source, rows, one_key_batches(4), |_, root| {
-        let mut root = root.borrow_mut();
+        let mut root = root.write().unwrap_or_else(PoisonError::into_inner);
         let producer = root.as_mut().expect("a root holds its producer");
         decided.push(decided_by_store(producer.as_mut()).expect("the sink reads the loop's store"));
     });
@@ -2237,13 +2248,11 @@ fn dispatched_live_observed(
     mut idle: impl FnMut(&crate::interpreter::TestSink, &crate::interpreter::sinks::ProducerSlot),
 ) -> (Value, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
-    let feed = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    ));
+    let feed = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+        crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+    );
     ctx.register_source(feed.clone());
     let sink = ctx.register_test_sink("out");
     let loaded = LoadedProgram::test(source);
@@ -2256,7 +2265,8 @@ fn dispatched_live_observed(
         .find(|output| output.name == "out")
         .and_then(|output| output.sink_consumer.clone())
         .unwrap_or_else(|| panic!("{source} writes to sink out"))
-        .borrow()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
         .producer_slot()
         .clone();
     let mut batches = batches.into_iter();
@@ -2264,7 +2274,7 @@ fn dispatched_live_observed(
         let Some((entries, complete)) = batch else {
             panic!("{source}: the run waits after the last batch")
         };
-        let mut feed = feed.borrow_mut();
+        let mut feed = feed.write().unwrap_or_else(PoisonError::into_inner);
         feed.add_data(&entries);
         feed.set_yield_predicate(complete);
     };
@@ -2836,11 +2846,11 @@ fn a_cartesian_product_of_two_live_sources(
     let feeds: Vec<_> = ["source1", "source2"]
         .into_iter()
         .map(|name| {
-            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+            let source = TestDataSource::new(
                 name,
                 crate::ccl::Type::Base(BaseType::Int),
                 Extent::Base(BaseType::Int),
-            )));
+            );
             ctx.register_source(source.clone());
             source
         })
@@ -2882,7 +2892,7 @@ fn a_cartesian_product_of_two_live_sources(
                     (Value::UInt(key), Value::Int(value))
                 })
                 .collect();
-            let mut feed = feeds[side].borrow_mut();
+            let mut feed = feeds[side].write().unwrap_or_else(PoisonError::into_inner);
             feed.add_data(&entries);
             let decided = if closed {
                 Predicate::True
@@ -2914,13 +2924,14 @@ fn a_cartesian_product_of_two_live_sources(
         .iter()
         .find_map(|output| output.sink_consumer.as_ref())
         .expect("one sink")
-        .borrow()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
         .producer_slot()
         .clone();
     let mut boundaries = Vec::new();
     deliver();
     let mut next_delivery = || {
-        let mut slot = root.borrow_mut();
+        let mut slot = root.write().unwrap_or_else(PoisonError::into_inner);
         let decided = product_decided(slot.as_mut().expect("the sink owns its input").as_mut())
             .expect("the program has a Cartesian iterator");
         assert!(
@@ -2975,20 +2986,16 @@ fn a_live_product_as_a_loop_source(#[case] pairs: &str, #[values(1, usize::MAX)]
 fn a_loop_over_two_open_product_dimensions(#[values(1, usize::MAX)] rows: usize) {
     use crate::interpreter::{BaseType, Extent, Predicate};
     let mut ctx = GlobalContext::default();
-    let a = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(BaseType::Int),
-            Extent::Base(BaseType::Int),
-        ),
-    ));
-    let b = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source2",
-            crate::ccl::Type::Base(BaseType::Int),
-            Extent::Base(BaseType::Int),
-        ),
-    ));
+    let a = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    );
+    let b = TestDataSource::new(
+        "source2",
+        crate::ccl::Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    );
     ctx.register_source(a.clone());
     ctx.register_source(b.clone());
     let sink = ctx.register_test_sink("out");
@@ -3001,22 +3008,34 @@ fn a_loop_over_two_open_product_dimensions(#[values(1, usize::MAX)] rows: usize)
     "};
     let mut program =
         compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
-    a.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(1)),
-        (Value::UInt(1), Value::Int(2)),
-    ]);
-    a.borrow_mut()
+    a.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(1)),
+            (Value::UInt(1), Value::Int(2)),
+        ]);
+    a.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
-    b.borrow_mut().add_data(&[(Value::UInt(0), Value::Int(10))]);
-    b.borrow_mut()
+    b.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[(Value::UInt(0), Value::Int(10))]);
+    b.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
     let mut delivered = false;
     let mut next = || {
         assert!(!delivered, "the next delivery closes both sources");
         delivered = true;
-        b.borrow_mut().add_data(&[(Value::UInt(1), Value::Int(20))]);
-        a.borrow_mut().set_yield_predicate(Predicate::True);
-        b.borrow_mut().set_yield_predicate(Predicate::True);
+        b.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_data(&[(Value::UInt(1), Value::Int(20))]);
+        a.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_yield_predicate(Predicate::True);
+        b.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_yield_predicate(Predicate::True);
     };
     crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut next).unwrap();
     assert_eq!(
@@ -3129,13 +3148,11 @@ struct LiveMain {
 /// dispatcher at morsels of `rows`, the source fed `batches` as [`dispatched_live`] feeds them.
 fn dispatched_live_main(source: &str, rows: usize, batches: Vec<Batch>) -> LiveMain {
     let mut ctx = GlobalContext::default();
-    let feed = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    ));
+    let feed = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+        crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+    );
     ctx.register_source(feed.clone());
     let loaded = LoadedProgram::test(source);
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
@@ -3146,7 +3163,7 @@ fn dispatched_live_main(source: &str, rows: usize, batches: Vec<Batch>) -> LiveM
         let Some((entries, complete)) = batch else {
             panic!("{source}: the run waits after the last batch")
         };
-        let mut feed = feed.borrow_mut();
+        let mut feed = feed.write().unwrap_or_else(PoisonError::into_inner);
         feed.add_data(&entries);
         feed.set_yield_predicate(complete);
     };
@@ -3253,13 +3270,11 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 ) {
     use crate::interpreter::dispatcher::{Ended, Targets};
     let mut ctx = GlobalContext::default();
-    let feed = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    ));
+    let feed = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+        crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+    );
     ctx.register_source(feed.clone());
     let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
@@ -3269,7 +3284,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         .and_then(|output| output.producer.take())
         .expect("a `main` output");
     let slot: crate::interpreter::sinks::ProducerSlot =
-        std::rc::Rc::new(std::cell::RefCell::new(Some(producer)));
+        std::sync::Arc::new(std::sync::RwLock::new(Some(producer)));
     let main = std::sync::Arc::new(MainAnswers::default());
     let mut targets = Targets::default();
     targets.add_main(&program, slot.clone(), main.clone());
@@ -3280,7 +3295,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     let mut paused = 0;
     let mut done = false;
     for (entries, complete) in two_batches() {
-        let mut feed = feed.borrow_mut();
+        let mut feed = feed.write().unwrap_or_else(PoisonError::into_inner);
         feed.add_data(&entries);
         feed.set_yield_predicate(complete);
         drop(feed);
@@ -3916,13 +3931,11 @@ fn a_store_over_a_live_source_reading_a_sum_of_another(
 ) {
     let mut ctx = GlobalContext::default();
     let feed = |name: &str| {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            crate::interpreter::TestDataSource::new(
-                name,
-                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-            ),
-        ))
+        TestDataSource::new(
+            name,
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        )
     };
     let (first, second) = (feed("source1"), feed("source2"));
     ctx.register_source(first.clone());
@@ -3936,13 +3949,21 @@ fn a_store_over_a_live_source_reading_a_sum_of_another(
         keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
             .collect::<Vec<_>>()
     };
-    first.borrow_mut().add_data(&entries(0..3));
     first
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..3));
+    first
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(crate::interpreter::Predicate::True);
-    second.borrow_mut().add_data(&entries(0..2));
     second
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..2));
+    second
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(crate::interpreter::Predicate::at_or_below(Value::UInt(1)));
     let mut rest = Some(entries(2..4));
     let planned =
@@ -3950,9 +3971,13 @@ fn a_store_over_a_live_source_reading_a_sum_of_another(
             let entries = rest
                 .take()
                 .expect("the run waits only for the second batch");
-            second.borrow_mut().add_data(&entries);
             second
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .add_data(&entries);
+            second
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .set_yield_predicate(crate::interpreter::Predicate::True);
         })
         .unwrap_or_else(|refused| panic!("{refused}"))
@@ -4011,13 +4036,11 @@ fn a_transaction_takes_each_delivery_once_its_seed_is_final(#[values(1, usize::M
     "};
     let mut ctx = GlobalContext::default();
     let feed = |name: &str| {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            crate::interpreter::TestDataSource::new(
-                name,
-                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-            ),
-        ))
+        TestDataSource::new(
+            name,
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        )
     };
     let (items, seed) = (feed("source1"), feed("source2"));
     ctx.register_source(items.clone());
@@ -4032,27 +4055,52 @@ fn a_transaction_takes_each_delivery_once_its_seed_is_final(#[values(1, usize::M
             .collect::<Vec<_>>()
     };
     let up_to = |key: u64| crate::interpreter::Predicate::at_or_below(Value::UInt(key));
-    items.borrow_mut().add_data(&entries(0..2));
-    items.borrow_mut().set_yield_predicate(up_to(1));
-    seed.borrow_mut().add_data(&entries(0..2));
-    seed.borrow_mut().set_yield_predicate(up_to(1));
+    items
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..2));
+    items
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(up_to(1));
+    seed.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..2));
+    seed.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(up_to(1));
     let mut idle = 0;
     let mut released = Vec::new();
     crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
         idle += 1;
-        released.push(items.borrow().get_released_predicate());
+        released.push(
+            items
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate(),
+        );
         match idle {
             1 => {
-                seed.borrow_mut().add_data(&entries(2..4));
-                seed.borrow_mut()
+                seed.write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .add_data(&entries(2..4));
+                seed.write()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .set_yield_predicate(crate::interpreter::Predicate::True);
             }
             2 => {
-                items.borrow_mut().add_data(&entries(2..4));
-                items.borrow_mut().set_yield_predicate(up_to(3));
+                items
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .add_data(&entries(2..4));
+                items
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .set_yield_predicate(up_to(3));
             }
             3 => items
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .set_yield_predicate(crate::interpreter::Predicate::True),
             _ => panic!("{source}: the run waits only for its three batches"),
         }
@@ -4092,13 +4140,11 @@ fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)
         out << last
     "};
     let mut ctx = GlobalContext::default();
-    let items = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    ));
+    let items = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+        crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+    );
     ctx.register_source(items.clone());
     let sink = ctx.register_test_sink("out");
     let loaded = LoadedProgram::test(source);
@@ -4110,20 +4156,38 @@ fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)
             .collect::<Vec<_>>()
     };
     let up_to = |key: u64| crate::interpreter::Predicate::at_or_below(Value::UInt(key));
-    items.borrow_mut().add_data(&entries(0..2));
-    items.borrow_mut().set_yield_predicate(up_to(1));
+    items
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..2));
+    items
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(up_to(1));
     let mut idle = 0;
     let mut released = Vec::new();
     crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
         idle += 1;
-        released.push(items.borrow().get_released_predicate());
+        released.push(
+            items
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_released_predicate(),
+        );
         match idle {
             1 => {
-                items.borrow_mut().add_data(&entries(2..4));
-                items.borrow_mut().set_yield_predicate(up_to(3));
+                items
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .add_data(&entries(2..4));
+                items
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .set_yield_predicate(up_to(3));
             }
             2 => items
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .set_yield_predicate(crate::interpreter::Predicate::True),
             _ => panic!("{source}: the run waits only for its two batches"),
         }
@@ -4199,13 +4263,11 @@ fn a_reader_of_two_pipelines_decided_apart(
 ) {
     let mut ctx = GlobalContext::default();
     let feed = |name: &str| {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            crate::interpreter::TestDataSource::new(
-                name,
-                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-            ),
-        ))
+        TestDataSource::new(
+            name,
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        )
     };
     let (list, summed) = (feed("source1"), feed("source2"));
     ctx.register_source(list.clone());
@@ -4219,10 +4281,20 @@ fn a_reader_of_two_pipelines_decided_apart(
             .collect::<Vec<_>>()
     };
     let up_to = |key: u64| crate::interpreter::Predicate::at_or_below(Value::UInt(key));
-    list.borrow_mut().add_data(&entries(0..2));
-    list.borrow_mut().set_yield_predicate(up_to(1));
-    summed.borrow_mut().add_data(&entries(0..1));
-    summed.borrow_mut().set_yield_predicate(up_to(0));
+    list.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..2));
+    list.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(up_to(1));
+    summed
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&entries(0..1));
+    summed
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(up_to(0));
     let mut idle = 0;
     crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
         idle += 1;
@@ -4231,8 +4303,11 @@ fn a_reader_of_two_pipelines_decided_apart(
             2 => (&list, 2..5),
             _ => panic!("{source}: the run waits only for its two batches"),
         };
-        fed.borrow_mut().add_data(&entries(keys));
-        fed.borrow_mut()
+        fed.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_data(&entries(keys));
+        fed.write()
+            .unwrap_or_else(PoisonError::into_inner)
             .set_yield_predicate(crate::interpreter::Predicate::True);
     })
     .unwrap_or_else(|refused| panic!("{source}: {refused}"));
