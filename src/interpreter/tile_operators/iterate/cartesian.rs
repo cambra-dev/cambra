@@ -35,11 +35,8 @@ pub(super) fn subscribe(
 ) -> Box<dyn TileProducer> {
     let mut fields: Vec<_> = fields.iter().map(|(n, e)| (n.clone(), e.clone())).collect();
     fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let wakeup = shared_consumer(consumer);
-    let leaf = wakeup.clone();
     IterateExtent::add_all_source_handles(&op.extent, cx);
-    let base = ProducerBase::new(IterateExtentProducer::alloc_id(), op.tiling(), &op.base, cx)
-        .leaf(leaf.clone());
+    let base = ProducerBase::new(IterateExtentProducer::alloc_id(), op.tiling(), &op.base, cx);
     let mut holds = Vec::new();
     for (side, (_, extent)) in fields.iter().enumerate() {
         let mut sources = Vec::new();
@@ -75,13 +72,14 @@ pub(super) fn subscribe(
             }
         })
         .collect();
+    let state = Rc::new(RefCell::new(CartesianIteration { sides, holds }));
+    let leaf = shared_consumer(Box::new(CartesianSource {
+        state: state.clone(),
+        downstream: consumer,
+    }));
     Box::new(IterateExtentProducer {
-        base,
-        iteration: Iteration::Cartesian(Box::new(CartesianIteration {
-            sides,
-            holds,
-            _source_wakeup: leaf,
-        })),
+        base: base.leaf(leaf),
+        iteration: Iteration::Cartesian(state),
     })
 }
 
@@ -89,11 +87,30 @@ pub(super) struct CartesianIteration {
     sides: Vec<Side>,
     // Each dimension retains source values independently for downstream lookups and future pairs.
     holds: Vec<SourceHold>,
-    _source_wakeup: SharedConsumer,
+}
+
+/// The existing source notification path updates the same state the producer reads. A route
+/// or planning probe only forwards its region; an actual delivery first ingests source news.
+struct CartesianSource {
+    state: Rc<RefCell<CartesianIteration>>,
+    downstream: Box<dyn Consumer>,
+}
+
+impl Consumer for CartesianSource {
+    fn notify(
+        &mut self,
+        region: &Projection,
+        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
+    ) {
+        if landing.is_delivery() {
+            self.state.borrow_mut().arrive();
+        }
+        self.downstream.notify(region, landing);
+    }
 }
 
 impl CartesianIteration {
-    fn read(&mut self, obsolete: &TileGuard) {
+    fn arrive(&mut self) {
         for side in &mut self.sides {
             let known = side.tile.to_guard().projection("IterateExtent");
             let known = match known {
@@ -130,7 +147,6 @@ impl CartesianIteration {
             };
             *domain_predicate = domain_predicate.union(&decided);
         }
-        self.reclaim_sides(obsolete);
     }
 
     fn keys(&self, guard: &TileGuard, tiling: &Tiling) -> ColumnValue {
@@ -231,10 +247,7 @@ impl CartesianIteration {
         ProducerStateInfo::holding(self.sides.iter().map(|side| side.tile.cell_count()).sum())
     }
 
-    pub(super) fn get(&mut self, guard: TileGuard, tiling: &Tiling, obsolete: &TileGuard) -> Tile {
-        if !guard.is_empty() {
-            self.read(obsolete);
-        }
+    pub(super) fn get(&self, guard: TileGuard, tiling: &Tiling, obsolete: &TileGuard) -> Tile {
         self.offer(guard, tiling, obsolete)
     }
 
@@ -321,7 +334,22 @@ mod tests {
             &mut SubscribeContext::new(),
         )
     }
+    fn deliver(head: &dyn TileProducer) {
+        // Exercise the same completion delivery that source polling uses, before reading.
+        let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);
+        let consumer = head
+            .base()
+            .downstream
+            .clone()
+            .expect("an iterator's source consumer");
+        dispatcher.land_range_complete(
+            crate::interpreter::dispatcher::PipelineId(0),
+            &Projection::Everything,
+            &consumer,
+        );
+    }
     fn rows(head: &mut dyn TileProducer) -> usize {
+        deliver(head);
         let mut tile = head.read_in_pipeline(head.tiling().universal_guard());
         tile.compact();
         let Tile::DataFunction { domain, .. } = tile else {
@@ -486,6 +514,7 @@ mod tests {
         let mut p = head(Extent::DataSourceDomain(a.clone()), Extent::uint_range(2));
         assert_eq!(rows(&mut *p), 2);
         a.borrow_mut().set_yield_predicate(prefix(0));
+        deliver(&*p);
         let tile = p.read_in_pipeline(p.tiling().universal_guard());
         let Tile::DataFunction {
             domain_predicate,
@@ -503,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cartesian_iterator_is_a_leaf_and_reads_arrivals_on_get() {
+    fn a_cartesian_iterator_is_a_leaf_and_reads_delivered_arrivals() {
         let (a, b) = (source("a"), source("b"));
         add(&a, &[0], prefix(0));
         add(&b, &[0], prefix(0));
@@ -515,6 +544,44 @@ mod tests {
         assert_eq!(rows(&mut *p), 1);
         add(&a, &[1], prefix(1));
         assert_eq!(rows(&mut *p), 2);
+        assert_eq!(rows(&mut *p), 2);
+    }
+    #[test]
+    fn source_delivery_ingests_domains_while_reads_and_probes_only_observe() {
+        let (a, b) = (source("a"), source("b"));
+        add(&a, &[0], prefix(0));
+        add(&b, &[0], prefix(0));
+        let mut p = head(
+            Extent::DataSourceDomain(a.clone()),
+            Extent::DataSourceDomain(b),
+        );
+        let consumer = p.base().downstream.clone().unwrap();
+        let mut probe = crate::interpreter::dispatcher::Landing::probe(
+            crate::interpreter::dispatcher::PipelineId(0),
+        );
+        consumer
+            .borrow_mut()
+            .notify(&Projection::Everything, &mut probe);
+        let before = p.read_in_pipeline(p.tiling().universal_guard());
+        let Tile::DataFunction { domain, .. } = before else {
+            panic!("product rows")
+        };
+        assert_eq!(
+            domain.len(),
+            0,
+            "planning probes and reads do not ingest source data"
+        );
+        assert_eq!(rows(&mut *p), 1);
+        add(&a, &[1], prefix(1));
+        let before_delivery = p.read_in_pipeline(p.tiling().universal_guard());
+        let Tile::DataFunction { domain, .. } = before_delivery else {
+            panic!("product rows")
+        };
+        assert_eq!(
+            domain.len(),
+            1,
+            "a read observes only delivered source news"
+        );
         assert_eq!(rows(&mut *p), 2);
     }
 }

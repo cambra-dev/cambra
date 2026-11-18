@@ -16,7 +16,7 @@ use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Projection,
-    SharedConsumer, SubscribeContext, UnionArm, Value, notifications::shared_consumer,
+    SubscribeContext, UnionArm, Value, notifications::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -124,7 +124,7 @@ struct IterateExtentProducer {
 
 enum Iteration {
     Direct(DirectIteration),
-    Cartesian(Box<CartesianIteration>),
+    Cartesian(Rc<RefCell<CartesianIteration>>),
 }
 
 struct DirectIteration {
@@ -332,7 +332,7 @@ impl TileProducer for IterateExtentProducer {
     fn state_info(&self) -> ProducerStateInfo {
         match &self.iteration {
             Iteration::Direct(_) => ProducerStateInfo::holding(0),
-            Iteration::Cartesian(cartesian) => cartesian.state_info(),
+            Iteration::Cartesian(cartesian) => cartesian.borrow().state_info(),
         }
     }
 
@@ -349,10 +349,10 @@ impl TileProducer for IterateExtentProducer {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
             let obsolete = self.obsolete_guard().clone();
-            let Iteration::Cartesian(cartesian) = &mut self.iteration else {
+            let Iteration::Cartesian(cartesian) = &self.iteration else {
                 unreachable!()
             };
-            return cartesian.get(projection_guard, &tiling, &obsolete);
+            return cartesian.borrow().get(projection_guard, &tiling, &obsolete);
         }
         let Iteration::Direct(direct) = &self.iteration else {
             unreachable!()
@@ -393,7 +393,7 @@ impl TileProducer for IterateExtentProducer {
         let name = self.name();
         let obsolete = self.obsolete_guard().clone();
         match &mut self.iteration {
-            Iteration::Cartesian(cartesian) => cartesian.release(&obsolete),
+            Iteration::Cartesian(cartesian) => cartesian.borrow_mut().release(&obsolete),
             Iteration::Direct(direct) => {
                 let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
                     panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
