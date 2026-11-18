@@ -35,8 +35,10 @@ Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 ### Cartesian iteration
 
 `IterateExtentProducer` owns the retained keys and decided regions of a live record extent.
-It remains a leaf producer. Each dimension is enumerated on `get`; keys already retained or
-released are excluded before merging new information. The output is the identity over record keys.
+It remains a leaf producer. Its source consumer ingests each dimension on an actual source
+notification, before forwarding progress downstream. Keys already retained or released are
+excluded before merging new information. Reads and planning probes observe this retained state
+without ingesting arrivals. The output is the identity over record keys.
 
 The dispatcher polls every physical source in a live range's extent once per pass. The extent's
 decided region is the conjunction of record fields or the tagged regions of a union. Each range
