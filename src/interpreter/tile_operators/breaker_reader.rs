@@ -1,12 +1,17 @@
 use super::*;
 use crate::interpreter::dispatcher::BreakerHandle;
+use std::sync::PoisonError;
 
 /// Own one breaker subscription in a cell shared by its reader and the execution plan.
 /// The breaker retains only a weak reference to its cell.
 pub(crate) fn share_breaker(producer: impl BreakingProducer + 'static) -> Box<dyn TileProducer> {
     let tiling = producer.tiling().clone();
-    let handle: BreakerHandle = Rc::new(RefCell::new(producer));
-    handle.borrow_mut().base_mut().breaker_handle = Some(Rc::downgrade(&handle));
+    let handle: BreakerHandle = Arc::new(RwLock::new(producer));
+    handle
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .base_mut()
+        .breaker_handle = Some(Arc::downgrade(&handle));
     Box::new(BreakerReader {
         base: ProducerBase::unowned(BreakerReader::alloc_id(), &tiling),
         handle,
@@ -26,25 +31,46 @@ impl TileProducer for BreakerReader {
     fn get(&self, guard: TileGuard) -> Tile {
         #[cfg(debug_assertions)]
         pull_levels::check_input_level(pull_levels::address_of(self), || self.name(), &guard);
-        self.handle.borrow().get(guard)
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(guard)
     }
     fn get_impl(&self, guard: TileGuard) -> Tile {
-        self.handle.borrow().get(guard)
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(guard)
     }
     fn release_impl(&mut self, guard: TileGuard) {
-        self.handle.borrow_mut().release(guard);
+        self.handle
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(guard);
     }
     fn restates(&self) -> Restates {
-        self.handle.borrow().restates()
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .restates()
     }
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("breaker", &*self.handle.borrow());
+        visit(
+            "breaker",
+            &*self.handle.read().unwrap_or_else(PoisonError::into_inner),
+        );
     }
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
-        visit("breaker", &mut *self.handle.borrow_mut());
+        visit(
+            "breaker",
+            &mut *self.handle.write().unwrap_or_else(PoisonError::into_inner),
+        );
     }
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        self.handle.borrow().inspect(opts)
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .inspect(opts)
     }
 }
 
@@ -106,11 +132,18 @@ mod tests {
         let weak = weak.expect("the concrete breaker retains its weak handle");
         let handle = weak.upgrade().expect("the reader owns its breaker");
         handle
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
         assert_eq!(reader.get(tiling.universal_guard()), tile);
         reader.release(tiling.universal_guard());
-        assert!(handle.borrow().final_guard().is_empty());
+        assert!(
+            handle
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .final_guard()
+                .is_empty()
+        );
         drop(reader);
         assert!(
             weak.upgrade().is_some(),

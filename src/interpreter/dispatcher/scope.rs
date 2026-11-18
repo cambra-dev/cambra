@@ -15,7 +15,7 @@ pub(super) enum Scope {
         store: StoreCell,
         // shared-state-ok: the loop's request and step handlers take turns advancing it; what
         // crosses it is the loop's request and round guards, never a tile.
-        schedule: RefCell<LoopSchedule>,
+        schedule: Mutex<LoopSchedule>,
     },
     /// One writer of a transaction store: its attempts.
     Writer {
@@ -23,8 +23,12 @@ pub(super) enum Scope {
         writer: usize,
         // shared-state-ok: the writer's request and step handlers take turns advancing it; what
         // crosses it is the writer's request and attempt guards, never a tile.
-        phase: RefCell<WriterPhase>,
+        phase: Mutex<WriterPhase>,
     },
+}
+
+fn scope_state<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Land the scope's decision for the request `package` it completed, then acknowledge it.
@@ -66,8 +70,8 @@ impl Scope {
     /// Whether a request is open, whose claim is in flight until it completes.
     pub(super) fn has_request(&self) -> bool {
         match self {
-            Scope::Loop { schedule, .. } => schedule.borrow().has_request(),
-            Scope::Writer { phase, .. } => phase.borrow().has_request(),
+            Scope::Loop { schedule, .. } => scope_state(schedule).has_request(),
+            Scope::Writer { phase, .. } => scope_state(phase).has_request(),
         }
     }
 
@@ -81,7 +85,7 @@ impl Scope {
                 writer,
                 phase,
             } => {
-                if phase.borrow().open() {
+                if scope_state(phase).open() {
                     transaction_scope::transaction(store)
                         .writer_run_mut(*writer)
                         .body
@@ -95,15 +99,13 @@ impl Scope {
     pub(super) fn begin(&self, dispatcher: &Dispatcher, package: WorkPackage) {
         match self {
             Scope::Loop { store, schedule } => {
-                schedule.borrow_mut().begin(store, dispatcher, package)
+                scope_state(schedule).begin(store, dispatcher, package)
             }
             Scope::Writer {
                 store,
                 writer,
                 phase,
-            } => phase
-                .borrow_mut()
-                .begin(store, *writer, dispatcher, package),
+            } => scope_state(phase).begin(store, *writer, dispatcher, package),
         }
     }
 
@@ -112,13 +114,13 @@ impl Scope {
     pub(super) fn step(&self, dispatcher: &Dispatcher, package: WorkPackage) {
         match self {
             Scope::Loop { store, schedule } => {
-                schedule.borrow_mut().step(store, dispatcher, package)
+                scope_state(schedule).step(store, dispatcher, package)
             }
             Scope::Writer {
                 store,
                 writer,
                 phase,
-            } => phase.borrow_mut().step(store, *writer, dispatcher, package),
+            } => scope_state(phase).step(store, *writer, dispatcher, package),
         }
     }
 
@@ -127,7 +129,7 @@ impl Scope {
     pub(super) fn begin_finish(&self, dispatcher: &Dispatcher) {
         match self {
             Scope::Loop { store, schedule } => {
-                let mut schedule = schedule.borrow_mut();
+                let mut schedule = scope_state(schedule);
                 induction(store).begin_shared_finish(&mut schedule, dispatcher);
             }
             Scope::Writer {
@@ -135,7 +137,7 @@ impl Scope {
                 writer,
                 phase,
             } => {
-                let mut phase = phase.borrow_mut();
+                let mut phase = scope_state(phase);
                 transaction_scope::transaction(store)
                     .begin_transaction_finish(&mut phase, dispatcher, *writer);
             }
@@ -148,7 +150,7 @@ impl Scope {
         dispatcher.finish(dispatcher.pushes(step));
         let finished = match self {
             Scope::Loop { store, schedule } => {
-                let mut schedule = schedule.borrow_mut();
+                let mut schedule = scope_state(schedule);
                 schedule.take_finish(induction(store).body_mut(), dispatcher)
             }
             Scope::Writer {
@@ -156,7 +158,7 @@ impl Scope {
                 writer,
                 phase,
             } => {
-                let mut phase = phase.borrow_mut();
+                let mut phase = scope_state(phase);
                 transaction_scope::transaction(store)
                     .writer_run_mut(*writer)
                     .take_finish(&mut phase, dispatcher)
@@ -184,11 +186,11 @@ impl Scope {
     fn schedule(&self) -> (bool, Option<TileGuard>) {
         match self {
             Scope::Loop { schedule, .. } => {
-                let schedule = schedule.borrow();
+                let schedule = scope_state(schedule);
                 (schedule.publishing(), schedule.step_guard().cloned())
             }
             Scope::Writer { phase, .. } => {
-                let phase = phase.borrow();
+                let phase = scope_state(phase);
                 (phase.open(), phase.step_guard().cloned())
             }
         }
@@ -197,7 +199,7 @@ impl Scope {
 
 /// A scope's settlement: its body's members, fixed when the plan attaches the body.
 struct LocalSteps {
-    scope: Rc<Scope>,
+    scope: Arc<Scope>,
     request: PipelineId,
     step: PipelineId,
     base: usize,
@@ -207,7 +209,7 @@ struct LocalSteps {
 /// Where a scope publishes one inner pipeline's held output: a chain's breaker, or a nested loop.
 enum PublicationTarget {
     Chain(BreakerHandle),
-    Child(Rc<Scope>),
+    Child(Arc<Scope>),
 }
 
 /// Every scope of a run, each settling its own body and queueing its own step.
@@ -218,7 +220,7 @@ pub(super) struct ScopeSteps {
 
 impl ScopeSteps {
     /// The settlement of each of `scopes`, attached; a nested loop's scope among them.
-    pub(super) fn plan(scopes: impl Iterator<Item = Rc<Scope>>) -> Self {
+    pub(super) fn plan(scopes: impl Iterator<Item = Arc<Scope>>) -> Self {
         let scopes: Vec<_> = scopes
             .map(|scope| (scope.with_body(|body| body.attached().pipeline.0), scope))
             .collect();
@@ -237,7 +239,7 @@ impl ScopeSteps {
                         .enumerate()
                         .map(|(local, member)| match member {
                             Member::Chain(handle) => PublicationTarget::Chain(handle.clone()),
-                            Member::Scope(_) => PublicationTarget::Child(Rc::clone(
+                            Member::Scope(_) => PublicationTarget::Child(Arc::clone(
                                 by_id
                                     .get(&body.global(PipelineId(local)).0)
                                     .expect("a nested loop's scope is attached"),
@@ -293,7 +295,10 @@ impl LocalSteps {
         let published = push_held(
             dispatcher,
             &mut |id, call| match &self.members[id.0 - self.base] {
-                PublicationTarget::Chain(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
+                PublicationTarget::Chain(handle) => call(
+                    &mut *handle.write().unwrap_or_else(PoisonError::into_inner),
+                    InputId::ONLY,
+                ),
                 PublicationTarget::Child(child) => {
                     if !child.has_request() {
                         child.reach(call);
