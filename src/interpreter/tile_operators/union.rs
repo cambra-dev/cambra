@@ -387,7 +387,7 @@ fn restated_in(tile: Tile, tiling: &Tiling) -> Tile {
                 codomain,
                 domain_predicate,
                 deleted,
-                absent_keys,
+                keys_follow_beneath,
             },
             Tiling::DataFunction {
                 codomain: beneath, ..
@@ -398,7 +398,7 @@ fn restated_in(tile: Tile, tiling: &Tiling) -> Tile {
             codomain: Box::new(restated_in(*codomain, beneath)),
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         },
         (Tile::Scalar(column), tiling) if tiling.holds_a_level() => {
             restated_in(open_collections(&column, &tiling.extent()), tiling)

@@ -864,8 +864,6 @@ impl TileProducer for LookupProducer {
             domain,
             codomain,
             deleted,
-            domain_predicate,
-            absent_keys,
             ..
         } = collection
         else {
@@ -897,13 +895,12 @@ impl TileProducer for LookupProducer {
         let rows_level = CurryLevel::new(self.level.index() - 1);
         let paths = tile.paths_at(rows_level);
         // What `Tile::completion_at` would say one level further down, with each row's
-        // collection standing in for that level: a key it calls complete or knows absent
+        // collection standing in for that level: a key its collection states complete
         // settles its row.
         let complete = tile
             .completion_at(rows_level)
             .descend(1)
-            .union(domain_predicate)
-            .union(absent_keys);
+            .union(&collection.level_statement());
         let keep: Vec<bool> = answers.iter().map(Option::is_some).collect();
         if !keep.iter().all(|&held| held) {
             let withheld: Vec<&[Value]> = paths
