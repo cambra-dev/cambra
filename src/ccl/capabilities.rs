@@ -723,18 +723,15 @@ pub fn assert_discharged(expr: &crate::ccl::Expr) {
 /// a name a term substitution renames even where no term mentions it, as in a call of a
 /// closure that writes it.
 pub fn names_in_tree(name: &Name, expr: &crate::ccl::Expr) -> bool {
-    fn in_type(name: &Name, ty: &crate::ccl::Type) -> bool {
-        let here =
-            matches!(ty, crate::ccl::Type::Fun { capabilities, .. } if capabilities.names(name));
-        let mut below = false;
-        ty.walk_children(|child| below |= in_type(name, child));
-        here || below
-    }
     if expr.capabilities.names(name) || expr.own_capabilities.names(name) {
         return true;
     }
     let mut found = false;
-    expr.walk_type_slots(|ty| found |= in_type(name, ty));
+    expr.walk_type_slots(|ty| {
+        found |= ty.holds_type(&|t| {
+            matches!(t, crate::ccl::Type::Fun { capabilities, .. } if capabilities.names(name))
+        });
+    });
     found || expr.any_child(|child| names_in_tree(name, child))
 }
 
@@ -2811,12 +2808,8 @@ impl Capability {
     pub fn variable(&self) -> Option<&Name> {
         match self {
             Capability::Requires(r) => r.requirement().terms.first(),
-            Capability::Causes(Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x)) => {
-                Some(x)
-            }
-            Capability::Causes(Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_))
-            | Capability::Param(_)
-            | Capability::Every(_) => None,
+            Capability::Causes(e) => e.variable(),
+            Capability::Param(_) | Capability::Every(_) => None,
         }
     }
 }
@@ -2841,10 +2834,7 @@ impl CapabilitySet {
         self.requires
             .iter()
             .filter_map(|r| r.requirement().terms.first())
-            .chain(self.causes.iter().filter_map(|e| match e {
-                Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
-                Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_) => None,
-            }))
+            .chain(self.causes.iter().filter_map(Effect::variable))
     }
 }
 
@@ -2888,11 +2878,9 @@ impl Written {
             .set
             .causes
             .iter()
-            .map(|e| match e {
-                Effect::Write(x) => Effect::Write(f(x)),
-                Effect::WriteTxn(x) => Effect::WriteTxn(f(x)),
-                Effect::Append(x) => Effect::Append(f(x)),
-                Effect::RunTransaction | Effect::AffectWorld | Effect::Raise(_) => e.clone(),
+            .map(|e| match e.variable() {
+                Some(x) => e.naming(f(x)),
+                None => e.clone(),
             })
             .collect();
         Written {
@@ -2914,9 +2902,9 @@ impl Written {
     /// These clauses with `f` applied to each variable what their `except` takes away names.
     fn map_except_names(mut self, mut f: impl FnMut(&Name) -> Name) -> Written {
         let mut item = |item: &Capability| match item {
-            Capability::Causes(Effect::Write(x)) => Capability::Causes(Effect::Write(f(x))),
-            Capability::Causes(Effect::WriteTxn(x)) => Capability::Causes(Effect::WriteTxn(f(x))),
-            Capability::Causes(Effect::Append(x)) => Capability::Causes(Effect::Append(f(x))),
+            Capability::Causes(e) if let Some(x) = e.variable() => {
+                Capability::Causes(e.naming(f(x)))
+            }
             Capability::Requires(r) => Capability::Requires(r.map_terms(&mut f)),
             item => item.clone(),
         };

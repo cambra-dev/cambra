@@ -24,6 +24,7 @@ mod type_gen;
 
 mod alloc_probe;
 mod binding_nodes;
+mod capability_names;
 mod chl_parser_roundtrip;
 mod cli_driver_convergence;
 mod compilation_pipeline;
