@@ -2339,24 +2339,7 @@ x = Option::none
 x1: {Int where _ == 1} = x!
 x1 == 1
         "#},
-        "| not __elem ▷ option_is_none}, found {Option(",
-    )
-}
-
-/// This test should fail to typecheck, because `f`'s domain will be
-/// inferred to something that does not satisfy `!`'s domain
-/// refinement.
-#[test]
-fn unwrapping_a_parameter_called_with_none_is_rejected() {
-    check_compile_error(
-        indoc! {r#"
-def f(x):
-    x1: {Int where _ == 1} = x!
-    x1 == 1
-f(Option::some(1)) == f(Option::none)
-        "#},
-        "Type mismatch for Apply: expected {Option(Int@1) | not __elem ▷ option_is_none}, \
-         found {Option(?",
+        "where not _.is_none()}, found {Option(",
     )
 }
 
@@ -2410,7 +2393,7 @@ fn an_option_meets_a_predicate_written_with_its_methods(
             o!
         f(Option::none)
     "},
-    "expected {Option(Int) | not __elem ▷ option_is_none}, found {Option(?",
+    "Type mismatch for this call: expected {Option(Int) where not _.is_none()}, found {Option(",
 )]
 fn an_option_violating_a_predicate_written_with_its_methods(
     #[case] code: &str,
@@ -2435,14 +2418,8 @@ fn unwrap_or_of_some_of_a_computed_value() {
     );
 }
 
-// The tests below assert the value each program computes, and `should_panic` pins the panic it
-// raises instead. Pinned on the failure rather than deferred: an `#[ignore]` reports the same
-// green whether the gap closed, regressed, or went away, and nothing runs ignored tests here.
-// Once the program computes its value, the `should_panic` comes off.
-
 /// `Option::some(b)` with `b` computed rather than literal. Its type carries
-/// `__elem ▷ option_value == b`, which `lambda_elim` rewrites point-free in the expected type
-/// while the inferred type keeps `== 6`, so the post-planning check rejects the tree.
+/// `__elem ▷ option_value == b`, which `lambda_elim` rewrites point-free.
 #[rstest]
 #[case::is_none(
     indoc! {"
@@ -2464,18 +2441,13 @@ fn unwrap_or_of_some_of_a_computed_value() {
     "},
     Value::Int(6),
 )]
-#[should_panic(expected = "post-planning produced an invalid tree")]
 fn some_of_a_computed_value(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
 /// `b ^+ x` in a comprehension's element, with `b` computed. Its type carries
-/// `__elem == b ^+ x`; planning replaces the operand `b` with `6 ▷ const` in the term but not
-/// in the recorded refinement, so the refinement the post-planning check re-derives from the
-/// operands names `6` where the recorded one names `b`, and the check rejects the tree.
-/// [`some_of_a_computed_value`] is the same failure through `Option::some`'s refinement.
+/// `__elem == b ^+ x`, which names `b` where the planned term reads `6 ▷ const`.
 #[test]
-#[should_panic(expected = "post-planning produced an invalid tree")]
 fn refined_add_of_a_computed_value_in_a_comprehension() {
     check_scalar(
         indoc! {"
@@ -2488,27 +2460,9 @@ fn refined_add_of_a_computed_value_in_a_comprehension() {
     );
 }
 
-/// `!` in a comprehension's element. `Option::some(x)` is refined `__elem ▷ option_value == x`,
-/// and lambda elimination leaves that refinement on `variant_wrap(`some)` after removing the
-/// `λ x` that binds `x`. Discharging the `Let` that holds the eliminated term then substitutes a
-/// range mentioning `x` under the Pi binder `x`. `Option::some(x).unwrap_or(0)` fails the same
-/// way; [`some_of_a_computed_value`] is the same family.
+/// `!` applied twice. The outer `Option::unwrap`'s parameter is refined
+/// `not __elem ▷ option_is_none`, which the inner `!`'s result type entails.
 #[test]
-#[should_panic(expected = "Barendregt violation")]
-fn unwrap_in_a_comprehension() {
-    check_scalar(
-        indoc! {"
-            xs = [1, 2]
-            sum([Option::some(x)! for x in xs])
-        "},
-        Value::Int(3),
-    );
-}
-
-/// `!` applied twice. Inlining the monomorphized `Option::unwrap` meets a parameter refined
-/// `not __elem ▷ option_is_none` that the argument's type does not entail.
-#[test]
-#[should_panic(expected = "inline: outer lambda for `__mono`")]
 fn unwrap_of_an_unwrap() {
     check_scalar(
         indoc! {"
@@ -2519,10 +2473,43 @@ fn unwrap_of_an_unwrap() {
     );
 }
 
-/// `!` of a `String` payload. Inlining the monomorphized `Option::unwrap` meets a parameter
-/// typed `String@"a"` that the argument's type `String` does not entail.
+/// `!` of an `Option` whose annotation alone proves it `some`.
 #[test]
-#[should_panic(expected = "inline: outer lambda for `__mono`")]
+fn unwrap_of_an_annotated_option() {
+    check_scalar(
+        indoc! {"
+            y: {Option(Int) where not _.is_none()} = Option::some(3)
+            y!
+        "},
+        Value::Int(3),
+    );
+}
+
+// The tests below assert the value each program computes, and `should_panic` pins the panic it
+// raises instead. Pinned on the failure rather than deferred: an `#[ignore]` reports the same
+// green whether the gap closed, regressed, or went away, and nothing runs ignored tests here.
+// Once the program computes its value, the `should_panic` comes off.
+
+/// `!` in a comprehension's element. The post-lambda-elimination check rejects the tree: a
+/// `Compose` stage expects the variant ``{`some{Int}}`` and finds the nominal `Option(Int)`.
+/// `Option::some(x).unwrap_or(0)` is the same program through `unwrap_or`.
+#[test]
+#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
+fn unwrap_in_a_comprehension() {
+    check_scalar(
+        indoc! {"
+            xs = [1, 2]
+            sum([Option::some(x)! for x in xs])
+        "},
+        Value::Int(3),
+    );
+}
+
+/// `!` of a `String` payload. The post-inlining check rejects the type of `Option::some("a")`:
+/// the type it expects carries `_.value() == "a"`, and the type it finds carries only
+/// `not _.is_none()`.
+#[test]
+#[should_panic(expected = "post-inline produced an invalid tree")]
 fn unwrap_of_a_string_payload() {
     check_scalar(
         indoc! {r#"
@@ -2533,17 +2520,20 @@ fn unwrap_of_a_string_payload() {
     );
 }
 
-/// `!` of an `Option` whose annotation proves it `some`. Inlining the monomorphized
-/// `Option::unwrap` meets a parameter typed `Int@3` that the argument's type `Int` does not
-/// entail, as in [`unwrap_of_a_string_payload`].
+/// `f`'s parameter is inferred from both calls, so it admits `Option::none`, and `!`'s domain
+/// refinement `not _.is_none()` rejects it. Checked alone, `f`'s body reaches the `match` inside
+/// `Option::unwrap` with a scrutinee that carries `` `some `` but whose payload no value reaches;
+/// the payload is `f`'s parameter, not an unreachable arm to pin.
 #[test]
-#[should_panic(expected = "inline: outer lambda for `__mono`")]
-fn unwrap_of_an_annotated_option() {
-    check_scalar(
-        indoc! {"
-            y: {Option(Int) where not _.is_none()} = Option::some(3)
-            y!
-        "},
-        Value::Int(3),
-    );
+fn unwrapping_a_parameter_called_with_none_is_rejected() {
+    check_compile_error(
+        indoc! {r#"
+def f(x):
+    x1: {Int where _ == 1} = x!
+    x1 == 1
+f(Option::some(1)) == f(Option::none)
+        "#},
+        "Type mismatch for this call: expected {Option({Int where _ == 1}) where not _.is_none()}, \
+         found {Option(",
+    )
 }

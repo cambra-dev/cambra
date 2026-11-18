@@ -922,6 +922,15 @@ impl Printer {
                 Prec::Not,
                 format!("not {}", at_least(argument.written(), Prec::Not)),
             )),
+            // An `Option`'s observers, as a predicate writes them.
+            TypedExprNode::Builtin(Builtin::OptionIsNone) => {
+                let target = at_least(argument.written(), Prec::Postfix);
+                written((Prec::Postfix, format!("{target}.is_none()")))
+            }
+            TypedExprNode::Builtin(Builtin::OptionValue) => {
+                let target = at_least(argument.written(), Prec::Postfix);
+                written((Prec::Postfix, format!("{target}.value()")))
+            }
             TypedExprNode::Proj(key) => match (argument, key) {
                 (Val::Tuple(mut parts), ProjKey::Index(i)) if *i < parts.len() => {
                     Some(parts.swap_remove(*i))
@@ -1244,6 +1253,15 @@ mod tests {
     #[case("{a: Int, b: Bool}", "{a: Int, b: Bool}")]
     #[case("{`a{Int} | `b}", "{`a{Int} | `b}")]
     #[case("Option(Int)", "Option(Int)")]
+    #[case("{Option(Int) where _.is_none()}", "{Option(Int) where _.is_none()}")]
+    #[case(
+        "{Option(Int) where not _.is_none()}",
+        "{Option(Int) where not _.is_none()}"
+    )]
+    #[case(
+        "{Option(Int) where _.value() == 3}",
+        "{Option(Int) where _.value() == 3}"
+    )]
     #[case("{Int where _ > 0}", "{Int where _ > 0}")]
     #[case("{Int where _ > 0 and _ < 10}", "{Int where _ > 0 and _ < 10}")]
     // Two refinements of one base are one set, written nested in a fixed order.

@@ -1992,6 +1992,18 @@ fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[L
 #[cfg(not(debug_assertions))]
 fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &[Label]) {}
 
+/// Whether `value`, the type a value gave a `match`'s scrutinee ([`value_type`]), can carry the
+/// arm tag `tag`. A value that is not a variant, such as a nominal type, names no tags here and
+/// is taken to carry none.
+fn value_carries_tag(value: &Type, tag: &Label) -> bool {
+    match crate::ccl::ccl_utils::strip_refinements(value) {
+        Type::Variant(tags, _) => tags
+            .iter()
+            .any(|(k, _)| *k == crate::ccl::FieldKey::Name(tag.clone())),
+        _ => false,
+    }
+}
+
 /// Whether a **value** has reached `ty` — as opposed to merely something
 /// determining what it must be.
 ///
@@ -2555,12 +2567,21 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // code — a scrutinee no value reaches stands for what the uses supply, so
             // an arm with no value at its payload is not unreachable: its payload is
             // a parameter of the definition, and pinning it would decide a type no
-            // use chose.
-            let pin = !ctx.discarding || scrutinee.as_ref().is_some_and(|s| value_reaches(&s.ty));
+            // use chose. The same holds for an arm whose tag the reaching value
+            // carries: a value of shape ``{`some{𝑇}}`` with `𝑇` a parameter reaches
+            // the scrutinee of `Option::unwrap`'s `match` through its stamped `id`.
+            let scrutinee_value = ctx
+                .discarding
+                .then(|| scrutinee.as_ref().and_then(|s| value_type(&s.ty)));
+            let pin = |p: &Pattern| match &scrutinee_value {
+                None => true,
+                Some(None) => false,
+                Some(Some(value)) => !value_carries_tag(value, &p.tag()),
+            };
             let pinned_tags: Vec<Label> = branches
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
-                .filter(|p| pin && pin_unobservable_arm_payload(p, ctx))
+                .filter(|p| pin(p) && pin_unobservable_arm_payload(p, ctx))
                 .map(|p| p.tag())
                 .collect();
             if let Some(s) = scrutinee {

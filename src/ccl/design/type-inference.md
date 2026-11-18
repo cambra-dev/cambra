@@ -1170,6 +1170,11 @@ In a walk whose types are dropped, a `match` on a scrutinee no value reaches doe
 payloads
 ([An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)):
 the scrutinee stands for what the uses supply, so its payloads are parameters of the definition.
+An arm whose tag the reaching value carries is not pinned either: the value's payload is then a
+parameter. `Option::unwrap`'s stamped `id` gives its scrutinee the value ``{`some{𝑇}}`` with `𝑇`
+unreached while `f`'s body is checked alone in `def f(x): x!`. An arm is pinned there only when
+a value reaches the scrutinee and that value, read as a variant, lacks the arm's tag
+(`value_carries_tag`, `src/ccl/infer/solve.rs`).
 
 Calls from discarded code are checked too. They can specialize an outer generalized binding to
 test the callee's demands against the arguments. Those specializations remain registered for memo
