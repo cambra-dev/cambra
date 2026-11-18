@@ -653,18 +653,21 @@ impl TileProducer for UncurryProducer {
 
     /// It restates every level: a standing level's keys are its input's, and a key at or beneath
     /// the pairs stands under a pair, which is a path of the outer and the inner key
-    /// ([`unpaired`]).
+    /// ([`Predicate::with_levels_unpaired`]).
     fn restates(&self) -> Restates {
         Restates::Every
     }
 
     /// At and beneath the pairs, a pair is its outer key with its inner key on the next input
-    /// level, so the input is pulled one level deeper; above them it keeps its keys.
+    /// level, so the input is pulled at most one level deeper; above them it keeps its keys. An
+    /// input that does not restate that level is pulled at the nearest level above that it
+    /// restates ([`Projection::restated_by`]), and the declaration is that level.
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        Some(match level.index() < self.level.index() {
+        let unpaired = match level.index() < self.level.index() {
             true => level,
             false => CurryLevel::new(level.index() + 1),
-        })
+        };
+        Some(self.input.restates().nearest(unpaired))
     }
 
     /// Projections above the paired level keep their keys. At and beneath that level,
@@ -674,15 +677,27 @@ impl TileProducer for UncurryProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let input_guard = match (self.level == CurryLevel::OUTERMOST, &projection) {
-            (_, Projection::Keys { level, keys }) if *level >= self.level => Projection::keys_at(
-                CurryLevel::new(level.index() + 1),
-                unpaired(keys, *level, self.level),
-            )
-            .guard(self.input.tiling()),
-            (false, _) => projection.guard(self.input.tiling()),
-            (true, _) => self.input.tiling().universal_guard(),
+        // At and beneath the pairs, the paths the pairs spell stand one level deeper in the
+        // input (`Predicate::with_levels_unpaired`). Above them the input keeps its keys.
+        let pulled = match &projection {
+            Projection::Keys { level, keys } if *level >= self.level => {
+                let fields = (tuple_field(0), tuple_field(1));
+                Projection::keys_at(
+                    CurryLevel::new(level.index() + 1),
+                    keys.with_levels_unpaired(
+                        level.index(),
+                        self.level.index(),
+                        (fields.0.as_str(), fields.1.as_str()),
+                    ),
+                )
+            }
+            above_the_pairs => above_the_pairs.clone(),
         };
+        // An input that does not restate the level `pulled` names is pulled at the nearest
+        // level above that it does, and the pairs are cut after.
+        let input_guard = pulled
+            .restated_by(&self.input.restates())
+            .guard(self.input.tiling());
         let input_tile = self.input.get(input_guard);
         // Pair beneath the standing levels, which stand unchanged: a row's group is a
         // curried collection in its own right, so the pairing below is the same one a
@@ -704,52 +719,6 @@ impl TileProducer for UncurryProducer {
         trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
     }
-}
-
-/// The keys `keys` admits at `level`, at or beneath the pairs an `Uncurry` makes at `pairs`, as keys
-/// of its input one level deeper: each path's pair is its outer key with its inner key beneath it.
-///
-/// # Panics
-///
-/// Where a path's pair is named by a predicate other than a record of its two components, which no
-/// projection of a pair level spells.
-fn unpaired(keys: &Predicate, level: CurryLevel, pairs: CurryLevel) -> Predicate {
-    // `admitted` admits paths whose last key stands at `depth`.
-    fn split(admitted: &Predicate, depth: usize, pairs: usize) -> Predicate {
-        match admitted {
-            Predicate::Or(arms) => {
-                Predicate::union_all(arms.iter().map(|arm| split(arm, depth, pairs)).collect())
-            }
-            Predicate::Qualified { enclosing, here } if depth > pairs => {
-                Predicate::qualified(split(enclosing, depth - 1, pairs), (**here).clone())
-            }
-            Predicate::Qualified { enclosing, here } => {
-                let (outer, inner) = components(here);
-                Predicate::qualified(Predicate::qualified((**enclosing).clone(), outer), inner)
-            }
-            unqualified if depth > pairs => unqualified.clone(),
-            pair => {
-                let (outer, inner) = components(pair);
-                Predicate::qualified(outer, inner)
-            }
-        }
-    }
-    fn components(pair: &Predicate) -> (Predicate, Predicate) {
-        match pair {
-            Predicate::True => (Predicate::True, Predicate::True),
-            Predicate::Record(fields) => {
-                let field = |at: usize| {
-                    fields
-                        .get(&tuple_field(at))
-                        .cloned()
-                        .unwrap_or(Predicate::True)
-                };
-                (field(0), field(1))
-            }
-            other => panic!("a pair is named by its two components, not {other:?}"),
-        }
-    }
-    split(keys, level.index(), pairs.index())
 }
 
 /// Pair a curried collection's two levels into one keyed by `(outer, inner)` pairs.
@@ -1770,9 +1739,10 @@ impl TileProducer for ProductProducer {
             *domain_predicate = complete;
         }
         tile.remove_guarded(self.obsolete_guard().clone());
-        if pulled != projection {
-            tile.restrict_to(&projection, self.tiling());
-        }
+        // The completeness intersected above is each side's, which a side states over the region
+        // it was pulled at and the pairing restates over the product's keys, so it is cut to the
+        // projection whether or not the sides were pulled at more.
+        tile.restrict_to(&projection, self.tiling());
         tile
     }
 
@@ -4007,36 +3977,7 @@ mod uncurry_projection_tests {
 
     /// Groups 1, 2 and 3 holding members `{0, 2}`, `{1}` and `{3}` with values 10 to 40.
     fn paired_groups() -> (UncurryProducer, GuardLog) {
-        let groups = Tile::data_function(
-            ColumnValue::Ints(vec![1, 2, 3]),
-            Box::new(Tile::grouped(
-                vec![0, 2, 3],
-                ColumnValue::UInts(vec![0, 2, 1, 3]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 30, 20, 40]))),
-                Predicate::True,
-                BitSet::new(),
-            )),
-            Predicate::True,
-            BitSet::new(),
-        );
-        let in_tiling = Tiling::data_function(
-            Extent::Base(BaseType::Int),
-            Tiling::data_function(
-                Extent::uint_range(4),
-                Tiling::Scalar(Extent::Base(BaseType::Int)),
-            ),
-        );
-        let out = Tiling::data_function(
-            Extent::Record(
-                [
-                    (tuple_field(0), Extent::Base(BaseType::Int)),
-                    (tuple_field(1), Extent::uint_range(4)),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            Tiling::Scalar(Extent::Base(BaseType::Int)),
-        );
+        let (groups, in_tiling, out) = groups();
         let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
         (
             UncurryProducer {
@@ -4137,6 +4078,230 @@ mod uncurry_projection_tests {
             ))))]
         );
         assert_conforms(|| Box::new(paired_groups_of_collections().0), guard);
+    }
+
+    /// Two pairs under one standing row that differ in both components stay a union beneath
+    /// the row, and each is the path of its own outer and inner key: the pairs `(0, 1)` and
+    /// `(1, 0)` under row 1 pull the paths `(1, 0, 1)` and `(1, 1, 0)`.
+    #[test]
+    fn pairs_under_one_row_that_differ_in_both_components_pull_the_path_of_each() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let in_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::data_function(uint(), Tiling::Scalar(uint())),
+            ),
+        );
+        let out = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                Extent::Record(
+                    [(tuple_field(0), uint()), (tuple_field(1), uint())]
+                        .into_iter()
+                        .collect(),
+                ),
+                Tiling::Scalar(uint()),
+            ),
+        );
+        // Rows 0 and 1, each holding outer keys 0 and 1, each holding inner keys 0 and 1.
+        let rows = || {
+            Tile::data_function(
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(Tile::grouped(
+                    vec![0, 2],
+                    ColumnValue::UInts(vec![0, 1, 0, 1]),
+                    Box::new(Tile::grouped(
+                        vec![0, 2, 4, 6],
+                        ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1]),
+                        Box::new(Tile::Scalar(ColumnValue::UInts((10..18).collect()))),
+                        Predicate::True,
+                        BitSet::new(),
+                    )),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let make = || {
+            let (input, pulled, _) = ProjectionSpy::new(rows(), in_tiling.clone());
+            let uncurry = UncurryProducer {
+                base: ProducerBase::unowned(UncurryProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::new(1),
+                empty_pair: out.empty_at_no_rows(),
+            };
+            (uncurry, pulled)
+        };
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let pair = |outer: u64, inner: u64| {
+            Predicate::Record(HashMap::from([
+                (tuple_field(0), point(outer)),
+                (tuple_field(1), point(inner)),
+            ]))
+        };
+        let path = |outer: u64, inner: u64| {
+            Predicate::qualified(Predicate::qualified(point(1), point(outer)), point(inner))
+        };
+        let guard = Projection::keys_at(
+            CurryLevel::new(1),
+            Predicate::qualified(point(1), pair(0, 1))
+                .union(&Predicate::qualified(point(1), pair(1, 0))),
+        )
+        .guard(&out);
+        let (mut uncurry, pulled) = make();
+        let morsel = uncurry.get(guard.clone());
+        assert_eq!(
+            *pulled.borrow(),
+            [
+                Projection::keys_at(CurryLevel::new(2), path(0, 1).union(&path(1, 0)))
+                    .guard(&in_tiling)
+            ]
+        );
+        assert_eq!(morsel.paths_at(CurryLevel::new(1)).len(), 2, "{morsel:?}");
+        assert_conforms(|| Box::new(make().0), guard);
+    }
+
+    /// The grouping [`paired_groups`] pairs, with its tiling and the tiling of the pairs.
+    fn groups() -> (Tile, Tiling, Tiling) {
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 2, 1, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 30, 20, 40]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(
+            Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::Int)),
+                    (tuple_field(1), Extent::uint_range(4)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        (groups, in_tiling, out)
+    }
+
+    /// An `Uncurry` of [`groups`] over an [`OutermostSpy`], with the log of the guards the
+    /// grouping is pulled at.
+    fn paired_outermost_groups() -> (UncurryProducer, GuardLog) {
+        let (groups, in_tiling, out) = groups();
+        let pulled = GuardLog::default();
+        let uncurry = UncurryProducer {
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &out),
+            input: Box::new(OutermostSpy {
+                base: ProducerBase::unowned(OutermostSpy::alloc_id(), &in_tiling),
+                tile: groups,
+                pulled: pulled.clone(),
+            }),
+            level: CurryLevel::OUTERMOST,
+            empty_pair: out.empty_at_no_rows(),
+        };
+        (uncurry, pulled)
+    }
+
+    /// A producer over a fixed tile that restates its outermost keys only, the default
+    /// ([`TileProducer::restates`]), answers without what it was released, and logs the guards
+    /// it is pulled at.
+    struct OutermostSpy {
+        base: ProducerBase,
+        tile: Tile,
+        pulled: GuardLog,
+    }
+
+    impl TileProducer for OutermostSpy {
+        impl_producer_base!();
+
+        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+            self.pulled.borrow_mut().push(projection_guard.clone());
+            let mut tile = self.tile.clone();
+            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.restrict_to(&projection_guard.projection(&self.name()), self.tiling());
+            tile
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A pair named by both components is a path one level into the grouping. A grouping that
+    /// restates its outermost keys only is pulled at the group the path runs through, and the
+    /// pair is cut from it: `(1, 2)` of group 1's `(1, 0)` and `(1, 2)`.
+    #[test]
+    fn a_grouping_that_restates_outermost_keys_is_pulled_at_the_groups_of_the_pairs() {
+        let (mut uncurry, pulled) = paired_outermost_groups();
+        let group_one = Predicate::point(Value::Int(1));
+        let morsel = uncurry.get(pairs(group_one.clone(), Predicate::point(Value::UInt(2))));
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Domain(group_one))]
+        );
+        assert_eq!(pair_count(&morsel), 1, "only the pair (1, 2): {morsel:?}");
+    }
+
+    /// The level `input_level` declares for a pull of pairs is the level the grouping is pulled
+    /// at: the pair's path one level in for a grouping that restates every level, and its group
+    /// for one that restates its outermost keys only.
+    #[test]
+    fn the_declared_input_level_is_the_level_the_grouping_is_pulled_at() {
+        let pair = pairs(
+            Predicate::point(Value::Int(1)),
+            Predicate::point(Value::UInt(2)),
+        );
+        for ((mut uncurry, pulled), level) in [
+            (paired_groups(), CurryLevel::new(1)),
+            (paired_outermost_groups(), CurryLevel::OUTERMOST),
+        ] {
+            uncurry.get(pair.clone());
+            let restates = uncurry.input.restates();
+            assert_eq!(
+                uncurry.input_level("input", CurryLevel::OUTERMOST),
+                Some(level),
+                "{restates}"
+            );
+            let [guard] = pulled.borrow().clone().try_into().expect("one pull");
+            assert_eq!(
+                Projection::of(&guard).expect("a projection").level(),
+                Some(level),
+                "{restates}"
+            );
+        }
+    }
+
+    /// A pair released after such a pull is released to the grouping as its path, and the
+    /// group's other pair is then cut from the group read again without it: `(1, 0)` once
+    /// `(1, 2)` is released.
+    #[test]
+    fn a_pair_released_from_a_group_pulled_whole_is_gone_from_the_group_s_next_pull() {
+        let (mut uncurry, pulled) = paired_outermost_groups();
+        let group_one = Predicate::point(Value::Int(1));
+        let pair = |member: u64| pairs(group_one.clone(), Predicate::point(Value::UInt(member)));
+        assert_eq!(pair_count(&uncurry.get(pair(2))), 1);
+        uncurry.release(pair(2));
+        let morsel = uncurry.get(pair(0));
+        assert_eq!(pair_count(&morsel), 1, "only the pair (1, 0): {morsel:?}");
+        // The released pair is answered marked deleted, which compacting drops.
+        let mut whole = uncurry.get(pairs(group_one.clone(), Predicate::True));
+        whole.compact();
+        assert_eq!(pair_count(&whole), 1, "(1, 2) is released: {whole:?}");
+        let group = TileGuard::Function(FunctionGuard::Domain(group_one));
+        assert_eq!(*pulled.borrow(), [group.clone(), group.clone(), group]);
     }
 
     /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and

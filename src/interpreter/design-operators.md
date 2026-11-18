@@ -514,14 +514,16 @@ level. A producer that declares more than the outermost keys reads its projectio
 `TileGuard::projection_for`, and any other with `TileGuard::projection`. Either panics with the
 guard on a shape that is no projection or that names keys at a level the producer does not restate,
 as [Guard operations are exact](#guard-operations-are-exact) requires of a restatement with no
-spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
-(`src/interpreter/design-path-projections.md`, "Representation").
+spelling. A debug build's `get` panics on a pull at such a level. `Tile::restrict_to_paths` cuts a
+tile at a level beneath the outermost (`src/interpreter/design-path-projections.md`,
+"Representation").
 
 Each producer also declares, for each input, the deepest level a pull at the keys of level 𝑛 pulls
 that input at, or a whole read (`TileProducer::input_level`). The declaration is monotone in 𝑛. A
 debug build checks every pull against it in the `get` wrapper (`check_input_level`): no input is
 pulled beneath its declared level, and an input declared read whole is pulled whole. A pull may stop
-above the declaration, as `Uncurry` does for pairs named by their first component alone.
+above the declaration, as `Uncurry` does for pairs named by their first component alone and for an
+input that does not restate the declared level.
 
 - **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
   under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
@@ -538,9 +540,13 @@ above the declaration, as `Uncurry` does for pairs named by their first componen
 - **Completeness between pulls.** The completeness contract compares a producer's answers inside the
   region pulled, and a pull of one projection states completeness over its keys only, so a pull of
   another region withdraws nothing it said of the first. The debug check keeps the last statement of
-  each region.
-- **Check.** Every answer lies within the projection it was asked for: it holds no key the
-  projection omits and no cell where the projection names nothing.
+  each region, and a pull at keys drops from it the rows released since.
+- **Check.** A debug build's `TileProducer::get` compares each answer with the projection it was
+  asked for (`Tile::within`) and panics on a key the projection omits, on any cell where the
+  projection names nothing, and on a pull for keys that a non-collection answers. It panics too on
+  completeness stated outside what `Tile::restrict_to` leaves stated, at any level: a key stated
+  complete with no row is stated absent, and an answer states absence only of keys the pull names. A
+  producer that answers whole fails the check at its first pull for keys.
 
 Each operator answers a projection as its row of this table states.
 
@@ -561,7 +567,7 @@ Each operator answers a projection as its row of this table states.
 | `Filter` | A predicate or input that is a collection is pulled at the projection, since they share the keys of the level the mask names. A side that is not a collection is read whole. With a collection predicate it takes a projection at any level down to the masked one (`Restates::Above`). The predicate holds no level beneath that one. With a function predicate, which masks the outermost keys, it takes a projection at any level (`Restates::Every`). |
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
-| `Uncurry` | Above the pairs the input is pulled at the projection. At and beneath them a pair is its outer key with its inner key on the next input level, so the input is pulled one level deeper, at the paths the pairs spell; pairs named by their first component alone are pulled at the outer keys. The pairs are cut after. |
+| `Uncurry` | Above the pairs the input is pulled at the projection. At and beneath them a pair is its outer key with its inner key on the next input level, so the input is pulled one level deeper, at the paths the pairs spell; pairs named by their first component alone are pulled at the outer keys. An input that does not restate the level it would be pulled at is pulled at the nearest level above that it restates (`Projection::restated_by`), and `input_level` declares that level (`Restates::nearest`). The pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
 | `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
