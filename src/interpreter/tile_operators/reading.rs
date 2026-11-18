@@ -11,7 +11,9 @@ use std::{
 use super::*;
 use crate::ccl::ReadingKind;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{BaseType, ColumnValue, Consumer, Extent, Scheduler, Value};
+use crate::interpreter::{
+    BaseType, ColumnValue, Consumer, Extent, Scheduler, Value, fields_in_order,
+};
 
 /// What the run has read at one site ([`Reading::site`](crate::ccl::Reading::site)):
 /// one value per position, taken the first time any reader asks for the position and returned
@@ -130,23 +132,12 @@ impl ReadingSource {
 /// loops around it, whatever records the levels group them in.
 fn components(value: &Value, out: &mut Vec<Value>) {
     match value {
-        Value::Record(fields) => record_fields(fields)
+        Value::Record(fields) => fields_in_order(fields.keys())
             .into_iter()
-            .for_each(|(_, field)| components(field, out)),
+            .for_each(|name| components(&fields[name], out)),
         Value::Union { inner, .. } => components(inner, out),
         other => out.push(other.clone()),
     }
-}
-
-/// A record's fields in order: a tuple's by index, any other record's by name.
-fn record_fields(fields: &HashMap<SmolStr, Value>) -> Vec<(&SmolStr, &Value)> {
-    let tuple = (0..fields.len()).all(|i| fields.contains_key(&crate::interpreter::tuple_field(i)));
-    let mut ordered: Vec<_> = fields.iter().collect();
-    match tuple {
-        true => ordered.sort_by_key(|(name, _)| name[1..].parse::<usize>().expect("a tuple field")),
-        false => ordered.sort_by_key(|(name, _)| *name),
-    }
-    ordered
 }
 
 /// The keys of a reader's rows whose components begin with one position's: the whole keys of the
@@ -193,7 +184,8 @@ impl Extensions {
                 let mut spelled = HashMap::new();
                 let mut parts = HashMap::new();
                 let mut partial = false;
-                for (name, field) in record_fields(fields) {
+                for name in fields_in_order(fields.keys()) {
+                    let field = &fields[name];
                     if rest.is_empty() {
                         partial = true;
                         parts.insert(name.clone(), Predicate::True);
