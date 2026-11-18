@@ -217,8 +217,13 @@ impl AggregateKind {
         }
         let values = &values;
         match (self, accumulator, values) {
+            // Workers fold disjoint packages into one accumulator in any order. A wrapping add
+            // makes the sum independent of that order and the same in every build profile, as a
+            // release build's `+` already is.
             (AggregateKind::Sum, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
-                acc[0] += vs[start..end].iter().sum::<i64>()
+                acc[0] = vs[start..end]
+                    .iter()
+                    .fold(acc[0], |sum, value| sum.wrapping_add(*value))
             }
             (AggregateKind::Max, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
                 accumulate_max(acc, &vs[start..end]);

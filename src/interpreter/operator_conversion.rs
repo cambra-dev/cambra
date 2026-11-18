@@ -6834,7 +6834,7 @@ mod variant_ctor_tests {
             Box::new(FixedStreamProducer {
                 base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
-                released: false,
+                released: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -6842,7 +6842,7 @@ mod variant_ctor_tests {
     struct FixedStreamProducer {
         base: ProducerBase,
         tile: Tile,
-        released: bool,
+        released: std::sync::atomic::AtomicBool,
     }
 
     impl TileProducer for FixedStreamProducer {
@@ -6851,15 +6851,16 @@ mod variant_ctor_tests {
             node
         }
         fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
-            if self.released {
+            if self.released.load(std::sync::atomic::Ordering::Relaxed) {
                 self.tiling().empty_tile()
             } else {
                 self.tile.clone()
             }
         }
-        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        fn release_impl(&self, obsolete_guard: TileGuard) {
             if obsolete_guard.is_universal() {
-                self.released = true;
+                self.released
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
