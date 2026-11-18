@@ -55,6 +55,11 @@ pub enum Tile {
         /// preserved so `to_guard` can report every key ever seen, enabling complete source
         /// releasing.
         deleted: BitSet,
+        /// The paths of this level known absent everywhere: keys that have no value in any
+        /// region, not only in the region this tile answers. A cut keeps it whole, since an
+        /// absent key has no path in any region, where it cuts `domain_predicate` to the region
+        /// kept (`src/interpreter/design-operators.md`, "Absent keys").
+        absent_keys: Predicate,
     },
     /// A Tile representing the state of a scalar aggregation.
     Aggregation {
@@ -319,8 +324,10 @@ impl Tile {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record { fields: m, .. } => m.values().all(Tile::is_terminal),
             Tile::DataFunction {
-                domain_predicate, ..
-            } => domain_predicate.as_bool().unwrap_or(false),
+                domain_predicate,
+                absent_keys,
+                ..
+            } => domain_predicate.union(absent_keys).is_true(),
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
@@ -424,6 +431,7 @@ impl Tile {
                 codomain: s_codomain,
                 domain_predicate: s_pred,
                 deleted: s_deleted,
+                absent_keys: s_absent,
             },
             Tile::DataFunction {
                 row_starts: o_starts,
@@ -431,6 +439,7 @@ impl Tile {
                 codomain: o_codomain,
                 domain_predicate: o_pred,
                 deleted: o_deleted,
+                absent_keys: o_absent,
             },
         ) = (&mut *self, other)
         else {
@@ -463,6 +472,7 @@ impl Tile {
             s_domain.len(),
         );
         *s_pred = s_pred.union(&o_pred);
+        *s_absent = s_absent.union(&o_absent);
         s_deleted.extend(o_deleted.iter().map(|i| i + shift));
     }
 
@@ -784,6 +794,7 @@ impl Tile {
             codomain,
             domain_predicate,
             deleted,
+            absent_keys,
             ..
         } = self
         else {
@@ -810,6 +821,7 @@ impl Tile {
             codomain: Box::new(codomain.select_rows(&picked)),
             domain_predicate: domain_predicate.clone(),
             deleted: moved,
+            absent_keys: absent_keys.clone(),
         };
         debug_assert!(
             valid_over(&regrouped, level_offsets_of(&regrouped).len()),
@@ -1262,6 +1274,7 @@ impl Tile {
             codomain,
             domain_predicate,
             deleted,
+            absent_keys: Predicate::False,
         };
         debug_assert!(
             valid_over(&result, level_offsets_of(&result).len()),
@@ -1445,14 +1458,18 @@ impl Tile {
             let Tile::DataFunction {
                 codomain,
                 domain_predicate,
+                absent_keys,
                 ..
             } = node
             else {
                 panic!("{level} of {self:?} has no level there")
             };
             complete = match depth {
-                0 => domain_predicate.clone(),
-                _ => complete.descend(1).union(domain_predicate),
+                0 => domain_predicate.union(absent_keys),
+                _ => complete
+                    .descend(1)
+                    .union(domain_predicate)
+                    .union(absent_keys),
             };
             node = codomain;
         }
@@ -2653,6 +2670,7 @@ fn merged_rows(
                 codomain: l_codomain,
                 domain_predicate: l_pred,
                 deleted: l_deleted,
+                absent_keys: l_absent,
             },
             Tile::DataFunction {
                 row_starts: r_starts,
@@ -2660,6 +2678,7 @@ fn merged_rows(
                 codomain: r_codomain,
                 domain_predicate: r_pred,
                 deleted: r_deleted,
+                absent_keys: r_absent,
             },
         ) => {
             let l_offsets = l_starts;
@@ -2770,6 +2789,7 @@ fn merged_rows(
                 )),
                 domain_predicate: l_pred.union(r_pred),
                 deleted,
+                absent_keys: l_absent.union(r_absent),
             }
         }
         // An aggregation stands over rows without keys of its own. A row one side delivered
@@ -3011,6 +3031,7 @@ fn valid_over_settled(
             codomain,
             domain_predicate,
             deleted,
+            absent_keys,
         } => {
             let starts = row_starts;
             // A run per row, beginning at 0, non-decreasing, and ending inside `domain`.
@@ -3024,6 +3045,23 @@ fn valid_over_settled(
             if deleted.iter().any(|i| i >= domain.len()) {
                 return false;
             }
+            let key_paths = row_paths.map(|paths| tile.key_paths(paths));
+            // A key held is never recorded absent. Each key is read at its path where the rows
+            // above give one; without paths only the arms naming no enclosing path can be read.
+            let absent_held = match &key_paths {
+                Some(paths) => paths
+                    .iter()
+                    .enumerate()
+                    .any(|(i, path)| !deleted.contains(i) && absent_keys.contains_path(path)),
+                None => {
+                    let unqualified = absent_keys.unqualified_arms();
+                    (0..domain.len())
+                        .any(|i| !deleted.contains(i) && unqualified.contains(&domain.index_at(i)))
+                }
+            };
+            if absent_held {
+                return false;
+            }
             // Keys are unique *within* a row; a key may repeat across rows, since each row
             // has a collection of its own.
             let all: Vec<Value> = domain.clone().drain_to_value_iter().collect();
@@ -3033,7 +3071,6 @@ fn valid_over_settled(
             }) {
                 return false;
             }
-            let key_paths = row_paths.map(|paths| tile.key_paths(paths));
             // Which keys are settled, each on its own: a row beneath one is a row the level
             // above calls complete. The step [`Tile::completion_at`] takes per level.
             let (settled, complete): (Vec<bool>, Predicate) = match &key_paths {
@@ -3168,6 +3205,7 @@ mod tests {
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 20, 21]))),
             domain_predicate: Predicate::False,
             deleted: deleted.iter().copied().collect(),
+            absent_keys: Predicate::False,
         }
     }
 
@@ -3752,9 +3790,11 @@ mod tests {
                 codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
                 domain_predicate: inner_statement,
                 deleted: BitSet::new(),
+                absent_keys: Predicate::False,
             }),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         assert!(
             !valid_over(&tile(Predicate::True), 1),
@@ -3822,6 +3862,7 @@ mod tests {
             codomain: c_values,
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         let b = Tile::DataFunction {
             row_starts,
@@ -3829,6 +3870,7 @@ mod tests {
             codomain: Box::new(short),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         assert!(
             !valid_over(&b, 1),
@@ -4181,6 +4223,7 @@ mod tests {
             }),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         assert!(
             !validate_tile(&overfull),
@@ -4840,6 +4883,7 @@ mod tests {
             codomain,
             domain_predicate: Predicate::True,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         assert!(!validate_tile(&mismatched));
     }
@@ -6263,5 +6307,108 @@ mod tests {
             Predicate::False,
             BitSet::new(),
         ));
+    }
+
+    /// Two groups beneath the outermost keys `0` and `1`, with every key from `5` recorded absent.
+    fn groups_with_absent_keys() -> Tile {
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![3, 4]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+            unreachable!("a collection")
+        };
+        *absent_keys = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4)));
+        tile
+    }
+
+    /// A cut beneath the outermost keys keeps the keys recorded absent: they have no path in any
+    /// region, where the statement is cut to the region kept.
+    #[test]
+    fn a_cut_beneath_the_keys_keeps_the_keys_recorded_absent() {
+        let mut tile = groups_with_absent_keys();
+        tile.restrict_to_paths(CurryLevel::new(1), &Predicate::point(Value::UInt(3)));
+        let Tile::DataFunction { absent_keys, .. } = &tile else {
+            unreachable!("a collection")
+        };
+        assert!(absent_keys.contains(&Value::UInt(7)), "{tile:?}");
+    }
+
+    /// A merge records absent the keys either side records absent.
+    #[test]
+    fn a_merge_unites_the_keys_recorded_absent() {
+        let mut tile = groups_with_absent_keys();
+        let mut other = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![8, 9]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![80, 90]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        if let Tile::DataFunction { absent_keys, .. } = &mut other {
+            *absent_keys = Predicate::point(Value::UInt(2));
+        }
+        if let Tile::DataFunction { absent_keys, .. } = &mut tile {
+            *absent_keys = Predicate::False;
+        }
+        tile.merge(other);
+        let Tile::DataFunction { absent_keys, .. } = &tile else {
+            unreachable!("a collection")
+        };
+        assert!(absent_keys.contains(&Value::UInt(2)), "{tile:?}");
+    }
+
+    /// Groups beneath the outermost keys `0` and `1` holding `3` and `4`, with `absent` recorded
+    /// absent at the inner level.
+    fn groups_with_inner_absent(absent: Predicate) -> Tile {
+        let mut inner = Tile::grouped(
+            vec![0, 1],
+            ColumnValue::UInts(vec![3, 4]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let Tile::DataFunction { absent_keys, .. } = &mut inner else {
+            unreachable!("a collection")
+        };
+        *absent_keys = absent;
+        // Built field by field: `Tile::data_function` asserts the validity this checks.
+        Tile::DataFunction {
+            row_starts: vec![0],
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(inner),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+            absent_keys: Predicate::False,
+        }
+    }
+
+    /// A key held at a path recorded absent beneath an enclosing key is invalid: the record is
+    /// read at each key's path, not at the key alone.
+    #[test]
+    fn a_key_held_at_a_path_recorded_absent_is_invalid() {
+        let absent_under_0 = Predicate::qualified(
+            Predicate::point(Value::UInt(0)),
+            Predicate::point(Value::UInt(3)),
+        );
+        assert!(!validate_tile(&groups_with_inner_absent(absent_under_0)));
+        let absent_under_1 = Predicate::qualified(
+            Predicate::point(Value::UInt(1)),
+            Predicate::point(Value::UInt(3)),
+        );
+        assert!(validate_tile(&groups_with_inner_absent(absent_under_1)));
     }
 }

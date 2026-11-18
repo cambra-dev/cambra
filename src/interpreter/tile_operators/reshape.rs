@@ -145,6 +145,7 @@ impl TileProducer for PermuteRecordDomainProducer {
             codomain,
             domain_predicate,
             deleted,
+            ..
         } = input_tile
         else {
             unreachable!();
@@ -635,6 +636,7 @@ fn flatten_level(tile: Tile, field_map: &[(SmolStr, Option<SmolStr>)]) -> Tile {
         mut codomain,
         domain_predicate,
         deleted,
+        ..
     } = tile
     else {
         panic!("FlattenTupleDomain expected a collection");

@@ -746,6 +746,7 @@ impl VariantProjectProducer {
                 codomain,
                 domain_predicate,
                 deleted,
+                ..
             } => {
                 assert_eq!(
                     row_starts.len(),
