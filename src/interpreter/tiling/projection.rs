@@ -1,6 +1,7 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
+use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::{
     CurryLevel, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value,
 };
@@ -25,6 +26,32 @@ pub enum Projection {
     /// path. `keys` is neither `True` nor `False`, and is not every key beneath some keys of the
     /// level above, which that level spells ([`Projection::keys_at`]).
     Keys { level: CurryLevel, keys: Predicate },
+}
+
+/// `keys`, admitting paths whose last key stands at `depth` beneath an arm of a tagged union, as
+/// paths of the union: each path's outermost key under `tag`. A part unqualified below the
+/// outermost level stands under every enclosing path of the arm, which is every path headed by a
+/// key under `tag`. The outermost keys are tagged whole, so they stay one union predicate, the
+/// shape a tagged union reads its outermost keys in.
+fn tagged_at(keys: &Predicate, depth: usize, tag: &FieldKey) -> Predicate {
+    match keys {
+        _ if keys.is_false() => Predicate::False,
+        Predicate::Or(arms) if depth > 0 => arms
+            .iter()
+            .map(|arm| tagged_at(arm, depth, tag))
+            .fold(Predicate::False, |all, arm| all.union(&arm)),
+        Predicate::Qualified { enclosing, here } if depth > 0 => {
+            Predicate::qualified(tagged_at(enclosing, depth - 1, tag), (**here).clone())
+        }
+        unqualified if depth > 0 => Predicate::qualified(
+            tagged_at(&Predicate::True, depth - 1, tag),
+            unqualified.clone(),
+        ),
+        outermost => Predicate::tagged(
+            TagMap::from_arms(vec![(tag.clone(), outermost.clone())]),
+            false,
+        ),
+    }
 }
 
 impl Projection {
@@ -186,6 +213,19 @@ impl Projection {
                     .checked_sub(own.index())
                     .unwrap_or_else(|| panic!("{self:?} is read at {level}, above its own level"));
                 keys.descend(beneath)
+            }
+        }
+    }
+
+    /// The region of a tagged union that `self`, a region of the union's arm under `tag`, names:
+    /// the same paths with their outermost key under the tag. The arm's
+    /// [`Everything`](Self::Everything) is every key under the tag, and no key under another.
+    pub fn tagged(&self, tag: &FieldKey) -> Projection {
+        match self {
+            Projection::Nothing => Projection::Nothing,
+            Projection::Everything => Projection::admitting(tagged_at(&Predicate::True, 0, tag)),
+            Projection::Keys { level, keys } => {
+                Projection::keys_at(*level, tagged_at(keys, level.index(), tag))
             }
         }
     }
@@ -1210,6 +1250,24 @@ mod tests {
         assert_eq!(
             codomain(domain(under(key(2), Predicate::True))).projection("Producer"),
             Projection::admitting(key(2))
+        );
+    }
+
+    /// A region beneath the outermost keys keeps its path, with the outermost key under the tag;
+    /// keys under every outer key stand under every key of the arm.
+    #[test]
+    fn a_region_beneath_the_outermost_keys_is_tagged_at_its_outermost_key() {
+        let tag = FieldKey::Index(0);
+        let under_tag = |keys: Predicate| {
+            Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
+        };
+        assert_eq!(
+            level_one(under(key(0), key(1))).tagged(&tag),
+            level_one(under(under_tag(key(0)), key(1)))
+        );
+        assert_eq!(
+            level_one(key(1)).tagged(&tag),
+            level_one(under(under_tag(Predicate::True), key(1)))
         );
     }
 

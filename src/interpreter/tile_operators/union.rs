@@ -445,13 +445,23 @@ impl TileOperator for UnionOperator {
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         // The arms of a flat union are disjoint slices of one collection, pulled at the
-        // projection. A tagged union keys its rows by arm, which a region of plain keys does not
-        // name.
+        // projection. A tagged union keys an arm's rows by the arm's keys under its tag.
         let flat = self.flat;
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter_mut()
-            .map(|op| subscribe_forwarding_keeping_keys_if(flat, &mut **op, &shared, scheduler))
+            .zip(&self.tags)
+            .map(|(op, tag)| match flat {
+                true => subscribe_forwarding_keeping_keys(&mut **op, &shared, scheduler),
+                false => {
+                    let consumer = crate::interpreter::forwarding_consumer_tagging(
+                        &shared,
+                        &scheduler.wakeup_queue(),
+                        tag.clone(),
+                    );
+                    op.subscribe(op.tiling().universal_guard(), consumer, scheduler)
+                }
+            })
             .collect();
         Box::new(UnionProducer {
             base: ProducerBase::new(
@@ -928,6 +938,65 @@ mod tests {
             Predicate::qualified(point(2), point(5))
         );
         assert_eq!(under_arm(&point(5), 1, &FieldKey::Index(0)), point(5));
+    }
+
+    /// Tagging a region of an arm and reading the union's region back under the arm's tag gives
+    /// the region again, at the outermost level and beneath it; under another tag it names
+    /// nothing.
+    #[test]
+    fn tagging_a_region_and_reading_it_under_the_tag_round_trips() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let record = |a: u64, b: u64| {
+            Predicate::point(Value::Record(HashMap::from([
+                ("a".into(), Value::UInt(a)),
+                ("b".into(), Value::UInt(b)),
+            ])))
+        };
+        // Two record points differing in both fields, which no componentwise join merges.
+        let records = record(1, 1).union(&record(2, 2));
+        let union_key = Predicate::tagged(
+            TagMap::from_arms(vec![(FieldKey::Index(3), point(1))]),
+            false,
+        );
+        let (tag, other) = (FieldKey::Index(1), FieldKey::Index(0));
+        let regions = [
+            (0, point(2)),
+            (0, Predicate::True),
+            (1, point(5)),
+            (1, Predicate::qualified(point(2), point(5))),
+            (2, point(7)),
+            (
+                2,
+                Predicate::qualified(Predicate::qualified(point(2), point(5)), point(7)),
+            ),
+            (2, Predicate::qualified(point(5), point(7))),
+            (0, records.clone()),
+            (0, union_key),
+            (1, Predicate::qualified(point(2), records)),
+            (1, Predicate::qualified(point(2), point(5)).union(&point(6))),
+            (
+                1,
+                Predicate::qualified(point(2), Predicate::True)
+                    .union(&Predicate::qualified(point(0), point(9))),
+            ),
+        ];
+        for (depth, keys) in regions {
+            let tagged =
+                match Projection::keys_at(CurryLevel::new(depth), keys.clone()).tagged(&tag) {
+                    Projection::Keys { keys, .. } => keys,
+                    Projection::Everything => Predicate::True,
+                    Projection::Nothing => Predicate::False,
+                };
+            assert_eq!(under_arm(&tagged, depth, &tag), keys, "{depth}: {tagged:?}");
+            // A tagged union reads its outermost keys as one union predicate.
+            if depth == 0 {
+                assert!(matches!(tagged, Predicate::Union { .. }), "{tagged:?}");
+            }
+            assert!(
+                under_arm(&tagged, depth, &other).is_false(),
+                "{depth}: {tagged:?}"
+            );
+        }
     }
 
     #[rstest::rstest]
