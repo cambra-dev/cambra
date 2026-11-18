@@ -309,7 +309,7 @@ either a structure of cells linked by `Ref`s, or a table whose rows hold keys.
 |---|---|---|---|
 | `Cell(𝑉, 𝑅)` | A cell declared at a module's top level: `x: Cell(𝑉, 𝑅) := init`. A **root cell**; each run of the module has its own. | The variable is not; `ref(x)` gives a `Ref` | Until every consumer releases it |
 | `Ref(𝑉, 𝑅)` | An opaque reference to a cell | Yes | Keeps its cell alive |
-| `Pin(𝑉, 𝑅)` | A transparent key to an allocated cell, for references that leave the program | Yes, and serializable | Until `unpin` |
+| `Pin(𝑉, 𝑅)` | A transparent key to an allocated cell, for references that leave the program | Yes, and serializable | Until `unpin`, or until its time-to-live passes |
 
 `Cell(𝑉, 𝑅)` replaces `Mut(𝑉, Txn)`. With `Txn` gone from `Mut`, the domain slot of `Mut` holds
 only induction domains, which inference always supplies, so the surface type is `Mut(𝑉)`. `Txn(𝑅)`
@@ -344,6 +344,7 @@ ref(x: Cell(V, R)) => Ref(V, R)
 to_mut(r: Ref(V, R)) => Mut(V)         requires Transaction(R)   # spelled *r; r->f is (*r).f
 r == s                                                           # same cell; hashable
 pin(r: Ref(V, R)) => Pin(V, R)               requires Transaction(R)
+pin(r: Ref(V, R), ttl: Duration) => Pin(V, R)   requires Transaction(R)
 unpin(p: Pin(V, R))                          requires Transaction(R)
 resolve(p: Pin(V, R)) => Option(Ref(V, R))   requires Transaction(R)
 ```
@@ -351,6 +352,9 @@ resolve(p: Pin(V, R)) => Option(Ref(V, R))   requires Transaction(R)
 - **`Ref::new` requires a transaction**, so a cell's creation is part of a commit. The new
   place is named by its allocation site and the position where `Ref::new` runs, so allocation
   never conflicts.
+- **A pin ends by `unpin` or by its time-to-live.** `pin(r, ttl)` suits a reference that expires,
+  such as a session cookie. Once `ttl` has passed since the pin committed, the system unpins the
+  cell in a commit of its own.
 - **`Ref` has equality and hashing but no order.** An order would expose allocation order.
 - **A root cell is read and written by name. A cell reached through a `Ref` is read and written
   through `*r` and `r->f`** ([Converting a cell to a Mut](#converting-a-cell-to-a-mut)).
@@ -377,7 +381,8 @@ two cases, which differ in whether the access goes through a `Ref`:
   field holds a `Ref(Cart)`, the cart's items are `s->cart->items`, as in [Example](#example).
 - **A pair is written `k ↦ v`.** `->` was the pair arrow, and `a -> b` is the two-tuple `(a, b)`
   ([spec 2.4](../../../docs/chl-spec.md#24-atoms)), so `(k, v)` is the spelling of a pair without
-  `↦`. A lambda keeps `\x -> body` (question 4).
+  `↦`. A lambda keeps `\x -> body`. The parse is unambiguous, because a lambda's binders are names
+  and type annotations, and no type uses `->`.
 
 `to_mut` is a projection, not an ordinary function. Rule 2 of [The rules](#the-rules) forbids a
 function from returning a `Mut`; a projection yields a `Mut` place that lasts as long as the
@@ -471,9 +476,9 @@ nowhere would leave the cell garbage.
 
 ### Transaction boundaries
 
-Every transaction is an explicit `with begin():` block. Implicit transactions, such as a single
-statement outside a block running as its own transaction, are set aside until programs show many
-single-statement blocks (question 1).
+Every transaction is an explicit `with begin():` block. No transaction is implicit: a statement
+outside a block never runs as its own transaction, and a loop iteration is a transaction only where
+its body opens a block.
 
 Inside a block, a cell is read and written through `to_mut`, and a `Mut` declared outside the block
 is read and written as a `Mut`. The block reads its own writes. Nothing outside the block sees them
@@ -668,12 +673,13 @@ version, cannot leave at all.
 ```python
 def pick_user() => UserKey requires Transaction: ...
 
-u: Int = with begin(): pick_user()      # the cast, in the spelling of question 5's candidate (a)
+u: Int = with begin(): pick_user()      # the cast: a type ascription on the binding
 k: Cell(UserKey) := u                   # error: an Int is not a UserKey
 k: Cell(Int) := u                       # ok
 ```
 
-The spelling of the cast is open (question 5).
+The cast is a type ascription on the binding that receives the block's result, `u: Int = with
+begin(): …`. A result with no version-free supertype is an error at the ascription.
 
 ## Views
 
@@ -733,9 +739,17 @@ with begin():
   `carts_by_item()[i₁]` and `carts_by_item()[i₂]`. The set inserts commute, so they do not conflict
   with each other. Testing `k in carts_by_item().keys()` conflicts only with writers that add or
   drop a reference to `k`. A scan would conflict with every writer to `carts`.
-- **Index syntax is planned.** A form such as `index(carts, \c -> c.lines)` is shorter, and the
-  checker can carry a built-in lemma for it ("an absent key implies no occurrence in the source
-  field") in place of unfolding a comprehension into quantified formulas (question 6).
+- **`@index` declares an index.** The declaration names the source cell, the field function and
+  the index:
+
+  ```python
+  @index(carts, \c -> c.lines)
+  lines_to_carts
+  ```
+
+  `lines_to_carts` maps each item key to the carts whose `lines` contain it, as `carts_by_item`
+  does. The checker carries a built-in lemma for an index, "an absent key implies no occurrence in
+  the source field", in place of unfolding a comprehension into quantified formulas.
 
 ### Deferred materialized views
 
@@ -809,7 +823,9 @@ The rules:
 
 `Feed(𝑇)` and `OnceMap(𝐾, 𝑉)` are **deferred collections**: immutable places whose value is defined
 piecewise, by contributions that combine without order. A deferred collection has no history. Its
-name denotes its final value, and no read observes it partly defined.
+name denotes its final value, and no read observes it partly defined. Their semantics is
+**deferred value semantics**, the counterpart of [Mutable Value Semantics](#mutable-value-semantics)
+for places whose contributions combine without order.
 
 | Type | Contribution | Denotes | Obligation on the contributions |
 |---|---|---|---|
@@ -894,7 +910,7 @@ merge law decides the ordering.
 - **A read of the whole collection waits until it is complete.** `sum(f)`, `len(m)` and a scan
   complete once every contribution has been made. A deferred collection whose contributors never
   finish has no complete value, and such a read never completes. The compiler does not reject it:
-  termination checking is deferred (question 9).
+  termination checking is future work ([Termination checking](#termination-checking)).
 - **A read does not depend on its position.** `g = f` gives `f`'s final value even where the
   assignment stands above some of `f`'s contributions. A read of the whole collection inside a loop
   that contributes to it would make the collection depend on itself, and it is rejected.
@@ -907,8 +923,8 @@ or counts the elements not yet processed. A queue that one loop fills and anothe
 holding a list.
 
 Both merge laws are instances of LVars (Kuper & Newton, FHPC 2013): contributions are joins in a
-lattice, and a pointwise read is a threshold read. Whether other lattices join them is open
-(question 10).
+lattice, and a pointwise read is a threshold read. Other lattices are future work ([Other merge
+laws](#other-merge-laws)).
 
 ## Crossing between dataflow and transactions
 
@@ -1046,7 +1062,9 @@ bob::receive(alice::output)
   that never happens leaves `alice` with no input from that peer.
 - **Modules are not records.** A run bundles cells and logic under one name. Its outputs are
   members, and its inputs are functions.
-- **A wiring call is a top-level statement.** Spec 9.17 does not admit one yet (question 13).
+- **A wiring call is a statement.** `receive` causes effects, so a call to it is not a bare value
+  expression, and [spec 9.17](../../../docs/chl-spec.md#917-no-trailing-expressions) admits it at
+  a module's top level.
 
 ## Four kinds of reference
 
@@ -1096,7 +1114,9 @@ type CartKey requires Transaction = {Int where _ in carts.keys()}
    [Leaving a transaction](#leaving-a-transaction).
 5. **A refinement may mention only cells of its own module.** Every dependent of a key set is then
    visible to the module that owns it. Adding a module never makes another module's deletions
-   fail. A key that crosses a module boundary is an unvalidated key.
+   fail. A key that crosses a module boundary is an unvalidated key. A module parameter is never a
+   cell: a run passes a cell to another module as a `Ref`. A refinement therefore never mentions a
+   cell its module received, and the rule covers child modules.
 
 Removing `𝑗` from a key set narrows `ItemKey`, and every dependent must hold no `𝑗` at the commit
 point. [Invariants over cell contents](#invariants-over-cell-contents) states that obligation, the
@@ -1213,9 +1233,9 @@ dependent's content type, and on whether the write narrows or widens `𝑇`:
 
 Whether a write narrows or widens `𝑇` is a comparison of two instances, `𝑇@𝜏′ ⊆ 𝑇@𝜏` or `𝑇@𝜏 ⊆
 𝑇@𝜏′`. Membership in a key set is monotone in the set, so an insert widens and a remove narrows with
-no solver query. Other predicates go to z3 (question 15). A write the compiler cannot classify
-creates an obligation for every occurrence. A write that changes no instance, such as overwriting
-the value under an existing key, creates none.
+no solver query. Other predicates go to z3 ([Classifying writes](#classifying-writes)). A write
+the compiler cannot classify creates an obligation for every occurrence. A write that changes no
+instance, such as overwriting the value under an existing key, creates none.
 
 ### Examples
 
@@ -1289,12 +1309,17 @@ version that last wrote it, or at the committed version if the transaction has n
 3 of [Validated keys](#validated-keys) re-checks each use at a later version: a key read from
 `carts` after `items.remove(𝑗)` needs `𝑘 ≠ 𝑗` at its use, as a local key does.
 
+A write through `*r` may write a cell `x` when `r`'s site kind contains `x`. Unless the exclusivity
+facts ([Converting a cell to a Mut](#converting-a-cell-to-a-mut)) separate such a write from `x`, it
+counts as a write to `x` at an unknown path. `x`'s content returns to its declared type, and
+rule 3 of [Validated keys](#validated-keys) re-checks the keys read from it earlier. Refinements
+learned about `x` before the write are lost where the facts cannot separate the cells.
+
 Between two writes, a cell's content can have a type that no signature names. In the first `prefs`
 transaction, after `users.add(u)` and before `prefs[u] := default_prefs`, `prefs` is not a
 `FullMap(UserKey, Prefs)` at the current version, because it has no row for `u`. A call there to a
 helper that takes `p: Mut(FullMap(UserKey, Prefs))` is a type error, although the declared types
-suggest it is allowed, and the error names a type the program never wrote. What the type of
-`UserKey`, and of `prefs`, is between the two writes is open (question 17).
+suggest it is allowed, and the error names a type the program never wrote.
 
 The module-local rule ([Validated keys](#validated-keys), rule 5) and the concurrency argument
 ([Concurrency](#concurrency)) apply to every obligation unchanged.
@@ -1362,12 +1387,12 @@ every `with begin():` block that touches a cell, whichever module it is in, and 
 footprint declarations in signatures. Declared footprints serve a different purpose: stability
 across reloads. An elision is a proof about the whole program, and a reload that adds a write to a
 shared cell can invalidate it. A module type that bounds its runs' footprints lets a reload within
-those bounds keep other modules' plans (question 22).
+those bounds keep other modules' plans ([Reloads that widen
+footprints](#reloads-that-widen-footprints)).
 
 A `Ref` that crosses a module boundary has an abstract site kind. Its effects name the run's cells
 as a whole. The effects stack writes this `WriteTxn(inv::*)`, a glob over the run's variables.
-That is not a place expression, and in this design `*` is the dereference of a `Ref`, so its
-spelling here is open (question 21).
+That is not a place expression, and in this design `*` is the dereference of a `Ref`.
 
 ## Garbage collection
 
@@ -1437,8 +1462,8 @@ to that read, because the transaction that removed the reference is a conflictin
 
 ### Pins
 
-A pinned cell is a root until `unpin`. The collector does not count unvalidated keys. A `Pin` whose
-cell has been unpinned and reclaimed resolves to `None`.
+A pinned cell is a root until `unpin`, or until its time-to-live passes. The collector does not
+count unvalidated keys. A `Pin` whose cell has been unpinned and reclaimed resolves to `None`.
 
 ## Staging
 
@@ -1498,7 +1523,7 @@ Proposals for the owners of each part.
 - **[Spec 2.4](../../../docs/chl-spec.md#24-atoms) and the precedence table.** The pair arrow
   becomes `↦`. `->` becomes a postfix operator beside `.`, the field access through a `Ref`, and
   prefix `*` is the dereference, binding looser than the postfix operators. A lambda keeps
-  `\x -> body` (question 4).
+  `\x -> body`.
 - **[Spec 8.4](../../../docs/chl-spec.md#84-feeds-are-the-second-form-of-mutability).** "Feeds are
   the second form of mutability" becomes: a feed is a deferred collection, an immutable place with
   no history ([Deferred collections](#deferred-collections)).
@@ -1522,8 +1547,6 @@ Proposals for the owners of each part.
   `pub stock: Mut(…)` and `pub counts: Feed(Int)` become values, `pub counts = …`, or functions.
   "eu and us feed one `audit::events`" no longer holds
   ([Modules and deferred collections](#modules-and-deferred-collections)).
-- **[Spec 9.17](../../../docs/chl-spec.md#917-no-trailing-expressions).** Admit a wiring call,
-  such as `alice::receive(bob::output)`, as a top-level statement (question 13).
 - **[`docs/modules.md`](../../../docs/modules.md#worked-example-two-storefronts-and-an-audit-log),
   "Worked example: two storefronts and an audit log".** `storefront` exports its events as a
   value, `pub events = …`, and takes no `audit` parameter. `audit` exports a `receive` function
@@ -1547,142 +1570,73 @@ Proposals for the owners of each part.
 - **Inference.** `Feed(𝑇)` stays a variable type, no longer a mutable variable's. `OnceMap(𝐾, 𝑉)`
   joins it as the second deferred-collection type.
 
-## Open questions
+## Future work
 
-Candidates listed under a question are proposals with their costs, not decisions.
+The design leaves these out. Each is a candidate for a later revision.
 
-**Cells**
+### User-defined projections
 
-1. **Transaction boundaries.** Whether a loop iteration over a source becomes the default
-   transaction, with the compiler splitting it where transaction chopping (Shasha et al., 1995)
-   proves serializability preserved, and whether `Ref::new` is allowed outside a block, which needs
-   a creation commit of its own. For now every transaction is an explicit `with begin():` block, and
-   `Ref::new` requires one ([Transaction boundaries](#transaction-boundaries)). Also whether a realm
-   sets a default deadline for its transactions ([Transaction outcomes](#transaction-outcomes)).
-2. **`Pin` lifetime.** Explicit `unpin` only, or a time-to-live (`pin(r, ttl)`) for references
-   such as session cookies that expire.
-3. **User-defined projections.** Future work. `to_mut` is the only projection: an operation that
-   yields a `Mut` place rather than returning a value. Whether programs can define projections, as
-   Hylo's subscripts do, is not decided. A definition would map a place to a place, as in
-   `proj f_at(xs, i): xs[i].f`, used as `ys.f_at[i]` on `ys: Mut(List({f: Int}))`. A projection
-   could instead be a function with an effect or a capability, which would make it an ordinary
-   function rather than a separate concept. If programs can define projections, `to_mut` and `*`
-   become ordinary definitions.
-4. **Pair and lambda spelling.** `->` is the field access through a `Ref`, and a pair is `k ↦ v`,
-   with the tuple `(k, v)` as the spelling without `↦` ([Converting a cell to a
-   Mut](#converting-a-cell-to-a-mut)). A lambda keeps `\x -> body`. The parse is unambiguous,
-   because a lambda's binders are names and type annotations, and no type uses `->`. Whether a
-   lambda should change too, so that `->` has one meaning, is open.
+Field access `.f`, lookup `[k]` and `to_mut` (`*`) are the built-in projections: each yields a
+place rather than returning a value. Programs will define projections, as Hylo's subscripts do, and
+the design of the form is not written. A definition would map a place to a place, as in
+`proj f_at(xs, i): xs[i].f`, used as `ys.f_at[i]` on `ys: Mut(List({f: Int}))`. A projection might
+instead be a function with an effect or a capability, which would make it an ordinary function
+rather than a separate concept.
 
-**Versions**
+### Materialized views with parameters
 
-5. **The cast out of a transaction.** Its spelling
-   ([Leaving a transaction](#leaving-a-transaction)). Candidates:
-   - (a) A type ascription on the receiving binding, `k: Int = with begin(): …`. A result with no
-     version-free supertype is an error at the ascription.
-   - (b) A builtin applied inside the block that maps a value to its base type. Cost: a second
-     spelling for what an ascription states.
-   - (c) An implicit coercion of a block's result to its version-free supertype. Cost: the point
-     where the proof is dropped is invisible, against principle 5.
-   - Recommendation: (a).
+A view takes no parameters (`() ⇒ 𝑉 requires Transaction`), so a materialized view holds one value.
+A view with parameters, such as `orders_for(u: UserId)`, could be materialized only for the
+arguments that are read, as Noria does: the value for an argument is computed by an upquery on its
+first read, maintained incrementally after that, and can be evicted. With it, `@materialize`
+applies to functions that take parameters as well as to views, and the names for the two need
+choosing.
 
-   The cast is required whenever the result type is version-indexed. Inferring it where no
-   ascription is written is a later relaxation.
+### Termination checking
 
-**Views**
+A read of the final value of a history or a deferred collection whose contributors never finish,
+and a cell write of a value that is never final (`c := stdin()`), never complete. A check that
+rejects them waits until the system is more mature.
 
-6. **Index syntax.** The spelling of an index and its built-in lemma ([Indexes](#indexes)).
-7. **Materialized views with parameters.** Future work. A view takes no parameters
-   (`() ⇒ 𝑉 requires Transaction`), so a materialized view holds one value. A view with
-   parameters, such as `orders_for(u: UserId)`, could be materialized only for the arguments that
-   are read, as Noria does: the value for an argument is computed by an upquery on its first read,
-   maintained incrementally after that, and can be evicted. This design does not include it. With
-   it, `@materialize` applies to functions that take parameters as well as to views, and the
-   names for the two, and for what `@materialize` may annotate, are open.
+### Other merge laws
 
-**Deferred collections and dataflow**
+Feeds and `OnceMap`s are instances of LVars: contributions are joins in a lattice, and a pointwise
+read is a threshold read ([Reads](#reads)). Other laws, such as a maximum or the Z-sets of DBSP,
+could join them, and a materialized view could then be a value.
 
-8. **Names.** What to call the semantics of place variables whose contributions combine without
-   order, as a counterpart to Mutable Value Semantics. Candidates raised in discussion: deferred
-   value semantics, append value semantics, monotonic value semantics, progress value semantics.
-   "Deferred collection" is the spec's term for the types themselves ([spec
-   3.7](../../../docs/chl-spec.md#37-feed-operator-)).
-9. **Termination checking.** A read of the final value of a history or a deferred collection whose
-   contributors never finish, and a cell write of a value that is never final (`c := stdin()`),
-   never complete. A check that rejects them is deferred until the system is more mature.
-10. **Other merge laws.** Feeds and `OnceMap`s are instances of LVars: contributions are joins in a
-   lattice, and a pointwise read is a threshold read ([Reads](#reads)). Whether other laws join
-   them, such as a maximum or the Z-sets of DBSP, is open, as is whether a materialized view could
-   then be a value.
-11. **Borrowing a point of a deferred collection.** `&m[k]` lends one entry of a `OnceMap` for its
-    callee to define, as `&xs[i]` lends one element of a `Mut`. The parameter needs a type that
-    `Mut` does not supply, such as `Defer(𝑉)`, a place that holds a `𝑉` defined once:
-    ```python
-    def set_to_1(v: Defer(Int)):
-        v = 1
+### Keys of captured contributions called from another module
 
-    m: OnceMap(Int, Int)
-    set_to_1(&m[0])
-    ```
-    With `Defer`, `OnceMap(𝐾, 𝑉)` could be `FullMap(𝐾, Defer(𝑉))`, and `Feed(𝑇)` could be
-    `_ ⤇ Defer(𝑇)`, where `_` is a domain that inference fixes per feed, neither universally
-    quantified nor a `Σ`. Whether this model is useful, and whether it is the right one, is open.
-12. **Keys of captured contributions called from another module.** A `def` that appends to a feed
-    its module declares, called from another module, contributes at the caller's call site ([Which
-    contributions participate](#which-contributions-participate)). How those keys are formed, and
-    what a reload that adds or removes such a call does to them, is not written.
-13. **Wiring calls.** `alice::receive(bob::output)` is a call statement at a module's top level,
-    which [spec 9.17](../../../docs/chl-spec.md#917-no-trailing-expressions) does not admit. Whether
-    it becomes a statement form, or wiring gets its own syntax, is open
-    ([Modules and deferred collections](#modules-and-deferred-collections)).
+A `def` that appends to a feed its module declares, called from another module, contributes at the
+caller's call site ([Which contributions participate](#which-contributions-participate)). How those
+keys are formed, and what a reload that adds or removes such a call does to them, is not written.
 
-**References and invariants**
+### Classifying writes
 
-14. **Child modules.** A child module reaches its parent's cells only through the arguments of
-    its `run` (spec: "Runs share state only by being passed"). Whether a refinement may mention a
-    cell received as a module parameter decides whether staging step 1's restriction covers
-    children.
-15. **Classifying writes.** Which predicates the compiler classifies as monotone in their read
-    set without a solver query, beyond membership in a key set.
-16. **Refinements across possibly aliased cells.** Inside a transaction a cell's content keeps the
-    type it had at the version that last wrote it ([When obligations are
-    checked](#when-obligations-are-checked)). A write through `*r` may have written `x` when `r`'s
-    site kind contains `x`, and the rule for the refinements the transaction learned about `x`'s
-    content is not written.
-    - (a) A write through `*r` that the exclusivity facts ([Converting a cell to a
-      Mut](#converting-a-cell-to-a-mut)) do not separate from `x` counts as a write to `x` at an
-      unknown path: `x`'s content returns to its declared type, and rule 3 of [Validated
-      keys](#validated-keys) re-checks keys read from it earlier. Cost: refinements learned before
-      the write are lost where the facts cannot separate the cells.
-    - (b) The write is rejected unless disjointness from every cell read earlier in the
-      transaction is proved. Cost: rejects every write through a `Ref` whose site kind contains a
-      root cell the transaction has read.
-    - Recommendation: (a).
-17. **The type of a cell between writes.** Between `users.add(u)` and `prefs[u] := …`, `prefs` is
-    not a `FullMap(UserKey, Prefs)` at the current version ([When obligations are
-    checked](#when-obligations-are-checked)). A call to a helper that takes a
-    `Mut(FullMap(UserKey, Prefs))` there is a type error whose message names a type the program
-    never wrote. The question is what `UserKey` and `prefs` are at that point. A transaction moves
-    a cell from one instance of its version-indexed content type to another, and the rule should
-    say which instance each name has at each point.
-18. **Declared invariants.** Whether cell contents should carry invariants beyond refinements and
-    views, letting the compiler check explicit boundaries and admit more elisions (Bailis et al.,
-    VLDB 2015; Gotsman et al., POPL 2016).
-19. **Prior work on static restrict.** Branded indices (Kiselyov & Shan) and GhostCell prove
-    validity for one collection over one scope, without deletion against persistent dependents. A
-    literature search for statically checked referential integrity has not been done.
-20. **Lowering `Ref`.** Whether native code can lower `heap_𝜌[r]` to a pointer dereference, with
-    `Addr_𝜌` as the address and no materialized index, under MVCC versioning of the cells.
+Membership in a key set is the one predicate the compiler classifies as monotone in its read set
+without a solver query ([Which writes create an obligation](#which-writes-create-an-obligation)).
+Built-in rules for further shapes, such as negated membership or a comparison against a numeric
+cell, would replace z3 queries with checks of predictable cost.
 
-**Footprints**
+### Declared invariants
 
-21. **Written path effects.** Which places a clause may name beyond those starting at a root cell
-    or a parameter, such as a place through a value the body computes. Also how a clause names
-    every cell of a run reached through a `Ref` with an abstract site kind: the effects stack's glob
-    `inv::*` is not a place expression, and `*` is this design's dereference
-    ([Across modules](#across-modules)).
-22. **Reloads that widen footprints.** Whether a reload may re-plan other modules, or must stay
-    within declared footprints ([Across modules](#across-modules)).
+Cell contents could carry invariants beyond refinements and views, letting the compiler check
+explicit boundaries and admit more elisions (Bailis et al., VLDB 2015; Gotsman et al., POPL 2016).
+
+### Prior work on static restrict
+
+Branded indices (Kiselyov & Shan) and GhostCell prove validity for one collection over one scope,
+without deletion against persistent dependents. A literature search for statically checked
+referential integrity waits for the full design and implementation of validated keys.
+
+### Lowering `Ref`
+
+Native code might lower `heap_𝜌[r]` to a pointer dereference, with `Addr_𝜌` as the address and no
+materialized index, under MVCC versioning of the cells.
+
+### Reloads that widen footprints
+
+A reload may re-plan other modules, or stay within declared footprints
+([Across modules](#across-modules)). The rule is not written.
 
 ## References
 
