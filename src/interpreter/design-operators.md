@@ -815,6 +815,14 @@ Repeated notifications are delivered; the dispatcher deduplicates queued regions
 wakeup queue participates in execution. A notification that reenters a consumer is a cycle error.
 Stores close cycles by publishing snapshots through their fan-out.
 
+`notify` takes `&self`, and a delivery takes no lock on the consumer it notifies. A consumer that
+records state, as `Arrivals` and a sink's placement do, holds its own lock only for that read or
+write and releases it before it notifies another consumer. A landing therefore holds no lock while
+it passes from one consumer to the next, and two threads can notify one consumer at once. Re-entry
+is detected per thread: `notify_shared` marks a `SharedConsumer` as being notified on the current
+thread, and a notification that reaches a marked consumer calls `Landing::reentered` instead of
+notifying it.
+
 Direct reads schedule no continuation. Dispatcher packages and loop rounds advance execution.
 `release` declares which values a reader no longer needs; it does not announce new input.
 
@@ -1193,14 +1201,15 @@ once in depth-first postorder. A visited-id set terminates shared paths and cycl
 without ids, including test doubles, are neither emitted nor traversed. Conversion records sink
 identities with `record_sink`; the walk adds each recorded sink and its output edge.
 
-`compile_program` walks newly constructed operators before subscribing them. Subscription takes
-`CycleSlot` contents and store inputs, so a later walk cannot recover those edges. Reused operators
-that were already subscribed expose only the inputs they still hold. The implementation is in
-`operator_graph.rs`.
+`compile_program` walks newly constructed operators before subscribing them. Subscription runs on
+the thread that compiles or reloads the program, and a dispatched run constructs no producer.
+Subscription takes `CycleSlot` contents and store inputs, so a later walk cannot recover those
+edges. Reused operators that were already subscribed expose only the inputs they still hold. The
+implementation is in `operator_graph.rs`.
 
 `visit_inputs` is required on every operator. The graph walk and the default `TileOperator::inspect`
 implementation both read it; an omitted input can remove an edge or subtree from both. Its callback
-borrows each target only for the call, permitting inputs held behind `RefCell`, including fan inputs
+borrows each target only for the call, permitting inputs held behind a lock, including fan inputs
 and `CycleSlot` contents. `inspect_annotation` supplies non-input metadata such as a constant's
 value or variant tag.
 

@@ -11,6 +11,8 @@ use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use crate::interpreter::{
     CurryLevel, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value,
 };
+#[cfg(test)]
+use std::sync::PoisonError;
 
 /// The part of a producer's tile that a `get` asks for.
 ///
@@ -2521,7 +2523,12 @@ mod tests {
             let morsel = keys_between(first, first + MORSEL - 1);
             assert_eq!(int_entries(&spy.get(morsel.clone())).len(), MORSEL as usize);
             spy.release(morsel);
-            let Some(Tile::DataFunction { domain, .. }) = &*spy.base.last_output.borrow() else {
+            let Some(Tile::DataFunction { domain, .. }) = &*spy
+                .base
+                .last_output
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+            else {
                 panic!("a pull records the collection it answered")
             };
             assert_eq!(
@@ -2545,10 +2552,13 @@ mod tests {
         let rest = spy.read_in_pipeline(tiling.universal_guard());
         assert_eq!(int_entries(&rest), [(0, 10), (3, 40)]);
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             [keys_between(1, 2), tiling.universal_guard()]
         );
-        assert_eq!(*released.borrow(), [keys_between(1, 2)]);
+        assert_eq!(
+            *released.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(1, 2)]
+        );
         // A pull that names nothing states nothing complete, which is withdrawal unless
         // the consumer released what it took.
         spy.release(tiling.universal_guard());
@@ -2623,7 +2633,7 @@ mod tests {
         expected.restrict_to(&projection, &nested_tiling());
         assert_eq!(producer.get(asked), expected);
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
             vec![domain(key(0))],
             "the producer is pulled at the outermost key the asked path runs through"
         );
