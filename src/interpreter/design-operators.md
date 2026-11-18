@@ -305,24 +305,57 @@ union instead forwards the whole predicate over the domain shared by its arms, e
 is itself union-keyed. Prefix construction over union keys is specified under [Componentwise
 predicates and prefixes](#componentwise-predicates-and-prefixes).
 
-### Absent keys
+### Keys that follow the level beneath
 
-A collection level records apart from its statement the paths it knows absent everywhere
-(`absent_keys`). A statement covers the region a tile answers, so a cut to a projection keeps only
-what it says of the region kept; an absent key has no path in any region, so a cut keeps the record
-whole, and a merge unites the two sides'. A key in it is complete wherever completeness is read for
-that level. `Converse` writes it: once every input key it has read is complete, a value no row
-carried has no group ([Converse](#converse)). `MapAggregate` reads it with the outer statement, so
-a group no answer holds is stated absent after any cut beneath the groups' keys. A key held is
-never recorded absent: `validate_tile` reads the record at the path of each key whose path the rows
-above give, and at the key alone otherwise, where only a record naming no enclosing path can be
-read.
+A collection level states one of three things about its keys through the level beneath
+(`keys_follow_beneath`, a `KeysFollow`):
 
-Absent keys contribute to completion at their level and every level beneath it. A tile assembled
-from completed nested values and absent outer keys can therefore state the whole collection
-complete even when its outer `domain_predicate` alone does not. Operators combining rows derive
-completion from held whole values and explicit absence; completion of a held group's value does
-not establish that an enclosing key which has not arrived is absent.
+| State | Meaning |
+| --- | --- |
+| `Follows` | A key arrives at the level only with a key beneath it, so the level gains no key once the level beneath is complete under every path |
+| `DoesNot` | The level can gain a key that no key beneath it brings |
+| `Unstated` | The tile states neither; every collection constructor builds this |
+
+A level that follows is complete at every key once the level beneath states every key under every
+path complete (`Tile::level_statement`). A level in either other state states only its
+`domain_predicate`. `completion_at`, `to_guard`, `complete_keys` and `is_terminal` read a level's
+statement through that rule.
+
+A cut first writes each level's statement through the rule into its `domain_predicate`
+(`Tile::state_derived`), then narrows the statements to the region kept and keeps the flag: the cut
+level beneath no longer states every path, so the flag adds nothing to the cut answer.
+
+A merge unites the two sides' flags (`merged_follow`), since a merge of rows can join collections of
+different producers. A side that does not follow keeps the merged level from following, and two
+unstated sides leave it unstated. Beside a side that follows, an unstated side holding keys holds
+keys its producer stated nothing about, so the merged level does not follow; an unstated side
+holding no key adds none and leaves the other side's flag. The rule does not depend on the order of
+the sides.
+
+A merge unites what the sides state, as it unites their `domain_predicate`s. Where the merged level
+does not follow, a side that follows writes its statement through the rule into the merged
+predicate first (`Tile::stated_through_flag`), so the result does not depend on whether a side
+states a key through the flag or in its predicate. `MapAggregate` unites its answers' flags and
+statements by the same rules (`Stated::union`).
+
+An operator that changes a level without the level beneath writes the level's statement through
+the rule into its `domain_predicate` and sets the flag to `DoesNot`, so the level beneath does not
+widen the level back. `MapResult` and
+`MapResultToConst` replace the values beneath the level, and `MapDomain` replaces a level's values
+with its keys; each calls `Tile::unfollow_values_at` before replacing them, which reads the
+statement from them. An operator that takes a region out of a level's statement in place takes it
+through `Tile::unstate_at`, as `Tile::withhold` and the live rows `MapResultToConst` leaves open
+do.
+
+A level's keys follow a collection beneath it, so `validate_tile` rejects `Follows` on a level whose
+values are no collection, a record of fields included.
+
+`Converse` sets `Follows` at the outermost level it inverts ([Converse](#converse)). An answer of a
+pull beneath the groups' keys states only the input keys it read, so no single answer completes the
+groups' level. A reader that unites its answers does: a `Memo` merges them into its cache,
+`MapAggregate` unites them in its `Stated`, and a loop's drive reads its source whole. `Zip` reads
+each arm's level through the rule, states their meet, and sets `DoesNot` on the level enclosing the
+pair, whose values are a record of the arms'.
 
 ### Qualified predicates
 
@@ -784,9 +817,9 @@ In debug builds, `TileProducer::get` compares consecutive outputs through
 2. Previously present keys and values beneath complete paths remain unchanged, or are absent
    because they were released.
 3. No new key or value appears beneath a previously complete path.
-4. No key appears at a path an earlier output recorded absent ([Absent keys](#absent-keys)),
-   released or not. An output may leave the record out: it holds in every region, and leaving it
-   out withdraws nothing.
+
+Each check reads a level's statement through
+[Keys that follow the level beneath](#keys-that-follow-the-level-beneath).
 
 A violation panics with the producer tree. Store checks cover both semantic reads at decided
 positions and the component collections: seeds, frontiers, changelogs and decided positions.
@@ -989,11 +1022,11 @@ paths it changed, with the value step admitting anything: `Converse` passes its 
 that restates the region there (`notifications::one_level_in`), and a pull at such a region pulls the
 input at the same keys (`Predicate::without_open_level`) and inverts only those rows. A region of
 the standing keys above the inverted level passes through as it is. It keeps the input rows it read
-and has not released, which a release of a group names by their values. At the outermost level it
-also keeps the input keys its answers stated complete and the values those answers held, and once
-every input key is complete it records every other value absent ([Absent keys](#absent-keys)): such
-a value has no group, and a cut beneath the values keeps no statement of the groups it does not
-hold.
+and has not released, which a release of a group names by their values. At the outermost level its
+answers' groups follow the input keys beneath them
+([Keys that follow the level beneath](#keys-that-follow-the-level-beneath)): a group is the rows
+whose value is its key, so once a reader holds every input key complete, a value no row carried
+has no group.
 
 #### A release of a converse group
 
