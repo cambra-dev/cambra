@@ -348,7 +348,7 @@ impl TileProducer for IterateExtentProducer {
         sources
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
             let obsolete = self.obsolete_guard().clone();
