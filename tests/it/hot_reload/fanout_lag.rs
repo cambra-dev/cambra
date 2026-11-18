@@ -23,12 +23,10 @@
 //! `a_slot_that_dies_during_the_handover_holds_reclamation_back_until_it_settles` check that
 //! order.
 
-use std::{cell::RefCell, rc::Rc};
-
 use indoc::{formatdoc, indoc};
 
 use cambra::{
-    ccl::{Type, context::GlobalContext},
+    ccl::{SourceDefinition, Type, context::GlobalContext},
     interpreter::{
         BaseType, ColumnValue, Extent, Predicate, TestDataSource, TestSink, Tile, Value,
     },
@@ -141,7 +139,7 @@ const DELIVERED: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
 struct LiveFeed {
     ctx: GlobalContext,
     live: LiveProgram,
-    source: Rc<RefCell<TestDataSource>>,
+    source: SourceDefinition<TestDataSource>,
     reads_n: bool,
 }
 
@@ -151,11 +149,11 @@ impl LiveFeed {
         use cambra::ccl::Type;
         use cambra::interpreter::{BaseType, Extent, TestDataSource};
         let mut ctx = GlobalContext::default();
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = TestDataSource::new(
             "source1",
             Type::Base(BaseType::String),
             Extent::Base(BaseType::String),
-        )));
+        );
         ctx.register_source(source.clone());
         let live = LiveProgram::start_text(&mut ctx, &feed("source1()", reads_n, ""), &no_main)
             .expect("v1 compiles");
@@ -170,7 +168,10 @@ impl LiveFeed {
     /// Deliver the item at position `at` and yield every position through it.
     fn deliver(&mut self, at: usize) {
         use cambra::interpreter::{Predicate, Value};
-        let mut source = self.source.borrow_mut();
+        let mut source = self
+            .source
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         source.add_data(&[(
             Value::uint_from_row(at),
             Value::String(DELIVERED[at].into()),
@@ -181,7 +182,8 @@ impl LiveFeed {
     /// Yield every position, so the source completes.
     fn complete(&mut self) {
         self.source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_yield_predicate(Predicate::True);
     }
 
@@ -339,7 +341,7 @@ fn most_names_held_by(live: &LiveProgram, branch: &str) -> usize {
     live.held_operators(branch)
         .expect("the branch exists")
         .iter()
-        .filter_map(std::rc::Weak::upgrade)
+        .filter_map(std::sync::Weak::upgrade)
         .map(|fan| fan.most_names_of_a_slot())
         .max()
         .unwrap_or(0)
@@ -430,19 +432,15 @@ fn two_readers_of_a_feed(k: i64, a_waits: bool, b_waits: bool) -> String {
 }
 
 /// A test source of integers named `name`, registered with `ctx`.
-fn int_source(ctx: &mut GlobalContext, name: &str) -> Rc<RefCell<TestDataSource>> {
-    let source = Rc::new(RefCell::new(TestDataSource::new(
-        name,
-        Type::Base(BaseType::Int),
-        Extent::Base(BaseType::Int),
-    )));
+fn int_source(ctx: &mut GlobalContext, name: &str) -> SourceDefinition<TestDataSource> {
+    let source = TestDataSource::new(name, Type::Base(BaseType::Int), Extent::Base(BaseType::Int));
     ctx.register_source(source.clone());
     source
 }
 
 /// Add rows `from..=to` of `nums`, row `i` holding `i + 1`, and declare every row up to `to`
 /// complete.
-fn add_nums(nums: &Rc<RefCell<TestDataSource>>, from: u64, to: u64) {
+fn add_nums(nums: &SourceDefinition<TestDataSource>, from: u64, to: u64) {
     let rows: Vec<(Value, Value)> = (from..=to)
         .map(|i| {
             (
@@ -451,7 +449,9 @@ fn add_nums(nums: &Rc<RefCell<TestDataSource>>, from: u64, to: u64) {
             )
         })
         .collect();
-    let mut nums = nums.borrow_mut();
+    let mut nums = nums
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     nums.add_data(&rows);
     nums.set_yield_predicate(Predicate::at_or_below(Value::UInt(to)));
 }
@@ -517,7 +517,9 @@ fn rebuilt_readers_state_the_prefix_their_predecessors_released_complete() {
         run_to_drained(&mut live);
     }
     add_nums(&nums, 6, 7);
-    nums.borrow_mut().set_yield_predicate(Predicate::True);
+    nums.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     run_to_drained(&mut live);
     assert!(live.poll_finished(), "both sinks complete");
     let each_position_once = [
@@ -581,9 +583,13 @@ fn a_replacement_held_behind_its_sibling_starts_at_its_predecessors_release() {
     )
     .expect("only the writes changed");
     add_nums(&nums, 6, 7);
-    nums.borrow_mut().set_yield_predicate(Predicate::True);
+    nums.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     {
-        let mut hold_b = hold_b.borrow_mut();
+        let mut hold_b = hold_b
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         hold_b.add_data(&[(Value::UInt(0), Value::Int(0))]);
         hold_b.set_yield_predicate(Predicate::True);
     }

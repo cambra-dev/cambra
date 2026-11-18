@@ -2,10 +2,9 @@
 //! the program's producer chains, plans each edge between two of them, and drives the run on
 //! the calling thread. See `src/interpreter/design-dispatcher.md`, "Running a compiled program".
 
-use std::cell::RefCell;
 use std::ops::ControlFlow;
-use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::{PoisonError, RwLock};
 
 use smol_str::SmolStr;
 
@@ -120,10 +119,9 @@ pub fn run_program_into(
     let mut targets: Vec<RunTarget> = Vec::new();
     for (at, output) in program.outputs.iter_mut().enumerate() {
         if let Some(consumer) = &output.sink_consumer {
-            let consumer_ref = consumer.borrow();
             targets.push((
-                consumer_ref.producer_slot().clone(),
-                consumer_ref.sink(),
+                consumer.producer_slot().clone(),
+                consumer.sink(),
                 TargetEntry::Sink(consumer.clone()),
             ));
         } else if let Some(producer) = output.producer.take() {
@@ -132,7 +130,7 @@ pub fn run_program_into(
                 .main_entry
                 .clone()
                 .expect("a `main` output keeps the placement of the entry before its consumer");
-            let slot: ProducerSlot = Rc::new(RefCell::new(Some(producer)));
+            let slot: ProducerSlot = Arc::new(RwLock::new(Some(producer)));
             taken = Some((at, slot.clone()));
             targets.push((slot, main.clone(), TargetEntry::Main(placement)));
         }
@@ -147,7 +145,7 @@ pub fn run_program_into(
     });
     drop(returned);
     if let Some((at, slot)) = &taken {
-        let producer = slot.borrow_mut().take();
+        let producer = slot.write().unwrap_or_else(PoisonError::into_inner).take();
         debug_assert!(
             result.is_err()
                 || producer
@@ -179,7 +177,7 @@ impl Drop for MainGivenBackOnUnwind<'_> {
         if let Some((at, slot)) = &self.taken {
             // The run's frames have dropped before this one, so nothing borrows the slot; a borrow
             // that still did would make a second panic here, which aborts.
-            if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Ok(mut slot) = slot.try_write() {
                 self.outputs[*at].producer = slot.take();
             }
         }
@@ -191,7 +189,7 @@ impl Drop for MainGivenBackOnUnwind<'_> {
 fn complete_sinks(targets: &[RunTarget]) {
     for (_, _, entry) in targets {
         if let TargetEntry::Sink(consumer) = entry {
-            consumer.borrow_mut().complete();
+            consumer.complete();
         }
     }
 }
@@ -238,10 +236,9 @@ impl Targets {
     pub fn add_sinks(&mut self, program: &CompiledProgram) {
         for output in &program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                let consumer_ref = consumer.borrow();
                 self.0.push((
-                    consumer_ref.producer_slot().clone(),
-                    consumer_ref.sink(),
+                    consumer.producer_slot().clone(),
+                    consumer.sink(),
                     TargetEntry::Sink(consumer.clone()),
                 ));
             }
@@ -350,13 +347,13 @@ fn run_targets(
             }
         };
         let under = {
-            let mut root = root.borrow_mut();
+            let mut root = root.write().unwrap_or_else(PoisonError::into_inner);
             let producer = root.as_mut().expect("a root holds the producer it pulls");
             planner.pipelines_under(&mut **producer, "sink")
         };
         let pipeline = planner.add(Located::Sink(at), format!("SinkBreaker#{at}"), None, under);
         sink_pipelines.push(pipeline);
-        sink_breakers.push(RefCell::new(breaker));
+        sink_breakers.push(RwLock::new(breaker));
     }
     planner.check_direct();
     if let Some(refused) = planner.refused.take() {
@@ -369,9 +366,13 @@ fn run_targets(
     {
         let local = PipelineId(planner.local[*pipeline]);
         match entry {
-            TargetEntry::Sink(consumer) => consumer
-                .borrow_mut()
-                .place(local, breaker.borrow().input_tiling(InputId::ONLY)),
+            TargetEntry::Sink(consumer) => consumer.place(
+                local,
+                breaker
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .input_tiling(InputId::ONLY),
+            ),
             TargetEntry::Main(placement) => placement.set(Some(local)),
         }
     }
@@ -417,9 +418,14 @@ fn run_targets(
         }
     }
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| match &members.located[pipeline.0] {
-        Located::Sink(sink) => call(&mut *sink_breakers[*sink].borrow_mut(), InputId::ONLY),
+        Located::Sink(sink) => call(
+            &mut *sink_breakers[*sink]
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+            InputId::ONLY,
+        ),
         Located::Store { store, input, .. } => {
-            let mut store = store.borrow_mut();
+            let mut store = store.write();
             call(
                 store
                     .as_breaking_mut()
@@ -428,7 +434,10 @@ fn run_targets(
             )
         }
         Located::Scope { .. } => call(&mut *induction(scope_at(pipeline)), InputId::ONLY),
-        Located::Chain(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
+        Located::Chain(handle) => call(
+            &mut *handle.write().unwrap_or_else(PoisonError::into_inner),
+            InputId::ONLY,
+        ),
     };
     // Induction request and step roles target the same store producer.
     let mut end_of = |pipeline: PipelineId| match &members.located[pipeline.0] {
@@ -555,7 +564,10 @@ fn run_targets(
             let local = planner.local[*pipeline];
             dispatcher.order(PipelineId(local));
             if reads_a_scope(&members.located, &members.reads, local) {
-                breaker.borrow_mut().reads_a_loop();
+                breaker
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .reads_a_loop();
             }
         }
     }
@@ -723,7 +735,10 @@ fn run_targets(
     if !live.is_empty() {
         for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
             if let TargetEntry::Main(_) = entry {
-                breaker.borrow_mut().hand_each_package();
+                breaker
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .hand_each_package();
             }
         }
     }
@@ -884,7 +899,7 @@ enum Handler {
     Root,
     Body(BreakerHandle),
     /// A scope's own pipeline, whose claims are the scope's requests.
-    Request(Rc<Scope>),
+    Request(Arc<Scope>),
     /// A scope's step, whose claim ends a round or an attempt: the step of the scope whose own
     /// pipeline is the one named.
     Step(PipelineId),
@@ -962,7 +977,7 @@ impl Execution {
                 body.hold_followers(dispatcher);
             }
         });
-        self.handlers[pipeline.0] = Handler::Request(Rc::new(scope));
+        self.handlers[pipeline.0] = Handler::Request(Arc::new(scope));
         self.handlers.push(Handler::Step(pipeline));
         step
     }
@@ -977,7 +992,7 @@ impl Execution {
         let scope = Scope::Writer {
             store: store.clone(),
             writer,
-            phase: RefCell::default(),
+            phase: Mutex::default(),
         };
         let step = self.attach_body(scope, request, dispatcher);
         // An attempt's step is closed once the finish's attempt has run (`WriterRun::drain`).
@@ -993,7 +1008,7 @@ impl Execution {
         let step = self.attach_body(
             Scope::Loop {
                 store: store.clone(),
-                schedule: RefCell::default(),
+                schedule: Mutex::default(),
             },
             pipeline,
             dispatcher,
@@ -1017,14 +1032,17 @@ impl Execution {
     pub(super) fn reach(&self, pipeline: PipelineId, root: &mut Reach<'_>, call: &mut Call<'_>) {
         match &self.handlers[pipeline.0] {
             Handler::Root => root(pipeline, call),
-            Handler::Body(handle) => call(&mut *handle.borrow_mut(), InputId::ONLY),
+            Handler::Body(handle) => call(
+                &mut *handle.write().unwrap_or_else(PoisonError::into_inner),
+                InputId::ONLY,
+            ),
             Handler::Request(scope) => scope.reach(call),
             Handler::Step(owner) => self.request_scope(*owner).reach(call),
         }
     }
 
     /// Every scope, each at its request handler.
-    fn scopes(&self) -> impl Iterator<Item = &Rc<Scope>> {
+    fn scopes(&self) -> impl Iterator<Item = &Arc<Scope>> {
         self.handlers.iter().filter_map(|handler| match handler {
             Handler::Request(scope) => Some(scope),
             _ => None,
@@ -1237,7 +1255,7 @@ fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     }
     for (_, _, entry) in targets {
         match entry {
-            TargetEntry::Sink(consumer) => consumer.borrow_mut().unplace(),
+            TargetEntry::Sink(consumer) => consumer.unplace(),
             TargetEntry::Main(placement) => placement.set(None),
         }
     }
@@ -1350,6 +1368,7 @@ pub(super) fn plan_edges(
             input = Some(breaker.input_tiling(at))
         });
         let input = input.expect("a reach calls the breaker it reaches");
+        dispatcher.consumes_input(PipelineId(reader), input.clone());
         // An arrival is a region of the entry it reaches, which may stand for another of the
         // breaker's inputs, as a loop's seed does; it names these rows (`rows_named_in`).
         let changed = |arrival: Arrival| Some(rows_named_in(&input, &arrival.guard));
@@ -1488,11 +1507,9 @@ fn queue_starts(dispatcher: &Dispatcher, starts: &Starts) {
     }
 }
 
-/// A sink output's consumer, which the planner places in the sink's pipeline.
-// shared-state-ok: the compiled output's own handle on its sink consumer
-// (`CompiledOutput::sink_consumer`), which the planner places and reads the sink's producer
-// through; no tile crosses it.
-type SinkTarget = Rc<RefCell<crate::interpreter::sinks::SinkConsumer>>;
+/// A sink output's consumer, which the planner places in the sink's pipeline. The consumer keeps
+/// its placement behind its own lock, so placing it takes no lock a notification waits on.
+type SinkTarget = Arc<crate::interpreter::sinks::SinkConsumer>;
 
 /// A root of the run: the slot of the producer its sink breaker pulls, the `DataSink` the breaker
 /// hands each answer to, and what the planner places in the root's pipeline.
@@ -1677,7 +1694,7 @@ pub(super) fn routes_to(
 ) -> Vec<Route> {
     let mut landing = Landing::route();
     for region in regions {
-        consumer.borrow_mut().notify(region, &mut landing);
+        crate::interpreter::notifications::notify_shared(consumer, region, &mut landing);
     }
     landing
         .routes()
@@ -1694,7 +1711,7 @@ pub(super) fn probe(
     reader: usize,
 ) -> Vec<Arrival> {
     let mut landing = Landing::probe(from);
-    consumer.borrow_mut().notify(region, &mut landing);
+    crate::interpreter::notifications::notify_shared(consumer, region, &mut landing);
     landing
         .arrivals()
         .into_iter()
@@ -1917,7 +1934,7 @@ fn yields_a_prefix(path: &[SmolStr], yielded: &Predicate) -> bool {
 }
 
 /// A live source, as a range over its domain reads it.
-pub(super) type LiveSource = Rc<RefCell<dyn DataSourceDomainExtentImpl>>;
+pub(super) type LiveSource = Arc<RwLock<dyn DataSourceDomainExtentImpl>>;
 
 impl Beneath {
     /// Add `pipelines` to the pipelines beneath, each once: a reader that reaches a pipeline
@@ -1964,11 +1981,11 @@ impl Planner {
             .base()
             .breaker_handle
             .as_ref()
-            .and_then(std::rc::Weak::upgrade);
+            .and_then(std::sync::Weak::upgrade);
         if let Some(pipeline) = self
             .located
             .iter()
-            .position(|at| matches!((at, &handle), (Located::Chain(seen), Some(handle)) if Rc::ptr_eq(seen, handle)))
+            .position(|at| matches!((at, &handle), (Located::Chain(seen), Some(handle)) if Arc::ptr_eq(seen, handle)))
         {
             return Beneath {
                 pipelines: vec![(pipeline, true)],
@@ -1994,10 +2011,13 @@ impl Planner {
         }
         let sources = producer.data_sources();
         let extent = producer.tiling().domain_extent();
-        if sources
-            .iter()
-            .any(|source| source.borrow().element_extent() != Extent::Base(BaseType::UInt))
-        {
+        if sources.iter().any(|source| {
+            source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .element_extent()
+                != Extent::Base(BaseType::UInt)
+        }) {
             self.refuse(format!(
                 "{} ranges over a live source without UInt positions",
                 producer.name()
@@ -2076,23 +2096,23 @@ impl Planner {
         if !planned.is_empty() {
             return planned;
         }
-        let within = self.scope_of(&**read.store.borrow());
-        let is_induction = read.store.borrow_mut().as_induction_store_mut().is_some();
+        let within = self.scope_of(&**read.store.read());
+        let is_induction = read.store.write().as_induction_store_mut().is_some();
         if is_induction {
             return vec![self.scope_pipeline(read, within)];
         }
         // A nested transaction store runs in the scope of the loop around it, a row of its store
         // per round of that loop.
-        if within.is_none() && !matches!(read.store.borrow().tiling(), Tiling::Store { .. }) {
+        if within.is_none() && !matches!(read.store.read().tiling(), Tiling::Store { .. }) {
             self.refuse(format!(
                 "a nested transaction store, one per enclosing row, runs in no pipeline outside \
                  its loop's scope: its frontier is per row: {}",
-                read.store.borrow().tiling()
+                read.store.read().tiling()
             ));
             return Vec::new();
         }
         let cell = read.store.clone();
-        let mut store = cell.borrow_mut();
+        let mut store = cell.write();
         let name = store.name();
         assert!(
             within.is_none(),
@@ -2237,7 +2257,7 @@ impl Planner {
         self.walking.push(scope);
         let mut below = Beneath::default();
         let name = {
-            let mut store = read.store.borrow_mut();
+            let mut store = read.store.write();
             visit_inputs_checked(&mut *store, &mut |role, input| {
                 below.read_once(self.pipelines_under(input, role).pipelines);
             });
@@ -2259,23 +2279,14 @@ impl Planner {
         self.scopes[scope].pipeline = Some(pipeline);
         // The store's seeds reach the scope's pipeline through their entries, which record what
         // each seed has completed; the scope takes no push of them.
-        let (seeds, rows) = read
+        let seeds = read
             .store
-            .borrow_mut()
+            .write()
             .as_breaking_mut()
-            .map(|store| {
-                (
-                    store.seed_placements(),
-                    Some(store.input_tiling(InputId::ONLY)),
-                )
-            })
+            .map(|store| store.seed_placements())
             .unwrap_or_default();
-        // A seed's push names the scope's input whole, rows of the input the scope consumes.
         for placement in &seeds {
             placement.set(Some(PipelineId(self.local[pipeline])));
-            if let Some(rows) = &rows {
-                placement.set_rows(rows.clone());
-            }
         }
         self.placements[pipeline].extend(seeds);
         pipeline
@@ -2629,7 +2640,7 @@ impl Planner {
         assert!(
             reads.iter().any(Vec::is_empty),
             "{} has a pipeline inside its cycle that reads none, the drive's",
-            store.borrow().name()
+            store.read().name()
         );
         let mut members: Vec<Option<Member>> = members.into_iter().map(Some).collect();
         let members: Vec<Member> = kept
@@ -2659,7 +2670,7 @@ impl Planner {
         );
         assert!(
             members.iter().all(|member| match member {
-                Member::Scope(child) => !Rc::ptr_eq(&store, child),
+                Member::Scope(child) => !Arc::ptr_eq(&store, child),
                 Member::Chain(_) => true,
             }),
             "run metadata does not retain its own store cell"
@@ -2922,7 +2933,7 @@ fn store_items(input: &Tiling, leaves: &[LiveLeaf]) -> Option<StoreItems> {
 /// Add each source `extent` reads to `sources`, once.
 fn note_sources(extent: &Extent, sources: &mut Vec<LiveSource>) {
     extent.for_each_source(&mut |source| {
-        if !sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+        if !sources.iter().any(|seen| Arc::ptr_eq(seen, source)) {
             sources.push(source.clone());
         }
     });
@@ -3186,13 +3197,16 @@ fn drive_live(
         let mut sources: Vec<LiveSource> = Vec::new();
         for (_, leaf, _) in live.iter().flat_map(|at| &at.leaves) {
             leaf.extent.for_each_source(&mut |source| {
-                if !sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+                if !sources.iter().any(|seen| Arc::ptr_eq(seen, source)) {
                     sources.push(source.clone());
                 }
             });
         }
         for source in &sources {
-            source.borrow_mut().check_for_new_data();
+            source
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .check_for_new_data();
         }
         observer.polled();
         let mut changed = false;
@@ -3238,11 +3252,12 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn a_record_range_yields_a_prefix_of_its_ordering_field() {
-        let source: LiveSource = Rc::new(RefCell::new(crate::interpreter::TestDataSource::new(
+        let source: LiveSource = crate::interpreter::TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        )));
+        )
+        .runtime();
         let extent = Extent::Record(
             [
                 (SmolStr::new("a"), Extent::DataSourceDomain(source)),
@@ -3367,11 +3382,12 @@ mod tests {
     /// A record with a source in a field after its first is ordered by no field.
     #[test]
     fn a_record_with_a_later_source_field_has_no_ordering_path() {
-        let source: LiveSource = Rc::new(RefCell::new(crate::interpreter::TestDataSource::new(
+        let source: LiveSource = crate::interpreter::TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        )));
+        )
+        .runtime();
         let extent = Extent::Record(
             [
                 (SmolStr::new("a"), Extent::Base(BaseType::Int)),
@@ -3385,7 +3401,7 @@ mod tests {
 
     fn ordering_path_of(extent: &Extent) -> Option<Vec<SmolStr>> {
         LiveLeaf {
-            consumer: Rc::new(RefCell::new(|| {})),
+            consumer: Arc::new(|| {}),
             extent: extent.clone(),
         }
         .ordering_path()
@@ -3405,11 +3421,11 @@ mod tests {
         }
 
         let mut ctx = GlobalContext::default();
-        ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+        ctx.register_source(TestDataSource::new(
             "nums",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        ))));
+        ));
         let mut program = compile_program(
             &mut ctx,
             &LoadedProgram::test("[x * 2 for x in nums()]"),

@@ -9,10 +9,8 @@
 //! ([`GlobalContext::take_operator_map`]) holds the fan-outs the consumers subscribed to, so a
 //! fan-out that held its consumers strongly would keep them alive past the program.
 
-use std::cell::RefCell;
 use std::ops::ControlFlow;
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use cambra::ccl::context::{CompileResultExt, CompiledProgram, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
@@ -27,10 +25,10 @@ use rstest::rstest;
 const CAP: usize = 10_000;
 
 /// A weak reference to each of `program`'s sink consumers.
-fn sink_consumers(program: &CompiledProgram) -> Vec<Weak<RefCell<SinkConsumer>>> {
+fn sink_consumers(program: &CompiledProgram) -> Vec<Weak<SinkConsumer>> {
     let consumers: Vec<_> = program
         .sinks()
-        .filter_map(|output| output.sink_consumer.as_ref().map(Rc::downgrade))
+        .filter_map(|output| output.sink_consumer.as_ref().map(Arc::downgrade))
         .collect();
     assert!(!consumers.is_empty(), "the program has a sink consumer");
     assert!(
@@ -61,7 +59,7 @@ impl DataSink for IgnoreMain {
     fn process(&self, _: &Tile) {}
 }
 
-fn assert_released(consumers: &[Weak<RefCell<SinkConsumer>>]) {
+fn assert_released(consumers: &[Weak<SinkConsumer>]) {
     assert!(
         consumers.iter().all(|c| c.upgrade().is_none()),
         "a sink consumer outlived its program, so something besides its output holds it strongly"
