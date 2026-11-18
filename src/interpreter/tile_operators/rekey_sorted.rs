@@ -276,13 +276,7 @@ mod tests {
     }
 
     /// A producer over `input`, pulled once, with the guards it forwards upstream.
-    fn pulled(
-        input: Tile,
-    ) -> (
-        RekeySortedProducer,
-        Tile,
-        Rc<std::cell::RefCell<Vec<TileGuard>>>,
-    ) {
+    fn pulled(input: Tile) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
         let (spy, released) = ReleaseSpy::new(input, pair_tiling());
         let (tiling, key) = rekeyed_tiling(&pair_tiling());
         let mut producer = RekeySortedProducer {
