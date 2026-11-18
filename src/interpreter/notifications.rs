@@ -1,16 +1,84 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::sync::PoisonError;
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing};
 
+// Construction and notification delivery share one gate; recursive calls on its owner reuse it.
+#[derive(Default)]
+struct ControlThread {
+    lock: Option<std::sync::MutexGuard<'static, ()>>,
+    depth: usize,
+    active: std::collections::HashSet<usize>,
+}
+thread_local! {
+    static CONTROL_THREAD: std::cell::RefCell<ControlThread> = Default::default();
+}
+
+pub(crate) struct ControlGuard(std::marker::PhantomData<std::sync::MutexGuard<'static, ()>>);
+
+pub(crate) fn control_plane() -> ControlGuard {
+    static CONTROL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CONTROL_THREAD.with(|thread| {
+        let mut thread = thread.borrow_mut();
+        if thread.depth == 0 {
+            thread.lock = Some(CONTROL.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+        thread.depth += 1;
+    });
+    ControlGuard(std::marker::PhantomData)
+}
+
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        CONTROL_THREAD.with(|thread| {
+            let mut thread = thread.borrow_mut();
+            thread.depth -= 1;
+            if thread.depth == 0 {
+                drop(thread.lock.take());
+            }
+        });
+    }
+}
+
+fn with_consumer<C: Consumer + ?Sized>(shared: &Arc<RwLock<C>>, f: impl FnOnce(&mut C)) -> bool {
+    let _control = control_plane();
+    let identity = Arc::as_ptr(shared) as *const () as usize;
+    if !CONTROL_THREAD.with(|thread| thread.borrow_mut().active.insert(identity)) {
+        return false;
+    }
+    struct Active(usize);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            CONTROL_THREAD.with(|thread| {
+                thread.borrow_mut().active.remove(&self.0);
+            });
+        }
+    }
+    let _active = Active(identity);
+    f(&mut *shared.write().unwrap_or_else(PoisonError::into_inner));
+    true
+}
+
+pub(crate) fn notify_shared<C: Consumer + ?Sized>(
+    shared: &Arc<RwLock<C>>,
+    region: &Projection,
+    landing: &mut Landing<'_>,
+) {
+    if !with_consumer(shared, |consumer| consumer.notify(region, landing)) {
+        landing.reentered();
+    }
+}
+
 /// A consumer handle shared by notification forwarders.
 /// It carries notifications, not tile data.
-pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
+pub type SharedConsumer = Arc<RwLock<dyn Consumer>>;
 
 /// Share a consumer between its input paths. Pipeline entries end notification propagation.
 pub fn shared_consumer(consumer: Box<dyn Consumer>) -> SharedConsumer {
-    Rc::new(RefCell::new(consumer))
+    Arc::new(RwLock::new(consumer))
 }
 
 /// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
@@ -136,7 +204,7 @@ impl Consumer for WideningRestatingComplete {
 /// key and also their input's value, so the complete region it passes names only part of what
 /// those rows depend on ([`Landing::completing_part`]).
 pub fn restating_lookup(
-    restate: Box<dyn Fn(&Projection) -> Projection>,
+    restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     Box::new(RestatingLookup(Restating(restate, consumer)))
@@ -154,13 +222,16 @@ impl Consumer for RestatingLookup {
 /// complete region: an operator that keeps its input's keys under another spelling, as `Uncurry`
 /// beneath a standing level names an outer and an inner key as one pair, restates both exactly.
 pub fn restating(
-    restate: Box<dyn Fn(&Projection) -> Projection>,
+    restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     Box::new(Restating(restate, consumer))
 }
 
-struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
+struct Restating(
+    Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
+    Box<dyn Consumer>,
+);
 
 impl Consumer for Restating {
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
@@ -194,10 +265,7 @@ impl Consumer for Forwarding {
     /// A push is passed on at once. A push climbs from one breaker to the next, so
     /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
     fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        match self.shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(region, landing),
-            Err(_) => landing.reentered(),
-        }
+        notify_shared(&self.shared, region, landing);
     }
 }
 
@@ -264,22 +332,26 @@ impl Consumer for OneLevelIn {
 /// Source handles registered by subscriptions, for source-window inspection and route retirement.
 #[derive(Default)]
 pub struct SourceRegistry {
-    source_handles: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    source_handles: HashMap<String, Arc<RwLock<dyn DataSourceDomainExtentImpl>>>,
 }
 
 impl SourceRegistry {
     pub fn sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> + '_ {
+    ) -> impl Iterator<Item = (&str, &Arc<RwLock<dyn DataSourceDomainExtentImpl>>)> + '_ {
         self.source_handles
             .iter()
             .map(|(name, source)| (name.as_str(), source))
     }
-    pub fn add_source_handle(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
-        let id = source.borrow().get_id().to_string();
+    pub fn add_source_handle(&mut self, source: Arc<RwLock<dyn DataSourceDomainExtentImpl>>) {
+        let id = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_id()
+            .to_string();
         if let Some(existing) = self.source_handles.get(&id) {
             assert!(
-                Rc::ptr_eq(existing, &source),
+                Arc::ptr_eq(existing, &source),
                 "two sources are registered as `{id}`"
             );
         } else {
@@ -361,13 +433,16 @@ mod tests {
     fn replaced_values_pass_changes_but_only_whole_value_completion() {
         use crate::interpreter::dispatcher::PipelineId;
         use crate::interpreter::{BaseType, Extent, Predicate, Tiling, Value};
-        struct Received(Rc<RefCell<Vec<Projection>>>);
+        struct Received(Arc<RwLock<Vec<Projection>>>);
         impl Consumer for Received {
             fn notify(&mut self, region: &Projection, _: &mut Landing<'_>) {
-                self.0.borrow_mut().push(region.clone());
+                self.0
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(region.clone());
             }
         }
-        let received = Rc::new(RefCell::new(Vec::new()));
+        let received = Arc::new(RwLock::new(Vec::new()));
         let tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
@@ -391,7 +466,7 @@ mod tests {
         consumer.notify(&whole, &mut Landing::probe_complete(PipelineId(0)));
         let outer = Projection::admitting(row);
         assert_eq!(
-            *received.borrow(),
+            *received.read().unwrap_or_else(PoisonError::into_inner),
             vec![outer.clone(), Projection::Nothing, outer]
         );
     }
@@ -406,6 +481,9 @@ mod tests {
             &keys,
         );
         crate::interpreter::dispatcher::notify_for_test(&mut *forwarding_consumer(&shared), &keys);
-        assert_eq!(*received.borrow(), [keys, Projection::Everything]);
+        assert_eq!(
+            *received.read().unwrap_or_else(PoisonError::into_inner),
+            [keys, Projection::Everything]
+        );
     }
 }
