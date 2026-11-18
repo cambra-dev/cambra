@@ -1302,3 +1302,54 @@ fn a_constant_list_element_is_not_refused_as_varying(#[case] body: &str) {
         "{rendered}"
     );
 }
+
+/// A filter holds at every use of a definition generic in the collection it filters: each
+/// instantiation keeps its own rows, a nested filter keeps both predicates, and a `let`-bound
+/// filtered collection filtered again keeps the outer filter
+/// (`src/ccl/design/type-inference.md`, "A variable base takes a guarded bound").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::two_instantiations(
+    indoc! {"
+        def keep_big(xs):
+            [x for x in xs if x > 1]
+        sum(keep_big([1, 2, 3])) + sum(keep_big([5, 6]))
+    "},
+    16
+)]
+#[case::a_nested_filter_in_a_definition(
+    indoc! {"
+        def nested(xs):
+            ys = [x for x in xs if x > 1]
+            [y for y in ys if y < 5]
+        sum(nested([1, 2, 3, 6])) + sum(nested([4, 5]))
+    "},
+    9
+)]
+#[case::a_let_bound_nested_filter(
+    indoc! {"
+        xs = [1, 2, 3, 6]
+        ys = [x for x in xs if x > 1]
+        zs = [y for y in ys if y < 5]
+        sum(zs)
+    "},
+    5
+)]
+fn a_filter_holds_at_each_use_of_a_generic_definition(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A definition generic in two collections it joins refuses a call passing them differently
+/// filtered: the instantiation's domains are compared where they meet.
+#[test]
+fn a_generic_join_refuses_differently_filtered_arguments_at_the_call() {
+    check_compile_error(
+        indoc! {"
+            def pick(c: Bool, a, b) => Int:
+                sum(a if c else b)
+            xs = [1, 2, 3]
+            pick(1 > 0, [x for x in xs if x > 1], [x for x in xs if x > 2])
+        "},
+        "Collection domains have no common answer",
+    );
+}

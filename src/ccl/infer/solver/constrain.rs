@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::normal_refinement;
-use crate::ccl::infer_var::Origin;
+use crate::ccl::infer_var::{GuardedBound, Origin};
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
@@ -1865,8 +1865,10 @@ fn constrain_go_impl(
             //
             // The invariance is two inequalities, drawn whatever the domains are: a variable
             // on either side receives both bounds, so two collections over different domains
-            // reaching one variable meet as an equation and the edge that closes them reports
-            // it.
+            // reaching one variable meet as an equation. The edge that closes them reports it
+            // where both bases are concrete; over a variable base the comparison waits until
+            // the bases resolve (`src/ccl/design/type-inference.md`, "Refinements on the
+            // lattice").
             //
             // The kind edge above reports which rule its two sides call for, so
             // this asks one question rather than inspecting both spellings — a var
@@ -2497,6 +2499,14 @@ fn constrain_go_impl(
                     )
                 })?;
             }
+            let guarded = rv.bounds.borrow().guarded_upper.clone();
+            if !guarded.is_empty() {
+                let low =
+                    Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
+                for entry in &guarded {
+                    close_guarded(rv, &low, entry, cache, scope)?;
+                }
+            }
             Ok(())
         }
 
@@ -2681,87 +2691,251 @@ fn constrain_go_impl(
         // refinement on a concrete value is an explicit `Restrict`, not
         // subsumption.
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
-            let (lbase, lrefs) = (lhs.peel_refinements(), lhs.refinements());
-            let (rbase, rrefs) = (rhs.peel_refinements(), rhs.refinements());
+            let lbase = lhs.peel_refinements();
             if cache.refinement_blind() {
-                return constrain_go(lbase, rbase, sl, sr, cache, scope);
+                return constrain_go(lbase, rhs.peel_refinements(), sl, sr, cache, scope);
             }
-            // The refinements rhs requires that no transported lhs layer
-            // matches (by `Refinement`'s structural `PartialEq`). Each side's
-            // refinements are forced through its own morphism into the ambient frame
-            // before comparing (`sl(S₁)` vs `sr(S₂)`); the deficit keeps the
-            // *untransported* rhs refinements, since the recursive constraint below
-            // carries `sr` for them.
-            //
-            // Each transported predicate is taken in its normal form ([`normal_refinement`]),
-            // which is what refinement equality compares, and what the SMT encoder below can
-            // read: it has no `let` or eliminated combinator.
-            let lrefs_in_ambient: Vec<Refinement> = lrefs
+            // Each side's refinements are forced through its own morphism into the ambient
+            // frame before comparing (`sl(S₁)` vs `sr(S₂)`), each in its normal form
+            // ([`normal_refinement`]), which is what refinement equality compares and what
+            // the SMT encoder can read: it has no `let` or eliminated combinator.
+            let lrefs_in_ambient: Vec<Refinement> = lhs
+                .refinements()
                 .iter()
                 .map(|l| normal_refinement(&sl.force_refinement(l)))
                 .collect();
-            // Transported, unlike `deficit`'s members: `smt_sub` below reads both
-            // sides' predicates as terms of one formula, so a name has to mean the
-            // same thing on both. It is also what makes the entailment decidable at
-            // all here — an untransported lhs predicate mentions the `let` binder a
-            // discharge edge on `sl` replaces with the bound term.
-            let rrefs_in_ambient: Vec<Refinement> = rrefs
-                .iter()
-                .map(|r| normal_refinement(&sr.force_refinement(r)))
-                .collect();
-            let deficit: RefinementSet = rrefs
-                .iter()
-                .zip(&rrefs_in_ambient)
-                .filter(|(_, forced)| !lrefs_in_ambient.contains(forced))
-                .map(|(r, _)| r.clone())
-                .collect();
-            // `0..𝑛` is the `UInt`s below `𝑛`, so a refined `UInt` or wider range is below it
-            // exactly when its refinements entail the bound. That bound is a demand the bases
-            // carry rather than a refinement layer, so no deficit records it and only the
-            // solver decides it. An unrefined pair never reaches this arm: no predicate bounds
-            // it, so the base arm's mismatch is already the answer.
-            let range_demand = match (lbase, rbase) {
-                (Type::Base(BaseType::UInt), Type::UIntRange(_)) => true,
-                (Type::UIntRange(a), Type::UIntRange(b)) => a > b,
-                _ => false,
-            };
-            if deficit.is_empty() && !range_demand {
-                // lhs's explicit layers already supply every refinement rhs requires.
-                constrain_go(lbase, rbase, sl, sr, cache, scope)
-            } else if matches!(lbase, Type::Infer(_)) {
-                // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
-                // rather than rejecting; it fails later iff the variable
-                // resolves to a concrete base lacking those refinements.
-                let demanded = Type::refined(rbase.clone(), deficit);
-                constrain_go(lbase, &demanded, sl, sr, cache, scope)
-            } else if scope.is_skip_smt() {
-                Err(mismatch(lhs, rhs, sl, sr))
-            } else if range_demand {
-                // Both bases are leaves, so the entailment is the whole edge.
-                let proven = super::smt::smt_sub_at(
-                    lbase,
-                    rbase,
-                    &lrefs_in_ambient,
-                    &rrefs_in_ambient,
-                    scope,
-                )
-                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?;
-                if proven {
-                    Ok(())
-                } else {
-                    Err(mismatch(lhs, rhs, sl, sr))
-                }
-            } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
-                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?
-            {
-                constrain_go(lbase, rbase, sl, sr, cache, scope)
-            } else {
-                Err(mismatch(lhs, rhs, sl, sr))
-            }
+            constrain_refined(lhs, lbase, lrefs_in_ambient, &[], rhs, sl, sr, cache, scope)
         }
 
         _ => Err(mismatch(lhs, rhs, sl, sr)),
     }
+}
+
+/// The refinement arm of [`constrain_go_impl`] once the producer's refinements are in the
+/// ambient frame: `{lbase | lrefs_in_ambient, guard}‹sl› <: rhs‹sr›`, where `lrefs_in_ambient`
+/// are already transported (`sl(S₁)`, in normal form). `lhs` is the producer as a message names
+/// it. `guard` is a guarded bound's guard, already in the ambient frame, which a check of a lower
+/// bound under it adds ([`close_guarded`]); it is empty for the arm itself.
+///
+/// Taking the producer's predicates already transported is what lets a guarded bound's check
+/// add its guard, which reads in the holder's frame, to a lower bound that reads in its own,
+/// without applying the lower bound's morphism to the lower bound itself.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two sides of an edge, each with its morphism, the producer's transported predicates, and the walk's state"
+)]
+fn constrain_refined(
+    lhs: &Type,
+    lbase: &Type,
+    lrefs_in_ambient: Vec<Refinement>,
+    guard: &[Refinement],
+    rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
+    let (rbase, rrefs) = (rhs.peel_refinements(), rhs.refinements());
+    // Transported, unlike `deficit`'s members: `smt_sub` below reads both
+    // sides' predicates as terms of one formula, so a name has to mean the
+    // same thing on both. It is also what makes the entailment decidable at
+    // all here — an untransported lhs predicate mentions the `let` binder a
+    // discharge edge on `sl` replaces with the bound term.
+    let rrefs_in_ambient: Vec<Refinement> = rrefs
+        .iter()
+        .map(|r| normal_refinement(&sr.force_refinement(r)))
+        .collect();
+    // The refinements rhs requires that no transported lhs layer matches (by
+    // `Refinement`'s structural `PartialEq`). The deficit keeps the *untransported* rhs
+    // refinements, since the recursive constraint below carries `sr` for them.
+    let deficit: RefinementSet = rrefs
+        .iter()
+        .zip(&rrefs_in_ambient)
+        .filter(|(_, forced)| !lrefs_in_ambient.contains(forced) && !guard.contains(forced))
+        .map(|(r, _)| r.clone())
+        .collect();
+    // `0..𝑛` is the `UInt`s below `𝑛`, so a refined `UInt` or wider range is below it
+    // exactly when its refinements entail the bound. That bound is a demand the bases
+    // carry rather than a refinement layer, so no deficit records it and only the
+    // solver decides it. An unrefined pair never reaches this arm: no predicate bounds
+    // it, so the base arm's mismatch is already the answer.
+    let range_demand = match (lbase, rbase) {
+        (Type::Base(BaseType::UInt), Type::UIntRange(_)) => true,
+        (Type::UIntRange(a), Type::UIntRange(b)) => a > b,
+        _ => false,
+    };
+    // Two refined variable bases within two data domains are two collections' domains, each
+    // settled by its own collection, and the variable can hold filters in its own bounds: a
+    // comprehension over a filtered collection ranges over that collection's domain. Tying
+    // the bases would hand one side's filters to the other and make two domains that differ
+    // agree. The edge relates neither base; coalescing compares the two domains whole
+    // (`src/ccl/design/type-inference.md`, "A variable base takes a guarded bound").
+    if cache.in_data_domains
+        && matches!(lbase, Type::Infer(_))
+        && matches!(rbase, Type::Infer(_))
+        && !lrefs_in_ambient.is_empty()
+        && !rrefs.is_empty()
+    {
+        return Ok(());
+    }
+    if deficit.is_empty() && !range_demand {
+        // lhs's explicit layers already supply every refinement rhs requires.
+        constrain_go(lbase, rbase, sl, sr, cache, scope)
+    } else if let Type::Infer(lv) = lbase {
+        // Variable base: the edge constrains only the values of `lbase` that `lhs`'s
+        // own refinements keep, so it is recorded as written, a guarded upper bound
+        // `{lbase | S₁} <: rhs`, and each lower bound of `lbase` is checked under the
+        // guard. Copying the deficit onto `lbase` would narrow its other values by
+        // this edge's filter. Within two data domains the edge is an equation, which
+        // coalescing decides once the bases resolve (`data_domains_disagree`)
+        // (`src/ccl/design/type-inference.md`, "A variable base takes a guarded
+        // bound").
+        constrain_go(lbase, rbase, sl, sr, cache, scope)?;
+        if cache.in_data_domains {
+            return Ok(());
+        }
+        let guard: RefinementSet = lrefs_in_ambient
+            .into_iter()
+            .chain(guard.iter().cloned())
+            .collect();
+        record_guarded_upper(lv, &guard, rhs, sl, sr, cache, scope)
+    } else if scope.is_skip_smt() {
+        Err(mismatch(lhs, rhs, sl, sr))
+    } else if range_demand {
+        // Both bases are leaves, so the entailment is the whole edge.
+        let proven =
+            super::smt::smt_sub_at(lbase, rbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
+                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?;
+        if proven {
+            Ok(())
+        } else {
+            Err(mismatch(lhs, rhs, sl, sr))
+        }
+    } else if super::smt::smt_sub_guarded(lbase, &lrefs_in_ambient, guard, &rrefs_in_ambient, scope)
+        .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?
+    {
+        constrain_go(lbase, rbase, sl, sr, cache, scope)
+    } else {
+        Err(mismatch(lhs, rhs, sl, sr))
+    }
+}
+
+/// Record `{lv | guard}‹sl› <: rhs‹sr›` on `lv` ([`GuardedBound`]) and check each lower bound
+/// `lv` already has under it. A guarded bound already recorded is not recorded or checked
+/// again, which is what ends the walk on a cyclic bound graph: the check of a variable lower
+/// bound records the same guarded bound on it.
+fn record_guarded_upper(
+    lv: &Rc<InferVar>,
+    guard: &RefinementSet,
+    rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
+    // An upper bound sits at or below its holder's level, as the upper-bound arm keeps it.
+    let rhs = if type_level(rhs) > lv.level() {
+        if let Some(param) = escaping_param(rhs, lv.level()) {
+            return Err(ConstrainError::TypeParamEscapes { param });
+        }
+        extrude(
+            rhs,
+            false,
+            lv.level(),
+            cache.extruded.entry(lv.level()).or_default(),
+        )
+    } else {
+        rhs.clone()
+    };
+    let entry = GuardedBound {
+        guard: guard.clone(),
+        bound: Bound::edge(sl.clone(), rhs, sr.clone()).with_origin(cache.origins.1),
+    };
+    let lows = {
+        let mut bounds = lv.bounds.borrow_mut();
+        let recorded = bounds.guarded_upper.iter().any(|g| {
+            g.guard == entry.guard
+                && g.bound.ty == entry.bound.ty
+                && g.bound
+                    .self_subst
+                    .eq_modulo_ty_slots(&entry.bound.self_subst)
+                && g.bound.ty_subst.eq_modulo_ty_slots(&entry.bound.ty_subst)
+        });
+        if recorded {
+            return Ok(());
+        }
+        bounds.guarded_upper.push(entry.clone());
+        Rc::clone(bounds.lower())
+    };
+    for low in lows.iter() {
+        close_guarded(lv, low, &entry, cache, scope)?;
+    }
+    Ok(())
+}
+
+/// The closure step for a guarded bound: the lower bound `low.ty‹low.ty_subst› <:
+/// holder‹low.self_subst›` meets `{holder | guard} <: 𝑈‹ty_subst›`, and the edge it draws is
+/// `{low.ty | guard} <: 𝑈`, the views of `holder` bridged as [`bridge_holder_gap`] bridges an
+/// ordinary bound's. The guard is stored transported into the holder's view, and the bridge
+/// moves it with the upper side; the lower bound's own refinements are transported through its
+/// morphism, and its base keeps that morphism. Applying the morphism to the base instead would
+/// suspend a variable base on it, and the guard would land on the suspension rather than on the
+/// variable the lower bounds reach.
+fn close_guarded(
+    holder: &Rc<InferVar>,
+    low: &Bound,
+    entry: &GuardedBound,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
+    let Some((tau_l, tau_u)) =
+        bridge_holder_gap(&low.self_subst, &entry.bound.self_subst, Some(holder))
+    else {
+        return Ok(());
+    };
+    let low_subst = Subst::then(&low.ty_subst, &tau_l);
+    let upper_subst = Subst::then(&entry.bound.ty_subst, &tau_u);
+    let lrefs_in_ambient: Vec<Refinement> = low
+        .ty
+        .refinements()
+        .iter()
+        .map(|l| normal_refinement(&low_subst.force_refinement(l)))
+        .collect();
+    let guard: Vec<Refinement> = entry
+        .guard
+        .iter()
+        .map(|g| {
+            if tau_u.is_id() {
+                g.clone()
+            } else {
+                normal_refinement(&tau_u.force_refinement(g))
+            }
+        })
+        .filter(|g| !lrefs_in_ambient.contains(g))
+        .collect();
+    cache.with_origins((low.origin, entry.bound.origin), |cache| {
+        if cache.refinement_blind() {
+            return constrain_go(
+                low.ty.peel_refinements(),
+                entry.bound.ty.peel_refinements(),
+                &low_subst,
+                &upper_subst,
+                cache,
+                scope,
+            );
+        }
+        constrain_refined(
+            &low.ty,
+            low.ty.peel_refinements(),
+            lrefs_in_ambient,
+            &guard,
+            &entry.bound.ty,
+            &low_subst,
+            &upper_subst,
+            cache,
+            scope,
+        )
+    })
 }
 
 /// The failed edge `lhs‹sl› <: rhs‹sr›`, each side under its substitution, so a message
@@ -3164,6 +3338,10 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     })
                     .collect();
                 nvs.bounds.borrow_mut().set_upper(new_ups);
+                // A guarded bound restricts what reaches `tv`, so the proxy flowing into it
+                // carries it as it carries the upper bounds.
+                let guarded = extrude_guarded(tv, pol, target_level, cache);
+                nvs.bounds.borrow_mut().guarded_upper.extend(guarded);
             }
             Type::Infer(nvs)
         }
@@ -3209,6 +3387,7 @@ fn lower_var_levels(ty: &Type, level: Level) {
             .lower()
             .iter()
             .chain(bounds.upper().iter())
+            .chain(bounds.guarded_upper.iter().map(|g| &g.bound))
             .map(|b| b.ty.clone())
             .chain(
                 bounds
@@ -3258,6 +3437,30 @@ fn lower_fun_kind_levels(ty: &Type, level: Level) {
 /// (and vice versa for reads through the original), so neither side's
 /// constraints are lost. Structural recursion does not flip polarity —
 /// equality is symmetric in every position.
+/// `tv`'s guarded upper bounds, their bounding types extruded at `pol` to `target_level` as an
+/// upper bound's is. The guard is a predicate, which extrusion does not walk.
+fn extrude_guarded(
+    tv: &InferVar,
+    pol: bool,
+    target_level: Level,
+    cache: &mut ExtrudeCache,
+) -> Vec<GuardedBound> {
+    let guarded = tv.bounds.borrow().guarded_upper.clone();
+    guarded
+        .into_iter()
+        .map(|g| GuardedBound {
+            guard: g.guard,
+            bound: Bound {
+                origin: g.bound.origin,
+                self_subst: g.bound.self_subst,
+                ty: extrude(&g.bound.ty, pol, target_level, cache),
+                ty_subst: g.bound.ty_subst,
+                rendered: Default::default(),
+            },
+        })
+        .collect()
+}
+
 fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
         lower_fun_kind_levels(ty, target_level);
@@ -3359,6 +3562,8 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                     })
                     .collect();
                 nvs.bounds.borrow_mut().upper_mut().extend(new_ups);
+                let guarded = extrude_guarded(tv, false, target_level, cache);
+                nvs.bounds.borrow_mut().guarded_upper.extend(guarded);
             }
             Type::Infer(nvs)
         }
@@ -3944,28 +4149,84 @@ mod tests {
     }
 
     #[test]
-    fn refined_var_base_absorbs_deficit() {
-        // {?a | q} <: {Int | p}: the explicit layer only supplies q, but the
-        // base variable ?a can acquire the deficit {p}, so the constraint
-        // succeeds by flowing `?a <: {Int | p}`. This is what lets a value
-        // that is *already* refined be cast to add a further refinement (nested
-        // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`); a concrete
-        // `{p} ⊆ {q}` check would reject it.
+    fn refined_var_base_takes_a_guarded_bound() {
+        // {?a | q} <: {Int | p}: the explicit layer supplies only q. The edge relates the bases,
+        // `?a <: Int`, and is kept as written, a guarded bound `{?a | q} <: {Int | p}`. The
+        // deficit {p} is not copied onto ?a, which would narrow its values outside q.
         let (p, q) = (1, 2);
         let a = fresh_var(0);
         let lhs = refined(a.clone(), q);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
         assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
-        // The deficit must have been recorded on ?a as the upper bound
-        // `{Int | p}`, so coalescing ?a yields a base carrying p.
         let Type::Infer(v) = &a else { unreachable!() };
-        let expected = refined(prim(BaseType::Int), p);
-        assert!(
-            v.bounds.borrow().upper().iter().any(|u| u.ty == expected),
-            "?a should carry {{Int | p}} as an upper bound, got {:?}",
-            v.bounds.borrow().upper()
-        );
+        let bounds = v.bounds.borrow();
+        let uppers: Vec<Type> = bounds.upper().iter().map(|u| u.ty.clone()).collect();
+        assert_eq!(uppers, vec![prim(BaseType::Int)], "?a takes the base alone");
+        let guarded: Vec<(Type, Type)> = bounds
+            .guarded_upper
+            .iter()
+            .map(|g| {
+                (
+                    Type::refined(prim(BaseType::Int), g.guard.clone()),
+                    g.bound.ty.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(guarded, vec![(refined(prim(BaseType::Int), q), rhs)]);
+    }
+
+    #[test]
+    fn a_guarded_bound_checks_each_lower_bound_under_its_guard() {
+        // {Int | p} <: ?a <: Int, then {?a | q} <: {Int | p}: the lower bound already carries p.
+        // A later lower bound {Int | r} carries neither, so `{Int | r, q} <: {Int | p}` fails.
+        let (p, q, r) = (1, 2, 3);
+        let a = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&refined(prim(BaseType::Int), p), &a, &mut cache).unwrap();
+        let rhs = refined(prim(BaseType::Int), p);
+        constrain_subtype(&refined(a.clone(), q), &rhs, &mut cache).unwrap();
+        assert!(matches!(
+            constrain_subtype(&refined(prim(BaseType::Int), r), &a, &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_guarded_bound_reaches_a_lower_bound_recorded_before_it() {
+        // {Int | r} <: ?a first: recording {?a | q} <: {Int | p} checks it at once.
+        let (p, q, r) = (1, 2, 3);
+        let a = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&refined(prim(BaseType::Int), r), &a, &mut cache).unwrap();
+        assert!(matches!(
+            constrain_subtype(
+                &refined(a.clone(), q),
+                &refined(prim(BaseType::Int), p),
+                &mut cache
+            ),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_guarded_bound_reaches_a_variable_below() {
+        // ?b <: ?a, then {?a | q} <: {Int | p}: the guarded bound is recorded on ?b too, so a
+        // lower bound reaching ?b is checked under the guard.
+        let (p, q, r) = (1, 2, 3);
+        let (a, b) = (fresh_var(0), fresh_var(0));
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&b, &a, &mut cache).unwrap();
+        constrain_subtype(
+            &refined(a.clone(), q),
+            &refined(prim(BaseType::Int), p),
+            &mut cache,
+        )
+        .unwrap();
+        assert!(matches!(
+            constrain_subtype(&refined(prim(BaseType::Int), r), &b, &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
     }
 
     #[test]

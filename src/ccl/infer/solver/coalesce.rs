@@ -760,11 +760,34 @@ fn coalesce_compact_go(
                 // candidates are the conflicting domains and say it directly.
                 let domains = match &cf.combined {
                     Some(combined) => {
+                        // An operand that is itself a negative merge of two filters names the
+                        // two the program wrote rather than their union
+                        // ([`CompactType::met_refinements`]).
                         let (a, b) = combined.pair();
-                        vec![
-                            coalesce_compact_go(a, !polarity, scope)?,
-                            coalesce_compact_go(b, !polarity, scope)?,
-                        ]
+                        let mut domains: Vec<Type> = Vec::new();
+                        for operand in [a, b] {
+                            let written: Vec<CompactType> = match &operand.met_refinements {
+                                Some(met) => {
+                                    let (x, y) = met.pair();
+                                    [x, y]
+                                        .into_iter()
+                                        .map(|set| CompactType {
+                                            refinements: Some(set.clone()),
+                                            met_refinements: None,
+                                            ..operand.clone()
+                                        })
+                                        .collect()
+                                }
+                                None => vec![operand.clone()],
+                            };
+                            for w in written {
+                                let ty = coalesce_compact_go(&w, !polarity, scope)?;
+                                if !domains.contains(&ty) {
+                                    domains.push(ty);
+                                }
+                            }
+                        }
+                        domains
                     }
                     None => match &type_kind {
                         crate::ccl::ty::TypeKind::Enumerated(ds) => ds.clone(),

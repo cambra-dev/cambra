@@ -182,7 +182,7 @@ use crate::ccl::RecordEntry;
 use crate::ccl::{
     BindingTransparency, Branch, Expr, Name, Type, TypedBinding, TypedExprNode,
     ccl_utils::is_free,
-    mut_scope::{Muts, is_mut_var, under_param, with},
+    mut_scope::{self, Muts, is_mut_var, under_param, with},
     opaque_output::is_annotated_result,
     provenance::{self, Nature},
     subst::Subst,
@@ -204,7 +204,8 @@ pub fn run(expr: Expr) -> Expr {
         if holds_raise(&expr) {
             short_circuits_as_branches(&mut expr);
         }
-        normalize(expr, &Muts::new())
+        let normalized = normalize(expr, &Muts::new());
+        share_collection_reads(normalized)
     };
     #[cfg(debug_assertions)]
     debug_assert_flat_spines(&out);
@@ -251,6 +252,60 @@ pub fn temp_respelling(expr: &Expr) -> Subst {
     let mut env = HashMap::new();
     go(expr, &mut env);
     Subst::discharging(&env)
+}
+
+/// `e` with each temp that names a collection read an enclosing temp already names replaced by
+/// that temp: `let 𝑡₂ = xs ▷ Iterable::elements` inside the body of
+/// `let 𝑡₁ = xs ▷ Iterable::elements` is dropped, and its reads, the types quoting it included,
+/// read `𝑡₁`.
+///
+/// A comprehension's domain is refined by predicates that quote its source's temp. Two
+/// comprehensions over one variable with one filter then state one domain, and a join of them
+/// compares equal (`src/ccl/design/type-inference.md`, "A variable base takes a guarded bound"). Only
+/// a read of an immutable variable by a trait that reads collections is shared: it is the
+/// variable's value through one function, the same wherever it is evaluated. A mutable
+/// variable's read depends on where it stands.
+fn share_collection_reads(e: Expr) -> Expr {
+    /// The variable and function of a collection read `𝑣 ▷ Trait::𝑓`, the key two reads share.
+    fn collection_read(e: &Expr, mutable: &Muts) -> Option<(Name, smol_str::SmolStr)> {
+        let TypedExprNode::Apply { function, argument } = &e.node else {
+            return None;
+        };
+        let TypedExprNode::TraitFn {
+            trait_, function, ..
+        } = &function.node
+        else {
+            return None;
+        };
+        let TypedExprNode::Var(v) = &argument.node else {
+            return None;
+        };
+        (trait_.reads_collections() && !mutable.contains(v)).then(|| (v.clone(), function.clone()))
+    }
+    fn go(mut e: Expr, named: &mut Vec<((Name, smol_str::SmolStr), Name)>, mutable: &Muts) -> Expr {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = &mut e.node
+            && binding.name.is_anf_temp()
+            && let Some(key) = collection_read(bound_expr, mutable)
+        {
+            if let Some((_, earlier)) = named.iter().find(|(k, _)| *k == key) {
+                let renamed = Subst::rename(binding.name.clone(), earlier.clone()).apply_expr(body);
+                return go(renamed, named, mutable);
+            }
+            named.push((key, binding.name.clone()));
+            let taken = std::mem::take(&mut **body);
+            **body = go(taken, named, mutable);
+            named.pop();
+            return e;
+        }
+        e.walk_children_mut(|c| *c = go(std::mem::take(c), named, mutable));
+        e
+    }
+    let mutable = mut_scope::bound_in(&e);
+    go(e, &mut Vec::new(), &mutable)
 }
 
 /// Whether `e` holds a `raise` anywhere.

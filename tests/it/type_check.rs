@@ -3566,6 +3566,151 @@ fn test_case_arms_with_different_filters_become_sigma_candidates() {
     );
 }
 
+/// The same arms **consumed**, unboxed. The consumer's domain is a variable both arms' domains
+/// reach, and neither takes the other's filter, so the arms keep their own domains and the join
+/// reports them (`src/ccl/design/type-inference.md`, "A variable base takes a guarded bound").
+#[rstest]
+#[case::literal_sources(
+    indoc! {"
+        c = 1 > 0
+        sum([x for x in [1, 2, 3] if x > 1] if c else [x for x in [1, 2, 3] if x > 2])
+    "}
+)]
+#[case::one_source(
+    indoc! {"
+        xs = [1, 2, 3]
+        c = 1 > 0
+        sum([x for x in xs if x > 1] if c else [x for x in xs if x > 2])
+    "}
+)]
+#[case::let_bound_arms(
+    indoc! {"
+        xs = [1, 2, 3]
+        c = 1 > 0
+        a = [x for x in xs if x > 1]
+        b = [x for x in xs if x > 2]
+        sum(a if c else b)
+    "}
+)]
+#[case::in_a_definition(
+    indoc! {"
+        def f(c: Bool) => Int:
+            xs = [1, 2, 3]
+            sum([x for x in xs if x > 1] if c else [x for x in xs if x > 2])
+        f(1 > 0)
+    "}
+)]
+#[case::max(
+    indoc! {"
+        xs = [1, 2, 3]
+        c = 1 > 0
+        max([x for x in xs if x > 1] if c else [x for x in xs if x > 2])
+    "}
+)]
+fn consumed_arms_with_different_filters_have_no_join(#[case] code: &str) {
+    let rendered = format!("{:?}", infer_program_err(code));
+    assert!(
+        rendered.contains("Collection domains have no common answer")
+            && rendered.contains("> 1")
+            && rendered.contains("> 2"),
+        "expected the domain-join rejection naming both filters, got:\n{rendered}"
+    );
+}
+
+/// Arms that reach the conditional as a definition's parameters meet at one domain variable,
+/// whose merge unions their filters. The report names the two domains the program wrote, not
+/// that union.
+#[test]
+fn arms_passed_as_parameters_are_reported_with_their_own_domains() {
+    let rendered = format!(
+        "{:?}",
+        infer_program_err(indoc! {"
+            def f(c: Bool, a, b) => Int:
+                sum(a if c else b)
+            xs = [1, 2, 3]
+            f(1 > 0, [x for x in xs if x > 1], [x for x in xs if x > 2])
+        "})
+    );
+    let domains = rendered
+        .split("Conflicting Domains: ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_else(|| panic!("expected the domain-join rejection, got:\n{rendered}"));
+    let written: Vec<&str> = domains.split(" vs ").collect();
+    assert_eq!(written.len(), 2, "two domains, got: {domains}");
+    assert!(
+        written
+            .iter()
+            .any(|d| d.contains("> 1") && !d.contains("> 2"))
+            && written
+                .iter()
+                .any(|d| d.contains("> 2") && !d.contains("> 1")),
+        "each domain as the program wrote it, got: {domains}"
+    );
+}
+
+/// Consumed arms under one filter are one domain, and join: written inline, bound by `let`, or
+/// passed as a definition's parameters. Each comprehension over `xs` reads one shared
+/// A-normalization temp, so the two filters are one predicate.
+#[rstest]
+#[case::inline(indoc! {"
+    xs = [1, 2, 3]
+    c = 1 > 0
+    sum([x for x in xs if x > 1] if c else [x for x in xs if x > 1])
+"})]
+#[case::let_bound(indoc! {"
+    xs = [1, 2, 3]
+    c = 1 > 0
+    a = [x for x in xs if x > 1]
+    b = [x for x in xs if x > 1]
+    sum(a if c else b)
+"})]
+#[case::parameters(indoc! {"
+    def f(c: Bool, a, b) => Int:
+        sum(a if c else b)
+    xs = [1, 2, 3]
+    f(1 > 0, [x for x in xs if x > 1], [x for x in xs if x > 1])
+"})]
+fn consumed_arms_with_one_filter_join(#[case] code: &str) {
+    assert_eq!(infer_program(code), int());
+}
+
+/// An arm over a filtered comprehension ranges over the filtered domain, and a sibling over the
+/// unfiltered source does not, though the filters the two arms add are one. The join refuses
+/// them, naming each arm's whole domain: the inner filter stays with its own arm.
+#[rstest]
+#[case::same_outer_filter(indoc! {"
+    xs = [1, 2, 3]
+    c = 1 > 2
+    t = 1 > 0
+    sum([y for y in [x for x in xs if x > 1] if t] if c else [x for x in xs if t])
+"})]
+#[case::let_bound_inner(indoc! {"
+    xs = [1, 2, 3]
+    c = 1 > 2
+    ys = [x for x in xs if x > 1]
+    sum([y for y in ys if y < 3] if c else [x for x in xs if x < 3])
+"})]
+#[case::inline_inner(indoc! {"
+    xs = [1, 2, 3]
+    c = 1 > 2
+    sum([y for y in [x for x in xs if x > 1] if y < 3] if c else [x for x in xs if x < 3])
+"})]
+fn an_inner_filter_stays_with_its_own_arm(#[case] code: &str) {
+    let rendered = format!("{:?}", infer_program_err(code));
+    let domains = rendered
+        .split("Conflicting Domains: ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_else(|| panic!("expected the domain-join rejection, got:\n{rendered}"));
+    let written: Vec<&str> = domains.split(" vs ").collect();
+    assert_eq!(written.len(), 2, "the two arms' domains, got: {domains}");
+    assert!(
+        written.iter().filter(|d| d.contains("> 1")).count() == 1,
+        "the inner filter on one arm's domain only, got: {domains}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Defer / Feed / Define typing rules (pre-channelize trees)
 // ---------------------------------------------------------------------------

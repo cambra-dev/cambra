@@ -425,6 +425,29 @@ pub struct InferBounds {
     /// annotation is a demand, so `r: List(Int) = box(…)` records `UIntRanges` on the
     /// domain variable there.
     pub type_kinds: Vec<crate::ccl::ty::TypeKind>,
+    /// **Guarded upper bounds** — `{α | 𝑔} <: 𝑈`, an upper bound on the values of `α` that
+    /// satisfy the guard `𝑔`, stored as the edge was written.
+    ///
+    /// A refined variable meeting a refinement it lacks, `{α | 𝑝} <: {𝑇 | 𝑞}`, constrains
+    /// only the part of `α` that `𝑝` keeps. No upper bound on the whole of `α` states that:
+    /// `α <: {𝑇 | 𝑞}` narrows the values outside `𝑝` too, and the exact whole-variable form,
+    /// `α <: {𝑇 | 𝑝 ⇒ 𝑞}`, is a predicate no refinement comparison reads. So the edge is kept
+    /// in its native form, as [`Bound`] keeps its holder-side morphism rather than inverting
+    /// it, and each lower bound `𝐿` of `α` is checked as `{𝐿 | 𝑔} <: 𝑈`
+    /// (`src/ccl/design/type-inference.md`, "A variable base takes a guarded bound").
+    ///
+    /// Apart from the bounds because compaction does not read them: they decide which values
+    /// may reach `α`, and say nothing about the type `α` stands for.
+    pub guarded_upper: Vec<GuardedBound>,
+}
+
+/// One of [`InferBounds::guarded_upper`]: `{α | guard}‹bound.self_subst› <: bound.ty‹bound.ty_subst›`.
+/// The guard is stored transported through the holder side's morphism, in the frame where the
+/// two sides meet, as the refinement arm compares predicates.
+#[derive(Debug, Clone)]
+pub struct GuardedBound {
+    pub guard: crate::ccl::ty::RefinementSet,
+    pub bound: Bound,
 }
 
 #[derive(Default)]
@@ -449,6 +472,7 @@ impl Default for InferBounds {
             lower: Rc::clone(empty),
             upper: Rc::clone(empty),
             type_kinds: Vec::new(),
+            guarded_upper: Vec::new(),
         })
     }
 }
