@@ -72,9 +72,7 @@ use crate::interpreter::{
 
 use crate::interpreter::operator_conversion::{store_key, store_key_name};
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
-use crate::interpreter::tile_operators::{
-    ExecutionContext, InputId, ReadPreparation, refresh_source_inputs,
-};
+use crate::interpreter::tile_operators::{ExecutionContext, InputId, refresh_source_inputs};
 use crate::interpreter::tile_operators::{
     OperatorBase, ProducerStateInfo, column_of_rows, impl_operator_base, impl_producer_base,
     read_again_toward, stored_value_tile, with_values_at,
@@ -1207,10 +1205,35 @@ impl SteppedStore for CommitProducer {
 /// including an empty-write proposal, which takes a tick when it commits
 /// (`src/interpreter/design-operators.md`, "Ready transaction decisions").
 impl Breaker for CommitProducer {
+    fn plan_stages(
+        &mut self,
+        dispatcher: &mut crate::interpreter::dispatcher::Dispatcher,
+    ) -> Vec<crate::interpreter::dispatcher::ControlStage> {
+        if self.stages.is_some() {
+            return Vec::new();
+        }
+        let stages = crate::interpreter::dispatcher::ControlStages::plan(
+            &mut self.writer_producers,
+            dispatcher,
+        );
+        let handlers = stages.handlers();
+        self.stages = Some(stages);
+        handlers
+    }
+    fn bind_dispatcher(
+        &mut self,
+        dispatcher: std::sync::Weak<crate::interpreter::dispatcher::Dispatcher>,
+    ) {
+        if let Some(stages) = &mut self.stages {
+            stages.bind(dispatcher);
+        }
+    }
+
     fn refresh_sources(&mut self) {
         refresh_source_inputs(self);
     }
     fn begin_run(&mut self) {
+        self.stages = None;
         self.breaker.last_finishes = 0;
         if self.breaker.snapshot.is_none() && self.seed_producers.is_empty() {
             assert!(self.open_store(), "constant seeds open without input");
@@ -1307,7 +1330,14 @@ impl Breaker for CommitProducer {
                 .publish(&tile);
             self.breaker.snapshot = Some(tile);
         }
+        let last = self.breaker.last_finishes + 1 == self.inputs();
         finish_store(self, pushes);
+        if last {
+            self.stages
+                .as_ref()
+                .expect("transaction stages are planned")
+                .close();
+        }
     }
 }
 
@@ -2512,6 +2542,7 @@ impl TileOperator for CommitOperator {
             None => base,
         };
         Box::new(CommitProducer {
+            stages: None,
             base,
             seed_placements,
             queued: (0..n).map(|_| BTreeMap::new()).collect(),
@@ -2535,6 +2566,7 @@ impl TileOperator for CommitOperator {
 }
 
 struct CommitProducer {
+    stages: Option<crate::interpreter::dispatcher::ControlStages>,
     base: ProducerBase,
     writer_producers: Vec<Box<dyn TileProducer>>,
     /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
@@ -2765,7 +2797,6 @@ impl CommitProducer {
     /// Pull writer `k`, and answer the proposals it holds that the store has neither attempted
     /// nor taken, with the step of each and the source position of its item.
     fn new_proposals(&mut self, k: usize) -> Vec<(u64, Position, Proposal)> {
-        ReadPreparation::default().prepare(&mut *self.writer_producers[k]);
         let guard = self.writer_producers[k].tiling().universal_guard();
         let (tile, _) = split_transact_stream(self.writer_producers[k].get(guard));
         let Tile::DataFunction {
@@ -2949,6 +2980,11 @@ impl CommitProducer {
     /// writer, which acks its attempt, so the drive moves on to its next item while the store
     /// holds the decision. Every decision retains its read set for validation, including an empty write set.
     fn take(&mut self, k: usize) {
+        self.stages
+            .as_ref()
+            .expect("transaction stages are planned before consumption")
+            .consume(k);
+
         for (step, item, proposal) in self.new_proposals(k) {
             #[cfg(debug_assertions)]
             debug_assert!(
@@ -6647,7 +6683,7 @@ impl TileOperator for TransactDriver {
                     Predicate::at_or_below_in(through.value().clone(), &self.item_positions),
                 )));
         }
-        Box::new(TransactDriverProducer {
+        crate::interpreter::tile_operators::share_breaker(TransactDriverProducer {
             rendered: self.tiling().empty_tile(),
             base: ProducerBase::new(
                 TransactDriverProducer::alloc_id(),
@@ -6791,8 +6827,7 @@ impl TransactDriverProducer {
 }
 
 impl TransactDriverProducer {
-    fn advance(&mut self, prepared: &mut ReadPreparation) -> Tile {
-        prepared.prepare(&mut *self.source_producer);
+    fn advance(&mut self) -> Tile {
         // Read the source after a notification or consuming delivery. Between those arrivals
         // and the drive's own releases its tile does not grow, so the last decode still answers.
         // A release removes what the driver has finished with. The drive
@@ -6988,7 +7023,34 @@ impl TransactDriverProducer {
     }
 }
 
+impl Breaker for TransactDriverProducer {
+    fn consume(&mut self, _: InputId, _: TileGuard) {
+        self.rendered = self.advance();
+    }
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.source_producer.tiling().clone()
+    }
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.source_producer.obsolete_guard().clone()
+    }
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+}
+impl BreakingProducer for TransactDriverProducer {
+    fn complete(&self) -> TileGuard {
+        self.rendered.to_guard()
+    }
+    fn final_guard(&self) -> TileGuard {
+        self.complete()
+    }
+}
+
 impl TileProducer for TransactDriverProducer {
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
     fn input_entry(&self, input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
         (input == "source").then(|| self.source_entry.clone())
     }
@@ -7003,7 +7065,7 @@ impl TileProducer for TransactDriverProducer {
         visit("source", &mut *self.source_producer);
     }
 
-    /// The drive reads its source again at its next pull; it reads its store at every one.
+    /// The next consume reads the source again; every consume samples the store.
     fn read_again(&mut self, input: &str) {
         if input == "source" {
             self.source_news.record(&Projection::Everything);
@@ -7016,9 +7078,6 @@ impl TileProducer for TransactDriverProducer {
 
     impl_producer_base!();
 
-    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
-        self.rendered = self.advance(prepared);
-    }
     fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         let mut tile = self.rendered.clone();
         tile.remove_guarded(self.obsolete_guard().clone());
@@ -7425,7 +7484,7 @@ fn decision_at_index(
 /// per-slot and the proposal positions would re-index out from under the
 /// `CommitProducer`'s cursor.
 ///
-/// Each pull: take the newest live position from the [`TransactDriver`] — which built
+/// Each consume: take the newest live position from the [`TransactDriver`] — which built
 /// that row from `(item, frontier)`, one row per pair — pull the body for its decision,
 /// and append the proposal `{snap: frontier, reads: {key ↦ old}, writes: {key ↦ new}}`.
 /// Releasing the driver row acks the attempt's finish, so the driver advances to the next
@@ -7517,7 +7576,7 @@ impl TileOperator for TransactWriter {
         // owns the transaction source, so a request arriving on a live source
         // reaches this writer, and through it the commit cycle, along this edge.
         let driver_producer = subscribe_forwarding(&self.driver_op, &consumer, cx);
-        Box::new(TransactWriterProducer {
+        crate::interpreter::tile_operators::share_breaker(TransactWriterProducer {
             base: ProducerBase::new(
                 TransactWriterProducer::alloc_id(),
                 self.tiling(),
@@ -7794,35 +7853,8 @@ impl CyclicSequencingProducer for TransactWriterProducer {
     }
 }
 
-impl TileProducer for TransactWriterProducer {
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("store", &*self.store_producer);
-        visit("body", &*self.body_producer);
-        visit("driver", &*self.driver_producer);
-    }
-
-    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
-        visit("store", &mut *self.store_producer);
-        visit("body", &mut *self.body_producer);
-        visit("driver", &mut *self.driver_producer);
-    }
-
-    fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(
-            self.emitted
-                .iter()
-                .map(|p| p.reads.len() + p.writes.len())
-                .sum(),
-        )
-    }
-
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut ProducerBase {
-        &mut self.base
-    }
-    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
+impl Breaker for TransactWriterProducer {
+    fn consume(&mut self, _: InputId, _: TileGuard) {
         let store_tile = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -7878,7 +7910,6 @@ impl TileProducer for TransactWriterProducer {
         // below, off the driver: the driver emits a row once per `(item, frontier)`,
         // so a position appearing here is a distinct attempt, and re-pulling at an
         // unchanged pair adds none.
-        prepared.prepare(&mut *self.body_producer);
         let body_tile = self
             .body_producer
             .get(self.body_producer.tiling().universal_guard());
@@ -7887,7 +7918,6 @@ impl TileProducer for TransactWriterProducer {
         // pull, or the one still in flight from an earlier one. Reading it here
         // rather than counting positions independently keeps the writer and the
         // driver from inventing two numberings that could drift.
-        prepared.prepare(&mut *self.driver_producer);
         let (driver_tile, decided) = split_transact_stream(
             self.driver_producer
                 .get(self.driver_producer.tiling().universal_guard()),
@@ -8000,6 +8030,57 @@ impl TileProducer for TransactWriterProducer {
             }
         }
         self.debug_assert_position_invariant();
+    }
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.body_producer.tiling().clone()
+    }
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.body_producer.obsolete_guard().clone()
+    }
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+}
+impl BreakingProducer for TransactWriterProducer {
+    fn complete(&self) -> TileGuard {
+        self.render().to_guard()
+    }
+    fn final_guard(&self) -> TileGuard {
+        self.complete()
+    }
+}
+
+impl TileProducer for TransactWriterProducer {
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
+        visit("body", &*self.body_producer);
+        visit("driver", &*self.driver_producer);
+    }
+
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("body", &mut *self.body_producer);
+        visit("driver", &mut *self.driver_producer);
+    }
+
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(
+            self.emitted
+                .iter()
+                .map(|p| p.reads.len() + p.writes.len())
+                .sum(),
+        )
+    }
+
+    fn base(&self) -> &ProducerBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut ProducerBase {
+        &mut self.base
     }
     fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         // A release naming part of a proposal rather than the proposal leaves it in the

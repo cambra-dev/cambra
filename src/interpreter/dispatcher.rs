@@ -33,7 +33,11 @@ use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
 };
 
+mod control_stages;
 pub(crate) mod loop_scope;
+#[doc(hidden)]
+pub use control_stages::ControlStage;
+pub(crate) use control_stages::ControlStages;
 mod plan;
 mod workers;
 

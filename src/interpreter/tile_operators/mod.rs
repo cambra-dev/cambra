@@ -875,13 +875,6 @@ pub struct ProducerBase {
 }
 
 impl ProducerBase {
-    /// A breaker reads its input directly only inside another scheduled pipeline. Its own
-    /// placement delegates execution to consume; outside execution a read observes held state.
-    pub(crate) fn reads_input(&self) -> bool {
-        crate::interpreter::dispatcher::is_in_a_run()
-            && self.placement.as_ref().is_none_or(|at| at.get().is_none())
-    }
-
     /// Output releases may reclaim local state immediately, but their forwarding
     /// must wait until this pipeline can no longer read shared operands.
     fn defer_worker_release(&mut self, guard: &TileGuard) -> bool {
@@ -1596,6 +1589,35 @@ pub trait Breaker {
     /// When the breaker cannot consume its input's shape.
     fn consume(&mut self, input: InputId, guard: TileGuard);
 
+    /// Plan coordinator-only stages belonging to this pipeline, once before execution.
+    #[doc(hidden)]
+    fn plan_stages(
+        &mut self,
+        _dispatcher: &mut crate::interpreter::dispatcher::Dispatcher,
+    ) -> Vec<crate::interpreter::dispatcher::ControlStage> {
+        Vec::new()
+    }
+
+    /// Bind the run's shared dispatcher without retaining it beyond the run.
+    #[doc(hidden)]
+    fn bind_dispatcher(
+        &mut self,
+        _dispatcher: std::sync::Weak<crate::interpreter::dispatcher::Dispatcher>,
+    ) {
+    }
+
+    /// Whether this control input needs a delivery in the current transaction phase.
+    #[doc(hidden)]
+    fn input_enabled(&self, _input: InputId) -> bool {
+        true
+    }
+
+    /// The input graph role consumed by one control input; `None` consumes all operands.
+    #[doc(hidden)]
+    fn consumption_role(&self, _input: InputId) -> Option<&str> {
+        None
+    }
+
     /// Refresh source metadata before announcing or consuming source work.
     #[doc(hidden)]
     fn refresh_sources(&mut self) {}
@@ -1727,44 +1749,6 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// seed, has one per entry. The default answers [`entry_placement`](Self::entry_placement).
     fn entry_placements(&self, input: InputId) -> Vec<crate::interpreter::dispatcher::Placement> {
         self.entry_placement(input).into_iter().collect()
-    }
-}
-
-/// Coordinator preparation of an existing transaction input chain. It advances each inline
-/// control or breaker once; published dependencies and recurrence snapshots are boundaries.
-#[doc(hidden)]
-#[derive(Default)]
-pub struct ReadPreparation {
-    visited: std::collections::HashSet<usize>,
-}
-impl ReadPreparation {
-    pub(crate) fn prepare<P: TileProducer + ?Sized>(&mut self, producer: &mut P) {
-        let address = std::ptr::from_ref(&*producer).cast::<()>() as usize;
-        if !self.visited.insert(address)
-            || producer.recurrence_of().is_some()
-            || producer.store_read().is_some()
-            || producer
-                .base()
-                .placement
-                .as_ref()
-                .is_some_and(|at| at.get().is_some())
-        {
-            return;
-        }
-        producer.refresh_source();
-        producer.prepare_read(self);
-    }
-    pub(crate) fn inputs<P: TileProducer + ?Sized>(&mut self, producer: &mut P) {
-        producer.visit_input_producers_mut(&mut |_, input| self.prepare(input));
-    }
-    pub(crate) fn consume<P: TileProducer + ?Sized>(&mut self, producer: &mut P) {
-        if let Some(breaker) = producer.as_breaking_mut() {
-            for input in 0..breaker.inputs() {
-                let input = InputId(input);
-                let whole = breaker.input_tiling(input).universal_guard();
-                breaker.consume(input, whole);
-            }
-        }
     }
 }
 
@@ -2141,13 +2125,6 @@ pub trait TileProducer: Send + Sync {
         Vec::new()
     }
 
-    /// Explicit coordinator advancement before a transaction control phase reads snapshots.
-    #[doc(hidden)]
-    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
-        prepared.inputs(self);
-        prepared.consume(self);
-    }
-
     /// Refresh this source leaf's published domain metadata, leaving reads observational.
     #[doc(hidden)]
     fn refresh_source(&mut self) {}
@@ -2327,6 +2304,13 @@ pub(crate) mod test_helpers {
             {
                 placement.set(Some(crate::interpreter::dispatcher::PipelineId(0)));
             }
+            self.begin_run();
+            // Component fixtures still use the same stage planning and queue accounting as a run.
+            let mut dispatcher =
+                crate::interpreter::dispatcher::Dispatcher::new(Vec::new(), usize::MAX);
+            let _stages = self.plan_stages(&mut dispatcher);
+            let dispatcher = std::sync::Arc::new(dispatcher);
+            self.bind_dispatcher(std::sync::Arc::downgrade(&dispatcher));
             crate::interpreter::dispatcher::in_pipeline_for_test(|| self.consume(input, guard));
         }
     }

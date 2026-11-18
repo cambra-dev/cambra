@@ -188,6 +188,20 @@ consumption and updates its counter before removing the entry and unlocking the 
 Graph composition requires every reserved package to remain ready, so neither an in-flight nor
 an acknowledged package can enter a newly composed graph.
 
+## Transaction consumption stages
+
+A transaction store's writer pipeline keeps its parent package outstanding while the driver,
+body breakers and writer consume one attempt. Planning resolves those canonical instances once
+and adds their stages to the run's dispatcher. Recurrence snapshots and other placed pipelines
+end that planning walk. No read prepares an input chain or advances a transaction.
+
+The store's consuming phase claims its held stages on that same dispatcher, in dependency order,
+and acknowledges each after native consumption. Stale decisions repeat the stages against the
+newly published store snapshot. These stages run synchronously on the coordinator; they do not
+create another dispatcher or operator instances. Their queues close after the store settles its
+last input. Clean memos demand no input, and a final extraction demands its default only after
+consuming an empty completed source.
+
 ## A loop in rounds
 
 An induction store owns its accumulator, published snapshot and optional run-local controller.

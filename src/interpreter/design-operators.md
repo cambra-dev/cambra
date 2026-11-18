@@ -2221,13 +2221,15 @@ publication and acknowledgement. Canonical native reads call the same `get_impl`
 recorded releases after the read. Every producer implements this shared read interface. Stateful
 transaction controls remain coordinator-only; worker admission still excludes their chains.
 
-Before collecting proposals, the commit store prepares its existing writer chain. Preparation
-walks the actual input graph once, stops at placed pipelines and recurrence/store snapshots, and
-runs inline breakers through their native consumption callbacks. The transaction driver then
-retains its current attempt stream and the writer retains its proposals; their getters only
-render those snapshots. Source polling separately refreshes Cartesian extent metadata before
-announcing regions, and native consumption refreshes it before reading. Neither operation adds
-another operator graph or makes an ordinary read advance transaction control.
+Transaction input stages are planned once from the existing producer graph, stopping at placed
+pipelines and recurrence/store snapshots. The driver, inline body breakers, and writer are
+canonical breakers with native `consume` callbacks. Their stages reserve and acknowledge packages
+on the run's shared dispatcher inside the store's consuming phase, including when retrying a stale
+proposal. The parent package stays outstanding until that phase completes. No proposal read walks
+the graph or advances an operator. Clean memo inputs are skipped; a final extraction's default
+input runs only after its source has finished without a value. Stage queues close after the store
+has settled its last input. Source polling separately refreshes Cartesian extent metadata before
+announcing regions, and native consumption refreshes it before reading.
 
 `ConsumeState` borrows a worker's input cursor and retained aggregation buffers for a batch. Workers
 call `consume_impl(&self, state, input, guard)` on the canonical breaker under a shared runtime guard.

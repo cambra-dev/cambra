@@ -205,7 +205,6 @@ impl ExtractFinalProducer {
             );
         };
         let default_tiling = default.tiling().clone();
-        ReadPreparation::default().prepare(&mut **default);
         let default_tile = default.get(default_tiling.universal_guard());
         // A collection-valued position falls back to the whole collection, so the default
         // is the tile it is rather than a value to rebuild a column from. It has converged
@@ -225,12 +224,6 @@ impl ExtractFinalProducer {
 }
 
 impl TileProducer for ExtractFinalProducer {
-    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
-        prepared.prepare(&mut *self.source);
-        let whole = self.input_tiling(InputId::ONLY).universal_guard();
-        self.consume(InputId::ONLY, whole);
-    }
-
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(
             self.merged.cell_count() + self.final_tile.as_ref().map_or(0, Tile::cell_count),
@@ -293,6 +286,27 @@ impl TileProducer for ExtractFinalProducer {
 }
 
 impl Breaker for ExtractFinalProducer {
+    fn inputs(&self) -> usize {
+        1 + usize::from(self.default.is_some())
+    }
+    fn consumption_role(&self, input: InputId) -> Option<&str> {
+        Some(if input.0 == 0 { "source" } else { "default" })
+    }
+    fn input_enabled(&self, input: InputId) -> bool {
+        if self.final_tile.is_some() || self.obsolete_guard().is_universal() {
+            return false;
+        }
+        input.0 == 0
+            || (self.source.obsolete_guard().is_universal()
+                && self
+                    .merged
+                    .live_keys()
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_none())
+    }
+
     fn refresh_sources(&mut self) {
         refresh_source_inputs(self);
     }
@@ -301,7 +315,14 @@ impl Breaker for ExtractFinalProducer {
     /// the order they arrive, so the last row is not the final one: the key says which is. Once
     /// the source has been released whole the value is extracted, or the default read when the
     /// source held nothing.
-    fn consume(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, input: InputId, guard: TileGuard) {
+        if input.0 == 1 {
+            if self.input_enabled(input) {
+                self.final_tile = self.pull_default();
+                self.complete = self.final_tile.is_some();
+            }
+            return;
+        }
         debug_assert!(
             guard.check_from(self.source.tiling()),
             "{} consumes a guard of its source's tiling: {guard:?}",
@@ -353,11 +374,27 @@ impl Breaker for ExtractFinalProducer {
         }
     }
 
-    fn input_tiling(&self, _: InputId) -> Tiling {
+    fn input_tiling(&self, input: InputId) -> Tiling {
+        if input.0 == 1 {
+            return self
+                .default
+                .as_ref()
+                .expect("a default input")
+                .tiling()
+                .clone();
+        }
         self.source.tiling().clone()
     }
 
-    fn input_released(&self, _: InputId) -> TileGuard {
+    fn input_released(&self, input: InputId) -> TileGuard {
+        if input.0 == 1 {
+            return self
+                .default
+                .as_ref()
+                .expect("a default input")
+                .obsolete_guard()
+                .clone();
+        }
         self.source.obsolete_guard().clone()
     }
 

@@ -1556,6 +1556,10 @@ fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
 }
 
 impl Breaker for MemoProducer {
+    fn input_enabled(&self, _: InputId) -> bool {
+        self.dirty.intersects(&Projection::Everything)
+    }
+
     fn refresh_sources(&mut self) {
         refresh_source_inputs(self);
     }
@@ -1677,14 +1681,6 @@ impl BreakingProducer for MemoProducer {
 }
 
 impl TileProducer for MemoProducer {
-    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
-        if self.base.reads_input() && self.dirty.intersects(&Projection::Everything) {
-            prepared.inputs(self);
-            let whole = self.input_tiling(InputId::ONLY).universal_guard();
-            self.consume(InputId::ONLY, whole);
-        }
-    }
-
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(
             self.cached_tile
@@ -1719,17 +1715,7 @@ impl TileProducer for MemoProducer {
     }
 
     fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
-        if !self.base.reads_input() {
-            return self.answer(&projection_guard.projection_for(self));
-        }
-        let projection = projection_guard.projection_for(self);
-        if projection == Projection::Nothing {
-            return self.tiling().empty_tile();
-        }
-        if self.dirty.intersects(&projection) {
-            self.read_input(&mut **self.input(), projection_guard, &projection);
-        }
-        self.answer(&projection)
+        self.answer(&projection_guard.projection_for(self))
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

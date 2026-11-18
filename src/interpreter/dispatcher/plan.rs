@@ -789,7 +789,25 @@ fn run_targets_with_workers(
     for pipeline in 0..members.names.len() {
         reach(PipelineId(pipeline), &mut |breaker, _| breaker.begin_run());
     }
-    let execution = Execution::new(&scopes, &mut dispatcher);
+    let mut execution = Execution::new(&scopes, &mut dispatcher);
+    let mut controls = std::collections::HashSet::new();
+    for pipeline in 0..members.names.len() {
+        reach(PipelineId(pipeline), &mut |breaker, _| {
+            if let Some(producer) = breaker.as_producer()
+                && !controls.insert(producer.base().id)
+            {
+                return;
+            }
+            for stage in breaker.plan_stages(&mut dispatcher) {
+                assert_eq!(
+                    stage.pipeline.0,
+                    execution.handlers.len(),
+                    "each stage has one execution handler"
+                );
+                execution.handlers.push(Handler::Control(stage));
+            }
+        });
+    }
     let mut bindings = HashMap::new();
     let mut ambiguous = std::collections::HashSet::new();
     for located in &members.located {
@@ -873,6 +891,13 @@ fn run_targets_with_workers(
         graphs,
     );
     workers.configure(&mut dispatcher);
+
+    let dispatcher = Arc::new(dispatcher);
+    for pipeline in 0..members.names.len() {
+        reach(PipelineId(pipeline), &mut |breaker, _| {
+            breaker.bind_dispatcher(Arc::downgrade(&dispatcher))
+        });
+    }
 
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
@@ -1006,6 +1031,7 @@ impl Drop for InductionRuns {
 enum Handler {
     Root,
     Body(BreakerHandle),
+    Control(ControlStage),
     Request(StoreCell),
     Step(StoreCell),
 }
@@ -1101,6 +1127,13 @@ impl Execution {
     pub(super) fn reach(&self, pipeline: PipelineId, root: &mut Reach<'_>, call: &mut Call<'_>) {
         match &self.handlers[pipeline.0] {
             Handler::Root => root(pipeline, call),
+            Handler::Control(stage) => call(
+                &mut *stage
+                    .breaker
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner),
+                stage.input,
+            ),
             Handler::Body(handle) => call(
                 &mut *handle.write().unwrap_or_else(PoisonError::into_inner),
                 InputId::ONLY,
@@ -1154,7 +1187,9 @@ impl Execution {
                 let completed = induction(scope).begin_shared(dispatcher, package);
                 self.complete(dispatcher, scope, completed);
             }
-            Handler::Root | Handler::Body(_) => consume_with(dispatcher, reach, package),
+            Handler::Root | Handler::Body(_) | Handler::Control(_) => {
+                consume_with(dispatcher, reach, package)
+            }
         }
         self.hold_followers(dispatcher);
     }
@@ -1167,7 +1202,9 @@ impl Execution {
         consumed: Option<TileGuard>,
     ) {
         match &self.handlers[pipeline.0] {
-            Handler::Step(_) => dispatcher.finish(dispatcher.pushes(pipeline)),
+            Handler::Step(_) | Handler::Control(_) => {
+                dispatcher.finish(dispatcher.pushes(pipeline))
+            }
             Handler::Request(scope) => induction(scope).begin_shared_finish(dispatcher, consumed),
             Handler::Root | Handler::Body(_) => finish_with(dispatcher, reach, pipeline, consumed),
         }
@@ -1205,7 +1242,7 @@ impl Execution {
             .iter()
             .enumerate()
             .filter(|(pipeline, handler)| {
-                !matches!(handler, Handler::Step(_))
+                !matches!(handler, Handler::Step(_) | Handler::Control(_))
                     && !dispatcher.states[*pipeline].held.load(Ordering::SeqCst)
                     && !matches!(handler, Handler::Request(scope) if induction(scope).has_package())
             })
