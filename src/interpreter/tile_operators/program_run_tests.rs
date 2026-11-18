@@ -109,7 +109,11 @@ fn dispatched_with(
 /// breakers' inputs answered.
 fn pulls_beneath_breakers(roots: &[crate::interpreter::sinks::ProducerSlot]) -> u64 {
     fn walk(producer: &mut dyn TileProducer, beneath: bool) -> u64 {
-        let own = if beneath { producer.base().reads } else { 0 };
+        let own = if beneath {
+            producer.base().reads.get()
+        } else {
+            0
+        };
         let breaker = beneath || producer.as_breaking_mut().is_some();
         let mut total = own;
         producer.visit_input_producers_mut(&mut |_, input| total += walk(input, breaker));

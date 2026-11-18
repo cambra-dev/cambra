@@ -141,6 +141,38 @@ pub(crate) fn extract_final_of(
     )))
 }
 
+#[cfg(test)]
+impl ExtractFinal {
+    /// This operator's producer over its subscribed source and default, unplaced, for a test
+    /// that consumes it by hand.
+    fn unplaced_producer(&mut self) -> ExtractFinalProducer {
+        let mut cx = SubscribeContext::new();
+        let source = self.source.subscribe(
+            self.source.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut cx,
+        );
+        let default = self
+            .default
+            .as_mut()
+            .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), &mut cx));
+        ExtractFinalProducer::new(
+            ProducerBase::unowned(ExtractFinalProducer::alloc_id(), self.tiling()),
+            source,
+            default,
+        )
+    }
+
+    /// [`unplaced_producer`](Self::unplaced_producer) once it has consumed its source whole.
+    fn consumed_whole(&mut self) -> ExtractFinalProducer {
+        use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
+        let mut producer = self.unplaced_producer();
+        let whole = producer.source.tiling().universal_guard();
+        producer.consume_in_pipeline(InputId::ONLY, whole);
+        producer
+    }
+}
+
 impl ExtractFinalProducer {
     fn new(
         base: ProducerBase,
@@ -255,83 +287,22 @@ impl TileProducer for ExtractFinalProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
     /// The final position of a stream is one value, or one collection that a release takes
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        if projection_of_one_value(&self.name(), "extracts one final value", &projection_guard)
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        if projection_of_one_value(&self.name(), "extracts one final value", &guard)
             == Projection::Nothing
+            || self.obsolete_guard().is_universal()
         {
             return self.tiling().empty_tile();
         }
-        // Scalar columns use the declared extent, retaining variant arms absent from the
-        // selected value so downstream merges see the declared layout.
-        let empty = self.tiling().empty_tile();
-        if self.obsolete_guard().is_universal() {
-            return empty;
-        }
-        if !self.base.reads_input() {
-            return self.final_tile.clone().unwrap_or(empty);
-        }
-        if let Some(tile) = &self.final_tile {
-            return tile.clone();
-        }
-        let source_tiling = self.source.tiling().clone();
-        let source_tile = self.source.get(source_tiling.universal_guard());
-        if !source_tile.is_terminal() {
-            // Release UInt positions below the highest live position without waiting for
-            // completion. Retain that position because it can still supply the final value.
-            if let Some(keys) = source_tile.live_keys() {
-                let max_pos = keys
-                    .filter_map(|(_, key)| match key {
-                        Value::UInt(p) => Some(p),
-                        _ => None,
-                    })
-                    .max();
-                if let Some(max_pos) = max_pos
-                    && max_pos >= 1
-                {
-                    self.source
-                        .release(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::at_or_below(Value::UInt(max_pos - 1)),
-                        )));
-                }
-            }
-            return empty;
-        }
-        // Release the completed source before selecting its final value or pulling the default.
-        self.source.release(source_tiling.universal_guard());
-        let Tile::DataFunction {
-            domain, deleted, ..
-        } = &source_tile
-        else {
-            panic!("ExtractFinal source must be a collection tile");
-        };
-        // The position being indexed is this collection's key, and what it holds is
-        // everything below it: a value where the values are a column, a whole collection
-        // where they are one.
-        // TODO don't assume sorting; we need to sort by the key value instead.
-        let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
-        if let Some(final_idx) = live_outer {
-            let tile = self.value_at(&source_tile, final_idx);
-            self.final_tile = Some(tile.clone());
-            self.complete = true;
-            self.merged = self.source.tiling().empty_tile();
-            return tile;
-        }
-        // No live positions remain. Cache the default only once it is complete.
-        match self.pull_default() {
-            Some(tile) => {
-                self.final_tile = Some(tile.clone());
-                self.complete = true;
-                self.merged = self.source.tiling().empty_tile();
-                tile
-            }
-            None => empty,
-        }
+        self.final_tile
+            .clone()
+            .unwrap_or_else(|| self.tiling().empty_tile())
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -368,6 +339,22 @@ impl Breaker for ExtractFinalProducer {
         self.keep_greatest_key();
         self.source.release(upstream_guard);
         if !self.source.obsolete_guard().is_universal() {
+            let greatest = self
+                .merged
+                .live_keys()
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, key)| match key {
+                    Value::UInt(position) => Some(position),
+                    _ => None,
+                })
+                .max();
+            if let Some(greatest) = greatest.filter(|position| *position > 0) {
+                self.source
+                    .release(TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::at_or_below(Value::UInt(greatest - 1)),
+                    )));
+            }
             return;
         }
         let Tile::DataFunction {
@@ -519,7 +506,7 @@ mod tests {
 
     impl TileProducer for PartialSourceProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
@@ -572,7 +559,7 @@ mod tests {
 
     impl TileProducer for TerminalSourceProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 self.domain.clone(),
                 Box::new(Tile::Scalar(self.codomain_tile.clone())),
@@ -624,7 +611,7 @@ mod tests {
 
     impl TileProducer for DelayedDefaultProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             if self.ready.get() {
                 Tile::Scalar(ColumnValue::Ints(vec![42]))
             } else {
@@ -646,10 +633,8 @@ mod tests {
     }
 
     /// BUG: a ready fallback should wake readers and let Memo deliver 42, but its notification
-    /// is discarded. A debug probe rejects the unnotified change; without assertions, Memo
-    /// keeps returning an empty result. Convert this pin when repaired.
+    /// is discarded, and Memo keeps returning an empty result. Convert this pin when repaired.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "changed without notifying"))]
     fn bug_delayed_default_does_not_wake_a_memoized_consumer() {
         let ready = Rc::new(Cell::new(false));
         let consumer = Rc::new(RefCell::new(None));
@@ -707,29 +692,27 @@ mod tests {
             let default = Constant::new(Value::Int(42), Extent::Base(BaseType::Int));
             let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
             let guard = op.tiling().universal_guard();
-            let mut producer =
-                op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
+            let mut producer = op.consumed_whole();
             assert!(producer.read_in_pipeline(guard.clone()).is_terminal());
-            assert!(retained(&*producer) > 0);
+            assert!(retained(&producer) > 0);
             producer.release(guard.clone());
-            assert_eq!(retained(&*producer), 0, "a released cache holds nothing");
+            assert_eq!(retained(&producer), 0, "a released cache holds nothing");
             assert_eq!(producer.read_in_pipeline(guard).cell_count(), 0);
         }
     }
 
-    /// BUG: terminal extraction selects the last row instead of the greatest live key.
-    /// Pin the current result until the ordering policy is fixed; the value at key 2 is 20.
+    /// Terminal extraction selects the row at the greatest live key, not the last row: the value
+    /// at key 2 is 20.
     #[test]
-    fn bug_unsorted_final_selection_uses_row_order() {
+    fn terminal_extraction_selects_the_greatest_live_key() {
         let mut op =
             ExtractFinal::without_default(Box::new(int_source(vec![2, 0, 1], vec![20, 0, 10])));
         let guard = op.tiling().universal_guard();
-        let mut producer =
-            op.subscribe(guard.clone(), Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer = op.consumed_whole();
         let Tile::Scalar(result) = producer.read_in_pipeline(guard) else {
             panic!("expected a scalar final value");
         };
-        assert_eq!(result.as_single(), Some(Value::Int(10)));
+        assert_eq!(result.as_single(), Some(Value::Int(20)));
     }
 
     fn union_value(tag: &str, inner: Value) -> Value {
@@ -777,8 +760,7 @@ mod tests {
             named_variant(&[("neg", Extent::Base(BaseType::Int))]),
         );
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
-        let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer = op.consumed_whole();
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
@@ -813,8 +795,7 @@ mod tests {
             named_variant(&[("neg", Extent::Base(BaseType::Int))]),
         );
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
-        let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer = op.consumed_whole();
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
 
         let Tile::Scalar(cv) = tile else {
@@ -827,7 +808,7 @@ mod tests {
         assert_eq!(cv.as_single(), Some(union_value("neg", Value::Int(7))));
     }
 
-    /// On a non-terminal pull, `ExtractFinal` needs only the highest-domain value,
+    /// On a consume of a non-terminal source, `ExtractFinal` needs only the highest-domain value,
     /// so it releases everything below it — `[0, max)`. Over a source with domain
     /// `[0, 1, 2]`, it forwards a release `≤ 1`, freeing the prefix that a
     /// never-terminating scalar-final loop would otherwise pin.
@@ -841,10 +822,8 @@ mod tests {
         };
         let default = Constant::new(Value::Int(0), Extent::Base(BaseType::Int));
         let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
-        let guard = op.tiling().universal_guard();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
-
-        // Non-terminal source → ExtractFinal emits empty but releases `[0, max)`.
+        // Non-terminal source → ExtractFinal's consume releases `[0, max)` and it emits empty.
+        let mut producer = op.consumed_whole();
         let tile = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(
             !tile.is_terminal(),
@@ -868,7 +847,7 @@ mod projection_tests {
 
     /// `final_or_default(xs, 0)` over a finished stream `[10, 20, 30]`, with the pulls of the
     /// stream logged.
-    fn final_of_finished_stream() -> (Box<dyn TileProducer>, GuardLog) {
+    fn final_of_finished_stream() -> (ExtractFinalProducer, GuardLog) {
         let int = || Extent::Base(BaseType::Int);
         let tiling = Tiling::data_function(Extent::uint_range(3), Tiling::Scalar(int()));
         let finished = Tile::data_function(
@@ -882,15 +861,17 @@ mod projection_tests {
             Box::new(stream),
             Box::new(Constant::new(Value::Int(0), int())),
         );
-        let guard = op.tiling().universal_guard();
-        let producer = op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
-        (producer, pulled)
+        (op.unplaced_producer(), pulled)
     }
 
-    /// The last position is not known before the stream ends, so the source is read whole.
+    /// The last position is not known before the stream ends, so the stream consumed whole is
+    /// read once, and the value at its last position is the answer.
     #[test]
     fn the_stream_is_read_whole_to_find_its_last_position() {
+        use crate::interpreter::tile_operators::test_helpers::ConsumeInPipeline as _;
         let (mut last, pulled) = final_of_finished_stream();
+        let whole = last.source.tiling().universal_guard();
+        last.consume_in_pipeline(InputId::ONLY, whole);
         let tile = last.read_in_pipeline(last.tiling().universal_guard());
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
         assert_eq!(pulled.borrow().len(), 1);
@@ -931,7 +912,7 @@ mod consuming_tests {
     };
     use crate::interpreter::{BaseType, Extent};
     use Region::{All, Keys};
-    use Step::{Add, Close, Consume, Notify, Release};
+    use Step::{Add, Close, Consume, Release};
 
     fn int() -> Tiling {
         Tiling::Scalar(Extent::Base(BaseType::Int))
@@ -1035,7 +1016,9 @@ mod consuming_tests {
         assert_eq!(offer(&mut extract), Some(value(10)));
     }
 
-    /// A region is pulled and released once, and a partial source yields no value.
+    /// A region is pulled once and released at what the answer stated, then everything below the
+    /// greatest key merged is released, and a partial source yields no value. The release below
+    /// the greatest key follows every consume, a repeat of the last included.
     #[test]
     fn a_region_is_pulled_and_released_and_yields_no_value_yet() {
         let source = source(0..10);
@@ -1043,13 +1026,23 @@ mod consuming_tests {
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, keys_between(2, 5));
         assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
-        assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
+        assert_eq!(
+            source.borrow().released,
+            vec![keys_between(2, 5), keys_between(0, 4)]
+        );
         assert_eq!(offer(&mut extract), None);
         extract.consume_in_pipeline(InputId::ONLY, keys_between(7, 9));
         extract.consume_in_pipeline(InputId::ONLY, keys_between(4, 8));
         assert_eq!(
             source.borrow().released,
-            vec![keys_between(2, 5), keys_between(7, 9), keys_between(4, 8)]
+            vec![
+                keys_between(2, 5),
+                keys_between(0, 4),
+                keys_between(7, 9),
+                keys_between(0, 8),
+                keys_between(4, 8),
+                keys_between(0, 8),
+            ]
         );
     }
 
@@ -1248,7 +1241,6 @@ mod consuming_tests {
                     self.input.closed = true;
                     self.sut_source.borrow_mut().closed = true;
                 }
-                Notify(_) => unreachable!("an extraction listens to no region"),
                 Consume(region) => {
                     self.sut.consume_in_pipeline(InputId::ONLY, region.guard());
                     if self.released || self.extracted {
@@ -1256,13 +1248,20 @@ mod consuming_tests {
                     }
                     self.answered.extend(self.input.pull(region).0);
                     self.extracted = self.input.drained();
+                    // Short of extraction, the source is released below the greatest key
+                    // answered, which reaches it again on every consume.
+                    if !self.extracted
+                        && let Some(&greatest) = self.answered.iter().max()
+                        && greatest > 0
+                    {
+                        self.input.release(Keys(0, greatest - 1));
+                    }
                 }
                 Release(_) => {
+                    // A repeated release reaches the source again.
                     self.sut.release(int().universal_guard());
-                    if !self.released {
-                        self.released = true;
-                        self.input.release(All);
-                    }
+                    self.released = true;
+                    self.input.release(All);
                 }
             }
         }
@@ -1306,13 +1305,14 @@ mod consuming_tests {
             if self.released {
                 return;
             }
-            // An extraction queried inside a pipeline over the keys that were answered yields the same value.
+            // An extraction that consumes the keys that were answered whole yields the same value.
             let twin_source = source(self.answered.iter().copied());
             let mut twin = final_over(&twin_source, default_of(-1));
+            twin.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
             assert_eq!(
                 scalar_of(&twin.read_in_pipeline(int().universal_guard())),
                 offer(&mut self.sut),
-                "{}: the answer queried inside a pipeline",
+                "{}: the answer of an extraction consumed whole",
                 self.trace
             );
         }
@@ -1351,7 +1351,7 @@ mod consuming_tests {
             let trace = format!("seed {SEED:#x} iteration {iteration} initial {initial:?} steps");
             let mut run = Run::new(&initial, trace);
             for _ in 0..12 {
-                let step = rng.step_among(&run.answered, false);
+                let step = rng.step_among(&run.answered);
                 run.apply(step);
                 run.check();
             }

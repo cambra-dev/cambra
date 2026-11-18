@@ -6568,11 +6568,13 @@ mod variant_ctor_tests {
         ])
     }
 
-    /// Drive an operator once and return its tile.
+    /// Drive an operator once and return its tile: each breaker beneath it consumes its input
+    /// whole, inputs before readers, and the operator is then read whole.
     fn drive(op: Box<dyn TileOperator>) -> Tile {
         let mut op = op;
         let mut cx = SubscribeContext::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        crate::interpreter::tile_operators::test_helpers::consume_breakers(&mut *producer);
         producer.read_in_pipeline(producer.tiling().universal_guard())
     }
 
@@ -6741,7 +6743,7 @@ mod variant_ctor_tests {
         fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
             node
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             if self.released {
                 self.tiling().empty_tile()
             } else {
