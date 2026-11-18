@@ -1001,7 +1001,6 @@ impl Execution {
         // The loop closes its step's arrivals once its finish begins. The step reads every inner
         // pipeline, so its queue closes after their final pushes have landed.
         dispatcher.take_arrivals(step);
-        induction(store).mark_entry_scope();
         // A drive's source offers its pushes only to a scope that takes its positions from them,
         // which the run sets once its scopes are attached.
         induction(store).forget_through_drive();
