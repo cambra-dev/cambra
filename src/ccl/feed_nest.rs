@@ -57,7 +57,7 @@ pub(crate) fn contribution_lambda(
             },
         )
         .unwrap_or(FunKind::Compute);
-    let ty = Type::pi_if_dependent(param.name.clone(), param.ty.clone(), codomain, fun_kind);
+    let ty = Type::fun_over(param.name.clone(), param.ty.clone(), codomain, fun_kind);
     Expr::lambda(
         &param.name,
         param.occurrence.clone(),
@@ -593,11 +593,7 @@ fn read_level(
 /// minted.
 fn collection_over(position: &Name, domain: Type, body: Expr) -> Expr {
     let value = body.ty.clone();
-    let ty = if crate::ccl::subst::type_free_vars(&value).contains(position) {
-        Type::pi_kinded(position.clone(), domain.clone(), value, FunKind::Data(None))
-    } else {
-        Type::data_fun(domain.clone(), value)
-    };
+    let ty = Type::fun_over(position.clone(), domain.clone(), value, FunKind::Data(None));
     Expr::lambda(position, Occurrence::mint(), domain, body).with_ty(ty)
 }
 

@@ -1496,6 +1496,8 @@ impl TypedExpr {
     ///
     /// Used to pre-fill the type in tests or when the type is known at construction time.
     pub fn with_ty(self, ty: Type) -> Self {
+        #[cfg(debug_assertions)]
+        ty.assert_indices_bound();
         TypedExpr { ty, ..self }
     }
 
@@ -1976,7 +1978,7 @@ impl TypedExpr {
     /// Do not pass `Type::Infer(fresh_infer_var())` from lowering — `Hole` is
     /// the correct lowering placeholder.
     ///
-    /// The lambda is a compute function, typed by [`Type::pi_if_dependent`]: a body whose type
+    /// The lambda is a compute function, typed by [`Type::fun_over`]: a body whose type
     /// reads `param` makes it a Pi over `param`.
     pub fn lambda(
         param: impl Into<Name>,
@@ -1985,7 +1987,7 @@ impl TypedExpr {
         body: TypedExpr,
     ) -> Self {
         let param = param.into();
-        let result_ty = Type::pi_if_dependent(
+        let result_ty = Type::fun_over(
             param.clone(),
             param_ty.clone(),
             body.ty.clone(),
