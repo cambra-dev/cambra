@@ -183,8 +183,8 @@ every round of a loop request it opened run before a control request is seen. `C
 bounds a package, not a pass, and no live run sets a source's limit on outstanding packages
 (`Dispatcher::limit`).
 
-Between two claims the serial driver has no package in flight except a loop scope's open request.
-That request's state is `InductionRun::request`, which lives on the store producer and which run
+Between two claims the serial driver may retain a loop or transaction scope's open request.
+A loop request's state is `InductionRun::request`, which lives on the store producer and which run
 cleanup drops (`InductionStoreProducer::clear_run`). A pause between claims would have to keep it on
 the store and re-key its package, which names a queue index in the old plan, to a region of the
 store's input. This is a conjecture; nothing implements a pause between claims.
@@ -193,14 +193,15 @@ store's input. This is a conjecture; nothing implements a pause between claims.
 
 A run that unwinds restores the graph's ownership and nothing more. `ClearsPlacements` clears the
 placements a loop's planning pass sets for its probes, `Planner`'s `Drop` clears the entries the
-planner placed, `SinksUnplacedOnUnwind` unplaces the sink consumers, `InductionRuns` drops each
-loop's run, `run_program_into` puts the `main` output's producer back (`MainGivenBackOnUnwind`), and
-`LiveProgram::run` puts each branch's back (`TakenMains`). The state an operator advanced before the
-unwind, a cache, a consuming breaker's accumulation, a store, or the region each queue consumed,
-stays as it was, so the graph can be planned again, but a run of it answers from that state: a graph
-whose run unwound after its first package is compiled again rather than run again. A run that
-finishes keeps its placements, as `run_targets` leaves them, and a paused one unplaces them ([Pause
-and reload](#pause-and-reload)).
+planner placed, `SinksUnplacedOnUnwind` unplaces the sink consumers, `ScopeRuns` drops each
+loop's and each transaction writer's run, `run_program_into` puts the `main` output's producer
+back (`MainGivenBackOnUnwind`), and `LiveProgram::run` puts each branch's back (`TakenMains`).
+The state an operator advanced before the unwind, a cache, a consuming breaker's accumulation, a
+store, or the region each queue consumed, stays as it was, so the graph can be planned again, but a
+run of it answers from that state: a graph whose run unwound after its first package is compiled
+again rather than run again. A run that finishes keeps the placements outside its scopes' bodies,
+as `run_targets` leaves them, and a scope's body is unplaced once it finishes (`Scope::resume`). A
+paused run unplaces them ([Pause and reload](#pause-and-reload)).
 
 ## Waiting for input completion
 
@@ -340,6 +341,32 @@ Ordered pipelines claim only while the queue's in-flight map is empty. Acknowled
 consumption and updates its counter before removing the entry and unlocking the next claim.
 Graph composition requires every reserved package to remain ready, so neither an in-flight nor
 an acknowledged package can enter a newly composed graph.
+
+## Transaction requests and attempts
+
+A writer's request retains the delivered source region while an attempt runs. As for a loop
+scope, request and step handlers bound the recurrence: both kinds of scope sit behind
+`Handler::Request` and `Handler::Step` as a `Scope`. Both keep their inner pipelines in a `Body`
+(`loop_scope.rs`): the planned graph, its members and entries, the driver, and where execution
+appends the graph to the run's shared dispatcher (`Execution::attach_body`). The driver, body
+breakers and writer are ordinary pipelines planned by the same dependency and notification rules as
+other pipelines. The main claim loop consumes them; transaction control queues work and never
+claims or consumes a body pipeline itself.
+
+The driver samples the committed store and publishes attempt rows. Each row carries its source
+item's position and the sampled frontier. Body pipelines publish the decision, and the writer
+publishes a proposal against that same frontier. The step follows the body's pipelines and waits
+for their output to settle before collecting proposals and validating them. A stale proposal
+records a retry in the store tile and queues another attempt against the new snapshot. A parent
+request is acknowledged only after its source region is released and its decisions are settled.
+
+Completing a writer includes the finish's attempt, so its body observes source completion. Source
+pipelines then close; normal finishes drain the body graph before the request pipeline finishes. A
+writer's attempts are for no request, one request, or the finish (`Attempt` in
+`transaction_scope.rs`). The body holds the scope's finish until its pipelines and step have
+finished (`Body::take_finish`), for a loop as for a writer.
+Run cleanup removes the transaction metadata and its placements, as it does for loop scopes.
+Transaction control retains no dispatcher handle and constructs no additional producer instances.
 
 ## A loop in rounds
 

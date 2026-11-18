@@ -916,14 +916,34 @@ pub struct ProducerBase {
     /// For a pipeline breaker, the pipeline the [`Entry`](crate::interpreter::dispatcher::Entry)
     /// at its input queues for, which a planner sets. `None` for every other producer.
     pub(crate) placement: Option<crate::interpreter::dispatcher::Placement>,
+    /// The id of the last dispatched run that consumed this breaker, `0` before any
+    /// ([`reads_input`](Self::reads_input)).
+    consumed_in_run: std::sync::atomic::AtomicU64,
 }
 
 impl ProducerBase {
     /// A breaker reads its input directly only inside another scheduled pipeline. Its own
     /// placement delegates execution to consume; outside execution a read observes held state.
+    /// A breaker the run consumes runs in a pipeline of its own even where its entry is unplaced,
+    /// as a source of a scope's body is (`Body::activate`), so it also answers from held
+    /// state.
     pub(crate) fn reads_input(&self) -> bool {
-        crate::interpreter::dispatcher::is_in_a_run()
+        let run = crate::interpreter::dispatcher::current_run();
+        run != 0
             && self.placement.as_ref().is_none_or(|at| at.get().is_none())
+            && self
+                .consumed_in_run
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != run
+    }
+
+    /// Record that the current dispatched run consumes this breaker
+    /// ([`reads_input`](Self::reads_input)).
+    pub(crate) fn consumed_in_this_run(&self) {
+        self.consumed_in_run.store(
+            crate::interpreter::dispatcher::current_run(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Initialize a producer for `owner`'s operator.
@@ -946,6 +966,7 @@ impl ProducerBase {
             last_output: None,
             downstream: None,
             placement: None,
+            consumed_in_run: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -990,6 +1011,7 @@ impl ProducerBase {
             last_output: None,
             downstream: None,
             placement: Some(Rc::new(std::cell::Cell::new(None))),
+            consumed_in_run: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -2140,6 +2162,13 @@ pub trait TileProducer {
     /// The cyclic fan-out this producer reads through a reader slot, where it is one: a reader
     /// of that fan-out's store.
     fn store_read(&self) -> Option<StoreRead> {
+        None
+    }
+
+    /// The transaction state behind a cyclic store cell, for dispatcher control.
+    fn as_transaction_store_mut(
+        &mut self,
+    ) -> Option<&mut crate::interpreter::commit_operator::CommitProducer> {
         None
     }
 
