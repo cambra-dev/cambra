@@ -979,7 +979,7 @@ hold.
 
 A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
 the input rows the region covers among those it holds, at once, and each later row of a released
-group on the read that first holds it (`ConverseProducer::release_late_rows`). An input guard names
+group on the next release after a read first holds it. An input guard names
 rows by key, and a group is the rows whose value is the group's key, so no input guard names a group
 before its rows are read. The two parts together release exactly the region named, as
 [Guard operations are exact](#guard-operations-are-exact) requires.
@@ -1780,7 +1780,7 @@ time. A nested `Converse` passes a guard naming standing keys to its input as th
 naming part of one row's inversion names input rows through their values, so the `Converse` records
 each input row it read with the output path `[𝑠…, value, key]` it stands at and its input path
 `[𝑠…, key]`, and releases the input rows whose output path the guard covers. A row read after its
-group was released is released on the read that holds it (`ConverseProducer::release_late_rows`).
+group was released is retained until the next release reclaims it.
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
@@ -2212,3 +2212,23 @@ transitive indices (t1→t3 directly) vs. recompute on demand.
 ### Cycles
 None of the above algorithms guarantee termination in the presence of cycles in the dataflow
 graph. Detecting convergence (rather than truncating iteration) is an open problem.
+
+
+## Immutable producer reads
+
+Every producer implements `get_impl(&self, guard)` and exposes `get(&self, guard)`.
+Operators read their existing inputs directly. Stateful breakers maintain their output during
+consumption; reads observe that snapshot. A read does not step a loop, construct a transaction
+attempt, fold aggregate contributions, or refresh a Cartesian source domain. Cartesian source
+consumers ingest arrivals through the dispatcher's range-completion notifications.
+
+The immutable `get` wrapper validates tiling, projections, releases and completeness, and records
+probe observations. Validation history and read bookkeeping use interior mutability on each
+canonical producer; there is no separate read context or mutable post-read traversal.
+
+Dropped input-row guards, Converse correlations, zip presence and nested source-key correlations
+remain on their canonical operators. Reads record newly discovered rows without releasing inputs.
+Consumption and native release callbacks reclaim retained state. Repeated and empty release
+deliveries also run native reclamation, because a later read can discover additional rows belonging
+to a region already released. Fan-out intersections suppress unchanged upstream releases at shared
+and cyclic boundaries.

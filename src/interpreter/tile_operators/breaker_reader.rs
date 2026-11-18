@@ -23,13 +23,13 @@ struct BreakerReader {
 impl TileProducer for BreakerReader {
     impl_producer_base!();
 
-    fn get(&mut self, guard: TileGuard) -> Tile {
+    fn get(&self, guard: TileGuard) -> Tile {
         #[cfg(debug_assertions)]
         pull_levels::check_input_level(pull_levels::address_of(self), || self.name(), &guard);
-        self.handle.borrow_mut().get(guard)
+        self.handle.borrow().get(guard)
     }
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        self.handle.borrow_mut().get(guard)
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        self.handle.borrow().get(guard)
     }
     fn release_impl(&mut self, guard: TileGuard) {
         self.handle.borrow_mut().release(guard);
@@ -69,7 +69,7 @@ mod tests {
             fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
                 visit("input", &*self.input);
             }
-            fn get_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _: TileGuard) -> Tile {
                 self.input
                     .get(
                         CurryLevel::new(1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(
@@ -82,7 +82,7 @@ mod tests {
         let (tile, tiling) = two_levels_of_ints();
         let input = ProjectionSpy::new(tile, tiling.clone()).0;
         let reader = share_breaker(MemoProducer::over(Box::new(input), &tiling));
-        let mut consumer = IncorrectRead {
+        let consumer = IncorrectRead {
             base: ProducerBase::unowned(IncorrectRead::alloc_id(), &tiling),
             input: reader,
         };

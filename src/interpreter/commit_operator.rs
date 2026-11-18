@@ -2605,7 +2605,7 @@ impl TileProducer for CommitProducer {
         true
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
         if self.breaker.snapshot.is_none() {
             return CommitEngine::unopened().render_full_store_tile(self.tiling());
         }
@@ -3785,7 +3785,7 @@ impl TileProducer for InductionStoreProducer {
         true
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
         if self.breaker.snapshot.is_none() {
             return render_engines(
                 &Engines::unopened(self.tiling()),
@@ -3998,7 +3998,7 @@ impl TileProducer for StoreValueStreamProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         // Read the published store without advancing its writers.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
@@ -4197,6 +4197,7 @@ impl TileOperator for StoreFinalRead {
             self.store_op
                 .subscribe(self.store_op.tiling().universal_guard(), forward, cx);
         Box::new(StoreFinalReadProducer {
+            read_frontier: Default::default(),
             base: ProducerBase::new(
                 StoreFinalReadProducer::alloc_id(),
                 self.tiling(),
@@ -4227,6 +4228,7 @@ impl Consumer for FinalKeyConsumer {
 }
 
 struct StoreFinalReadProducer {
+    read_frontier: crate::interpreter::tile_operators::DroppedRows,
     base: ProducerBase,
     store_producer: Box<dyn TileProducer>,
     key: Value,
@@ -4256,7 +4258,7 @@ impl TileProducer for StoreFinalReadProducer {
     fn input_level(&self, _: &str, _: CurryLevel) -> Option<CurryLevel> {
         None
     }
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         if self.obsolete_guard().is_universal() {
             return self.tiling().empty_tile();
         }
@@ -4276,8 +4278,8 @@ impl TileProducer for StoreFinalReadProducer {
         // which holds every version of every key for the length of the loop.
         if let Some(frontier) = store_frontier(&store) {
             let levels = path_levels(self.store_producer.tiling());
-            self.store_producer
-                .release(domain_prefix_over(vec![frontier.into_value()], &levels));
+            self.read_frontier
+                .remember(domain_prefix_over(vec![frontier.into_value()], &levels));
         }
         let settled = match &store {
             Tile::Store {
@@ -4304,6 +4306,7 @@ impl TileProducer for StoreFinalReadProducer {
         tile
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        self.read_frontier.release_to(&mut *self.store_producer);
         // Under rows the output's levels are the store's, so a release of rows names the
         // same rows of the store, whose stores those rows' readers are then done with.
         // Beneath the rows the output holds a value where the store holds a store, so only a
@@ -4334,7 +4337,7 @@ impl StoreFinalReadProducer {
     /// stands, its seed where its inner loop ran no position. A row still running is left
     /// out, as a scalar read leaves out a store still running, and the induction store's statement
     /// of which rows are complete is the output's.
-    fn per_row(&mut self) -> Tile {
+    fn per_row(&self) -> Tile {
         let tile = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -4538,7 +4541,7 @@ impl StoreDenseReadProducer {
     /// than to the previous row's last write. The enclosing level's `domain_predicate`
     /// comes straight from the store, which knows it because the drive is sequential: a
     /// row can gain no further position once the next row has one.
-    fn read_per_row(&mut self, store: &Tile) -> Tile {
+    fn read_per_row(&self, store: &Tile) -> Tile {
         // Standing levels stand above the induction store and are kept as they are; only the level
         // holding the stores becomes a level of histories. Beneath a standing level the
         // stores are one collection whose groups belong to different enclosing positions, and
@@ -4672,7 +4675,7 @@ impl TileProducer for StoreDenseReadProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint) and
         // fold `key` at each position it has decided. The cycle advances one position
@@ -5935,18 +5938,14 @@ impl TileProducer for InductionDriverProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !(self.base.reads_input() && self.decides.borrow().is_none())
+        true
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
-        if self.base.reads_input() && self.decides.borrow().is_none() {
-            self.step(&guard.projection_for(self))
-        } else {
-            let mut tile = self.rendered.clone();
-            tile.remove_guarded(self.obsolete_guard().clone());
-            tile.restrict_to(&guard.projection_for(self), self.tiling());
-            tile
-        }
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        let mut tile = self.rendered.clone();
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.restrict_to(&guard.projection_for(self), self.tiling());
+        tile
     }
 
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
@@ -6932,7 +6931,7 @@ impl TileProducer for TransactDriverProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         let mut tile = self.rendered.clone();
         tile.restrict_to(&guard.projection(&self.name()), self.tiling());
         tile.remove_guarded(self.obsolete_guard().clone());
@@ -7960,7 +7959,7 @@ impl TileProducer for TransactWriterProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         // A release naming part of a proposal rather than the proposal leaves it in the
         // window (`release_impl`), so what it names is withheld here.
         let mut tile = self.render();
@@ -8127,7 +8126,7 @@ mod tests {
 
         fn snapshot(&mut self) -> Tile {
             let mut reader = self.fan.slot();
-            let mut producer = reader.subscribe(
+            let producer = reader.subscribe(
                 reader.tiling().universal_guard(),
                 Box::new(|| {}),
                 &mut SubscribeContext::new(),
@@ -8778,7 +8777,7 @@ mod tests {
         }
         // A `Restrict` keeps a filtered row's key, marked deleted, in every tile it
         // emits, so this offers the tile as built.
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -8946,7 +8945,7 @@ mod tests {
         }
 
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             let in_tile = self.input.get(self.input.tiling().universal_guard());
             let Tile::DataFunction {
                 domain,
@@ -9988,7 +9987,7 @@ mod tests {
         }
 
         impl_producer_base!();
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
             let tile = self.inner.get(projection_guard);
             let rows = tile.clone();
             if let Tile::DataFunction { domain, .. } = &rows {
@@ -10303,7 +10302,7 @@ mod tests {
     fn store_reads_do_not_advance_execution(#[case] source: &str) {
         let mut fixture = DispatchedStore::new(source);
         let mut reader = fixture.slot();
-        let mut reader = reader.subscribe(
+        let reader = reader.subscribe(
             reader.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -10481,7 +10480,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             let store = self
                 .store_producer
                 .get(self.store_producer.tiling().universal_guard());
@@ -10698,7 +10697,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             honoring_release(&self.tile, self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -11005,7 +11004,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -11548,7 +11547,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             honoring_release(&self.tile.borrow(), self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -11956,7 +11955,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             *self.gets.borrow_mut() += 1;
             if self.obsolete_guard().is_universal() {
                 return self.tiling().empty_tile();
@@ -12016,7 +12015,7 @@ mod tests {
         let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        let producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
         let cell = fan.store().expect("the store is subscribed");
         let whole = cell
             .borrow_mut()

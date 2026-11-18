@@ -6741,7 +6741,7 @@ mod variant_ctor_tests {
         fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
             node
         }
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             if self.released {
                 self.tiling().empty_tile()
             } else {
