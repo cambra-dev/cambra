@@ -359,20 +359,10 @@ impl FreshenLevel {
     }
 }
 
-/// Walk `ty` and replace every variable at level > `lim` with a fresh
-/// variable (level chosen by `target`). Variables at level ≤ `lim` are kept
-/// as-is — they're free in the surrounding scope, not quantified.
-///
-/// The bounds of each quantified variable are themselves freshened
-/// (recursively), so the fresh copy carries the same constraints as the
-/// original.
-/// Freshen a function's kind at instantiation. A concrete kind
-/// (`Data`/`Compute`) is intrinsic and copies through. An unresolved
-/// [`FunKind::Var`] is *quantified*: mint one fresh `FunKindVar` per original
-/// (cached by `uid` so repeated occurrences of the same `κ` in one copy stay
-/// identified), seeding it with a copy of the original's bounds so any
-/// def-intrinsic forcing is preserved while use-site forcing lands on the fresh
-/// cell — decoupling instantiations (see [`FreshenCache::fun_kind_vars`]).
+/// Freshen a function's kind at instantiation. A variable at or below `lim` belongs to the
+/// enclosing scope and is shared. A variable above `lim`, or without a recorded level, is
+/// copied through [`freshen_kind_var`]. Concrete kinds keep their form, with a sum's candidate
+/// types freshened through the same cache.
 fn freshen_fun_kind(
     fun_kind: &FunKind,
     lim: Level,
@@ -539,12 +529,10 @@ fn freshen_capability_var(
     f
 }
 
-/// Mint (or retrieve, cached by `uid`) the per-instantiation copy of a
-/// quantified kind var, carrying across whatever the def site was pinned to.
-///
-/// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
-/// copy identified; the copy decouples *this* instantiation's pin from the
-/// definition's and from every sibling instantiation's.
+/// Keep a kind variable at or below `lim`, or retrieve its per-instantiation copy from the
+/// cache. A variable above `lim`, or without a recorded level, is quantified. Its copy carries
+/// the definition's constraints and receives this instantiation's constraints independently.
+/// Caching by `uid` keeps repeated occurrences of one kind variable in a copy identified.
 fn freshen_kind_var(
     kv: &Rc<FunKindVar>,
     lim: Level,
@@ -554,7 +542,16 @@ fn freshen_kind_var(
     if let Some(f) = cache.fun_kind_vars.get(&kv.uid) {
         return f.clone();
     }
+    // A funkind variable at or below the cutoff is an enclosing scope's, as a variable there
+    // is, and freshens to itself: a copy of a function this freshening copies relates to it as
+    // the original did.
+    if kv.level().is_some_and(|l| l <= lim) {
+        return Rc::clone(kv);
+    }
     let f = FunKindVar::fresh();
+    if let Some(l) = kv.level() {
+        f.place_at(target.level_of(l));
+    }
     // Registered **before** the bounds are carried across: a collection reaches itself
     // through a recurrence, and the cache is what terminates the walk.
     cache.fun_kind_vars.insert(kv.uid, Rc::clone(&f));
@@ -580,13 +577,30 @@ fn freshen_kind_var(
         cache.witnesses.insert(from, f.binder_id_at(i));
     }
     // Each edge's substitution comes across freshened, as a copied bound's does.
-    for (k, edge) in kv.lower_edges() {
-        let edge = freshen_subst_payloads(lim, &edge, target, cache);
-        f.record_under(freshen_fun_kind(&k, lim, target, cache), true, edge);
-    }
-    for (k, edge) in kv.upper_edges() {
-        let edge = freshen_subst_payloads(lim, &edge, target, cache);
-        f.record_under(freshen_fun_kind(&k, lim, target, cache), false, edge);
+    for (lower, edges) in [(true, kv.lower_edges()), (false, kv.upper_edges())] {
+        for (k, edge) in edges {
+            let edge = freshen_subst_payloads(lim, &edge, target, cache);
+            let neighbor = freshen_fun_kind(&k, lim, target, cache);
+            // A neighbor this freshening leaves in place, an enclosing scope's funkind variable,
+            // is not copied, so its side of the edge is recorded here: the edge is recorded on
+            // both ends, and `kv`'s neighbor reads it as it reads its edge to `kv`.
+            if let (FunKind::Var(original), FunKind::Var(kept)) = (&k, &neighbor)
+                && Rc::ptr_eq(original, kept)
+            {
+                let reverse = if lower {
+                    kept.upper_edges()
+                } else {
+                    kept.lower_edges()
+                };
+                for (back, back_edge) in reverse {
+                    if matches!(&back, FunKind::Var(b) if b.uid == kv.uid) {
+                        let back_edge = freshen_subst_payloads(lim, &back_edge, target, cache);
+                        kept.record_under(FunKind::Var(Rc::clone(&f)), !lower, back_edge);
+                    }
+                }
+            }
+            f.record_under(neighbor, lower, edge);
+        }
     }
     for src in kv.built_over().into_iter().rev() {
         f.contributes_first(freshen_fun_kind(&src, lim, target, cache));
@@ -1076,6 +1090,10 @@ pub fn freshen_above(
             if let Some(existing) = cache.vars.get(&tv.uid) {
                 return Type::Infer(Rc::clone(existing));
             }
+            debug_assert!(
+                tv.fun_kind.level().is_none_or(|level| level > lim),
+                "a quantified type variable's own funkind is quantified at the same cutoff"
+            );
             // Mint the fresh variable at the level `target` dictates: the use
             // site's level (`At`) or the original's own level (`Preserve`), raised
             // (`Raise`).
@@ -1104,6 +1122,7 @@ pub fn freshen_above(
                 Some(existing) => Rc::clone(existing),
                 None => {
                     let f = FunKindVar::fresh();
+                    f.place_at(new_level);
                     cache.fun_kind_vars.insert(tv.fun_kind.uid, Rc::clone(&f));
                     f
                 }
