@@ -54,9 +54,7 @@ use std::rc::Rc;
 /// restriction-refinement subsetting (`unrefined ⊀ refined`) is enforced. Every edge it
 /// draws carries [`CheckCtx::scopes`], so a deficit between two predicates that state
 /// one restriction differently is decided by entailment rather than by structural
-/// matching. The explicit cast operator canonicalizes restriction *acquisition*, so the
-/// long-standing deep strip is gone, and the check runs both after inference *and*
-/// after join planning (`context.rs`).
+/// matching. The check runs both after inference and after join planning (`context.rs`).
 ///
 /// There is no cast escape in the adjacency rule: a producer must already
 /// carry the refinement its consumer demands. Join planning makes this hold by
@@ -67,8 +65,7 @@ use std::rc::Rc;
 /// `Rc` at every marker, the producer's `{D | r}` and the consumer's contract
 /// rarely share an `Rc`; [`crate::ccl::infer::solver`]'s subset check matches them
 /// by *structural predicate equality* (not just `Rc` identity) so the re-minted
-/// refinements still chain. (Previously this gap was papered over by a
-/// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
+/// refinements still chain.
 pub(super) struct CheckCtx {
     /// The types of the registered data sources, where the caller states them. A projected
     /// source's recorded type is verified against its registered one; without a registry the
@@ -1006,8 +1003,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         }
 
         // Leaves whose type carries the full load and was resolved during
-        // inference — trust the recorded type (matching the old typecheck,
-        // which left these unchecked).
+        // inference — trust the recorded type.
         TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::LoadFrom(_)
@@ -1160,7 +1156,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // Reconcile: the rule-derived type must agree with the node's recorded
     // type. In Emit this is the writeback `expr.ty = ty`; here it is the
     // subtype check `ty <: expr.ty` (the recorded type may be a width-wider
-    // supertype — e.g. an annotation — exactly as the old typecheck allowed).
+    // supertype — e.g. an annotation).
     //
     // Fast path: when the rule reproduced the recorded type exactly (the common
     // case — eliminators that destructure return the function's own codomain,
@@ -1717,9 +1713,7 @@ mod tests {
     /// returning at the first, and each recorded error is blamed on the node
     /// whose rule raised it.
     ///
-    /// This is the property the shared rules give Check that emission does not
-    /// yet have (see `emit_node`'s `TODO(multi-error)`), so it is worth pinning:
-    /// two independently ill-typed applications must produce two errors on two
+    /// Two independently ill-typed applications must produce two errors on two
     /// distinct nodes, not one error and an early return.
     #[test]
     fn check_accumulates_one_error_per_failing_node() {

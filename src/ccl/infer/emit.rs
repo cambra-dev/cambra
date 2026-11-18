@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Constraint emitter (Step 7d)
+// Constraint emitter
 // ---------------------------------------------------------------------------
 
 use crate::ccl::Label;
@@ -114,10 +114,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // three nodes of that `__elem == n` term are minted *here* — the
             // predicate is a pure function of the literal value, memoized per
             // pass, so it is born the first time each distinct value is seen.
-            //
-            // The recording names the literal's own node, which is the edge
-            // `predicate-domain-report` records as missing: nothing used to link
-            // a singleton refinement back to the literal the user wrote.
+            // The recording names the literal's own node.
             let _g = crate::ccl::provenance::enter(
                 node_id,
                 "infer.lit_singleton",
@@ -189,13 +186,6 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             }
         }
 
-        // Builtins with a polymorphic signature (shared type variables
-        // across positions) live in the `OperatorSchemes` registry — at
-        // each use site instantiates a fresh copy. `FinalOrDefault`
-        // (`∀α β. ((α → β), β) → β`), the two `get_prev_*` causal accessors,
-        // and `AwaitFinal` (`∀ν. Mut(ν, Txn) → ν`) qualify. All other
-        // builtins arrive pre-stamped from lowering and just get converted
-        // in place.
         // `unbox` reads its argument's witnesses out of the value: `(c : 𝐴) ⇒ 𝐴‹elim(c)›`, the
         // argument's collection type with each binder of its sum read as `σᵢ(c)`
         // (`crate::ccl::subst::Elim`). Which binders those are is the argument's funkind's to
@@ -216,6 +206,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             Type::pi(c, arg, result)
         }
 
+        // Builtins with a polymorphic signature (shared type variables across positions) live
+        // in the `OperatorSchemes` registry, and each use site instantiates a fresh copy:
+        // `Box`, `CollectionContains`, `Uncurry`, `FinalOrDefault`, the two `get_prev_*` causal
+        // accessors, and `AwaitFinal`. All other builtins arrive pre-stamped from lowering and
+        // are converted in place.
         TypedExprNode::Builtin(b) => {
             if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
                 // Through [`Typing::instantiate`], which stamps the *use site's*
@@ -249,11 +244,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
-        // Scheme-based rules: the registry lookup (which scheme for this op)
-        // is Emit-specific, so the dispatcher resolves it and hands the
-        // instantiable scheme to the shared rule. Cloning releases the `ctx`
-        // borrow on the registry so the rule can take `ctx` mutably; schemes
-        // are `Rc`-shaped, so the clone is cheap.
+        // Scheme-based rules: the dispatcher looks up the op's scheme and hands it to the
+        // shared rule. Cloning releases the `ctx` borrow on the registry so the rule can take
+        // `ctx` mutably; schemes are `Rc`-shaped, so the clone is cheap.
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
             emit_binop(node_id, *op, left, right, &sig, ctx)?
@@ -392,9 +385,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Begin { body, .. } => emit_begin(body, ctx)?,
 
-        // The feed/define target lookup is Emit-specific (Check maintains no
-        // scope): resolve the feed handle's type from the environment exactly
-        // as a `Var` use would. Instantiation is a no-op for the common
+        // Resolve the feed handle's type from the environment exactly as a
+        // `Var` use would. Instantiation is a no-op for the common
         // monomorphic defer binding; for a feed-typed lambda param it
         // returns the param type verbatim.
         TypedExprNode::Feed {
@@ -464,8 +456,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             body,
         } => emit_for(node_id, position, target, iter, body, ctx)?,
 
-        // The write target's lookup is Emit-specific, like `Feed`'s: the
-        // written value must flow into the mutable variable's binding type.
+        // Look up the write target: the written value must flow into the
+        // mutable variable's binding type.
         // Instantiation is a no-op for the monomorphic accumulator bindings
         // lowering produces (a polymorphic init would under-constrain the
         // write and surface as `UnresolvedInfer`).
@@ -1009,9 +1001,9 @@ pub(super) fn emit_lambda<C: Typing>(
     //   bound, which *is* "inferred, and no wider than `𝑇`": body usage and call
     //   sites add their own bounds, so the parameter lands on the meet.
     //
-    // Reconciling the slot against the annotation afterwards — what this used to
-    // do — is what made an exact annotation behave as neither reading: it
-    // contributed one upper bound among several instead of being the type.
+    // Reconciling the slot against the annotation afterwards would make an exact
+    // annotation behave as neither reading: it would contribute one upper bound
+    // among several instead of being the type.
     //
     // A Hole (no annotation) turns into a fresh Var accumulating bounds from body
     // usage and call sites. Either way `param.ty` is linked to that type so
@@ -1473,7 +1465,7 @@ fn emit_lookup_checked<C: Typing>(
         ctx,
     )?;
     let result = Type::option_of(at_key);
-    // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
+    // Stamp the builtin with the concrete instance at this site so later
     // passes read a consistent type off the node. The domain is the pair the operator is
     // applied to, which is what op-conversion reads to size its output.
     function.ty = Type::fun(
