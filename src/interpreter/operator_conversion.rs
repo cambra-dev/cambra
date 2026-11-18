@@ -1880,6 +1880,14 @@ the compilation declined outlives it here"
     /// What bounds a witness the value carries is the type a key has, so a range converts to
     /// `UInt` rather than to the range: which range this value is, is the value's to say.
     fn candidate_key_extent(&self, candidate: &Type) -> Result<Extent, ConversionError> {
+        // A generalized parameter's keys are its bound's ([`Self::extent_in`]), refined or not.
+        if let Some(bound) = candidate
+            .peel_refinements()
+            .generalized_param()
+            .and_then(|p| p.bound.as_ref())
+        {
+            return self.candidate_key_extent(bound);
+        }
         match candidate.peel_refinements() {
             Type::UIntRange(_) => Ok(Extent::Base(BaseType::UInt)),
             other => self.extent_of(other),
