@@ -19,6 +19,7 @@
 //! seed and `CAMBRA_FUZZ_N` the number of chains, the same two knobs the
 //! order fuzz reads.
 
+use crate::ccl::infer::solver::Solver;
 use crate::it::type_gen;
 
 use cambra::ccl::Type;
@@ -30,12 +31,13 @@ use type_gen::{Fragment, Rng, env_or, gen_ty, partner};
 /// the triple printed.
 #[test]
 fn transitivity_chain_fuzz() {
+    let solver = &mut Solver::new();
     let seed: u64 = env_or("CAMBRA_FUZZ_SEED", 0xBEEF);
     let n: usize = env_or("CAMBRA_FUZZ_N", 4000);
 
-    let ok = |x: &Type, y: &Type| {
+    let mut ok = |x: &Type, y: &Type| {
         let mut cache = ConstrainCache::new();
-        constrain_subtype(x, y, &mut cache).is_ok()
+        constrain_subtype(solver, x, y, &mut cache).is_ok()
     };
     let mut rng = Rng::new(seed);
     let mut chains = 0usize;

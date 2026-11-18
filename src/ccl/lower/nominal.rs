@@ -15,6 +15,7 @@
 
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -1694,8 +1695,9 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     }
     let case = ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label);
     let name = member_binding(decl, IS_NONE);
-    let self_ty = decl
-        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
+    let self_ty = decl.applied_to_params(&mut Solver::none(), &mut |n, ty| {
+        ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label)
+    });
     let binder = Occurrence::mint();
     bind_function(
         decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
@@ -1762,8 +1764,9 @@ fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     );
     let case = ctx.tag_machinery(case, span, label);
     let name = member_binding(decl, "extract");
-    let self_ty = decl
-        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
+    let self_ty = decl.applied_to_params(&mut Solver::none(), &mut |n, ty| {
+        ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label)
+    });
     let binder = Occurrence::mint();
     bind_function(
         decl, name, binder, arg, self_ty, case, acc, span, label, ctx,

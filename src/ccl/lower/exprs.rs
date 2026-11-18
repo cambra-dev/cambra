@@ -3,6 +3,7 @@
 //! application), unary ops, feeds, defines, and literal constants.
 
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use std::rc::Rc;
 
 use super::*;
@@ -326,7 +327,7 @@ pub(super) fn lower_call(
                 func.span,
                 "lower.int_to_uint",
             );
-            let stamp = crate::ccl::ty::int_to_uint_type(|predicate| {
+            let stamp = crate::ccl::ty::int_to_uint_type(&mut Solver::none(), |predicate| {
                 ctx.tag_predicate(predicate, func.span, "lower.int_to_uint")
             });
             let op = op.with_ty(stamp);

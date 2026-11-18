@@ -193,7 +193,7 @@ impl KindVarPool {
             let i = rng.below(self.0.len() as u64) as usize;
             return Rc::clone(&self.0[i]);
         }
-        let v = FunKindVar::fresh();
+        let v = FunKindVar::unowned(cambra::ccl::KindPin::Unpinned, false);
         self.0.push(Rc::clone(&v));
         v
     }

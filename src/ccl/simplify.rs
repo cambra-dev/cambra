@@ -54,6 +54,7 @@ use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, count_free, is_builtin, walk_quoted_terms_mut,
 };
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::lambda_elim::{id, strength_over, typed_tuple, zip_pair};
 use crate::ccl::ty::FunKind;
 use crate::ccl::{Builtin, Expr, Name, ProjKey, Type, TypedExpr, TypedExprNode};
@@ -726,7 +727,12 @@ fn try_pairwise_in_compose(
     // term-determined refinements, reading a `target` whose kind now matches.
     if let TypedExprNode::Cast { value, target } = &expr.node {
         let view = expr.ty.clone();
-        expr.ty = crate::ccl::ccl_utils::canonical_cast_ty(target, Some(&value.ty), view);
+        expr.ty = crate::ccl::ccl_utils::canonical_cast_ty(
+            &mut Solver::none(),
+            target,
+            Some(&value.ty),
+            view,
+        );
     }
     expr.user_annotation = user_annotation;
     true
@@ -2002,7 +2008,7 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
                 (Some(f), None) => match (f.ty.codomain(), curry_ty.codomain()) {
                     (Some(domain), Some(codomain)) => {
                         let domain = crate::ccl::subst::open_codomain(&f.ty, &domain);
-                        Type::fun_like_or_hole(&f.ty, &domain, &codomain)
+                        Type::fun_like_or_hole(&mut Solver::none(), &f.ty, &domain, &codomain)
                     }
                     _ => Type::Hole,
                 },

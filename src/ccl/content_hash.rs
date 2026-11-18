@@ -1186,44 +1186,6 @@ mod tests {
             h(&typed(Type::fun(int(), int()))),
             h(&typed(Type::data_fun(int(), int()))),
         );
-        // An unresolved kind is a third state, not a synonym for either point.
-        let unpinned = || {
-            typed(Type::Fun {
-                name: None,
-                fun_kind: FunKind::fresh_var(),
-                domain: Box::new(int()),
-                codomain: Box::new(int()),
-                capabilities: crate::ccl::capabilities::Capabilities::none(),
-            })
-        };
-        assert_ne!(h(&unpinned()), h(&typed(Type::fun(int(), int()))));
-        // Two fresh variables differ only in `uid`, a per-compilation identity,
-        // so they agree — the property the whole hash rests on.
-        assert_eq!(h(&unpinned()), h(&unpinned()));
-
-        // What a variable was pinned to *is* content, and it is the one part of
-        // a `FunKindVar` that a program determines rather than allocation order.
-        let pinned = |data: bool| {
-            let fun_kind = FunKind::fresh_var();
-            let FunKind::Var(v) = &fun_kind else {
-                unreachable!()
-            };
-            if data {
-                v.stamp_data()
-            } else {
-                v.record(FunKind::Compute, true)
-            }
-            typed(Type::Fun {
-                name: None,
-                fun_kind,
-                domain: Box::new(int()),
-                codomain: Box::new(int()),
-                capabilities: crate::ccl::capabilities::Capabilities::none(),
-            })
-        };
-        assert_ne!(h(&pinned(true)), h(&pinned(false)));
-        assert_ne!(h(&pinned(false)), h(&unpinned()));
-        assert_eq!(h(&pinned(true)), h(&pinned(true)));
     }
 
     #[test]

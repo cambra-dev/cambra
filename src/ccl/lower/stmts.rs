@@ -4,6 +4,7 @@
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType, TypeEntry, TypeEntryForm};
 use std::{collections::HashSet, rc::Rc};
 
@@ -3300,7 +3301,7 @@ fn lower_quantified_trait(
             .expect("the member was just declared");
         slot.kind = crate::ccl::ty::TypeKind::family(
             domains.clone(),
-            Some(Type::family(binders.to_vec(), bound)),
+            Some(Type::family(&mut Solver::none(), binders.to_vec(), bound)),
         );
     }
     // An operand that reads no type parameter leaves the requirement nothing to state of a
@@ -3426,7 +3427,10 @@ fn bound_quantified_member(
         .map(|(n, t)| (Name::raw(n.node.clone()), t.clone()))
         .collect();
     let domains: Vec<Type> = binders.iter().map(|(_, t)| t.clone()).collect();
-    slot.kind = crate::ccl::ty::TypeKind::family(domains, Some(Type::family(binders, lowered)));
+    slot.kind = crate::ccl::ty::TypeKind::family(
+        domains,
+        Some(Type::family(&mut Solver::none(), binders, lowered)),
+    );
     slot.bound_at = Some(bound.span);
     Ok(())
 }
@@ -3545,8 +3549,10 @@ fn bound_family_value(
     }
     let bound = lower_type_expr(sup, ctx)?;
     refuse_reading_binders(scope, &bound, sup.span)?;
-    members[at].kind =
-        crate::ccl::ty::TypeKind::family(domains, Some(Type::family(applied_to, bound)));
+    members[at].kind = crate::ccl::ty::TypeKind::family(
+        domains,
+        Some(Type::family(&mut Solver::none(), applied_to, bound)),
+    );
     members[at].bound_at = Some(sup.span);
     Ok(())
 }
@@ -5461,12 +5467,13 @@ fn family_argument(
     if let Some(PassedOnFamily { binders, app }) =
         passed_on_family(arg, domains, &format!("`{}`'s family", param.spelling), ctx)?
     {
-        return Ok(Type::family(binders, app));
+        return Ok(Type::family(&mut Solver::none(), binders, app));
     }
     let body = lower_type_expr(arg, ctx)?;
     // `_` infers the whole family, so its hole stands under the binders.
     if matches!(body, Type::Hole) {
         return Ok(Type::family(
+            &mut Solver::none(),
             domains
                 .iter()
                 .map(|d| (Name::fresh("__family_k"), d.clone()))
@@ -5643,6 +5650,7 @@ fn under_type_binders(
         .map(|(name, _)| Some(Name::raw(name.node.clone())))
         .collect();
     Ok(crate::ccl::subst::close_pi_binders(
+        &mut Solver::none(),
         &enclosing,
         &lowered?,
         crate::ccl::Ids::Fresh,
@@ -5855,7 +5863,11 @@ fn lower_type_application(
                     crate::ccl::FunKind::Data(None),
                 ));
             }
-            Ok(Type::full_map_of(key, lower_type_expr(v, ctx)?))
+            Ok(Type::full_map_of(
+                &mut Solver::none(),
+                key,
+                lower_type_expr(v, ctx)?,
+            ))
         }
         // `Set(K)` = `Map(K, unit)` — a map whose codomain is `unit`, so the
         // key domain is the payload (`Type::set_of`).

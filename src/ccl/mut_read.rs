@@ -155,6 +155,7 @@
 //! transaction that performs it.
 
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::Duplicate;
@@ -1077,7 +1078,8 @@ fn reveal_go(
                 // The terms the restated type quotes are minted for the `let` whose definiens
                 // they copy.
                 let _g = provenance::enter(d.at, "mut_read.reveal", Nature::Machinery);
-                *ty = Subst::discharge(n, d.value.clone_preserving_ids()).apply_type(ty);
+                *ty = Subst::discharge(n, d.value.clone_preserving_ids())
+                    .apply_type_in(&mut Solver::scratch(), ty);
             }
         }
     });

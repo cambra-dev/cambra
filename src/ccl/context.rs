@@ -5,6 +5,7 @@
 
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::lower::ResolvedName;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2520,13 +2521,16 @@ fn check_modules(
                 .is_none_or(|home| !rejected.contains(&home))
                 || blame.span(error.node_id, Some(before)).file == check.file
         });
+        // The errors' types hold the failed run's variables.
+        let solver = &mut Solver::scratch();
         let respelling = crate::ccl::subst::Subst::then(
+            solver,
             &mut_read::read_respelling(&tree, crate::ccl::Ids::Fresh),
             &reads_named,
         );
         let errors = errors
             .map(|mut located| {
-                located.respell(&respelling);
+                located.respell(solver, &respelling);
                 located
             })
             .collect();
@@ -2754,7 +2758,7 @@ fn normalized(error: &InferError) -> InferError {
     }
     let vars = RefCell::new(Vec::new());
     let mut error = error.clone();
-    error.map_types(&|ty| {
+    error.map_types(&mut |ty| {
         let mut ty = ty.clone();
         number(&mut ty, &vars);
         walk_refined_predicates_mut(&mut ty, &PredMemo::new(), &(), &mut |predicate, _| {
@@ -3081,17 +3085,19 @@ fn run_passes(
         // than the term it names: machinery no program mentions. Respell both
         // here, where the tree still carries the bindings (`mut_read::unbind`
         // erases them below) and nothing types the error's types again.
-        let respelling = crate::ccl::subst::Subst::then(
-            &anf::temp_respelling(&expr, crate::ccl::Ids::Fresh),
-            &crate::ccl::subst::Subst::then(
-                &mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh),
-                &reads_named,
-            ),
+        // The errors' types hold the failed run's variables.
+        let solver = &mut Solver::scratch();
+        let temps = anf::temp_respelling(&expr, crate::ccl::Ids::Fresh);
+        let reads = crate::ccl::subst::Subst::then(
+            solver,
+            &mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh),
+            &reads_named,
         );
+        let respelling = crate::ccl::subst::Subst::then(solver, &temps, &reads);
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.respell(&respelling);
+                located.respell(solver, &respelling);
                 located
             })
             .collect();
@@ -3345,7 +3351,7 @@ fn run_passes(
 
     // The program is pure-functional from here: every effect has been discharged.
     #[cfg(debug_assertions)]
-    crate::ccl::capabilities::assert_discharged(&channelized);
+    crate::ccl::capabilities::assert_discharged(&mut Solver::none(), &channelized);
     let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
         // Every point-free morphism now serves every value of the parameters eliminated
         // around it, so a type stated under one is generalized over what it can no longer

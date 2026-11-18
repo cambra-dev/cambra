@@ -6,6 +6,7 @@
 //! [`CompactType`] / [`CompactGraph`] are the shared currency consumed by the
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::nominal::{DeclMap, NominalDecl, Variance};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -285,8 +286,13 @@ impl CompactTypeKind {
     /// this operation against the model — the polar merge's oracle cannot, since the model's
     /// compact form has no Σ binder slot to carry a kind.
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn merge_kinds(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
-        Self::merge(pol, a, b)
+    pub fn merge_kinds(
+        solver: &mut Solver,
+        pol: bool,
+        a: CompactTypeKind,
+        b: CompactTypeKind,
+    ) -> CompactTypeKind {
+        Self::merge(solver, pol, a, b)
     }
 
     /// Merge binder kinds at the enclosing function's polarity. A sum binder constrains the
@@ -306,7 +312,12 @@ impl CompactTypeKind {
     /// polarities. That sample contains no nested record or function domains. The semantic
     /// theorem `kind_glb_assoc` follows from leastness; it does not establish that this
     /// implementation computes the semantic meet for every Rust compact position.
-    fn merge(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
+    fn merge(
+        solver: &mut Solver,
+        pol: bool,
+        a: CompactTypeKind,
+        b: CompactTypeKind,
+    ) -> CompactTypeKind {
         use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
         let (a, b) = if pol {
             (a, b)
@@ -346,19 +357,25 @@ impl CompactTypeKind {
             // holds both. A meet keeps the candidates it admits.
             (Enumerated(xs), UIntRanges) | (UIntRanges, Enumerated(xs)) => {
                 if pol {
-                    if xs.iter().all(denotes_a_uint_range) {
+                    if xs.iter().all(|x| denotes_a_uint_range(solver, x)) {
                         UIntRanges
                     } else {
                         Universe
                     }
                 } else {
-                    Enumerated(xs.into_iter().filter(denotes_a_uint_range).collect())
+                    Enumerated(
+                        xs.into_iter()
+                            .filter(|x| denotes_a_uint_range(solver, x))
+                            .collect(),
+                    )
                 }
             }
             (UIntRanges, UIntRanges) => UIntRanges,
             // Two bounds are ordered by their parameters, so this is the parameter's own
             // merge at this polarity — the reason the parameter is a [`CompactType`].
-            (SubtypesOf(x), SubtypesOf(y)) => SubtypesOf(Box::new(CompactType::merge(pol, *x, *y))),
+            (SubtypesOf(x), SubtypesOf(y)) => {
+                SubtypesOf(Box::new(CompactType::merge(solver, pol, *x, *y)))
+            }
             // **A join with a bound is a bound, not the universe.** Every type below the
             // parameter is below the parameter joined with the candidates, and so is every
             // candidate; and nothing smaller is above both, since the only kinds above a
@@ -387,7 +404,7 @@ impl CompactTypeKind {
             (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) if pol => {
                 SubtypesOf(Box::new(
                     xs.into_iter()
-                        .fold(*k, |acc, x| CompactType::merge(true, acc, x)),
+                        .fold(*k, |acc, x| CompactType::merge(solver, true, acc, x)),
                 ))
             }
             // **A bound and `UIntRanges` have only the universe above them.** Anything above
@@ -422,7 +439,7 @@ impl CompactTypeKind {
                 // one once the variables answer.
                 Enumerated(if k.denotes_a_type() {
                     xs.into_iter()
-                        .filter(|x| x.denotes_a_type() && x.is_below(&k))
+                        .filter(|x| x.denotes_a_type() && x.is_below(solver, &k))
                         .collect()
                 } else {
                     Vec::new()
@@ -434,7 +451,7 @@ impl CompactTypeKind {
             // its shape rather than a subtyping search, which is why this row needs nothing
             // the join did not already have.
             (SubtypesOf(k), UIntRanges) | (UIntRanges, SubtypesOf(k)) => {
-                Enumerated(if denotes_a_uint_range(&k) {
+                Enumerated(if denotes_a_uint_range(solver, &k) {
                     vec![*k]
                 } else {
                     Vec::new()
@@ -461,11 +478,12 @@ pub struct CompactWitness {
 
 /// Whether `acting` maps a name or witness `v`'s own content reads ([`ContentWalk::reads_of`]).
 fn content_mentions(
+    solver: &mut Solver,
     v: &Rc<crate::ccl::infer_var::InferVar>,
     acting: &Subst,
     walk: &mut ContentWalk,
 ) -> bool {
-    let reads = walk.reads_of(v);
+    let reads = walk.reads_of(solver, v);
     if acting.maps_any(&reads.names) {
         return true;
     }
@@ -474,7 +492,7 @@ fn content_mentions(
     if reads.witnesses.is_empty() {
         return false;
     }
-    let witnesses = acting.mapped_witnesses();
+    let witnesses = acting.mapped_witnesses(solver);
     reads.witnesses.iter().any(|w| witnesses.contains(w))
 }
 
@@ -512,7 +530,11 @@ impl ContentWalk {
     /// Variables whose bounds reach one another in a cycle read what any of them reads, so the
     /// reads of every variable `v` reaches are computed together, from nothing until no
     /// variable's reads grow.
-    fn reads_of(&mut self, v: &Rc<crate::ccl::infer_var::InferVar>) -> Rc<OwnReads> {
+    fn reads_of(
+        &mut self,
+        solver: &mut Solver,
+        v: &Rc<crate::ccl::infer_var::InferVar>,
+    ) -> Rc<OwnReads> {
         if let Some(done) = self.reads.get(&v.uid) {
             return Rc::clone(done);
         }
@@ -523,7 +545,7 @@ impl ContentWalk {
             if self.reads.contains_key(&u.uid) || !entered.insert(u.uid) {
                 continue;
             }
-            let bounds = own_bounds(&u);
+            let bounds = own_bounds(solver, &u);
             for b in &bounds {
                 stack.extend(b.reached.iter().cloned());
             }
@@ -572,30 +594,31 @@ impl ContentWalk {
 }
 
 /// `v`'s bounds under no acting discharge, as [`ContentWalk::reads_of`] reads them.
-fn own_bounds(v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
-    let b = v.bounds.borrow();
-    b.lower()
-        .iter()
-        .chain(b.upper().iter())
-        .filter(|b| {
-            let (_, discharged) = b.self_subst.split_renames();
-            discharged.acting_on(v).is_id()
-        })
-        .map(|b| {
-            let mut reached = Vec::new();
-            b.ty.walk_infer_vars(&mut |v| reached.push(Rc::clone(v)));
-            OwnBound {
-                render: b.render_subst().image_table(),
-                reads: OwnReads {
-                    names: crate::ccl::subst::type_free_vars(&b.ty),
-                    witnesses: crate::ccl::ty::witness_references(&b.ty)
-                        .into_iter()
-                        .collect(),
-                },
-                reached,
-            }
-        })
-        .collect()
+fn own_bounds(solver: &mut Solver, v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
+    let (lower, upper) = {
+        let b = v.bounds(solver);
+        (Rc::clone(b.lower()), Rc::clone(b.upper()))
+    };
+    let mut out = Vec::new();
+    for b in lower.iter().chain(upper.iter()) {
+        let (_, discharged) = b.self_subst.split_renames();
+        if !discharged.acting_on(solver, v).is_id() {
+            continue;
+        }
+        let mut reached = Vec::new();
+        b.ty.walk_infer_vars(&mut |v| reached.push(Rc::clone(v)));
+        out.push(OwnBound {
+            render: b.render_subst(solver).image_table(),
+            reads: OwnReads {
+                names: crate::ccl::subst::type_free_vars(&b.ty),
+                witnesses: crate::ccl::ty::witness_references(&b.ty)
+                    .into_iter()
+                    .collect(),
+            },
+            reached,
+        });
+    }
+    out
 }
 
 /// A history in a compacted position: its function's binder, domain and value, the two
@@ -810,7 +833,7 @@ impl CompactType {
 /// **A witness projected through a sum is a dense range where its whole range is**, as
 /// `admits` judges it: `σ₁(𝑐)` is whichever candidate `𝑐` holds, so a sum ranging over dense
 /// ranges alone projects one.
-fn denotes_a_uint_range(ct: &CompactType) -> bool {
+fn denotes_a_uint_range(solver: &mut Solver, ct: &CompactType) -> bool {
     let o = ct.occupied();
     o.atoms == 1
         && o.fun.is_none()
@@ -818,7 +841,7 @@ fn denotes_a_uint_range(ct: &CompactType) -> bool {
         && ct.atoms.iter().all(|a| match a {
             AtomKey::UIntRange(_) => true,
             AtomKey::Projection(p) => match &*p.ty {
-                Type::WitnessProjection(p) => projects_a_uint_range(p),
+                Type::WitnessProjection(p) => projects_a_uint_range(solver, p),
                 _ => false,
             },
             _ => false,
@@ -827,9 +850,9 @@ fn denotes_a_uint_range(ct: &CompactType) -> bool {
 
 /// Whether `p` projects a dense range: its sum ranges over dense ranges alone. A term typed by
 /// a variable is read through the variable's compaction, at the binder `p` projects.
-fn projects_a_uint_range(p: &crate::ccl::ty::WitnessProjection) -> bool {
+fn projects_a_uint_range(solver: &mut Solver, p: &crate::ccl::ty::WitnessProjection) -> bool {
     if let Some(w) = p.witness() {
-        return ranges_over_uint_ranges(&w.type_kind());
+        return ranges_over_uint_ranges(solver, &w.type_kind());
     }
     let Type::Infer(v) = p.term.ty.peel_refinements() else {
         return false;
@@ -852,26 +875,26 @@ fn projects_a_uint_range(p: &crate::ccl::ty::WitnessProjection) -> bool {
     }
     let reading = Reading(v.uid);
     // This query runs under `READING`, so its result must not enter the batch's root cache.
-    let term = compact_type_with(&p.term.ty, true, false).term;
+    let term = compact_type_with(solver, &p.term.ty, true, false).term;
     drop(reading);
     term.fun
         .and_then(|f| f.binders.get(p.position).map(|w| w.type_kind.clone()))
         .is_some_and(|k| match k {
             CompactTypeKind::UIntRanges => true,
-            CompactTypeKind::Enumerated(ds) => ds.iter().all(denotes_a_uint_range),
+            CompactTypeKind::Enumerated(ds) => ds.iter().all(|x| denotes_a_uint_range(solver, x)),
             CompactTypeKind::SubtypesOf(_) | CompactTypeKind::Type => false,
         })
 }
 
 /// Whether every member of `k` is a dense prefix range: `UIntRanges` itself, or candidates
 /// that each are one.
-fn ranges_over_uint_ranges(k: &crate::ccl::ty::TypeKind) -> bool {
+fn ranges_over_uint_ranges(solver: &mut Solver, k: &crate::ccl::ty::TypeKind) -> bool {
     use crate::ccl::ty::TypeKind;
     match k {
         TypeKind::UIntRanges => true,
         TypeKind::Enumerated(ds) => ds.iter().all(|d| match d {
             Type::UIntRange(_) => true,
-            Type::WitnessProjection(p) => projects_a_uint_range(p),
+            Type::WitnessProjection(p) => projects_a_uint_range(solver, p),
             _ => false,
         }),
         TypeKind::SubtypesOf(_) | TypeKind::Type => false,
@@ -974,7 +997,12 @@ fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
 /// Unmatched positions pass through. Unequal sum arities conflict in the adjacent kind
 /// merge and remain reportable at materialization.
 /// See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
-fn merge_binders(pol: bool, a: &[CompactWitness], b: &[CompactWitness]) -> Vec<CompactWitness> {
+fn merge_binders(
+    solver: &mut Solver,
+    pol: bool,
+    a: &[CompactWitness],
+    b: &[CompactWitness],
+) -> Vec<CompactWitness> {
     let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     longer
         .iter()
@@ -983,6 +1011,7 @@ fn merge_binders(pol: bool, a: &[CompactWitness], b: &[CompactWitness]) -> Vec<C
             Some(other) => CompactWitness {
                 id: w.id.min(other.id),
                 type_kind: CompactTypeKind::merge(
+                    solver,
                     pol,
                     w.type_kind.clone(),
                     other.type_kind.clone(),
@@ -996,16 +1025,16 @@ fn merge_binders(pol: bool, a: &[CompactWitness], b: &[CompactWitness]) -> Vec<C
 impl CompactFun {
     /// Merge two function slots. `pol` is the *outer* polarity; the domain merges
     /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
-    fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
+    fn merge(solver: &mut Solver, pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
         let name = a.name.clone().or_else(|| b.name.clone());
         // Capabilities are covariant: a positive position holds either function, so it may do
         // what either does, and a negative one accepts only what both accept. The variables
         // at a negative one are each a call's expectation of the one function value there,
         // so every one stays: they stand for what that value does.
         let capabilities = Rc::new(if pol {
-            a.capabilities.union(&b.capabilities)
+            a.capabilities.union(solver, &b.capabilities)
         } else {
-            let mut meet = a.capabilities.intersection(&b.capabilities);
+            let mut meet = a.capabilities.intersection(solver, &b.capabilities);
             meet.vars = a
                 .capabilities
                 .vars
@@ -1015,12 +1044,13 @@ impl CompactFun {
                 .collect();
             meet
         });
-        let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
+        let codomain = Box::new(CompactType::merge(solver, pol, *a.codomain, *b.codomain));
         // The domain merges **contravariantly** and as one ordinary position — there is no
         // domain lattice left to consult, because a `fun` slot holds one domain. What was a
         // join or meet of candidate *sets* is now the same `CompactType::merge` every other
         // position gets.
         let domain = Box::new(CompactType::merge(
+            solver,
             !pol,
             (*a.domain).clone(),
             (*b.domain).clone(),
@@ -1051,7 +1081,7 @@ impl CompactFun {
                     .then(|| CombinedDomains::new((*a.domain).clone(), (*b.domain).clone()))
             });
         let kind = a.kind.clone().join(b.kind.clone());
-        let binders = merge_binders(pol, &a.binders, &b.binders);
+        let binders = merge_binders(solver, pol, &a.binders, &b.binders);
 
         // A domain disagreement is a fact about the **domains**, so it is recorded beside
         // the kind rather than inside it: the kind still says what the function is, and the
@@ -1638,8 +1668,13 @@ impl CompactType {
     /// feature gate adds this door rather than widening the merge's own
     /// visibility, so the production configuration is the ungated one.
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn merge_bounds(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
-        Self::merge(pol, lhs, rhs)
+    pub fn merge_bounds(
+        solver: &mut Solver,
+        pol: bool,
+        lhs: CompactType,
+        rhs: CompactType,
+    ) -> CompactType {
+        Self::merge(solver, pol, lhs, rhs)
     }
 
     /// How many **shapes** this position names: an atom, a record, a variant, a function, a
@@ -1745,13 +1780,13 @@ impl CompactType {
     /// subtyping requires further hypotheses beyond `denotes_a_type`; see
     /// `formal/design.md`, "Rust absorption checks". `equiv` excludes variable provenance,
     /// so merging variable sets does not by itself prevent absorption.
-    pub(super) fn is_below(&self, other: &CompactType) -> bool {
+    pub(super) fn is_below(&self, solver: &mut Solver, other: &CompactType) -> bool {
         debug_assert!(
             self.denotes_a_type() && other.denotes_a_type(),
             "is_below reads both operands as types at a fixed polarity: a position naming two \
              shapes absorbs every candidate, and one naming none absorbs into every parameter"
         );
-        CompactType::merge(true, self.clone(), other.clone()).equiv(other)
+        CompactType::merge(solver, true, self.clone(), other.clone()).equiv(other)
     }
 
     /// Are these two `Enumerated` candidates one domain? They are where they materialize as
@@ -1924,7 +1959,12 @@ impl CompactType {
     /// - `refinements`: `None` is the identity; two present sets intersect at
     ///   positive polarity and union at negative
     ///   ([`merge_refinements`](Self::merge_refinements)).
-    pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+    pub(super) fn merge(
+        solver: &mut Solver,
+        pol: bool,
+        lhs: CompactType,
+        rhs: CompactType,
+    ) -> CompactType {
         if lhs.imposes_nothing() {
             return rhs.absorbing_vars_of(lhs);
         }
@@ -1946,7 +1986,7 @@ impl CompactType {
             // imposes nothing, so the other side passes through. A present
             // `Some(empty)` is *not* identity — see the `rec` field docs.
             (None, r) | (r, None) => r,
-            (Some(a), Some(b)) => Some(Self::merge_records(pol, a, b)),
+            (Some(a), Some(b)) => Some(Self::merge_records(solver, pol, a, b)),
         };
         let width = match (lhs.width, rhs.width) {
             (None, w) | (w, None) => w,
@@ -1954,11 +1994,11 @@ impl CompactType {
         };
         let var = match (lhs.var, rhs.var) {
             (None, v) | (v, None) => v,
-            (Some(a), Some(b)) => Some(Self::merge_variants(pol, a, b)),
+            (Some(a), Some(b)) => Some(Self::merge_variants(solver, pol, a, b)),
         };
         let fun = match (lhs.fun, rhs.fun) {
             (None, f) | (f, None) => f,
-            (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b)),
+            (Some(a), Some(b)) => Some(CompactFun::merge(solver, pol, a, b)),
         };
         // Component by component, as `constrain_go` relates two dependent tuples: the
         // components are keyed by position, and a name is either side's spelling.
@@ -1982,7 +2022,7 @@ impl CompactType {
                         .components
                         .into_iter()
                         .zip(b.components)
-                        .map(|(x, y)| Self::merge(pol, x, y))
+                        .map(|(x, y)| Self::merge(solver, pol, x, y))
                         .collect(),
                 })
             }
@@ -2009,9 +2049,9 @@ impl CompactType {
                         .domains
                         .into_iter()
                         .zip(b.domains)
-                        .map(|(x, y)| Self::merge(pol, x, y))
+                        .map(|(x, y)| Self::merge(solver, pol, x, y))
                         .collect(),
-                    body: Box::new(Self::merge(pol, *a.body, *b.body)),
+                    body: Box::new(Self::merge(solver, pol, *a.body, *b.body)),
                 })
             }
         };
@@ -2054,8 +2094,8 @@ impl CompactType {
                 Some(CompactHistory {
                     // Either side's binder, as a function's merge takes `na.or(nb)`.
                     name: a.name.or(b.name),
-                    value: Box::new(Self::merge(pol, *a.value, *b.value)),
-                    domain: Box::new(Self::merge(pol, *a.domain, *b.domain)),
+                    value: Box::new(Self::merge(solver, pol, *a.value, *b.value)),
+                    domain: Box::new(Self::merge(solver, pol, *a.domain, *b.domain)),
                     kind: a.kind,
                 })
             }
@@ -2082,7 +2122,7 @@ impl CompactType {
                             nominal_conflict =
                                 Some((decl.clone(), Box::new(a.clone()), Box::new(b.clone())));
                         }
-                        Self::merge(v.polarity(pol), a, b)
+                        Self::merge(solver, v.polarity(pol), a, b)
                     })
                     .collect(),
             };
@@ -2172,13 +2212,18 @@ impl CompactType {
     /// reliably handles `[B]`). Payload depth at matching tags is
     /// covariant — payloads recurse at the outer polarity `pol`, not
     /// flipped.
-    fn merge_variants(pol: bool, lhs: CompactVariant, rhs: CompactVariant) -> CompactVariant {
+    fn merge_variants(
+        solver: &mut Solver,
+        pol: bool,
+        lhs: CompactVariant,
+        rhs: CompactVariant,
+    ) -> CompactVariant {
         // Variants invert the set-op vs records (so `!pol` selects
         // intersect-vs-union) but keep payload polarity at the outer
         // `pol` (covariant depth, same as records).
         CompactVariant {
             openness: CompactVariant::meet_openness(lhs.openness, rhs.openness),
-            tags: Self::merge_keyed(!pol, pol, lhs.tags, rhs.tags),
+            tags: Self::merge_keyed(solver, !pol, pol, lhs.tags, rhs.tags),
         }
     }
 
@@ -2189,13 +2234,14 @@ impl CompactType {
     /// Payload depth at matching fields is covariant — payloads recurse
     /// at the outer polarity `pol`.
     fn merge_records(
+        solver: &mut Solver,
         pol: bool,
         lhs: BTreeMap<FieldKey, CompactType>,
         rhs: BTreeMap<FieldKey, CompactType>,
     ) -> BTreeMap<FieldKey, CompactType> {
         // For records the set-op aligns with polarity (pos = intersect)
         // and payload polarity also tracks `pol` (covariant depth).
-        Self::merge_keyed(pol, pol, lhs, rhs)
+        Self::merge_keyed(solver, pol, pol, lhs, rhs)
     }
 
     /// Shared keyed-merge skeleton used by both records and variants.
@@ -2215,6 +2261,7 @@ impl CompactType {
     /// See [`Self::merge_records`] and [`Self::merge_variants`] for how
     /// outer polarity maps onto these two flags at each call site.
     fn merge_keyed<K: Ord + Clone>(
+        solver: &mut Solver,
         intersect_keys: bool,
         payload_pol: bool,
         lhs: BTreeMap<K, CompactType>,
@@ -2226,14 +2273,14 @@ impl CompactType {
                 if let Some(v_rhs) = rhs.get(k) {
                     out.insert(
                         k.clone(),
-                        Self::merge(payload_pol, v_lhs.clone(), v_rhs.clone()),
+                        Self::merge(solver, payload_pol, v_lhs.clone(), v_rhs.clone()),
                     );
                 }
             }
         } else {
             for (k, v_lhs) in lhs {
                 let merged = match rhs.get(&k) {
-                    Some(v_rhs) => Self::merge(payload_pol, v_lhs, v_rhs.clone()),
+                    Some(v_rhs) => Self::merge(solver, payload_pol, v_lhs, v_rhs.clone()),
                     None => v_lhs,
                 };
                 out.insert(k, merged);
@@ -2313,7 +2360,7 @@ pub enum JoinedPosition {
 /// while their addresses distinguish quoted type slots, settled witness ranges and declarations.
 #[cfg(debug_assertions)]
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct CompactionInput {
+pub(crate) struct CompactionInput {
     ty: Type,
     views: Vec<usize>,
 }
@@ -2361,27 +2408,30 @@ impl CompactionInput {
     }
 }
 
+/// The compactions a fixed-graph batch shares ([`with_fixed_graph_compactions`]).
 #[cfg(debug_assertions)]
-thread_local! {
-    static FIXED_GRAPH_COMPACTIONS: std::cell::RefCell<Option<HashMap<CompactionInput, CompactGraph>>> =
-        const { std::cell::RefCell::new(None) };
-}
+pub(crate) type FixedCompactions = HashMap<CompactionInput, CompactGraph>;
 
 /// Share complete compactions while `f` reads a fixed inference graph. The caller must not
 /// add bounds or change scopes during the batch. Each nested batch starts empty, and its
 /// results are discarded on return or unwind. Specialization runs outside these batches.
 #[cfg(debug_assertions)]
-#[allow(clippy::mutable_key_type)] // Types identify live variables by uid; their graph is fixed here.
-pub(crate) fn with_fixed_graph_compactions<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<HashMap<CompactionInput, CompactGraph>>);
-    impl Drop for Restore {
+pub(crate) fn with_fixed_graph_compactions<R>(
+    solver: &mut Solver,
+    f: impl FnOnce(&mut Solver) -> R,
+) -> R {
+    struct Batch<'s> {
+        solver: &'s mut Solver,
+        previous: Option<FixedCompactions>,
+    }
+    impl Drop for Batch<'_> {
         fn drop(&mut self) {
-            FIXED_GRAPH_COMPACTIONS.with(|memo| *memo.borrow_mut() = self.0.take());
+            self.solver.fixed_compactions = self.previous.take();
         }
     }
-    let previous = FIXED_GRAPH_COMPACTIONS.with(|memo| memo.replace(Some(HashMap::new())));
-    let _restore = Restore(previous);
-    f()
+    let previous = solver.fixed_compactions.replace(HashMap::new());
+    let batch = Batch { solver, previous };
+    f(batch.solver)
 }
 
 /// Walk a `Type`, transitively expanding variable bounds at the
@@ -2391,34 +2441,24 @@ pub(crate) fn with_fixed_graph_compactions<R>(f: impl FnOnce() -> R) -> R {
 /// following, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 #[allow(clippy::mutable_key_type)] // A batch keeps each key's graph fixed while its entry is live.
-pub fn compact_type(ty: &Type) -> CompactGraph {
+pub fn compact_type(solver: &mut Solver, ty: &Type) -> CompactGraph {
     #[cfg(debug_assertions)]
-    {
-        let input = FIXED_GRAPH_COMPACTIONS
-            .with(|memo| memo.borrow().as_ref().map(|_| CompactionInput::new(ty)));
-        if let Some(done) = input.as_ref().and_then(|input| {
-            FIXED_GRAPH_COMPACTIONS.with(|memo| {
-                memo.borrow()
-                    .as_ref()
-                    .and_then(|memo| memo.get(input).cloned())
-            })
-        }) {
-            return done;
+    if solver.fixed_compactions.is_some() {
+        let input = CompactionInput::new(ty);
+        if let Some(done) = solver
+            .fixed_compactions
+            .as_ref()
+            .and_then(|memo| memo.get(&input))
+        {
+            return done.clone();
         }
-        let graph = compact_type_with(ty, true, false);
-        if let Some(input) = input {
-            FIXED_GRAPH_COMPACTIONS.with(|memo| {
-                if let Some(memo) = memo.borrow_mut().as_mut() {
-                    memo.insert(input, graph.clone());
-                }
-            });
+        let graph = compact_type_with(solver, ty, true, false);
+        if let Some(memo) = solver.fixed_compactions.as_mut() {
+            memo.insert(input, graph.clone());
         }
-        graph
+        return graph;
     }
-    #[cfg(not(debug_assertions))]
-    {
-        compact_type_with(ty, true, false)
-    }
+    compact_type_with(solver, ty, true, false)
 }
 
 /// [`compact_type`] with the opposite-polarity collapse suppressed **entirely**,
@@ -2434,27 +2474,34 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
 /// Suppressing it walk-wide rather than at the entry is the same thing:
 /// [`fallback_allowed`] already confines the collapse to the entered position, so
 /// disabling it there disables it everywhere.
-pub fn compact_type_polarity_only(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, false, false)
+pub fn compact_type_polarity_only(solver: &mut Solver, ty: &Type) -> CompactGraph {
+    compact_type_with(solver, ty, false, false)
 }
 
 /// [`compact_type_polarity_only`], with each function position's capabilities also holding the
 /// capability variables standing at it, which a rendering of a polymorphic type names
 /// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
-pub fn compact_type_for_display(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, false, true)
+pub fn compact_type_for_display(solver: &mut Solver, ty: &Type) -> CompactGraph {
+    compact_type_with(solver, ty, false, true)
 }
 
-fn compact_type_with(ty: &Type, collapse: bool, capability_vars: bool) -> CompactGraph {
+fn compact_type_with(
+    solver: &mut Solver,
+    ty: &Type,
+    collapse: bool,
+    capability_vars: bool,
+) -> CompactGraph {
     let mut st = CompactState::new(collapse);
     st.capability_vars = capability_vars;
     if capability_vars {
-        st.held_elsewhere = Some(Rc::new(crate::ccl::infer_var::var_edges_held_elsewhere()));
+        st.held_elsewhere = Some(Rc::new(crate::ccl::infer_var::var_edges_held_elsewhere(
+            solver,
+        )));
     }
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
     let term = crate::ccl::subst::with_transport_memo(|| {
-        compact_go(ty, true, &Subst::id(), Position::default(), &mut st)
+        compact_go(solver, ty, true, &Subst::id(), Position::default(), &mut st)
     });
     debug_assert!(
         refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
@@ -2579,10 +2626,10 @@ impl<'a> Position<'a> {
     /// variable that compaction has not narrowed resolves to `Unpinned`, which is not
     /// data, so an undecided kind's domain is read like a compute one — the same
     /// reading `Display` gives it (`⇒`).
-    fn domain_of(fun_kind: &crate::ccl::ty::FunKind) -> Self {
+    fn domain_of(solver: &mut Solver, fun_kind: &crate::ccl::ty::FunKind) -> Self {
         Position {
             parents: None,
-            invariant: fun_kind.resolved().is_data(),
+            invariant: fun_kind.resolved_in(solver).is_data(),
         }
     }
 
@@ -2725,6 +2772,7 @@ impl ConsultedInputs {
 /// reads as edges. Each bound's substitution transports the reads back to its holder.
 /// `None` conservatively disables reuse where a kind binds witnesses or a barrier recurs.
 fn consulted_in(
+    solver: &mut Solver,
     ty: &Type,
     pol: bool,
     at: (bool, bool),
@@ -2733,7 +2781,7 @@ fn consulted_in(
     let fresh = (true, false);
     match ty {
         Type::Refinement(inner, refinements) => {
-            let mut out = consulted_in(inner, pol, at, barriers)?;
+            let mut out = consulted_in(solver, inner, pol, at, barriers)?;
             out.reads.witnesses = true;
             for r in refinements {
                 out.reads
@@ -2751,16 +2799,17 @@ fn consulted_in(
             codomain,
             ..
         } => {
-            if !fun_kind.binder_ids().is_empty() {
+            if !fun_kind.binder_ids(solver).is_empty() {
                 return None;
             }
             let mut out = consulted_in(
+                solver,
                 domain,
                 !pol,
-                (true, fun_kind.resolved().is_data()),
+                (true, fun_kind.resolved_in(solver).is_data()),
                 barriers,
             )?;
-            out.extend(consulted_in(codomain, pol, fresh, barriers)?);
+            out.extend(consulted_in(solver, codomain, pol, fresh, barriers)?);
             out.reads.witnesses = true;
             Some(out)
         }
@@ -2770,13 +2819,19 @@ fn consulted_in(
                 match v {
                     Variance::Bipolar => {
                         let (input, output) = crate::ccl::nominal::sides(t);
-                        out.extend(consulted_in(input, !pol, fresh, barriers)?);
-                        out.extend(consulted_in(output, pol, fresh, barriers)?);
+                        out.extend(consulted_in(solver, input, !pol, fresh, barriers)?);
+                        out.extend(consulted_in(solver, output, pol, fresh, barriers)?);
                     }
                     Variance::Invariant => {
-                        out.extend(consulted_in(t, pol, (true, true), barriers)?);
+                        out.extend(consulted_in(solver, t, pol, (true, true), barriers)?);
                     }
-                    other => out.extend(consulted_in(t, other.polarity(pol), fresh, barriers)?),
+                    other => out.extend(consulted_in(
+                        solver,
+                        t,
+                        other.polarity(pol),
+                        fresh,
+                        barriers,
+                    )?),
                 }
             }
             Some(out)
@@ -2794,12 +2849,12 @@ fn consulted_in(
             if !barriers.insert(barrier.uid) {
                 return None;
             }
-            let lowers = barrier.lowers.borrow().clone();
+            let lowers = barrier.lowers(solver).to_vec();
             let out = lowers
                 .iter()
                 .try_fold(ConsultedInputs::default(), |mut out, b| {
-                    let below = consulted_in(&b.ty, true, fresh, barriers)?;
-                    out.extend(below.under(&NameImage::of(&b.render_subst())));
+                    let below = consulted_in(solver, &b.ty, true, fresh, barriers)?;
+                    out.extend(below.under(&NameImage::of(&b.render_subst(solver))));
                     Some(out)
                 });
             barriers.remove(&barrier.uid);
@@ -2840,7 +2895,7 @@ fn consulted_in(
             let mut out = Some(ConsultedInputs::default());
             other.walk_children(|child| {
                 if let Some(reads) = &mut out {
-                    match consulted_in(child, pol, fresh, barriers) {
+                    match consulted_in(solver, child, pol, fresh, barriers) {
                         Some(more) => reads.extend(more),
                         None => out = None,
                     }
@@ -2856,6 +2911,7 @@ fn consulted_in(
 /// path. Like `ContentWalk::reads_of`, collect the reached graph once and propagate reads
 /// until no summary grows. Unknown reads propagate too, disabling reuse conservatively.
 fn consulted_below(
+    solver: &mut Solver,
     state: &Rc<crate::ccl::InferVar>,
     pol: bool,
     at: (bool, bool),
@@ -2879,16 +2935,17 @@ fn consulted_below(
             st.consulted_expanded += 1;
         }
         let inputs = if !crate::ccl::ty::FunKind::Var(Rc::clone(&var.fun_kind))
-            .binder_ids()
+            .binder_ids(solver)
             .is_empty()
         {
             None
         } else {
-            let bounds = var.bounds.borrow();
+            let bounds = var.bounds(solver);
+            let (lowers, uppers) = (Rc::clone(bounds.lower()), Rc::clone(bounds.upper()));
             let (primary, opposite) = if pol {
-                (bounds.lower(), bounds.upper())
+                (lowers, uppers)
             } else {
-                (bounds.upper(), bounds.lower())
+                (uppers, lowers)
             };
             let read_opposite = st.collapse && (at.0 || (!pol && at.1));
             primary
@@ -2896,8 +2953,10 @@ fn consulted_below(
                 .map(|b| (b, pol))
                 .chain(opposite.iter().filter(|_| read_opposite).map(|b| (b, !pol)))
                 .try_fold(ConsultedInputs::default(), |mut out, (b, side)| {
-                    let below = consulted_in(&b.ty, side, (false, at.1), &mut HashSet::new())?;
-                    out.extend(below.under(&NameImage::of(&b.render_subst())));
+                    let below =
+                        consulted_in(solver, &b.ty, side, (false, at.1), &mut HashSet::new())?;
+                    let rendered = b.render_subst(solver);
+                    out.extend(below.under(&NameImage::of(&rendered)));
                     Some(out)
                 })
         };
@@ -3009,10 +3068,11 @@ impl ConsultedNames {
     /// The names below `state` at polarity `pol`; `None` where they are not known.
     pub(super) fn below(
         &mut self,
+        solver: &mut Solver,
         state: &Rc<crate::ccl::InferVar>,
         pol: bool,
     ) -> Option<Rc<ConsultedReads>> {
-        consulted_below(state, pol, (false, false), &mut self.0)
+        consulted_below(solver, state, pol, (false, false), &mut self.0)
     }
 }
 
@@ -3140,15 +3200,16 @@ struct CompactState {
 impl CompactState {
     fn own_bound_flags(
         &mut self,
+        solver: &mut Solver,
         uid: InferVarId,
         lower: bool,
         bounds: &[crate::ccl::Bound],
-        check: impl Fn(&crate::ccl::Bound) -> bool,
+        check: impl Fn(&mut Solver, &crate::ccl::Bound) -> bool,
     ) -> Rc<Vec<bool>> {
         let flags = Rc::clone(
             self.own_bounds
                 .entry((uid, lower))
-                .or_insert_with(|| Rc::new(bounds.iter().map(check).collect())),
+                .or_insert_with(|| Rc::new(bounds.iter().map(|b| check(solver, b)).collect())),
         );
         assert_eq!(
             flags.len(),
@@ -3192,13 +3253,14 @@ impl CompactState {
 /// at an output, every variable flowing into it, which a rendering keeps where it also stands
 /// at an input.
 fn capabilities_at(
+    solver: &mut Solver,
     capabilities: &crate::ccl::capabilities::Capabilities,
     pol: bool,
     st: &CompactState,
 ) -> crate::ccl::capabilities::CapabilitySet {
     // Each exception stands at the type its bounds resolve to, whether or not the walk records
     // variables: a monomorphic function's contract states it too.
-    let mut set = capabilities.set().with_raises_resolved();
+    let mut set = capabilities.set_in(solver).with_raises_resolved(solver);
     if st.capability_vars
         && let crate::ccl::capabilities::Repr::Var(v) = capabilities.repr()
     {
@@ -3223,6 +3285,7 @@ fn capabilities_at(
 /// alone: the lowers are walked as new positions, so no parent path spans the barrier,
 /// and the `Infer` arm treats a cycle through a barrier the same way.
 fn join_barrier_lowers(
+    solver: &mut Solver,
     barrier: &BarrierVar,
     subst_acc: &Subst,
     st: &mut CompactState,
@@ -3235,12 +3298,15 @@ fn join_barrier_lowers(
         return (CompactType::from_var(placeholder), Vec::new());
     }
     st.barriers_in_process.insert(barrier.uid);
-    let lowers = barrier.lowers.borrow().clone();
+    let lowers = barrier.lowers(solver).to_vec();
     let mut joined = CompactType::empty();
     for b in &lowers {
-        let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-        let bc = compact_bound(&b.ty, true, &inner_acc, Position::default(), st);
-        joined = CompactType::merge(true, joined, bc);
+        let inner_acc = {
+            let rendered = b.render_subst(solver);
+            Subst::then(solver, &rendered, subst_acc)
+        };
+        let bc = compact_bound(solver, &b.ty, true, &inner_acc, Position::default(), st);
+        joined = CompactType::merge(solver, true, joined, bc);
     }
     let mut escaped = Vec::new();
     joined.resolve_barrier_refinements(Variance::Covariant, &barrier.opaque, &mut escaped);
@@ -3258,9 +3324,12 @@ fn join_barrier_lowers(
 ///
 /// A graph, because a lower bound can reach `barrier` again: the resolution is then a
 /// recursive type, whose bounds are in `rec_vars`.
-pub(super) fn barrier_resolution(barrier: &BarrierVar) -> (CompactGraph, Vec<Name>) {
+pub(super) fn barrier_resolution(
+    solver: &mut Solver,
+    barrier: &BarrierVar,
+) -> (CompactGraph, Vec<Name>) {
     let mut st = CompactState::new(true);
-    let (term, escaped) = join_barrier_lowers(barrier, &Subst::id(), &mut st);
+    let (term, escaped) = join_barrier_lowers(solver, barrier, &Subst::id(), &mut st);
     let graph = CompactGraph {
         term,
         rec_vars: st.rec_vars,
@@ -3294,6 +3363,7 @@ pub(super) fn barrier_resolution(barrier: &BarrierVar) -> (CompactGraph, Vec<Nam
 ///   `a_source_shared_between_two_joins_keeps_the_joins_apart` is the program that rule
 ///   keeps apart.
 fn var_binder_kind(
+    solver: &mut Solver,
     k: &Rc<crate::ccl::ty::FunKindVar>,
     position: usize,
     pol: bool,
@@ -3306,10 +3376,19 @@ fn var_binder_kind(
     }
     seen.push(k.uid);
     let mut offset = 0;
-    for src in k.built_over() {
-        let n = src.arity().unwrap_or(0);
+    for src in k.built_over(solver) {
+        let n = src.arity(solver).unwrap_or(0);
         if position < offset + n {
-            return kind_at(&src, position - offset, pol, true, subst_acc, st, seen);
+            return kind_at(
+                solver,
+                &src,
+                position - offset,
+                pol,
+                true,
+                subst_acc,
+                st,
+                seen,
+            );
         }
         offset += n;
     }
@@ -3323,26 +3402,43 @@ fn var_binder_kind(
     // Each kind is read across its edge under the substitution the edge was recorded under,
     // composed before the walk's own, as a bound's content is
     // ([`crate::ccl::ty::FunKindVar::record_under`]).
-    let merged = |ks: Vec<(crate::ccl::ty::FunKind, Subst)>,
+    let merged = |solver: &mut Solver,
+                  ks: Vec<(crate::ccl::ty::FunKind, Subst)>,
                   joining: bool,
                   through: bool,
                   st: &mut CompactState,
                   seen: &mut _| {
-        ks.iter()
-            .filter_map(|(f, edge)| {
-                let acc = Subst::then(edge, subst_acc);
-                kind_at(f, position, pol, through, &acc, st, seen)
-            })
-            .reduce(|a, b| CompactTypeKind::merge(joining, a, b))
+        let mut out: Option<CompactTypeKind> = None;
+        for (f, edge) in ks.iter() {
+            let acc = Subst::then(solver, edge, subst_acc);
+            if let Some(kind) = kind_at(solver, f, position, pol, through, &acc, st, seen) {
+                out = Some(match out {
+                    Some(prev) => CompactTypeKind::merge(solver, joining, prev, kind),
+                    None => kind,
+                });
+            }
+        }
+        out
     };
-    merged(k.lower_edges(), true, true, st, seen)
-        .or_else(|| merged(k.upper_edges(), false, false, st, seen))
+    let lower = k.lower_edges(solver);
+    match merged(solver, lower, true, true, st, seen) {
+        Some(kind) => Some(kind),
+        None => {
+            let upper = k.upper_edges(solver);
+            merged(solver, upper, false, false, st, seen)
+        }
+    }
 }
 
 /// The same question of one kind, concrete or variable — a concrete kind states its binders,
 /// a variable derives them from the relations it is in ([`var_binder_kind`]), where
 /// `through` permits it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's solver, the question, and the walk's accumulators"
+)]
 fn kind_at(
+    solver: &mut Solver,
     f: &crate::ccl::ty::FunKind,
     position: usize,
     pol: bool,
@@ -3356,7 +3452,7 @@ fn kind_at(
         // relations it is in. Off — at a demand — it answers nothing rather than the other
         // collections that reach the consumer (see [`var_binder_kind`], *Above*).
         crate::ccl::ty::FunKind::Var(v) if through => {
-            var_binder_kind(v, position, pol, subst_acc, st, seen)
+            var_binder_kind(solver, v, position, pol, subst_acc, st, seen)
         }
         crate::ccl::ty::FunKind::Var(_) => None,
         // A candidate takes the *kind's* polarity: it is a member of the kind's set, and the
@@ -3364,7 +3460,7 @@ fn kind_at(
         other => other
             .witnesses()
             .get(position)
-            .map(|w| compact_type_kind(&w.type_kind(), pol, subst_acc, st)),
+            .map(|w| compact_type_kind(solver, &w.type_kind(), pol, subst_acc, st)),
     }
 }
 
@@ -3373,6 +3469,7 @@ fn kind_at(
 /// carrier as a Σ's witness and one reaching it as a *kinding constraint* on a free
 /// witness become the same thing — which is what lets binding read either.
 fn compact_type_kind(
+    solver: &mut Solver,
     type_kind: &crate::ccl::ty::TypeKind,
     pol: bool,
     subst_acc: &Subst,
@@ -3390,26 +3487,31 @@ fn compact_type_kind(
         // the kind over every value is every subtype of the candidate without what it
         // states about the binder (`src/ccl/design/type-inference.md`, "A contribution
         // crosses the binders after its target"). The candidates' kinds then join.
-        TypeKind::Enumerated(domains) => domains
-            .iter()
-            .map(|d| {
+        TypeKind::Enumerated(domains) => {
+            let mut joined: Option<CompactTypeKind> = None;
+            for d in domains {
                 let depth = std::mem::take(&mut st.data_domain_depth);
                 let outer = st.candidate_widened.replace(false);
-                let candidate = compact_go(d, pol, subst_acc, Position::candidate(), st);
+                let candidate = compact_go(solver, d, pol, subst_acc, Position::candidate(), st);
                 let widened = std::mem::replace(&mut st.candidate_widened, outer);
                 st.data_domain_depth = depth;
-                if widened == Some(true) {
+                let kind = if widened == Some(true) {
                     CompactTypeKind::SubtypesOf(Box::new(candidate))
                 } else {
                     CompactTypeKind::Enumerated(vec![candidate])
-                }
-            })
-            // One sum's candidates are alternatives for its one witness, so they join at
-            // either polarity: a meet would intersect them, and a sum in a negative
-            // position would compact to the kind admitting nothing.
-            .reduce(|a, b| CompactTypeKind::merge(true, a, b))
-            .unwrap_or(CompactTypeKind::Enumerated(Vec::new())),
+                };
+                // One sum's candidates are alternatives for its one witness, so they join at
+                // either polarity: a meet would intersect them, and a sum in a negative
+                // position would compact to the kind admitting nothing.
+                joined = Some(match joined {
+                    Some(prev) => CompactTypeKind::merge(solver, true, prev, kind),
+                    None => kind,
+                });
+            }
+            joined.unwrap_or(CompactTypeKind::Enumerated(Vec::new()))
+        }
         TypeKind::SubtypesOf(k) => CompactTypeKind::SubtypesOf(Box::new(compact_go(
+            solver,
             k,
             pol,
             subst_acc,
@@ -3424,11 +3526,11 @@ fn compact_type_kind(
 /// Every kind variable's binder correspondence, one per line. Diagnostic only — the
 /// substitution half of [`crate::ccl::ty::dump_kind_vars`], which shows only the edges.
 #[cfg(debug_assertions)]
-pub fn dump_kind_correspondences() -> String {
+pub fn dump_kind_correspondences(solver: &mut Solver) -> String {
     let mut out = String::new();
-    for v in crate::ccl::ty::fun_kind_vars() {
+    for v in solver.funkind_vars().to_vec() {
         let kind = crate::ccl::ty::FunKind::Var(Rc::clone(&v));
-        let corr = fun_kind_correspondence(&kind, &Subst::id());
+        let corr = fun_kind_correspondence(solver, &kind, &Subst::id());
         if corr.is_id() {
             continue;
         }
@@ -3447,12 +3549,16 @@ pub fn dump_kind_correspondences() -> String {
 ///
 /// Composed into the accumulated substitution exactly as a Pi binder's rename is, so every
 /// bound the walk records below this function is already spelled in this kind's binders.
-fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> Subst {
+fn fun_kind_correspondence(
+    solver: &mut Solver,
+    fun_kind: &crate::ccl::ty::FunKind,
+    acc: &Subst,
+) -> Subst {
     let crate::ccl::ty::FunKind::Var(k) = fun_kind else {
         return acc.clone();
     };
-    match kind_renames(k) {
-        Some((mine, hop)) => Subst::then(&acc.shadow_witnesses(&mine), &hop),
+    match kind_renames(solver, k) {
+        Some((mine, hop)) => Subst::then(solver, &acc.shadow_witnesses(&mine), &hop),
         None => acc.clone(),
     }
 }
@@ -3461,6 +3567,7 @@ fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> S
 /// binders discharged to the witnesses the value carries, or a variable kind's binders, once
 /// the correspondence has renamed every spelling reaching it onto them.
 fn eliminated_acc(
+    solver: &mut Solver,
     fun_kind: &crate::ccl::ty::FunKind,
     rest: &Subst,
     term: &Rc<crate::ccl::TypedExpr>,
@@ -3468,10 +3575,10 @@ fn eliminated_acc(
     use crate::ccl::ty::FunKind;
     match fun_kind {
         FunKind::Data(Some(ws)) => rest.clone().discharged_through(ws, term),
-        FunKind::Var(k) => Subst::then(
-            &fun_kind_correspondence(fun_kind, rest),
-            &Subst::kind_elim(k, term),
-        ),
+        FunKind::Var(k) => {
+            let correspondence = fun_kind_correspondence(solver, fun_kind, rest);
+            Subst::then(solver, &correspondence, &Subst::kind_elim(k, term))
+        }
         FunKind::Data(None) | FunKind::Compute => rest.clone(),
     }
 }
@@ -3481,9 +3588,13 @@ fn eliminated_acc(
 /// `k`'s binders, and `acc` then acts on them, discharging them where it does. Entering the
 /// function is what shadows `acc`'s mappings for its binders, and a part reached along a chain
 /// has not entered it.
-fn part_correspondence(k: &Rc<crate::ccl::ty::FunKindVar>, acc: &Subst) -> Subst {
-    match kind_renames(k) {
-        Some((_, hop)) => Subst::then(&hop, acc),
+fn part_correspondence(
+    solver: &mut Solver,
+    k: &Rc<crate::ccl::ty::FunKindVar>,
+    acc: &Subst,
+) -> Subst {
+    match kind_renames(solver, k) {
+        Some((_, hop)) => Subst::then(solver, &hop, acc),
         None => acc.clone(),
     }
 }
@@ -3492,9 +3603,10 @@ fn part_correspondence(k: &Rc<crate::ccl::ty::FunKindVar>, acc: &Subst) -> Subst
 /// reaching a position of `k`'s function can be spelled in. `None` while `k`'s arity is
 /// unknown.
 fn kind_renames(
+    solver: &mut Solver,
     k: &Rc<crate::ccl::ty::FunKindVar>,
 ) -> Option<(Vec<crate::ccl::ty::WitnessId>, Subst)> {
-    let arity = k.arity()?;
+    let arity = k.arity(solver)?;
     // Built on its own and **composed** onto the accumulator, not inserted into it: a
     // reference already renamed by an outer hop has to be carried on by this one. Inserting
     // leaves the outer entry pointing at a name this hop has since moved, so a chain
@@ -3504,7 +3616,7 @@ fn kind_renames(
     // walks.
     //
     // This kind's own binders, picked once — every rename below targets one of them.
-    let mine = k.binder_ids();
+    let mine = k.binder_ids(solver);
     // **Downward without limit, upward one hop.** A spelling reaching this position can be
     // several relations away: a filter over a conditional whose arms are themselves
     // comprehensions puts the arm's source three hops below the consumer — built over the
@@ -3521,22 +3633,23 @@ fn kind_renames(
     // through, for the reason [`var_binder_kind`] gives under *Above*: the kinds below a
     // consumer are the other collections reaching it, siblings of this one rather than more
     // of it.
-    let push_below = |stack: &mut Vec<(crate::ccl::ty::FunKind, usize, bool)>,
+    let push_below = |solver: &Solver,
+                      stack: &mut Vec<(crate::ccl::ty::FunKind, usize, bool)>,
                       k: &Rc<crate::ccl::ty::FunKindVar>,
                       at: usize| {
-        for l in k.lower() {
+        for l in k.lower(solver) {
             stack.push((l, at, true));
         }
         let mut offset = at;
-        for src in k.built_over() {
-            let n = src.arity().unwrap_or(0);
+        for src in k.built_over(solver) {
+            let n = src.arity(solver).unwrap_or(0);
             stack.push((src, offset, true));
             offset += n;
         }
     };
     let mut stack: Vec<(crate::ccl::ty::FunKind, usize, bool)> =
-        k.upper().into_iter().map(|u| (u, 0, false)).collect();
-    push_below(&mut stack, k, 0);
+        k.upper(solver).into_iter().map(|u| (u, 0, false)).collect();
+    push_below(solver, &mut stack, k, 0);
     let mut seen: Vec<crate::ccl::ty::FunKindVarId> = vec![k.uid];
     let mut hop = Subst::id();
     while let Some((below, at, expand)) = stack.pop() {
@@ -3545,9 +3658,9 @@ fn kind_renames(
             && !seen.contains(&v.uid)
         {
             seen.push(v.uid);
-            push_below(&mut stack, v, at);
+            push_below(solver, &mut stack, v, at);
         }
-        for (i, id) in below.binder_ids().into_iter().enumerate() {
+        for (i, id) in below.binder_ids(solver).into_iter().enumerate() {
             if at + i >= arity {
                 break;
             }
@@ -3566,6 +3679,7 @@ fn kind_renames(
 /// with the bound's edge: a binder the edge joins over with no term at the key enters
 /// [`CompactState::join_entries`] at this bound for the walk below it.
 fn compact_bound(
+    solver: &mut Solver,
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
@@ -3581,7 +3695,7 @@ fn compact_bound(
         st.join_entries
             .insert(n.clone(), (pol, st.data_domain_depth));
     }
-    let ct = compact_go(ty, pol, subst_acc, pos, st);
+    let ct = compact_go(solver, ty, pol, subst_acc, pos, st);
     for n in &entered {
         st.join_entries.remove(n);
     }
@@ -3622,6 +3736,7 @@ fn compact_bound(
 /// One stack frame per type layer and bound edge crossed; the stack grows on demand, as the
 /// other solver walks do.
 fn compact_go(
+    solver: &mut Solver,
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
@@ -3629,7 +3744,7 @@ fn compact_go(
     st: &mut CompactState,
 ) -> CompactType {
     let mut ct = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        compact_go_inner(ty, pol, subst_acc, pos, st)
+        compact_go_inner(solver, ty, pol, subst_acc, pos, st)
     });
     // A type a variable's bound holds is born where the bound says; the variable's arm
     // records it. Any other type contributes without a recorded birth.
@@ -3651,6 +3766,7 @@ fn stands_for_a_variable(ty: &Type) -> bool {
 
 /// The body of [`compact_go`].
 fn compact_go_inner(
+    solver: &mut Solver,
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
@@ -3665,7 +3781,7 @@ fn compact_go_inner(
     if !matches!(ty, Type::Infer(_) | Type::Refinement(..) | Type::Fun { .. })
         && let Some((_, rest)) = subst_acc.top_elim()
     {
-        return compact_go(ty, pol, &rest, pos, st);
+        return compact_go(solver, ty, pol, &rest, pos, st);
     }
     match ty {
         // Not a type — an annotation-position obligation, erased by
@@ -3690,7 +3806,7 @@ fn compact_go_inner(
             let mut acc = subst_acc.clone();
             let mut components = Vec::with_capacity(cs.len());
             for (name, t) in cs {
-                components.push(compact_go(t, pol, &acc, Position::default(), st));
+                components.push(compact_go(solver, t, pol, &acc, Position::default(), st));
                 st.scope.enter(name.clone());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
@@ -3710,7 +3826,7 @@ fn compact_go_inner(
         Type::Family { binders, body } => {
             let domains = binders
                 .iter()
-                .map(|(_, t)| compact_go(t, pol, subst_acc, Position::invariant(), st))
+                .map(|(_, t)| compact_go(solver, t, pol, subst_acc, Position::invariant(), st))
                 .collect();
             let mut acc = subst_acc.clone();
             for (name, _) in binders {
@@ -3719,7 +3835,7 @@ fn compact_go_inner(
                     acc = acc.shadow(b);
                 }
             }
-            let body = compact_go(body, pol, &acc, Position::default(), st);
+            let body = compact_go(solver, body, pol, &acc, Position::default(), st);
             binders.iter().for_each(|_| st.scope.exit());
             CompactType {
                 family: Some(CompactFamily {
@@ -3741,16 +3857,16 @@ fn compact_go_inner(
             let mut ty = subst_acc
                 .without_witnesses()
                 .unwrap_or_else(|| subst_acc.clone())
-                .apply_type(ty);
+                .apply_type_in(solver, ty);
             // A projection a bound's holder side reads back is that holder's binder
             // (`crate::ccl::subst::Elim::ReadBack`), landing as a reference does.
             if let Type::WitnessRef(_) = &ty {
-                return compact_go(&ty, pol, subst_acc, pos, st);
+                return compact_go(solver, &ty, pol, subst_acc, pos, st);
             }
             // Landing closes, as a refinement's does: references to the walk's enclosing
             // binders become indices.
             for quoted in ty.quoted_terms_mut() {
-                st.scope.close_quoted(quoted);
+                st.scope.close_quoted(solver, quoted);
             }
             let atom = AtomKey::from_type(&ty).unwrap_or_else(|| {
                 unreachable!("a substitution keeps a quoting type's form or reads it back: {ty}")
@@ -3767,12 +3883,12 @@ fn compact_go_inner(
         // accumulated substitution carries the correspondence each enclosing kind states
         // ([`fun_kind_correspondence`]), so an arm's binder reaching a consumer is the
         // consumer's by the time it lands in a position.
-        Type::WitnessRef(w) => match subst_acc.apply_witnesses(ty) {
+        Type::WitnessRef(w) => match subst_acc.apply_witnesses(solver, ty) {
             Type::WitnessRef(x) => CompactType::from_atom(AtomKey::Witness(x)),
             // A witness discharged to a type is that type, read under the rest of the
             // substitution.
             Type::WitnessProjection(p) => {
-                compact_go(&Type::WitnessProjection(p), pol, subst_acc, pos, st)
+                compact_go(solver, &Type::WitnessProjection(p), pol, subst_acc, pos, st)
             }
             // Compaction's accumulated substitution discharges a witness only by an
             // elimination, to a projection ([`eliminated_acc`]); a candidate is substituted by
@@ -3792,7 +3908,7 @@ fn compact_go_inner(
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
         Type::Refinement(inner, refinements) => {
-            let mut ct = compact_go(inner, pol, subst_acc, pos, st);
+            let mut ct = compact_go(solver, inner, pol, subst_acc, pos, st);
             for r in refinements {
                 // **A refinement naming a joined binder** states something per value of the
                 // binder. In a sum's candidate the candidate widens; in a data domain there
@@ -3842,13 +3958,13 @@ fn compact_go_inner(
                     continue;
                 }
                 let r = if at_key {
-                    subst_acc.in_data_domain().force_refinement(r)
+                    subst_acc.in_data_domain().force_refinement(solver, r)
                 } else {
-                    subst_acc.force_refinement(r)
+                    subst_acc.force_refinement(solver, r)
                 };
                 // References to the walk's enclosing binders become indices
                 // before the refinement is compared or stored.
-                let r = st.scope.close(&r);
+                let r = st.scope.close(solver, &r);
                 ct.refinements
                     .get_or_insert_with(RefinementSet::default)
                     .insert(r);
@@ -3873,17 +3989,20 @@ fn compact_go_inner(
             // function binds none. The correspondence renames an arm's spelling onto this
             // kind's binders first, so the elimination then finds every occurrence.
             let (owned_acc, eliminated) = match subst_acc.top_elim() {
-                Some((term, rest)) => (eliminated_acc(fun_kind, &rest, &term), true),
-                None => (fun_kind_correspondence(fun_kind, subst_acc), false),
+                Some((term, rest)) => (eliminated_acc(solver, fun_kind, &rest, &term), true),
+                None => (fun_kind_correspondence(solver, fun_kind, subst_acc), false),
             };
             let subst_acc = &owned_acc;
             // Function: domain is contravariant, and each child is a new
             // position — which for the parent path mirrors Scala's `Set.empty`
             // argument, cycles spanning only one variable's bound chain and not
             // crossing a function boundary.
-            let data_domain = fun_kind.has_data_domain();
+            let data_domain = fun_kind.has_data_domain(solver);
             st.data_domain_depth += u32::from(data_domain);
-            let dom = compact_go(d, !pol, subst_acc, Position::domain_of(fun_kind), st);
+            let dom = {
+                let domain = Position::domain_of(solver, fun_kind);
+                compact_go(solver, d, !pol, subst_acc, domain, st)
+            };
             st.data_domain_depth -= u32::from(data_domain);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain (it binds the name locally), so restrict it there.
@@ -3894,7 +4013,7 @@ fn compact_go_inner(
             // Entering the codomain crosses this function — named or not, it
             // deepens what a refinement landing below closes against.
             st.scope.enter(name.clone());
-            let cod = compact_go(c, pol, &cod_acc, Position::default(), st);
+            let cod = compact_go(solver, c, pol, &cod_acc, Position::default(), st);
             st.scope.exit();
             debug_assert!(
                 name.as_ref()
@@ -3922,8 +4041,8 @@ fn compact_go_inner(
             // candidate carrying a refinement still needs the accumulated discharges.
             // Only the **name** moves under the walk's substitution; what a binder ranges
             // over is not a name.
-            let moved = |id: crate::ccl::ty::WitnessId| match subst_acc
-                .apply_witnesses(&Type::WitnessRef(id))
+            let moved = |solver: &mut Solver, id: crate::ccl::ty::WitnessId| match subst_acc
+                .apply_witnesses(solver, &Type::WitnessRef(id))
             {
                 Type::WitnessRef(x) => x,
                 _ => id,
@@ -3943,13 +4062,21 @@ fn compact_go_inner(
                 // candidate set, which is `Σ (σ : []). σ ⤇ 𝑉` — a type nothing inhabits and
                 // one [`crate::ccl::Type::sum_over`] refuses to build.
                 crate::ccl::ty::FunKind::Var(v) => fun_kind
-                    .binder_ids()
+                    .binder_ids(solver)
                     .into_iter()
                     .enumerate()
                     .map(|(i, id)| {
                         Some(CompactWitness {
-                            id: moved(id),
-                            type_kind: var_binder_kind(v, i, pol, subst_acc, st, &mut Vec::new())?,
+                            id: moved(solver, id),
+                            type_kind: var_binder_kind(
+                                solver,
+                                v,
+                                i,
+                                pol,
+                                subst_acc,
+                                st,
+                                &mut Vec::new(),
+                            )?,
                         })
                     })
                     .collect::<Option<Vec<_>>>()
@@ -3958,8 +4085,8 @@ fn compact_go_inner(
                     .witnesses()
                     .iter()
                     .map(|w| CompactWitness {
-                        id: moved(*w.id()),
-                        type_kind: compact_type_kind(&w.type_kind(), pol, subst_acc, st),
+                        id: moved(solver, *w.id()),
+                        type_kind: compact_type_kind(solver, &w.type_kind(), pol, subst_acc, st),
                     })
                     .collect(),
             };
@@ -3968,12 +4095,12 @@ fn compact_go_inner(
                     // **Compute or data, never which index.** A slot carrying binders is a
                     // sum by carrying them; the pin's own sum spelling says the same thing
                     // twice and the two can then disagree.
-                    kind: match fun_kind.resolved() {
+                    kind: match fun_kind.resolved_in(solver) {
                         _ if eliminated => KindPin::Plain,
                         KindPin::Sum(_) => KindPin::Data,
                         other => other,
                     },
-                    capabilities: Rc::new(capabilities_at(capabilities, pol, st)),
+                    capabilities: Rc::new(capabilities_at(solver, capabilities, pol, st)),
                     name: name.clone(),
                     binders,
                     domains_disagree: false,
@@ -3991,7 +4118,7 @@ fn compact_go_inner(
             for (i, v) in ts.iter().enumerate() {
                 compacted.insert(
                     FieldKey::Index(i),
-                    compact_go(v, pol, subst_acc, Position::default(), st),
+                    compact_go(solver, v, pol, subst_acc, Position::default(), st),
                 );
             }
             CompactType {
@@ -4005,7 +4132,7 @@ fn compact_go_inner(
             for (n, v) in fs {
                 compacted.insert(
                     FieldKey::Name(n.clone()),
-                    compact_go(v, pol, subst_acc, Position::default(), st),
+                    compact_go(solver, v, pol, subst_acc, Position::default(), st),
                 );
             }
             CompactType {
@@ -4022,7 +4149,7 @@ fn compact_go_inner(
             for (k, v) in tags {
                 compacted.insert(
                     k.clone(),
-                    compact_go(v, pol, subst_acc, Position::default(), st),
+                    compact_go(solver, v, pol, subst_acc, Position::default(), st),
                 );
             }
             CompactType {
@@ -4052,13 +4179,13 @@ fn compact_go_inner(
             else {
                 unreachable!("a history's function is an unrefined function, got {function}")
             };
-            let domain = compact_go(domain, pol, subst_acc, Position::default(), st);
+            let domain = compact_go(solver, domain, pol, subst_acc, Position::default(), st);
             let value_acc = match name {
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
             st.scope.enter(name.clone());
-            let value = compact_go(value, pol, &value_acc, Position::default(), st);
+            let value = compact_go(solver, value, pol, &value_acc, Position::default(), st);
             st.scope.exit();
             CompactType {
                 history_slot: Some(CompactHistory {
@@ -4084,15 +4211,43 @@ fn compact_go_inner(
                 match v {
                     Variance::Bipolar => {
                         let (input, output) = crate::ccl::nominal::sides(t);
-                        sides.push(compact_go(input, !pol, subst_acc, Position::default(), st));
-                        sides.push(compact_go(output, pol, subst_acc, Position::default(), st));
+                        sides.push(compact_go(
+                            solver,
+                            input,
+                            !pol,
+                            subst_acc,
+                            Position::default(),
+                            st,
+                        ));
+                        sides.push(compact_go(
+                            solver,
+                            output,
+                            pol,
+                            subst_acc,
+                            Position::default(),
+                            st,
+                        ));
                     }
                     Variance::Invariant => {
-                        sides.push(compact_go(t, pol, subst_acc, Position::invariant(), st));
+                        sides.push(compact_go(
+                            solver,
+                            t,
+                            pol,
+                            subst_acc,
+                            Position::invariant(),
+                            st,
+                        ));
                     }
                     other => {
                         let pol = other.polarity(pol);
-                        sides.push(compact_go(t, pol, subst_acc, Position::default(), st));
+                        sides.push(compact_go(
+                            solver,
+                            t,
+                            pol,
+                            subst_acc,
+                            Position::default(),
+                            st,
+                        ));
                     }
                 }
             }
@@ -4110,7 +4265,7 @@ fn compact_go_inner(
         // position is kept, and `solve_barrier_vars` reports one naming such a binder. The
         // upper bounds are not read here: `solve_barrier_vars` checks them before any
         // compaction, so this walk leaves the graph as it found it.
-        Type::BarrierVar(barrier) => join_barrier_lowers(barrier, subst_acc, st).0,
+        Type::BarrierVar(barrier) => join_barrier_lowers(solver, barrier, subst_acc, st).0,
         Type::Infer(state) => {
             let uid = state.uid;
             let key = (uid, pol);
@@ -4128,7 +4283,7 @@ fn compact_go_inner(
             let below = if subst_acc.is_id() {
                 None
             } else {
-                consulted_below(state, pol, (memo_key.3, memo_key.4), st)
+                consulted_below(solver, state, pol, (memo_key.3, memo_key.4), st)
                     .filter(|reads| !subst_acc.has_witnesses() || !reads.witnesses)
             };
             let memoizable = subst_acc.is_id()
@@ -4212,6 +4367,7 @@ fn compact_go_inner(
             // in, exactly as a function's own kind is, so every bound below arrives spelled
             // in the position's binders.
             let mut owned_acc = fun_kind_correspondence(
+                solver,
                 &crate::ccl::ty::FunKind::Var(Rc::clone(&state.fun_kind)),
                 subst_acc,
             );
@@ -4220,8 +4376,8 @@ fn compact_go_inner(
             // whichever related sum's binder reached it; the function's correspondence puts
             // them in its own binders, as entering the function does. A part reached along a
             // bound chain is never entered through the function, so it is applied here.
-            for k in state.witness_scope_kinds() {
-                owned_acc = part_correspondence(&k, &owned_acc);
+            for k in state.witness_scope_kinds(solver) {
+                owned_acc = part_correspondence(solver, &k, &owned_acc);
             }
             let subst_acc = &owned_acc;
             // The opposite-polarity fallback below is monomorphization's
@@ -4248,7 +4404,7 @@ fn compact_go_inner(
             // coalesces per-use *clones* pinned to one resolved use type);
             // only those clones and the per-use instantiations reach here,
             // each fixed by a single use site.
-            let s = state.bounds.borrow();
+            let s = state.bounds(solver);
             // `Rc::clone`, not a copy: taking the list out of the `RefCell` is a
             // refcount bump, and this is the walk's hot read.
             let primary_bounds = Rc::clone(if pol { s.lower() } else { s.upper() });
@@ -4283,10 +4439,9 @@ fn compact_go_inner(
             // the binder is outside `𝑉`'s scope, or `𝑉`'s own content does not name it
             // ([`content_mentions`]). Elsewhere it stays out of `𝑉`'s answer; the variable that
             // stands for the instance reads it.
-            drop(s);
-            let holder = crate::ccl::infer_var::lookup(&uid);
+            let holder = solver.lookup(&uid);
             let own_content = Rc::clone(&st.own_content);
-            let renders_as_own = |b: &crate::ccl::Bound| -> bool {
+            let renders_as_own = |solver: &mut Solver, b: &crate::ccl::Bound| -> bool {
                 if b.self_subst.invert().is_some() {
                     return true;
                 }
@@ -4294,16 +4449,18 @@ fn compact_go_inner(
                     return true;
                 };
                 let (_, discharged) = b.self_subst.split_renames();
-                let acting = discharged.acting_on(v);
+                let acting = discharged.acting_on(solver, v);
                 if acting.is_id() {
                     return true;
                 }
                 // An elimination acts on `𝑉` exactly where `𝑉` is a sum, which its kind says once
                 // the graph is closed: on a plain collection it eliminates nothing.
-                if acting.eliminates_top() && !matches!(v.fun_kind.resolved(), KindPin::Plain) {
+                if acting.eliminates_top()
+                    && !matches!(v.fun_kind.resolved_in(solver), KindPin::Plain)
+                {
                     return false;
                 }
-                !content_mentions(v, &acting, &mut own_content.borrow_mut())
+                !content_mentions(solver, v, &acting, &mut own_content.borrow_mut())
             };
             // Walk bounds, transitively expanding, seeded from the variable's own
             // identity: `from_var` is not a value, so it imposes nothing at any
@@ -4320,7 +4477,7 @@ fn compact_go_inner(
                 prev: pos.parents,
             };
             let mut bound = CompactType::from_var(uid);
-            let primary_own = st.own_bound_flags(uid, pol, &primary_bounds, renders_as_own);
+            let primary_own = st.own_bound_flags(solver, uid, pol, &primary_bounds, renders_as_own);
             for (index, b) in primary_bounds.iter().enumerate() {
                 if !primary_own[index] {
                     continue;
@@ -4329,12 +4486,16 @@ fn compact_go_inner(
                 // descending: a bound reached transitively through `v → w → …`
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
-                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let mut bc = compact_bound(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+                let inner_acc = {
+                    let rendered = b.render_subst(solver);
+                    Subst::then(solver, &rendered, subst_acc)
+                };
+                let mut bc =
+                    compact_bound(solver, &b.ty, pol, &inner_acc, pos.under(&new_parents), st);
                 if !stands_for_a_variable(&b.ty) {
                     bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
                 }
-                bound = CompactType::merge(pol, bound, bc);
+                bound = CompactType::merge(solver, pol, bound, bc);
             }
             // **An edge between two variables is a fact about both.** Inference holds
             // `𝑢 <: 𝑣` on one end, whichever the levels pick, so a rendering, which names a
@@ -4351,7 +4512,7 @@ fn compact_go_inner(
                     }
                 }
                 if pos.invariant {
-                    let s = state.bounds.borrow();
+                    let s = state.bounds(solver);
                     partners.extend(
                         if pol { s.upper() } else { s.lower() }
                             .iter()
@@ -4363,9 +4524,15 @@ fn compact_go_inner(
                     );
                 }
                 for u in partners {
-                    let bc =
-                        compact_go(&Type::Infer(u), pol, subst_acc, pos.under(&new_parents), st);
-                    bound = CompactType::merge(pol, bound, bc);
+                    let bc = compact_go(
+                        solver,
+                        &Type::Infer(u),
+                        pol,
+                        subst_acc,
+                        pos.under(&new_parents),
+                        st,
+                    );
+                    bound = CompactType::merge(solver, pol, bound, bc);
                 }
             }
             // Whether the *shape* collapse fires: the primary walk produced no
@@ -4452,20 +4619,22 @@ fn compact_go_inner(
             let read_opposite = collapse || merge;
             let mut recovered: Option<CompactType> = None;
             if read_opposite {
-                let opposite_own = st.own_bound_flags(uid, !pol, &opposite_bounds, renders_as_own);
+                let opposite_own =
+                    st.own_bound_flags(solver, uid, !pol, &opposite_bounds, renders_as_own);
                 for (index, b) in opposite_bounds.iter().enumerate() {
                     if !opposite_own[index] {
                         continue;
                     }
-                    let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                    let rendered = b.render_subst(solver);
+                    let inner_acc = Subst::then(solver, &rendered, subst_acc);
                     let mut bc =
-                        compact_bound(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+                        compact_bound(solver, &b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
                     if !stands_for_a_variable(&b.ty) {
                         bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
                     }
                     recovered = Some(match recovered {
                         None => bc,
-                        Some(acc) => CompactType::merge(!pol, acc, bc),
+                        Some(acc) => CompactType::merge(solver, !pol, acc, bc),
                     });
                 }
             }
@@ -4510,7 +4679,7 @@ fn compact_go_inner(
                 // meet both closes the marker and intersects away a tag the demand does
                 // not name (`a_settled_negative_position_closes_an_open_child_demand`).
                 (Some(recovered), false) => {
-                    bound = CompactType::merge(pol, bound, recovered);
+                    bound = CompactType::merge(solver, pol, bound, recovered);
                 }
                 (None, _) => {}
             }
@@ -4736,22 +4905,28 @@ mod tests {
     #[test]
     fn consulted_names_include_unresolved_predicate_type_scopes() {
         use crate::ccl::infer_var::{InferVar, Telescope};
+        let solver = &mut Solver::new();
         let hidden = Name::raw("hidden");
-        let slot = InferVar::fresh_in(0, &Telescope::empty().extended(hidden.clone()));
+        let slot = InferVar::fresh_in(solver, 0, &Telescope::empty().extended(hidden.clone()));
         let predicate = TypedExpr::var("p").with_ty(Type::Infer(slot));
-        let root = fresh_var(0);
+        let root = fresh_var(solver, 0);
         let Type::Infer(v) = &root else {
             unreachable!()
         };
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::refined(
                 Type::Base(BaseType::Int),
                 RefinementSet::one(Refinement::born(Rc::new(predicate))),
             )));
-        let reads =
-            consulted_below(v, true, (false, false), &mut CompactState::new(false)).unwrap();
+        let reads = consulted_below(
+            solver,
+            v,
+            true,
+            (false, false),
+            &mut CompactState::new(false),
+        )
+        .unwrap();
         assert!(reads.names.contains(&hidden));
     }
 
@@ -4759,41 +4934,40 @@ mod tests {
     fn consulted_names_close_under_a_cycle_s_edges() {
         use super::super::test_helpers::dep_pred;
         use crate::ccl::infer_var::{InferVar, Telescope};
+        let solver = &mut Solver::new();
         let names = |ns: &[&str]| ns.iter().map(|n| Name::raw(*n)).collect::<BTreeSet<_>>();
         let scope = ["x", "y", "z", "a", "b"]
             .into_iter()
             .fold(Telescope::empty(), |s, n| s.extended(Name::raw(n)));
-        let fresh = || InferVar::fresh_in(0, &scope);
-        let seed = |v: &Rc<InferVar>, name| {
-            v.bounds
-                .borrow_mut()
+        let fresh = |solver: &mut Solver| InferVar::fresh_in(solver, 0, &scope);
+        let seed = |solver: &mut Solver, v: &Rc<InferVar>, name| {
+            v.bounds_mut(solver)
                 .lower_mut()
                 .push(crate::ccl::Bound::conc(Type::refined(
                     Type::Base(BaseType::Int),
                     RefinementSet::one(Refinement::born(dep_pred(name))),
                 )));
         };
-        let edge = |from: &Rc<InferVar>, to: &Rc<InferVar>, subst| {
-            from.bounds
-                .borrow_mut()
+        let edge = |solver: &mut Solver, from: &Rc<InferVar>, to: &Rc<InferVar>, subst| {
+            from.bounds_mut(solver)
                 .lower_mut()
                 .push(crate::ccl::Bound::suspended_on(to, subst));
         };
         // The two edges compose from the leaf back to its holder: x -> y -> z.
-        let a = fresh();
-        let b = fresh();
-        seed(&a, "x");
-        edge(&a, &b, Subst::rename("y", "z"));
-        edge(&b, &a, Subst::rename("x", "y"));
+        let a = fresh(solver);
+        let b = fresh(solver);
+        seed(solver, &a, "x");
+        edge(solver, &a, &b, Subst::rename("y", "z"));
+        edge(solver, &b, &a, Subst::rename("x", "y"));
         let mut st = CompactState::new(false);
         assert_eq!(
-            consulted_below(&a, true, (false, false), &mut st)
+            consulted_below(solver, &a, true, (false, false), &mut st)
                 .unwrap()
                 .names,
             names(&["x", "z"])
         );
         assert_eq!(
-            consulted_below(&b, true, (false, false), &mut st)
+            consulted_below(solver, &b, true, (false, false), &mut st)
                 .unwrap()
                 .names,
             names(&["y", "z"])
@@ -4801,28 +4975,41 @@ mod tests {
         assert_eq!(st.consulted_expanded, 2);
 
         // One cycle's image feeds the other until both have closed.
-        let a = fresh();
-        seed(&a, "x");
-        edge(&a, &a, Subst::rename("y", "z"));
-        edge(&a, &a, Subst::rename("x", "y"));
+        let a = fresh(solver);
+        seed(solver, &a, "x");
+        edge(solver, &a, &a, Subst::rename("y", "z"));
+        edge(solver, &a, &a, Subst::rename("x", "y"));
         assert_eq!(
-            consulted_below(&a, true, (false, false), &mut CompactState::new(false))
-                .unwrap()
-                .names,
+            consulted_below(
+                solver,
+                &a,
+                true,
+                (false, false),
+                &mut CompactState::new(false)
+            )
+            .unwrap()
+            .names,
             names(&["x", "y", "z"])
         );
 
-        let a = fresh();
-        seed(&a, "a");
+        let a = fresh(solver);
+        seed(solver, &a, "a");
         edge(
+            solver,
             &a,
             &a,
             Subst::discharge("a", TypedExpr::var("b").with_ty(Type::Base(BaseType::Int))),
         );
         assert_eq!(
-            consulted_below(&a, true, (false, false), &mut CompactState::new(false))
-                .unwrap()
-                .names,
+            consulted_below(
+                solver,
+                &a,
+                true,
+                (false, false),
+                &mut CompactState::new(false)
+            )
+            .unwrap()
+            .names,
             names(&["a", "b"])
         );
     }
@@ -4835,34 +5022,35 @@ mod tests {
     #[test]
     fn a_memoized_variable_s_names_include_its_barrier_s_lowers() {
         use crate::ccl::infer::solver::test_helpers::dep_pred;
+        let solver = &mut Solver::new();
         let int = || Type::Base(BaseType::Int);
-        let barrier = BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let barrier = BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
         let b = Type::BarrierVar(Rc::clone(&barrier));
         let lower = Type::fun(
             Type::refined_one(int(), Refinement::born(dep_pred("x"))),
             int(),
         );
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&lower, &b, &mut cache).expect("the lower flows in");
-        let v = fresh_var(0);
-        constrain_subtype(&b, &v, &mut cache).expect("the barrier flows into ?v");
-        let below = |subst: Subst| {
-            let w = fresh_var(0);
+        constrain_subtype(solver, &lower, &b, &mut cache).expect("the lower flows in");
+        let v = fresh_var(solver, 0);
+        constrain_subtype(solver, &b, &v, &mut cache).expect("the barrier flows into ?v");
+        let mut below = |subst: Subst| {
+            let w = fresh_var(solver, 0);
             let Type::Infer(state) = &w else {
                 unreachable!()
             };
-            state
-                .bounds
-                .borrow_mut()
-                .lower_mut()
-                .push(crate::ccl::Bound::with_subst(v.clone(), subst));
+            let bound = crate::ccl::Bound::with_subst(solver, v.clone(), subst);
+            state.bounds_mut(solver).lower_mut().push(bound);
             w
         };
         let (w1, w2) = (below(Subst::id()), below(Subst::rename("x", "y")));
-        let read = |ty: &Type| {
-            coalesce_compact(&compact_type(ty))
-                .expect("coalesces")
-                .to_string()
+        let mut read = |ty: &Type| {
+            {
+                let c = compact_type(solver, ty);
+                coalesce_compact(solver, &c)
+            }
+            .expect("coalesces")
+            .to_string()
         };
         let both = read(&Type::Tuple(vec![w1.clone(), w2.clone()]));
         assert_eq!(both, format!("({}, {})", read(&w1), read(&w2)));
@@ -4872,54 +5060,74 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn final_graph_compactions_are_isolated_between_batches_and_modes() {
+        let solver = &mut Solver::new();
         let _arena = crate::ccl::infer::InferArena::new();
-        let variable = fresh_var(0);
+        let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
         };
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        let mode_slot = fresh_var(0);
+        let mode_slot = fresh_var(solver, 0);
         let Type::Infer(mode_var) = &mode_slot else {
             unreachable!()
         };
         mode_var
-            .bounds
-            .borrow_mut()
+            .bounds_mut(solver)
             .upper_mut()
             .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        with_fixed_graph_compactions(|| {
-            let mut first = compact_type(&variable);
-            assert_eq!(coalesce_compact(&first).unwrap(), Type::Base(BaseType::Int));
+        with_fixed_graph_compactions(solver, |solver| {
+            let mut first = compact_type(solver, &variable);
+            assert_eq!(
+                coalesce_compact(solver, &first).unwrap(),
+                Type::Base(BaseType::Int)
+            );
             first.term.atoms.clear();
             assert_eq!(
-                coalesce_compact(&compact_type(&variable)).unwrap(),
+                {
+                    let graph = compact_type(solver, &variable);
+                    coalesce_compact(solver, &graph)
+                }
+                .unwrap(),
                 Type::Base(BaseType::Int)
             );
             assert_eq!(
-                coalesce_compact(&compact_type(&mode_slot)).unwrap(),
+                {
+                    let graph = compact_type(solver, &mode_slot);
+                    coalesce_compact(solver, &graph)
+                }
+                .unwrap(),
                 Type::Base(BaseType::Int)
             );
             assert_eq!(
-                coalesce_compact(&compact_type_polarity_only(&mode_slot)).unwrap(),
+                {
+                    let graph = compact_type_polarity_only(solver, &mode_slot);
+                    coalesce_compact(solver, &graph)
+                }
+                .unwrap(),
                 mode_slot
             );
-            with_fixed_graph_compactions(|| {
+            with_fixed_graph_compactions(solver, |solver| {
                 assert_eq!(
-                    coalesce_compact(&compact_type(&variable)).unwrap(),
+                    {
+                        let graph = compact_type(solver, &variable);
+                        coalesce_compact(solver, &graph)
+                    }
+                    .unwrap(),
                     Type::Base(BaseType::Int)
                 );
             });
         });
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Base(BaseType::Bool)));
-        with_fixed_graph_compactions(|| {
+        with_fixed_graph_compactions(solver, |solver| {
             assert!(matches!(
-                coalesce_compact(&compact_type(&variable)),
+                {
+                    let graph = compact_type(solver, &variable);
+                    coalesce_compact(solver, &graph)
+                },
                 Err(CoalesceError::IncompatibleBounds { .. })
             ));
         });
@@ -4928,31 +5136,37 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn final_graph_compactions_release_their_graph_on_unwind() {
+        let solver = &mut Solver::new();
         let _arena = crate::ccl::infer::InferArena::new();
-        let variable = fresh_var(0);
+        let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
         };
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_fixed_graph_compactions(|| {
+            with_fixed_graph_compactions(solver, |solver| {
                 assert_eq!(
-                    coalesce_compact(&compact_type(&variable)).unwrap(),
+                    {
+                        let graph = compact_type(solver, &variable);
+                        coalesce_compact(solver, &graph)
+                    }
+                    .unwrap(),
                     Type::Base(BaseType::Int)
                 );
                 panic!("end the verification batch");
             });
         }));
         assert!(failed.is_err());
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Base(BaseType::Bool)));
         assert!(matches!(
-            coalesce_compact(&compact_type(&variable)),
+            {
+                let graph = compact_type(solver, &variable);
+                coalesce_compact(solver, &graph)
+            },
             Err(CoalesceError::IncompatibleBounds { .. })
         ));
     }
@@ -4960,6 +5174,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn final_graph_compactions_preserve_each_quoted_term() {
+        let solver = &mut Solver::new();
         let make = || Rc::new(TypedExpr::var("p").with_ty(Type::Base(BaseType::Bool)));
         let first = make();
         let second = make();
@@ -4971,10 +5186,13 @@ mod tests {
             left, right,
             "predicate equality omits its typed view and origin"
         );
-        with_fixed_graph_compactions(|| {
+        with_fixed_graph_compactions(solver, |solver| {
             for (ty, original) in [(&left, &first), (&right, &second)] {
-                let Type::Refinement(_, refinements) = coalesce_compact(&compact_type(ty)).unwrap()
-                else {
+                let Type::Refinement(_, refinements) = {
+                    let graph = compact_type(solver, ty);
+                    coalesce_compact(solver, &graph)
+                }
+                .unwrap() else {
                     panic!("the refinement survives")
                 };
                 assert!(Rc::ptr_eq(&refinements.sole().unwrap().predicate, original));
@@ -4986,6 +5204,7 @@ mod tests {
     #[test]
     fn final_graph_compactions_preserve_settled_witness_ranges() {
         use crate::ccl::ty::{FunKind, TypeKind, Witness};
+        let solver = &mut Solver::new();
         let narrow = Type::sum_over(
             TypeKind::Enumerated(vec![Type::UIntRange(2)]),
             None,
@@ -5005,9 +5224,13 @@ mod tests {
             narrow, wide,
             "witness equality names the binder, not its range"
         );
-        with_fixed_graph_compactions(|| {
+        with_fixed_graph_compactions(solver, |solver| {
             for (ty, extent) in [(&narrow, 2), (&wide, 4)] {
-                let resolved = coalesce_compact(&compact_type(ty)).unwrap();
+                let resolved = {
+                    let graph = compact_type(solver, ty);
+                    coalesce_compact(solver, &graph)
+                }
+                .unwrap();
                 assert_eq!(
                     resolved.sum().unwrap()[0].type_kind(),
                     TypeKind::Enumerated(vec![Type::UIntRange(extent)])
@@ -5019,23 +5242,23 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn final_graph_compactions_collect_memberships_on_every_read() {
+        let solver = &mut Solver::new();
         let _arena = crate::ccl::infer::InferArena::new();
-        let variable = fresh_var(0);
+        let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
         };
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        v.bounds
-            .borrow_mut()
+        v.bounds_mut(solver)
             .type_kinds
             .push(crate::ccl::ty::TypeKind::Type);
-        with_fixed_graph_compactions(|| {
+        with_fixed_graph_compactions(solver, |solver| {
             for _ in 0..2 {
                 let (resolved, pending) = super::super::coalesce::collecting_memberships(|| {
-                    coalesce_compact(&compact_type(&variable))
+                    let graph = compact_type(solver, &variable);
+                    coalesce_compact(solver, &graph)
                 });
                 assert_eq!(resolved.unwrap(), Type::Base(BaseType::Int));
                 assert_eq!(pending.len(), 1);
@@ -5048,55 +5271,53 @@ mod tests {
     #[test]
     fn bound_eligibility_is_shared_across_views_and_polarities() {
         use crate::ccl::infer_var::{InferVar, Telescope};
+        let solver = &mut Solver::new();
         let _arena = crate::ccl::infer::InferArena::new();
         let x = Name::raw("x");
         let telescope = Telescope::empty().extended(x.clone());
-        let variable = InferVar::fresh_in(0, &telescope);
+        let variable = InferVar::fresh_in(solver, 0, &telescope);
         let int = Type::Base(BaseType::Int);
         let predicate = TypedExpr::var(x.clone()).with_ty(Type::Base(BaseType::Bool));
         variable
-            .bounds
-            .borrow_mut()
+            .bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::refined_one(
                 int.clone(),
                 Refinement::born(Rc::new(predicate)),
             )));
         variable
-            .bounds
-            .borrow_mut()
+            .bounds_mut(solver)
             .upper_mut()
             .push(crate::ccl::Bound::conc(int.clone()));
-        variable
-            .bounds
-            .borrow_mut()
-            .lower_mut()
-            .push(crate::ccl::Bound::edge(
-                Subst::discharge(x.clone(), TypedExpr::lit(Lit::Bool(true))),
-                crate::ccl::infer::lit_singleton(&Lit::Int(7)),
-                Subst::id(),
-            ));
-        let view = |name: &str| {
+        let edge = crate::ccl::Bound::edge(
+            solver,
+            Subst::discharge(x.clone(), TypedExpr::lit(Lit::Bool(true))),
+            crate::ccl::infer::lit_singleton(&Lit::Int(7)),
+            Subst::id(),
+        );
+        variable.bounds_mut(solver).lower_mut().push(edge);
+        let view = |solver: &mut Solver, name: &str| {
             let name = Name::raw(name);
-            let holder = InferVar::fresh_in(0, &Telescope::empty().extended(name.clone()));
-            holder
-                .bounds
-                .borrow_mut()
-                .lower_mut()
-                .push(crate::ccl::Bound::with_subst(
-                    Type::Infer(Rc::clone(&variable)),
-                    Subst::rename(x.clone(), name),
-                ));
+            let holder = InferVar::fresh_in(solver, 0, &Telescope::empty().extended(name.clone()));
+            let bound = crate::ccl::Bound::with_subst(
+                solver,
+                Type::Infer(Rc::clone(&variable)),
+                Subst::rename(x.clone(), name),
+            );
+            holder.bounds_mut(solver).lower_mut().push(bound);
             Type::Infer(holder)
         };
         let parts = vec![
-            view("y"),
-            view("z"),
+            view(solver, "y"),
+            view(solver, "z"),
             Type::fun(Type::Infer(Rc::clone(&variable)), Type::Infer(variable)),
         ];
-        let read = |ty: &Type| coalesce_compact(&compact_type(ty)).expect("the type coalesces");
-        let separately = Type::Tuple(parts.iter().map(read).collect());
-        let together = read(&Type::Tuple(parts));
+        let read = |solver: &mut Solver, ty: &Type| {
+            let graph = compact_type(solver, ty);
+            coalesce_compact(solver, &graph).expect("the type coalesces")
+        };
+        let separately = Type::Tuple(parts.iter().map(|t| read(solver, t)).collect());
+        let together = read(solver, &Type::Tuple(parts));
         assert_eq!(
             together, separately,
             "one walk preserves each view and both bound sides"
@@ -5114,13 +5335,25 @@ mod tests {
 
     #[test]
     fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
-        let kind = crate::ccl::ty::FunKindVar::fresh();
+        let solver = &mut Solver::new();
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
         let collection = Rc::new(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
-        let (root, nodes) =
-            super::super::test_helpers::diamond_bound_graph(16, Type::Base(BaseType::Int), &edge);
+        let (root, nodes) = super::super::test_helpers::diamond_bound_graph(
+            solver,
+            16,
+            Type::Base(BaseType::Int),
+            &edge,
+        );
         let mut state = CompactState::new(false);
-        let result = compact_go(&root, true, &Subst::id(), Position::default(), &mut state);
+        let result = compact_go(
+            solver,
+            &root,
+            true,
+            &Subst::id(),
+            Position::default(),
+            &mut state,
+        );
         assert!(result.atoms.contains(&AtomKey::Prim(BaseType::Int)));
         assert_eq!(result.vars.len(), nodes);
         assert!(
@@ -5132,24 +5365,39 @@ mod tests {
 
     #[test]
     fn an_unnamed_function_kind_still_reads_a_top_elimination() {
-        let shared = fresh_var(0);
+        let solver = &mut Solver::new();
+        let shared = fresh_var(solver, 0);
         let Type::Infer(v) = &shared else {
             unreachable!()
         };
-        v.bounds
-            .borrow_mut()
+        let fun_kind = crate::ccl::ty::FunKind::fresh_var(solver);
+        v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Fun {
                 name: None,
-                fun_kind: crate::ccl::ty::FunKind::fresh_var(),
+                fun_kind,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
                 capabilities: crate::ccl::capabilities::Capabilities::none(),
             }));
         let mut st = CompactState::new(false);
-        let original = compact_go(&shared, true, &Subst::id(), Position::default(), &mut st);
+        let original = compact_go(
+            solver,
+            &shared,
+            true,
+            &Subst::id(),
+            Position::default(),
+            &mut st,
+        );
         let through = Subst::eliminating(Rc::new(TypedExpr::var("xs")));
-        let eliminated = compact_go(&shared, true, &through, Position::default(), &mut st);
+        let eliminated = compact_go(
+            solver,
+            &shared,
+            true,
+            &through,
+            Position::default(),
+            &mut st,
+        );
         assert_eq!(original.fun.unwrap().kind, KindPin::Unpinned);
         assert_eq!(eliminated.fun.unwrap().kind, KindPin::Plain);
     }
@@ -5157,21 +5405,25 @@ mod tests {
     #[test]
     fn witness_mappings_keep_their_distinct_results() {
         use crate::ccl::ty::{TypeKind, Witness};
+        let solver = &mut Solver::new();
         let source = *Witness::mint(TypeKind::UIntRanges).id();
         let first = *Witness::mint(TypeKind::UIntRanges).id();
         let second = *Witness::mint(TypeKind::UIntRanges).id();
-        let shared = fresh_var(0);
+        let shared = fresh_var(solver, 0);
         let Type::Infer(var) = &shared else {
             unreachable!()
         };
-        var.place_under(crate::ccl::infer_var::WitnessScope::Binders(vec![source]));
-        var.bounds
-            .borrow_mut()
+        var.place_under(
+            solver,
+            crate::ccl::infer_var::WitnessScope::Binders(vec![source]),
+        );
+        var.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::WitnessRef(source)));
         let mut state = CompactState::new(false);
         for target in [first, second, first] {
             let result = compact_go(
+                solver,
                 &shared,
                 true,
                 &Subst::rename_witness(&source, &target),
@@ -5184,31 +5436,32 @@ mod tests {
 
     #[test]
     fn witness_dependencies_survive_a_cached_cycle() {
+        let solver = &mut Solver::new();
         let source = *crate::ccl::ty::Witness::mint(crate::ccl::ty::TypeKind::UIntRanges).id();
-        let a = fresh_var(0);
-        let b = fresh_var(0);
+        let a = fresh_var(solver, 0);
+        let b = fresh_var(solver, 0);
         let (Type::Infer(av), Type::Infer(bv)) = (&a, &b) else {
             unreachable!()
         };
         for v in [av, bv] {
-            v.place_under(crate::ccl::infer_var::WitnessScope::Binders(vec![source]));
+            v.place_under(
+                solver,
+                crate::ccl::infer_var::WitnessScope::Binders(vec![source]),
+            );
         }
-        av.bounds
-            .borrow_mut()
+        av.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(b.clone()));
-        av.bounds
-            .borrow_mut()
+        av.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::WitnessRef(source)));
-        bv.bounds
-            .borrow_mut()
+        bv.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(a.clone()));
         let mut state = CompactState::new(false);
         for v in [av, bv] {
             assert!(
-                consulted_below(v, true, (false, false), &mut state)
+                consulted_below(solver, v, true, (false, false), &mut state)
                     .unwrap()
                     .witnesses
             );
@@ -5227,8 +5480,9 @@ mod tests {
     fn a_dependent_tuple_compacts_componentwise_and_coalesces_back() {
         use crate::ccl::infer::solver::simplify_type;
         use crate::ccl::{BinOpKind, CompareKind};
+        let solver = &mut Solver::new();
         let int = || Type::Base(BaseType::Int);
-        let tuple = |binder: &str| {
+        let tuple = |solver: &mut Solver, binder: &str| {
             let a = Name::fresh(binder);
             let elem_is_a = TypedExpr::binop(
                 TypedExpr::var(Name::elem()).with_ty(int()),
@@ -5236,25 +5490,36 @@ mod tests {
                 TypedExpr::var(a.clone()).with_ty(int()),
             )
             .with_ty(Type::Base(BaseType::Bool));
-            Type::dep_tuple(vec![
-                (Some(a), int()),
-                (
-                    None,
-                    Type::refined_one(int(), Refinement::born(Rc::new(elem_is_a))),
-                ),
-            ])
+            Type::dep_tuple_in(
+                solver,
+                vec![
+                    (Some(a), int()),
+                    (
+                        None,
+                        Type::refined_one(int(), Refinement::born(Rc::new(elem_is_a))),
+                    ),
+                ],
+            )
         };
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&tuple("a"), &v, &mut cache).expect("the first copy flows in");
-        constrain_subtype(&tuple("b"), &v, &mut cache).expect("and the second");
-        let compact = compact_type(&v);
+        {
+            let tuple_a = tuple(solver, "a");
+            constrain_subtype(solver, &tuple_a, &v, &mut cache)
+        }
+        .expect("the first copy flows in");
+        {
+            let tuple_b = tuple(solver, "b");
+            constrain_subtype(solver, &tuple_b, &v, &mut cache)
+        }
+        .expect("and the second");
+        let compact = compact_type(solver, &v);
         let components = compact.term.dep_tuple.as_ref().map(|d| d.components.len());
         assert_eq!(components, Some(2), "{:?}", compact.term);
-        let back = coalesce_compact(&simplify_type(compact)).expect("one tuple coalesces");
+        let back = coalesce_compact(solver, &simplify_type(compact)).expect("one tuple coalesces");
         assert_eq!(
             back.without_pi_names(),
-            tuple("c").without_pi_names(),
+            tuple(solver, "c").without_pi_names(),
             "{back}"
         );
     }
@@ -5269,23 +5534,31 @@ mod tests {
     /// compactions must be too.
     #[test]
     fn a_dependent_tuple_compaction_agrees_with_type_equality() {
-        let tuple = |slot: Type| {
+        let solver = &mut Solver::new();
+        let mut tuple = |slot: Type| {
             let i = Name::fresh("i");
             let pred = TypedExpr::var(i.clone()).with_ty(slot);
-            Type::dep_tuple(vec![
-                (Some(i), Type::Base(BaseType::Int)),
-                (
-                    None,
-                    Type::refined_one(Type::Base(BaseType::Int), Refinement::born(Rc::new(pred))),
-                ),
-            ])
+            Type::dep_tuple_in(
+                solver,
+                vec![
+                    (Some(i), Type::Base(BaseType::Int)),
+                    (
+                        None,
+                        Type::refined_one(
+                            Type::Base(BaseType::Int),
+                            Refinement::born(Rc::new(pred)),
+                        ),
+                    ),
+                ],
+            )
         };
         let (a, b) = (tuple(Type::Hole), tuple(Type::Base(BaseType::Int)));
         assert_eq!(a.without_pi_names(), b.without_pi_names());
-        let compacted = |t: &Type| {
-            let v = fresh_var(0);
-            constrain_subtype(t, &v, &mut ConstrainCache::new()).expect("the tuple flows in");
-            compact_type(&v).term
+        let mut compacted = |t: &Type| {
+            let v = fresh_var(solver, 0);
+            constrain_subtype(solver, t, &v, &mut ConstrainCache::new())
+                .expect("the tuple flows in");
+            compact_type(solver, &v).term
         };
         assert!(compacted(&a).equiv(&compacted(&b)));
     }
@@ -5303,25 +5576,26 @@ mod tests {
     /// at the position").
     #[test]
     fn a_negative_position_meets_both_sides() {
+        let solver = &mut Solver::new();
         let int = || Type::Base(BaseType::Int);
         let field = |n: &str| (Label::new(n), int());
         // `demand` is what the body asks of the variable; `value` is what reaches it.
         // `negative` places it at a function's domain rather than its codomain.
-        let read_at = |value: Type, demand: Type, negative: bool| {
-            let v = fresh_var(0);
+        let mut read_at = |value: Type, demand: Type, negative: bool| {
+            let v = fresh_var(solver, 0);
             let mut cache = ConstrainCache::new();
-            constrain_subtype(&value, &v, &mut cache).expect("the value flows in");
-            constrain_subtype(&v, &demand, &mut cache).expect("and meets the demand");
+            constrain_subtype(solver, &value, &v, &mut cache).expect("the value flows in");
+            constrain_subtype(solver, &v, &demand, &mut cache).expect("and meets the demand");
             let f = if negative {
                 Type::fun(v, int())
             } else {
                 Type::fun(int(), v)
             };
-            let slot = compact_type(&f).term.fun.expect("a function slot");
+            let slot = compact_type(solver, &f).term.fun.expect("a function slot");
             let read = if negative { slot.domain } else { slot.codomain };
             read.as_ref().clone()
         };
-        let domain_of = |value: Type, demand: Type| read_at(value, demand, true);
+        let mut domain_of = |value: Type, demand: Type| read_at(value, demand, true);
 
         // Refinements: the demand settles the shape and carries none of its own.
         let refined = domain_of(crate::ccl::infer::lit_singleton(&Lit::Int(1)), int());
@@ -5386,19 +5660,20 @@ mod tests {
     /// takes the replacement instead and drops the demand whole.
     #[test]
     fn a_settled_negative_position_closes_an_open_child_demand() {
+        let solver = &mut Solver::new();
         let int = || Type::Base(BaseType::Int);
         let arm = |n: &str, t: Type| (FieldKey::Name(n.into()), t);
         let rec = |t: Type| Type::Record(vec![("f".into(), t)]);
-        let dom = fresh_var(0);
+        let dom = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         let value = Type::Variant(
             vec![arm("some", int()), arm("other", Type::Base(BaseType::Unit))],
             Openness::Closed,
         );
         let demand = Type::Variant(vec![arm("some", int())], Openness::Open);
-        constrain_subtype(&rec(value), &dom, &mut cache).expect("the value flows in");
-        constrain_subtype(&dom, &rec(demand), &mut cache).expect("and meets the demand");
-        let read = compact_type(&Type::fun(dom, int()))
+        constrain_subtype(solver, &rec(value), &dom, &mut cache).expect("the value flows in");
+        constrain_subtype(solver, &dom, &rec(demand), &mut cache).expect("and meets the demand");
+        let read = compact_type(solver, &Type::fun(dom, int()))
             .term
             .fun
             .expect("a function slot")
@@ -5469,6 +5744,7 @@ mod tests {
     /// which is why it has to be compared before merging.
     #[test]
     fn a_data_join_does_not_acquire_one_sides_domain_refinement() {
+        let solver = &mut Solver::new();
         let filtered_domain = CompactType {
             refinements: Some(RefinementSet::one(Refinement::born(Rc::new(
                 TypedExpr::lit(Lit::Bool(true)),
@@ -5490,6 +5766,7 @@ mod tests {
         };
         // Positive polarity: the join a conditional's two arms build.
         let merged = CompactType::merge(
+            solver,
             true,
             data_fun(filtered_domain),
             data_fun(CompactType::from_atom(AtomKey::UIntRange(2))),
@@ -5504,6 +5781,7 @@ mod tests {
     /// conflict. The rule is about a refinement one side lacks, not about refinements.
     #[test]
     fn a_data_join_over_one_refined_domain_is_fine() {
+        let solver = &mut Solver::new();
         let refined = || CompactType {
             refinements: Some(RefinementSet::one(Refinement::born(Rc::new(
                 TypedExpr::lit(Lit::Bool(true)),
@@ -5523,17 +5801,18 @@ mod tests {
             }),
             ..Default::default()
         };
-        let merged = CompactType::merge(true, data_fun(refined()), data_fun(refined()));
+        let merged = CompactType::merge(solver, true, data_fun(refined()), data_fun(refined()));
         assert_eq!(merged.fun.expect("fun slot present").kind, KindPin::Data);
     }
 
     /// Two atoms in a merged data domain are two domains even when the inputs agree.
     #[test]
     fn a_data_domain_denoting_two_atoms_disagrees_after_merge() {
-        let mut f = compact_type(&Type::data_fun(Type::UIntRange(2), Type::Txn)).term;
+        let solver = &mut Solver::new();
+        let mut f = compact_type(solver, &Type::data_fun(Type::UIntRange(2), Type::Txn)).term;
         let slot = f.fun.as_mut().expect("a function slot");
         slot.domain.atoms.insert(AtomKey::UIntRange(3));
-        let merged = CompactType::merge(true, f.clone(), f);
+        let merged = CompactType::merge(solver, true, f.clone(), f);
         assert!(merged.fun.expect("fun slot present").domains_disagree);
     }
 
@@ -5543,14 +5822,19 @@ mod tests {
     /// universe.
     #[test]
     fn a_variable_beside_a_range_atom_denotes_the_range() {
+        let solver = &mut Solver::new();
         let range_and_var = CompactType {
             vars: BTreeSet::from([InferVarId(0)]),
             ..CompactType::from_atom(AtomKey::UIntRange(2))
         };
-        assert!(denotes_a_uint_range(&range_and_var));
-        assert!(!denotes_a_uint_range(&CompactType::from_var(InferVarId(0))));
+        assert!(denotes_a_uint_range(solver, &range_and_var));
+        assert!(!denotes_a_uint_range(
+            solver,
+            &CompactType::from_var(InferVarId(0))
+        ));
         assert!(matches!(
             CompactTypeKind::merge(
+                solver,
                 true,
                 CompactTypeKind::Enumerated(vec![range_and_var]),
                 CompactTypeKind::UIntRanges,
@@ -5565,6 +5849,7 @@ mod tests {
     #[test]
     fn a_sum_in_a_domain_keeps_its_candidates() {
         use crate::ccl::ty::TypeKind;
+        let solver = &mut Solver::new();
         let int = Type::Base(BaseType::Int);
         let sum = Type::sum_over(
             TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
@@ -5581,8 +5866,8 @@ mod tests {
             },
             None => panic!("a sum compacts to a function: {ct:?}"),
         };
-        assert_eq!(candidates(&compact_type(&sum).term), 2);
-        let in_domain = compact_type(&Type::fun(sum, int)).term;
+        assert_eq!(candidates(&compact_type(solver, &sum).term), 2);
+        let in_domain = compact_type(solver, &Type::fun(sum, int)).term;
         let domain = &in_domain.fun.as_ref().expect("a function").domain;
         assert_eq!(candidates(domain), 2);
     }
@@ -5590,6 +5875,7 @@ mod tests {
     /// Compact merge at positive polarity unions tags.
     #[test]
     fn compact_merge_variants_positive_unions() {
+        let solver = &mut Solver::new();
         let int_a = CompactType {
             var: Some(CompactVariant::closed(
                 [(FieldKey::Name("A".into()), CompactType::default())]
@@ -5606,7 +5892,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let merged = CompactType::merge(true, int_a, int_b);
+        let merged = CompactType::merge(solver, true, int_a, int_b);
         let var = merged.var.expect("variant present");
         assert!(var.tags.contains_key(&FieldKey::Name("A".into())));
         assert!(var.tags.contains_key(&FieldKey::Name("B".into())));
@@ -5615,6 +5901,7 @@ mod tests {
     /// Compact merge at negative polarity intersects tags.
     #[test]
     fn compact_merge_variants_negative_intersects() {
+        let solver = &mut Solver::new();
         let int_ab = CompactType {
             var: Some(CompactVariant::closed(
                 [
@@ -5637,7 +5924,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let merged = CompactType::merge(false, int_ab, int_bc);
+        let merged = CompactType::merge(solver, false, int_ab, int_bc);
         let var = merged.var.expect("variant present");
         assert!(!var.tags.contains_key(&FieldKey::Name("A".into())));
         assert!(var.tags.contains_key(&FieldKey::Name("B".into())));
@@ -5652,6 +5939,7 @@ mod tests {
     /// open however the tags combine.
     #[test]
     fn compact_merge_variants_meets_openness() {
+        let solver = &mut Solver::new();
         let arms = |openness| CompactType {
             var: Some(CompactVariant {
                 tags: [(FieldKey::Name("A".into()), CompactType::default())]
@@ -5665,6 +5953,7 @@ mod tests {
         for pol in [true, false] {
             assert_eq!(
                 openness_of(CompactType::merge(
+                    solver,
                     pol,
                     arms(Openness::Open),
                     arms(Openness::Open)
@@ -5673,6 +5962,7 @@ mod tests {
             );
             assert_eq!(
                 openness_of(CompactType::merge(
+                    solver,
                     pol,
                     arms(Openness::Open),
                     arms(Openness::Closed)
@@ -5681,6 +5971,7 @@ mod tests {
             );
             assert_eq!(
                 openness_of(CompactType::merge(
+                    solver,
                     pol,
                     arms(Openness::Closed),
                     arms(Openness::Open)
@@ -5693,6 +5984,7 @@ mod tests {
         // present side passes through rather than being closed by a default.
         assert_eq!(
             openness_of(CompactType::merge(
+                solver,
                 true,
                 CompactType::default(),
                 arms(Openness::Open)
@@ -5713,6 +6005,7 @@ mod tests {
     /// payload should merge at pos → record fields intersect.
     #[test]
     fn compact_merge_variants_propagates_outer_polarity_to_payloads() {
+        let solver = &mut Solver::new();
         // Both sides have tag "A". Payload on lhs: CompactType { rec:
         // {a: ?} }, payload on rhs: CompactType { rec: {b: ?} }.
         let payload_a = CompactType {
@@ -5750,7 +6043,7 @@ mod tests {
         // Outer positive variant merge: tags union (one tag A here).
         // Payload depth covariant → payload merges at pos → record
         // fields intersect → empty rec map (no field in both).
-        let merged = CompactType::merge(true, lhs, rhs);
+        let merged = CompactType::merge(solver, true, lhs, rhs);
         let var = merged.var.expect("variant present");
         let payload = var.tags.get(&FieldKey::Name("A".into())).expect("tag A");
         let rec = payload.rec.as_ref().expect("payload rec present");
@@ -5804,6 +6097,7 @@ mod tests {
     /// three collections over `{a, b}`, `{a}`, and `{b}`.
     #[test]
     fn undetermined_kinds_join_without_deciding_the_domain_rule() {
+        let solver = &mut Solver::new();
         let data = fun_over(KindPin::Data, &["a", "b"]);
         let u1 = fun_over(KindPin::Unpinned, &["a"]);
         let u2 = fun_over(KindPin::Unpinned, &["b"]);
@@ -5813,15 +6107,17 @@ mod tests {
             (u1.clone(), u2.clone(), data.clone()),
         ] {
             let associations = [
-                CompactType::merge(
-                    true,
-                    CompactType::merge(true, x.clone(), y.clone()),
-                    z.clone(),
-                ),
-                CompactType::merge(true, x, CompactType::merge(true, y, z)),
+                {
+                    let merged = CompactType::merge(solver, true, x.clone(), y.clone());
+                    CompactType::merge(solver, true, merged, z.clone())
+                },
+                {
+                    let merged = CompactType::merge(solver, true, y, z);
+                    CompactType::merge(solver, true, x, merged)
+                },
             ];
             for merged in associations {
-                let err = coalesce_compact(&as_graph(merged))
+                let err = coalesce_compact(solver, &as_graph(merged))
                     .expect_err("three distinct data domains have no single join");
                 assert!(
                     matches!(err, CoalesceError::DomainJoinConflict { .. }),
@@ -5836,7 +6132,9 @@ mod tests {
     /// pinned away from — applies once at coalesce, meeting the domains contravariantly.
     #[test]
     fn two_undetermined_kinds_join_to_a_compute_function_over_the_met_domain() {
+        let solver = &mut Solver::new();
         let merged = CompactType::merge(
+            solver,
             true,
             fun_over(KindPin::Unpinned, &["a"]),
             fun_over(KindPin::Unpinned, &["b"]),
@@ -5846,7 +6144,7 @@ mod tests {
             Some(KindPin::Unpinned),
             "an unpinned kind stays unpinned through the merge"
         );
-        let ty = coalesce_compact(&as_graph(merged)).expect("the domains meet");
+        let ty = coalesce_compact(solver, &as_graph(merged)).expect("the domains meet");
         let Type::Fun {
             fun_kind, domain, ..
         } = &ty
@@ -5871,6 +6169,7 @@ mod tests {
     /// load-bearing where types are identities.
     #[test]
     fn a_positive_join_of_two_domains_is_order_insensitive() {
+        let solver = &mut Solver::new();
         let fun = |dom: BaseType| CompactType {
             fun: Some(CompactFun {
                 binders: Vec::new(),
@@ -5886,8 +6185,8 @@ mod tests {
         };
         let a = fun(BaseType::Int);
         let b = fun(BaseType::String);
-        let ab = CompactType::merge(true, a.clone(), b.clone());
-        let ba = CompactType::merge(true, b, a);
+        let ab = CompactType::merge(solver, true, a.clone(), b.clone());
+        let ba = CompactType::merge(solver, true, b, a);
         assert_eq!(
             ab, ba,
             "the merged slot does not depend on which arrived first"
@@ -5897,7 +6196,7 @@ mod tests {
         // builds a sum"). What the order-insensitivity claim protects is that the
         // rejection is the same rejection either way.
         for merged in [ab, ba] {
-            let err = coalesce_compact(&as_graph(merged))
+            let err = coalesce_compact(solver, &as_graph(merged))
                 .expect_err("two distinct data domains have no single join");
             assert!(
                 matches!(err, CoalesceError::DomainJoinConflict { .. }),
@@ -5915,6 +6214,7 @@ mod tests {
     fn a_bare_variable_is_refinement_neutral_and_an_unrefined_value_is_not() {
         use crate::ccl::Refinement;
         use crate::ccl::infer::solver::test_helpers::dep_pred;
+        let solver = &mut Solver::new();
 
         let refinement = Refinement::born(dep_pred("x"));
         let refined = CompactType {
@@ -5923,6 +6223,7 @@ mod tests {
         };
         assert_eq!(
             CompactType::merge(
+                solver,
                 true,
                 CompactType::from_var(fresh_infer_var_id()),
                 refined.clone()
@@ -5932,7 +6233,7 @@ mod tests {
             "a bare variable must not erase a sibling bound's refinement"
         );
         assert_eq!(
-            CompactType::merge(true, CompactType::value(), refined).refinements,
+            CompactType::merge(solver, true, CompactType::value(), refined).refinements,
             Some(RefinementSet::new()),
             "a value carrying no refinement erases it: an empty set is absorbing under intersect"
         );
@@ -5943,22 +6244,24 @@ mod tests {
     /// that records a barrier's lower bound runs no occurs check, so nothing keeps this
     /// graph from forming. Compacting `𝐵` terminates, and coalescing reports the cycle as
     /// a recursive type.
-    fn barrier_with_a_self_reaching_lower() -> Rc<BarrierVar> {
-        let barrier = BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+    fn barrier_with_a_self_reaching_lower(solver: &mut Solver) -> Rc<BarrierVar> {
+        let barrier = BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
         let b = Type::BarrierVar(Rc::clone(&barrier));
         let lower = Type::fun(Type::Base(BaseType::Int), b.clone());
-        constrain_subtype(&lower, &b, &mut ConstrainCache::new()).expect("the lower flows in");
+        constrain_subtype(solver, &lower, &b, &mut ConstrainCache::new())
+            .expect("the lower flows in");
         barrier
     }
 
     /// The `BarrierVar` arm of `compact_go`.
     #[test]
     fn a_barrier_reaching_itself_through_its_lower_is_a_recursive_type() {
-        let barrier = barrier_with_a_self_reaching_lower();
-        let compact = compact_type(&Type::BarrierVar(barrier));
+        let solver = &mut Solver::new();
+        let barrier = barrier_with_a_self_reaching_lower(solver);
+        let compact = compact_type(solver, &Type::BarrierVar(barrier));
         assert!(
             matches!(
-                coalesce_compact(&compact),
+                coalesce_compact(solver, &compact),
                 Err(CoalesceError::RecursiveType { .. })
             ),
             "{compact:?}"
@@ -5969,8 +6272,9 @@ mod tests {
     /// the upper bounds against. It returns, and names no opaque binder.
     #[test]
     fn a_barrier_resolution_reaching_itself_through_its_lower_terminates() {
-        let barrier = barrier_with_a_self_reaching_lower();
-        let (_, escaped) = barrier_resolution(&barrier);
+        let solver = &mut Solver::new();
+        let barrier = barrier_with_a_self_reaching_lower(solver);
+        let (_, escaped) = barrier_resolution(solver, &barrier);
         assert!(escaped.is_empty(), "{escaped:?}");
     }
 }
@@ -6009,11 +6313,16 @@ mod refinement_closing_tests {
         use crate::ccl::infer::solver::{
             ConstrainCache, coalesce_compact, constrain_subtype, fresh_var, simplify_type,
         };
-        let coalesce_with_order = |first: &Type, second: &Type| {
-            let v = fresh_var(0);
-            constrain_subtype(&v, first, &mut ConstrainCache::new()).unwrap();
-            constrain_subtype(&v, second, &mut ConstrainCache::new()).unwrap();
-            coalesce_compact(&simplify_type(compact_type(&v))).unwrap()
+        let solver = &mut Solver::new();
+        let mut coalesce_with_order = |first: &Type, second: &Type| {
+            let v = fresh_var(solver, 0);
+            constrain_subtype(solver, &v, first, &mut ConstrainCache::new()).unwrap();
+            constrain_subtype(solver, &v, second, &mut ConstrainCache::new()).unwrap();
+            {
+                let c = simplify_type(compact_type(solver, &v));
+                coalesce_compact(solver, &c)
+            }
+            .unwrap()
         };
         let (fx, fy) = (dep_fun("x"), dep_fun("y"));
         let a = coalesce_with_order(&fx, &fy);
@@ -6064,6 +6373,7 @@ mod refinement_closing_tests {
     /// argument.
     #[test]
     fn closing_keeps_distinct_binders_distinct() {
+        let solver = &mut Solver::new();
         let nested = |referenced: &str| Type::Fun {
             name: Some(Name::raw("x")),
             fun_kind: FunKind::Data(None),
@@ -6081,8 +6391,8 @@ mod refinement_closing_tests {
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert_ne!(
-            compact_type(&nested("y")).term,
-            compact_type(&nested("x")).term,
+            compact_type(solver, &nested("y")).term,
+            compact_type(solver, &nested("x")).term,
             "closing against the walk's enclosing binders must not conflate the inner and \
              outer Pi binders"
         );

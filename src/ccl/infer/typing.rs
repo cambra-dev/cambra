@@ -5,6 +5,7 @@
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::api::RelatedPositions;
 use crate::ccl::infer::solver::PolyScheme;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
@@ -155,6 +156,9 @@ pub(super) trait Typing {
     /// constraints and writing its inferred type onto the child node.
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError>;
 
+    /// The solver of this typing run: what is recorded on the variables it mints.
+    fn solver(&mut self) -> &mut Solver;
+
     /// A fresh existential type variable at the current level.
     fn fresh(&mut self) -> Type;
 
@@ -162,7 +166,7 @@ pub(super) trait Typing {
     /// binders that kind may have ([`crate::ccl::InferVar::may_name_witness`]).
     fn fresh_part(&mut self, kind: &crate::ccl::ty::FunKind) -> Type {
         let t = self.fresh();
-        crate::ccl::InferVar::place_parts_under(&t, kind);
+        crate::ccl::InferVar::place_parts_under(self.solver(), &t, kind);
         t
     }
 
@@ -193,9 +197,7 @@ pub(super) trait Typing {
     /// whole reason this is a `Typing` method rather than a shared rule body. Emit's
     /// operands are usually still unresolved variables, so it records an obligation
     /// that discharges as bounds arrive. Check runs after inference on concrete
-    /// types, so it decides immediately — and must, because there is no
-    /// [`InferArena`](super::api::InferArena) there to break an obligation's
-    /// reference cycle.
+    /// types, so it decides immediately.
     fn require_trait(
         &mut self,
         trait_: Trait,
@@ -489,7 +491,7 @@ pub(super) trait Typing {
     /// `positions` have no order, or `None` to keep the error inference raised. Check keeps
     /// it.
     fn unordered_loop(
-        &self,
+        &mut self,
         _node: NodeId,
         _source: NodeId,
         _positions: &Type,
@@ -540,14 +542,14 @@ pub(super) trait Typing {
     /// [`should_generalize`](super::context::should_generalize)).
     /// Emit answers from the definition and level; Check always returns `false`
     /// (it never generalizes).
-    fn is_generalizable(&self, def: &Expr) -> bool;
+    fn is_generalizable(&mut self, def: &Expr) -> bool;
 
     /// The error a generalized definition named `name` raises on its own, blamed on the
     /// `let` that binds it: its type does not resolve, whatever any use supplies
     /// (`src/ccl/design/type-inference.md`, "Checking a definition alone"). Asked where a
     /// call of it fails, so the definition's error is reported rather than the call's.
     /// Check has none to report.
-    fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError>;
+    fn definition_alone_error(&mut self, name: &Name) -> Option<LocatedInferError>;
 
     /// Note `ty`, the type the generalized binding `name` is bound at, while its
     /// scheme is live, for a module check that reports its public members'

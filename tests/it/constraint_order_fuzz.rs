@@ -13,6 +13,7 @@
 //! Seeded and dependency-free, so a failure replays: `CAMBRA_FUZZ_SEED` picks
 //! the seed and `CAMBRA_FUZZ_N` the number of constraint sets.
 
+use crate::ccl::infer::solver::Solver;
 use crate::it::type_gen;
 
 use std::rc::Rc;
@@ -46,7 +47,7 @@ enum Spec {
 /// set flipping between accepted and rejected across orders is a violation.
 ///
 /// Every constraint gets a fresh cache, as real emission does.
-fn run(nvars: usize, specs: &[Spec], order: &[usize]) -> String {
+fn run(solver: &mut Solver, nvars: usize, specs: &[Spec], order: &[usize]) -> String {
     // The generator's predicates reference its two Pi binder names, and it emits
     // a dependent refinement independently of whether an enclosing function
     // binds one. The variables therefore stand in a context holding both, which
@@ -56,22 +57,26 @@ fn run(nvars: usize, specs: &[Spec], order: &[usize]) -> String {
         .extended(Name::raw("x"))
         .extended(Name::raw("y"));
     let vars: Vec<Type> = (0..nvars)
-        .map(|_| Type::Infer(InferVar::fresh_in(0, &scope)))
+        .map(|_| Type::Infer(InferVar::fresh_in(solver, 0, &scope)))
         .collect();
     let mut rejected = false;
     for &i in order {
         let result = match &specs[i] {
-            Spec::Low(v, t) => constrain_subtype(t, &vars[*v], &mut ConstrainCache::new()),
-            Spec::Up(v, t) => constrain_subtype(&vars[*v], t, &mut ConstrainCache::new()),
+            Spec::Low(v, t) => constrain_subtype(solver, t, &vars[*v], &mut ConstrainCache::new()),
+            Spec::Up(v, t) => constrain_subtype(solver, &vars[*v], t, &mut ConstrainCache::new()),
             Spec::VarVar(a, b) => {
-                constrain_subtype(&vars[*a], &vars[*b], &mut ConstrainCache::new())
+                constrain_subtype(solver, &vars[*a], &vars[*b], &mut ConstrainCache::new())
             }
         };
         rejected |= result.is_err();
     }
     let mut coalesced = Vec::with_capacity(nvars);
     for v in &vars {
-        match coalesce_compact(&simplify_type(compact_type(v))) {
+        let res = {
+            let compacted = compact_type(solver, v);
+            coalesce_compact(solver, &simplify_type(compacted))
+        };
+        match res {
             Ok(t) => coalesced.push(format!("{t}")),
             Err(_) => rejected = true,
         }
@@ -179,6 +184,7 @@ fn shuffle(rng: &mut Rng, n: usize) -> Vec<usize> {
 /// rather than left to the sampler.
 #[test]
 fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
+    let solver = &mut Solver::new();
     let fun_over = |fun_kind: FunKind| Type::Fun {
         name: None,
         fun_kind,
@@ -189,30 +195,34 @@ fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
     // `k1` and `k2` meet on opposite bounds of `v0`, which is the var-var kind
     // edge; `Data` reaches `k1` only; `k2` also sits in a positive position of
     // `v1`, which is what makes its resolution show up in a coalesced type.
-    let build = |order: &[usize]| -> String {
+    let mut build = |order: &[usize]| -> String {
         let scope = Telescope::empty();
-        let v0 = Type::Infer(InferVar::fresh_in(0, &scope));
-        let v1 = Type::Infer(InferVar::fresh_in(0, &scope));
-        let (k1, k2) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let v0 = Type::Infer(InferVar::fresh_in(solver, 0, &scope));
+        let v1 = Type::Infer(InferVar::fresh_in(solver, 0, &scope));
+        let (k1, k2) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
         let mut rejected = false;
         for &i in order {
             let r = match i {
                 0 => constrain_subtype(
+                    solver,
                     &fun_over(FunKind::Var(Rc::clone(&k1))),
                     &v0,
                     &mut ConstrainCache::new(),
                 ),
                 1 => constrain_subtype(
+                    solver,
                     &v0,
                     &fun_over(FunKind::Var(Rc::clone(&k2))),
                     &mut ConstrainCache::new(),
                 ),
                 2 => constrain_subtype(
+                    solver,
                     &fun_over(FunKind::Var(Rc::clone(&k2))),
                     &v1,
                     &mut ConstrainCache::new(),
                 ),
                 _ => constrain_subtype(
+                    solver,
                     &v0,
                     &fun_over(FunKind::Data(None)),
                     &mut ConstrainCache::new(),
@@ -222,7 +232,11 @@ fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
         }
         let mut out = Vec::new();
         for v in [&v0, &v1] {
-            match coalesce_compact(&simplify_type(compact_type(v))) {
+            let res = {
+                let compacted = compact_type(solver, v);
+                coalesce_compact(solver, &simplify_type(compacted))
+            };
+            match res {
                 Ok(t) => out.push(format!("{t}")),
                 Err(_) => {
                     rejected = true;
@@ -277,6 +291,7 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
 
 #[test]
 fn solving_is_independent_of_constraint_arrival_order() {
+    let solver = &mut Solver::new();
     let seed: u64 = env_or("CAMBRA_FUZZ_SEED", 0xD1CE);
     let n: usize = env_or("CAMBRA_FUZZ_N", 2000);
 
@@ -294,11 +309,11 @@ fn solving_is_independent_of_constraint_arrival_order() {
             (nvars, specs)
         };
         let (nvars, specs) = build();
-        let baseline = run(nvars, &specs, &(0..specs.len()).collect::<Vec<_>>());
+        let baseline = run(solver, nvars, &specs, &(0..specs.len()).collect::<Vec<_>>());
         for _ in 0..8 {
             let (nvars, specs) = build();
             let order = shuffle(&mut rng, specs.len());
-            let outcome = run(nvars, &specs, &order);
+            let outcome = run(solver, nvars, &specs, &order);
             if outcome != baseline {
                 mismatches.push(format!(
                     "case {case}: order {order:?} diverges\n  specs = {specs:?}\n  \

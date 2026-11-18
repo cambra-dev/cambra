@@ -42,6 +42,7 @@
 
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
+use crate::ccl::infer::solver::Solver;
 use std::rc::Rc;
 
 use crate::ccl::Duplicate;
@@ -150,7 +151,7 @@ fn run_memoized(mut expr: Expr) -> Result<Expr, LambdaElimError> {
     // refinements, `expr.ty` = value-refinements ∪ born on the rebuilt view) so the
     // post-pass typecheck's reconstruction matches the recorded type without
     // making the cast's refinements route-dependent.
-    crate::ccl::ccl_utils::canonicalize_cast_types(&mut simplified);
+    crate::ccl::ccl_utils::canonicalize_cast_types(&mut Solver::none(), &mut simplified);
     Ok(simplified)
 }
 
@@ -441,7 +442,7 @@ pub(crate) fn pairing_components(element: &Expr) -> Option<Vec<Expr>> {
     let input = Expr::var(a).with_ty((**domain).clone());
     Some(
         fs.iter()
-            .map(|f| crate::ccl::ccl_utils::read_at(&input, f))
+            .map(|f| crate::ccl::ccl_utils::read_at(&mut Solver::none(), &input, f))
             .collect(),
     )
 }
@@ -493,7 +494,12 @@ pub fn const_(c: Expr) -> Expr {
 /// impossible under the Barendregt convention and the engine asserts it.
 pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     let mut expr = expr;
-    crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
+    crate::ccl::subst::Subst::discharge_in_place_in(
+        &mut Solver::scratch(),
+        &mut expr,
+        name,
+        replacement,
+    );
     expr
 }
 
@@ -1248,7 +1254,8 @@ fn eta_expanded(v: Expr) -> Expr {
         Type::Fun { name, .. } => name.as_ref(),
         _ => None,
     };
-    let codomain = crate::ccl::subst::codomain_renamed(source_binder, &y, &codomain);
+    let codomain =
+        crate::ccl::subst::codomain_renamed(&mut Solver::none(), source_binder, &y, &codomain);
     let body = Expr::apply(Expr::var(&y).with_ty(domain.clone()), v).with_ty(codomain.clone());
     let mut binding =
         crate::ccl::expr::TypedBinding::new_unannotated(y.clone(), Occurrence::mint());
@@ -1748,6 +1755,7 @@ fn elim_lambda_impl(
                                                 Some(originals),
                                             ) if reads_input => {
                                                 let restated = crate::ccl::ccl_utils::chain_type_of(
+                                                    &mut Solver::none(),
                                                     &originals[..=at + 1],
                                                     chain.clone(),
                                                 );
@@ -2606,7 +2614,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // is what puts the binder back. Without it the morphism keeps a witness domain
             // with nothing binding it, which the free-witness check reports at the pass
             // boundary and the assert below reports here.
-            result.ty = Type::sum_like(&original_ty, result.ty);
+            result.ty = Type::sum_like(&mut Solver::none(), &original_ty, result.ty);
             // Compare modulo Pi binder *presence*: the point-free
             // construction keeps a dependent morphism's own binder (same
             // `Name`, uid-preserved) but rebuilds a built-in's own function type

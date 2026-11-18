@@ -5,6 +5,7 @@
 //! [`wrap_with_iterate`] to the hash-join strategy ([`super::join::try_hash_join_rewrite`])
 //! when applicable, else the uniform iterate-then-restricts chain.
 
+use crate::ccl::infer::solver::Solver;
 use std::mem::take;
 
 use super::join::try_hash_join_rewrite;
@@ -643,7 +644,12 @@ pub(super) fn planned_restrict(
     ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
     let planned = plan_lifted(lifted, PlanningPhase::MarkIterationSites, ctx)?;
-    Ok(make_restrict_stating(stated, planned, upstream))
+    Ok(make_restrict_stating(
+        &mut Solver::none(),
+        stated,
+        planned,
+        upstream,
+    ))
 }
 
 /// The morphism a `Compose` chain leads with, or the expression itself when it is
@@ -908,7 +914,7 @@ fn domain_keys(
     // `domain` rather than the built source's domain, because `make_restrict` drops a
     // trivially-true layer (`if True`) that the consumer's type still states.
     Ok(if matches!(domain, Type::Refinement(..)) {
-        set_codomain(source, domain.clone())
+        set_codomain(&mut Solver::none(), source, domain.clone())
     } else {
         source
     })
