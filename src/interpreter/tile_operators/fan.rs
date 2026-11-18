@@ -253,7 +253,7 @@ impl TileProducer for RecordWrapProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let guard = match &obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -745,8 +745,8 @@ impl TileProducer for ZipProducer {
                 *self.held.write().unwrap_or_else(PoisonError::into_inner) = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
-                if !self.base.obsolete_guard.is_empty() {
-                    out.remove_guarded(self.base.obsolete_guard.clone());
+                if !self.obsolete_guard().is_empty() {
+                    out.remove_guarded(self.obsolete_guard());
                 }
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
                     let emitted = self
@@ -766,10 +766,11 @@ impl TileProducer for ZipProducer {
         }
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         for (arm, dropped) in std::mem::take(
-            self.dropped_rows
-                .get_mut()
+            &mut *self
+                .dropped_rows
+                .write()
                 .unwrap_or_else(PoisonError::into_inner),
         ) {
             self.inputs[arm].release(dropped);
@@ -799,7 +800,7 @@ impl TileProducer for ZipProducer {
             &pair,
         )]);
         let released = TileGuard::flatten_or(vec![whole.clone(), delivered]);
-        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+        for (name, input) in self.names.iter().zip(self.inputs.iter()) {
             let guard = match &released {
                 g if g.is_universal() => input.tiling().universal_guard(),
                 g if g.is_empty() => input.tiling().empty_guard(),
@@ -815,24 +816,23 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
-        for paths in self.held.get_mut().unwrap_or_else(PoisonError::into_inner) {
+        for paths in self
+            .held
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+        {
             paths.retain(|path| !whole.covers_path(path));
         }
         if whole.is_universal() {
-            *self
-                .emitted
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner) = Predicate::False;
+            *self.emitted.write().unwrap_or_else(PoisonError::into_inner) = Predicate::False;
         } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
             let emitted = self
                 .emitted
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .minus(keys);
-            *self
-                .emitted
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner) = emitted;
+            *self.emitted.write().unwrap_or_else(PoisonError::into_inner) = emitted;
         }
     }
 }
@@ -1030,20 +1030,20 @@ impl TileProducer for MakeRecordProducer {
         Tile::record(fields)
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         // A record guard names one guard per field, and each goes to that field's operand.
         // A later pull re-reads every operand, and each withholds what it was told.
         match &obsolete_guard {
             g if g.is_empty() => {}
             TileGuard::Record(fields) => {
-                for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+                for (name, input) in self.names.iter().zip(self.inputs.iter()) {
                     if let Some(field) = fields.get(name) {
                         input.release(field.clone());
                     }
                 }
             }
             g if g.is_universal() => {
-                for input in self.inputs.iter_mut() {
+                for input in self.inputs.iter() {
                     input.release(input.tiling().universal_guard());
                 }
             }
@@ -1307,8 +1307,8 @@ impl TileProducer for SelectFieldProducer {
         tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.dropped_rows.release_to(&mut *self.input);
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&*self.input);
         let released = self.at_field(obsolete_guard);
         self.input.release(released);
     }
@@ -1487,7 +1487,7 @@ mod tests {
     #[test]
     fn record_wrap_forwards_a_release_to_its_input() {
         let (tile, tiling) = keyed_ints();
-        let (mut producer, log) = record_wrap_over(tile, tiling, "f");
+        let (producer, log) = record_wrap_over(tile, tiling, "f");
         producer.release(producer.tiling().universal_guard());
         assert!(
             log.read()
@@ -1503,7 +1503,7 @@ mod tests {
     #[test]
     fn record_wrap_forwards_a_release_of_its_keys() {
         let (tile, tiling) = keyed_ints();
-        let (mut producer, log) = record_wrap_over(tile, tiling, "f");
+        let (producer, log) = record_wrap_over(tile, tiling, "f");
         let key_zero = Predicate::at_or_below(Value::UInt(0));
         producer.release(TileGuard::Function(FunctionGuard::Domain(key_zero.clone())));
         assert_eq!(
@@ -1524,7 +1524,7 @@ mod tests {
             uint.clone(),
             Tiling::data_function(uint, Tiling::Scalar(int)),
         );
-        let (mut producer, log) = record_wrap_over(tiling.empty_tile(), tiling.clone(), "f");
+        let (producer, log) = record_wrap_over(tiling.empty_tile(), tiling.clone(), "f");
         let key_zero = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
             Value::UInt(0),
         )));
@@ -1557,7 +1557,7 @@ mod tests {
             inputs.push(Box::new(spy));
         }
         let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
-        let mut producer = MakeRecordProducer {
+        let producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: (0..2).map(tuple_field).collect(),
             inputs,
@@ -1579,7 +1579,7 @@ mod tests {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
-        let mut producer = MakeRecordProducer {
+        let producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0)],
             inputs: vec![Box::new(spy)],
@@ -1617,7 +1617,7 @@ mod tests {
         let names: Vec<SmolStr> = (0..2).map(tuple_field).collect();
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
-        let mut producer = MakeRecordProducer {
+        let producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: names.clone(),
             inputs,
@@ -1724,7 +1724,7 @@ mod tests {
             input_tiling.clone(),
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
-        let mut producer = SelectFieldProducer {
+        let producer = SelectFieldProducer {
             dropped_rows: Default::default(),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
@@ -2322,7 +2322,7 @@ mod tests {
                 .clone()
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// A row an arm deletes reaches no consumer, so the zip stops tracking it where it gives the

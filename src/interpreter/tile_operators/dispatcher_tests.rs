@@ -141,11 +141,11 @@ impl TileProducer for Scripted {
         self.tiling().empty_tile()
     }
 
-    fn release_impl(&mut self, _guard: TileGuard) {}
+    fn release_impl(&self, _guard: TileGuard) {}
 }
 
 impl Breaker for Scripted {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
         self.input.get(guard);
         if let Some(released) = &self.releases {
             self.input.release(released.clone());
@@ -602,7 +602,7 @@ impl TileProducer for Positions {
         self.tiling().empty_tile()
     }
 
-    fn release_impl(&mut self, _guard: TileGuard) {}
+    fn release_impl(&self, _guard: TileGuard) {}
 }
 
 /// Finish source pipeline 0 after it consumed row 0 of a `Positions` input whole and the input
