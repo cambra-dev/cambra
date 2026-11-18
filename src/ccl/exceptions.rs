@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     PredMemo, projected_element, projected_element_ref, walk_refined_predicates_mut,
 };
@@ -81,7 +82,7 @@ fn replace_filter(ty: &mut Type, memo: &PredMemo<()>, from: &Expr, to: &Expr) {
         if !crate::ccl::ty::eq_term_modulo_ty_slots(predicate, from) {
             return false;
         }
-        *predicate = to.clone();
+        *predicate = to.duplicate();
         true
     });
 }
@@ -924,7 +925,7 @@ impl Cx {
                 let bind = |bound: Expr, body: Expr, body_ty: Type| {
                     at_terminal(bound, |value| {
                         kept.rebuild(TypedExprNode::Let {
-                            binding: b.clone(),
+                            binding: b.duplicate(),
                             bound_expr: Box::new(value),
                             body: Box::new(body),
                         })
@@ -989,7 +990,7 @@ impl Cx {
                 let body = self.elim(*body, arms);
                 let rebuild = |init: Expr, body: Expr, ty: Type| {
                     kept.rebuild(TypedExprNode::MutDecl {
-                        binding: b.clone(),
+                        binding: b.duplicate(),
                         init: Box::new(init),
                         body: Box::new(body),
                     })
@@ -1103,7 +1104,7 @@ impl Cx {
                         );
                         let function = function_kept
                             .rebuild(TypedExprNode::Lambda {
-                                params: vec![param.clone()],
+                                params: vec![param.duplicate()],
                                 body: Box::new(body),
                             })
                             .with_ty(function_ty);
@@ -1422,7 +1423,7 @@ impl Cx {
         let lp = |iter: Expr, body: Expr| {
             kept.rebuild(TypedExprNode::For {
                 position: Box::new(position.clone()),
-                target: target.clone(),
+                target: target.duplicate(),
                 iter: Box::new(iter),
                 body: Box::new(body),
             })
@@ -1745,7 +1746,7 @@ impl Cx {
         }
         let scan = Expr::new(TypedExprNode::For {
             position: Box::new(Name::fresh("__position")),
-            target: o.clone(),
+            target: o.duplicate(),
             iter: Box::new(tvar(&elements.name, elements_ty.clone())),
             body: Box::new(value_match(&o, scan, &unit_ty)),
         })
@@ -1822,7 +1823,7 @@ impl Cx {
                 .filter(|r| holds_raise(&r.predicate));
             let filter = raising.next().expect("the filter raises");
             assert!(raising.next().is_none(), "a comprehension has one filter");
-            Expr::clone(&filter.predicate)
+            Expr::duplicate(&filter.predicate)
         };
         let value_ty = body.ty.clone();
         let bool_ty = Type::Base(BaseType::Bool);
@@ -1834,10 +1835,10 @@ impl Cx {
         let inner = self.arms(&raised);
         let filter_at = TypedBinding {
             name: Name::fresh_like(&param.name),
-            ..param.clone()
+            ..param.duplicate()
         };
         let guard = crate::ccl::lambda_elim::substitute(
-            filter.clone(),
+            filter.duplicate(),
             &Name::elem(),
             &tvar(&filter_at.name, filter_at.ty.clone()),
         );
@@ -1878,7 +1879,7 @@ impl Cx {
         // The scan's positions under a binder of their own: the cast keeps the element's.
         let at = TypedBinding {
             name: Name::fresh_like(&param.name),
-            ..param.clone()
+            ..param.duplicate()
         };
         let read_at = tvar(&at.name, at.ty.clone());
         let scanned = crate::ccl::lambda_elim::substitute(*body, &param.name, &read_at);
@@ -1886,7 +1887,7 @@ impl Cx {
         let holds = binding(Name::fresh("__holds"), guard_ty.clone());
         let mut on_outcome = vec![(
             Self::ok(),
-            holds.clone(),
+            holds.duplicate(),
             Expr::new(TypedExprNode::Case {
                 scrutinee: None,
                 branches: vec![
@@ -1923,7 +1924,7 @@ impl Cx {
             Occurrence::mint(),
             at.ty.clone(),
             Expr::let_in(
-                outcome_b.clone(),
+                outcome_b.duplicate(),
                 filter_read(read_at),
                 value_match(&outcome_b, on_outcome, &kept_ty),
             )
@@ -1947,7 +1948,7 @@ impl Cx {
         // Where the filter held, as a predicate on `__elem`: what stands for 𝑃 in every type.
         let mut where_held = vec![(
             Self::ok(),
-            holds.clone(),
+            holds.duplicate(),
             tvar(&holds.name, guard_ty.clone()),
         )];
         for (tag, t) in &inner {
@@ -2025,7 +2026,7 @@ impl Cx {
             }
         }
         let mut expr = expr;
-        let pure = self.pure_filter(lifted.raising.clone());
+        let pure = self.pure_filter(lifted.raising.duplicate());
         replace_filter_in(&mut expr, &PredMemo::default(), &lifted.held, &pure);
         expr
     }
@@ -2044,7 +2045,7 @@ impl Cx {
                 let holds = binding(Name::fresh("__holds"), bool_ty.clone());
                 let mut arms = vec![(
                     Self::ok(),
-                    holds.clone(),
+                    holds.duplicate(),
                     tvar(&holds.name, bool_ty.clone()),
                 )];
                 for (tag, t) in &inner {

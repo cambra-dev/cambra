@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::Type;
 use crate::ccl::ty::TypeParamId;
 
@@ -35,7 +36,7 @@ pub(crate) fn instantiate(ty: &Type, incoming: &Type) -> Type {
     let params: Vec<TypeParamId> = poly.params.iter().map(|p| p.param.id).collect();
     let mut bound = HashMap::new();
     match_params(&domain, incoming, &params, &mut bound);
-    closed_deep(&instantiate_with(poly, &bound))
+    closed_deep(&instantiate_with(poly, &bound), crate::ccl::Ids::Fresh)
 }
 
 /// What a generalized parameter is instantiated to ([`match_params`]).
@@ -139,11 +140,12 @@ fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::FunBinder) ->
     let Type::Fun { domain, .. } = fun.peel_refinements() else {
         unreachable!("only a function has a codomain")
     };
-    crate::ccl::subst::open_at_binder(b, domain, codomain)
+    crate::ccl::subst::open_at_binder(b, domain, codomain, crate::ccl::Ids::Fresh)
 }
 
-/// `ty` with every named function's references to its own binder read by name.
-pub(crate) fn opened_deep(ty: &Type) -> Type {
+/// `ty` with every named function's references to its own binder read by name, the terms the
+/// opening copies copied as `ids` says.
+pub(crate) fn opened_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
     match ty {
         Type::Fun {
             binder,
@@ -153,54 +155,59 @@ pub(crate) fn opened_deep(ty: &Type) -> Type {
             capabilities,
         } if !binder.is_none() => {
             let binder = crate::ccl::subst::named_binder(binder);
-            let codomain = crate::ccl::subst::open_at_binder(&binder, domain, codomain);
+            let codomain = crate::ccl::subst::open_at_binder(&binder, domain, codomain, ids);
             Type::Fun {
                 binder,
                 fun_kind: fun_kind.clone(),
-                domain: Box::new(opened_deep(domain)),
-                codomain: Box::new(opened_deep(&codomain)),
+                domain: Box::new(opened_deep(domain, ids)),
+                codomain: Box::new(opened_deep(&codomain, ids)),
                 capabilities: capabilities.clone(),
             }
         }
         // A family's body reads its binders by their names.
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
-            let opened = crate::ccl::subst::opened_family_body(binders, body);
+            let opened = crate::ccl::subst::opened_family_body(binders, body, ids);
             Type::Family {
                 binders: binders
                     .iter()
-                    .map(|(n, t)| (n.clone(), opened_deep(t)))
+                    .map(|(n, t)| (n.clone(), opened_deep(t, ids)))
                     .collect(),
-                body: Box::new(opened_deep(opened.as_ref().unwrap_or(body))),
+                body: Box::new(opened_deep(opened.as_ref().unwrap_or(body), ids)),
             }
         }
         // A component's references to the components before it are read by their names, as a
         // codomain's to its function's binder. A tuple naming each component has them.
         Type::DepTuple(cs) if cs.iter().all(|(n, _)| n.is_some()) => {
-            let opened = crate::ccl::subst::open_tuple_components(cs, |j, _| {
-                crate::ccl::subst::Mapping::Rename(
-                    cs[j]
-                        .0
-                        .clone()
-                        .unwrap_or_else(|| unreachable!("every component is named")),
-                )
-            });
+            let opened = crate::ccl::subst::open_tuple_components(
+                cs,
+                |j, _| {
+                    crate::ccl::subst::Mapping::Rename(
+                        cs[j]
+                            .0
+                            .clone()
+                            .unwrap_or_else(|| unreachable!("every component is named")),
+                    )
+                },
+                ids,
+            );
             Type::DepTuple(
                 cs.iter()
                     .zip(opened)
-                    .map(|((n, _), t)| (n.clone(), opened_deep(&t)))
+                    .map(|((n, _), t)| (n.clone(), opened_deep(&t, ids)))
                     .collect(),
             )
         }
         _ => {
             let mut out = ty.clone();
-            out.walk_children_mut(|c| *c = opened_deep(c));
+            out.walk_children_mut(|c| *c = opened_deep(c, ids));
             out
         }
     }
 }
 
-/// [`opened_deep`] undone: every named function closed over its binder (`Type::pi_kinded`).
-pub(crate) fn closed_deep(ty: &Type) -> Type {
+/// [`opened_deep`] undone: every named function closed over its binder (`Type::pi_kinded`), the
+/// terms the closing copies copied as `ids` says.
+pub(crate) fn closed_deep(ty: &Type, ids: crate::ccl::Ids) -> Type {
     match ty {
         Type::Fun {
             binder,
@@ -211,29 +218,34 @@ pub(crate) fn closed_deep(ty: &Type) -> Type {
         } if !binder.is_none() => Type::Fun {
             binder: binder.clone(),
             fun_kind: fun_kind.clone(),
-            domain: Box::new(closed_deep(domain)),
+            domain: Box::new(closed_deep(domain, ids)),
             codomain: Box::new(crate::ccl::subst::close_at_binder(
                 binder,
-                &closed_deep(codomain),
+                &closed_deep(codomain, ids),
+                ids,
             )),
             capabilities: capabilities.clone(),
         },
-        Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => Type::family(
-            binders
-                .iter()
-                .map(|(n, t)| (n.clone().expect("matched named"), closed_deep(t)))
-                .collect(),
-            closed_deep(body),
-        ),
+        Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
+            Type::family_with_ids(
+                binders
+                    .iter()
+                    .map(|(n, t)| (n.clone().expect("matched named"), closed_deep(t, ids)))
+                    .collect(),
+                closed_deep(body, ids),
+                ids,
+            )
+        }
         // Closed over the components' names, and the plain tuple where none reads another.
-        Type::DepTuple(cs) => Type::dep_tuple(
+        Type::DepTuple(cs) => Type::dep_tuple_with_ids(
             cs.iter()
-                .map(|(n, t)| (n.clone(), closed_deep(t)))
+                .map(|(n, t)| (n.clone(), closed_deep(t, ids)))
                 .collect(),
+            ids,
         ),
         _ => {
             let mut out = ty.clone();
-            out.walk_children_mut(|c| *c = closed_deep(c));
+            out.walk_children_mut(|c| *c = closed_deep(c, ids));
             out
         }
     }
@@ -276,7 +288,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                     &still.params.iter().map(|q| q.param.id).collect::<Vec<_>>(),
                     &mut bound,
                 );
-                closed_deep(&substitute(&still.body, &bound))
+                closed_deep(&substitute(&still.body, &bound), crate::ccl::Ids::Fresh)
             }
             // An instance can hold generalized types of its own, a pair of generic morphisms whose
             // pairing is generic too, which meet the supertype's components in turn.
@@ -338,7 +350,11 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                 b
             };
             Type::Fun {
-                codomain: Box::new(crate::ccl::subst::close_at_binder(&b, &aligned)),
+                codomain: Box::new(crate::ccl::subst::close_at_binder(
+                    &b,
+                    &aligned,
+                    crate::ccl::Ids::Fresh,
+                )),
                 binder: b,
                 fun_kind: fun_kind.clone(),
                 domain,
@@ -354,6 +370,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                     .zip(sups)
                     .map(|(a, (name, b))| (name.clone(), align_sub(a, b)))
                     .collect(),
+                crate::ccl::Ids::Fresh,
             )
         }
         // Every other shape aligns position by position, a position the supertype lacks kept.
@@ -394,7 +411,7 @@ pub(crate) fn renamed_by_match(part: &Type, pattern: &Type, actual: &Type) -> Ty
         &crate::ccl::ccl_utils::PredMemo::default(),
         &(),
         &mut |term, _| {
-            *term = term.clone();
+            *term = term.duplicate();
             true
         },
     );
@@ -447,8 +464,8 @@ fn match_params(
 ) {
     let mut met = Vec::new();
     match_direct(
-        &opened_deep(pattern),
-        &opened_deep(actual),
+        &opened_deep(pattern, crate::ccl::Ids::Fresh),
+        &opened_deep(actual, crate::ccl::Ids::Fresh),
         params,
         &[],
         out,
@@ -609,25 +626,27 @@ fn substitute_sharing(
         .values()
         .any(|i| matches!(i, Instance::Type { binders, .. } if !binders.is_empty()));
     let mut out = if families {
-        closed_deep(&substitute_go(&opened_deep(ty), bound))
+        closed_deep(
+            &substitute_go(&opened_deep(ty, crate::ccl::Ids::Fresh), bound),
+            crate::ccl::Ids::Fresh,
+        )
     } else {
         substitute_go(ty, bound)
     };
     // The terms a type holds carry type slots of their own, written over the same
-    // parameters. The rewrite is the same type's, so it keeps the identities it copies.
-    crate::ccl::provenance::preserving_ids(|| {
-        crate::ccl::ccl_utils::walk_held_terms_mut(&mut out, memo, &(), &mut |term, memo| {
-            fn in_term(
-                e: &mut crate::ccl::Expr,
-                bound: &HashMap<TypeParamId, Instance>,
-                memo: &crate::ccl::ccl_utils::PredMemo,
-            ) {
-                e.walk_type_slots_mut(|t| *t = substitute_sharing(t, bound, memo));
-                e.walk_children_mut(|c| in_term(c, bound, memo));
-            }
-            in_term(term, bound, memo);
-            true
-        })
+    // parameters. The instance lives on beside the type it instantiates, so the rewrite
+    // duplicates the terms it copies, each recorded as a copy of its origin.
+    crate::ccl::ccl_utils::walk_held_terms_mut(&mut out, memo, &(), &mut |term, memo| {
+        fn in_term(
+            e: &mut crate::ccl::Expr,
+            bound: &HashMap<TypeParamId, Instance>,
+            memo: &crate::ccl::ccl_utils::PredMemo,
+        ) {
+            e.walk_type_slots_mut(|t| *t = substitute_sharing(t, bound, memo));
+            e.walk_children_mut(|c| in_term(c, bound, memo));
+        }
+        in_term(term, bound, memo);
+        true
     });
     out
 }
@@ -641,22 +660,21 @@ fn substitute_go(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
         },
         Type::FamilyApp(app) => match bound.get(&app.param.id) {
             // The arguments are the application's own terms, moved into the instance, so
-            // they keep their identities, as `substitute`'s rewrite of held terms does.
+            // they keep their identities.
             Some(Instance::Type { binders, ty: at }) => {
-                crate::ccl::provenance::preserving_ids(|| {
-                    let is_itself = |b: &crate::ccl::Name, a: &crate::ccl::ty::FamilyArg| matches!(&a.term.node, crate::ccl::TypedExprNode::Var(n) if n == b);
-                    let env: HashMap<crate::ccl::Name, crate::ccl::Expr> = binders
-                        .iter()
-                        .zip(&app.args)
-                        .filter(|(b, a)| !is_itself(b, a))
-                        .map(|(b, a)| (b.clone(), (*a.term).clone()))
-                        .collect();
-                    if env.is_empty() {
-                        at.clone()
-                    } else {
-                        crate::ccl::subst::Subst::discharging(&env).apply_type(at)
-                    }
-                })
+                let is_itself = |b: &crate::ccl::Name, a: &crate::ccl::ty::FamilyArg| matches!(&a.term.node, crate::ccl::TypedExprNode::Var(n) if n == b);
+                let env: HashMap<crate::ccl::Name, crate::ccl::Expr> = binders
+                    .iter()
+                    .zip(&app.args)
+                    .filter(|(b, a)| !is_itself(b, a))
+                    .map(|(b, a)| (b.clone(), (*a.term).clone_preserving_ids()))
+                    .collect();
+                if env.is_empty() {
+                    at.clone()
+                } else {
+                    crate::ccl::subst::Subst::discharging(&env, crate::ccl::Ids::Kept)
+                        .apply_type(at)
+                }
             }
             Some(Instance::Param(q)) => Type::FamilyApp(crate::ccl::ty::FamilyApp {
                 param: Rc::clone(q),
@@ -932,13 +950,12 @@ pub(crate) struct Ungeneralizable(pub(crate) String);
 /// reading none of them: whether every part reading one is determined by what the morphism
 /// receives.
 pub(crate) fn generalizes(ty: &Type, out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool) -> bool {
-    // The generalized type is discarded, so the terms it holds are copied under their own ids.
-    crate::ccl::provenance::preserving_ids(|| {
-        generalized(ty, out_of_scope, "", &mut HashMap::new()).is_ok_and(|t| {
-            !crate::ccl::subst::type_free_vars(&t)
-                .iter()
-                .any(out_of_scope)
-        })
+    // The generalized type is discarded. Its copies of the terms it holds take fresh ids,
+    // which no tree reaches (`src/ccl/design/provenance.md`, "Duplication").
+    generalized(ty, out_of_scope, "", &mut HashMap::new()).is_ok_and(|t| {
+        !crate::ccl::subst::type_free_vars(&t)
+            .iter()
+            .any(out_of_scope)
     })
 }
 
@@ -1006,7 +1023,13 @@ fn with_open_binders(
     let mut own = Vec::new();
     type_binders(&apart, &mut own);
     let out_of_scope_here = |n: &crate::ccl::Name| out_of_scope(n) && !own.contains(n);
-    let generalized = closed_deep(&derive(&opened_deep(&apart), &out_of_scope_here)?);
+    let generalized = closed_deep(
+        &derive(
+            &opened_deep(&apart, crate::ccl::Ids::Fresh),
+            &out_of_scope_here,
+        )?,
+        crate::ccl::Ids::Fresh,
+    );
     Ok(restored_names(&generalized, &renames))
 }
 
@@ -1040,7 +1063,11 @@ fn renamed_apart(
             let opened = codomain_opened_as(ty, codomain, &fresh);
             let codomain = renamed_apart(&opened, free, renames);
             Type::Fun {
-                codomain: Box::new(crate::ccl::subst::close_at_binder(&fresh, &codomain)),
+                codomain: Box::new(crate::ccl::subst::close_at_binder(
+                    &fresh,
+                    &codomain,
+                    crate::ccl::Ids::Fresh,
+                )),
                 binder: fresh,
                 domain: Box::new(renamed_apart(domain, free, renames)),
                 fun_kind: fun_kind.clone(),
@@ -1352,7 +1379,7 @@ fn index_instances(
     ) {
         if own_path(e, own) {
             if !out.iter().any(|o| o == e) {
-                out.push(e.clone());
+                out.push(e.duplicate());
             }
             return;
         }
@@ -1392,7 +1419,7 @@ fn index_instances(
                         .as_ref()
                         .is_some_and(|d| p.ty.peel_refinements() == d.peel_refinements())
                 })
-                .map(|p| Rc::new(p.clone()))
+                .map(|p| Rc::new(p.duplicate()))
                 .collect()
         })
         .collect();
@@ -1499,7 +1526,7 @@ fn part_range(
                      out of scope once its refinements naming it are dropped"
                 )));
             }
-            Ok(closed_deep(&base))
+            Ok(closed_deep(&base, crate::ccl::Ids::Fresh))
         };
         let kind = match kind {
             crate::ccl::ty::TypeKind::Enumerated(candidates) => {
@@ -1534,7 +1561,7 @@ fn part_range(
     }
     // Stated closed: closing the quantified type ([`generalized`]) rebuilds the kind's copy of
     // the bound but not the parameter's, which would keep terms no tree holds.
-    let bound = closed_deep(&base);
+    let bound = closed_deep(&base, crate::ccl::Ids::Fresh);
     Ok((
         crate::ccl::ty::TypeKind::SubtypesOf(Box::new(bound.clone())),
         Some(bound),
@@ -2032,12 +2059,12 @@ mod tests {
             result,
             FunKind::Compute,
         );
-        let named = opened_deep(&ty);
+        let named = opened_deep(&ty, crate::ccl::Ids::Fresh);
         let Type::Fun { codomain, .. } = &named else {
             unreachable!()
         };
         assert!(crate::ccl::subst::type_free_vars(codomain).contains(&Name::from("a")));
-        assert_eq!(closed_deep(&named), ty);
+        assert_eq!(closed_deep(&named, crate::ccl::Ids::Fresh), ty);
         let mut binders = Vec::new();
         type_binders(&ty, &mut binders);
         assert_eq!(binders, vec![Name::from("a"), Name::from("b")]);
@@ -2060,7 +2087,7 @@ mod tests {
         );
         let above_i = compare(CompareKind::Greater, Expr::var("i").with_ty(int.clone()));
         let both = Expr::binop(
-            below_four.clone(),
+            below_four.duplicate(),
             BinOpKind::BoolLogic(LogicKind::And),
             above_i,
         )

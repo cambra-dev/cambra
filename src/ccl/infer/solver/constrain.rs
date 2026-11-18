@@ -19,6 +19,7 @@ use crate::ccl::nominal::{Variance, sides};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::normal_refinement;
 use crate::ccl::infer_var::{GuardedBound, Origin};
 use crate::ccl::subst::Subst;
@@ -592,7 +593,7 @@ impl ComponentScope<'_> {
             .collect();
         let substitution = {
             let _copies = crate::ccl::provenance::copy_frame("infer.argument_diagnostic");
-            Subst::discharging(&values)
+            Subst::discharging(&values, crate::ccl::Ids::Fresh)
         };
         ConstrainError::Mismatch {
             lhs: Box::new(substitution.apply_type(&lhs)),
@@ -1967,7 +1968,7 @@ fn constrain_go_impl(
                             && other_n
                                 .names()
                                 .any(|name| crate::ccl::ccl_utils::is_free_in_type(name, other)))))
-                .then(|| crate::ccl::subst::open_at_binder(n, d, c))
+                .then(|| crate::ccl::subst::open_at_binder(n, d, c, crate::ccl::Ids::Fresh))
             };
             let c0_opened = open(&crate::ccl::subst::named_binder(n0), d0, c0, n1, c1);
             let c1_opened = open(n1, d1, c1, n0, c0);
@@ -2108,9 +2109,11 @@ fn constrain_go_impl(
                 .iter()
                 .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__component")))
                 .collect();
-            let opened = crate::ccl::subst::open_tuple_components(a, |j, _| {
-                crate::ccl::subst::Mapping::Rename(names[j].clone())
-            });
+            let opened = crate::ccl::subst::open_tuple_components(
+                a,
+                |j, _| crate::ccl::subst::Mapping::Rename(names[j].clone()),
+                crate::ccl::Ids::Fresh,
+            );
             for (i, t1) in b.iter().enumerate() {
                 let joined = names[..i].iter().fold(Subst::id(), |s, n| {
                     Subst::then(&s, &Subst::join_arm(n.clone()))
@@ -2174,25 +2177,27 @@ fn constrain_go_impl(
             // A side closed to indices opens at its names where the other side is live, or
             // where the other side does not read the same components by index, so the two
             // cannot be compared index to index: a plain tuple meeting a written dependent one.
-            let opened = |cs: &[(Option<Name>, Type)],
-                          closed: bool,
-                          other: &Type,
-                          other_reads: bool| {
-                if closed
-                    && (cache.derivation.opens_unconditionally()
-                        || !other_reads
-                        || crate::ccl::subst::type_contains_infer(other))
-                {
-                    crate::ccl::subst::open_tuple_components(cs, |j, _| {
-                        let name = cs[j].0.clone().unwrap_or_else(|| {
+            let opened =
+                |cs: &[(Option<Name>, Type)], closed: bool, other: &Type, other_reads: bool| {
+                    if closed
+                        && (cache.derivation.opens_unconditionally()
+                            || !other_reads
+                            || crate::ccl::subst::type_contains_infer(other))
+                    {
+                        crate::ccl::subst::open_tuple_components(
+                            cs,
+                            |j, _| {
+                                let name = cs[j].0.clone().unwrap_or_else(|| {
                             panic!("a component a later one reads by index names a binder: {lhs}")
                         });
-                        crate::ccl::subst::Mapping::Rename(name)
-                    })
-                } else {
-                    cs.iter().map(|(_, t)| t.clone()).collect()
-                }
-            };
+                                crate::ccl::subst::Mapping::Rename(name)
+                            },
+                            crate::ccl::Ids::Fresh,
+                        )
+                    } else {
+                        cs.iter().map(|(_, t)| t.clone()).collect()
+                    }
+                };
             let (a_opened, b_opened) = (
                 opened(a, a_reads, rhs, b_reads),
                 opened(b, b_reads, lhs, a_reads),
@@ -2241,9 +2246,11 @@ fn constrain_go_impl(
             let opened = |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
                 let live = cache.derivation.opens_unconditionally()
                     || crate::ccl::subst::type_contains_infer(other);
-                live.then(|| crate::ccl::subst::opened_family_body(binders, body))
-                    .flatten()
-                    .unwrap_or_else(|| body.clone())
+                live.then(|| {
+                    crate::ccl::subst::opened_family_body(binders, body, crate::ccl::Ids::Fresh)
+                })
+                .flatten()
+                .unwrap_or_else(|| body.clone())
             };
             let (a_opened, b_opened) = (opened(a, a_body, rhs), opened(b, b_body, lhs));
             let aligned = a
@@ -2634,7 +2641,7 @@ fn constrain_go_impl(
             // substitution on its side reaches them before it is delivered.
             if let Type::FamilyApp(_) = lhs.peel_refinements() {
                 let into = edge_into_holder(sl, sr);
-                let at = crate::ccl::provenance::preserving_ids(|| into.apply_type(lhs));
+                let at = into.copying(crate::ccl::Ids::Kept).apply_type(lhs);
                 notify_lower(rv, &at, cache)?;
             } else {
                 notify_lower(rv, lhs, cache)?;

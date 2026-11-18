@@ -8,6 +8,7 @@ use cambra::ccl::Occurrence;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::ccl::Duplicate;
 use cambra::ccl::content_hash::content_hash;
 use cambra::ccl::{
     BindingTransparency, Expr, Home, Lit, Name, SharedImport, Type, TypedBinding, TypedExpr,
@@ -61,7 +62,7 @@ fn term_equality_compares_the_expression_outside_the_binder() {
         .into_iter()
         .zip(single_binder_nodes(2, None))
     {
-        assert!(eq_term_modulo_ty_slots(&one, &one.clone()));
+        assert!(eq_term_modulo_ty_slots(&one, &one.duplicate()));
         assert!(!eq_term_modulo_ty_slots(&one, &two));
     }
 }

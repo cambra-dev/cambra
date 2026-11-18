@@ -10,6 +10,7 @@
 use cambra::ccl::Occurrence;
 use std::rc::Rc;
 
+use cambra::ccl::Duplicate;
 use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, FunKindVar, Lit, Name, Openness,
     Refinement, Type, TypeKind, TypedExpr, UnaryOpKind, ccl_utils,
@@ -83,7 +84,7 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
             } else {
                 UnaryOpKind::Neg
             },
-            (*gen_pred_at(rng, depth - 1)).clone(),
+            (*gen_pred_at(rng, depth - 1)).duplicate(),
         )),
         // A projection: `Apply` of a `Proj` morphism, which is how field and
         // index access is spelled (`TypedExpr::proj_field` / `proj_index`).
@@ -94,13 +95,13 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
                 TypedExpr::proj_index(rng.below(2) as usize)
             };
             Rc::new(TypedExpr::apply(
-                (*gen_pred_at(rng, depth - 1)).clone(),
+                (*gen_pred_at(rng, depth - 1)).duplicate(),
                 key,
             ))
         }
         // A general application, the other compound the model's `Predicate` carries.
         7 => Rc::new(TypedExpr::apply(
-            (*gen_pred_at(rng, depth - 1)).clone(),
+            (*gen_pred_at(rng, depth - 1)).duplicate(),
             TypedExpr::var(Name::raw(binder(rng))),
         )),
         // A binder the predicate itself introduces, referenced from its body —
@@ -113,10 +114,10 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
                 TypedExpr::binop(
                     TypedExpr::var(name.clone()),
                     BinOpKind::Compare(CompareKind::Equals),
-                    (*gen_pred_at(rng, depth - 1)).clone(),
+                    (*gen_pred_at(rng, depth - 1)).duplicate(),
                 )
             } else {
-                (*gen_pred_at(rng, depth - 1)).clone()
+                (*gen_pred_at(rng, depth - 1)).duplicate()
             };
             Rc::new(TypedExpr::lambda(
                 name,
@@ -130,21 +131,21 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
         9 => {
             let target = ccl_utils::refined_data_fun(
                 Type::Base(BaseType::Int),
-                (*gen_pred_at(rng, depth - 1)).clone(),
+                (*gen_pred_at(rng, depth - 1)).duplicate(),
                 Type::Base(BaseType::Int),
                 // A plain collection: the sum shapes come from `gen_ty`'s
                 // `Type::sum_over` arm.
                 FunKind::Data(None),
             );
             Rc::new(
-                ccl_utils::make_cast((*gen_pred_at(rng, depth - 1)).clone(), target)
+                ccl_utils::make_cast((*gen_pred_at(rng, depth - 1)).duplicate(), target)
                     .with_ty(Type::Base(BaseType::Int)),
             )
         }
         _ => {
             let x = binder(rng);
             Rc::new(TypedExpr::binop(
-                (*gen_pred_at(rng, depth - 1)).clone(),
+                (*gen_pred_at(rng, depth - 1)).duplicate(),
                 BinOpKind::Compare(CompareKind::Equals),
                 TypedExpr::var(Name::raw(x)),
             ))

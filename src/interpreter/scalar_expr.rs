@@ -682,6 +682,7 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Duplicate;
     use crate::ccl::Occurrence;
     use crate::ccl::RecordEntry;
     use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
@@ -1003,7 +1004,7 @@ mod tests {
             vec![false; n]
         );
         assert_eq!(
-            compare(CompareKind::Equals, vec![a.clone(), b.clone()]),
+            compare(CompareKind::Equals, vec![a.duplicate(), b.duplicate()]),
             vec![false; n]
         );
         assert_eq!(compare(CompareKind::NotEquals, vec![a, b]), vec![true; n]);
@@ -1047,7 +1048,7 @@ mod tests {
         let built = zip(vec![second_minus_one, Expr::proj_index(1)]);
         let compare = |op| {
             let chain = vec![
-                zip(vec![built.clone(), id()]),
+                zip(vec![built.duplicate(), id()]),
                 binop(BinOpKind::Compare(op)),
             ];
             let fused = fuse_prefix(&chain, &tuple_of_ints(2)).expect("the tuple is taken apart");
@@ -1148,7 +1149,7 @@ mod tests {
     #[test]
     fn operand_order_survives_the_zip() {
         let sub = binop(BinOpKind::Arithmetic(ArithmeticKind::Sub));
-        let left = vec![zip(vec![constant(7), id()]), sub.clone()];
+        let left = vec![zip(vec![constant(7), id()]), sub.duplicate()];
         let right = vec![zip(vec![id(), constant(7)]), sub];
         let input = || ColumnValue::Ints(vec![1, 10]);
         let eval = |chain: &[Expr]| fuse_prefix(chain, &int()).unwrap().program.eval(&input());
@@ -1413,7 +1414,7 @@ mod tests {
             zip(vec![Expr::proj_field("x"), constant(1)]),
             binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
         ]);
-        let with_unit = vec![zip(vec![id(), x_plus_one.clone()])];
+        let with_unit = vec![zip(vec![id(), x_plus_one.duplicate()])];
         assert!(fuse_prefix(&with_unit, &unit).is_none());
         let without = vec![zip(vec![Expr::proj_field("x"), x_plus_one])];
         assert!(fuse_prefix(&without, &unit).is_some());
@@ -1597,12 +1598,12 @@ mod tests {
     #[test]
     fn an_abandoned_attempt_leaves_the_same_program() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
-        let plain = vec![zip(vec![id(), constant(1)]), add.clone()];
+        let plain = vec![zip(vec![id(), constant(1)]), add.duplicate()];
         let plain = fuse_prefix(&plain, &int()).unwrap().program;
         // A good prefix, then a `zip` whose second arm is not element-wise.
         let abandoned = vec![
             zip(vec![id(), constant(1)]),
-            add.clone(),
+            add.duplicate(),
             zip(vec![
                 Expr::compose(vec![zip(vec![id(), constant(9)]), add]),
                 Expr::builtin(Builtin::Sum),
@@ -1769,12 +1770,17 @@ mod tests {
                 binop(BinOpKind::Arithmetic(ArithmeticKind::Mul)),
             ]
         };
-        let separate = [vec![field("a"), field("b"), field("c")], times_two()].concat();
-        let composed = [
+        let separate: Vec<Expr> = [vec![field("a"), field("b"), field("c")], times_two()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let composed: Vec<Expr> = [
             vec![Expr::compose(vec![field("a"), field("b"), field("c")])],
             times_two(),
         ]
-        .concat();
+        .into_iter()
+        .flatten()
+        .collect();
         let separate = fuse_prefix(&separate, &abc).expect("an operation follows the projections");
         let composed = fuse_prefix(&composed, &abc).expect("an operation follows the projections");
         assert_eq!(separate.program, composed.program);

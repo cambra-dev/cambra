@@ -52,10 +52,9 @@ by several slots through one `Rc`; distinct live terms must not share IDs. Two t
 would collapse to one row and one source attribution. [Walking the ids](#walking-the-ids) specifies
 the different traversal rules for these two domains.
 
-`Expr::new` mints an ID and reports it to the recorder. Ordinary `Clone` freshens each expression
-node it copies and reports its origin; type-slot predicates retain their `Rc` sharing.
-The explicit preserving operations and diagnostic-only exceptions are specified under
-[Duplication](#duplication).
+`Expr::new` mints an ID and reports it to the recorder. Each copy of an expression either freshens
+each node it copies and reports its origin, or keeps each node's ID ([Duplication](#duplication));
+type-slot predicates retain their `Rc` sharing.
 
 `NodeId::PLACEHOLDER` is zero; the counter starts at one. `Default`, `mem::take` placeholders and
 diagnostic throwaways use this sentinel without recording a birth. It must not persist in the
@@ -116,26 +115,43 @@ memoization contract are specified in
 
 ### Duplication
 
-Ordinary `TypedExpr::Clone` mints a new ID for each copied expression node and reports every
-`(origin, fresh)` pair through `on_copy`. A recording writes each copy against its origin.
-With no recording open, the copy has a fresh ID but no new provenance row; under an active phase,
-the hook's debug coverage assertion detects that missing recording.
+Expressions are not `Clone`. A value holding expressions is copied through `Duplicate::copied`,
+and its `Ids` argument states what the copy does with the IDs it copies:
 
-The explicit copying operations have different identity contracts:
-
-- `clone` duplicates the value at fresh expression IDs. Its type slots share their predicates
-  with the source through `Rc`; they do not duplicate those predicate terms.
-- `clone_preserving_ids` retains every copied expression ID and emits no copy events. Source
+- `Ids::Fresh` (`duplicate`) gives each copied node and occurrence a fresh ID and reports every
+  `(origin, fresh)` pair through `on_copy`. A recording writes each copy against its origin. With
+  no recording open, the copy has a fresh ID but no new provenance row; under an active phase, the
+  hook's debug coverage assertion detects that missing recording.
+- `Ids::Kept` (`clone_preserving_ids`) retains every copied ID and emits no copy events. Source
   and copy must not become distinct occurrences in one reachable tree. Permitted uses include
   substitution templates, separately rooted pane snapshots, rollback/comparison snapshots,
   tests comparing a phase's input with its output, and copies that replace a borrowed source
   which is then dropped. A substitution template is not itself a live tree node; materializing
   a read gives that occurrence fresh identities. A snapshot remains a separate tree.
-- `clone_at(id)` copies a subtree with the supplied root ID and ordinary cloning of its children.
-  Substitution uses it to retain a replaced variable occurrence's identity while freshening the
-  replacement's interior. Distinct occurrences retain distinct roots. Recording a wholly fresh
-  copy against the occurrence could preserve attribution, but would also report the occurrence
-  dead and require an ordering-compatible record.
+
+A copy's type slots share their predicates with the source through `Rc`; neither mode copies
+those predicate terms.
+
+A rewrite that copies terms copies them as its caller states. A `Subst` carries an `Ids`, and so
+does the walk behind the binder conversions (`open_pi_binder`, `close_pi_binder` and the functions
+built on them). Each copy they make follows it, a substitution derived from another carries it, and
+the memos of their results key on it. An instantiation of a family keeps the IDs of the template it
+copies: `NominalDecl::instantiate` opens, substitutes and closes the declaration's types with
+`Ids::Kept`, and `generalize::substitute_go` discharges a family parameter's instance with them, as
+`subst::discharge_binders` discharges a family's arguments into its body. A rewrite whose result
+only reaches a message or a check keeps them too: the respelling of an error raised in a dropped
+definition (`typecheck_discarded_definition`), and the rename that gives a slot's predicate its
+binder for a check (`check_slot_predicates`). So does a family application delivered to a trait
+obligation in the frame of the variable it reaches (`notify_lower`'s holder edge,
+`deliver_in_frame`), and so do the reductions that compute a term's normal form
+(`ccl_utils::normal_form`), which mint no node a tree holds. Every other substitution and conversion
+duplicates.
+
+`copied_at(id, ids)` copies a subtree with the supplied root ID and copies its children as `ids`
+states. Substitution uses it to retain a replaced variable occurrence's identity while copying the
+replacement's interior. Distinct occurrences retain distinct roots. Recording a wholly fresh copy
+against the occurrence could preserve attribution, but would also report the occurrence dead and
+require an ordering-compatible record.
 
 `preserve(id, node)` constructs a node directly at an existing ID without minting or recording.
 It defaults the type to `Hole` and the user annotation to `None`. A field-wise rebuild that must
@@ -146,10 +162,6 @@ Minting a root and overwriting its ID would leave a recorded birth that no node 
 `clone_preserving_ids` is not a repair for an `Unrecorded` or `DanglingParent` leak. A duplicated
 term needs a recording around the copy and a recorded origin. Preserving its IDs would instead
 hide the missing recording and may create collisions.
-
-`run_debug_check` is a separate diagnostic-only scope: clones preserve IDs and `Expr::new`
-constructs a `PLACEHOLDER` throwaway. Nothing built in this scope may enter a live tree.
-The scope prevents diagnostic work from shifting later allocation IDs and serialized fixtures.
 
 Every duplicated arm freshens, including the first. Choosing an arm to retain the source ID by
 position assumes that arm survives; later transformations may discard it.
@@ -258,13 +270,11 @@ Pattern { head: PatternHead, head_occurrence: Occurrence, binding: TypedBinding,
 ```
 
 `Occurrence` wraps a `NodeId` and gives it the two properties [Node identity](#node-identity) gives
-a `TypedExpr`'s id. Its `Clone` goes through `provenance::copy_id`, which freshens the id and
-reports the copy, or keeps the id inside `preserve_ids()`. Its `PartialEq` holds for any two
-occurrences, so an occurrence is not part of a binder's value. `TypedBinding` and `TypedExprNode`
-derive `Clone` and `PartialEq`, and a bare `NodeId` field under them would be copied verbatim by
-every clone, putting two live binders on one id, and would take part in structural equality.
-`content_hash` hashes a binder field by field (`hash_binding`), so it leaves the occurrence out
-without a change.
+a `TypedExpr`'s id. A copy of it freshens the id and reports the copy, or keeps the id, as its `Ids`
+states ([Duplication](#duplication)). Its `PartialEq` holds for any two occurrences, so an
+occurrence is not part of a binder's value. A bare `NodeId` field under `TypedBinding` or
+`TypedExprNode` would take part in their derived structural equality. `content_hash` hashes a binder
+field by field (`hash_binding`), so it leaves the occurrence out without a change.
 
 An occurrence is a field of the node, beside the name it locates, and never part of the name's value
 (`Name`, `Label`, `Type`). Those values are copied between terms and types by clones no recording
@@ -324,9 +334,9 @@ the pattern's `PatternHead::Constructor` reaches through its `decl`.
 | Lowering, a name the source writes: a binder, an applied occurrence, a label, a tag, a pattern head or an annotation | A `LoweringStep::Leaf` at the span the source writes it at, labelled `lower.image`, from `LoweringContext::occurrence_at`. `AssignmentBindings` and `PrefixStmt::Bind` carry each binder's span to the site that builds its node. |
 | Lowering, a binder or an annotation the source does not write | The leaf of the tag that records its holding node (`tag_source`, `tag_image`, `tag_machinery`, `tag_predicate`), at that tag's span and label, unless the occurrence is already recorded: `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload, a `def`'s polymorphic annotation, the members and checks a module's parameters bind, the element a `for` or comprehension pattern binder takes apart, the name `_` binds. |
 | `uniquify` | Nothing new. It renames binders in place, so every occurrence survives, and mints none. |
-| A copy of a subtree | A fresh id and a copy row, from `Occurrence::clone`. `subst`'s transport, monomorphization and inlining need no change. |
+| A copy of a subtree | A fresh id and a copy row, from `Occurrence::duplicate`. `subst`'s transport, monomorphization and inlining need no change. |
 | A binder a pass makes | A mint under the open recording, which becomes its parent: `__anf_N`, the reads `mut_read` names, `mut_elim`'s history and writer binders. |
-| A binder a pass makes to stand for a source binder | A copy of the source binder's occurrence, by `Occurrence::clone` or `Occurrence::copied_from`, so it resolves to the written name rather than to the recording's node. |
+| A binder a pass makes to stand for a source binder | A copy of the source binder's occurrence, by `Occurrence::duplicate` or `Occurrence::copied_from`, so it resolves to the written name rather than to the recording's node. |
 | A throwaway (`Expr::throwaway`, `mem::take`) | `NodeId::PLACEHOLDER`, which the recorder ignores. |
 
 The construction helpers outside lowering (`Expr::lambda`, `let_bind`, `mut_decl`,

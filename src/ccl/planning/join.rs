@@ -15,6 +15,7 @@ use crate::ccl::provenance::NodeId;
 use super::iterate::extent_overstates_keys;
 
 use super::*;
+use crate::ccl::Duplicate;
 
 /// Splits a (pointful) join predicate into equality join conditions and
 /// residual predicates, each compiled to a point-free morphism over the tuple
@@ -36,7 +37,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
     // decomposable join predicate, so treat the whole thing as one residual (no
     // join forms — plan_loop_join then bails on the empty equality set).
     if refinement.ty.domain().is_some() {
-        other_preds.push(refinement.clone());
+        other_preds.push(refinement.duplicate());
         return (eq_conds, other_preds);
     }
     // env: element binder name → its extraction morphism `rec.i ▷ li` (over rec).
@@ -59,7 +60,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
             let read_ty = source.ty.codomain().unwrap_or(Type::Hole);
             env.push((
                 element,
-                Expr::apply(position, source.clone()).with_ty(read_ty),
+                Expr::apply(position, source.duplicate()).with_ty(read_ty),
             ));
         }
         cur = inner;
@@ -73,7 +74,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
     {
         env.push((
             crate::ccl::one_param(params).name.clone(),
-            (**argument).clone(),
+            (**argument).duplicate(),
         ));
         cur = inner.as_ref();
     }
@@ -178,7 +179,7 @@ fn decompose_join_bool(
 /// Substitute the element-binder environment into `side`, then compile the bare predicate
 /// as a morphism over the tuple domain through [`predicates::fn_of_bare_predicate`].
 fn compile_join_side(side: &Expr, env: &[(Name, Expr)], rec_ty: &Type) -> Expr {
-    let mut body = side.clone();
+    let mut body = side.duplicate();
     for (var, morph) in env {
         body = lambda_elim::substitute(body, var, morph);
     }
@@ -251,7 +252,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
                 function.node
             );
             reindex_for_domain(argument, new_domain_ty, arm_order);
-            let arg = argument.clone();
+            let arg = argument.duplicate();
             *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
         TypedExprNode::Tuple(elts) => {
@@ -458,11 +459,11 @@ fn build_residual_predicate(
 
             let proj_a =
                 Expr::proj_index(pos_a).with_ty(Type::fun(flat_domain_ty.clone(), arm_ty_a));
-            let lhs = typed_compose(vec![proj_a, key_a.clone()]);
+            let lhs = typed_compose(vec![proj_a, key_a.duplicate()]);
 
             let proj_b =
                 Expr::proj_index(pos_b).with_ty(Type::fun(flat_domain_ty.clone(), arm_ty_b));
-            let rhs = typed_compose(vec![proj_b, key_b.clone()]);
+            let rhs = typed_compose(vec![proj_b, key_b.duplicate()]);
 
             // (lhs, rhs) ▷ zip ≫ eq : flat_domain_ty → Bool
             let zip_input_ty = Type::Tuple(vec![
@@ -542,7 +543,10 @@ fn build_join_plan(
         predicate: None,
     };
     let mut probe_arms = vec![node];
-    let mut remaining_preds: Vec<(Expr, BTreeSet<usize>)> = other_predicates.to_vec();
+    let mut remaining_preds: Vec<(Expr, BTreeSet<usize>)> = other_predicates
+        .iter()
+        .map(|(e, arms)| (e.duplicate(), arms.clone()))
+        .collect();
 
     // Build a left-deep sequence of hash joins: for each BFS child, hash-join its subtree
     // (build side) onto the accumulated probe side.  The first straddling condition drives
@@ -556,7 +560,7 @@ fn build_join_plan(
         let mut child_preds: Vec<(Expr, BTreeSet<usize>)> = Vec::new();
         remaining_preds.retain(|(pred, arms_used)| {
             if !arms_used.is_empty() && arms_used.iter().all(|a| build_arms.contains(a)) {
-                child_preds.push((pred.clone(), arms_used.clone()));
+                child_preds.push((pred.duplicate(), arms_used.clone()));
                 false
             } else {
                 true
@@ -580,9 +584,9 @@ fn build_join_plan(
 
         // Orient so that probe_arm is on the probe side.
         let (probe_arm, build_arm, probe_key_expr, build_key_expr) = if probe_arms.contains(arm_a) {
-            (*arm_a, *arm_b, key_a.clone(), key_b.clone())
+            (*arm_a, *arm_b, key_a.duplicate(), key_b.duplicate())
         } else {
-            (*arm_b, *arm_a, key_b.clone(), key_a.clone())
+            (*arm_b, *arm_a, key_b.duplicate(), key_a.duplicate())
         };
 
         let probe_key_idx = probe_arms.iter().position(|&a| a == probe_arm)?;
@@ -608,7 +612,7 @@ fn build_join_plan(
             let mut app = Vec::new();
             remaining_preds.retain(|(pred, arms_used)| {
                 if arms_used.iter().all(|a| probe_arms.contains(a)) {
-                    let mut adapted = pred.clone();
+                    let mut adapted = pred.duplicate();
                     reindex_for_domain(&mut adapted, &flat_domain_ty, &probe_arms);
                     app.push(adapted);
                     false
@@ -650,7 +654,7 @@ fn build_join_plan(
         let mut leaf_pred: Option<Expr> = None;
         remaining_preds.retain(|(pred, arms_used)| {
             if arms_used.iter().all(|a| probe_arms.contains(a)) {
-                let mut adapted = pred.clone();
+                let mut adapted = pred.duplicate();
                 replace_tuple_project_with_id(&mut adapted, &leaf_ty);
                 leaf_pred = combine_predicates(leaf_pred.take(), Some(adapted));
                 false
@@ -720,8 +724,8 @@ fn plan_loop_join(
             return None;
         }
 
-        let mut key_a = raw_a.clone();
-        let mut key_b = raw_b.clone();
+        let mut key_a = raw_a.duplicate();
+        let mut key_b = raw_b.duplicate();
         replace_tuple_project_with_id(&mut key_a, &arm_types[arm_a]);
         checker.check(&key_a).ok()?;
         replace_tuple_project_with_id(&mut key_b, &arm_types[arm_b]);
@@ -1041,7 +1045,7 @@ fn extent_iteration(ty: Type) -> Result<Expr, String> {
 
 /// A copy of `term` for the join to place, its id recorded in `lifted`.
 fn lifted_copy(term: &Expr, lifted: &mut Vec<NodeId>) -> Expr {
-    let copy = term.clone();
+    let copy = term.duplicate();
     lifted.push(copy.node_id());
     copy
 }
@@ -2023,7 +2027,7 @@ mod tests {
         // Pointful: λ rec → rec.0 ▷ (λ x → rec.1 ▷ (λ y → x == y and x ▷ some_filter)).
         // The equality drives the join; `x ▷ some_filter` is a residual on arm 0.
         let refinement = pointful_2arm_pred(&i, |x, y| {
-            let eq = Expr::binop(x.clone(), BinOpKind::Compare(CompareKind::Equals), y)
+            let eq = Expr::binop(x.duplicate(), BinOpKind::Compare(CompareKind::Equals), y)
                 .with_ty(b.clone());
             let filt = Expr::apply(x, var("some_filter").with_ty(fun_ty(i.clone(), b.clone())))
                 .with_ty(b.clone());

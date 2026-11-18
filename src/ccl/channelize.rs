@@ -119,6 +119,7 @@ use std::fmt;
 
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
@@ -352,7 +353,7 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
             ..
         }
     )
-    .then(|| crate::ccl::ccl_utils::tag_case_to_guard_case(body.clone()));
+    .then(|| crate::ccl::ccl_utils::tag_case_to_guard_case(body.duplicate()));
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
@@ -380,7 +381,7 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
         }
         let values = arm_contributions(&b.body, defer_name)?;
         any_feed |= !values.is_empty();
-        arms.push((b.guard.clone(), values));
+        arms.push((b.guard.duplicate(), values));
     }
     any_feed.then_some(arms)
 }
@@ -407,13 +408,13 @@ fn arm_contributions(body: &Expr, defer_name: &Name) -> Option<Vec<ArmFeed>> {
                 if &binding.name == defer_name || feeds_defer(bound, defer_name) {
                     return None;
                 }
-                lets.push((binding.clone(), bound.clone()));
+                lets.push((binding.duplicate(), bound.duplicate()));
             }
             SpineStep::Statement(e) => match &e.node {
                 TypedExprNode::Feed {
                     name, value, row, ..
                 } if name == defer_name => {
-                    let value = FeedValue::new((**value).clone(), row.clone());
+                    let value = FeedValue::new((**value).duplicate(), row.clone());
                     contributions.push((None, under_feed_lets(&lets, value)));
                 }
                 TypedExprNode::Case { .. } if feeds_defer(e, defer_name) => {
@@ -442,7 +443,7 @@ fn case_contributions(case: &Expr, defer_name: &Name) -> Option<Vec<(Expr, FeedV
             ..
         }
     )
-    .then(|| crate::ccl::ccl_utils::tag_case_to_guard_case(case.clone()));
+    .then(|| crate::ccl::ccl_utils::tag_case_to_guard_case(case.duplicate()));
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
@@ -458,11 +459,11 @@ fn case_contributions(case: &Expr, defer_name: &Name) -> Option<Vec<(Expr, FeedV
             return None;
         }
         let taken = synthesize_arm_predicate(&b.guard, &prior);
-        prior.push(b.guard.clone());
+        prior.push(b.guard.duplicate());
         for (condition, value) in arm_contributions(&b.body, defer_name)? {
             let condition = match condition {
-                Some(condition) => conjunction(taken.clone(), condition),
-                None => taken.clone(),
+                Some(condition) => conjunction(taken.duplicate(), condition),
+                None => taken.duplicate(),
             };
             contributions.push((condition, value));
         }
@@ -608,7 +609,7 @@ fn let_chain<'e>(body: &'e Expr, defer_name: &Name) -> (Vec<(TypedBinding, Expr)
         {
             break;
         }
-        lets.push((binding.clone(), (**bound_expr).clone()));
+        lets.push((binding.duplicate(), (**bound_expr).duplicate()));
         end = body;
     }
     (lets, end)
@@ -621,7 +622,7 @@ fn let_chain<'e>(body: &'e Expr, defer_name: &Name) -> (Vec<(TypedBinding, Expr)
 fn under_lets(lets: &[(TypedBinding, Expr)], term: Expr) -> Expr {
     lets.iter().rev().fold(term, |body, (binding, def)| {
         if crate::ccl::ccl_utils::free_reads(&body).contains(&binding.name) {
-            Expr::let_in(binding.clone(), def.clone(), body)
+            Expr::let_in(binding.duplicate(), def.duplicate(), body)
         } else {
             body
         }
@@ -630,7 +631,7 @@ fn under_lets(lets: &[(TypedBinding, Expr)], term: Expr) -> Expr {
 
 fn under_feed_lets(lets: &[(TypedBinding, Expr)], mut value: FeedValue) -> FeedValue {
     for (binding, definition) in lets.iter().rev() {
-        value.bind_let(binding.clone(), definition.clone());
+        value.bind_let(binding.duplicate(), definition.duplicate());
     }
     value
 }
@@ -761,7 +762,7 @@ fn lift_defer(
     let inner_subst = channelize_rename(inner_body_x, &inner_name, binding_name);
 
     // Wrap `body_y` with the prefix (renaming stale feed targets to `y`).
-    let mut new_outer_body = body.clone();
+    let mut new_outer_body = body.duplicate();
     for head in prefix.into_iter().rev() {
         let renamed_head = match head.node {
             TypedExprNode::Feed {
@@ -1422,7 +1423,7 @@ fn check_predicate_defers(
     let mut in_predicate = |pred: &Expr, visited: &mut HashSet<PredicateId>| {
         if result.is_ok() {
             result = if holds_defer(pred) {
-                provenance::preserving_ids(|| run(pred.clone())).map(drop)
+                run(pred.clone_preserving_ids()).map(drop)
             } else {
                 check_predicate_defers(pred, visited)
             };
@@ -2172,7 +2173,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                     // outer binder's occurrence.
                     lift_defer(
                         &binding.name,
-                        binding.occurrence.clone(),
+                        binding.occurrence.duplicate(),
                         *bound_expr,
                         &body,
                     )
@@ -2222,8 +2223,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                     provenance::Nature::Machinery,
                 );
                 let inner_name = inner_binding.name.clone();
-                let inner_be = (**inner_be).clone();
-                let inner_body = (**inner_body).clone();
+                let inner_be = (**inner_be).duplicate();
+                let inner_body = (**inner_body).duplicate();
                 // Replace the trailing Var(inner_name) inside inner_body
                 // with the outer body_y, so the inner scope's contents
                 // run *before* body_y (preserving execution order).
@@ -2247,7 +2248,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 // the outer binder's occurrence.
                 let collapsed = Expr::let_bind(
                     binding.name.clone(),
-                    binding.occurrence.clone(),
+                    binding.occurrence.duplicate(),
                     inner_be,
                     renamed,
                 );
@@ -3205,7 +3206,7 @@ fn extract_for_defer_impl(
                             "channelize.feed",
                             provenance::Nature::Expansion,
                         );
-                        feed.bind_let(binding.clone(), bound_expr.clone());
+                        feed.bind_let(binding.duplicate(), bound_expr.duplicate());
                     }
                 }
                 new_body
@@ -3267,7 +3268,7 @@ fn extract_for_defer_impl(
                 )?;
                 no_inner_define(lambda_define);
                 let new_argument =
-                    extract_for_defer(*argument.clone(), cx, feeds, define, in_inner_scope)?;
+                    extract_for_defer(*argument.duplicate(), cx, feeds, define, in_inner_scope)?;
                 for Contribution {
                     value: v,
                     levels,
@@ -3283,7 +3284,7 @@ fn extract_for_defer_impl(
                     // (the argument matches `param.ty`). Typed at construction.
                     // It binds one element, so it adds no position.
                     // A value reading the element reads the argument.
-                    let channel = v.lambda(&param, None).apply_to(new_argument.clone());
+                    let channel = v.lambda(&param, None).apply_to(new_argument.duplicate());
                     feeds.push(Contribution {
                         value: channel,
                         levels,
@@ -3472,9 +3473,9 @@ fn extract_for_defer_impl(
                             // disjoint by first-match, so there is no one domain the
                             // arms could share a scan over.
                             let source_prefix = if new_elts.len() == 1 {
-                                new_elts[0].clone()
+                                new_elts[0].duplicate()
                             } else {
-                                typed_compose(new_elts.clone())
+                                typed_compose(new_elts.duplicate())
                             };
                             let src_domain = source_prefix.ty.domain().unwrap_or(Type::Hole);
                             let src_item = source_prefix.ty.codomain().unwrap_or(Type::Hole);
@@ -3502,7 +3503,7 @@ fn extract_for_defer_impl(
                                         Some(condition) => conjunction(taken, condition),
                                         None => taken,
                                     };
-                                    let pred = under_lets(&lets, condition.clone());
+                                    let pred = under_lets(&lets, condition.duplicate());
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
                                     // The item at the element: a family's item reads its key.
                                     let item_at_elem = match source_prefix.ty.peel_refinements() {
@@ -3515,11 +3516,12 @@ fn extract_for_defer_impl(
                                         ),
                                         _ => src_item.clone(),
                                     };
-                                    let source_at_elem = Expr::apply(elem, source_prefix.clone())
-                                        .with_ty(item_at_elem);
+                                    let source_at_elem =
+                                        Expr::apply(elem, source_prefix.duplicate())
+                                            .with_ty(item_at_elem);
                                     let mut pred_lambda = Expr::lambda(
                                         &param.name,
-                                        param.occurrence.clone(),
+                                        param.occurrence.duplicate(),
                                         param.ty.clone(),
                                         pred,
                                     );
@@ -3554,7 +3556,7 @@ fn extract_for_defer_impl(
                                                 ));
                                             }
                                             gated_contribution(
-                                                source_prefix.clone(),
+                                                source_prefix.duplicate(),
                                                 &param,
                                                 &lets,
                                                 condition,
@@ -3563,7 +3565,7 @@ fn extract_for_defer_impl(
                                         } else {
                                             let refinement_struct =
                                                 Refinement::born(Rc::new(pred_on_source));
-                                            let mut refined_prefix = source_prefix.clone();
+                                            let mut refined_prefix = source_prefix.duplicate();
                                             refine_source_domain(
                                                 &mut refined_prefix,
                                                 refinement_struct,
@@ -3639,7 +3641,7 @@ fn extract_for_defer_impl(
                             // a prefix that is itself a defer read carries its
                             // place's rigid `ChanDom` domain, closed by the
                             // final `erase_chan_domains` substitution.
-                            let channel_expr = v.lambda(&param, None).after(new_elts.clone());
+                            let channel_expr = v.lambda(&param, None).after(new_elts.duplicate());
                             // The loop keys the feed by its positions: one more level.
                             feeds.push(Contribution {
                                 value: channel_expr,
@@ -3800,7 +3802,7 @@ fn extract_for_defer_impl(
                 for (pattern, guard, branch_feeds, _) in &per_branch {
                     let guard = match (pattern, &scrutinee) {
                         (Some(pat), Some(scrut)) => tag_test(scrut, pat.tag()),
-                        (None, _) => guard.clone(),
+                        (None, _) => guard.duplicate(),
                         (Some(_), None) => {
                             unreachable!("a pattern arm dispatches on its Case's scrutinee")
                         }
@@ -3816,7 +3818,7 @@ fn extract_for_defer_impl(
                     // gate leaves the driver unrefined (an unconditional feed).
                     // A gate reading a value the channel's type cannot state gates the fed
                     // value instead ([`gated_contribution`]).
-                    let gate = reads_any(&pred, cx.recursive_values).then(|| pred.clone());
+                    let gate = reads_any(&pred, cx.recursive_values).then(|| pred.duplicate());
                     let refined = if gate.is_some()
                         || matches!(&pred.node, TypedExprNode::Lit(Lit::Bool(true)))
                     {
@@ -3846,14 +3848,14 @@ fn extract_for_defer_impl(
                                     "__unused",
                                     Occurrence::mint(),
                                     unit_ty.clone(),
-                                    (**scrut).clone(),
+                                    (**scrut).duplicate(),
                                 )
                                 .with_ty(Type::data_fun(unit_ty.clone(), scrut.ty.clone()));
                                 let project = Expr::builtin(Builtin::VariantProject(
                                     FieldKey::Name(pat.tag()),
                                 ))
                                 .with_ty(Type::fun(scrut.ty.clone(), payload_ty));
-                                v.clone()
+                                v.duplicate()
                                     .lambda(&pat.binding, None)
                                     .after(vec![one_row, project])
                             }
@@ -3867,13 +3869,13 @@ fn extract_for_defer_impl(
                                             unit_ty.clone(),
                                         ),
                                         FunKind::Data(None),
-                                        gate.clone(),
-                                        v.value.clone(),
+                                        gate.duplicate(),
+                                        v.value.duplicate(),
                                         |tap| tap,
                                     );
                                     FeedValue::new(value, row)
                                 }
-                                None => v.clone().one_row(refined.clone()),
+                                None => v.duplicate().one_row(refined.clone()),
                             },
                         };
                         feeds.push(Contribution {
@@ -3993,7 +3995,7 @@ fn extract_for_defer_impl(
                 let original = std::mem::replace(&mut feed.value, placeholder);
                 let ty = original.ty.clone();
                 feed.value = Expr::new(TypedExprNode::LetRec {
-                    bindings: bindings.clone(),
+                    bindings: bindings.duplicate(),
                     body: Box::new(original),
                 })
                 .with_ty(ty);

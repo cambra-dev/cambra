@@ -44,6 +44,7 @@ use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, flatten_trailing_value_case, is_free,
     is_free_in_value, refine_with, strip_refinements, synthesize_arm_predicate, typed_compose,
@@ -772,7 +773,7 @@ fn build_value_case_cform(
         let refined_dom = refine_with(driver_dom.clone(), &gate_fn);
         arm_domains.push(refined_dom.clone());
         if i == last {
-            default_body = Some(body.clone());
+            default_body = Some(body.duplicate());
         }
         // const(eᵢ) : {UIntRange(1) | π̂ᵢ} ⤇ V — lift the value over the gated driver.
         let arm = apply_primitive(
@@ -974,7 +975,7 @@ fn build_scrutinee_case_cform(
         let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
         let arm_fn = elim_lambdas(ctx, arm_fn)?;
         arms.push(arm_compose(
-            vec![scrut_stream.clone(), vp, arm_fn],
+            vec![scrut_stream.duplicate(), vp, arm_fn],
             driver_dom.clone(),
             &result_ty,
             // A value-position scrutinee case reads a one-element *stream* driver
@@ -1584,7 +1585,7 @@ fn elim_lambda_impl(
                     .into_iter()
                     .map(|mut r| {
                         ctx.pair_lifts.rebuild(&mut r, &key, |predicate| {
-                            *predicate = onto_pair(&Rc::new(predicate.clone()));
+                            *predicate = onto_pair(&Rc::new(predicate.duplicate()));
                             true
                         });
                         r
@@ -2018,7 +2019,12 @@ fn elim_lambda_impl(
             let call_v_result_ty = match &new_def.ty {
                 Type::Fun {
                     binder, codomain, ..
-                } => crate::ccl::subst::discharge_at_binder(binder, &x, codomain),
+                } => crate::ccl::subst::discharge_at_binder(
+                    binder,
+                    &x,
+                    codomain,
+                    crate::ccl::Ids::Fresh,
+                ),
                 _ => Type::Hole,
             };
             let call_v =
@@ -2127,7 +2133,7 @@ fn elim_lambda_impl(
                         name: b.name.clone(),
                         occurrence: Occurrence::preserve(b.occurrence.id()),
                         ty: def.ty.clone(),
-                        user_annotation: b.user_annotation.clone(),
+                        user_annotation: b.user_annotation.duplicate(),
                         transparency: b.transparency,
                         site: b.site.clone(),
                     };
@@ -2482,7 +2488,7 @@ fn elim_lambda_impl(
                     let arm_fn = elim_lambda(ctx, &payload_name, &payload_ty, br.body)?;
                     let mut chain: Vec<Expr> = Vec::with_capacity(3);
                     if !scrut_is_id {
-                        chain.push(scrut_pf.clone());
+                        chain.push(scrut_pf.duplicate());
                     }
                     chain.push(vp);
                     chain.push(arm_fn);
@@ -2512,7 +2518,7 @@ fn elim_lambda_impl(
                     let payload_pf = if scrut_is_id {
                         vp
                     } else {
-                        typed_compose(vec![scrut_pf.clone(), vp])
+                        typed_compose(vec![scrut_pf.duplicate(), vp])
                     };
                     // Outer morphism `param_ty ⇒ param_ty` — the full element; the
                     // zip's `Zip` restricts it to the tag-`cᵢ` keys by inner-join.
@@ -2692,7 +2698,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             #[cfg(debug_assertions)]
             let original = symbolic(&Expr::throwaway(TypedExprNode::Lambda {
                 params: vec![param.clone_preserving_ids()],
-                body: Box::new(body.clone_preserving_ids()),
+                body: Box::new(body.as_ref().clone_preserving_ids()),
             }));
             let mut result = elim_lambda_kinded(
                 ctx,
@@ -2769,7 +2775,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let target_elim = elim_lambdas(ctx, raw_target)?;
             let pred_elem = elim_lambda(ctx, &param.name, &param.ty, guard)?;
             let pred_elem = elim_lambdas(ctx, pred_elem)?;
-            let pred_on_source = typed_compose(vec![target_elim.clone(), pred_elem]);
+            let pred_on_source = typed_compose(vec![target_elim.duplicate(), pred_elem]);
             let source_domain = target_elim.ty.domain().unwrap();
             let source_codomain = target_elim.ty.codomain().unwrap();
             let refinement = Refinement::born(Rc::new(pred_on_source));
@@ -3226,15 +3232,14 @@ mod tests {
         )
         .with_ty(int.clone());
         for fun_kind in [FunKind::Data(None), FunKind::Compute] {
-            let lambda = Expr::lambda("x", Occurrence::mint(), int.clone(), body.clone()).with_ty(
-                Type::Fun {
+            let lambda = Expr::lambda("x", Occurrence::mint(), int.clone(), body.duplicate())
+                .with_ty(Type::Fun {
                     binder: crate::ccl::FunBinder::None,
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(int.clone()),
                     codomain: Box::new(int.clone()),
                     capabilities: crate::ccl::capabilities::Capabilities::none(),
-                },
-            );
+                });
             let out = run(lambda).expect("elimination succeeds");
             let Type::Fun { fun_kind: got, .. } = &out.ty else {
                 panic!(
@@ -3340,7 +3345,7 @@ mod tests {
         let guard = Expr::binop(
             Expr::var(Name::elem()).with_ty(uint.clone()),
             BinOpKind::Compare(CompareKind::Greater),
-            operand.clone(),
+            operand.duplicate(),
         )
         .with_ty(bool_ty());
         let domain = Type::refined_one(Type::UIntRange(3), Refinement::born(Rc::new(guard)));
@@ -3577,14 +3582,14 @@ mod tests {
         // verify substitution descended into it.
         let pred_after_subst = match &result.ty {
             Type::Fun { domain, .. } => match domain.refinements() {
-                [r] => (*r.predicate).clone(),
+                [r] => (*r.predicate).duplicate(),
                 _ => panic!("expected a singly-refined domain, got {domain}"),
             },
             other => panic!("expected function type, got {other}"),
         };
 
         // The predicate's `y` should now be `42`: `λ _p : Int → 42 > 0`.
-        assert_expr_eq(pred_after_subst, pred_of(replacement.clone()));
+        assert_expr_eq(pred_after_subst, pred_of(replacement.duplicate()));
     }
 
     // -----------------------------------------------------------------------

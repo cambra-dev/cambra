@@ -16,6 +16,7 @@ use std::rc::Rc;
 use chl_parser::ast::Span;
 use smol_str::SmolStr;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{free_names, strip_refinements};
 use crate::ccl::constant::{ConstParam, ConstTerm, NoValue};
 use crate::ccl::{
@@ -326,7 +327,11 @@ pub fn typed_case_facts(
     scrutinee: &crate::ccl::TypedExpr,
     branches: &[crate::ccl::Branch],
 ) -> Vec<Vec<crate::ccl::TypedExpr>> {
-    let none = || vec![Vec::new(); branches.len()];
+    let none = || {
+        std::iter::repeat_with(Vec::new)
+            .take(branches.len())
+            .collect()
+    };
     let Some(decl) = branches
         .iter()
         .find_map(|b| match &b.pattern.as_ref()?.head {
@@ -1180,14 +1185,13 @@ impl NominalDecl {
         let mut out = if self.has_family_params() {
             // Opening and closing rewrite the terms the declaration's types hold, which no tree
             // holds, so the copies keep their identities rather than derive from them.
-            crate::ccl::provenance::preserving_ids(|| {
-                let mut opened = crate::ccl::generalize::opened_deep(ty);
-                replace_params(&mut opened, true, &map);
-                crate::ccl::generalize::closed_deep(&opened)
-            })
+            let ids = crate::ccl::Ids::Kept;
+            let mut opened = crate::ccl::generalize::opened_deep(ty, ids);
+            replace_params(&mut opened, true, &map, ids);
+            crate::ccl::generalize::closed_deep(&opened, ids)
         } else {
             let mut out = ty.clone();
-            replace_params(&mut out, true, &map);
+            replace_params(&mut out, true, &map, crate::ccl::Ids::Fresh);
             out
         };
         // A type of the module that reaches the same `const` parameters names them as its
@@ -1470,7 +1474,12 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
 /// The polarity follows [`occurrences`]: a compute function's domain flips it, and an
 /// argument of a nominal type takes its parameter's variance. An equality position keeps
 /// it; a parameter occurring there is not bipolar, so its two sides are one type.
-fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &Type)>) {
+fn replace_params(
+    ty: &mut Type,
+    pol: bool,
+    map: &HashMap<TypeParamId, (&Type, &Type)>,
+    ids: crate::ccl::Ids,
+) {
     match ty {
         Type::Param(p) => {
             if let Some((input, output)) = map.get(&p.id) {
@@ -1498,9 +1507,12 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
                 .iter()
                 .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__family_k")))
                 .collect();
-            let opened = crate::ccl::subst::open_family_body(binders, body, |j| {
-                crate::ccl::subst::Mapping::Rename(names[j].clone())
-            });
+            let opened = crate::ccl::subst::open_family_body(
+                binders,
+                body,
+                |j| crate::ccl::subst::Mapping::Rename(names[j].clone()),
+                ids,
+            );
             let terms: Vec<Rc<crate::ccl::TypedExpr>> =
                 app.args.iter().map(|a| Rc::clone(&a.term)).collect();
             *ty = crate::ccl::subst::discharge_binders(&names, &opened, &terms);
@@ -1511,23 +1523,24 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
             codomain,
             ..
         } if !fun_kind.resolved().is_data() => {
-            replace_params(domain, !pol, map);
-            replace_params(codomain, pol, map);
+            replace_params(domain, !pol, map, ids);
+            replace_params(codomain, pol, map, ids);
         }
         Type::Nominal(decl, args) => {
             let variances = decl.body().variances.clone();
             for (arg, v) in args.iter_mut().zip(variances) {
-                replace_params(arg, v.polarity(pol), map);
+                replace_params(arg, v.polarity(pol), map, ids);
             }
-            if let Some(instance) = decl.substituted(&mut |arg| replace_params(arg, pol, map)) {
+            if let Some(instance) = decl.substituted(&mut |arg| replace_params(arg, pol, map, ids))
+            {
                 *decl = instance;
             }
         }
         Type::Split { input, output } => {
-            replace_params(input, !pol, map);
-            replace_params(output, pol, map);
+            replace_params(input, !pol, map, ids);
+            replace_params(output, pol, map, ids);
         }
-        _ => ty.walk_children_mut(|child| replace_params(child, pol, map)),
+        _ => ty.walk_children_mut(|child| replace_params(child, pol, map, ids)),
     }
 }
 
