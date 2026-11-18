@@ -42,6 +42,7 @@
 //! parameterized by an iteration input that is not part of the term, so the term
 //! does not identify it.
 
+use crate::interpreter::Projection;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
@@ -209,7 +210,7 @@ fn branch_main_consumer(
     let mut wake = main_consumer();
     Box::new(move || {
         notified.set(true);
-        wake.notify();
+        wake.notify(&Projection::Everything);
     })
 }
 
