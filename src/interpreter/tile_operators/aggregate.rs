@@ -181,7 +181,8 @@ impl TileProducer for AggregateProducer {
     }
 }
 
-/// Extracts a terminal result from an aggregation. Partial-result extraction is unsupported.
+/// Extracts a terminal result from an aggregation, and emits nothing while the aggregation's
+/// terminal flag is absent or false.
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
     base: OperatorBase,
