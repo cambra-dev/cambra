@@ -1,13 +1,15 @@
 //! Operators that read a collection's rows skip the rows a `Restrict` marked deleted
 //! (`cambra::interpreter::live_keys`). Each test reads a `Restrict` over a source whose last
-//! row the predicate rejects, and observes the reader through what it releases from the source.
+//! row the predicate rejects, and observes the reader through what it releases from the source
+//! and what it answers.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::Type;
 use cambra::interpreter::tile_operators::{
-    Converse, ExtractFinal, IterateExtent, MapResultWithSource, Restrict, TileOperator,
+    Converse, ExtractFinal, InputId, IterateExtent, MapResultWithSource, Restrict, Tile,
+    TileOperator,
 };
 use cambra::interpreter::{
     BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FunctionGuard, Predicate,
@@ -37,22 +39,40 @@ fn restricted_flags() -> (Rc<RefCell<TestDataSource>>, Restrict) {
     (src, Restrict::new(Box::new(flags)))
 }
 
-/// `ExtractFinal` over an open source releases every position below the highest live one,
-/// `1`, and keeps it: the deleted key `2` above it does not count.
+/// `ExtractFinal` keeps the row at the highest live position, `1`, of what it consumes from an
+/// open source, and extracts its value once the source completes: the deleted key `2` above it
+/// does not count. The consume releases the source at every position the source answered.
 #[test]
-fn extract_final_releases_below_the_highest_live_position() {
+fn extract_final_keeps_the_highest_live_position() {
     let (src, restricted) = restricted_flags();
     let mut op = ExtractFinal::without_default(Box::new(restricted));
-    let mut producer = op.subscribe(
+    let mut reader = op.subscribe(
         op.tiling().universal_guard(),
         Box::new(|| {}),
         &mut SubscribeContext::new(),
     );
-    let guard = producer.tiling().universal_guard();
-    cambra::interpreter::dispatcher::read_for_test(&mut *producer, guard);
+    // The subscription reads a shared breaker, which consumes its source whole.
+    let mut consume_whole = || {
+        reader.visit_input_producers_mut(&mut |_, producer| {
+            let extract = producer
+                .as_breaking_mut()
+                .expect("the reader's input is the extraction");
+            let whole = extract.input_tiling(InputId::ONLY).universal_guard();
+            extract.consume_impl(InputId::ONLY, whole);
+        });
+    };
+    consume_whole();
     assert_eq!(
         src.borrow().get_released_predicate(),
-        Predicate::at_or_below(Value::UInt(0)),
+        Predicate::at_or_below(Value::UInt(2)),
+    );
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    consume_whole();
+    let guard = reader.tiling().universal_guard();
+    assert_eq!(
+        reader.get(guard),
+        Tile::Scalar(ColumnValue::UInts(vec![1])),
+        "a `Restrict` maps position 1 to itself"
     );
 }
 
