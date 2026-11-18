@@ -82,9 +82,8 @@ A pipeline consumes one breaker input, and an entry lands regions of its own inp
 breaker with several inputs, as a loop's scope with its seed, has entries of an input its pipeline
 does not consume. A chain between an entry and its breaker can reshape the input, as a zip makes a
 record of its arms. A region of a tiling other than the consumed input's names every row of the
-consumed input (`rows_named_in`). The planner reads each pipeline's consumed input off its breaker
-(`Breaker::input_tiling`), records it on the pipeline's entries (`Placement::set_rows`), and reads
-arrivals by the same rule.
+consumed input (`rows_named_in`). The planner records each pipeline's consumed input
+(`Dispatcher::consumes_input`) and reads arrivals by the same rule.
 
 Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
 before execution consumes anything. Refusals include an unsupported store shape,
@@ -303,8 +302,8 @@ Notifications queue dispatcher work; no deferred wakeup schedules work.
 ## A widened push
 
 A push widened on its way to an entry names every row of the reader's input, and the entry queues
-it as it queues any push, named as the rows of that input (`Landing::queue`, `rows_named_in`).
-No pipeline reads its input again. A reader takes each row once and
+it as it queues any push, named as the rows of that input (`Landing::queue`,
+`Dispatcher::rows_named`). No pipeline reads its input again. A reader takes each row once and
 final, so a live collection inside a record or a nested row reaches its reader once that row is
 whole.
 
@@ -492,6 +491,8 @@ in-flight claims. A claim moves the oldest ready package to the in-flight map; a
 removes its entry, even when an earlier package is still running. Package indices increase for the
 run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
 pipelines permit at most one package in flight. No queue lock is held while an operator executes.
+A delivery takes no lock beyond what each consumer's own state needs
+([The notification contract](design-operators.md#the-notification-contract)).
 
 Queue entries retain only ready and in-flight guards. Collection capacity can retain its peak
 allocation; it does not grow with the number of acknowledged packages. The accumulated region
@@ -506,7 +507,8 @@ waiting therefore cannot be lost. A worker failure wakes waiters and stops furth
 does a panic in a thread that publishes (`notify`, `start_source`, `close`, `land`, `finish`,
 queueing a reader), worker or not.
 
-These guarantees concern scheduling. Breakers use `Rc<RefCell<_>>`, and the production driver runs
-them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
-need additional coordination before parallel execution. Atomic-ordering proofs and queue storage
-mechanics are documented beside their implementation in `dispatcher.rs`.
+These guarantees concern scheduling. Breakers are `Send + Sync`, each behind an `Arc<RwLock<_>>`
+(`BreakerHandle`), and the production driver runs them serially. Several pipelines can share one
+breaker, whose consumes, offers and finishes would need additional coordination before parallel
+execution. Atomic-ordering proofs and queue storage mechanics are documented beside their
+implementation in `dispatcher.rs`.

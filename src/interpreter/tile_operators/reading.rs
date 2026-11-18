@@ -1,9 +1,10 @@
 use bit_set::BitSet;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 use std::{
-    cell::RefCell,
     collections::HashMap,
     hash::BuildHasher,
-    rc::Rc,
+    sync::Arc,
     sync::atomic::{AtomicI64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -309,15 +310,15 @@ pub struct Readings {
     /// Output tiling: an `Int`, or `input`'s tiling with an `Int` at `level`.
     base: OperatorBase,
     /// The positions, one at each value at `level`, or `None` outside every loop.
-    input: Option<Box<dyn TileOperator>>,
-    source: Rc<RefCell<ReadingSource>>,
+    input: Option<std::sync::Arc<dyn TileOperator>>,
+    source: Arc<RwLock<ReadingSource>>,
     /// The level whose values the reading replaces.
     level: CurryLevel,
 }
 
 impl Readings {
     /// The reading at the one position outside every loop.
-    pub fn once(source: Rc<RefCell<ReadingSource>>) -> Self {
+    pub fn once(source: Arc<RwLock<ReadingSource>>) -> Self {
         Self {
             base: OperatorBase::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
             input: None,
@@ -328,8 +329,8 @@ impl Readings {
 
     /// The reading at the position of each of `input`'s values at `level`.
     pub fn at(
-        input: Box<dyn TileOperator>,
-        source: Rc<RefCell<ReadingSource>>,
+        input: std::sync::Arc<dyn TileOperator>,
+        source: Arc<RwLock<ReadingSource>>,
         level: CurryLevel,
     ) -> Self {
         let tiling = with_values_at(
@@ -356,20 +357,30 @@ impl TileOperator for Readings {
     }
 
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let reader = self.source.borrow_mut().join();
-        let input = self
-            .input
-            .as_mut()
-            .map(|input| input.subscribe(input.tiling().universal_guard(), consumer, cx));
+        let reader = self
+            .source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .join();
+        let input = self.input.as_ref().map(|input| {
+            input
+                .clone()
+                .subscribe(input.tiling().universal_guard(), consumer, cx)
+        });
         Box::new(ReadingsProducer {
-            base: ProducerBase::new(ReadingsProducer::alloc_id(), self.tiling(), &self.base, cx),
+            base: ProducerBase::new(
+                ReadingsProducer::alloc_id(),
+                self.tiling(),
+                self.clone(),
+                cx,
+            ),
             input,
-            source: Rc::clone(&self.source),
+            source: Arc::clone(&self.source),
             reader,
             level: self.level,
         })
@@ -379,7 +390,7 @@ impl TileOperator for Readings {
 struct ReadingsProducer {
     base: ProducerBase,
     input: Option<Box<dyn TileProducer>>,
-    source: Rc<RefCell<ReadingSource>>,
+    source: Arc<RwLock<ReadingSource>>,
     /// This producer's index among the source's readers.
     reader: usize,
     level: CurryLevel,
@@ -387,7 +398,10 @@ struct ReadingsProducer {
 
 impl Drop for ReadingsProducer {
     fn drop(&mut self) {
-        self.source.borrow_mut().leave(self.reader);
+        self.source
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .leave(self.reader);
     }
 }
 
@@ -411,7 +425,11 @@ impl TileProducer for ReadingsProducer {
             if self.base.obsolete_guard.is_universal() {
                 return self.tiling().empty_tile();
             }
-            let reading = self.source.borrow_mut().at(self.reader, Vec::new(), &[]);
+            let reading = self
+                .source
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .at(self.reader, Vec::new(), &[]);
             let mut output = Tile::Scalar(ColumnValue::Ints(vec![reading]));
             output.remove_guarded(self.obsolete_guard().clone());
             return output;
@@ -437,7 +455,7 @@ impl TileProducer for ReadingsProducer {
             ),
         };
         let operands = scalar_tile_to_column_value(output.values_at(self.level).clone());
-        let mut source = self.source.borrow_mut();
+        let mut source = self.source.write().unwrap_or_else(PoisonError::into_inner);
         let readings: Vec<i64> = rows
             .iter()
             .enumerate()
@@ -466,7 +484,8 @@ impl TileProducer for ReadingsProducer {
     /// every position all its readers have released.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .release(self.reader, self.base.obsolete_guard.clone());
         if let Some(input) = &mut self.input {
             let upstream = crate::interpreter::tiling::through_shared_levels(

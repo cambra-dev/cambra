@@ -2,6 +2,7 @@
 //! run of its own, with its own state and sinks, reached through its run name
 //! from its statement down (`docs/chl-spec.md`, "9.3 Runs", "9.9 Running").
 
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
@@ -189,17 +190,23 @@ fn two_runs_of_a_module_each_read_all_of_its_source() {
     use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
     use cambra::interpreter::{Extent, Predicate, TestDataSource};
     let mut ctx = GlobalContext::default();
-    let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    source.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(1)),
-        (Value::UInt(1), Value::Int(2)),
-        (Value::UInt(2), Value::Int(3)),
-    ]);
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    );
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(1)),
+            (Value::UInt(1), Value::Int(2)),
+            (Value::UInt(2), Value::Int(3)),
+        ]);
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     ctx.register_source(source);
     let program = program(
         indoc! {"
