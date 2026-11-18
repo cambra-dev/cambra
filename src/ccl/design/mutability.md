@@ -1,5 +1,9 @@
 # Mutability, transactions, and feeds
 
+> **Superseded.** [mutability-model.md](mutability-model.md) replaces this design and is under
+> review. This document describes the current implementation, and code comments cite it; it stays
+> until those citations move to the new design.
+
 Cambra's surface language (CHL) is Pythonic: programs reassign variables, accumulate
 in loops, run transactions, and stream replies out to sinks. The runtime is a pure
 dataflow graph over *tilings* — there is no mutable cell anywhere. This document explains
