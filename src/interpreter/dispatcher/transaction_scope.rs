@@ -139,14 +139,22 @@ impl WriterRun {
     }
 }
 
-pub(super) fn transaction(
-    store: &StoreCell,
-) -> crate::interpreter::tile_operators::StoreBorrow<'_, CommitProducer> {
-    store.borrow_mut().map(|producer| {
-        producer
+pub(super) struct TransactionBorrow<'a>(crate::interpreter::tile_operators::StoreBorrow<'a>);
+impl std::ops::Deref for TransactionBorrow<'_> {
+    type Target = CommitProducer;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_transaction_store().expect("a transaction store")
+    }
+}
+impl std::ops::DerefMut for TransactionBorrow<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
             .as_transaction_store_mut()
             .expect("a transaction store")
-    })
+    }
+}
+pub(super) fn transaction(store: &StoreCell) -> TransactionBorrow<'_> {
+    TransactionBorrow(store.write())
 }
 
 impl CommitProducer {

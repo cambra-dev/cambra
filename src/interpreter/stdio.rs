@@ -1,3 +1,4 @@
+use std::sync::PoisonError;
 use std::{
     io::BufRead,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
@@ -29,13 +30,7 @@ pub struct StdinDataSource {
 
     /// Lines from the background reader thread, then the end of file or the error that stopped
     /// it.
-    ///
-    /// Absent until the first poll, which starts the thread. Every
-    /// [`GlobalContext`](crate::ccl::context::GlobalContext) registers this
-    /// source so `stdin()` resolves during lowering, but only a program that
-    /// reads it subscribes it, and only a subscribed source is ever polled. A
-    /// program that never reads `stdin()` therefore starts no thread.
-    receiver: Option<Receiver<StdinMessage>>,
+    receiver: std::sync::Mutex<Option<Receiver<StdinMessage>>>,
 }
 
 /// What the stdin reader thread sends.
@@ -79,7 +74,7 @@ impl StdinDataSource {
     pub fn new() -> Self {
         Self {
             buf: UIntStreamBuffer::new(),
-            receiver: None,
+            receiver: std::sync::Mutex::new(None),
         }
     }
 
@@ -122,7 +117,11 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         if self.buf.eof_reached {
             return false;
         }
-        let receiver = self.receiver.get_or_insert_with(spawn_reader);
+        let receiver = self
+            .receiver
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(spawn_reader);
         let mut got_data = false;
         loop {
             match receiver.try_recv() {
@@ -172,10 +171,6 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Extent::Base(BaseType::String)
     }
 
-    fn output_type(&self) -> Type {
-        Type::Base(BaseType::String)
-    }
-
     fn release(&mut self, producer: &str, obsolete: Predicate) {
         self.buf.release(producer, obsolete);
     }
@@ -188,8 +183,13 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         self.buf.first_index_for_a_new_producer()
     }
 
-    fn retire_producer(&mut self, producer: &str) {
-        self.buf.retire_producer(producer);
+    fn producer_retirement(&self, producer: &str) -> crate::interpreter::SourceReaderRetirement {
+        self.buf.releases.retirement(producer)
+    }
+}
+impl crate::ccl::SourceType for StdinDataSource {
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
     }
 }
 
@@ -213,7 +213,7 @@ mod tests {
         }
         StdinDataSource {
             buf: UIntStreamBuffer::new(),
-            receiver: Some(receiver),
+            receiver: std::sync::Mutex::new(Some(receiver)),
         }
     }
 
@@ -417,14 +417,14 @@ mod tests {
         source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Store the first predicate
-        let pred_after_first = source.buf.releases.of("producer_a").cloned().unwrap();
+        let pred_after_first = source.buf.releases.of("producer_a").unwrap();
 
         // Second release from producer A: index 1
         // This should use union with the existing predicate
         source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // The predicate should now be an OR of the two
-        let pred_after_second = source.buf.releases.of("producer_a").cloned().unwrap();
+        let pred_after_second = source.buf.releases.of("producer_a").unwrap();
 
         // The second predicate should be different from the first (should be OR'd)
         assert_ne!(

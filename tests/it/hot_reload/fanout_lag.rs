@@ -124,7 +124,7 @@ const DELIVERED: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
 struct LiveFeed {
     ctx: GlobalContext,
     live: LiveProgram,
-    source: std::rc::Rc<std::cell::RefCell<cambra::interpreter::TestDataSource>>,
+    source: cambra::ccl::SourceDefinition<cambra::interpreter::TestDataSource>,
     reads_n: bool,
 }
 
@@ -134,11 +134,11 @@ impl LiveFeed {
         use cambra::ccl::Type;
         use cambra::interpreter::{BaseType, Extent, TestDataSource};
         let mut ctx = GlobalContext::default();
-        let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+        let source = TestDataSource::new(
             "source1",
             Type::Base(BaseType::String),
             Extent::Base(BaseType::String),
-        )));
+        );
         ctx.register_source(source.clone());
         let live = LiveProgram::start_text(&mut ctx, &feed("source1()", reads_n, ""), &no_main)
             .expect("v1 compiles");
@@ -153,7 +153,10 @@ impl LiveFeed {
     /// Deliver the item at position `at` and yield every position through it.
     fn deliver(&mut self, at: usize) {
         use cambra::interpreter::{Predicate, Value};
-        let mut source = self.source.borrow_mut();
+        let mut source = self
+            .source
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         source.add_data(&[(
             Value::uint_from_row(at),
             Value::String(DELIVERED[at].into()),
@@ -164,7 +167,8 @@ impl LiveFeed {
     /// Yield every position, so the source completes.
     fn complete(&mut self) {
         self.source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_yield_predicate(cambra::interpreter::Predicate::True);
     }
 
@@ -322,7 +326,7 @@ fn most_names_held_by(live: &LiveProgram, branch: &str) -> usize {
     live.held_operators(branch)
         .expect("the branch exists")
         .iter()
-        .filter_map(std::rc::Weak::upgrade)
+        .filter_map(std::sync::Weak::upgrade)
         .map(|fan| fan.most_names_of_a_slot())
         .max()
         .unwrap_or(0)
