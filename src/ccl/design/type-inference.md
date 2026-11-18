@@ -4953,8 +4953,14 @@ type. Once the walk ends, coalesce gives every node's slots the set its variable
 to, children first, the nodes of each term a type quotes included: a refinement's predicate, a
 projection's sum, a family's arguments (`settle_capabilities` in `solve.rs`). A run that fails
 before coalesce settles its tree the same way (`run_once` in `infer/mod.rs`), since the passes after
-a failed inference still read it. No node's capabilities leave inference as a variable or a
-union holding one, which debug builds check.
+a failed inference still read it.
+
+Settling closes the types in the tree too: a function type's capabilities become the set they
+resolve to, and an ordering requirement in any set becomes one whose capabilities are known and
+whose answer is decided by the run, since its capabilities no longer say whether an effect input is
+open (`Requirement::closed`). Every run, failed or not, also closes the types its errors hold, the
+schemes it records and the ordering requirements of its top level (`close_outputs`). Nothing of a
+run's capability variables leaves it, which debug builds check.
 
 A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
 arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one
