@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { fixture, stubLayout } from "./__fixtures__/helpers";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
+import { dumped, fixture, stubLayout } from "./__fixtures__/helpers";
 import { LiveStore } from "./liveStore";
 import { LiveView } from "./liveView";
 import { describePanes, renderApp } from "./main";
 import { Store } from "./store";
 import type { LiveFrame, LiveProbe } from "./types";
+
+const listMinJson = dumped("list_min");
 
 const listMin = fixture(listMinJson);
 

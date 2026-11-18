@@ -1,9 +1,9 @@
 //! A UDF called once, closing over an outer binding — the smallest program in
 //! which a call site and a free variable meet.
 //!
-//! The inspector's canary: its committed snapshot fixture (`arithmetic`) pins
-//! the whole wire byte-for-byte, so every `Lit` carrying `: Int` and every
-//! `BinOp` showing operator dispatch is checked there.
+//! The inspector's canary: the frontend's tests read its payload in most of
+//! their cases (`dumped("udf_closure")` in `web/src/`), so a change to how its
+//! literals or operators reach the wire shows there.
 
 use super::common::expect_scalar;
 

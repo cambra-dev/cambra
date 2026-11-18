@@ -1139,7 +1139,7 @@ A data source is not a graph node. `IterateExtent` enumerates its domain and reg
 wake-ups; `MapResultWithSource` reads values at supplied keys. A source lookup descends from an
 iteration of that source, since inference admits no literal source-domain key. The invariant is
 pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
-`tests/it/inspector_goldens.rs`. Neither operator adds an edge to the source itself.
+`tests/it/inspector_wire.rs`. Neither operator adds an edge to the source itself.
 `source_nodes` derives source-to-iteration ids from the current graph's iteration-domain tilings.
 
 [A node on the wire](../inspector_model/design.md#a-node-on-the-wire) owns serialization. Operator

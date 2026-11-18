@@ -93,8 +93,8 @@ and only the source windows otherwise: nothing pulls after the run.
 Under `--inspect --control`, `/api/snapshot`, the source anchors and every probe frame describe the
 version `main` runs. The payload's `meta.version` and each frame's `version` carry that version's
 number from the branch table (`LiveProgram::program`), which starts at `1`. A payload no run
-produced has `meta.version` `0`: `--inspect-only`, `--dump-snapshot`, a degraded payload, and every
-committed fixture.
+produced has `meta.version` `0`: `--inspect-only`, `--dump-snapshot` and a degraded payload, so
+every payload the frontend's tests read.
 
 The driver compares `main`'s version with the one it follows after each control-port poll. On a
 change it renders the new version's payload into the served snapshot (`ServedSnapshot::replace`),
@@ -473,10 +473,9 @@ No bump is due yet. Nothing durable consumes this payload — the frontend is re
 so the version stays at 1 through any change until a consumer exists that an old version could
 reach. The rule above is what a bump means once one does.
 
-The wire is pinned on both sides. The consumer's golden fixtures compare whole payload documents,
-every node id included, so any change re-blesses all of them; its wire validator pins the schema
-number and the pane list as literal lists. Both live in the wire validator, which owns the
-fixture corpus.
+The wire is checked on both sides, over the same fresh dumps of every gallery program. Each side's
+validator pins the schema number and the pane list as literal lists: `wire_check.rs` in the
+backend's tests, and `wireValidate.ts` in the frontend's.
 
 ## Cost
 

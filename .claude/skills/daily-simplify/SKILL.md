@@ -513,8 +513,8 @@ the log is the record anyone reads:
 
 - Only the orchestrator pushes. Implementers and reviewers never push, never create bookmarks,
   and never run jj or cargo in `REPO`, the scout, or any workspace outside this run.
-- Never re-bless the inspector golden fixtures, and never edit expected test output to make a
-  refactor pass. Moved goldens or expectations mean behaviour changed, so the attempt is
+- Never edit expected test output to make a refactor pass, the frontend tests' assertions on the
+  inspector's payloads included. A moved expectation means behaviour changed, so the attempt is
   abandoned.
 - Every jj command that could open an editor gets `-m` or `--config ui.editor=true`. A bare
   `jj squash` hangs forever.

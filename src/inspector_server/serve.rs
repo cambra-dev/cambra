@@ -179,15 +179,12 @@ fn root_file(program: &LoadedProgram) -> (&str, &str) {
     (sources.path(sources.root()), sources.text(sources.root()))
 }
 
-/// Compile `program` once and return the pretty-printed `/api/snapshot` body —
-/// what `--dump-snapshot` prints, and therefore the exact bytes of the
-/// committed golden fixtures (see [`super::snapshot_json_pretty`] for why the
-/// binary owns this format). The degraded form (source + diagnostics, no panes)
-/// on a compile failure, as the route serves.
+/// Compile `program` once and return the pretty-printed `/api/snapshot` body,
+/// which `--dump-snapshot` prints. On a compile failure it is the degraded form
+/// (source + diagnostics, no panes), as the route serves.
 ///
-/// One-shot and exits: this regenerates the frontend's golden test fixtures
-/// **without** standing up the never-exiting HTTP server (see
-/// `web/src/__fixtures__/`). The HTTP route keeps the compact form.
+/// One-shot: a dump does not stand up the never-exiting HTTP server. The HTTP
+/// route keeps the compact form.
 pub fn snapshot_body_pretty(program: &LoadedProgram) -> String {
     let (name, code) = root_file(program);
     let mut ctx = GlobalContext::default();

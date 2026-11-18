@@ -1,18 +1,41 @@
-// Shared test helpers: the golden snapshot fixtures, and the jsdom layout stubs
-// every view test needs. The fixture walks reach a payload's pane node tables by
-// *semantic* facts (pane id, node label) rather than raw NodeIds, so they
-// survive id churn in the compiler.
+// Shared test helpers: the gallery programs' payloads, and the jsdom layout stubs
+// every view test needs. The payload walks reach a pane's node table by
+// *semantic* facts (pane id, node label) rather than raw NodeIds, which carry no
+// meaning across compiler changes.
+
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
+import { inject } from "vitest";
 
 import { isIrPane } from "../types";
 import type { IrChild, IrNode, IrPane, OperatorPane, PaneEntry, Snapshot } from "../types";
 import { validateSnapshot } from "../wireValidate";
 
 /**
- * Validate a golden fixture, enriching any wire error with the fixture
- * lifecycle: these JSONs are regenerated artifacts, so a mismatch here usually
- * means stale fixtures or a half-propagated schema change, not a frontend bug.
- * Production code keeps calling `validateSnapshot` directly — a live payload
- * error must not tell users to regenerate test fixtures.
+ * The `--dump-snapshot` payload of the gallery program `program`
+ * (`tests/programs/<program>/program.cambra`), as this run's setup dumped it
+ * (`dumps.ts`). Unvalidated: `fixture` validates.
+ */
+export function dumped(program: string): unknown {
+  return JSON.parse(readFileSync(join(inject("snapshots"), `${program}.snapshot.json`), "utf8"));
+}
+
+/** Every payload this run's setup dumped, by file name. */
+export function allDumped(): [string, unknown][] {
+  const dir = inject("snapshots");
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".snapshot.json"))
+    .sort()
+    .map((f) => [f, JSON.parse(readFileSync(join(dir, f), "utf8"))]);
+}
+
+/**
+ * Validate a gallery program's payload, enriching any wire error with where it
+ * came from: the payload is a fresh dump, so a mismatch means the backend's wire
+ * and this validator disagree, not that a test's data is stale. Production code
+ * keeps calling `validateSnapshot` directly — a live payload error must not
+ * point users at the test setup.
  */
 export function fixture(json: unknown): Snapshot {
   try {
@@ -20,10 +43,9 @@ export function fixture(json: unknown): Snapshot {
   } catch (e) {
     throw new Error(
       `${String(e)}\n` +
-        "  This is a golden fixture. If the wire shape changed on purpose, regenerate via\n" +
-        "  web/scripts/regen-fixtures.sh, updating both validators and any\n" +
-        "  hand-written expectations in the same change — re-bless discipline in\n" +
-        "  web/src/__fixtures__/README.md.",
+        "  This is a fresh dump of a gallery program, so the backend's wire and\n" +
+        "  wireValidate.ts disagree. A wire change updates both validators\n" +
+        "  (wire_check.rs and wireValidate.ts) and types.ts in the same change.",
     );
   }
 }
