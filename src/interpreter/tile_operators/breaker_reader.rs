@@ -42,9 +42,9 @@ impl TileProducer for BreakerReader {
             .unwrap_or_else(PoisonError::into_inner)
             .get(guard)
     }
-    fn release_impl(&mut self, guard: TileGuard) {
+    fn release_impl(&self, guard: TileGuard) {
         self.handle
-            .write()
+            .read()
             .unwrap_or_else(PoisonError::into_inner)
             .release(guard);
     }
@@ -103,7 +103,7 @@ mod tests {
                         ))),
                     )
             }
-            fn release_impl(&mut self, _: TileGuard) {}
+            fn release_impl(&self, _: TileGuard) {}
         }
         let (tile, tiling) = two_levels_of_ints();
         let input = ProjectionSpy::new(tile, tiling.clone()).0;
@@ -124,7 +124,7 @@ mod tests {
             Box::new(TestTileProducer::new(tile.clone(), tiling.clone())),
             &tiling,
         );
-        let mut reader = share_breaker(producer);
+        let reader = share_breaker(producer);
         let mut weak = None;
         reader.visit_input_producers(&mut |_, producer| {
             weak = producer.base().breaker_handle.clone()

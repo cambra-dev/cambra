@@ -128,7 +128,7 @@ impl TileProducer for Input {
             .unwrap_or_else(PoisonError::into_inner)
             .pulled
             .push(guard.clone());
-        if released_whole(&guard, self.obsolete_guard()) {
+        if released_whole(&guard, &self.obsolete_guard()) {
             self.source
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -157,7 +157,7 @@ impl TileProducer for Input {
         tile
     }
 
-    fn release_impl(&mut self, guard: TileGuard) {
+    fn release_impl(&self, guard: TileGuard) {
         self.source
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -496,7 +496,7 @@ impl TileProducer for NestedInput {
             .unwrap_or_else(PoisonError::into_inner)
             .pulled
             .push(guard.clone());
-        if released_whole(&guard, self.obsolete_guard()) {
+        if released_whole(&guard, &self.obsolete_guard()) {
             self.source
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -556,7 +556,7 @@ impl TileProducer for NestedInput {
         tile
     }
 
-    fn release_impl(&mut self, guard: TileGuard) {
+    fn release_impl(&self, guard: TileGuard) {
         self.source
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -600,7 +600,7 @@ impl TileProducer for ReadsBreaker {
             .get(guard)
     }
 
-    fn release_impl(&mut self, guard: TileGuard) {
+    fn release_impl(&self, guard: TileGuard) {
         self.breaker
             .write()
             .unwrap_or_else(PoisonError::into_inner)

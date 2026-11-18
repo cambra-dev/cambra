@@ -9,6 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Member, induction};
+use super::workers::WorkerPool;
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -64,6 +65,37 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// As [`run_program_into`].
 pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<Run, Refused> {
     run_program_polling(program, morsel_rows, &mut sleep_when_idle)
+}
+
+thread_local! {
+    static LOCAL_DOP: Cell<Option<usize>> = const { Cell::new(None) };
+}
+fn local_dop() -> usize {
+    LOCAL_DOP.get().unwrap_or_else(|| {
+        std::env::var("CAMBRA_LOCAL_DOP").map_or(1, |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|dop| *dop > 0)
+                .expect("CAMBRA_LOCAL_DOP is a positive integer")
+        })
+    })
+}
+/// Run the same native dispatcher plan with an explicit degree of parallelism.
+pub fn run_program_with_workers(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    workers: usize,
+) -> Result<Run, Refused> {
+    assert!(workers > 0, "a run has at least one worker");
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOCAL_DOP.set(self.0);
+        }
+    }
+    let _restore = Restore(LOCAL_DOP.replace(Some(workers)));
+    run_program(program, morsel_rows)
 }
 
 /// [`run_program`] with `on_idle` called each time nothing is claimable and a live source has
@@ -792,6 +824,20 @@ fn run_targets(
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
     };
+    let worker_targets = execution
+        .handlers
+        .iter()
+        .enumerate()
+        .map(|(pipeline, handler)| match handler {
+            Handler::Root => match members.located[pipeline] {
+                Located::Chain(handle) => Some(handle.clone()),
+                _ => None,
+            },
+            Handler::Body(handle) => Some(handle.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut workers = WorkerPool::new(local_dop(), worker_targets, &mut dispatcher, &mut reach);
     let done = in_a_run(|| {
         // A range over a static extent has completed every key from the start.
         for (pipeline, ranges) in members.leaves.iter().enumerate() {
@@ -805,12 +851,21 @@ fn run_targets(
         }
         match live.is_empty() {
             true => {
-                execution.drive(&dispatcher, &mut reach);
+                execution.drive(&dispatcher, &mut reach, &mut workers);
                 true
             }
-            false => drive_live(&dispatcher, &mut reach, &execution, &mut live, observer),
+            false => drive_live(
+                &dispatcher,
+                &mut reach,
+                &execution,
+                &mut workers,
+                &mut live,
+                observer,
+            ),
         }
     });
+    workers.report(&mut planned);
+    drop(workers);
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
     // complete by each of its sources all that a push of the source's every key lands as at its
     // entry. A run that pauses stops at a drained boundary before its end, and checks nothing.
@@ -1342,7 +1397,7 @@ impl Execution {
         push_held(dispatcher, reach, pipelines);
     }
 
-    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, workers: &mut WorkerPool) {
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
                 let mut input = None;
@@ -1350,15 +1405,26 @@ impl Execution {
                     input = Some(breaker.input_tiling(at))
                 });
                 let input = input.expect("a planned source has a breaker input");
-                dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
+                workers.start_source(
+                    dispatcher,
+                    PipelineId(pipeline),
+                    &input,
+                    &input.empty_guard(),
+                );
             }
         }
         loop {
-            match dispatcher.try_claim(None) {
-                Next::Package(package) => self.consume(dispatcher, reach, package),
+            match workers.next(dispatcher) {
+                Next::Package(package) => {
+                    if let Err(package) = workers.submit(dispatcher, package) {
+                        self.consume(dispatcher, reach, package);
+                    }
+                }
                 Next::Finish { pipeline, consumed } => {
+                    workers.finishing(pipeline, reach);
                     self.finish(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(_) if workers.wait(dispatcher) => {}
                 Next::Wait(_) if self.resume(dispatcher, reach) => {}
                 Next::Wait(_) => {
                     panic!("an acyclic run with no pending loop has a pipeline that may finish")
@@ -1508,6 +1574,9 @@ pub(super) fn plan_edges(
     let mut planned: Vec<Planned> = names
         .iter()
         .map(|name| Planned {
+            worker_claims: 0,
+            workers_used: 0,
+            incremental_claims: 0,
             name: name.clone(),
             whole: false,
             follows: Vec::new(),
@@ -1689,6 +1758,12 @@ enum TargetEntry {
 /// What [`run_program`] planned for one pipeline.
 #[cfg_attr(test, derive(Debug))]
 pub struct Planned {
+    /// Claims consumed through shared native breakers.
+    pub worker_claims: usize,
+    /// Worker threads that consumed at least one claim.
+    pub workers_used: usize,
+    /// Claims submitted before a producing dependency finished.
+    pub incremental_claims: usize,
     /// Its breaker's name.
     pub name: String,
     /// Whether it reads its input whole: once every pipeline it reads has finished, or, over a live
@@ -2770,8 +2845,8 @@ impl Planner {
             })
             .collect();
         let store = self.scopes[scope].store.clone();
-        let mut kept: Vec<usize> = (0..members.len()).collect();
-        let (inner, planned, reads) = loop {
+        let kept: Vec<usize> = (0..members.len()).collect();
+        let (inner, planned, reads) = {
             let reads = reads_of_kept(&pipelines.reads, &kept);
             // A breaker in no pipeline keeps no entry: an id the planner gave it may be a kept
             // pipeline's here, and a probe would take it for an arrival there.
@@ -2838,16 +2913,7 @@ impl Planner {
                 induction(scope).forget_through_drive();
             }
             drop(placed);
-            let whole: Vec<usize> = planned
-                .iter()
-                .enumerate()
-                .filter(|(at, plan)| plan.whole && pipelines.kinds[kept[*at]] == Consumes::Pushes)
-                .map(|(at, _)| kept[at])
-                .collect();
-            if whole.is_empty() {
-                break (inner, planned, reads);
-            }
-            kept.retain(|pipeline| !whole.contains(pipeline));
+            (inner, planned, reads)
         };
         assert!(
             reads.iter().any(Vec::is_empty),
@@ -3105,9 +3171,19 @@ fn unrestated(
     {
         return None;
     }
+    // Visiting a stateful producer holds its retained-state lock. Resolve owner
+    // metadata before descending rather than re-entering it from the callback.
+    let mut roles = Vec::new();
+    producer.visit_input_producers(&mut |role, _| roles.push(role.to_owned()));
+    let levels: Vec<_> = roles
+        .iter()
+        .map(|role| pulled.and_then(|level| producer.input_level(role, level)))
+        .collect();
     let mut why = None;
-    producer.visit_input_producers(&mut |role, input| {
-        let beneath = pulled.and_then(|pulled| producer.input_level(role, pulled));
+    let mut at = 0;
+    producer.visit_input_producers(&mut |_, input| {
+        let beneath = levels[at];
+        at += 1;
         why = why
             .take()
             .or_else(|| unrestated(input, beneath, consuming, false));
@@ -3391,6 +3467,7 @@ fn drive_live(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
     execution: &Execution,
+    workers: &mut WorkerPool,
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
@@ -3428,11 +3505,17 @@ fn drive_live(
             changed |= at.poll(dispatcher, reach);
         }
         loop {
-            match dispatcher.try_claim(None) {
-                Next::Package(package) => execution.consume(dispatcher, reach, package),
+            match workers.next(dispatcher) {
+                Next::Package(package) => {
+                    if let Err(package) = workers.submit(dispatcher, package) {
+                        execution.consume(dispatcher, reach, package);
+                    }
+                }
                 Next::Finish { pipeline, consumed } => {
+                    workers.finishing(pipeline, reach);
                     execution.finish(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(_) if workers.wait(dispatcher) => {}
                 Next::Wait(_) if execution.resume(dispatcher, reach) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
@@ -3929,7 +4012,7 @@ mod tests {
             self.tiling().empty_tile()
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// A pull at the outermost keys is walked: an operator that pulls its input beneath the keys
@@ -4046,7 +4129,7 @@ mod tests {
             tile
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// An `Uncurry` beneath a standing level, over an input that restates its outermost keys
@@ -4118,7 +4201,7 @@ mod tests {
             self.tiling().empty_tile()
         }
 
-        fn release_impl(&mut self, _guard: TileGuard) {}
+        fn release_impl(&self, _guard: TileGuard) {}
     }
 
     /// An input a producer reads whole is pulled at no level beneath the outermost keys, so

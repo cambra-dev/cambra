@@ -734,8 +734,8 @@ impl TileProducer for MapResultProducer {
         // Part of an output value released names no part of the input, so the input keeps
         // the row and the value is recomputed on the next pull (`release_impl`); what the
         // consumer let go is taken back out here.
-        if !self.base.obsolete_guard.is_empty() {
-            out.remove_guarded(self.base.obsolete_guard.clone());
+        if !self.obsolete_guard().is_empty() {
+            out.remove_guarded(self.obsolete_guard());
         }
         // Mapping keeps the input's keys, so the input already answered the projection; the
         // cut states it for an input that answered more.
@@ -743,8 +743,8 @@ impl TileProducer for MapResultProducer {
         out
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.dropped_rows.release_to(&mut *self.input);
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&*self.input);
         // A guard is shaped by the tiling it is handed to, so the input's is built
         // from the input's tiling — never from the function's, whose tiling is
         // unrelated (a function tiling, against the input's stream).
@@ -1003,8 +1003,8 @@ impl TileProducer for MapResultToConstProducer {
     /// input ([`through_shared_levels`]): the output is rebuilt from the input's rows on
     /// every pull, and a row the input gave back could not be rebuilt for what of it is still
     /// held here.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.dropped_rows.release_to(&mut *self.input);
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        self.dropped_rows.release_to(&*self.input);
         let upstream = crate::interpreter::tiling::through_shared_levels(
             obsolete_guard,
             self.level.index(),
@@ -1403,7 +1403,7 @@ impl MapResultWithSourceProducer {
         let Some(held) = &mut *held else {
             return everywhere;
         };
-        let released = &self.base.obsolete_guard;
+        let released = &self.obsolete_guard();
         let freed = everywhere.union(&held.releasable(released));
         held.reclaim(released, &freed);
         freed
@@ -1519,7 +1519,7 @@ impl TileProducer for MapResultWithSourceProducer {
                 }
                 held.as_mut()
                     .unwrap()
-                    .reclaim(self.obsolete_guard(), &Predicate::False);
+                    .reclaim(&self.obsolete_guard(), &Predicate::False);
             }
         }
         let source = self.source.read().unwrap_or_else(PoisonError::into_inner);
@@ -1530,7 +1530,7 @@ impl TileProducer for MapResultWithSourceProducer {
         })
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
@@ -1742,7 +1742,7 @@ mod tests {
     /// a function operand is not always a small `Constant`.
     #[test]
     fn map_result_releases_its_function_when_the_consumer_is_done() {
-        let (mut producer, released, tiling) = map_result_with_function_spy();
+        let (producer, released, tiling) = map_result_with_function_spy();
         producer.release(tiling.universal_guard());
         assert!(
             released
@@ -1759,7 +1759,7 @@ mod tests {
     /// it, and an emptied function would leave that pull mapping over nothing.
     #[test]
     fn map_result_keeps_its_function_for_a_narrower_release() {
-        let (mut producer, released, _) = map_result_with_function_spy();
+        let (producer, released, _) = map_result_with_function_spy();
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::at_or_below(Value::UInt(0)),
         )));

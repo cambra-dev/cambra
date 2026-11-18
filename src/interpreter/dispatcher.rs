@@ -36,12 +36,13 @@ use crate::interpreter::{
 pub(crate) mod loop_scope;
 mod plan;
 pub(crate) mod transaction_scope;
+mod workers;
 
 #[cfg(test)]
 pub(crate) use plan::walk_routes;
 pub use plan::{
     Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
-    run_program_polling,
+    run_program_polling, run_program_with_workers,
 };
 
 /// A pipeline, by its index in the [`Dispatcher`].
@@ -1165,16 +1166,18 @@ impl Dispatcher {
 
     fn mark_arrivals(&mut self, pipeline: PipelineId) {
         let p = pipeline.0;
+        let state = &self.states[p];
+        // Composed scope graphs may already contain their initial queued inputs.
+        // This newly configured entry must itself have received nothing yet.
         assert!(
-            self.states.iter().all(|pipeline| {
-                pipeline.queue.reserved() == 0
-                    && !pipeline
-                        .queue
-                        .state
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .arrivals_closed
-            }),
+            state.queue.reserved() == 0
+                && !state
+                    .queue
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .arrivals_closed
+                && state.phase.load() == Phase::Running,
             "pipeline {p} takes arrivals before any notify or close"
         );
         let info = &mut self.infos[p];
@@ -3024,21 +3027,21 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
         return work();
     }
     struct Command<F, R> {
-        work: Option<F>,
-        result: Option<R>,
+        work: std::cell::RefCell<Option<F>>,
+        result: std::cell::RefCell<Option<R>>,
     }
     impl<F: FnOnce() -> R, R> Breaker for Command<F, R> {
         fn as_producer(&self) -> Option<&dyn BreakingProducer> {
             None
         }
-        fn consume_impl(&mut self, _: InputId, _: TileGuard) {
-            self.result = Some(self.work.take().expect("one command")());
+        fn consume_impl(&self, _: InputId, _: TileGuard) {
+            *self.result.borrow_mut() = Some(self.work.borrow_mut().take().expect("one command")());
         }
         fn input_tiling(&self, _: InputId) -> Tiling {
             Tiling::Scalar(Extent::Base(crate::interpreter::BaseType::Unit))
         }
         fn input_released(&self, _: InputId) -> TileGuard {
-            TileGuard::Scalar(if self.work.is_none() {
+            TileGuard::Scalar(if self.work.borrow().is_none() {
                 Predicate::True
             } else {
                 Predicate::False
@@ -3046,8 +3049,8 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
         }
     }
     let mut command = Command {
-        work: Some(work),
-        result: None,
+        work: std::cell::RefCell::new(Some(work)),
+        result: std::cell::RefCell::new(None),
     };
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     in_a_run(|| {
@@ -3055,7 +3058,10 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
             call(&mut command, InputId::ONLY)
         })
     });
-    command.result.expect("the dispatcher consumes the command")
+    command
+        .result
+        .into_inner()
+        .expect("the dispatcher consumes the command")
 }
 
 /// Evaluate a component query inside one dispatched unit command, for protocol fixtures.
@@ -3352,7 +3358,7 @@ mod tests {
                 self.tiling().empty_tile()
             }
 
-            fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+            fn release_impl(&self, _obsolete_guard: TileGuard) {}
         }
 
         fn two_inputs(walk: Walk) -> TwoInputs {
