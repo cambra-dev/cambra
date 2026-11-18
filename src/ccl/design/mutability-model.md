@@ -1467,19 +1467,53 @@ count unvalidated keys. A `Pin` whose cell has been unpinned and reclaimed resol
 
 ## Staging
 
-`Ref` with the collect policy is the plan of record. The steps toward it:
+The design lands in the steps below, in order. Each step leaves the compiler and the spec
+consistent, and names the [proposed spec changes](#proposed-changes-to-the-spec-and-the-compiler)
+that land with it. Work not listed here is in [Future work](#future-work).
 
-1. **Module-local validated keys, checked statically.** Refinements mention only the module's own
-   cells. Each obligation is discharged by the commit point of the transaction that creates it, by
-   a compensating write, a guard, the version chain or an index, or the program is rejected. No
-   runtime check is inserted.
-2. **`Ref` with the collect policy.** This step introduces reference counts and the root scan. A
-   cycle in the type graph of cells is a compile error.
-3. **Cross-module validated keys.** A deletion can no longer see every dependent. The program reads
-   a system-maintained reference count, `refs(𝑆)`, built on step 2's counting, as an explicit
-   guard, or the deletion is rejected.
-4. **Cycle collection.** Cycles in the type graph are admitted, and `@NoTrace` bounds tracing
-   ([Cycle collection](#cycle-collection)).
+1. **`OnceMap`.** `OnceMap(𝐾, 𝑉)` joins `Feed(𝑇)` as a deferred-collection type, on today's
+   representation of feeds ([Deferred collections](#deferred-collections)). A definition
+   `m[k] = v` is checked to define each key at most once, totality is proved from the declaring
+   scope's code, and a lookup has type `𝑉`. `http::serve` becomes a module that is run, whose
+   `respond` takes a `FullMap` ([Sinks](#sinks)). A feed loses its aliases and its moves. Spec 3.7,
+   3.9, 4.4, 7.3 and 8.4 change.
+2. **A foundation for places.** The compiler gains one representation of a place: a place
+   variable and a path of projections from it ([Values, Places, and
+   Variables](#values-places-and-variables)). The rules for place variables are checked once,
+   over that representation: never stored, returned, aliased or public; a copy on use as a value;
+   a borrow marked `&` in a borrowing position; a parameter's borrow mode inferred from the body.
+   Today `Mut` and `Feed` are separate CCL types with separate second-class checks
+   (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class (downward-only)").
+   1. **`Mut`, `Feed` and `OnceMap` move onto the foundation.** An argument to a place parameter
+      is written `&x`, and an unmarked argument is always a copy. Two borrowers of one `Mut` are
+      sequenced, and two borrowers of one deferred collection are not. A module exports values
+      and no place. Spec 8.1, 9.6 and 9.7–9.9 change, and so does the worked example of
+      `docs/modules.md`. Only whole place variables are lent.
+   2. **Borrows of substructure.** A path is a write target, `m[k].f := v`, and a borrow lends a
+      path, `swap(&xs[i], &xs[j])` ([Mutable Value Semantics](#mutable-value-semantics)).
+      Exclusivity is checked per part, and the disjointness of computed indices is a z3
+      obligation.
+3. **`Mut(_, Txn)` becomes `Cell`.** A root cell is declared `x: Cell(𝑉) := init` and is read and
+   written by name inside a transaction ([Cells](#cells)). `to_mut` is inserted only for a root
+   cell named directly. Realms arrive as nominal types, with the default realm where none is
+   named ([Realms](#realms)). A block in value position yields its outcome, and a block may carry a
+   deadline ([Transaction outcomes](#transaction-outcomes)). Footprints name paths from root cells,
+   `ReadCell(𝑝)` and `WriteCell(𝑝)` ([Footprints and elision](#footprints-and-elision)). Spec 8.2
+   changes.
+4. **`Ref`, with reference counting.** `Ref::new`, `ref(x)`, `*` and `->` reach cells allocated at
+   run time, and `Pin` hands them outside the program ([Operations](#operations)). The pair arrow
+   becomes `↦` first, which frees `->` (spec 2.4). The collector counts the `Ref`s stored in cells
+   and scans the roots, and a cycle in the type graph of cells is a compile error ([Garbage
+   collection](#garbage-collection)). Footprints name allocation sites, and a transaction that
+   reads a `Ref` from a cell needs a reconnaissance step ([References read from
+   cells](#references-read-from-cells)).
+5. **Deferred materialized views.** `@materialize(delay=𝑡)`, in the sources' realm or another,
+   maintained by DBSP after commit from `history(𝑥)` ([Deferred materialized
+   views](#deferred-materialized-views)). A read at `𝜏` sees the definition at `σ(𝜏)`, and
+   `source_version` exposes it.
+6. **In-transaction materialized views.** `@materialize` with no delay, maintained inside each
+   writing transaction, and `@index` ([In-transaction materialized
+   views](#in-transaction-materialized-views)). Their footprint and latency fall on the writers.
 
 ## Changes relative to the current implementation and the effects stack
 
@@ -1574,6 +1608,26 @@ Proposals for the owners of each part.
 
 The design leaves these out. Each is a candidate for a later revision.
 
+### Validated keys
+
+Refinements that read cells, through version-indexed types, and the obligations they put on writes
+([Versions and version-indexed types](#versions-and-version-indexed-types), [Validated
+keys](#validated-keys), [Invariants over cell contents](#invariants-over-cell-contents)). They
+land in two parts. Module-local validated keys come first: a refinement mentions only its module's
+cells, and each obligation is discharged by the commit point of the transaction that creates it,
+by a compensating write, a guard, the version chain or an index, or the program is rejected. No
+runtime check is inserted. Cross-module validated keys follow. A deletion can no longer see every
+dependent, so the program reads a system-maintained reference count, `refs(𝑆)`, built on the
+counting of staging step 4, as an explicit guard, or the deletion is rejected. The required cast
+out of a transaction ([Leaving a transaction](#leaving-a-transaction)) lands with the first part.
+
+### Tracing garbage collection
+
+Reference counting reclaims no cell on a cycle, so staging step 4 rejects every cycle in the type
+graph of cells. A tracing collector admits them. Tracing is confined to the cyclic components of the
+type graph, starting from cells whose count decreased without reaching zero, and `@NoTrace` asserts
+that a cell lies in no cyclic component ([Cycle collection](#cycle-collection)).
+
 ### User-defined projections
 
 Field access `.f`, lookup `[k]` and `to_mut` (`*`) are the built-in projections: each yields a
@@ -1603,6 +1657,24 @@ rejects them waits until the system is more mature.
 Feeds and `OnceMap`s are instances of LVars: contributions are joins in a lattice, and a pointwise
 read is a threshold read ([Reads](#reads)). Other laws, such as a maximum or the Z-sets of DBSP,
 could join them, and a materialized view could then be a value.
+
+### Borrowing a point of a deferred collection
+
+`&m[k]` would lend one entry of a `OnceMap` for its callee to define, as `&xs[i]` lends one element
+of a `Mut`. The parameter needs a type that `Mut` does not supply, such as `Defer(𝑉)`, a place that
+holds a `𝑉` defined once:
+
+```python
+def set_to_1(v: Defer(Int)):
+    v = 1
+
+m: OnceMap(Int, Int)
+set_to_1(&m[0])
+```
+
+With `Defer`, `OnceMap(𝐾, 𝑉)` could be `FullMap(𝐾, Defer(𝑉))`, and `Feed(𝑇)` could be
+`_ ⤇ Defer(𝑇)`, where `_` is a domain that inference fixes per feed, neither universally quantified
+nor a `Σ`. Whether the model is useful, and whether it is the right one, is not settled.
 
 ### Keys of captured contributions called from another module
 
