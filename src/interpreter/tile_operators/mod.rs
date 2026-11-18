@@ -1865,7 +1865,9 @@ pub trait TileProducer: Send + Sync {
                 self.restates()
             );
         }
-        let mut result = self.get_exclusive_impl(projection_guard);
+        let mut context = ExecutionContext::default();
+        let mut result = self.get_impl(&mut context, projection_guard);
+        context.apply(self);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
         if let Some(cells) = self.obsolete_guard().released_cells() {
@@ -1964,12 +1966,6 @@ pub trait TileProducer: Send + Sync {
 
     /// Produce the tile for `projection_guard`, honoring accumulated releases and completeness.
     /// The [`get`](Self::get) wrapper supplies validation, not general projection or reclamation.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let mut cx = ExecutionContext::default();
-        let result = self.get_impl(&mut cx, projection_guard);
-        cx.apply(self);
-        result
-    }
 
     /// Read this existing instance with execution-local progress and deferred releases.
     #[doc(hidden)]
@@ -2541,7 +2537,7 @@ pub(crate) mod test_helpers {
             crate::interpreter::Restates::Every
         }
 
-        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
             self.pulled
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2674,7 +2670,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
             let mut tile = self
                 .tile
                 .read()
@@ -3040,7 +3036,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
 
@@ -3059,7 +3055,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
 
@@ -3104,7 +3100,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
@@ -3150,7 +3146,7 @@ mod tests {
             visit("input", &*self.input);
         }
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             use super::FunctionGuard;
             use crate::interpreter::{Predicate, Value};
             self.input
@@ -3214,7 +3210,7 @@ mod tests {
     impl TileProducer for OneRow {
         impl_producer_base!();
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             Tile::Scalar(ColumnValue::Ints(vec![7]))
         }
 

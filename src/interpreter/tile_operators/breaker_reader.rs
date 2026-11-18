@@ -113,7 +113,7 @@ mod tests {
             fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
                 visit("input", &*self.input);
             }
-            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _cx: &mut ExecutionContext, _: TileGuard) -> Tile {
                 self.input
                     .get(
                         CurryLevel::new(1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(

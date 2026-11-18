@@ -1707,7 +1707,7 @@ impl TileProducer for MemoProducer {
         Restates::Every
     }
 
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         if !self.base.reads_input() {
             return self.answer(&projection_guard.projection_for(self));
         }
@@ -2202,7 +2202,7 @@ mod tests {
             node
         }
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             self.pulls.set(self.pulls.get() + 1);
             let next = match self.standing.replace(false) {
                 true => self
@@ -2622,7 +2622,7 @@ mod projection_tests {
         impl TileProducer for NotifyingInput {
             impl_producer_base!();
 
-            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _cx: &mut ExecutionContext, _: TileGuard) -> Tile {
                 let reads = self.reads.get() + 1;
                 self.reads.set(reads);
                 if reads == 1 {
@@ -4107,7 +4107,7 @@ mod cycle_tests {
     impl TileProducer for StoreDoubleProducer {
         impl_producer_base!();
 
-        fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
             let read = self
                 .recurrence
                 .get(self.recurrence.tiling().universal_guard());

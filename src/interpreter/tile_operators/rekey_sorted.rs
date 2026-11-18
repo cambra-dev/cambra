@@ -171,16 +171,10 @@ impl TileProducer for RekeySortedProducer {
         Some(self)
     }
 
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
-        if self.base.reads_input() {
-            let mut tile = self.read_input(self.input.tiling().universal_guard());
-            tile.restrict_to(&guard.projection_for(self), self.tiling());
-            tile
-        } else {
-            let mut tile = self.output.clone();
-            tile.restrict_to(&guard.projection_for(self), self.tiling());
-            tile
-        }
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
+        let mut tile = self.output.clone();
+        tile.restrict_to(&guard.projection_for(self), self.tiling());
+        tile
     }
 
     fn release_impl(&mut self, _obsolete_guard: TileGuard) {
@@ -435,7 +429,7 @@ impl Complete {
 mod tests {
     use super::*;
     use crate::interpreter::BaseType;
-    use crate::interpreter::tile_operators::test_helpers::ReleaseSpy;
+    use crate::interpreter::tile_operators::test_helpers::{ReadInPipeline as _, ReleaseSpy};
     use bit_set::BitSet;
     use std::collections::HashMap;
 
@@ -482,8 +476,22 @@ mod tests {
             complete: Complete::new(order),
             consumed: Predicate::False,
         };
+        let reads = producer.input.base().reads;
+        let before = producer.read_in_pipeline(tiling.universal_guard());
+        assert!(before.is_empty(), "no rekeyed output before consumption");
+        assert_eq!(
+            producer.input.base().reads,
+            reads,
+            "a snapshot does not read input"
+        );
         producer.consume_in_pipeline(InputId::ONLY, pair_tiling().universal_guard());
-        let out = producer.get(tiling.universal_guard());
+        let reads = producer.input.base().reads;
+        let out = producer.read_in_pipeline(tiling.universal_guard());
+        assert_eq!(
+            producer.input.base().reads,
+            reads,
+            "a snapshot does not read input"
+        );
         (producer, out, released)
     }
 

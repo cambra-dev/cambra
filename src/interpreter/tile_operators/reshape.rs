@@ -143,12 +143,12 @@ impl TileProducer for PermuteRecordDomainProducer {
 
     /// The keys are renamed fieldwise, so the input is read whole and the answer is cut to the
     /// projection over the permuted keys.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        let input_tile = cx.get(&*self.input, self.input.tiling().universal_guard());
         let Tile::DataFunction {
             row_starts,
             domain,
@@ -612,12 +612,12 @@ impl TileProducer for FlattenTupleDomainProducer {
 
     /// The keys are restated flat, so the input is read whole and the answer is cut to the
     /// projection over the flat keys.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        let input_tile = cx.get(&*self.input, self.input.tiling().universal_guard());
         let mut flat = if self.level == CurryLevel::OUTERMOST {
             flatten_level(input_tile, &self.field_map)
         } else {
@@ -1428,7 +1428,7 @@ mod tests {
             fn add_inspect_children(&self, node: InspectNode, _: &VizOptions) -> InspectNode {
                 node
             }
-            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _cx: &mut ExecutionContext, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
             fn release_impl(&mut self, guard: TileGuard) {

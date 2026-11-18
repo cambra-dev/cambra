@@ -768,7 +768,7 @@ impl TileProducer for UnionProducer {
     /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
     /// projection reaches each arm as what it names under that arm's tag, as a release does, and
     /// an arm it names nothing of is not pulled.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         // Closed first, so a pull of every arm reads as the pull of everything it is.
         let projection_guard = projection_guard.closed_over(self.tiling());
         let projection = projection_guard.projection_for(self);
@@ -780,11 +780,12 @@ impl TileProducer for UnionProducer {
         {
             let tiles: Vec<Tile> = self
                 .inputs
-                .iter_mut()
+                .iter()
                 .zip(&self.tags)
                 .map(|(p, tag)| match under_arm(keys, level.index(), tag) {
                     under if under.is_false() => p.tiling().empty_tile(),
-                    under => p.get(
+                    under => cx.get(
+                        &**p,
                         Projection::keys_at(*level, under)
                             .restated_by(&p.restates())
                             .guard(p.tiling()),
@@ -814,7 +815,7 @@ impl TileProducer for UnionProducer {
         };
         let tiles: Vec<Tile> = self
             .inputs
-            .iter_mut()
+            .iter()
             .enumerate()
             .map(|(arm, p)| {
                 // An arm the consumer has fully released contributes nothing.
@@ -839,7 +840,10 @@ impl TileProducer for UnionProducer {
                 // An arm may compute values beneath a shallower level. Read at the nearest
                 // level it restates, then cut the combined answer to the requested projection.
                 match &tags {
-                    None => p.get(projection.restated_by(&p.restates()).guard(p.tiling())),
+                    None => cx.get(
+                        &**p,
+                        projection.restated_by(&p.restates()).guard(p.tiling()),
+                    ),
                     Some(pred) => {
                         let under = pred
                             .under_tag(&self.tags[arm])
@@ -848,7 +852,9 @@ impl TileProducer for UnionProducer {
                             // The arms are positional, so an arm the guard names nothing of
                             // still appears, as an empty tile that states nothing complete.
                             true => p.tiling().empty_tile(),
-                            false => p.get(TileGuard::Function(FunctionGuard::Domain(under))),
+                            false => {
+                                cx.get(&**p, TileGuard::Function(FunctionGuard::Domain(under)))
+                            }
                         }
                     }
                 }
@@ -943,7 +949,7 @@ mod tests {
         impl TileProducer for OuterOnly {
             impl_producer_base!();
 
-            fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
+            fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
                 self.input.get(guard)
             }
 
@@ -1586,7 +1592,7 @@ mod tests {
             fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
                 node
             }
-            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _cx: &mut ExecutionContext, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
             fn release_impl(&mut self, obsolete_guard: TileGuard) {

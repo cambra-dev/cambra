@@ -425,11 +425,11 @@ impl CheckedLookupProducer {
 }
 
 /// Compact `tile`, which `input` produced, releasing to `input` the rows that drops.
-fn compact_releasing(tile: &mut Tile, input: &mut Box<dyn TileProducer>) {
+fn compact_releasing(tile: &mut Tile, input: &dyn TileProducer, cx: &mut ExecutionContext) {
     let dropped = tile.deleted_keys_guard();
     tile.compact();
     if let Some(dropped) = dropped {
-        input.release(dropped);
+        cx.release(input, dropped);
     }
 }
 
@@ -460,7 +460,7 @@ impl TileProducer for CheckedLookupProducer {
     /// `(collection, key)` rows, is pulled at the projection while the collection is read whole:
     /// every key is answered against all of it. One answer for one key is a scalar and has no
     /// keys to project.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -472,7 +472,7 @@ impl TileProducer for CheckedLookupProducer {
             self.name()
         );
 
-        self.lookup(&projection)
+        self.lookup(cx, &projection)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -512,7 +512,7 @@ impl TileProducer for CheckedLookupProducer {
 
 impl CheckedLookupProducer {
     /// The answer to the keys `projection` names.
-    fn lookup(&mut self, projection: &Projection) -> Tile {
+    fn lookup(&self, cx: &mut ExecutionContext, projection: &Projection) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
             // One answer per row at one level, and a collection of answers per row —
@@ -532,12 +532,12 @@ impl CheckedLookupProducer {
         // released or filtered-out key as present. Compacting drops those rows and clears the
         // bitset, which is also what leaves the answer with no deletions of its own. A dropped
         // row reaches no consumer and answers no key, so each leg is released through it.
-        match &mut self.source {
+        match &self.source {
             ProducerSource::Split { collection, keys } => {
-                let mut key_tile = keys.get(projection.guard(keys.tiling()));
-                compact_releasing(&mut key_tile, keys);
-                let mut coll = collection.get(collection.tiling().universal_guard());
-                compact_releasing(&mut coll, collection);
+                let mut key_tile = cx.get(&**keys, projection.guard(keys.tiling()));
+                compact_releasing(&mut key_tile, &**keys, cx);
+                let mut coll = cx.get(&**collection, collection.tiling().universal_guard());
+                compact_releasing(&mut coll, &**collection, cx);
                 match key_tile {
                     // One key: the scalar form `m[k]`, the key pivoted to one column where
                     // it is a product. An empty column is a key that has not arrived, so
@@ -566,8 +566,8 @@ impl CheckedLookupProducer {
             }
             // An assembled stream of `(collection, key)` rows.
             ProducerSource::Paired(pairs) => {
-                let mut tile = pairs.get(projection.guard(pairs.tiling()));
-                compact_releasing(&mut tile, pairs);
+                let mut tile = cx.get(&**pairs, projection.guard(pairs.tiling()));
+                compact_releasing(&mut tile, &**pairs, cx);
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty tile, and this operator does the same until its rows arrive.
                 let Tile::DataFunction {
@@ -805,12 +805,12 @@ impl TileProducer for LookupProducer {
     }
 
     /// Read only the requested rows, each carrying its own key and collection.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let mut tile = self.input.get(projection.guard(self.input.tiling()));
+        let mut tile = cx.get(&*self.input, projection.guard(self.input.tiling()));
         let Tiling::Scalar(out_extent) = self.tiling().values_at(self.level) else {
             unreachable!("`Lookup::new_at` puts one value at the level")
         };

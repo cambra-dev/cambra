@@ -411,7 +411,7 @@ struct ScriptBreaker {
 impl TileProducer for ScriptBreaker {
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -1483,7 +1483,7 @@ impl SharedHeld {
 impl TileProducer for SharedHeld {
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 

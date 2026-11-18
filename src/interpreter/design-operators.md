@@ -1208,6 +1208,13 @@ pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
 `tests/it/inspector_goldens.rs`. Neither operator adds an edge to the source itself.
 `source_nodes` derives source-to-iteration ids from the current graph's iteration-domain tilings.
 
+For a source key repeated beneath outer rows, `MapResultWithSource` retains one synchronized set of
+nested occurrence and completeness metadata on its existing producer. Projected reads merge that
+coverage; a later morsel does not replace what earlier reads established. A source key is released
+only after every retained occurrence is released and completeness rules out future occurrences.
+Released paths and completed outer rows without pending paths leave the tracker, while keys still
+needed for possible future occurrences remain candidates. A universal release drops the tracker.
+
 [A node on the wire](../inspector_model/design.md#a-node-on-the-wire) owns serialization. Operator
 nodes include a label, tiling, and input edges; boundary nodes have no tiling. Walk roots are
 derived from the edges on both sides of the wire rather than serialized separately.
@@ -1249,9 +1256,10 @@ of a chain with at least two levels, leaving its enclosing levels intact. Both c
 accumulator tiling through `AggregateKind::output_tiling`; construction fails if the kind does not
 support the input values. The implementation is in `tile_operators/aggregate.rs`.
 
-Each pull reads the input universally, compacts the returned tile, and accumulates its live values.
-The producer releases the received tile's guard, captured before compaction so that it also covers
-deleted rows. `Aggregate` marks its result terminal when the input's accumulated obsolete guard is
+Consumption reads the input at its scheduled guard, compacts the returned tile, and accumulates
+its live values. The producer releases the received tile's guard, captured before compaction so
+that it also covers deleted rows. Reads of `Aggregate`, `MapAggregate` and `ExtractAggregate` observe
+retained accumulators or extracted values without reading input or folding another contribution. `Aggregate` marks its result terminal when the input's accumulated obsolete guard is
 universal. An extremum without an identity emits an empty tile until its first element arrives;
 completion without an element panics through `AggregateKind::no_extreme_of_nothing`. Otherwise it
 re-emits the running accumulator until a universal output release, after which it returns empty
@@ -1286,21 +1294,18 @@ levels; a partial release of an extracted value does not release its input aggre
 
 ### Final-value extraction
 
-`ExtractFinal` returns the last live position's value once its source collection is terminal. The
-output tiling is the source codomain, which may itself be a collection. The current terminal
-selection uses the last nondeleted row, not the greatest live key. Collection tiles do not require
-key order, so this is an implementation gap for unsorted inputs, not a source precondition.
-Induction histories use `StoreFinalRead` instead. The implementation is in
-`tile_operators/extract_final.rs`.
+`ExtractFinal` consumes source deliveries and retains the value at the greatest live key once the
+source is complete. The output tiling is the source codomain, which may itself be a collection.
+`get_impl` observes only the retained final value; it reads neither the source nor the default and
+returns an empty tile before consumption produces a final value. Induction histories use
+`StoreFinalRead` instead. The implementation is in `tile_operators/extract_final.rs`.
 
-Before source completion, extraction returns an empty tile. If a nonterminal delivery contains
-live `UInt` keys with maximum 𝑚 greater than zero, it releases the source prefix through 𝑚 − 1 and
-retains the maximum position. This key-value comparison agrees with the terminal row selection
-only when the remaining rows are in key order. On a terminal delivery, it releases the source
-universally. A live position supplies the result; if none remains, extraction pulls the default.
-The default's extent must be included in the source codomain. `without_default` requires a source
-that cannot finish empty, such as an exhaustive tag partition. Extraction panics if that requirement
-is violated.
+Before source completion, consumption retains candidates. If the retained rows contain live `UInt`
+keys with maximum 𝑚 greater than zero, consumption releases the source prefix through 𝑚 − 1: no
+smaller position can become final. Once the source is released whole, consumption extracts the
+candidate at the greatest key or reads the default if no candidate remains. The default's extent
+must be included in the source codomain. `without_default` requires a source that cannot finish
+empty, such as an exhaustive tag partition. Extraction panics if that requirement is violated.
 
 A collection-valued result is the selected position's group taken out on its own
 (`Tile::group_at`): its whole sub-tile, with every level's predicates restated over the group's own
@@ -1430,7 +1435,7 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the item finished" — only the release of its **newest live row** is the ack, exactly as a release from the body alone is not one.
 - **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it, in the tiling of `V` (`Tiling::from_extent`), so a collection-valued key arrives as a level, as every store read hands it out. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_read`, an induction accumulator's trailing read. It samples through `store_current` at the store's closure, so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. It reads the store whole and cuts the settled value and its completeness to the requested output keys. Without enclosing rows, a partial output release hides those keys while retaining the store slot. A universal release retires it and releases the store slot; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream, commit time ⇀ `V`, out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
-- **`RekeySorted` / `RekeySortedProducer`** (`tile_operators/rekey_sorted.rs`) — re-keys a collection of pairs by each pair's first component, `𝐾 ⇀ (𝐽, 𝑉)` to `𝐽 ⇀ 𝑉`, for an input whose new keys are distinct: the `map` constructor's re-keying, with completeness passing through. No CCL term names it. Op-conversion builds it for every reply tap of a commit store, a `with begin():` block's value among them ([mutability.md](../ccl/design/mutability.md#replies-ride-their-transaction), "Replies ride their transaction"): the tap's `StoreValueStream` holds `(item position, value)` at each commit, the `TransactWriter` having paired the value with the position the `TransactDriver`'s row carries (`F_ITEM_POSITION`), and a site commits each item once. `KeyOrder::of_items` reads the order a site commits in off its source's positions. Over a stream, whose `UInt` positions are delivered in their own order, the keys rise with the commit ticks (`KeyOrder::Rising`): once the input is complete through a position, the output is complete through the key carried there, so an item's value is final at its commit rather than when the source ends. That prefix is spelled over the output's domain, the pairs' first component's extent. Any other source's keys come in any order (`KeyOrder::Any`): a product's positions are a record, a concatenation's a union, and a keyed collection's keys arrive as their groups complete, so a site over one commits its items as they arrive: the output is complete at the keys of the rows the input states complete, and everywhere once the input completes, and the answer is sorted by key. For a direct input read, a release of output keys reaches the input as the longest prefix of positions whose every row has its key released, which under `KeyOrder::Rising` is exact for a prefix of keys; the rows above a gap stay with the input, and the operator drops them from its output. Under `KeyOrder::Rising`, keys that do not rise stop it with a panic in every build.
+- **`RekeySorted` / `RekeySortedProducer`** (`tile_operators/rekey_sorted.rs`) — re-keys a collection of pairs by each pair's first component, `𝐾 ⇀ (𝐽, 𝑉)` to `𝐽 ⇀ 𝑉`, for an input whose new keys are distinct: the `map` constructor's re-keying, with completeness passing through. No CCL term names it. Op-conversion builds it for every reply tap of a commit store, a `with begin():` block's value among them ([mutability.md](../ccl/design/mutability.md#replies-ride-their-transaction), "Replies ride their transaction"): the tap's `StoreValueStream` holds `(item position, value)` at each commit, the `TransactWriter` having paired the value with the position the `TransactDriver`'s row carries (`F_ITEM_POSITION`), and a site commits each item once. `KeyOrder::of_items` reads the order a site commits in off its source's positions. Over a stream, whose `UInt` positions are delivered in their own order, the keys rise with the commit ticks (`KeyOrder::Rising`): once the input is complete through a position, the output is complete through the key carried there, so an item's value is final at its commit rather than when the source ends. That prefix is spelled over the output's domain, the pairs' first component's extent. Any other source's keys come in any order (`KeyOrder::Any`): a product's positions are a record, a concatenation's a union, and a keyed collection's keys arrive as their groups complete, so a site over one commits its items as they arrive: the output is complete at the keys of the rows the input states complete, and everywhere once the input completes, and the answer is sorted by key. Consumption retains the re-keyed output and releases the consumed input prefix; positions above a completeness gap remain held until the gap closes. `get_impl` only projects that retained output, and output release removes values the consumer no longer needs. Under `KeyOrder::Rising`, keys that do not rise stop it with a panic in every build.
 
 A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` serves both engines.
 
@@ -1938,8 +1943,10 @@ in lexicographic order and one over a concatenation runs each part in turn.
 
 ### The driver
 
-`InductionDriver` owns the iteration source and produces the body's `(prev…, item)` input. It
-holds no part of the recurrence and reads the store on two axes:
+`InductionDriver` owns the iteration source and produces the body's `(prev…, item)` input.
+`LoopScope` schedules its consumption to step and retain the rendered body input. `get_impl` only
+projects that rendering and never advances a round. The driver holds no part of the recurrence and
+reads the store on two axes during the step:
 
 - The **frontier** is a position cursor. `step` advances the watermark whether or not the
   position wrote anything, so a frontier equal to `emitted_through` says every emitted position

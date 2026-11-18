@@ -122,7 +122,7 @@ impl TileProducer for Input {
         node
     }
 
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
         self.source
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -490,7 +490,7 @@ impl TileProducer for NestedInput {
         node
     }
 
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
         self.source
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -593,7 +593,7 @@ impl TileProducer for ReadsBreaker {
         node
     }
 
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
         self.breaker
             .write()
             .unwrap_or_else(PoisonError::into_inner)

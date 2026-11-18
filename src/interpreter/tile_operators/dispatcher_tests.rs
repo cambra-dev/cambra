@@ -137,7 +137,7 @@ impl Scripted {
 impl TileProducer for Scripted {
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -598,7 +598,7 @@ impl Positions {
 impl TileProducer for Positions {
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 

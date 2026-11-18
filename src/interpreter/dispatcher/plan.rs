@@ -3295,7 +3295,7 @@ mod tests {
             Some(CurryLevel::new(level.index() + 1))
         }
 
-        fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 
@@ -3344,7 +3344,7 @@ mod tests {
             None
         }
 
-        fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 

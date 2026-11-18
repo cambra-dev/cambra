@@ -417,8 +417,8 @@ impl TileProducer for ReadingsProducer {
         }
     }
 
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let Some(input) = &mut self.input else {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
+        let Some(input) = &self.input else {
             if self.base.obsolete_guard.is_universal() {
                 return self.tiling().empty_tile();
             }
@@ -437,7 +437,7 @@ impl TileProducer for ReadingsProducer {
             }
             _ => input.tiling().universal_guard(),
         };
-        let mut output = input.get(input_guard);
+        let mut output = cx.get(&**input, input_guard);
         // The key path of each value at `level`, and the rows among them the input marks
         // deleted, which are never read and take no reading. At the outermost level every value
         // stands at the path with no keys.

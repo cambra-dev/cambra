@@ -330,7 +330,11 @@ impl TileProducer for IterateExtentProducer {
         sources
     }
 
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        !self.base.tiling.extent().reads_a_source()
+            && matches!(self.iteration, Iteration::Direct(_))
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
             let obsolete = self.obsolete_guard().clone();
@@ -339,13 +343,7 @@ impl TileProducer for IterateExtentProducer {
             };
             return cartesian.get(projection_guard, &tiling, &obsolete);
         }
-        self.get_impl(&mut ExecutionContext::default(), projection_guard)
-    }
-    fn shared_execution(&self) -> bool {
-        !self.base.tiling.extent().reads_a_source()
-            && matches!(self.iteration, Iteration::Direct(_))
-    }
-    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
+
         let Iteration::Direct(direct) = &self.iteration else {
             unreachable!()
         };

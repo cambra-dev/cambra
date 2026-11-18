@@ -397,7 +397,7 @@ impl TileProducer for VariantWrapProducer {
 
     /// A payload stream keeps its keys, so the input is pulled at the projection. A payload
     /// that is itself a collection becomes one union column with no keys, so it is read whole.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -406,7 +406,7 @@ impl TileProducer for VariantWrapProducer {
             true => projection.guard(self.input.tiling()),
             false => self.input.tiling().universal_guard(),
         };
-        let mut tile = self.input.get(input_guard);
+        let mut tile = cx.get(&*self.input, input_guard);
         // **A collection payload is a value only once it is whole.** The arm holds it as one
         // materialized cell, which cannot grow, so a row's cell is emitted once that row's
         // collection is complete and not before. At the outermost level the payload is one
@@ -683,8 +683,8 @@ fn release_bare_scrutinee(scrutinee: &mut dyn TileProducer, released: &TileGuard
 
 impl VariantProjectProducer {
     /// The payloads of the scrutinee's rows carrying the tag.
-    fn project(&mut self, projection: &Projection) -> Tile {
-        let tile = self.input.get(scrutinee_guard(&*self.input, projection));
+    fn project(&self, cx: &mut ExecutionContext, projection: &Projection) -> Tile {
+        let tile = cx.get(&*self.input, scrutinee_guard(&*self.input, projection));
         // Under standing levels the projection runs one enclosing row at a time: its keys
         // are the rows it keeps, and which rows those are is a fact about one group.
         if let (Some(level), Some(empty)) = (self.level, self.empty_level.as_ref())
@@ -715,12 +715,12 @@ impl TileProducer for VariantProjectProducer {
     /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
     /// the projection. A bare union has implicit positions for keys, so it is read whole and
     /// the positions cut after.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let mut out = self.project(&projection);
+        let mut out = self.project(cx, &projection);
         // Part of a payload released names no part of the scrutinee, so the scrutinee keeps
         // the row and the payload is projected again on the next pull (`release_impl`);
         // what the consumer let go is taken back out here.
@@ -970,7 +970,7 @@ impl TileProducer for VariantIsProducer {
     /// Every key in is a key out, so the scrutinee is pulled at the projection, or whole where
     /// the scrutinee does not restate the projection's level, and the answer is cut to the
     /// projection after.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         // A test answers every position, so the scrutinee's levels, keys, groupings and
         // deletions stand as they are, and only its values change: each union value becomes
         // whether it carries the tag.
@@ -982,7 +982,7 @@ impl TileProducer for VariantIsProducer {
             Some(level) if self.input.restates().refuses(level) => Projection::Everything,
             _ => projection.clone(),
         };
-        let mut tile = self.input.get(scrutinee_guard(&*self.input, &pulled));
+        let mut tile = cx.get(&*self.input, scrutinee_guard(&*self.input, &pulled));
         let values = tile.deepest_values_mut();
         let Tile::Scalar(ColumnValue::Union(arms)) = &*values else {
             panic!("VariantIs expects a union input, got {values:?}")

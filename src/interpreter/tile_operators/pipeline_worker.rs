@@ -202,12 +202,7 @@ impl TileProducer for SharedInput {
                 .get(guard)
         }
     }
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
-        self.input
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(guard)
-    }
+
     fn release_impl(&mut self, guard: TileGuard) {
         self.input
             .write()
@@ -335,7 +330,7 @@ impl TileProducer for InputReader {
             guard,
         )
     }
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
         self.get(guard)
     }
     fn release_impl(&mut self, guard: TileGuard) {

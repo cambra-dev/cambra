@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::PoisonError;
 use std::sync::RwLock;
@@ -675,8 +675,7 @@ impl MapResultProducer {
                 .checked_sub(1)
                 .unwrap_or_else(|| unreachable!("the input was matched as a collection"));
             let paths = input_tile.row_paths_at(innermost + 1);
-            let defined: std::collections::HashSet<Value> =
-                (0..f_keys.len()).map(|i| f_keys.index_at(i)).collect();
+            let defined: HashSet<Value> = (0..f_keys.len()).map(|i| f_keys.index_at(i)).collect();
             let mut keep = vec![true; arguments.len()];
             let mut withheld: Vec<&[Value]> = Vec::new();
             for (i, path) in paths.iter().enumerate() {
@@ -1263,10 +1262,9 @@ struct MapResultWithSourceProducer {
     /// key the inner side holds, so no release short of the whole one frees a source row,
     /// and the source is held until then.
     result_correlation: Option<Vec<TilePathStep>>,
-    /// What the input last read holds, where it holds a level beneath its keys: a release
-    /// naming paths beneath particular keys is read against it
-    /// ([`Self::released_beneath_every_key`]).
-    last_nested_input: Option<HeldBeneathKeys>,
+    /// Nested source-key occurrences retained across reads. A source key is freed only once
+    /// every occurrence is released and the input rules out further occurrences.
+    nested_input: RwLock<Option<HeldBeneathKeys>>,
 }
 
 /// The parts of a two-level input a release beneath particular keys is read against, kept
@@ -1278,10 +1276,13 @@ struct HeldBeneathKeys {
     inner_stated: Predicate,
     /// Which inner paths are complete, from any level on the path ([`Tile::completion_at`]).
     complete: Predicate,
-    /// The outermost keys, each as its one-component path.
-    outer_keys: Vec<Vec<Value>>,
-    /// The path of every inner key.
-    inner_paths: Vec<Vec<Value>>,
+    /// Outer rows still requiring occurrence-completeness checks, as one-component paths.
+    outer_keys: HashSet<Vec<Value>>,
+    /// Unreleased paths through source keys, retained across overlapping or disjoint reads.
+    inner_paths: HashSet<Vec<Value>>,
+    /// Keys remain candidates after their current paths are released, until completeness proves
+    /// that no future occurrence can need their source values.
+    inner_keys: HashSet<Value>,
 }
 
 impl HeldBeneathKeys {
@@ -1302,13 +1303,66 @@ impl HeldBeneathKeys {
         else {
             return None;
         };
+        let inner_paths: HashSet<Vec<Value>> =
+            input.paths_at(CurryLevel::new(1)).into_iter().collect();
+        let inner_keys = inner_paths
+            .iter()
+            .map(|path| path.last().unwrap().clone())
+            .collect();
         Some(HeldBeneathKeys {
             outer_stated: outer_stated.clone(),
             inner_stated: inner_stated.clone(),
             complete: input.completion_at(CurryLevel::new(1)),
-            outer_keys: input.paths_at(CurryLevel::OUTERMOST),
-            inner_paths: input.paths_at(CurryLevel::new(1)),
+            outer_keys: input.paths_at(CurryLevel::OUTERMOST).into_iter().collect(),
+            inner_paths,
+            inner_keys,
         })
+    }
+    fn merge(&mut self, other: Self) {
+        self.outer_stated = self.outer_stated.union(&other.outer_stated);
+        self.inner_stated = self.inner_stated.union(&other.inner_stated);
+        self.complete = self.complete.union(&other.complete);
+        self.outer_keys.extend(other.outer_keys);
+        self.inner_paths.extend(other.inner_paths);
+        self.inner_keys.extend(other.inner_keys);
+    }
+
+    fn releasable(&self, released: &TileGuard) -> Predicate {
+        let everywhere_complete = self.inner_stated.unqualified_arms();
+        self.inner_keys
+            .iter()
+            .filter(|key| {
+                let all_released = self
+                    .inner_paths
+                    .iter()
+                    .filter(|path| path.last() == Some(*key))
+                    .all(|path| released.covers_path(path));
+                all_released
+                    && (everywhere_complete.contains(key)
+                        || (self.outer_stated.is_true()
+                            && self.outer_keys.iter().all(|outer| {
+                                released.covers_path(outer)
+                                    || self
+                                        .complete
+                                        .contains_path(&[outer[0].clone(), (*key).clone()])
+                            })))
+            })
+            .fold(Predicate::False, |all, key| {
+                all.union(&Predicate::point(key.clone()))
+            })
+    }
+
+    fn reclaim(&mut self, released: &TileGuard, freed: &Predicate) {
+        self.inner_paths
+            .retain(|path| !released.covers_path(path) && !freed.contains(path.last().unwrap()));
+        let complete = &self.outer_stated;
+        let pending = &self.inner_paths;
+        self.outer_keys.retain(|path| {
+            !released.covers_path(path)
+                && (!complete.contains_path(path)
+                    || pending.iter().any(|inner| inner.starts_with(path)))
+        });
+        self.inner_keys.retain(|key| !freed.contains(key));
     }
 }
 
@@ -1326,7 +1380,7 @@ impl MapResultWithSourceProducer {
             source,
             fields,
             result_correlation,
-            last_nested_input: None,
+            nested_input: RwLock::new(None),
         };
         // Register this producer with the source by calling release with a false predicate.
         // This way the source knows about all producers that read it before execution starts.
@@ -1353,43 +1407,17 @@ impl MapResultWithSourceProducer {
     /// level ([`Tile::completion_at`]).
     fn released_beneath_every_key(&self, pred: &Predicate) -> Predicate {
         let everywhere = pred.unqualified_arms();
-        if !pred.qualifies() {
-            return everywhere;
-        }
-        let Some(HeldBeneathKeys {
-            outer_stated,
-            inner_stated,
-            complete,
-            outer_keys,
-            inner_paths,
-        }) = &self.last_nested_input
-        else {
-            // Nothing pulled yet, so nothing is held beneath a key for a qualified arm to name.
+        let mut held = self
+            .nested_input
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(held) = &mut *held else {
             return everywhere;
         };
-        let complete_under_every_key = inner_stated.unqualified_arms();
         let released = &self.base.obsolete_guard;
-        let mut all_released: Vec<(Value, bool)> = Vec::new();
-        for path in inner_paths {
-            let key = path[path.len() - 1].clone();
-            let covered = released.covers_path(path);
-            match all_released.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, all)) => *all &= covered,
-                None => all_released.push((key, covered)),
-            }
-        }
-        all_released
-            .into_iter()
-            .filter(|(key, all)| {
-                *all && (complete_under_every_key.contains(key)
-                    || (outer_stated.is_true()
-                        && outer_keys
-                            .iter()
-                            .all(|outer| complete.contains_path(&[outer[0].clone(), key.clone()]))))
-            })
-            .fold(everywhere, |all, (key, _)| {
-                all.union(&Predicate::point(key))
-            })
+        let freed = everywhere.union(&held.releasable(released));
+        held.reclaim(released, &freed);
+        freed
     }
 }
 
@@ -1481,14 +1509,29 @@ impl TileProducer for MapResultWithSourceProducer {
 
     /// The source is read at the keys the input answers, and the input is pulled at the
     /// projection, so a morsel reads only its own rows from the source.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let input_tile = self.input.get(projection.guard(self.input.tiling()));
-        if self.input.tiling().levels() > 1 {
-            self.last_nested_input = HeldBeneathKeys::of(&input_tile);
+        let input_tile = cx.get(&*self.input, projection.guard(self.input.tiling()));
+        if matches!(
+            self.result_correlation.as_deref(),
+            Some([TilePathStep::Codomain, ..])
+        ) {
+            if let Some(next) = HeldBeneathKeys::of(&input_tile) {
+                let mut held = self
+                    .nested_input
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match &mut *held {
+                    Some(held) => held.merge(next),
+                    None => *held = Some(next),
+                }
+                held.as_mut()
+                    .unwrap()
+                    .reclaim(self.obsolete_guard(), &Predicate::False);
+            }
         }
         let source = self.source.read().unwrap_or_else(PoisonError::into_inner);
         let fields = &self.fields;
@@ -1499,6 +1542,12 @@ impl TileProducer for MapResultWithSourceProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if obsolete_guard.is_universal() {
+            *self
+                .nested_input
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
@@ -2349,6 +2398,7 @@ mod tests {
     fn release_a_source_key_beneath_two_rows(
         inner_stated: Predicate,
         one_guard: bool,
+        reread_morsels: bool,
     ) -> Vec<Predicate> {
         use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
         let src = TestDataSource::new(
@@ -2390,6 +2440,23 @@ mod tests {
             Some(vec![TilePathStep::Codomain]),
         );
         let _ = producer.read_in_pipeline(producer.tiling().universal_guard());
+        if reread_morsels {
+            std::thread::scope(|scope| {
+                for outer in 0..2 {
+                    let producer = &producer;
+                    scope.spawn(move || {
+                        crate::interpreter::dispatcher::in_a_run(|| {
+                            let mut cx = ExecutionContext::default();
+                            let guard = TileGuard::Function(FunctionGuard::Domain(
+                                Predicate::point(Value::UInt(outer)),
+                            ));
+                            let tile = producer.get_impl(&mut cx, guard);
+                            assert!(!tile.is_empty());
+                        })
+                    });
+                }
+            });
+        }
         let beneath = |outer: u64| {
             TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
                 FunctionGuard::Domain(Predicate::qualified(
@@ -2415,12 +2482,26 @@ mod tests {
             return agreed;
         }
         producer.release(beneath(0));
+        if reread_morsels {
+            let held = producer.nested_input.read().unwrap();
+            let held = held.as_ref().unwrap();
+            assert!(
+                held.inner_paths
+                    .iter()
+                    .all(|path| path[0] != Value::UInt(0))
+            );
+            assert!(held.inner_keys.contains(&Value::UInt(10)));
+        }
         agreed.push(
             src.read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get_released_predicate(),
         );
         producer.release(beneath(1));
+        if reread_morsels {
+            let held = producer.nested_input.read().unwrap();
+            assert!(held.as_ref().unwrap().inner_keys.is_empty());
+        }
         agreed.push(
             src.read()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2517,7 +2598,60 @@ mod tests {
     /// releases it.
     #[test]
     fn a_source_key_is_released_once_released_beneath_every_outer_row() {
-        let agreed = release_a_source_key_beneath_two_rows(Predicate::True, false);
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::True, false, false);
+        assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
+        assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
+    }
+
+    /// Releasing all current occurrences cannot free a source value while another outer row
+    /// might still use it. Completion of the outer input discharges that future demand.
+    #[test]
+    fn nested_source_retention_waits_for_future_occurrences_to_be_ruled_out() {
+        let outer = Value::UInt(0);
+        let key = Value::UInt(10);
+        let complete_path = Predicate::qualified(
+            Predicate::point(outer.clone()),
+            Predicate::point(key.clone()),
+        );
+        let mut input = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![10]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![10]))),
+                complete_path.clone(),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let mut held = HeldBeneathKeys::of(&input).unwrap();
+        let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(complete_path),
+        ))));
+        assert!(held.releasable(&released).is_false());
+        held.reclaim(&released, &Predicate::False);
+        assert!(held.inner_paths.is_empty());
+        assert!(held.inner_keys.contains(&key));
+
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut input
+        else {
+            unreachable!()
+        };
+        *domain_predicate = Predicate::True;
+        held.merge(HeldBeneathKeys::of(&input).unwrap());
+        let freed = held.releasable(&released);
+        assert!(freed.contains(&key));
+        held.reclaim(&released, &freed);
+        assert!(held.inner_keys.is_empty());
+    }
+
+    /// Projected reads must not overwrite the complete coverage an earlier read established.
+    #[test]
+    fn concurrent_source_morsels_preserve_nested_retention_coverage() {
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::False, false, true);
         assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
         assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
     }
@@ -2525,7 +2659,7 @@ mod tests {
     /// One guard naming both rows releases the source key.
     #[test]
     fn a_source_key_is_released_by_one_release_naming_every_outer_row() {
-        let agreed = release_a_source_key_beneath_two_rows(Predicate::True, true);
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::True, true, false);
         assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
     }
 
@@ -2533,7 +2667,7 @@ mod tests {
     /// which is complete at every depth, so no later path reaches key 10.
     #[test]
     fn a_source_key_is_released_when_completeness_is_stated_above_it() {
-        let agreed = release_a_source_key_beneath_two_rows(Predicate::False, true);
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::False, true, false);
         assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
         assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
     }
@@ -3265,7 +3399,7 @@ mod source_projection_tests {
                 source: source.runtime(),
                 fields: Vec::new(),
                 result_correlation: None,
-                last_nested_input: None,
+                nested_input: RwLock::new(None),
             },
             pulled,
         )

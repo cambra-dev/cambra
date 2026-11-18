@@ -54,6 +54,7 @@ use bit_set::BitSet;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
+#[cfg(test)]
 use std::sync::PoisonError;
 
 use crate::ccl::{F_WRITES, Label};
@@ -71,7 +72,7 @@ use crate::interpreter::{
 
 use crate::interpreter::operator_conversion::{store_key, store_key_name};
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
-use crate::interpreter::tile_operators::InputId;
+use crate::interpreter::tile_operators::{ExecutionContext, InputId};
 use crate::interpreter::tile_operators::{
     OperatorBase, ProducerStateInfo, column_of_rows, impl_operator_base, impl_producer_base,
     read_again_toward, stored_value_tile, with_values_at,
@@ -2654,7 +2655,7 @@ impl TileProducer for CommitProducer {
         &mut self.base
     }
 
-    fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         if self.breaker.snapshot.is_none() {
             return CommitEngine::unopened().render_full_store_tile(self.tiling());
         }
@@ -3875,7 +3876,7 @@ impl TileProducer for InductionStoreProducer {
 
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         if self.breaker.snapshot.is_none() {
             return render_engines(
                 &Engines::unopened(self.tiling()),
@@ -4092,10 +4093,10 @@ impl TileProducer for StoreValueStreamProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         // Read the published store without advancing its writers.
         let sg = self.store_producer.tiling().universal_guard();
-        let store = self.store_producer.get(sg);
+        let store = cx.get(&*self.store_producer, sg);
         // Fold the changelog directly. A closed stream yields a `True` output
         // domain predicate so a downstream terminal read resolves; a live one
         // carries the store's `at_or_below` watermark through.
@@ -4358,19 +4359,19 @@ impl TileProducer for StoreFinalReadProducer {
     fn input_level(&self, _: &str, _: CurryLevel) -> Option<CurryLevel> {
         None
     }
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         if self.obsolete_guard().is_universal() {
             return self.tiling().empty_tile();
         }
         // A reader can pull some rows, as one that takes rows as they arrive does, so the answer
         // keeps the rows the pull names.
         if self.levels_above > 0 {
-            let mut tile = self.per_row();
+            let mut tile = self.per_row(cx);
             tile.restrict_to(&projection_guard.projection_for(self), self.tiling());
             return tile;
         }
         let sg = self.store_producer.tiling().universal_guard();
-        let store = self.store_producer.get(sg);
+        let store = cx.get(&*self.store_producer, sg);
         // Release through the frontier. This read wants the key's value as the store
         // stands, and `gc_released_prefix` keeps each key's carry source where nothing above
         // the boundary supersedes it, so the fold below is never stranded. Without this
@@ -4378,8 +4379,10 @@ impl TileProducer for StoreFinalReadProducer {
         // which holds every version of every key for the length of the loop.
         if let Some(frontier) = store_frontier(&store) {
             let levels = path_levels(self.store_producer.tiling());
-            self.store_producer
-                .release(domain_prefix_over(vec![frontier.into_value()], &levels));
+            cx.release(
+                &*self.store_producer,
+                domain_prefix_over(vec![frontier.into_value()], &levels),
+            );
         }
         let settled = match &store {
             Tile::Store {
@@ -4436,10 +4439,11 @@ impl StoreFinalReadProducer {
     /// stands, its seed where its inner loop ran no position. A row still running is left
     /// out, as a scalar read leaves out a store still running, and the induction store's statement
     /// of which rows are complete is the output's.
-    fn per_row(&mut self) -> Tile {
-        let tile = self
-            .store_producer
-            .get(self.store_producer.tiling().universal_guard());
+    fn per_row(&self, cx: &mut ExecutionContext) -> Tile {
+        let tile = cx.get(
+            &*self.store_producer,
+            self.store_producer.tiling().universal_guard(),
+        );
         let rows = CurryLevel::new(self.levels_above - 1);
         let complete = tile.completion_at(rows);
         let paths = tile.paths_at(rows);
@@ -4640,7 +4644,7 @@ impl StoreDenseReadProducer {
     /// than to the previous row's last write. The enclosing level's `domain_predicate`
     /// comes straight from the store, which knows it because the drive is sequential: a
     /// row can gain no further position once the next row has one.
-    fn read_per_row(&mut self, store: &Tile) -> Tile {
+    fn read_per_row(&self, store: &Tile) -> Tile {
         // Standing levels stand above the induction store and are kept as they are; only the level
         // holding the stores becomes a level of histories. Beneath a standing level the
         // stores are one collection whose groups belong to different enclosing positions, and
@@ -4774,7 +4778,7 @@ impl TileProducer for StoreDenseReadProducer {
 
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint) and
         // fold `key` at each position it has decided. The cycle advances one position
@@ -4795,7 +4799,7 @@ impl TileProducer for StoreDenseReadProducer {
         // states complete only what the store's guard (`Tile::to_guard`) names, so the
         // consumer re-pulls until the store is terminal.
         let sg = self.store_producer.tiling().universal_guard();
-        let store = self.store_producer.get(sg);
+        let store = cx.get(&*self.store_producer, sg);
         // The store is read whole, since a position's value folds the changelog below it, and
         // the answer is cut to the pull's positions.
         if !self.enclosing.is_empty() {
@@ -6024,21 +6028,11 @@ impl TileProducer for InductionDriverProducer {
         None
     }
 
-    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
-        if self.base.reads_input()
-            && self
-                .decides
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_none()
-        {
-            self.step(&guard.projection_for(self))
-        } else {
-            let mut tile = self.rendered.clone();
-            tile.remove_guarded(self.obsolete_guard().clone());
-            tile.restrict_to(&guard.projection_for(self), self.tiling());
-            tile
-        }
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
+        let mut tile = self.rendered.clone();
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.restrict_to(&guard.projection_for(self), self.tiling());
+        tile
     }
 
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
@@ -6810,7 +6804,7 @@ impl TileProducer for TransactDriverProducer {
 
     impl_producer_base!();
 
-    fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         // Read the source after a notification or consuming delivery. Between those arrivals
         // and the drive's own releases its tile does not grow, so the last decode still answers.
         // A release removes what the driver has finished with. The drive
@@ -7801,7 +7795,7 @@ impl TileProducer for TransactWriterProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         let store_tile = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -8796,7 +8790,7 @@ mod tests {
         }
         // A `Restrict` keeps a filtered row's key, marked deleted, in every tile it
         // emits, so this offers the tile as built.
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -8972,7 +8966,7 @@ mod tests {
         }
 
         impl_producer_base!();
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             let in_tile = self.input.get(self.input.tiling().universal_guard());
             let Tile::DataFunction {
                 domain,
@@ -10014,7 +10008,7 @@ mod tests {
         }
 
         impl_producer_base!();
-        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
             let tile = self.inner.get(projection_guard);
             let (rows, _) = split_transact_stream(tile.clone());
             if let Tile::DataFunction { domain, .. } = &rows {
@@ -10529,7 +10523,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             let store = self
                 .store_producer
                 .get(self.store_producer.tiling().universal_guard());
@@ -10748,7 +10742,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             honoring_release(&self.tile, self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -11065,7 +11059,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -11611,7 +11605,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             honoring_release(
                 &self.tile.read().unwrap_or_else(PoisonError::into_inner),
                 self.obsolete_guard(),
@@ -12022,7 +12016,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut ProducerBase {
             &mut self.base
         }
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             *self.gets.write().unwrap_or_else(PoisonError::into_inner) += 1;
             if self.obsolete_guard().is_universal() {
                 return self.tiling().empty_tile();

@@ -2267,7 +2267,7 @@ mod tests {
             node
         }
 
-        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
             self.tile
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)

@@ -969,7 +969,7 @@ impl TileProducer for UncurryProducer {
 
     /// Projections above the paired level keep their keys. At and beneath that level,
     /// each pair is restated as its outer key and inner key on successive input levels.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -995,7 +995,7 @@ impl TileProducer for UncurryProducer {
         let input_guard = pulled
             .restated_by(&self.input.restates())
             .guard(self.input.tiling());
-        let input_tile = self.input.get(input_guard);
+        let input_tile = cx.get(&*self.input, input_guard);
         // Pair beneath the standing levels, which stand unchanged: a row's group is a
         // curried collection in its own right, so the pairing below is the same one a
         // depth-zero `Uncurry` does to the whole tile.
@@ -1618,14 +1618,12 @@ impl TileProducer for RestrictProducer {
 
     /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
     /// projection.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let pred_result = self
-            .predicate
-            .get(projection.guard(self.predicate.tiling()));
+        let pred_result = cx.get(&*self.predicate, projection.guard(self.predicate.tiling()));
 
         match pred_result {
             Tile::DataFunction {
@@ -2047,7 +2045,7 @@ impl TileProducer for ProductProducer {
 
     /// The two sides are aligned row for row, so a projection of the rows is a projection of
     /// each side.
-    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -2055,9 +2053,9 @@ impl TileProducer for ProductProducer {
         // The outer side has no paired level, so a projection at or beneath it pulls both sides
         // at the rows its paths run through, and the pairs are cut after.
         let pulled = projection.above(CurryLevel::new(self.level.index() + 1));
-        let mut outer_tile = self.outer.get(pulled.guard(self.outer.tiling()));
+        let mut outer_tile = cx.get(&*self.outer, pulled.guard(self.outer.tiling()));
         outer_tile.compact();
-        let mut inner_tile = self.inner.get(pulled.guard(self.inner.tiling()));
+        let mut inner_tile = cx.get(&*self.inner, pulled.guard(self.inner.tiling()));
         inner_tile.compact();
         // The two sides are pulled from their own branches, so a row is matched by its path.
         let (outer_paths, inner_row_at) = match self.level.enclosing() {
@@ -4756,7 +4754,7 @@ mod uncurry_projection_tests {
     impl TileProducer for OutermostSpy {
         impl_producer_base!();
 
-        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
             self.pulled
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
