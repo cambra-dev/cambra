@@ -2189,7 +2189,7 @@ impl Tile {
             } => {
                 if !codomain.holds_a_level() {
                     return TileGuard::Function(FunctionGuard::Domain(
-                        self.held_keys(row_paths)
+                        self.unstated_held_keys(row_paths)
                             .union(&self.stated_keys(row_paths)),
                     ));
                 }
@@ -2286,8 +2286,8 @@ impl Tile {
     /// where it is held and never arrives where it is not, so it is releasable at that row and
     /// no other.
     ///
-    /// Rows stated alike are named together, as [`held_keys`](Self::held_keys) names rows
-    /// holding alike.
+    /// Rows stated alike are named together, as
+    /// [`unstated_held_keys`](Self::unstated_held_keys) names rows holding alike.
     fn stated_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
         let Tile::DataFunction {
             domain_predicate,
@@ -2354,7 +2354,7 @@ impl Tile {
             if !codomain.holds_plain_values(domain.len()) {
                 return;
             }
-            let held = tile.held_keys(row_paths);
+            let held = tile.unstated_held_keys(row_paths);
             if let Tile::DataFunction {
                 domain_predicate, ..
             } = tile
@@ -2371,35 +2371,50 @@ impl Tile {
         );
     }
 
-    /// The keys this collection holds, each beneath the path of the row holding it.
+    /// The held keys outside this collection's completion statement, qualified by their rows.
     ///
     /// Rows holding the same keys are named together, in the order the first of them
     /// appears, so a column whose rows hold alike costs one arm however many rows it has
     /// and the region is spelled the same way each time.
-    fn held_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
-        let Tile::DataFunction { domain, .. } = self else {
-            panic!("held_keys is a collection's: {self:?}")
+    fn unstated_held_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            absent_keys,
+            ..
+        } = self
+        else {
+            panic!("unstated_held_keys is a collection's: {self:?}")
         };
+        let stated = domain_predicate.union(absent_keys);
         let mut group_of: HashMap<Vec<Value>, usize> = HashMap::new();
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for row in 0..row_paths.len() {
+        let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        for (row, path) in row_paths.iter().enumerate() {
+            let complete = stated.within(path, 0);
+            if complete.is_true() {
+                continue;
+            }
             let (start, end) = self.row_run(row);
-            if start < end {
-                let keys = (start..end).map(|k| domain.index_at(k)).collect();
+            // stated_keys supplies completed members. Only the remainder needs a held-key
+            // region, so a broad statement never expands into one qualified region per group.
+            let indices: Vec<usize> = (start..end)
+                .filter(|&key| complete.is_false() || !complete.contains(&domain.index_at(key)))
+                .collect();
+            if !indices.is_empty() {
+                let keys = indices.iter().map(|&key| domain.index_at(key)).collect();
                 let group = *group_of.entry(keys).or_insert_with(|| {
-                    groups.push(Vec::new());
+                    groups.push((indices, Vec::new()));
                     groups.len() - 1
                 });
-                groups[group].push(row);
+                groups[group].1.push(row);
             }
         }
         Predicate::union_all(
             groups
                 .into_iter()
-                .map(|rows| {
-                    let (start, end) = self.row_run(rows[0]);
+                .map(|(indices, rows)| {
                     let keys = Predicate::from_column_value(
-                        &domain.select_indices(start..end, end - start),
+                        &domain.select_indices(indices.iter().copied(), indices.len()),
                     );
                     let rows = Predicate::union_all(
                         rows.iter()
@@ -6723,6 +6738,119 @@ mod tests {
                 .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_)))),
             "the whole group is released by its own key"
         );
+    }
+
+    #[test]
+    fn to_guard_keeps_a_grouped_input_statement_unqualified() {
+        let mut members = Vec::new();
+        let mut starts = Vec::new();
+        for group in 0..64 {
+            starts.push(members.len());
+            members.extend([group, group + 64]);
+        }
+        let complete = Predicate::from_column_value(&ColumnValue::UInts((0..128).collect()));
+        let tile = Tile::data_function(
+            ColumnValue::Ints((0..64).collect()),
+            Box::new(Tile::grouped(
+                starts,
+                ColumnValue::UInts(members),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1; 128]))),
+                complete.clone(),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert_eq!(
+            tile.to_guard(),
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(complete),
+            )))),
+        );
+    }
+
+    #[test]
+    fn to_guard_grouped_members_match_held_keys_and_completion_statements() {
+        let keys = |mask: u64| {
+            Predicate::from_column_value(&ColumnValue::UInts(
+                (0..6).filter(|key| mask & (1 << key) != 0).collect(),
+            ))
+        };
+        let mut rng = Lcg(47);
+        for _ in 0..200 {
+            let held: [u64; 3] = std::array::from_fn(|_| rng.next(64));
+            let complete: [u64; 3] = std::array::from_fn(|_| rng.next(64));
+            let global = rng.next(64);
+            let whole_groups = rng.next(8);
+            let absent_rows = rng.next(8);
+            let global_absent = rng.next(2) != 0;
+            let absent_group = rng.next(2) != 0;
+            let mut statements = vec![keys(global)];
+            let mut absences = vec![if global_absent {
+                Predicate::point(Value::UInt(7))
+            } else {
+                Predicate::False
+            }];
+            let (mut starts, mut members) = (Vec::new(), Vec::new());
+            for (row, mask) in held.iter().enumerate() {
+                starts.push(members.len());
+                members.extend((0..6).filter(|key| mask & (1 << key) != 0));
+                let parent = Predicate::exactly(&[Value::UInt(row as u64)]);
+                statements.push(Predicate::qualified(parent.clone(), keys(complete[row])));
+                if absent_rows & (1 << row) != 0 {
+                    absences.push(Predicate::qualified(
+                        parent,
+                        Predicate::point(Value::UInt(6)),
+                    ));
+                }
+            }
+            let deleted = (0..members.len()).filter(|_| rng.next(3) == 0).collect();
+            let mut inner = Tile::grouped(
+                starts,
+                ColumnValue::UInts(members.clone()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1; members.len()]))),
+                Predicate::union_all(statements),
+                deleted,
+            );
+            let Tile::DataFunction { absent_keys, .. } = &mut inner else {
+                unreachable!()
+            };
+            *absent_keys = Predicate::union_all(absences);
+            let mut tile = Tile::data_function(
+                ColumnValue::UInts(vec![0, 1, 2]),
+                Box::new(inner),
+                keys(whole_groups),
+                BitSet::new(),
+            );
+            let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+                unreachable!()
+            };
+            if absent_group {
+                *absent_keys = Predicate::point(Value::UInt(3));
+            }
+            let guard = tile.to_guard();
+            for row in 0..5 {
+                let whole = whole_groups & (1 << row) != 0 || row == 3 && absent_group;
+                assert_eq!(
+                    guard.covers_path(&[Value::UInt(row)]),
+                    whole,
+                    "{tile:?}: {guard:?}"
+                );
+                for key in 0..9 {
+                    let expected = whole
+                        || global & (1 << key) != 0
+                        || global_absent && key == 7
+                        || row < 3
+                            && (held[row as usize] | complete[row as usize]) & (1 << key) != 0
+                        || row < 3 && absent_rows & (1 << row) != 0 && key == 6;
+                    assert_eq!(
+                        guard.covers_path(&[Value::UInt(row), Value::UInt(key)]),
+                        expected,
+                        "row {row}, member {key}: {tile:?}: {guard:?}",
+                    );
+                }
+            }
+        }
     }
 
     /// With every group whole there is nothing left for a codomain arm to name, so the
