@@ -1,3 +1,4 @@
+import std::http as http_api
 # Manual smoke test (replace {PORT} with a literal of your choice):
 #
 #     cargo run -- tests/programs/http_greeter/program.cambra
@@ -8,24 +9,24 @@
 
 prefix = "Hello, "
 
-run std::http(port="{PORT}", method="GET", path="/greet") as http_greet_resps
-http_greet_resps_replies: Feed(String)
-greet_reqs = http_greet_resps::requests
-run std::http(port="{PORT}", method="POST", path="/echo") as http_echo_resps
-http_echo_resps_replies: Feed(String)
-echo_reqs = http_echo_resps::requests
-run std::http(port="{PORT}", method="POST", path="/shout") as http_shout_resps
-http_shout_resps_replies: Feed(String)
-shout_reqs = http_shout_resps::requests
+run std::http::serve(port="{PORT}", method="GET", path="/greet") as http_greet_resps
+http_greet_resps_replies: Feed(http_api::Response)
+greet_reqs = [request.body() for request in http_greet_resps::requests]
+run std::http::serve(port="{PORT}", method="POST", path="/echo") as http_echo_resps
+http_echo_resps_replies: Feed(http_api::Response)
+echo_reqs = [request.body() for request in http_echo_resps::requests]
+run std::http::serve(port="{PORT}", method="POST", path="/shout") as http_shout_resps
+http_shout_resps_replies: Feed(http_api::Response)
+shout_reqs = [request.body() for request in http_shout_resps::requests]
 
 for req in greet_reqs:
-    http_greet_resps_replies << prefix + "stranger!\n"
+    http_greet_resps_replies << http_api::ok_text(prefix + "stranger!\n")
 
 for req in echo_reqs:
-    http_echo_resps_replies << "You said: " + req + "\n"
+    http_echo_resps_replies << http_api::ok_text("You said: " + req + "\n")
 
 for req in shout_reqs:
-    http_shout_resps_replies << prefix + req + "!!!\n"
+    http_shout_resps_replies << http_api::ok_text(prefix + req + "!!!\n")
 http_greet_resps::respond(http_greet_resps_replies)
 http_echo_resps::respond(http_echo_resps_replies)
 http_shout_resps::respond(http_shout_resps_replies)

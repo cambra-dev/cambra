@@ -15,7 +15,7 @@ pub def quote(item, qty) => Int requires Context except ObserveWorld causes only
 bigger: forall (T <: {at: Int}) {T, T} => T causes nothing = larger
 first: forall (A, T <: {A, ..}) T => A = head
 
-reqs, resps = http_serve(8080, 'GET', "/count")
+reqs, resps = serve(8080, 'GET', "/count")
 
 @LoadFrom(previous)
 total: Mut(Int, Txn)

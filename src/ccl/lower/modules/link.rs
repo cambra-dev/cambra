@@ -639,6 +639,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
                     ast,
                     chain,
                     ctx.parameters.clone(),
+                    &sinks,
                     ctx,
                 )),
                 scope: scope.clone(),
@@ -666,6 +667,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             &sinks,
             &defaults.consts,
             &mut chain,
+            None,
             program_span,
             &mut lowering.errors,
         );
@@ -1264,6 +1266,7 @@ impl<'a> ProgramLowering<'a> {
             ast,
             &chain,
             std::mem::take(&mut ctx.parameters),
+            &sinks,
             ctx,
         );
         interface.incomplete = !self.program.parsed_cleanly(file);
@@ -1668,17 +1671,19 @@ impl<'a> ProgramLowering<'a> {
         substitute_in(&mut chain, &defaults);
         // A route takes the address its run gives it. A module's check keeps the name the
         // module's chain gives its source, which it reads the requests' type off.
-        let declared = if self.checking {
-            Vec::new()
-        } else {
-            sinks_at(
-                &lowered.sinks,
-                &arguments.consts,
-                &mut chain,
-                statement,
-                &mut self.errors,
-            )
-        };
+        super::super::http::rename_source_expr(
+            &mut chain,
+            &lowered.interface.source_renames(&arguments.consts, &prefix),
+        );
+        let declared = sinks_at(
+            &lowered.sinks,
+            &arguments.consts,
+            &mut chain,
+            Some(&prefix),
+            statement,
+            &mut self.errors,
+        );
+        ctx.declare_unopened_routes(&declared);
         let mut qualified = own;
         let outer = std::mem::replace(&mut self.nested, true);
         let enclosing = std::mem::replace(&mut self.enclosing, place.clone());

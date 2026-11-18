@@ -533,9 +533,10 @@ Calls with unresolved effects separate the reads of state that a callback may wr
 a capture. Induction variables retain their read segments because captured induction writers
 are forbidden. Borrowed parameters whose sequencing domain is still unknown may be transactional.
 
-HTTP exposes `requests` and `respond(values)` from the embedded `std::http` module. Its private
-response Feed is registered as a sink separately from the pure CCL tree. Callers supply ordinary
-response collections. No writable place crosses the module boundary as data.
+HTTP exposes `Reqs`, `requests`, and `respond(values)` from the embedded `std::http::serve`
+run module. Its private response Feed is registered as a sink separately from the pure CCL tree.
+`respond` defines it once with a `Reqs |=> http::Response` data function. The nominal response
+type comes from importable `std::http`. No writable place crosses the module boundary as data.
 
 Inlining substitutes borrowed places into named parameters. Channelization gathers each Feed's
 contributions at its declaration and substitutes its assembled collection for reads. Its existing

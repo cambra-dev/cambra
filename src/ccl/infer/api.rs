@@ -256,7 +256,7 @@ impl TypeInferenceContext {
         let ty = Type::Fun {
             binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
-            domain: Box::new(Type::DataSource(name.to_string())),
+            domain: Box::new(Type::DataSource(name.into())),
             codomain: Box::new(elem_ty),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };

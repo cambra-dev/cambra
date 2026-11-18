@@ -268,8 +268,6 @@ is the specification for most rows. Six rows are specified in other sections:
 These rows and the spec disagree:
 
 - `test_sink` has no entry in the spec.
-- `http_serve` is a source and a sink in the spec, and its kind here is `SinkDeclaration` alone,
-  because lowering recognizes it by `sink_declaration`.
 - The spec's planned aggregates (`count`, `avg`, `len`) and tentative builtins (`str`,
   `open`, `stdout`, `restrict`) have no row.
 

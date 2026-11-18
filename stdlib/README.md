@@ -22,7 +22,8 @@ and `src/std.cambra` is `std`, the core module. `tests/` holds the programs that
 | -- | -- | -- | -- |
 | `std` | [src/std.cambra](src/std.cambra) | the prelude | `Option` with its methods `is_none`, `value` and `unwrap_or`, and the traits operators, loops and aggregates require, with their `@Builtin` instances for base types |
 | `std::random` | [src/std/random.cambra](src/std/random.cambra) | `import std::random` | `next()`, a random `Int` read once per position |
-| `std::http` | [src/std/http.cambra](src/std/http.cambra) | `run std::http(…) as server` | A route's request collection and response consumer |
+| `std::http` | [src/std/http.cambra](src/std/http.cambra) | `import std::http` | Nominal HTTP values and pure response helpers |
+| `std::http::serve` | [src/std/http/serve.cambra](src/std/http/serve.cambra) | `run std::http::serve(…) as server` | A route's request domain, requests, and complete response connection |
 | `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, durations, and conversions to integer counts and Unix time |
 
 - **A module whose top level requires or causes something is run; every other module is imported.**

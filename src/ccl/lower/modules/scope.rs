@@ -734,7 +734,12 @@ impl Qualifier {
             .with_related(found.declared, "declared here without `pub`"));
         }
         let mut ty = reroot_alias(&found.ty, &self.name);
-        ty.walk_types_mut(&mut |ty| substitute(ty, &self.types));
+        let qualifier = self.name.to_string();
+        let sources = interface.source_renames(&self.types.consts, &qualifier);
+        ty.walk_types_mut(&mut |ty| {
+            substitute(ty, &self.types);
+            super::super::http::rename_source_type(ty, &sources);
+        });
         Ok(Some(ty))
     }
 

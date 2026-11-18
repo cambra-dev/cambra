@@ -1,187 +1,148 @@
-//! The embedded `std::http` declaration primitive. It binds a request source and
-//! response Feed directly, and records the route's sink outside the pure CCL tree.
-//! Constant module parameters supply the address for each run.
+//! The `@Builtin` declarations of the embedded `std::http::serve`: a route's request key type,
+//! its request source, and its response Feed. The module's `const` parameters `port`, `method`
+//! and `path` give the route's address, and the route's sink is recorded outside the pure CCL
+//! tree.
 
 use super::constants::Refused;
 use super::*;
 use crate::ccl::constant::ConstTerm;
-use crate::chl_parser::SurfaceBuiltin;
-use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned};
+use crate::ccl::{Annotation, SourceName};
+use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned, TypeAnnotation};
 use crate::interpreter::HttpServerDataSource;
 
-/// `http_serve(port, method, path)`, with its arguments read off.
-pub(super) struct HttpServeDecl {
-    port: Spanned<ChlExpr>,
-    method: Spanned<ChlExpr>,
-    path: Spanned<ChlExpr>,
+/// The module that declares HTTP routes.
+const HTTP_SERVE_MODULE: &str = "std::http::serve";
+
+/// What the compiler supplies for one of `std::http::serve`'s `@Builtin` declarations.
+pub(super) enum HttpBuiltin {
+    /// `Reqs`, the type of a request's key: the route source's key type.
+    Keys,
+    /// `_requests`, the requests the route admits.
+    Requests,
+    /// `_responses`, the Feed the route's responses go to.
+    Responses,
 }
 
-/// The declaration, when `value` is a call to `http_serve` with exactly 3 arguments.
-pub(super) fn http_serve_decl(value: &Spanned<ChlExpr>) -> Option<HttpServeDecl> {
-    let ChlExpr::Call { func, args } = &value.node else {
-        return None;
-    };
-    if !matches!(&func.node, ChlExpr::Name(id)
-        if SurfaceBuiltin::from_name(id) == Some(SurfaceBuiltin::HttpServe))
-    {
-        return None;
+impl HttpBuiltin {
+    /// The declaration `module` declares as `name`, if the compiler supplies one.
+    pub(super) fn supplied_by(module: &str, name: &str) -> Option<Self> {
+        match (module, name) {
+            (HTTP_SERVE_MODULE, "Reqs") => Some(Self::Keys),
+            (HTTP_SERVE_MODULE, "_requests") => Some(Self::Requests),
+            (HTTP_SERVE_MODULE, "_responses") => Some(Self::Responses),
+            _ => None,
+        }
     }
-    // The slice pattern below states http_serve's arity.
-    const _: () = assert!(matches!(
-        SurfaceBuiltin::HttpServe.arity(),
-        chl_parser::Arity::Exact(3)
-    ));
-    let [port, method, path] = args.as_slice() else {
-        return None;
-    };
-    Some(HttpServeDecl {
-        port: port.clone(),
-        method: method.clone(),
-        path: path.clone(),
-    })
 }
 
-/// Bind the embedded module's `requests` source and `responses` Feed before `body`.
-/// The response declaration is also the sink's compiler reference. No product
-/// transports a writable reference. Only the embedded `std::http` module calls this.
-pub(super) fn lower_http_serve(
-    decl: HttpServeDecl,
-    target: &Spanned<AssignTarget>,
+/// The route the module being lowered serves, with the address its `const` parameters `port`,
+/// `method` and `path` give it, or `None` where one has no value to read here: its own
+/// diagnostic reports it. `at` is the `@Builtin` declaration that reads the address.
+fn module_route(at: Span, ctx: &mut LoweringContext) -> Result<Option<HttpRoute>, LoweringError> {
+    let mut terms = Vec::new();
+    for param in ["port", "method", "path"] {
+        let name = Spanned::new(at, ChlExpr::Name(param.into()));
+        match ctx.const_term(&name, at.start) {
+            Ok(term) => terms.push(term),
+            Err(Refused(Some(error))) => return Err(error),
+            Err(Refused(None)) => return Ok(None),
+        }
+    }
+    let [port, method, path]: [ConstTerm; 3] = terms.try_into().expect("three route parameters");
+    let route = match (&port, &method, &path) {
+        (
+            ConstTerm::Lit(Lit::String(p)),
+            ConstTerm::Lit(Lit::String(m)),
+            ConstTerm::Lit(Lit::String(t)),
+        ) => HttpRoute::fixed(p, m, t).map_err(|e| LoweringError::unsupported(at, e))?,
+        // One name per module: every declaration of the module reads the same route.
+        _ => HttpRoute {
+            source_name: format!("__http_route_{}", at.file.index()),
+            address: RouteAddress::Constant { port, method, path },
+        },
+    };
+    Ok(Some(route))
+}
+
+/// Declare the key type `name`, the `@Builtin type` at `span`, as the module's route source's
+/// key type, spelled `name`.
+pub(super) fn declare_http_keys(
+    name: &Spanned<SmolStr>,
     span: Span,
-    args_span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    if let Some(route) = module_route(span, ctx)? {
+        ctx.declare_type_alias(
+            name.node.as_str(),
+            span,
+            Some(name.span),
+            AliasType::Type(Type::DataSource(SourceName::spelled(
+                route.source_name,
+                name.node.clone(),
+            ))),
+        );
+    }
+    Ok(())
+}
+
+/// Bind the `@Builtin` value `builtin`, declared `name: annotation` at `span`, before `body`.
+/// The request source is the route's source. The response Feed is a declared Feed, and it is
+/// also the route's sink: the sink record reads it by name, so no product transports a
+/// writable reference.
+pub(super) fn lower_http_builtin(
+    builtin: HttpBuiltin,
+    target: &Spanned<AssignTarget>,
+    annotation: &TypeAnnotation,
+    span: Span,
     body: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if ctx
-        .module
-        .labels
-        .as_ref()
-        .is_none_or(|module| module.to_string() != "std::http")
-    {
-        return Err(LoweringError::unsupported(
-            span,
-            "HTTP routes are declared by running `std::http(port=…, method=…, path=…) as server`; read `server::requests` and call `server::respond(values)`",
-        ));
-    }
-    let AssignTarget::Tuple(names) = &target.node else {
-        unreachable!("the embedded HTTP module declares requests and responses together");
+    let Some(route) = module_route(span, ctx)? else {
+        return Ok(body);
     };
-    let [requests, responses_target] = names.as_slice() else {
-        unreachable!("the embedded HTTP module declares two names");
-    };
-    let AssignTarget::Name(requests_name) = &requests.node else {
-        unreachable!("the embedded HTTP module names its request source")
-    };
-    let AssignTarget::Name(responses_name) = &responses_target.node else {
-        unreachable!("the embedded HTTP module names its response Feed")
-    };
-
-    let HttpServeDecl { port, method, path } = decl;
-    let mut terms = Vec::new();
-    for arg in [&port, &method, &path] {
-        match ctx.const_term(arg, span.start) {
-            Ok(term) => terms.push(term),
-            Err(Refused(Some(error))) => return Err(error),
-            // A member of a module with errors of its own: the route has no address, so the
-            // target binds a value that reports nothing more.
-            Err(Refused(None)) => {
-                let value = ctx.tag_machinery(Expr::error(), span, "lower.http_serve");
-                let occurrence = ctx.occurrence_at(requests.span);
-                return Ok(ctx.tag_image(
-                    Expr::let_bind(requests_name.as_str(), occurrence, value, body),
-                    span,
-                ));
-            }
-        }
-    }
-    let terms: [ConstTerm; 3] = terms.try_into().expect("three arguments");
-
-    let (route, responses) = match &terms {
-        [
-            ConstTerm::Lit(Lit::String(port)),
-            ConstTerm::Lit(Lit::String(method)),
-            ConstTerm::Lit(Lit::String(path)),
-        ] => {
-            let route = HttpRoute::fixed(port, method, path)
-                .map_err(|e| LoweringError::unsupported(args_span, e))?;
-            // A module checked alone reads its requests' type off the source by this name, which
-            // a run of it then opens; a module only imported is never run.
+    match builtin {
+        HttpBuiltin::Keys => unreachable!("`Reqs` is a type, declared before the module's values"),
+        HttpBuiltin::Requests => {
+            let name = extract_name_target(target, "`@Builtin` declaration")?;
             if !ctx.sources.contains_key(&route.source_name) {
                 ctx.declare_unopened_route(&route.source_name);
+            }
+            if matches!(route.address, RouteAddress::Constant { .. }) {
+                ctx.module_route_sources.insert(route.source_name.clone());
+            } else {
                 ctx.checked_routes.insert(route.source_name.clone());
             }
-            (route, responses_name.to_string())
-        }
-        // An argument that reads no parameter is the same in every run, so one that is no
-        // string is refused here, once, rather than at each run.
-        _ if let Some(other) = terms
-            .iter()
-            .find(|t| t.params().is_empty() && !matches!(t, ConstTerm::Lit(Lit::String(_)))) =>
-        {
-            return Err(LoweringError::unsupported(
-                args_span,
-                format!("http_serve's arguments are strings, and one is `{other}`"),
-            ));
-        }
-        _ => {
-            let [port, method, path] = terms;
-            let route = HttpRoute {
-                source_name: format!("__http_route_{}_{}", span.file.index(), span.start),
-                address: RouteAddress::Constant { port, method, path },
-            };
-            let responses = responses_name.to_string();
-            // A module checked alone reads its requests' type off the source by this name.
-            ctx.module_route_sources.insert(route.source_name.clone());
-            ctx.declare_unopened_routes(&[DeclaredSink::Http {
-                route: Box::new(route.clone()),
-                responses: responses.clone(),
+            let source = ctx.tag_image(
+                Expr::new(TypedExprNode::Source(route.source_name, Vec::new())),
                 span,
-                args_span,
-            }]);
-            (route, responses)
+            );
+            let annotation = Annotation::new(
+                lower_type_annotation(annotation, ctx)?,
+                ctx.occurrence_at(annotation.ty.span),
+            );
+            let occurrence = ctx.occurrence_at(target.span);
+            Ok(ctx.tag_image(
+                Expr::let_bind_annotated(name, occurrence, source, body, annotation),
+                span,
+            ))
         }
-    };
-    let source_name = route.source_name.clone();
-    ctx.declared_sinks.push(DeclaredSink::Http {
-        route: Box::new(route),
-        responses: responses.clone(),
-        span,
-        args_span,
-    });
-    let requests_expr = ctx.tag_machinery(
-        Expr::new(TypedExprNode::Source(source_name, Vec::new())),
-        span,
-        "lower.http_serve",
-    );
-    let requests_occurrence = ctx.occurrence_at(requests.span);
-    let requests_binding = ctx.tag_image(
-        Expr::let_bind(
-            requests_name.as_str(),
-            requests_occurrence,
-            requests_expr,
-            body,
-        ),
-        span,
-    );
-    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
-    let responses_occurrence = ctx.occurrence_at(responses_target.span);
-    let annotation_occurrence = ctx.occurrence_at(responses_target.span);
-    Ok(ctx.tag_image(
-        Expr::let_bind_annotated(
-            responses_name.as_str(),
-            responses_occurrence,
-            channel,
-            requests_binding,
-            crate::ccl::Annotation::new(
-                Type::feed(Type::Hole, Type::Base(crate::ccl::BaseType::String)),
-                annotation_occurrence,
-            ),
-        ),
-        span,
-    ))
+        HttpBuiltin::Responses => {
+            let (name, occurrence, channel, annotation) =
+                feed_declaration(target, annotation, span, ctx)?;
+            ctx.declared_sinks.push(DeclaredSink::Http {
+                route: Box::new(route),
+                responses: name.clone(),
+                span,
+            });
+            Ok(ctx.tag_image(
+                Expr::let_bind_annotated(name, occurrence, channel, body, annotation),
+                span,
+            ))
+        }
+    }
 }
 
-/// The address an `http_serve` declaration serves, and the name of the source its requests
+/// The address a run of `std::http::serve` serves, and the name of the source its requests
 /// arrive on.
 #[derive(Debug, Clone)]
 pub(super) struct HttpRoute {
@@ -206,6 +167,7 @@ pub(super) enum RouteAddress {
 }
 
 impl HttpRoute {
+    /// The route as a diagnostic names it: `` `POST /echo` on port 8080 ``.
     pub(super) fn describe(&self) -> String {
         match &self.address {
             RouteAddress::Fixed { port, method, path } => {
@@ -218,17 +180,21 @@ impl HttpRoute {
     }
 
     /// The route at the address `port`, `method` and `path`, or why it has none: a port is a
-    /// number below 65536.
+    /// number below 65536, a method an HTTP token, and a path an absolute URI path, which the
+    /// route holds in normal form.
     fn fixed(port: &str, method: &str, path: &str) -> Result<HttpRoute, String> {
         let port_u16: u16 = port
             .parse()
-            .map_err(|_| format!("http_serve port must be a u16, got {port:?}"))?;
+            .map_err(|_| format!("an HTTP port is a number below 65536, got {port:?}"))?;
+        crate::interpreter::http_server::check_method(method)?;
+        // Equivalent spellings of a path are one route, so the route is keyed by the normal form.
+        let path = crate::interpreter::http_server::route_path(path)?;
         Ok(HttpRoute {
-            source_name: http_requests_source_name(port_u16, method, path),
+            source_name: http_requests_source_name(port_u16, method, &path),
             address: RouteAddress::Fixed {
                 port: port_u16,
                 method: method.to_string(),
-                path: path.to_string(),
+                path,
             },
         })
     }
@@ -252,9 +218,9 @@ impl HttpRoute {
     }
 
     /// The route a run whose `const` parameters take `consts` serves, with the name its
-    /// requests' source has in the module's chain, which the run's copy is renamed from;
-    /// `None` for a route whose address is fixed. An address that is no string here is
-    /// the error.
+    /// requests' source has in the module's chain, which the run's copy is renamed from.
+    /// Nested runs retain symbolic addresses over their enclosing constant parameters.
+    /// A settled non-String address is an error; a fixed route returns `None`.
     pub(super) fn at(
         &self,
         consts: &HashMap<crate::ccl::TypeParamId, ConstTerm>,
@@ -262,18 +228,88 @@ impl HttpRoute {
         let RouteAddress::Constant { port, method, path } = &self.address else {
             return None;
         };
-        let string = |term: &ConstTerm| match term.substituted(consts) {
-            Ok(ConstTerm::Lit(Lit::String(s))) => Ok(s.to_string()),
-            Ok(other) => Err(format!(
-                "a route's address is a string, and this run gives `{other}`"
-            )),
-            Err(no_value) => Err(no_value.0),
-        };
+        if self.missing_arguments(consts) {
+            return Some(Err("a route is missing an address argument".into()));
+        }
         Some((|| {
-            let route = HttpRoute::fixed(&string(port)?, &string(method)?, &string(path)?)?;
+            let port = port.substituted(consts).map_err(|e| e.0)?;
+            let method = method.substituted(consts).map_err(|e| e.0)?;
+            let path = path.substituted(consts).map_err(|e| e.0)?;
+            let route = match (&port, &method, &path) {
+                (
+                    ConstTerm::Lit(Lit::String(p)),
+                    ConstTerm::Lit(Lit::String(m)),
+                    ConstTerm::Lit(Lit::String(t)),
+                ) => HttpRoute::fixed(p, m, t)?,
+                _ => {
+                    if let Some(other) = [&port, &method, &path].into_iter().find(|t| {
+                        t.params().is_empty() && !matches!(t, ConstTerm::Lit(Lit::String(_)))
+                    }) {
+                        return Err(format!(
+                            "a route's address is a string, and this run gives `{other}`"
+                        ));
+                    }
+                    let identity =
+                        http_route_id(&route_key(&port), &route_key(&method), &route_key(&path));
+                    HttpRoute {
+                        source_name: format!("__http_route_{identity}"),
+                        address: RouteAddress::Constant { port, method, path },
+                    }
+                }
+            };
             Ok((route, self.source_name.clone()))
         })())
     }
+}
+
+/// The names a run gives its module's route sources, and the run's name, which qualifies a
+/// renamed key type's spelling. The root's defaults rename with no run.
+pub(in crate::ccl::lower) struct SourceRenames<'a> {
+    pub(in crate::ccl::lower) names: HashMap<String, String>,
+    pub(in crate::ccl::lower) run: Option<&'a str>,
+}
+
+pub(super) fn rename_source_type(ty: &mut Type, renames: &SourceRenames) -> bool {
+    fn atoms(ty: &mut Type, renames: &SourceRenames) -> bool {
+        if let Type::DataSource(name) = ty
+            && let Some(to) = renames.names.get(name.as_str())
+            && name.as_str() != to
+        {
+            name.renamed(to, renames.run);
+            return true;
+        }
+        let mut changed = false;
+        ty.walk_children_mut(|t| changed |= atoms(t, renames));
+        changed
+    }
+    if renames.names.is_empty() {
+        return false;
+    }
+    let mut changed = atoms(ty, renames);
+    changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
+        ty,
+        &crate::ccl::ccl_utils::PredMemo::new(),
+        &(),
+        &mut |expr, _| rename_source_expr(expr, renames),
+    );
+    changed
+}
+
+pub(super) fn rename_source_expr(expr: &mut Expr, renames: &SourceRenames) -> bool {
+    if renames.names.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    if let TypedExprNode::Source(name, _) = &mut expr.node
+        && let Some(to) = renames.names.get(name)
+        && name != to
+    {
+        *name = to.clone();
+        changed = true;
+    }
+    expr.walk_type_slots_mut(|ty| changed |= rename_source_type(ty, renames));
+    expr.walk_children_mut(|e| changed |= rename_source_expr(e, renames));
+    changed
 }
 
 impl LoweringContext {
@@ -286,6 +322,14 @@ impl LoweringContext {
                 DeclaredSink::Http { route, .. } => {
                     if !self.sources.contains_key(&route.source_name) {
                         self.declare_unopened_route(&route.source_name);
+                        match &route.address {
+                            RouteAddress::Constant { .. } => {
+                                self.module_route_sources.insert(route.source_name.clone());
+                            }
+                            RouteAddress::Fixed { .. } => {
+                                self.checked_routes.insert(route.source_name.clone());
+                            }
+                        }
                     }
                 }
                 #[cfg(test)]
@@ -294,14 +338,14 @@ impl LoweringContext {
         }
     }
 
-    /// Register the route `route`, declared with its arguments at `args_span`, for the run at
-    /// `run`, or for the root when `run` is `None`: open it, or bind the open one this context
-    /// inherited, and return the sink its responses go to. A route is unique across all runs,
+    /// Register the route `route`, declared at `span`, for the run at `run`, or for the root when
+    /// `run` is `None`: open it, or bind the open one this context inherited, and return the sink
+    /// its responses go to. A route is unique across all runs,
     /// so a second registration of one is an error.
     pub(super) fn register_route(
         &mut self,
         route: &HttpRoute,
-        args_span: Span,
+        span: Span,
         run: Option<&(RunPath, Span)>,
     ) -> Result<Arc<dyn DataSink>, LoweringError> {
         let HttpRoute {
@@ -334,22 +378,21 @@ impl LoweringContext {
                 )
                 .with_related(earlier_span, "served here first"),
                 (None, Some((earlier_path, earlier_statement))) => LoweringError::unsupported(
-                    args_span,
+                    span,
                     format!(
                         "this program serves {route}, which the run `{earlier_path}` already \
                          serves: a route is unique across all runs"
                     ),
                 )
                 .with_related(earlier_statement, "the run that serves it"),
-                (None, None) => LoweringError::unsupported(
-                    args_span,
-                    format!("duplicate http_serve registration: {route}"),
-                )
-                .with_related(earlier_span, "served here first"),
+                (None, None) => {
+                    LoweringError::unsupported(span, format!("duplicate HTTP route: {route}"))
+                        .with_related(earlier_span, "served here first")
+                }
             });
         }
         self.http_route_sites
-            .insert(source_name.clone(), (args_span, run.cloned()));
+            .insert(source_name.clone(), (span, run.cloned()));
         // A name a source already answers to and no route holds would be
         // overwritten by the insert below. `http_requests_source_name`
         // mints from the address, and no other source is named that way, so
@@ -358,7 +401,7 @@ impl LoweringContext {
             self.http_routes.contains_key(source_name)
                 || self.checked_routes.contains(source_name)
                 || !self.sources.contains_key(source_name),
-            "http_serve source name {source_name} is already a source that is not a route",
+            "HTTP route source name {source_name} is already a source that is not a route",
         );
         // A route the source/sink registry already holds is inherited: reusing its
         // `HttpServerDataSource` keeps the listener, the routing-table entry and the requests
@@ -372,12 +415,12 @@ impl LoweringContext {
                 Arc::new(UnopenedRouteSink)
             }
             Endpoints::BindPort => {
-                self.bind_port(*port, args_span)?;
+                self.bind_port(*port, span)?;
                 self.declare_unopened_route(source_name);
                 Arc::new(UnopenedRouteSink)
             }
             Endpoints::Open => {
-                let server = self.bind_port(*port, args_span)?;
+                let server = self.bind_port(*port, span)?;
                 let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
                     &server,
                     method.clone(),
@@ -402,17 +445,10 @@ impl LoweringContext {
 
     /// The listener on `port`, bound if this context holds none. One [`SharedHttpServer`] serves
     /// every route on a port.
-    fn bind_port(
-        &mut self,
-        port: u16,
-        args_span: Span,
-    ) -> Result<Arc<SharedHttpServer>, LoweringError> {
+    fn bind_port(&mut self, port: u16, span: Span) -> Result<Arc<SharedHttpServer>, LoweringError> {
         if let std::collections::hash_map::Entry::Vacant(e) = self.shared_servers.entry(port) {
             let server = SharedHttpServer::new(port).map_err(|e| {
-                LoweringError::unsupported(
-                    args_span,
-                    format!("http_serve: failed to bind port {port}: {e}"),
-                )
+                LoweringError::unsupported(span, format!("failed to bind HTTP port {port}: {e}"))
             })?;
             e.insert(Arc::new(server));
         }
@@ -425,4 +461,14 @@ impl LoweringContext {
         let source = Rc::new(RefCell::new(UnopenedRoute::new(source_name.to_string())));
         self.sources.insert(source_name.to_string(), source);
     }
+}
+
+/// An address term spelled with each parameter's id, so that two modules' parameters spelled
+/// alike give two routes.
+fn route_key(term: &ConstTerm) -> String {
+    let mut key = term.to_string();
+    for param in term.params() {
+        key.push_str(&format!("@{}", param.id.0));
+    }
+    key
 }

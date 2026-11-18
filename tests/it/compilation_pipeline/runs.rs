@@ -369,22 +369,24 @@ fn importing_a_module_that_runs_another_is_refused() {
 fn the_root_serving_a_runs_route_is_refused() {
     let errors = compile_errors(&program(
         indoc! {r#"
+            import std::http as http_api
             run service as eu
-            run std::http(port="0", method="GET", path="/ping") as http_resps
-            http_resps_replies: Feed(String)
-            reqs = http_resps::requests
+            run std::http::serve(port="0", method="GET", path="/ping") as http_resps
+            http_resps_replies: Feed(http_api::Response)
+            reqs = [request.body() for request in http_resps::requests]
             for r in reqs:
-                http_resps_replies << "pong"
+                http_resps_replies << http_api::ok_text("pong")
             http_resps::respond(http_resps_replies)
         "#},
         &[(
             "service",
             indoc! {r#"
-                run std::http(port="0", method="GET", path="/ping") as http_resps
-                http_resps_replies: Feed(String)
-                reqs = http_resps::requests
+                import std::http as http_api
+                run std::http::serve(port="0", method="GET", path="/ping") as http_resps
+                http_resps_replies: Feed(http_api::Response)
+                reqs = [request.body() for request in http_resps::requests]
                 for r in reqs:
-                    http_resps_replies << "pong"
+                    http_resps_replies << http_api::ok_text("pong")
                 http_resps::respond(http_resps_replies)
             "#},
         )],
@@ -433,11 +435,12 @@ fn a_run_rebinding_a_sink_is_refused() {
 #[timeout(Duration::from_secs(10))]
 fn two_runs_serving_one_route_are_refused() {
     let service = indoc! {r#"
-        run std::http(port="0", method="GET", path="/ping") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="0", method="GET", path="/ping") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
-            http_resps_replies << "pong"
+            http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#};
     let errors = compile_errors(&program(
@@ -469,31 +472,56 @@ fn two_runs_serving_one_route_are_refused() {
 )]
 #[case::the_roots(
     indoc! {r#"
+        import std::http as http_api
         const param path: String = "/ping"
         run service(path="/ping") as eu
-        run std::http(port="0", method="GET", path=path) as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="0", method="GET", path=path) as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
-            http_resps_replies << "pong"
+            http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#},
     "the run `http_resps` serves port=0, method=GET, path=/ping, which the run `eu::http_resps` already serves"
 )]
 #[case::not_a_port(
     "run service(path=\"/ping\", port=\"http\") as eu\n",
-    "the route declared here has no address in this run: http_serve port must be a u16, got \"http\""
+    "the route declared here has no address in this run: an HTTP port is a number below 65536, got \"http\""
+)]
+#[case::two_spellings_of_one_path(
+    indoc! {r#"
+        run service(path="/a%62/./c") as eu
+        run service(path="/ab/c") as us
+    "#},
+    "the run `us::http_resps` serves port=0, method=GET, path=/ab/c, which the run `eu::http_resps` already serves"
+)]
+#[case::not_a_path(
+    "run service(path=\"ping\") as eu\n",
+    "the route declared here has no address in this run: an HTTP path begins with `/`, got \"ping\""
+)]
+#[case::not_a_uri_path(
+    "run service(path=\"/caf\u{e9}\") as eu\n",
+    "and \"/caf\u{e9}\" holds '\u{e9}'"
+)]
+#[case::not_a_method(
+    indoc! {r#"
+        import std::http as http_api
+        run std::http::serve(port="0", method="G ET", path="/x") as http_resps
+        http_resps::respond([http_api::ok_text("x") for r in http_resps::requests])
+    "#},
+    "an HTTP method is a non-empty token"
 )]
 #[timeout(Duration::from_secs(10))]
 fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &str) {
     let service = indoc! {r#"
+        import std::http as http_api
         const param path: String
         const param port: String = "0"
-        run std::http(port=port, method="GET", path=path) as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port=port, method="GET", path=path) as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
-            http_resps_replies << "pong"
+            http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#};
     let errors = compile_errors(&program(root, &[("service", service)]));
@@ -505,24 +533,26 @@ fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &s
 #[rstest]
 #[case::not_a_constant(
     indoc! {r#"
+        import std::http as http_api
         param path: String
-        run std::http(port="0", method="GET", path=path) as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="0", method="GET", path=path) as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
-            http_resps_replies << "pong"
+            http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#},
     "`path` is a parameter without `const`"
 )]
 #[case::not_a_string(
     indoc! {r#"
+        import std::http as http_api
         const param path: String
-        run std::http(port=8080, method="GET", path=path) as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port=8080, method="GET", path=path) as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
-            http_resps_replies << "pong"
+            http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#},
     "a route's address is a string, and this run gives `8080`"
@@ -1021,4 +1051,46 @@ fn a_module_borrows_transactional_state_for_its_run() {
         ),
         Value::Int(6),
     );
+}
+
+#[test]
+fn an_http_run_exports_its_source_domain_through_a_forwarding_module() {
+    let loaded = program(
+        indoc! {r#"
+            import std::http
+            run endpoint(port="8080") as route
+            responses: route::Reqs |=> http::Response = [http::ok_text(r.body()) for r in route::requests]
+            route::respond(responses)
+        "#},
+        &[(
+            "endpoint",
+            indoc! {r#"
+            import std::http
+            const param port: String
+            run std::http::serve(port=port, method="POST", path="/forwarded") as server
+            pub Reqs = server::Reqs
+            pub requests = server::requests
+            pub def respond(values: Reqs |=> http::Response):
+                server::respond(values)
+        "#},
+        )],
+    );
+    let result = cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded);
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[test]
+fn a_module_check_reaches_the_imports_of_its_nested_runs() {
+    let loaded = program(
+        "run endpoint; 0",
+        &[(
+            "endpoint",
+            indoc! {r#"
+            run std::http::serve(port="8080", method="POST", path="/nested") as server
+            pub requests = server::requests
+        "#},
+        )],
+    );
+    let result = cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded);
+    assert!(result.is_ok(), "{result:?}");
 }

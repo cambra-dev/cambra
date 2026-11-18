@@ -286,13 +286,14 @@ pub(crate) mod fixtures {
     use indoc::indoc;
 
     pub const BUMP_OVER_SOURCE: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
             n := n + "a"
-            http_resps_replies << n + "\n"
+            http_resps_replies << http_api::ok_text(n + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
@@ -300,13 +301,14 @@ pub(crate) mod fixtures {
     /// changed — for the rule that a carried value wins over the init, which is
     /// only ever read on a fresh start.
     pub const BUMP_OVER_SOURCE_RESEEDED: &str = indoc! {r#"
+        import std::http as http_api
         n := "seed"
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
             n := n + "a"
-            http_resps_replies << n + "\n"
+            http_resps_replies << http_api::ok_text(n + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
@@ -315,205 +317,217 @@ pub(crate) mod fixtures {
     /// Neither program can be written with the field at two types, so the change
     /// only exists between versions.
     pub const RECORD_ACCUMULATOR: &str = indoc! {r#"
+        import std::http as http_api
         n := (a=0, b=1)
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
             n := (a=n.a + 1, b=n.b)
-            http_resps_replies << "ok\n"
+            http_resps_replies << http_api::ok_text("ok\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const RECORD_ACCUMULATOR_RETYPED_FIELD: &str = indoc! {r#"
+        import std::http as http_api
         n := (a=0, b="x")
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for r in reqs:
             n := (a=n.a + 1, b=n.b)
-            http_resps_replies << "ok\n"
+            http_resps_replies << http_api::ok_text("ok\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const BUMP_OVER_A_FIXED_LIST: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for x in ["y", "z"]:
             n := n + x
         for r in reqs:
-            http_resps_replies << n + "\n"
+            http_resps_replies << http_api::ok_text(n + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const BUMP_OVER_A_MARKED_LIST: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for x in ["y", "z"]:
             n := n + x + "!"
         for r in reqs:
-            http_resps_replies << n + "\n"
+            http_resps_replies << http_api::ok_text(n + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const BUMP_OVER_ANOTHER_FIXED_LIST: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         for x in ["p", "q"]:
             n := n + x
         for r in reqs:
-            http_resps_replies << n + "\n"
+            http_resps_replies << http_api::ok_text(n + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const GUESTBOOK_ADDS_ROUTE: &str = indoc! {r#"
+        import std::http as http_api
         entries := ""
 
-        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-        http_sign_resps_replies: Feed(String)
-        sign_reqs = http_sign_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
-        http_peek_resps_replies: Feed(String)
-        peek_reqs = http_peek_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/added") as http_added_resps
-        http_added_resps_replies: Feed(String)
-        added_reqs = http_added_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(http_api::Response)
+        sign_reqs = [request.body() for request in http_sign_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(http_api::Response)
+        peek_reqs = [request.body() for request in http_peek_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/added") as http_added_resps
+        http_added_resps_replies: Feed(http_api::Response)
+        added_reqs = [request.body() for request in http_added_resps::requests]
 
         for entry in sign_reqs:
             entries := entries + entry + "\n"
-            http_sign_resps_replies << entries
+            http_sign_resps_replies << http_api::ok_text(entries)
 
         for req in peek_reqs:
-            http_peek_resps_replies << "peek\n"
+            http_peek_resps_replies << http_api::ok_text("peek\n")
 
         for req in added_reqs:
-            http_added_resps_replies << "added\n"
+            http_added_resps_replies << http_api::ok_text("added\n")
         http_sign_resps::respond(http_sign_resps_replies)
         http_peek_resps::respond(http_peek_resps_replies)
         http_added_resps::respond(http_added_resps_replies)
     "#};
 
     pub const GUESTBOOK_DROPS_ROUTE: &str = indoc! {r#"
+        import std::http as http_api
         entries := ""
 
-        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-        http_sign_resps_replies: Feed(String)
-        sign_reqs = http_sign_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(http_api::Response)
+        sign_reqs = [request.body() for request in http_sign_resps::requests]
 
         for entry in sign_reqs:
             entries := entries + entry + "\n"
-            http_sign_resps_replies << entries
+            http_sign_resps_replies << http_api::ok_text(entries)
         http_sign_resps::respond(http_sign_resps_replies)
     "#};
 
     pub const GUESTBOOK_DROPS_STATE: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-        http_sign_resps_replies: Feed(String)
-        sign_reqs = http_sign_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
-        http_peek_resps_replies: Feed(String)
-        peek_reqs = http_peek_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(http_api::Response)
+        sign_reqs = [request.body() for request in http_sign_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(http_api::Response)
+        peek_reqs = [request.body() for request in http_peek_resps::requests]
 
         for entry in sign_reqs:
-            http_sign_resps_replies << entry + "\n"
+            http_sign_resps_replies << http_api::ok_text(entry + "\n")
 
         for req in peek_reqs:
-            http_peek_resps_replies << "peek\n"
+            http_peek_resps_replies << http_api::ok_text("peek\n")
         http_sign_resps::respond(http_sign_resps_replies)
         http_peek_resps::respond(http_peek_resps_replies)
     "#};
 
     pub const GUESTBOOK_RETYPES_STATE: &str = indoc! {r#"
+        import std::http as http_api
         entries := 0
 
-        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-        http_sign_resps_replies: Feed(String)
-        sign_reqs = http_sign_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
-        http_peek_resps_replies: Feed(String)
-        peek_reqs = http_peek_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(http_api::Response)
+        sign_reqs = [request.body() for request in http_sign_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(http_api::Response)
+        peek_reqs = [request.body() for request in http_peek_resps::requests]
 
         for entry in sign_reqs:
             entries := entries + 1
-            http_sign_resps_replies << "signed\n"
+            http_sign_resps_replies << http_api::ok_text("signed\n")
 
         for req in peek_reqs:
-            http_peek_resps_replies << "peek\n"
+            http_peek_resps_replies << http_api::ok_text("peek\n")
         http_sign_resps::respond(http_sign_resps_replies)
         http_peek_resps::respond(http_peek_resps_replies)
     "#};
 
     pub const GUESTBOOK_RETYPES_STATE_ADDS_ROUTE: &str = indoc! {r#"
+        import std::http as http_api
         entries := 0
 
-        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-        http_sign_resps_replies: Feed(String)
-        sign_reqs = http_sign_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
-        http_peek_resps_replies: Feed(String)
-        peek_reqs = http_peek_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/added") as http_added_resps
-        http_added_resps_replies: Feed(String)
-        added_reqs = http_added_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(http_api::Response)
+        sign_reqs = [request.body() for request in http_sign_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(http_api::Response)
+        peek_reqs = [request.body() for request in http_peek_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/added") as http_added_resps
+        http_added_resps_replies: Feed(http_api::Response)
+        added_reqs = [request.body() for request in http_added_resps::requests]
 
         for entry in sign_reqs:
             entries := entries + 1
-            http_sign_resps_replies << "signed\n"
+            http_sign_resps_replies << http_api::ok_text("signed\n")
 
         for req in peek_reqs:
-            http_peek_resps_replies << "peek\n"
+            http_peek_resps_replies << http_api::ok_text("peek\n")
 
         for req in added_reqs:
-            http_added_resps_replies << "added\n"
+            http_added_resps_replies << http_api::ok_text("added\n")
         http_sign_resps::respond(http_sign_resps_replies)
         http_peek_resps::respond(http_peek_resps_replies)
         http_added_resps::respond(http_added_resps_replies)
     "#};
 
     pub const GUESTBOOK_STATELESS_EDIT: &str = indoc! {r#"
+        import std::http as http_api
         entries := ""
 
-        run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-        http_sign_resps_replies: Feed(String)
-        sign_reqs = http_sign_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
-        http_peek_resps_replies: Feed(String)
-        peek_reqs = http_peek_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+        http_sign_resps_replies: Feed(http_api::Response)
+        sign_reqs = [request.body() for request in http_sign_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+        http_peek_resps_replies: Feed(http_api::Response)
+        peek_reqs = [request.body() for request in http_peek_resps::requests]
 
         for entry in sign_reqs:
             entries := entries + entry + "\n"
-            http_sign_resps_replies << entries
+            http_sign_resps_replies << http_api::ok_text(entries)
 
         for req in peek_reqs:
-            http_peek_resps_replies << "peek edited\n"
+            http_peek_resps_replies << http_api::ok_text("peek edited\n")
         http_sign_resps::respond(http_sign_resps_replies)
         http_peek_resps::respond(http_peek_resps_replies)
     "#};
 
     pub const LATEST_WRITE: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         latest: Mut(String, Txn) := "(none)"
 
         for msg in set_reqs:
             with begin():
                 latest := msg
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << latest
+                http_get_resps_replies << http_api::ok_text(latest)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
@@ -521,12 +535,13 @@ pub(crate) mod fixtures {
     /// [`LATEST_WRITE`] with `latest` retired and a new variable seeded from the
     /// value it held. The one program shape the `@LoadFrom` cases vary.
     pub const LATEST_WRITE_MIGRATED: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         @LoadFrom(latest)
         held: String
@@ -536,11 +551,11 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 marked := msg + "!"
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << marked
+                http_get_resps_replies << http_api::ok_text(marked)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
@@ -548,12 +563,13 @@ pub(crate) mod fixtures {
     /// [`LATEST_WRITE_MIGRATED`] keeping `latest` as well — the declared-and-loaded
     /// case, where a version seeds a new variable from one it goes on holding.
     pub const LATEST_WRITE_MIGRATED_BESIDE: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         latest: Mut(String, Txn) := "(none)"
         @LoadFrom(latest)
@@ -564,23 +580,24 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 latest := msg
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << latest + "/" + marked
+                http_get_resps_replies << http_api::ok_text(latest + "/" + marked)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
 
     /// [`LATEST_WRITE_MIGRATED`] loading a name no version ever declared.
     pub const LATEST_WRITE_LOADS_A_STRANGER: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         @LoadFrom(nonesuch)
         held: String
@@ -590,11 +607,11 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 marked := msg + "!"
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << marked
+                http_get_resps_replies << http_api::ok_text(marked)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
@@ -602,12 +619,13 @@ pub(crate) mod fixtures {
     /// [`LATEST_WRITE_MIGRATED`] reading the loaded value as an `Int`, which is
     /// not what `latest` holds.
     pub const LATEST_WRITE_MIGRATED_RETYPED: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         @LoadFrom(latest)
         held: Int
@@ -617,221 +635,232 @@ pub(crate) mod fixtures {
         for msg in set_reqs:
             with begin():
                 marked := marked + 1
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << "ok\n"
+                http_get_resps_replies << http_api::ok_text("ok\n")
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const LATEST_WRITE_WRITER_EDIT: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         latest: Mut(String, Txn) := "(none)"
 
         for msg in set_reqs:
             with begin():
                 latest := msg + "!"
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << latest
+                http_get_resps_replies << http_api::ok_text(latest)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const ONE_STATEFUL_LOOP: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
-        run std::http(port="{PORT}", method="POST", path="/p") as http_pr
-        http_pr_replies: Feed(String)
-        p = http_pr::requests
-        run std::http(port="{PORT}", method="POST", path="/q") as http_qr
-        http_qr_replies: Feed(String)
-        q = http_qr::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/p") as http_pr
+        http_pr_replies: Feed(http_api::Response)
+        p = [request.body() for request in http_pr::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/q") as http_qr
+        http_qr_replies: Feed(http_api::Response)
+        q = [request.body() for request in http_qr::requests]
         for x in p:
             n := n + "a"
-            http_pr_replies << n + "\n"
+            http_pr_replies << http_api::ok_text(n + "\n")
         for y in q:
-            http_qr_replies << "q\n"
+            http_qr_replies << http_api::ok_text("q\n")
         http_pr::respond(http_pr_replies)
         http_qr::respond(http_qr_replies)
     "#};
 
     pub const ONE_STATEFUL_LOOP_BOTH: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
         m := ""
-        run std::http(port="{PORT}", method="POST", path="/p") as http_pr
-        http_pr_replies: Feed(String)
-        p = http_pr::requests
-        run std::http(port="{PORT}", method="POST", path="/q") as http_qr
-        http_qr_replies: Feed(String)
-        q = http_qr::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/p") as http_pr
+        http_pr_replies: Feed(http_api::Response)
+        p = [request.body() for request in http_pr::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/q") as http_qr
+        http_qr_replies: Feed(http_api::Response)
+        q = [request.body() for request in http_qr::requests]
         for x in p:
             n := n + "a"
-            http_pr_replies << n + "\n"
+            http_pr_replies << http_api::ok_text(n + "\n")
         for y in q:
             m := m + "b"
-            http_qr_replies << m + "\n"
+            http_qr_replies << http_api::ok_text(m + "\n")
         http_pr::respond(http_pr_replies)
         http_qr::respond(http_qr_replies)
     "#};
 
     pub const ONE_STATEFUL_LOOP_MOVED: &str = indoc! {r#"
+        import std::http as http_api
         n := ""
-        run std::http(port="{PORT}", method="POST", path="/p") as http_pr
-        http_pr_replies: Feed(String)
-        p = http_pr::requests
-        run std::http(port="{PORT}", method="POST", path="/q") as http_qr
-        http_qr_replies: Feed(String)
-        q = http_qr::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/p") as http_pr
+        http_pr_replies: Feed(http_api::Response)
+        p = [request.body() for request in http_pr::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/q") as http_qr
+        http_qr_replies: Feed(http_api::Response)
+        q = [request.body() for request in http_qr::requests]
         for x in p:
-            http_pr_replies << "p\n"
+            http_pr_replies << http_api::ok_text("p\n")
         for y in q:
             n := n + "a"
-            http_qr_replies << n + "\n"
+            http_qr_replies << http_api::ok_text(n + "\n")
         http_pr::respond(http_pr_replies)
         http_qr::respond(http_qr_replies)
     "#};
 
     pub const RUNNING_LOG: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         log: Mut(String, Txn) := ""
 
         for msg in set_reqs:
             with begin():
                 log := log + msg
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << log
+                http_get_resps_replies << http_api::ok_text(log)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const RUNNING_LOG_WRITER_EDIT: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
 
         log: Mut(String, Txn) := ""
 
         for msg in set_reqs:
             with begin():
                 log := log + "-" + msg
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
 
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << log
+                http_get_resps_replies << http_api::ok_text(log)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
     "#};
 
     pub const TWO_ACCUMULATORS: &str = indoc! {r#"
+        import std::http as http_api
         left := ""
         right := ""
 
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
 
         for x in reqs:
             left := left + "a"
             right := right + "B"
-            http_resps_replies << left + "|" + right + "\n"
+            http_resps_replies << http_api::ok_text(left + "|" + right + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const TWO_ACCUMULATORS_ADDED: &str = indoc! {r#"
+        import std::http as http_api
         left := ""
         right := ""
         extra := ""
 
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
 
         for x in reqs:
             left := left + "a"
             right := right + "B"
             extra := extra + "c"
-            http_resps_replies << left + "|" + right + "|" + extra + "\n"
+            http_resps_replies << http_api::ok_text(left + "|" + right + "|" + extra + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const TWO_ACCUMULATORS_REORDERED: &str = indoc! {r#"
+        import std::http as http_api
         right := ""
         left := ""
 
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
 
         for x in reqs:
             right := right + "B"
             left := left + "a"
-            http_resps_replies << left + "|" + right + "\n"
+            http_resps_replies << http_api::ok_text(left + "|" + right + "\n")
         http_resps::respond(http_resps_replies)
     "#};
 
     pub const TWO_LOOPS: &str = indoc! {r#"
+        import std::http as http_api
         a := ""
         b := ""
 
-        run std::http(port="{PORT}", method="POST", path="/a") as http_a_resps
-        http_a_resps_replies: Feed(String)
-        a_reqs = http_a_resps::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_b_resps
-        http_b_resps_replies: Feed(String)
-        b_reqs = http_b_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(http_api::Response)
+        a_reqs = [request.body() for request in http_a_resps::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(http_api::Response)
+        b_reqs = [request.body() for request in http_b_resps::requests]
 
         for x in a_reqs:
             a := a + x + "\n"
-            http_a_resps_replies << a
+            http_a_resps_replies << http_api::ok_text(a)
 
         for y in b_reqs:
             b := b + y + "\n"
-            http_b_resps_replies << b
+            http_b_resps_replies << http_api::ok_text(b)
         http_a_resps::respond(http_a_resps_replies)
         http_b_resps::respond(http_b_resps_replies)
     "#};
 
     pub const TWO_LOOPS_ONE_EDITED: &str = indoc! {r#"
+        import std::http as http_api
         a := ""
         b := ""
 
-        run std::http(port="{PORT}", method="POST", path="/a") as http_a_resps
-        http_a_resps_replies: Feed(String)
-        a_reqs = http_a_resps::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_b_resps
-        http_b_resps_replies: Feed(String)
-        b_reqs = http_b_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(http_api::Response)
+        a_reqs = [request.body() for request in http_a_resps::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(http_api::Response)
+        b_reqs = [request.body() for request in http_b_resps::requests]
 
         for x in a_reqs:
             a := a + x + "\n"
-            http_a_resps_replies << a
+            http_a_resps_replies << http_api::ok_text(a)
 
         for y in b_reqs:
             b := b + "* " + y + "\n"
-            http_b_resps_replies << b
+            http_b_resps_replies << http_api::ok_text(b)
         http_a_resps::respond(http_a_resps_replies)
         http_b_resps::respond(http_b_resps_replies)
     "#};
@@ -839,69 +868,72 @@ pub(crate) mod fixtures {
     /// `TWO_LOOPS` with each loop reading the other's route, so both
     /// variables keep their values and continue on the source they moved to.
     pub const TWO_LOOPS_SWAPPED: &str = indoc! {r#"
+        import std::http as http_api
         a := ""
         b := ""
 
-        run std::http(port="{PORT}", method="POST", path="/a") as http_a_resps
-        http_a_resps_replies: Feed(String)
-        a_reqs = http_a_resps::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_b_resps
-        http_b_resps_replies: Feed(String)
-        b_reqs = http_b_resps::requests
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(http_api::Response)
+        a_reqs = [request.body() for request in http_a_resps::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(http_api::Response)
+        b_reqs = [request.body() for request in http_b_resps::requests]
 
         for y in b_reqs:
             a := a + y + "\n"
-            http_b_resps_replies << a
+            http_b_resps_replies << http_api::ok_text(a)
 
         for x in a_reqs:
             b := b + x + "\n"
-            http_a_resps_replies << b
+            http_a_resps_replies << http_api::ok_text(b)
         http_a_resps::respond(http_a_resps_replies)
         http_b_resps::respond(http_b_resps_replies)
     "#};
 
     pub const ONE_TRANSACTIONAL_LOOP: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
-        http_ok_a_replies: Feed(String)
-        set_a = http_ok_a::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
-        http_ok_b_replies: Feed(String)
-        set_b = http_ok_b::requests
-        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
-        http_out_a_replies: Feed(String)
-        get_a = http_out_a::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(http_api::Response)
+        set_a = [request.body() for request in http_ok_a::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(http_api::Response)
+        set_b = [request.body() for request in http_ok_b::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(http_api::Response)
+        get_a = [request.body() for request in http_out_a::requests]
 
         x: Mut(String, Txn) := ""
 
         for m in set_a:
             with begin():
                 x := x + m
-            http_ok_a_replies << "ok\n"
+            http_ok_a_replies << http_api::ok_text("ok\n")
 
         for r in get_a:
             with begin():
-                http_out_a_replies << x
+                http_out_a_replies << http_api::ok_text(x)
 
         for m in set_b:
-            http_ok_b_replies << "b\n"
+            http_ok_b_replies << http_api::ok_text("b\n")
         http_ok_a::respond(http_ok_a_replies)
         http_ok_b::respond(http_ok_b_replies)
         http_out_a::respond(http_out_a_replies)
     "#};
 
     pub const ONE_TRANSACTIONAL_LOOP_BOTH: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
-        http_ok_a_replies: Feed(String)
-        set_a = http_ok_a::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
-        http_ok_b_replies: Feed(String)
-        set_b = http_ok_b::requests
-        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
-        http_out_a_replies: Feed(String)
-        get_a = http_out_a::requests
-        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
-        http_out_b_replies: Feed(String)
-        get_b = http_out_b::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(http_api::Response)
+        set_a = [request.body() for request in http_ok_a::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(http_api::Response)
+        set_b = [request.body() for request in http_ok_b::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(http_api::Response)
+        get_a = [request.body() for request in http_out_a::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(http_api::Response)
+        get_b = [request.body() for request in http_out_b::requests]
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -909,20 +941,20 @@ pub(crate) mod fixtures {
         for m in set_a:
             with begin():
                 x := x + m
-            http_ok_a_replies << "ok\n"
+            http_ok_a_replies << http_api::ok_text("ok\n")
 
         for r in get_a:
             with begin():
-                http_out_a_replies << x
+                http_out_a_replies << http_api::ok_text(x)
 
         for m in set_b:
             with begin():
                 y := y + m
-            http_ok_b_replies << "ok\n"
+            http_ok_b_replies << http_api::ok_text("ok\n")
 
         for r in get_b:
             with begin():
-                http_out_b_replies << y
+                http_out_b_replies << http_api::ok_text(y)
         http_ok_a::respond(http_ok_a_replies)
         http_ok_b::respond(http_ok_b_replies)
         http_out_a::respond(http_out_a_replies)
@@ -930,18 +962,19 @@ pub(crate) mod fixtures {
     "#};
 
     pub const TWO_TRANSACTIONS: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
-        http_ok_a_replies: Feed(String)
-        set_a = http_ok_a::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
-        http_ok_b_replies: Feed(String)
-        set_b = http_ok_b::requests
-        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
-        http_out_a_replies: Feed(String)
-        get_a = http_out_a::requests
-        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
-        http_out_b_replies: Feed(String)
-        get_b = http_out_b::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(http_api::Response)
+        set_a = [request.body() for request in http_ok_a::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(http_api::Response)
+        set_b = [request.body() for request in http_ok_b::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(http_api::Response)
+        get_a = [request.body() for request in http_out_a::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(http_api::Response)
+        get_b = [request.body() for request in http_out_b::requests]
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -949,20 +982,20 @@ pub(crate) mod fixtures {
         for m in set_a:
             with begin():
                 x := x + m
-            http_ok_a_replies << "ok\n"
+            http_ok_a_replies << http_api::ok_text("ok\n")
 
         for r in get_a:
             with begin():
-                http_out_a_replies << x
+                http_out_a_replies << http_api::ok_text(x)
 
         for m in set_b:
             with begin():
                 y := y + m
-            http_ok_b_replies << "ok\n"
+            http_ok_b_replies << http_api::ok_text("ok\n")
 
         for r in get_b:
             with begin():
-                http_out_b_replies << y
+                http_out_b_replies << http_api::ok_text(y)
         http_ok_a::respond(http_ok_a_replies)
         http_ok_b::respond(http_ok_b_replies)
         http_out_a::respond(http_out_a_replies)
@@ -970,18 +1003,19 @@ pub(crate) mod fixtures {
     "#};
 
     pub const TWO_TRANSACTIONS_SWAPPED: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
-        http_ok_a_replies: Feed(String)
-        set_a = http_ok_a::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
-        http_ok_b_replies: Feed(String)
-        set_b = http_ok_b::requests
-        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
-        http_out_a_replies: Feed(String)
-        get_a = http_out_a::requests
-        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
-        http_out_b_replies: Feed(String)
-        get_b = http_out_b::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(http_api::Response)
+        set_a = [request.body() for request in http_ok_a::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(http_api::Response)
+        set_b = [request.body() for request in http_ok_b::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(http_api::Response)
+        get_a = [request.body() for request in http_out_a::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(http_api::Response)
+        get_b = [request.body() for request in http_out_b::requests]
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -989,20 +1023,20 @@ pub(crate) mod fixtures {
         for m in set_b:
             with begin():
                 x := x + m
-            http_ok_b_replies << "ok\n"
+            http_ok_b_replies << http_api::ok_text("ok\n")
 
         for r in get_a:
             with begin():
-                http_out_a_replies << x
+                http_out_a_replies << http_api::ok_text(x)
 
         for m in set_a:
             with begin():
                 y := y + m
-            http_ok_a_replies << "ok\n"
+            http_ok_a_replies << http_api::ok_text("ok\n")
 
         for r in get_b:
             with begin():
-                http_out_b_replies << y
+                http_out_b_replies << http_api::ok_text(y)
         http_ok_a::respond(http_ok_a_replies)
         http_ok_b::respond(http_ok_b_replies)
         http_out_a::respond(http_out_a_replies)
@@ -1010,18 +1044,19 @@ pub(crate) mod fixtures {
     "#};
 
     pub const TWO_TRANSACTIONS_ONE_WRITER_EDITED: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/a") as http_ok_a
-        http_ok_a_replies: Feed(String)
-        set_a = http_ok_a::requests
-        run std::http(port="{PORT}", method="POST", path="/b") as http_ok_b
-        http_ok_b_replies: Feed(String)
-        set_b = http_ok_b::requests
-        run std::http(port="{PORT}", method="GET", path="/ga") as http_out_a
-        http_out_a_replies: Feed(String)
-        get_a = http_out_a::requests
-        run std::http(port="{PORT}", method="GET", path="/gb") as http_out_b
-        http_out_b_replies: Feed(String)
-        get_b = http_out_b::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/a") as http_ok_a
+        http_ok_a_replies: Feed(http_api::Response)
+        set_a = [request.body() for request in http_ok_a::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/b") as http_ok_b
+        http_ok_b_replies: Feed(http_api::Response)
+        set_b = [request.body() for request in http_ok_b::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/ga") as http_out_a
+        http_out_a_replies: Feed(http_api::Response)
+        get_a = [request.body() for request in http_out_a::requests]
+        run std::http::serve(port="{PORT}", method="GET", path="/gb") as http_out_b
+        http_out_b_replies: Feed(http_api::Response)
+        get_b = [request.body() for request in http_out_b::requests]
 
         x: Mut(String, Txn) := ""
         y: Mut(String, Txn) := ""
@@ -1029,20 +1064,20 @@ pub(crate) mod fixtures {
         for m in set_a:
             with begin():
                 x := x + "-" + m
-            http_ok_a_replies << "ok\n"
+            http_ok_a_replies << http_api::ok_text("ok\n")
 
         for r in get_a:
             with begin():
-                http_out_a_replies << x
+                http_out_a_replies << http_api::ok_text(x)
 
         for m in set_b:
             with begin():
                 y := y + m
-            http_ok_b_replies << "ok\n"
+            http_ok_b_replies << http_api::ok_text("ok\n")
 
         for r in get_b:
             with begin():
-                http_out_b_replies << y
+                http_out_b_replies << http_api::ok_text(y)
         http_ok_a::respond(http_ok_a_replies)
         http_ok_b::respond(http_ok_b_replies)
         http_out_a::respond(http_out_a_replies)
@@ -1054,14 +1089,15 @@ pub(crate) mod fixtures {
     /// The base for the two cases about a loop that cannot read its collection
     /// from the start.
     pub(crate) const VIEW_FOLD: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_bump_resps
-        http_bump_resps_replies: Feed(String)
-        bump_reqs = http_bump_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_bump_resps
+        http_bump_resps_replies: Feed(http_api::Response)
+        bump_reqs = [request.body() for request in http_bump_resps::requests]
         seen = [r + "!" for r in bump_reqs]
         n := ""
         for x in seen:
             n := n + x
-            http_bump_resps_replies << n
+            http_bump_resps_replies << http_api::ok_text(n)
         http_bump_resps::respond(http_bump_resps_replies)
     "#};
 
@@ -1069,21 +1105,22 @@ pub(crate) mod fixtures {
     /// carrying a new variable instead. The `seen` loop then carries nothing, so
     /// it would read `seen` from the beginning — which is the refusal.
     pub(crate) const VIEW_FOLD_REVARIABLED: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_bump_resps
-        http_bump_resps_replies: Feed(String)
-        bump_reqs = http_bump_resps::requests
-        run std::http(port="{PORT}", method="POST", path="/tick") as http_tick_resps
-        http_tick_resps_replies: Feed(String)
-        tick_reqs = http_tick_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_bump_resps
+        http_bump_resps_replies: Feed(http_api::Response)
+        bump_reqs = [request.body() for request in http_bump_resps::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/tick") as http_tick_resps
+        http_tick_resps_replies: Feed(http_api::Response)
+        tick_reqs = [request.body() for request in http_tick_resps::requests]
         seen = [r + "!" for r in bump_reqs]
         m := ""
         for x in seen:
             m := m + x
-            http_bump_resps_replies << m
+            http_bump_resps_replies << http_api::ok_text(m)
         n := ""
         for z in tick_reqs:
             n := n + z
-            http_tick_resps_replies << n
+            http_tick_resps_replies << http_api::ok_text(n)
         http_bump_resps::respond(http_bump_resps_replies)
         http_tick_resps::respond(http_tick_resps_replies)
     "#};
@@ -1091,21 +1128,22 @@ pub(crate) mod fixtures {
     /// [`VIEW_FOLD`] plus a loop over a second route. The added loop reads a
     /// source rather than a collection, so it starts where that source is.
     pub(crate) const VIEW_FOLD_SECOND_ROUTE: &str = indoc! {r#"
-        run std::http(port="{PORT}", method="POST", path="/bump") as http_bump_resps
-        http_bump_resps_replies: Feed(String)
-        bump_reqs = http_bump_resps::requests
-        run std::http(port="{PORT}", method="POST", path="/tick") as http_tick_resps
-        http_tick_resps_replies: Feed(String)
-        tick_reqs = http_tick_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{PORT}", method="POST", path="/bump") as http_bump_resps
+        http_bump_resps_replies: Feed(http_api::Response)
+        bump_reqs = [request.body() for request in http_bump_resps::requests]
+        run std::http::serve(port="{PORT}", method="POST", path="/tick") as http_tick_resps
+        http_tick_resps_replies: Feed(http_api::Response)
+        tick_reqs = [request.body() for request in http_tick_resps::requests]
         seen = [r + "!" for r in bump_reqs]
         n := ""
         for x in seen:
             n := n + x
-            http_bump_resps_replies << n
+            http_bump_resps_replies << http_api::ok_text(n)
         t := ""
         for z in tick_reqs:
             t := t + z
-            http_tick_resps_replies << t
+            http_tick_resps_replies << http_api::ok_text(t)
         http_bump_resps::respond(http_bump_resps_replies)
         http_tick_resps::respond(http_tick_resps_replies)
     "#};
