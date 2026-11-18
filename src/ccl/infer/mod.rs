@@ -830,7 +830,7 @@ fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr, ct
     for failure in crate::ccl::capabilities::exceeded_uppers(&mut ctx.solver) {
         let item = match failure.blame {
             Blame::Clause(at) => ctx.item_beyond_clause(&failure.capability.item, at),
-            _ => failure.capability.item.to_string(),
+            _ => failure.capability.item.rendered(&mut ctx.solver),
         };
         if !reported.insert((failure.capability.at, item.clone(), failure.blame)) {
             continue;
@@ -851,7 +851,7 @@ fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr, ct
                 let committed = failure.capability.at;
                 let top = match &failure.capability.item {
                     crate::ccl::capabilities::Capability::Every(_) => {
-                        Some(failure.capability.item.to_string())
+                        Some(failure.capability.item.rendered(&mut ctx.solver))
                     }
                     _ => None,
                 };
@@ -1768,7 +1768,7 @@ fn attempt_run(
         .escaping
         .into_iter()
         .map(|(node, name, capability)| {
-            let item = capability.item.to_string();
+            let item = capability.item.rendered(&mut sub_ctx.solver);
             LocatedInferError::new(
                 InferError::VariablePastItsScope {
                     member: name.base().to_string(),
@@ -1835,7 +1835,7 @@ fn attempt_run(
             {
                 Some(LocatedInferError::new(
                     InferError::ExceptionEscapes {
-                        ty: l.item.to_string(),
+                        ty: l.item.rendered(&mut sub_ctx.solver),
                     },
                     l.at.unwrap_or(expr.node_id()),
                 ))
@@ -1859,7 +1859,10 @@ fn attempt_run(
         );
         eprintln!(
             "=== typed tree ===\n{}",
-            crate::ccl::symbolic::symbolic_typed(expr)
+            crate::ccl::symbolic::symbolic_typed_in(
+                &crate::ccl::ty::RenderCtx::new(&mut sub_ctx.solver),
+                expr
+            )
         );
     }
     Ok(Inferred {
