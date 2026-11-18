@@ -544,6 +544,67 @@ fn with_domain(arm: &TileGuard, pred: Predicate) -> TileGuard {
     }
 }
 
+/// `arm`, a chain of codomain steps ending in a record or a keyless leaf, `depth` steps in so far,
+/// without the paths the domain arms `above` name whole. `above[d]` is the domain arm at depth `d`.
+fn without_covered_beneath(arm: &TileGuard, above: &[Predicate], depth: usize) -> TileGuard {
+    match arm {
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+            FunctionGuard::Codomain(Box::new(without_covered_beneath(inner, above, depth + 1))),
+        ),
+        leaf if depth == 0 => leaf.clone(),
+        leaf => {
+            let mut levels: Vec<Predicate> = above.iter().take(depth).cloned().collect();
+            levels.resize(depth, Predicate::False);
+            without_paths(leaf, &levels)
+        }
+    }
+}
+
+/// `guard`, standing `above.len()` levels in, without the paths `above` names whole.
+fn without_paths(guard: &TileGuard, above: &[Predicate]) -> TileGuard {
+    if Predicate::covered_from(above).is_false() {
+        return guard.clone();
+    }
+    match guard {
+        TileGuard::Function(FunctionGuard::Domain(keys)) => {
+            TileGuard::Function(FunctionGuard::Domain(beyond(keys, above)))
+        }
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+            let mut deeper = above.to_vec();
+            deeper.push(Predicate::False);
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(without_paths(
+                inner, &deeper,
+            ))))
+        }
+        TileGuard::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), without_paths(field, above)))
+                .collect(),
+        ),
+        TileGuard::Scalar(cells) => TileGuard::Scalar(Predicate::qualified(
+            leaf_rows_beyond(cells, above),
+            Predicate::True,
+        )),
+        TileGuard::Aggregation(cells) => TileGuard::Aggregation(Predicate::qualified(
+            leaf_rows_beyond(cells, above),
+            Predicate::True,
+        )),
+        TileGuard::Or(arms) => {
+            let kept: Vec<TileGuard> = arms
+                .iter()
+                .map(|arm| without_paths(arm, above))
+                .filter(|arm| !arm.is_empty())
+                .collect();
+            match kept.len() {
+                0 => without_paths(&arms[0], above),
+                1 => kept.into_iter().next().unwrap(),
+                _ => TileGuard::Or(kept),
+            }
+        }
+    }
+}
+
 /// `arms`, each at most one per place, without what a shallower domain arm names whole
 /// ([`Predicate::without_covered`]). An arm left naming nothing is dropped, unless every
 /// arm is.
@@ -566,7 +627,8 @@ fn without_covered_arms(arms: Vec<TileGuard>) -> Vec<TileGuard> {
                 Some(kept) => with_domain(&arm, kept),
                 None => arm,
             },
-            _ => arm,
+            Some(_) => arm,
+            None => without_covered_beneath(&arm, &above, 0),
         })
         .collect();
     match pruned.iter().any(|arm| !arm.is_empty()) {
@@ -985,11 +1047,298 @@ impl FunctionGuard {
     }
 }
 
+impl TileGuard {
+    /// Whether this guard names every region `other` names, exactly. Both are guards of one
+    /// tiling.
+    ///
+    /// Leaves compare as their predicates do ([`Predicate::subsumes`]), a record field by field,
+    /// and a codomain guard one level in. A domain guard names its keys whole, so it also covers
+    /// every path beneath them: those paths are taken out of what `other` names deeper before the
+    /// arms at that depth are compared. A codomain guard naming everything beneath a key names the
+    /// key ([`whole_rows`]). An `Or` on either side is read as the union of its arms.
+    pub(crate) fn subsumes(&self, other: &TileGuard) -> bool {
+        subsumes_at(Some(self), other, &[])
+    }
+}
+
+/// [`TileGuard::subsumes`] at the position `above.len()` levels in, where `above[d]` is the
+/// region of paths the domain arms of `guard` name whole at level `d`, outermost first. `None`
+/// names nothing at this position.
+fn subsumes_at(guard: Option<&TileGuard>, other: &TileGuard, above: &[Predicate]) -> bool {
+    if other.is_empty() {
+        return true;
+    }
+    if let TileGuard::Or(arms) = other {
+        return arms.iter().all(|arm| subsumes_at(guard, arm, above));
+    }
+    let parts = Parts::of(guard);
+    // A codomain arm naming everything beneath some keys names those keys ([`whole_rows`]).
+    let whole = match &parts.codomain {
+        Some(inner) => parts.domain.union(&whole_rows(inner)),
+        None => parts.domain.clone(),
+    };
+    match other {
+        TileGuard::Function(FunctionGuard::Domain(keys)) => whole.subsumes(&beyond(keys, above)),
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+            let mut deeper = above.to_vec();
+            deeper.push(whole);
+            subsumes_at(parts.codomain.as_ref(), inner, &deeper)
+        }
+        TileGuard::Record(fields) => fields.iter().all(|(name, field)| {
+            let own = parts.record.as_ref().map(|record| {
+                record.get(name).unwrap_or_else(|| {
+                    panic!("guards of one record name the same fields: {record:?} and {fields:?}")
+                })
+            });
+            subsumes_at(own, field, above)
+        }),
+        TileGuard::Scalar(cells) => {
+            TileGuard::leaf_rows(&parts.scalar).subsumes(&leaf_rows_beyond(cells, above))
+        }
+        TileGuard::Aggregation(cells) => {
+            TileGuard::leaf_rows(&parts.aggregation).subsumes(&leaf_rows_beyond(cells, above))
+        }
+        TileGuard::Or(_) => unreachable!("an `Or` is read arm by arm above"),
+    }
+}
+
+/// The arms of a guard at one position, by what they name: keys, what lies one level in, a
+/// record's fields, or a keyless leaf. A guard of one tiling names only kinds its shape has.
+struct Parts {
+    domain: Predicate,
+    codomain: Option<TileGuard>,
+    record: Option<HashMap<SmolStr, TileGuard>>,
+    scalar: Predicate,
+    aggregation: Predicate,
+}
+
+impl Parts {
+    fn of(guard: Option<&TileGuard>) -> Parts {
+        let mut parts = Parts {
+            domain: Predicate::False,
+            codomain: None,
+            record: None,
+            scalar: Predicate::False,
+            aggregation: Predicate::False,
+        };
+        let arms: &[TileGuard] = match guard {
+            None => &[],
+            Some(TileGuard::Or(arms)) => arms,
+            Some(one) => std::slice::from_ref(one),
+        };
+        for arm in arms {
+            match arm {
+                TileGuard::Function(FunctionGuard::Domain(keys)) => {
+                    parts.domain = parts.domain.union(keys);
+                }
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                    parts.codomain = Some(match parts.codomain.take() {
+                        Some(held) => held.union(inner),
+                        None => (**inner).clone(),
+                    });
+                }
+                TileGuard::Record(fields) => {
+                    parts.record = Some(match parts.record.take() {
+                        Some(held) => zip_fields(&held, fields, TileGuard::union),
+                        None => fields.clone(),
+                    });
+                }
+                TileGuard::Scalar(cells) => parts.scalar = parts.scalar.union(cells),
+                TileGuard::Aggregation(cells) => {
+                    parts.aggregation = parts.aggregation.union(cells);
+                }
+                TileGuard::Or(_) => unreachable!("`flatten_or` leaves no `Or` inside an `Or`"),
+            }
+        }
+        parts
+    }
+}
+
+/// `keys`, over the keys of level `above.len()`, without the paths `above` names whole: each
+/// arm loses them from the enclosing paths it is qualified by, and an unqualified arm, standing
+/// under every enclosing path, is qualified by the paths left.
+fn beyond(keys: &Predicate, above: &[Predicate]) -> Predicate {
+    let covered = Predicate::covered_from(above);
+    if covered.is_false() {
+        return keys.clone();
+    }
+    let arms: &[Predicate] = match keys {
+        Predicate::Or(arms) => arms,
+        one => std::slice::from_ref(one),
+    };
+    Predicate::union_all(
+        arms.iter()
+            .map(|arm| {
+                let (enclosing, here) = arm.split_qualification();
+                Predicate::qualified(enclosing.minus(&covered), here.clone())
+            })
+            .collect(),
+    )
+}
+
+/// The enclosing paths a keyless leaf's `cells` name it under ([`TileGuard::leaf_rows`]), at
+/// level `above.len()`, without those `above` names whole.
+fn leaf_rows_beyond(cells: &Predicate, above: &[Predicate]) -> Predicate {
+    TileGuard::leaf_rows(cells).minus(&Predicate::covered_from(above))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ccl::AggregateKind;
     use crate::interpreter::tiling::tests::*;
+
+    /// A record arm one level in, naming a field's key only beneath a key a domain arm names whole,
+    /// is dropped by normalization; beneath another key it stays.
+    #[test]
+    fn flatten_or_drops_a_record_arm_beneath_a_key_named_whole() {
+        let field_under = |row: u64| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+                HashMap::from([(
+                    "xs".into(),
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
+                        Predicate::point(Value::UInt(row)),
+                        Predicate::point(Value::UInt(5)),
+                    ))),
+                )]),
+            ))))
+        };
+        let key_0 = TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(0))));
+        assert_eq!(
+            TileGuard::flatten_or(vec![key_0.clone(), field_under(0)]),
+            key_0
+        );
+        assert!(matches!(
+            TileGuard::flatten_or(vec![key_0, field_under(1)]),
+            TileGuard::Or(_)
+        ));
+    }
+
+    mod subsumes {
+        use super::*;
+
+        fn keys(values: &[u64]) -> Predicate {
+            values.iter().fold(Predicate::False, |all, &v| {
+                all.union(&Predicate::point(Value::UInt(v)))
+            })
+        }
+
+        /// `here` under the one enclosing path `path`.
+        fn under(path: &[u64], here: Predicate) -> Predicate {
+            let path: Vec<Value> = path.iter().map(|&k| Value::UInt(k)).collect();
+            Predicate::qualified(Predicate::exactly(&path), here)
+        }
+
+        /// Two domain guards compare as their predicates.
+        #[test]
+        fn a_domain_guard_subsumes_the_keys_its_predicate_does() {
+            assert!(domain(keys(&[1, 2])).subsumes(&domain(keys(&[1]))));
+            assert!(!domain(keys(&[1])).subsumes(&domain(keys(&[1, 2]))));
+        }
+
+        /// A key named whole covers every path beneath it, and no other.
+        #[test]
+        fn a_domain_guard_subsumes_what_lies_beneath_its_keys() {
+            let beneath_1 = codomain(domain(under(&[1], keys(&[5]))));
+            assert!(domain(keys(&[1])).subsumes(&beneath_1));
+            assert!(!domain(keys(&[2])).subsumes(&beneath_1));
+            // Keys under every row are covered only where every row is named whole.
+            let under_every_row = codomain(domain(keys(&[5])));
+            assert!(!domain(keys(&[1])).subsumes(&under_every_row));
+            assert!(domain(Predicate::True).subsumes(&under_every_row));
+        }
+
+        /// A region no single arm covers is covered by a whole key and an arm one level in
+        /// together.
+        #[test]
+        fn arms_at_two_depths_subsume_a_region_together() {
+            let both_rows = codomain(domain(
+                under(&[1], keys(&[5])).union(&under(&[2], keys(&[5]))),
+            ));
+            let together = TileGuard::flatten_or(vec![
+                domain(keys(&[1])),
+                codomain(domain(under(&[2], keys(&[5])))),
+            ]);
+            assert!(together.subsumes(&both_rows));
+            assert!(!domain(keys(&[1])).subsumes(&both_rows));
+            assert!(!codomain(domain(under(&[2], keys(&[5])))).subsumes(&both_rows));
+        }
+
+        /// A record compares field by field, and a whole key above it covers its fields.
+        #[test]
+        fn a_record_guard_subsumes_field_by_field() {
+            let record = |xs: Predicate| {
+                codomain(TileGuard::Record(HashMap::from([(
+                    "xs".into(),
+                    domain(xs),
+                )])))
+            };
+            assert!(record(keys(&[5, 6])).subsumes(&record(keys(&[5]))));
+            assert!(!record(keys(&[5])).subsumes(&record(keys(&[5, 6]))));
+            let beneath_1 = record(under(&[1], keys(&[5])));
+            assert!(domain(keys(&[1])).subsumes(&beneath_1));
+            assert!(!domain(keys(&[2])).subsumes(&beneath_1));
+        }
+
+        /// A key named whole covers paths two levels beneath it, and a codomain arm naming keys
+        /// beneath one path covers deeper paths through those keys only.
+        #[test]
+        fn coverage_reaches_two_levels_down() {
+            let two_down =
+                |path: &[u64], here: &[u64]| codomain(codomain(domain(under(path, keys(here)))));
+            assert!(domain(keys(&[1])).subsumes(&two_down(&[1, 7], &[2])));
+            assert!(!domain(keys(&[1])).subsumes(&two_down(&[2, 7], &[2])));
+            let seven_under_1 = codomain(domain(under(&[1], keys(&[7]))));
+            assert!(seven_under_1.subsumes(&two_down(&[1, 7], &[2])));
+            assert!(!seven_under_1.subsumes(&two_down(&[1, 6], &[2])));
+            // Keys two levels in under every path are covered only where every path is.
+            let under_every_path = codomain(codomain(domain(keys(&[2]))));
+            assert!(!domain(keys(&[1])).subsumes(&under_every_path));
+        }
+
+        /// A codomain arm naming everything beneath a key names the key.
+        #[test]
+        fn everything_beneath_a_key_subsumes_the_key() {
+            assert!(codomain(domain(Predicate::True)).subsumes(&domain(keys(&[1]))));
+            let all_under_1 = codomain(domain(under(&[1], Predicate::True)));
+            assert!(all_under_1.subsumes(&domain(keys(&[1]))));
+            assert!(!all_under_1.subsumes(&domain(keys(&[2]))));
+        }
+
+        /// An `Or` on the other side is subsumed when each of its arms is.
+        #[test]
+        fn an_or_is_subsumed_arm_by_arm() {
+            let both = TileGuard::Or(vec![
+                domain(keys(&[1])),
+                codomain(domain(under(&[2], keys(&[5])))),
+            ]);
+            let wide = TileGuard::flatten_or(vec![
+                domain(keys(&[1, 3])),
+                codomain(domain(under(&[2], keys(&[5, 6])))),
+            ]);
+            assert!(wide.subsumes(&both));
+            assert!(!domain(keys(&[1, 3])).subsumes(&both));
+        }
+
+        /// An aggregation's result compares as a scalar leaf does.
+        #[test]
+        fn an_aggregation_compares_by_the_rows_it_is_named_under() {
+            let result_under =
+                |row: u64| codomain(TileGuard::Aggregation(under(&[row], Predicate::True)));
+            assert!(domain(keys(&[1])).subsumes(&result_under(1)));
+            assert!(!domain(keys(&[1])).subsumes(&result_under(2)));
+            assert!(codomain(TileGuard::Aggregation(Predicate::True)).subsumes(&result_under(2)));
+        }
+
+        /// A keyless leaf beneath a key named whole is covered with that key.
+        #[test]
+        fn a_leaf_beneath_a_key_named_whole_is_subsumed() {
+            let cell_under_1 = codomain(TileGuard::Scalar(under(&[1], Predicate::True)));
+            assert!(domain(keys(&[1])).subsumes(&cell_under_1));
+            assert!(!domain(keys(&[2])).subsumes(&cell_under_1));
+            assert!(codomain(TileGuard::Scalar(Predicate::True)).subsumes(&cell_under_1));
+        }
+    }
 
     /// `domain_prefix` names every row before its head whole and the head's row up to its
     /// tail, and a later prefix absorbs the earlier one's arm beneath a row now whole.

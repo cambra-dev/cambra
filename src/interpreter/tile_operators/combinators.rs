@@ -1589,7 +1589,6 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
         Tile::DataFunction {
             domain: inner_rows,
             codomain: groups,
-            domain_predicate: inner_complete,
             ..
         },
     ) = (outer, inner)
@@ -1640,7 +1639,7 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
         domain_predicate, ..
     } = &mut emitted
     {
-        *domain_predicate = domain_predicate.intersect(inner_complete);
+        *domain_predicate = outer.complete_keys().intersect(&inner.complete_keys());
     }
     // A pair is complete where the inner side calls its key complete under the row, by the
     // group's statement or the row's (`Tile::completion_at`), and the outer row's value is whole.
@@ -1650,14 +1649,10 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
     let mut rows = Predicate::from_column_value(
         &outer_keys.select_indices(paired.iter().copied(), paired.len()),
     );
-    if let Tile::DataFunction {
-        codomain,
-        domain_predicate: outer_complete,
-        ..
-    } = outer
+    if let Tile::DataFunction { codomain, .. } = outer
         && codomain.holds_a_level()
     {
-        rows = rows.intersect(outer_complete);
+        rows = rows.intersect(&outer.complete_keys());
     }
     let stated = inner
         .completion_at(CurryLevel::new(1))

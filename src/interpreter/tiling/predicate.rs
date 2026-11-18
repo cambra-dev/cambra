@@ -1055,14 +1055,7 @@ impl Predicate {
     /// so it goes only where every path is covered: removing some would qualify an arm that
     /// said nothing about paths, a longer spelling of the same statement.
     pub(crate) fn without_covered(&self, above: &[Predicate]) -> Option<Predicate> {
-        // The covered paths reaching this level's keys: `above[d]` read `depth - 1 - d`
-        // levels further in, qualified by `True` once per level between.
-        let depth = above.len();
-        let covered = above
-            .iter()
-            .enumerate()
-            .map(|(level, whole)| whole.descend(depth - 1 - level))
-            .fold(Predicate::False, |all, region| all.union(&region));
+        let covered = Predicate::covered_from(above);
         if covered.is_false() {
             return None;
         }
@@ -1086,6 +1079,18 @@ impl Predicate {
             false => Predicate::flatten_or(kept),
         };
         (kept != *self).then_some(kept)
+    }
+
+    /// The paths reaching the keys of level `above.len()` that `above` names whole, where
+    /// `above[d]` is a predicate over the paths reaching level `d`, outermost first: `above[d]`
+    /// read `above.len() - 1 - d` levels further in ([`descend`](Self::descend)).
+    pub(crate) fn covered_from(above: &[Predicate]) -> Predicate {
+        let depth = above.len();
+        above
+            .iter()
+            .enumerate()
+            .map(|(level, whole)| whole.descend(depth - 1 - level))
+            .fold(Predicate::False, |all, region| all.union(&region))
     }
 
     /// The predicate admitting exactly `set`, in canonical form.
