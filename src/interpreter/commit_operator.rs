@@ -1132,14 +1132,14 @@ fn seed_input_tiling() -> Tiling {
 /// input's tiling, and the entry's placement, which a planner sets to the pipeline that reads the
 /// store's seeds. A push of the seed names the input whole ([`seed_input_tiling`]).
 fn subscribe_seed(
-    op: &mut dyn TileOperator,
+    op: &std::sync::Arc<dyn TileOperator>,
     cx: &mut SubscribeContext,
 ) -> (
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
 ) {
     let (entry, placement) = crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling());
-    let seed = op.subscribe(
+    let seed = op.clone().subscribe(
         op.tiling().universal_guard(),
         crate::interpreter::notifications::widening(Box::new(entry)),
         cx,
@@ -1270,15 +1270,15 @@ impl Breaker for CommitProducer {
     /// items.
     fn read_source_again(
         &mut self,
-        source: &std::rc::Rc<
-            std::cell::RefCell<dyn crate::interpreter::DataSourceDomainExtentImpl>,
+        source: &std::sync::Arc<
+            std::sync::RwLock<dyn crate::interpreter::DataSourceDomainExtentImpl>,
         >,
     ) {
         read_again_toward(self, &|producer| {
             producer
                 .data_sources()
                 .iter()
-                .any(|read| std::rc::Rc::ptr_eq(read, source))
+                .any(|read| std::sync::Arc::ptr_eq(read, source))
                 .then_some(true)
         });
     }
@@ -2220,7 +2220,7 @@ pub struct CommitOperator {
     /// has no entry (its log starts empty). This is the op-conversion seeding
     /// path, and it is the same field [`InductionStore`] carries: a seed is
     /// ordinary dataflow either side, read per pull until it settles.
-    seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
+    seed_ops: Vec<(Value, std::sync::Arc<dyn TileOperator>)>,
     base: OperatorBase,
     writer_inputs: Vec<CycleSlot<dyn TileOperator>>,
     /// Per writer, the keys it may write — its **static** footprint, so a
@@ -2262,7 +2262,7 @@ impl CommitOperator {
     /// contributes no entry (its log starts empty). ([`Self::new`] is the
     /// concrete-map constructor used by engine-level tests.)
     pub fn with_seed_ops(
-        seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
+        seed_ops: Vec<(Value, std::sync::Arc<dyn TileOperator>)>,
         values: HashMap<SmolStr, Tiling>,
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
@@ -2280,7 +2280,10 @@ impl CommitOperator {
 
     /// Wire writer `k`'s input. Call after the operator is boxed, so the writer
     /// can be built around a slot of the operator's store output (the cycle).
-    pub fn writer_input_setter(&self, k: usize) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
+    pub fn writer_input_setter(
+        &self,
+        k: usize,
+    ) -> impl FnOnce(std::sync::Arc<dyn TileOperator>) + use<> {
         self.writer_inputs[k].setter()
     }
 }
@@ -2305,7 +2308,7 @@ impl TileOperator for CommitOperator {
     }
 
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -2321,12 +2324,13 @@ impl TileOperator for CommitOperator {
         // subscribed behind an entry a planner places in that input's pipeline, and a push of a
         // seed queues the input whole, since the store reads every seed whole when it opens.
         let mut seed_placements = Vec::new();
-        let seed_producers = std::mem::take(&mut self.seed_ops)
-            .into_iter()
-            .map(|(key, mut op)| {
-                let (seed, placement) = subscribe_seed(&mut *op, cx);
+        let seed_producers = self
+            .seed_ops
+            .iter()
+            .map(|(key, op)| {
+                let (seed, placement) = subscribe_seed(op, cx);
                 seed_placements.push(placement);
-                (key, seed)
+                (key.clone(), seed)
             })
             .collect();
         // A writer is the store's input as a pipeline breaker, so it is subscribed behind an
@@ -2338,20 +2342,19 @@ impl TileOperator for CommitOperator {
             .iter()
             .enumerate()
             .map(|(k, slot)| {
-                let mut input = slot.take().unwrap_or_else(|| {
+                let input = slot.get().unwrap_or_else(|| {
                     panic!(
                         "CommitOperator: writer {k} is unwired at subscribe — either \
-                         `writer_input_setter({k})` was never called, or this operator is \
-                         being subscribed twice (the first subscribe takes the slot)"
+                         `writer_input_setter({k})` was never called"
                     )
                 });
-                let (producer, placement) = subscribe_behind_entry(&mut *input, cx);
+                let (producer, placement) = subscribe_behind_entry(&input, cx);
                 placements.push(placement);
                 producer
             })
             .collect::<Vec<_>>();
         let n = writer_producers.len();
-        let base = ProducerBase::new(CommitProducer::alloc_id(), self.tiling(), &self.base, cx);
+        let base = ProducerBase::new(CommitProducer::alloc_id(), self.tiling(), self.clone(), cx);
         // The store runs as a pipeline breaker of one pipeline per writer, each placed through
         // its writer's entry, beside one for its seeds where it has any; its own placement is
         // its first writer's.
@@ -2531,6 +2534,10 @@ impl CommitProducer {
 }
 
 impl TileProducer for CommitProducer {
+    fn as_transaction_store(&self) -> Option<&CommitProducer> {
+        Some(self)
+    }
+
     fn as_transaction_store_mut(&mut self) -> Option<&mut CommitProducer> {
         Some(self)
     }
@@ -3069,7 +3076,7 @@ pub struct InductionStore {
     /// snapshot the body. The store needs it too, because a fold resolves there: at a row's
     /// position that writes nothing, a store without it would carry the previous row's final
     /// where the driver's snapshot holds this row's seed.
-    seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
+    seed_ops: Vec<(Value, std::sync::Arc<dyn TileOperator>)>,
     base: OperatorBase,
 }
 
@@ -3082,7 +3089,7 @@ impl InductionStore {
     /// followed by tap keys. `resumed_after` is where a predecessor store stopped, which
     /// only an induction store with no rows above it has.
     pub fn new(
-        seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
+        seed_ops: Vec<(Value, std::sync::Arc<dyn TileOperator>)>,
         write_keys: Vec<Value>,
         tap_fields: Vec<SmolStr>,
         output_tiling: Tiling,
@@ -3106,7 +3113,7 @@ impl InductionStore {
     /// Install the decision body, which reads this store back through the cyclic
     /// `FanOut` — the same late wiring [`CommitOperator::writer_input_setter`]
     /// performs, and for the same reason.
-    pub fn body_input_setter(&self) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
+    pub fn body_input_setter(&self) -> impl FnOnce(std::sync::Arc<dyn TileOperator>) + use<> {
         self.body_input.setter()
     }
 }
@@ -3128,7 +3135,7 @@ impl TileOperator for InductionStore {
     }
 
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -3138,7 +3145,7 @@ impl TileOperator for InductionStore {
         // async source's incremental delivery and reads the store again.
         let consumer = shared_consumer(consumer);
 
-        let mut body_op = self.body_input.take().expect(
+        let body_op = self.body_input.get().expect(
             "InductionStore: the decision body is unwired at subscribe — either \
                  `body_input_setter` was never called, or this store is being subscribed \
                  twice (the first subscribe takes the slot)",
@@ -3146,7 +3153,7 @@ impl TileOperator for InductionStore {
         // The body is the store's input as a pipeline breaker: the entry in front of it queues
         // what a pipeline beneath pushes for the store's pipeline once a planner places it, and
         // stops every push before then.
-        let (body_producer, placement) = subscribe_behind_entry(&mut *body_op, cx);
+        let (body_producer, placement) = subscribe_behind_entry(&body_op, cx);
         // A seed stays subscribed rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -3155,12 +3162,13 @@ impl TileOperator for InductionStore {
         // subscribed behind an entry a planner places in the pipeline of the loop's scope, which
         // takes no push of it and records what it has decided.
         let mut seed_placements = Vec::new();
-        let seed_producers = std::mem::take(&mut self.seed_ops)
-            .into_iter()
-            .map(|(key, mut op)| {
-                let (seed, placement) = subscribe_seed(&mut *op, cx);
+        let seed_producers = self
+            .seed_ops
+            .iter()
+            .map(|(key, op)| {
+                let (seed, placement) = subscribe_seed(op, cx);
                 seed_placements.push(placement);
-                (key, seed)
+                (key.clone(), seed)
             })
             .collect();
         Box::new(InductionStoreProducer {
@@ -3168,7 +3176,7 @@ impl TileOperator for InductionStore {
             base: ProducerBase::new(
                 InductionStoreProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(consumer.clone(), placement),
@@ -3728,6 +3736,10 @@ impl TileProducer for InductionStoreProducer {
         Some(self)
     }
 
+    fn as_induction_store(&self) -> Option<&InductionStoreProducer> {
+        Some(self)
+    }
+
     fn as_induction_store_mut(&mut self) -> Option<&mut InductionStoreProducer> {
         Some(self)
     }
@@ -3816,7 +3828,7 @@ impl TileProducer for InductionStoreProducer {
 /// sampling the key once its writers have drained.
 pub struct StoreValueStream {
     base: OperatorBase,
-    store_op: Box<dyn TileOperator>,
+    store_op: std::sync::Arc<dyn TileOperator>,
     key: Value,
     value_extent: Extent,
     /// Whether the key's value persists across commit ticks that don't write it.
@@ -3830,7 +3842,7 @@ pub struct StoreValueStream {
 
 impl StoreValueStream {
     pub fn new(
-        store_op: Box<dyn TileOperator>,
+        store_op: std::sync::Arc<dyn TileOperator>,
         key: Value,
         value_extent: Extent,
         carry_forward: bool,
@@ -3877,7 +3889,7 @@ impl TileOperator for StoreValueStream {
         visit(value("store_op", &*self.store_op));
     }
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -3886,11 +3898,11 @@ impl TileOperator for StoreValueStream {
 
         // The stream is keyed by the store's commit ticks, so a region of ticks the store
         // decided names the stream's keys as it is.
-        let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
+        let store_producer = subscribe_forwarding_keeping_keys(&self.store_op, &consumer, cx);
         let mut base = ProducerBase::new(
             StoreValueStreamProducer::alloc_id(),
             self.tiling(),
-            &self.base,
+            self.clone(),
             cx,
         );
         base.obsolete_guard = inherited_release(&*store_producer, self.tiling());
@@ -4053,7 +4065,7 @@ pub struct StoreFinalRead {
     /// is handed out as a level, the way every other store read hands it out ([`read_tiling`]).
     base: OperatorBase,
     /// The commit store (a [`Tile::Store`] fan slot).
-    store_op: Box<dyn TileOperator>,
+    store_op: std::sync::Arc<dyn TileOperator>,
     /// The key whose settled value this reads.
     key: Value,
     value_extent: Extent,
@@ -4062,13 +4074,17 @@ pub struct StoreFinalRead {
 }
 
 impl StoreFinalRead {
-    pub fn new(store_op: Box<dyn TileOperator>, key: Value, value_extent: Extent) -> Self {
+    pub fn new(
+        store_op: std::sync::Arc<dyn TileOperator>,
+        key: Value,
+        value_extent: Extent,
+    ) -> Self {
         Self::per_row_at(store_op, key, value_extent, 0)
     }
 
     /// One read per row of the `levels_above` levels standing above the store.
     pub fn per_row_at(
-        store_op: Box<dyn TileOperator>,
+        store_op: std::sync::Arc<dyn TileOperator>,
         key: Value,
         value_extent: Extent,
         levels_above: usize,
@@ -4095,7 +4111,7 @@ impl TileOperator for StoreFinalRead {
         visit(value("store_op", &*self.store_op));
     }
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -4113,13 +4129,14 @@ impl TileOperator for StoreFinalRead {
         };
         let store_producer =
             self.store_op
+                .clone()
                 .subscribe(self.store_op.tiling().universal_guard(), forward, cx);
         Box::new(StoreFinalReadProducer {
             read_frontier: Default::default(),
             base: ProducerBase::new(
                 StoreFinalReadProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             ),
             store_producer,
@@ -4308,7 +4325,7 @@ pub struct StoreDenseRead {
     /// Output tiling [`read_tiling`] over `D`.
     base: OperatorBase,
     /// The induction store (a [`Tile::Store`] fan slot).
-    store_op: Box<dyn TileOperator>,
+    store_op: std::sync::Arc<dyn TileOperator>,
     /// The key to project.
     key: Value,
     value_extent: Extent,
@@ -4333,7 +4350,7 @@ pub struct StoreDenseRead {
 
 impl StoreDenseRead {
     pub fn new(
-        store_op: Box<dyn TileOperator>,
+        store_op: std::sync::Arc<dyn TileOperator>,
         key: Value,
         value_extent: Extent,
         carry_forward: bool,
@@ -4386,7 +4403,7 @@ impl TileOperator for StoreDenseRead {
         visit(value("store_op", &*self.store_op));
     }
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -4395,11 +4412,11 @@ impl TileOperator for StoreDenseRead {
         // to emit and the value to emit there, so it is the only news this read has.
         let consumer = shared_consumer(consumer);
 
-        let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
+        let store_producer = subscribe_forwarding_keeping_keys(&self.store_op, &consumer, cx);
         let mut base = ProducerBase::new(
             StoreDenseReadProducer::alloc_id(),
             self.tiling(),
-            &self.base,
+            self.clone(),
             cx,
         );
         base.obsolete_guard = inherited_release(&*store_producer, self.tiling());
@@ -5250,7 +5267,10 @@ struct DriverInputs {
 /// `op` subscribed behind an entry no planner places: an input its producer reads only by pull,
 /// as a store reads its seed at a step, so a push from a pipeline beneath it stops there. Nothing
 /// is notified through it.
-fn subscribe_pulled(op: &mut dyn TileOperator, cx: &mut SubscribeContext) -> Box<dyn TileProducer> {
+fn subscribe_pulled(
+    op: &std::sync::Arc<dyn TileOperator>,
+    cx: &mut SubscribeContext,
+) -> Box<dyn TileProducer> {
     subscribe_behind_entry(op, cx).0
 }
 
@@ -5258,7 +5278,7 @@ fn subscribe_pulled(op: &mut dyn TileOperator, cx: &mut SubscribeContext) -> Box
 /// ([`Entry::unplaced`](crate::interpreter::dispatcher::Entry::unplaced)), and the entry's
 /// placement, which a planner sets to place it in a pipeline.
 fn subscribe_behind_entry(
-    op: &mut dyn TileOperator,
+    op: &std::sync::Arc<dyn TileOperator>,
     cx: &mut SubscribeContext,
 ) -> (
     Box<dyn TileProducer>,
@@ -5271,7 +5291,7 @@ fn subscribe_behind_entry(
 /// [`subscribe_behind_entry`], answering beside the placement the entry's decided target
 /// ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).
 fn subscribe_deciding(
-    op: &mut dyn TileOperator,
+    op: &std::sync::Arc<dyn TileOperator>,
     arrivals: Option<&crate::interpreter::tile_operators::Arrivals>,
     item_level: Option<CurryLevel>,
     cx: &mut SubscribeContext,
@@ -5290,13 +5310,16 @@ fn subscribe_deciding(
         Some(arrivals) => arrivals.consumer(entry),
         None => entry,
     };
-    let producer = op.subscribe(op.tiling().universal_guard(), consumer, cx);
+    let producer = op
+        .clone()
+        .clone()
+        .subscribe(op.tiling().universal_guard(), consumer, cx);
     (producer, placement, decides)
 }
 
 fn subscribe_driver_inputs(
-    store_op: &mut dyn TileOperator,
-    source_op: &mut dyn TileOperator,
+    store_op: &std::sync::Arc<dyn TileOperator>,
+    source_op: &std::sync::Arc<dyn TileOperator>,
     item_level: CurryLevel,
     consumer: Box<dyn Consumer>,
     cx: &mut SubscribeContext,
@@ -5394,12 +5417,12 @@ struct NestedAt {
 pub struct InductionDriver {
     base: OperatorBase,
     /// The store read back through the cyclic `FanOut`.
-    store_op: Box<dyn TileOperator>,
+    store_op: std::sync::Arc<dyn TileOperator>,
     /// The iteration source — the items of each row's extent, curried one level per row
     /// above the positions.
-    source_op: Box<dyn TileOperator>,
+    source_op: std::sync::Arc<dyn TileOperator>,
     /// `None` for a drive whose body takes the position alone.
-    nested: Option<NestedDrive<Box<dyn TileOperator>>>,
+    nested: Option<NestedDrive<std::sync::Arc<dyn TileOperator>>>,
     /// Accumulator keys the body reads, in body-parameter order.
     read_keys: Vec<Value>,
     read_extents: Vec<Extent>,
@@ -5417,9 +5440,9 @@ pub struct InductionDriver {
 impl InductionDriver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store_op: Box<dyn TileOperator>,
-        source_op: Box<dyn TileOperator>,
-        nested: Option<NestedDrive<Box<dyn TileOperator>>>,
+        store_op: std::sync::Arc<dyn TileOperator>,
+        source_op: std::sync::Arc<dyn TileOperator>,
+        nested: Option<NestedDrive<std::sync::Arc<dyn TileOperator>>>,
         read_keys: Vec<Value>,
         read_extents: Vec<Extent>,
         item_extent: Extent,
@@ -5482,12 +5505,12 @@ impl InductionDriver {
     /// is the `(enclosing, inner)` domain the writer sequences its positions in, whose
     /// enclosing component is the level of the induction store's rows.
     pub fn nested_parts(
-        pairs_op: Box<dyn TileOperator>,
-        reseed_ops: Vec<Box<dyn TileOperator>>,
+        pairs_op: std::sync::Arc<dyn TileOperator>,
+        reseed_ops: Vec<std::sync::Arc<dyn TileOperator>>,
         standing: Vec<Extent>,
         enclosing_extent: Extent,
         pair_domain: &Extent,
-    ) -> (NestedDrive<Box<dyn TileOperator>>, Extent) {
+    ) -> (NestedDrive<std::sync::Arc<dyn TileOperator>>, Extent) {
         let (rows, inner) = split_pair_domain(pair_domain).unwrap_or_else(|| {
             panic!("a nested store sequences its positions as pairs, got {pair_domain}")
         });
@@ -5499,10 +5522,12 @@ impl InductionDriver {
             // Cached until they notify: these are read once per position, and the laps of
             // every enclosing level multiply. Unlike the source, nothing reads their
             // release as a position, so a `Memo` costs the drive nothing it owes.
-            pairs: Box::new(Memo::new(pairs_op)) as Box<dyn TileOperator>,
+            pairs: std::sync::Arc::new(Memo::new(pairs_op)) as std::sync::Arc<dyn TileOperator>,
             reseeds: reseed_ops
                 .into_iter()
-                .map(|seed| Box::new(Memo::new(seed)) as Box<dyn TileOperator>)
+                .map(|seed| {
+                    std::sync::Arc::new(Memo::new(seed)) as std::sync::Arc<dyn TileOperator>
+                })
                 .collect(),
         };
         (nested, inner)
@@ -5530,26 +5555,26 @@ impl TileOperator for InductionDriver {
     }
 
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let inputs = subscribe_driver_inputs(
-            &mut *self.store_op,
-            &mut *self.source_op,
+            &self.store_op,
+            &self.source_op,
             CurryLevel::new(self.nested.as_ref().map_or(1, |n| n.body.rows.len() + 1)),
             consumer,
             cx,
         );
         let consumer = inputs.consumer;
-        let nested = self.nested.as_mut().map(|n| NestedDrive {
+        let nested = self.nested.as_ref().map(|n| NestedDrive {
             body: n.body.clone(),
-            pairs: subscribe_pulled(&mut *n.pairs, cx),
+            pairs: subscribe_pulled(&n.pairs, cx),
             reseeds: n
                 .reseeds
-                .iter_mut()
-                .map(|op| subscribe_pulled(&mut **op, cx))
+                .iter()
+                .map(|op| subscribe_pulled(op, cx))
                 .collect(),
         });
         let rendered = self.tiling().empty_tile();
@@ -5557,7 +5582,7 @@ impl TileOperator for InductionDriver {
             base: ProducerBase::new(
                 InductionDriverProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(consumer.clone(), inputs.placement),
@@ -6351,9 +6376,9 @@ pub struct TransactDriver {
     /// again, and the items between them are not, so it does.
     resumed_from: Option<Predicate>,
     /// The store read back through the cyclic `FanOut`.
-    store_op: Box<dyn TileOperator>,
+    store_op: std::sync::Arc<dyn TileOperator>,
     /// The transaction source — one item per transaction to attempt.
-    source_op: Box<dyn TileOperator>,
+    source_op: std::sync::Arc<dyn TileOperator>,
     /// Runtime keys the body reads a snapshot of, in body-parameter order.
     read_keys: Vec<Value>,
     read_extents: Vec<Extent>,
@@ -6368,8 +6393,8 @@ impl TransactDriver {
     /// A driver whose rows each carry their item's source position ([`F_ITEM_POSITION`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store_op: Box<dyn TileOperator>,
-        source_op: Box<dyn TileOperator>,
+        store_op: std::sync::Arc<dyn TileOperator>,
+        source_op: std::sync::Arc<dyn TileOperator>,
         read_keys: Vec<Value>,
         read_extents: Vec<Extent>,
         item_extent: Extent,
@@ -6428,14 +6453,14 @@ impl TileOperator for TransactDriver {
     }
 
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let mut inputs = subscribe_driver_inputs(
-            &mut *self.store_op,
-            &mut *self.source_op,
+            &self.store_op,
+            &self.source_op,
             CurryLevel::new(1),
             consumer,
             cx,
@@ -6455,7 +6480,7 @@ impl TileOperator for TransactDriver {
             base: ProducerBase::new(
                 TransactDriverProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(inputs.consumer, inputs.placement.clone()),
@@ -7227,13 +7252,13 @@ fn decision_at_index(
 /// item. Retries (a fresh attempt at a new frontier) append as new positions.
 pub struct TransactWriter {
     base: OperatorBase,
-    store_op: Box<dyn TileOperator>,
-    body_op: Box<dyn TileOperator>,
+    store_op: std::sync::Arc<dyn TileOperator>,
+    body_op: std::sync::Arc<dyn TileOperator>,
     /// A second slot of the [`TransactDriver`] the body reads. The writer pulls
     /// it to learn which attempt is in flight, and **releases** it to ack the
     /// attempt's finish — the half of the driver's release intersection that a
     /// body's consume-release cannot supply.
-    driver_op: Box<dyn TileOperator>,
+    driver_op: std::sync::Arc<dyn TileOperator>,
     /// Runtime keys the body reads a snapshot of, in body-parameter order
     /// (snapshot position `i` ↦ `read_keys[i]`).
     read_keys: Vec<Value>,
@@ -7259,9 +7284,9 @@ pub struct TransactWriter {
 impl TransactWriter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store_op: Box<dyn TileOperator>,
-        body_op: Box<dyn TileOperator>,
-        driver_op: Box<dyn TileOperator>,
+        store_op: std::sync::Arc<dyn TileOperator>,
+        body_op: std::sync::Arc<dyn TileOperator>,
+        driver_op: std::sync::Arc<dyn TileOperator>,
         read_keys: Vec<Value>,
         write_keys: Vec<Value>,
         tap_fields: Vec<SmolStr>,
@@ -7300,7 +7325,7 @@ impl TileOperator for TransactWriter {
         visit(value("driver_op", &*self.driver_op));
     }
     fn subscribe(
-        &mut self,
+        self: std::sync::Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
@@ -7310,12 +7335,12 @@ impl TileOperator for TransactWriter {
         // the scheduled writer pipeline; forwarding the cyclic store would loop.
         let consumer = shared_consumer(consumer);
         let sg = self.store_op.tiling().universal_guard();
-        let store_producer = self.store_op.subscribe(sg, Box::new(|| {}), cx);
+        let store_producer = self.store_op.clone().subscribe(sg, Box::new(|| {}), cx);
         let body_tiling = self.body_op.tiling().clone();
         let (entry, body_entry) =
             crate::interpreter::dispatcher::Entry::unplaced(body_tiling.clone());
         let body_consumer = shared_consumer(Box::new(entry));
-        let body_producer = self.body_op.subscribe(
+        let body_producer = self.body_op.clone().subscribe(
             body_tiling.universal_guard(),
             forwarding_consumer_keeping_keys(&body_consumer),
             cx,
@@ -7323,7 +7348,7 @@ impl TileOperator for TransactWriter {
         // Forward the driver's notification to this writer's consumer: the driver
         // owns the transaction source, so a request arriving on a live source
         // reaches this writer, and through it the commit cycle, along this edge.
-        let driver_producer = self.driver_op.subscribe(
+        let driver_producer = self.driver_op.clone().subscribe(
             self.driver_op.tiling().universal_guard(),
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(1),
@@ -7335,7 +7360,7 @@ impl TileOperator for TransactWriter {
             base: ProducerBase::new(
                 TransactWriterProducer::alloc_id(),
                 self.tiling(),
-                &self.base,
+                self.clone(),
                 cx,
             )
             .breaking(consumer, body_entry),
@@ -7936,16 +7961,17 @@ mod tests {
     use crate::interpreter::tiling::{one_row_decided, row_frontier};
     use crate::interpreter::validate_tile;
     use rstest::rstest;
-    use std::{cell::RefCell, rc::Rc};
+    use std::sync::Arc;
+    use std::sync::RwLock;
 
     struct DispatchedStore {
         _ctx: crate::ccl::context::GlobalContext,
         program: crate::ccl::context::CompiledProgram,
-        fan: Rc<FanOut>,
+        fan: Arc<FanOut>,
     }
 
     impl std::ops::Deref for DispatchedStore {
-        type Target = Rc<FanOut>;
+        type Target = Arc<FanOut>;
         fn deref(&self) -> &Self::Target {
             &self.fan
         }
@@ -7998,8 +8024,8 @@ mod tests {
         }
 
         fn snapshot(&mut self) -> Tile {
-            let mut reader = self.fan.slot();
-            let producer = reader.subscribe(
+            let reader = self.fan.slot();
+            let producer = reader.clone().subscribe(
                 reader.tiling().universal_guard(),
                 Box::new(|| {}),
                 &mut SubscribeContext::new(),
@@ -8009,9 +8035,9 @@ mod tests {
         }
     }
 
-    fn consume_input(fan: &Rc<FanOut>, input: usize, guard: TileGuard) {
+    fn consume_input(fan: &Arc<FanOut>, input: usize, guard: TileGuard) {
         let cell = fan.store().expect("the store is subscribed");
-        let mut store = cell.borrow_mut();
+        let mut store = cell.write();
         store
             .as_breaking_mut()
             .unwrap()
@@ -8057,19 +8083,19 @@ mod tests {
     }
 
     /// The drive an induction store's body reads.
-    fn drive_of(fan: &Rc<FanOut>) -> crate::interpreter::dispatcher::BreakerHandle {
+    fn drive_of(fan: &Arc<FanOut>) -> crate::interpreter::dispatcher::BreakerHandle {
         let cell = fan.store().expect("the store is subscribed");
-        crate::interpreter::tile_operators::test_helpers::drive_of(&**cell.borrow())
+        crate::interpreter::tile_operators::test_helpers::drive_of(&**cell.read())
     }
 
     /// Step an induction store through `positions` as its loop's scope does: open the store with
     /// a consume at no position, then at each position consume the drive, which emits it into the
     /// body once the store has decided the position before, and then the store.
-    fn step_induction(fan: &Rc<FanOut>, positions: std::ops::Range<u64>) {
+    fn step_induction(fan: &Arc<FanOut>, positions: std::ops::Range<u64>) {
         let none = fan
             .store()
             .expect("the store is subscribed")
-            .borrow_mut()
+            .write()
             .as_breaking_mut()
             .unwrap()
             .input_tiling(InputId::ONLY)
@@ -8081,7 +8107,8 @@ mod tests {
                 position,
             ))));
             drive
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .consume_in_pipeline(InputId::ONLY, guard.clone());
             consume_input(fan, 0, guard);
         }
@@ -8103,7 +8130,7 @@ mod tests {
             _ctx: GlobalContext,
             _operators: OperatorMap,
             program: CompiledProgram,
-            feed: Rc<RefCell<TestDataSource>>,
+            feed: crate::ccl::SourceDefinition<TestDataSource>,
             sink: Arc<TestSink>,
             store: StoreCell,
         }
@@ -8111,11 +8138,11 @@ mod tests {
         impl Fixture {
             fn new() -> Self {
                 let mut ctx = GlobalContext::default();
-                let feed = Rc::new(RefCell::new(TestDataSource::new(
+                let feed = TestDataSource::new(
                     "source1",
                     crate::ccl::Type::Base(BaseType::Int),
                     Extent::Base(BaseType::Int),
-                )));
+                );
                 ctx.register_source(feed.clone());
                 let sink = ctx.register_test_sink("out");
                 let source = indoc! {"
@@ -8146,7 +8173,10 @@ mod tests {
             }
 
             fn first_delivery(&self) {
-                let mut feed = self.feed.borrow_mut();
+                let mut feed = self
+                    .feed
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 feed.add_data(&[
                     (Value::UInt(0), Value::Int(1)),
                     (Value::UInt(1), Value::Int(2)),
@@ -8161,7 +8191,7 @@ mod tests {
             }
 
             fn assert_run_cleared(&self) {
-                let mut store = self.store.borrow_mut();
+                let mut store = self.store.write();
                 let store = store.as_induction_store_mut().expect("an induction store");
                 assert!(
                     store.run.is_none(),
@@ -8184,7 +8214,10 @@ mod tests {
                     }
                     if let Some(target) = producer.completes_through() {
                         assert!(
-                            target.borrow().is_none(),
+                            target
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .is_none(),
                             "source completeness retains no target in the discarded dispatcher"
                         );
                     }
@@ -8195,7 +8228,7 @@ mod tests {
         }
 
         fn progress(store: &StoreCell) -> (Tile, TileGuard) {
-            let mut store = store.borrow_mut();
+            let mut store = store.write();
             let store = store.as_induction_store_mut().expect("an induction store");
             (
                 store
@@ -8217,7 +8250,7 @@ mod tests {
             fn drained(&mut self, _: bool) -> ControlFlow<()> {
                 assert!(
                     self.store
-                        .borrow_mut()
+                        .write()
                         .as_induction_store_mut()
                         .expect("an induction store")
                         .run
@@ -8265,7 +8298,10 @@ mod tests {
             targets.add_sinks(&extra);
             targets.add_sinks(&fixture.program);
             {
-                let mut feed = fixture.feed.borrow_mut();
+                let mut feed = fixture
+                    .feed
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 feed.add_data(&[(Value::UInt(2), Value::Int(3))]);
                 feed.set_yield_predicate(Predicate::True);
             }
@@ -8603,7 +8639,7 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -8621,7 +8657,7 @@ mod tests {
     struct FilteredLiveSource {
         tiling: Tiling,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<RwLock<Vec<TileGuard>>>,
     }
 
     impl FilteredLiveSource {
@@ -8640,7 +8676,7 @@ mod tests {
             Self {
                 tiling,
                 tile,
-                released: Rc::default(),
+                released: Arc::default(),
             }
         }
     }
@@ -8652,7 +8688,7 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -8668,7 +8704,7 @@ mod tests {
     struct RecordingSourceProducer {
         base: ProducerBase,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<RwLock<Vec<TileGuard>>>,
     }
 
     impl TileProducer for RecordingSourceProducer {
@@ -8684,7 +8720,10 @@ mod tests {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(obsolete_guard);
         }
     }
 
@@ -8695,19 +8734,19 @@ mod tests {
     fn induction_driver_releases_filtered_rows_it_reads_past() {
         let acc = acct("acc");
         let store = InductionStore::new(
-            vec![(acc.clone(), Box::new(Constant::new(int(0), value_extent())))],
+            vec![(acc.clone(), Arc::new(Constant::new(int(0), value_extent())))],
             vec![acc.clone()],
             Vec::new(),
             full_store_tiling(Extent::Base(BaseType::UInt), store_values(&["acc"])),
             None,
         );
         let set_body = store.body_input_setter();
-        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let fan = Arc::new(FanOut::new_cyclic(Arc::new(store)));
         let source = FilteredLiveSource::new(&[10, 20]);
         let released = source.released.clone();
         let driver = InductionDriver::new(
             fan.slot(),
-            Box::new(source),
+            Arc::new(source),
             None,
             vec![acc.clone()],
             vec![value_extent()],
@@ -8715,17 +8754,23 @@ mod tests {
             Extent::Base(BaseType::UInt),
             None,
         );
-        set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
-        let mut op = fan.slot();
+        set_body(Arc::new(AddIfBody::new(Arc::new(driver), i64::MIN, "acc")));
+        let op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let _producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        let _producer = op.clone().subscribe(guard, Box::new(|| {}), &mut cx);
         step_induction(&fan, 0..2);
         let both = |g: &TileGuard| (0..2).all(|p| g.covers_path(&[Value::UInt(p)]));
         assert!(
-            released.borrow().iter().any(both),
+            released
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(both),
             "the driver releases both filtered rows: {:?}",
-            released.borrow()
+            released
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         );
     }
 
@@ -8772,7 +8817,7 @@ mod tests {
     /// drawdown of a negative item against the read snapshot, with `i64::MIN`
     /// making every attempt a grant so contention is the only thing under test.
     struct AddIfBody {
-        input: Box<dyn TileOperator>,
+        input: Arc<dyn TileOperator>,
         tiling: Tiling,
         /// The accumulator this body writes. The write set is keyed by the
         /// variable written, so a fixture has to name its key the same way the
@@ -8784,7 +8829,7 @@ mod tests {
     }
 
     impl AddIfBody {
-        fn new(input: Box<dyn TileOperator>, threshold: i64, key: &str) -> Self {
+        fn new(input: Arc<dyn TileOperator>, threshold: i64, key: &str) -> Self {
             // The decision record, one column of records.
             let tiling = Tiling::data_function(
                 Extent::Base(BaseType::UInt),
@@ -8806,14 +8851,15 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
             cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            let input = self
-                .input
-                .subscribe(self.input.tiling().universal_guard(), consumer, cx);
+            let input =
+                self.input
+                    .clone()
+                    .subscribe(self.input.tiling().universal_guard(), consumer, cx);
             Box::new(AddIfBodyProducer {
                 key: self.key.clone(),
                 base: ProducerBase::unowned(AddIfBodyProducer::alloc_id(), &self.tiling),
@@ -8928,10 +8974,10 @@ mod tests {
     /// the tile protocol and return the converged store tile.
     fn drive_induction(items: &[i64], threshold: i64, init: i64) -> Tile {
         let (mut fan, _acc) = induction_cycle(items, threshold, init);
-        let mut op = fan.slot();
+        let op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = op.clone().subscribe(guard, Box::new(|| {}), &mut cx);
         snapshot_after_run(&mut fan, &mut producer)
     }
 
@@ -8986,10 +9032,10 @@ mod tests {
     #[test]
     fn induction_store_release_bounds_changelog_keeping_latest() {
         let (mut fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 10); // unconditional
-        let mut op = fan.slot();
+        let op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = op.clone().subscribe(guard, Box::new(|| {}), &mut cx);
 
         let full = snapshot_after_run(&mut fan, &mut producer);
         assert_eq!(
@@ -8999,7 +9045,7 @@ mod tests {
         );
 
         let store = fan.store().expect("the fixture subscribed its store");
-        let before = store.borrow().state_info().values;
+        let before = store.read().state_info().values;
         // A reader consumed loop positions ≤ 1.
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::at_or_below(Value::UInt(1)),
@@ -9013,12 +9059,12 @@ mod tests {
             "the accumulator still reads its correct final value after GC"
         );
         assert_eq!(
-            store.borrow().state_info().values,
+            store.read().state_info().values,
             3,
             "the engine retains its seed, final change and final decided position"
         );
         assert!(
-            store.borrow().state_info().values < before,
+            store.read().state_info().values < before,
             "release reclaims engine state without a stepping read"
         );
     }
@@ -9027,10 +9073,10 @@ mod tests {
     /// extent via `StoreDenseRead`; return the dense `Fun(D, V)` values in order.
     fn dense_read(items: &[i64], threshold: i64, init: i64) -> Vec<i64> {
         let (mut fan, acc) = induction_cycle(items, threshold, init);
-        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
+        let reader = Arc::new(StoreDenseRead::new(fan.slot(), acc, value_extent(), true));
         let guard = reader.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = reader.clone().subscribe(guard, Box::new(|| {}), &mut cx);
         // The cycle advances one position per pull, so the dense read converges
         // over several pulls rather than one.
         let tile = snapshot_after_run(&mut fan, &mut producer);
@@ -9121,10 +9167,10 @@ mod tests {
     fn carry_dense_reader_does_not_over_release_store() {
         // Writes iff `item > 3`: over [5, 1, 1, 9] that fires at positions 0 and 3.
         let (mut fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
-        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
+        let reader = Arc::new(StoreDenseRead::new(fan.slot(), acc, value_extent(), true));
         let guard = reader.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = reader.clone().subscribe(guard, Box::new(|| {}), &mut cx);
 
         fan.run();
         let read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(u64, i64)> {
@@ -9195,9 +9241,12 @@ mod tests {
         };
 
         let (mut fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
-        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
+        let reader = Arc::new(StoreDenseRead::new(fan.slot(), acc, value_extent(), true));
         let guard = reader.tiling().universal_guard();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer =
+            reader
+                .clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         fan.run();
         assert_eq!(positions(&mut producer), vec![0, 1, 2, 3]);
         producer.release(points(&[2]));
@@ -9206,29 +9255,34 @@ mod tests {
         let (mut fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
         let version = Version::default();
         let first = SlotReader::new(NodeId::fresh());
-        let mut predecessor = StoreDenseRead::new(
+        let predecessor = Arc::new(StoreDenseRead::new(
             fan.slot_read_by(first, None, &version),
             acc.clone(),
             value_extent(),
             true,
-        );
+        ));
         let guard = predecessor.tiling().universal_guard();
         let mut producer =
-            predecessor.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+            predecessor
+                .clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         fan.run();
         assert_eq!(positions(&mut producer), vec![0, 1, 2, 3]);
         producer.release(points(&[0, 2]));
         drop(producer);
         fan.reopen();
         let replacement = SlotReader::new(NodeId::fresh());
-        let mut resumed = StoreDenseRead::new(
+        let resumed = Arc::new(StoreDenseRead::new(
             fan.slot_read_by(replacement, Some(first), &version),
             acc,
             value_extent(),
             true,
-        );
+        ));
         let guard = resumed.tiling().universal_guard();
-        let mut producer = resumed.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut producer =
+            resumed
+                .clone()
+                .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         fan.run();
         assert_eq!(positions(&mut producer), vec![1, 3]);
     }
@@ -9272,10 +9326,10 @@ mod tests {
     #[test]
     fn a_released_prefix_does_not_strand_a_live_carry() {
         let (mut fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
-        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
+        let reader = Arc::new(StoreDenseRead::new(fan.slot(), acc, value_extent(), true));
         let guard = reader.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = reader.clone().subscribe(guard, Box::new(|| {}), &mut cx);
 
         // The cycle advances one position per pull, so drive the fold to convergence.
         let tile = snapshot_after_run(&mut fan, &mut producer);
@@ -9893,20 +9947,22 @@ mod tests {
     fn a_resumed_drive_starts_after_its_committed_prefix() {
         let tiling = store_tiling(&["pool"]);
         let store = CommitEngine::new(balances(&[("pool", 100)])).render_full_store_tile(&tiling);
-        let mut drive = TransactDriver::new(
-            Box::new(ItemSource {
+        let drive = Arc::new(TransactDriver::new(
+            Arc::new(ItemSource {
                 tiling,
                 tile: store,
             }),
-            Box::new(ItemSource::new(&[1, 2])),
+            Arc::new(ItemSource::new(&[1, 2])),
             vec![acct("pool")],
             vec![value_extent()],
             value_extent(),
             Some(Predicate::at_or_below(Value::UInt(0))),
-        );
+        ));
         let mut cx = SubscribeContext::new();
         let guard = drive.tiling().universal_guard();
-        let mut producer = drive.subscribe(guard.clone(), Box::new(|| {}), &mut cx);
+        let mut producer = drive
+            .clone()
+            .subscribe(guard.clone(), Box::new(|| {}), &mut cx);
         producer.visit_input_producers_mut(&mut |_, input| {
             let breaker = input
                 .as_breaking_mut()
@@ -10004,15 +10060,15 @@ mod tests {
         let mut engine = CommitEngine::new(balances(&[("pool", 100)]));
         let (store, _, snapshot, _) =
             NotifyingOp::scripted(engine.render_full_store_tile(&tiling), tiling.clone());
-        let mut driver = TransactDriver::new(
-            Box::new(store),
-            Box::new(ItemSource::new(&[-1])),
+        let driver = Arc::new(TransactDriver::new(
+            Arc::new(store),
+            Arc::new(ItemSource::new(&[-1])),
             vec![acct("pool")],
             vec![value_extent()],
             value_extent(),
             None,
-        );
-        let mut driver = driver.subscribe(
+        ));
+        let mut driver = driver.clone().subscribe(
             driver.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -10028,7 +10084,10 @@ mod tests {
                     CommitOutcome::Committed { .. }
                 ));
             }
-            *snapshot.borrow_mut() = engine.render_full_store_tile(&tiling);
+            *snapshot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                engine.render_full_store_tile(&tiling);
             let rows = advance_drive(&mut driver);
             let Tile::DataFunction { domain, .. } = &rows else {
                 panic!("attempt rows")
@@ -10057,11 +10116,7 @@ mod tests {
     fn current_values_allow_history_reclamation_after_a_lagging_reader_releases() {
         use crate::ccl::{BaseType as CclBase, Type};
         use crate::interpreter::TestDataSource;
-        let source = Rc::new(RefCell::new(TestDataSource::new(
-            "source1",
-            Type::Base(CclBase::Int),
-            value_extent(),
-        )));
+        let source = TestDataSource::new("source1", Type::Base(CclBase::Int), value_extent());
         let mut fixture = DispatchedStore::with(
             indoc::indoc! {r#"
             out = test_sink()
@@ -10072,19 +10127,23 @@ mod tests {
         "#},
             |ctx| ctx.register_source(source.clone()),
         );
-        let mut history = fixture.slot();
-        let mut history = history.subscribe(
+        let history = fixture.slot();
+        let mut history = history.clone().subscribe(
             history.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
         );
-        source.borrow_mut().add_data(&[
-            (Value::UInt(0), int(1)),
-            (Value::UInt(1), int(2)),
-            (Value::UInt(2), int(3)),
-        ]);
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_data(&[
+                (Value::UInt(0), int(1)),
+                (Value::UInt(1), int(2)),
+                (Value::UInt(2), int(3)),
+            ]);
+        source
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(2)));
         fixture.poll();
         let tile = history.read_in_pipeline(history.tiling().universal_guard());
@@ -10094,15 +10153,18 @@ mod tests {
             "the historical reader retains every change"
         );
         let store = fixture.store().unwrap();
-        let before = store.borrow().state_info().values;
+        let before = store.read().state_info().values;
         history.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::at_or_below(Value::UInt(1)),
         )));
         assert!(
-            store.borrow().state_info().values < before,
+            store.read().state_info().values < before,
             "a history reader's release permits reclamation"
         );
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_yield_predicate(Predicate::True);
         fixture.run();
         assert_eq!(
             store_value_now(
@@ -10131,8 +10193,8 @@ mod tests {
     "#})]
     fn store_reads_do_not_advance_execution(#[case] source: &str) {
         let mut fixture = DispatchedStore::new(source);
-        let mut reader = fixture.slot();
-        let reader = reader.subscribe(
+        let reader = fixture.slot();
+        let reader = reader.clone().subscribe(
             reader.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -10257,13 +10319,13 @@ mod tests {
     /// drives the cycle.
     struct StoreReadAsOf {
         tiling: Tiling,
-        store_op: Box<dyn TileOperator>,
+        store_op: Arc<dyn TileOperator>,
         key: Value,
         t: u64,
     }
 
     impl StoreReadAsOf {
-        fn new(store_op: Box<dyn TileOperator>, key: Value, t: u64) -> Self {
+        fn new(store_op: Arc<dyn TileOperator>, key: Value, t: u64) -> Self {
             Self {
                 tiling: Tiling::Scalar(value_extent()),
                 store_op,
@@ -10280,13 +10342,17 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             let store_guard = self.store_op.tiling().universal_guard();
-            let store_producer = self.store_op.subscribe(store_guard, Box::new(|| {}), cx);
+            let store_producer =
+                self.store_op
+                    .clone()
+                    .clone()
+                    .subscribe(store_guard, Box::new(|| {}), cx);
             Box::new(StoreReadAsOfProducer {
                 base: ProducerBase::unowned(StoreReadAsOfProducer::alloc_id(), &self.tiling),
                 store_producer,
@@ -10338,11 +10404,11 @@ mod tests {
     #[test]
     fn read_as_of_resolves_at_watermark() {
         use crate::interpreter::TestDataSource;
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = TestDataSource::new(
             "source1",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        )));
+        );
         let mut fixture = DispatchedStore::with(
             indoc::indoc! {r#"
             out = test_sink()
@@ -10354,8 +10420,8 @@ mod tests {
         "#},
             |ctx| ctx.register_source(source.clone()),
         );
-        let mut reader = StoreReadAsOf::new(fixture.slot(), acct("n"), 2);
-        let mut producer = reader.subscribe(
+        let reader = Arc::new(StoreReadAsOf::new(fixture.slot(), acct("n"), 2));
+        let mut producer = reader.clone().subscribe(
             reader.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -10366,10 +10432,12 @@ mod tests {
                 .is_empty()
         );
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .add_data(&[(Value::UInt(0), int(1)), (Value::UInt(1), int(2))]);
         source
-            .borrow_mut()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
         fixture.poll();
         let latest = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -10509,7 +10577,7 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -10574,54 +10642,68 @@ mod tests {
                 store_tile.clone(),
                 store_tiling.clone(),
             );
-        let mut stream = StoreValueStream::new(Box::new(spy), acc.clone(), value_ext.clone(), true);
+        let stream = Arc::new(StoreValueStream::new(
+            Arc::new(spy),
+            acc.clone(),
+            value_ext.clone(),
+            true,
+        ));
         let g = stream.tiling().universal_guard();
-        let mut p = stream.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut p = stream
+            .clone()
+            .subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         assert_eq!(
             ticks(&mut p),
             vec![Value::UInt(0), Value::UInt(1), Value::UInt(2)]
         );
         p.release(points(&[1]));
         assert_eq!(ticks(&mut p), vec![Value::UInt(0), Value::UInt(2)]);
-        assert_eq!(*released.borrow(), vec![points(&[1])]);
+        assert_eq!(
+            *released
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![points(&[1])]
+        );
 
-        let fan = FanOut::new(Box::new(FixedSource {
+        let fan = FanOut::new(Arc::new(FixedSource {
             tiling: store_tiling,
             tile: store_tile,
         }));
         let mut sched = SubscribeContext::new();
         let version = Version::default();
         let first = SlotReader::new(NodeId::fresh());
-        let mut predecessor = StoreValueStream::new(
+        let predecessor = Arc::new(StoreValueStream::new(
             fan.slot_read_by(first, None, &version),
             acc.clone(),
             value_ext.clone(),
             true,
-        );
+        ));
         let g = predecessor.tiling().universal_guard();
-        let mut p = predecessor.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut p = predecessor
+            .clone()
+            .subscribe(g, Box::new(|| {}), &mut sched);
         p.release(points(&[0]));
         drop(p);
         fan.reopen();
         let replacement = SlotReader::new(NodeId::fresh());
-        let mut resumed = StoreValueStream::new(
+        let resumed = Arc::new(StoreValueStream::new(
             fan.slot_read_by(replacement, Some(first), &version),
             acc.clone(),
             value_ext.clone(),
             true,
-        );
+        ));
         let g = resumed.tiling().universal_guard();
-        let mut p = resumed.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut p = resumed.clone().subscribe(g, Box::new(|| {}), &mut sched);
         assert_eq!(ticks(&mut p), vec![Value::UInt(1), Value::UInt(2)]);
 
         fan.settle_handover();
         p.release(points(&[2]));
-        let mut fresh = StoreValueStream::new(
+        let fresh = Arc::new(StoreValueStream::new(
             fan.slot_read_by(SlotReader::new(NodeId::fresh()), None, &version),
             acc,
             value_ext,
             true,
-        );
+        ));
         let g = fresh.tiling().universal_guard();
         let mut p = fresh.subscribe(g, Box::new(|| {}), &mut sched);
         assert_eq!(
@@ -10652,17 +10734,21 @@ mod tests {
 
         // While committing, the stream is non-terminal but already carries both
         // the tick-0 init (100) and the committed value (60) — observable now.
-        let mut stream = StoreValueStream::new(
-            Box::new(FixedSource {
+        let stream = Arc::new(StoreValueStream::new(
+            Arc::new(FixedSource {
                 tiling: store_tiling.clone(),
                 tile: store_tile.clone(),
             }),
             acc.clone(),
             value_ext.clone(),
             true, // carry: hold the committed value forward
-        );
+        ));
         let g = stream.tiling().universal_guard();
-        let mut p = stream.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut p =
+            stream
+                .clone()
+                .clone()
+                .subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         let t = p.read_in_pipeline(p.tiling().universal_guard());
         assert!(!t.is_terminal());
         let Tile::DataFunction { codomain, .. } = &t else {
@@ -10680,7 +10766,7 @@ mod tests {
             *terminal = true;
         }
         let stream = StoreValueStream::new(
-            Box::new(FixedSource {
+            Arc::new(FixedSource {
                 tiling: store_tiling,
                 tile: store_tile,
             }),
@@ -10692,10 +10778,14 @@ mod tests {
             tiling: Tiling::Scalar(value_ext.clone()),
             tile: Tile::Scalar(ColumnValue::single(int(100))),
         });
-        let mut extract =
-            crate::interpreter::tile_operators::ExtractFinal::new(Box::new(stream), default);
+        let extract = Arc::new(crate::interpreter::tile_operators::ExtractFinal::new(
+            Arc::new(stream),
+            Arc::new(*default),
+        ));
         let g = extract.tiling().universal_guard();
-        let mut p = extract.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut p = extract
+            .clone()
+            .subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         let t = consume_and_read(&mut p);
         let Tile::Scalar(cv) = &t else { panic!() };
         assert_eq!(cv.as_single(), Some(int(60)));
@@ -10836,17 +10926,18 @@ mod tests {
             unreachable!()
         };
         *terminal = true;
-        let mut read = StoreFinalRead::new(
-            Box::new(FixedSource {
+        let read = Arc::new(StoreFinalRead::new(
+            Arc::new(FixedSource {
                 tiling: store_tiling,
                 tile,
             }),
             key,
             value_extent,
-        );
+        ));
         let mut cx = Default::default();
         let mut producer =
-            read.subscribe(read.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+            read.clone()
+                .subscribe(read.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         for key in [1, 2] {
             let projection = Projection::admitting(Predicate::point(Value::UInt(key)));
             let guard = projection.guard(producer.tiling());
@@ -10875,26 +10966,32 @@ mod tests {
             &[(1, &[("alice", 70)]), (2, &[("alice", 40)])],
             Predicate::at_or_below(Value::UInt(2)),
         );
-        let recorder = Rc::new(RefCell::new(Vec::new()));
-        let mut read = StoreFinalRead::new(
-            Box::new(RecordingSource {
+        let recorder = Arc::new(RwLock::new(Vec::new()));
+        let read = Arc::new(StoreFinalRead::new(
+            Arc::new(RecordingSource {
                 tiling: store_tiling(&["alice"]),
                 tile: live,
                 released: recorder.clone(),
             }),
             acct("alice"),
             value_extent(),
-        );
+        ));
         let g = read.tiling().universal_guard();
-        let mut producer = read.subscribe(g, Box::new(|| {}), &mut cx);
+        let mut producer = read.clone().subscribe(g, Box::new(|| {}), &mut cx);
         let read = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(
-            recorder.borrow().is_empty(),
+            recorder
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
             "the read holds the history until its consumer releases"
         );
         producer.release(read.to_guard());
         assert_eq!(
-            recorder.borrow().as_slice(),
+            recorder
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
             [TileGuard::Function(FunctionGuard::Domain(
                 Predicate::at_or_below(Value::UInt(2))
             ))],
@@ -10906,12 +11003,12 @@ mod tests {
     struct RecordingSource {
         tiling: Tiling,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<RwLock<Vec<TileGuard>>>,
     }
     struct RecordingProducer {
         base: ProducerBase,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<RwLock<Vec<TileGuard>>>,
     }
     impl TileOperator for RecordingSource {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -10919,7 +11016,7 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -10942,7 +11039,10 @@ mod tests {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(obsolete_guard);
         }
     }
 
@@ -11347,9 +11447,9 @@ mod tests {
         let mut cx = SubscribeContext::new();
         let subscribe = |cx: &mut SubscribeContext| {
             let reader = StoreDenseRead::new(fan.slot(), acc.clone(), value_extent(), true);
-            let mut memo = Memo::new(Box::new(reader));
+            let memo = Arc::new(Memo::new(Arc::new(reader)));
             let guard = memo.tiling().universal_guard();
-            memo.subscribe(guard, Box::new(|| {}), cx)
+            memo.clone().subscribe(guard, Box::new(|| {}), cx)
         };
         let mut lagging = subscribe(&mut cx);
         let mut leading = subscribe(&mut cx);
@@ -11420,10 +11520,10 @@ mod tests {
     fn a_memo_over_a_live_dense_read_caches_only_decided_positions() {
         let (mut fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 0); // unconditional
         let reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
-        let mut memo = Memo::new(Box::new(reader));
+        let memo = Arc::new(Memo::new(Arc::new(reader)));
         let guard = memo.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = memo.clone().subscribe(guard, Box::new(|| {}), &mut cx);
         fan.run();
         let tile = consume_and_read(&mut producer);
         assert!(tile.is_terminal(), "the dispatched fixture finishes");
@@ -11449,11 +11549,11 @@ mod tests {
     /// A fixture whose tile the test changes between pulls.
     struct SharedSource {
         tiling: Tiling,
-        tile: Rc<RefCell<Tile>>,
+        tile: Arc<RwLock<Tile>>,
     }
     struct SharedSourceProducer {
         base: ProducerBase,
-        tile: Rc<RefCell<Tile>>,
+        tile: Arc<RwLock<Tile>>,
     }
     impl TileOperator for SharedSource {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -11461,7 +11561,7 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -11480,7 +11580,13 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
-            honoring_release(&self.tile.borrow(), self.obsolete_guard())
+            honoring_release(
+                &self
+                    .tile
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                self.obsolete_guard(),
+            )
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
     }
@@ -11664,7 +11770,7 @@ mod tests {
             uint.clone(),
             Tiling::data_function(uint.clone(), Tiling::Scalar(value_extent())),
         );
-        let source = Rc::new(RefCell::new(source_of(vec![0], vec![1])));
+        let source = Arc::new(RwLock::new(source_of(vec![0], vec![1])));
         let pairs_tile = |values: Vec<i64>| {
             Tile::data_function(
                 ColumnValue::from_values(vec![pair(0, 0), pair(0, 1), pair(1, 0)], &pair_extent),
@@ -11679,16 +11785,16 @@ mod tests {
         let mut engines = Engines::unopened(&store_tiling);
         let render =
             |e: &Engines| render_engines(e, &store_tiling, &[Predicate::False, Predicate::False]);
-        let store = Rc::new(RefCell::new(render(&engines)));
+        let store = Arc::new(RwLock::new(render(&engines)));
         let (nested, inner) = InductionDriver::nested_parts(
-            Box::new(SharedSource {
+            Arc::new(SharedSource {
                 tiling: pairs_tiling.clone(),
-                tile: Rc::new(RefCell::new(pairs_tile(vec![100, 100, 200]))),
+                tile: Arc::new(RwLock::new(pairs_tile(vec![100, 100, 200]))),
             }),
             // One reseed per enclosing position.
-            vec![Box::new(SharedSource {
+            vec![Arc::new(SharedSource {
                 tiling: Tiling::data_function(uint.clone(), Tiling::Scalar(value_extent())),
-                tile: Rc::new(RefCell::new(Tile::data_function(
+                tile: Arc::new(RwLock::new(Tile::data_function(
                     ColumnValue::from_uints(vec![0, 1]),
                     Box::new(Tile::Scalar(ColumnValue::from_ints(vec![0, 0]))),
                     Predicate::True,
@@ -11699,12 +11805,12 @@ mod tests {
             value_extent(),
             &pair_extent,
         );
-        let mut driver = InductionDriver::new(
-            Box::new(SharedSource {
+        let driver = Arc::new(InductionDriver::new(
+            Arc::new(SharedSource {
                 tiling: store_tiling.clone(),
                 tile: store.clone(),
             }),
-            Box::new(SharedSource {
+            Arc::new(SharedSource {
                 tiling: source_tiling,
                 tile: source.clone(),
             }),
@@ -11714,10 +11820,10 @@ mod tests {
             value_extent(),
             inner,
             None,
-        );
+        ));
         let g = driver.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut cx);
+        let mut producer = driver.clone().subscribe(g, Box::new(|| {}), &mut cx);
         let emitted = |t: &Tile| -> Vec<Vec<Value>> {
             decided_paths(t)
                 .into_iter()
@@ -11732,7 +11838,9 @@ mod tests {
                 CommitEngine::seeded_at(None, HashMap::from([(acc.clone(), int(0))]))
             })
             .step(pos(0), Some(HashMap::from([(acc.clone(), int(1))])));
-        *store.borrow_mut() = render(&engines);
+        *store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = render(&engines);
 
         let second = consume_nested_drive_and_read(&mut producer);
         let paths = emitted(&second);
@@ -11810,26 +11918,26 @@ mod tests {
             &[Predicate::False, Predicate::False],
         );
         let (nested, inner) = InductionDriver::nested_parts(
-            Box::new(SharedSource {
+            Arc::new(SharedSource {
                 tiling: pairs_tiling,
-                tile: Rc::new(RefCell::new(pairs)),
+                tile: Arc::new(RwLock::new(pairs)),
             }),
-            vec![Box::new(SharedSource {
+            vec![Arc::new(SharedSource {
                 tiling: reseed_tiling,
-                tile: Rc::new(RefCell::new(reseed)),
+                tile: Arc::new(RwLock::new(reseed)),
             })],
             Vec::new(),
             value_extent(),
             &pair_extent,
         );
-        let mut driver = InductionDriver::new(
-            Box::new(SharedSource {
+        let driver = Arc::new(InductionDriver::new(
+            Arc::new(SharedSource {
                 tiling: store_tiling.clone(),
-                tile: Rc::new(RefCell::new(store)),
+                tile: Arc::new(RwLock::new(store)),
             }),
-            Box::new(SharedSource {
+            Arc::new(SharedSource {
                 tiling: source_tiling,
-                tile: Rc::new(RefCell::new(source)),
+                tile: Arc::new(RwLock::new(source)),
             }),
             Some(nested),
             vec![acc],
@@ -11837,10 +11945,10 @@ mod tests {
             value_extent(),
             inner,
             None,
-        );
+        ));
         let g = driver.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut cx);
+        let mut producer = driver.clone().subscribe(g, Box::new(|| {}), &mut cx);
         let first = consume_nested_drive_and_read(&mut producer);
         assert!(
             decided_paths(&first).is_empty(),
@@ -11852,14 +11960,14 @@ mod tests {
     struct CountingSeed {
         tiling: Tiling,
         value: Value,
-        gets: Rc<RefCell<usize>>,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        gets: Arc<RwLock<usize>>,
+        released: Arc<RwLock<Vec<TileGuard>>>,
     }
     struct CountingSeedProducer {
         base: ProducerBase,
         value: Value,
-        gets: Rc<RefCell<usize>>,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        gets: Arc<RwLock<usize>>,
+        released: Arc<RwLock<Vec<TileGuard>>>,
     }
     impl TileOperator for CountingSeed {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -11867,7 +11975,7 @@ mod tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -11888,22 +11996,28 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
-            *self.gets.borrow_mut() += 1;
+            *self
+                .gets
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
             if self.obsolete_guard().is_universal() {
                 return self.tiling().empty_tile();
             }
             Tile::Scalar(ColumnValue::single(self.value.clone()))
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(obsolete_guard);
         }
     }
 
-    type Counters = (Rc<RefCell<usize>>, Rc<RefCell<Vec<TileGuard>>>);
+    type Counters = (Arc<RwLock<usize>>, Arc<RwLock<Vec<TileGuard>>>);
 
     fn counting_seed(init: i64) -> (CountingSeed, Counters) {
-        let gets = Rc::new(RefCell::new(0));
-        let released = Rc::new(RefCell::new(Vec::new()));
+        let gets = Arc::new(RwLock::new(0));
+        let released = Arc::new(RwLock::new(Vec::new()));
         (
             CountingSeed {
                 tiling: Tiling::Scalar(value_extent()),
@@ -11922,7 +12036,7 @@ mod tests {
         let acc = acct("acc");
         let (seed, (gets, released)) = counting_seed(0);
         let store = InductionStore::new(
-            vec![(acc.clone(), Box::new(seed))],
+            vec![(acc.clone(), Arc::new(seed))],
             vec![acc.clone()],
             Vec::new(),
             full_store_tiling(
@@ -11932,10 +12046,10 @@ mod tests {
             None,
         );
         let set_body = store.body_input_setter();
-        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let fan = Arc::new(FanOut::new_cyclic(Arc::new(store)));
         let driver = InductionDriver::new(
             fan.slot(),
-            Box::new(ItemSource::new(&items)),
+            Arc::new(ItemSource::new(&items)),
             None,
             vec![acc.clone()],
             vec![value_extent()],
@@ -11943,13 +12057,15 @@ mod tests {
             Extent::uint_range(uint_of_row(items.len())),
             None,
         );
-        set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
-        let mut op = fan.slot();
+        set_body(Arc::new(AddIfBody::new(Arc::new(driver), i64::MIN, "acc")));
+        let op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let producer = op.subscribe(guard, Box::new(|| {}), &mut cx);
+        let producer = op.clone().subscribe(guard, Box::new(|| {}), &mut cx);
         step_induction(&fan, 0..items.len() as u64);
-        let gets_at_open = *gets.borrow();
+        let gets_at_open = *gets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for _ in 0..4 {
             assert!(
                 producer
@@ -11958,12 +12074,17 @@ mod tests {
             );
         }
         assert_eq!(
-            *gets.borrow(),
+            *gets
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             gets_at_open,
             "snapshot reads never read the seed again"
         );
         assert!(
-            !released.borrow().is_empty(),
+            !released
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
             "the seed is released after opening"
         );
     }
@@ -11974,13 +12095,13 @@ mod tests {
         let acc = acct("acc");
         let (seed, (gets, released)) = counting_seed(7);
         let op = CommitOperator::with_seed_ops(
-            vec![(acc.clone(), Box::new(seed))],
+            vec![(acc.clone(), Arc::new(seed))],
             store_values(&["acc"]),
             Vec::new(),
         );
-        let fan = Rc::new(FanOut::new_cyclic(Box::new(op)));
-        let mut reader = fan.slot();
-        let mut producer = reader.subscribe(
+        let fan = Arc::new(FanOut::new_cyclic(Arc::new(op)));
+        let reader = fan.slot();
+        let mut producer = reader.clone().subscribe(
             reader.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -11989,9 +12110,17 @@ mod tests {
         let last = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(last.is_terminal(), "a store with no writers is terminal");
         assert_eq!(store_value_now(&last, &acc), Some(int(7)));
-        assert!(*gets.borrow() > 0);
         assert!(
-            !released.borrow().is_empty(),
+            *gets
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                > 0
+        );
+        assert!(
+            !released
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
             "the seed is released after opening"
         );
     }
@@ -12001,10 +12130,10 @@ mod tests {
     #[test]
     fn a_reclaim_stops_at_the_first_position_still_read() {
         let (mut fan, _acc) = induction_cycle(&[1, 2, 3, 4], i64::MIN, 0);
-        let mut reader = fan.slot();
+        let reader = fan.slot();
         let guard = reader.tiling().universal_guard();
         let mut cx = SubscribeContext::new();
-        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut cx);
+        let mut producer = reader.clone().subscribe(guard, Box::new(|| {}), &mut cx);
         let tile = snapshot_after_run(&mut fan, &mut producer);
         let Tile::Store { decided, .. } = &tile else {
             panic!("a store")
@@ -12045,17 +12174,21 @@ mod tests {
         engine.gc_released_prefix(&pos(1));
         let store_tiling = store_tiling(&["acc"]);
         let tile = engine.render_full_store_tile(&store_tiling);
-        let mut stream = StoreValueStream::new(
-            Box::new(FixedSource {
+        let stream = Arc::new(StoreValueStream::new(
+            Arc::new(FixedSource {
                 tiling: store_tiling,
                 tile,
             }),
             acc,
             Extent::Base(BaseType::Int),
             true,
-        );
+        ));
         let g = stream.tiling().universal_guard();
-        let mut p = stream.subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
+        let mut p =
+            stream
+                .clone()
+                .clone()
+                .subscribe(g, Box::new(|| {}), &mut SubscribeContext::new());
         let tile = p.read_in_pipeline(p.tiling().universal_guard());
         // Ticks 0 and 1 were reclaimed, so the stream starts at tick 2, where the carry
         // still folds to the write made there.

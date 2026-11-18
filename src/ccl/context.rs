@@ -8,8 +8,9 @@ use crate::ccl::Occurrence;
 use crate::ccl::lower::ResolvedName;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
-use std::{cell::RefCell, rc::Rc};
+use std::sync::PoisonError;
 
 use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::chl_parser::ast::Span;
@@ -43,8 +44,7 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSink, DataSourceDomainExtentImpl, SourceRegistry, StdinDataSource,
-        SubscribeContext,
+        Consumer, DataSink, SourceRegistry, StdinDataSource, SubscribeContext,
         http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, OperatorMap, convert_outputs_to_operators,
@@ -837,7 +837,7 @@ struct HttpRoute {
 #[derive(Default)]
 pub struct SourceSinkRegistry {
     /// Every open source, by the name `Source(name)` resolves against.
-    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    sources: HashMap<String, crate::ccl::SourceDefinition>,
     /// Every open `http_serve` route, by the route's source name. Keyed by route
     /// rather than by response-binding name, which a new version may spell
     /// differently.
@@ -922,7 +922,10 @@ impl SourceSinkRegistry {
             // answered: a request already in flight has no version left to
             // compute its reply.
             if let Some(source) = self.sources.remove(&name) {
-                source.borrow_mut().answer_in_flight();
+                source
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .answer_in_flight();
             }
             // The scheduler's handle is the last long-lived reference to the
             // source, and nothing else drops one, so it goes with the route.
@@ -1064,7 +1067,7 @@ impl GlobalContext {
             subscribe: SubscribeContext::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
         };
-        let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
+        let stdin = Arc::new(std::sync::RwLock::new(StdinDataSource::new()));
         result.register_source(stdin);
         result
     }
@@ -1099,7 +1102,7 @@ impl GlobalContext {
 
     /// Record, for every source, where the producers named in `predecessor`
     /// stopped, as the start for producers registering from now on
-    /// ([`DataSourceDomainExtentImpl::carry_release_to_new_producers`]).
+    /// ([`DataSourceDomainExtentImpl::carry_release_to_new_producers`](crate::interpreter::DataSourceDomainExtentImpl::carry_release_to_new_producers)).
     ///
     /// `predecessor` is every producer the version being replaced holds: the
     /// reloaded branch's own, or the parent's for branch-and-reload. Called
@@ -1110,7 +1113,8 @@ impl GlobalContext {
     pub fn carry_release_from(&mut self, predecessor: &HashSet<String>) {
         for source in self.sources_and_sinks.sources.values() {
             source
-                .borrow_mut()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
                 .carry_release_to_new_producers(predecessor);
         }
     }
@@ -1228,8 +1232,13 @@ impl GlobalContext {
     /// operator-conversion registration happen later in [`compile_program`] when
     /// [`LoweringContext::take_sources`] is called and every accumulated source
     /// (pre-registered and discovered) is registered in one uniform pass.
-    pub fn register_source(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
-        let name = source.borrow().get_id().to_string();
+    pub fn register_source(&mut self, source: impl Into<crate::ccl::SourceDefinition>) {
+        let source = source.into();
+        let name = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_id()
+            .to_string();
         self.lowering.register_source(name.clone(), source.clone());
         self.sources_and_sinks.sources.insert(name, source);
     }
@@ -1284,7 +1293,7 @@ pub struct CompiledOutput {
     /// name of a registered sink binding.
     pub name: String,
     /// The compiled tile operator producing this output's collection.
-    pub op: Box<dyn TileOperator>,
+    pub op: Arc<dyn TileOperator>,
     /// `Some` for `main` outputs — the producer the caller drives via
     /// [`TileProducer::get`] to consume primary-output values.  `None` for
     /// sink outputs, whose producer is owned by the [`SinkConsumer`].
@@ -1292,7 +1301,7 @@ pub struct CompiledOutput {
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
     /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
     /// This is the consumer's only strong owner: the operator holds it weakly.
-    pub sink_consumer: Option<Rc<RefCell<SinkConsumer>>>,
+    pub sink_consumer: Option<Arc<SinkConsumer>>,
     /// `Some` for `main` outputs: the placement of the
     /// [`Entry`](crate::interpreter::dispatcher::Entry) in front of the caller's consumer, which a
     /// dispatched run sets to the `main` output's pipeline, as it places a sink's consumer in the
@@ -2893,8 +2902,12 @@ pub fn check_program(
     };
     ctx.inference_ctx().marks = crate::ccl::lower::marked_nodes(&projection);
     for (_name, source) in ctx.lowering_ctx().take_sources() {
-        let name = source.borrow().get_id().to_string();
-        let output_type = source.borrow().output_type();
+        let name = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_id()
+            .to_string();
+        let output_type = source.output_type();
         ctx.inference_ctx().register_source_type(&name, output_type);
     }
     // The instances the program declares are each module's check's to read, as they are
@@ -3029,13 +3042,17 @@ fn run_passes(
     // Mutable variable every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
-        let name = source.borrow().get_id().to_string();
-        let output_type = source.borrow().output_type();
+        let name = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_id()
+            .to_string();
+        let output_type = source.output_type();
         // The source's data-function type is constructed inside
         // `register_source_type` from the element type — the `Data` kind is
         // intrinsic, not stamped here.
         ctx.inference_ctx().register_source_type(&name, output_type);
-        ctx.conversion_ctx().register_source(name, source);
+        ctx.conversion_ctx().register_source(name, source.runtime());
     }
 
     debug!("Lowered:\n{}", symbolic(&expr));
@@ -3665,7 +3682,7 @@ fn compile_version(
 
     let mut main_consumer = Some(main_consumer);
     let mut outputs = Vec::with_capacity(per_field_ops.len());
-    for (name, mut op) in per_field_ops {
+    for (name, op) in per_field_ops {
         let name = name.to_string();
         let universal = op.tiling().universal_guard();
         if name == "main" {
@@ -3675,7 +3692,9 @@ fn compile_version(
                 .expect("multiple `main` outputs in the program's trailing record");
             let (entry, placement) =
                 crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone());
-            let producer = op.subscribe(universal, Box::new(entry), ctx.subscribe_context());
+            let producer =
+                op.clone()
+                    .subscribe(universal, Box::new(entry), ctx.subscribe_context());
             debug!(
                 "Main producer:\n{}",
                 pretty_tile_producer_with(
@@ -3701,14 +3720,14 @@ fn compile_version(
 
             let notifier = notifiers.pop().unwrap();
             let (sink_consumer, producer_slot) = SinkConsumer::new(sink, notifier);
-            let consumer_rc = Rc::new(RefCell::new(sink_consumer));
+            let consumer_rc = Arc::new(sink_consumer);
             // The operator holds the consumer weakly, so the output this pushes is its only
             // strong owner, and dropping the program stops the sink
             // (`src/ccl/design/program-evolution.md`, "A subscription lasts as long as its
             // producer").
-            let sink_producer = op.subscribe(
+            let sink_producer = op.clone().subscribe(
                 universal,
-                Box::new(Rc::downgrade(&consumer_rc)),
+                Box::new(Arc::downgrade(&consumer_rc)),
                 ctx.subscribe_context(),
             );
             debug!(
@@ -3721,7 +3740,9 @@ fn compile_version(
                     }
                 )
             );
-            *producer_slot.borrow_mut() = Some(sink_producer);
+            *producer_slot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(sink_producer);
             outputs.push(CompiledOutput {
                 name,
                 op,
