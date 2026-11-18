@@ -1,0 +1,5 @@
+run std::http(port="8080", method="POST", path="/echo") as server
+server_replies: Feed(String)
+for request in server::requests:
+    server_replies << request
+server::respond(server_replies)

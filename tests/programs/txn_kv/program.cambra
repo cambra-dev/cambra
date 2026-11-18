@@ -13,18 +13,19 @@
 # the block calling `put` supplies.  A transaction commits on normal block exit;
 # one that should not write is written with a guard that writes nothing.
 
-import std::http
-
-get_reqs,   get_resps   = http.serve("8080", "GET",  "/get")
-set_reqs,   set_resps   = http.serve("8080", "POST", "/set")
-stats_reqs, stats_resps = http.serve("8080", "GET",  "/stats")
+run std::http(port="8080", method="GET", path="/get") as get_route
+get_route_replies: Feed(String)
+run std::http(port="8080", method="POST", path="/set") as set_route
+set_route_replies: Feed(String)
+run std::http(port="8080", method="GET", path="/stats") as stats_route
+stats_route_replies: Feed(String)
 
 store: Mut(Map(String, String), Txn) := []
 
-def put(key: String, value: String) requires Transaction:
+def put(store: Mut(Map(String, String), Txn), key: String, value: String) requires Transaction:
     store[key] := value
 
-for req in set_reqs:
+for req in set_route::requests:
     with begin():
         # Insert only if absent.  The read and write share one transaction, so
         # two concurrent /set requests for the same key can't both observe it
@@ -32,20 +33,23 @@ for req in set_reqs:
         match store[req.body.key]:
             case `some(_):
                 pass
-            case `none:    put(req.body.key, req.body.value)
-    set_resps[req.id] = "ok\n"
+            case `none:    put(&store, req.body.key, req.body.value)
+    set_route_replies[req.id] = "ok\n"
 
-for req in get_reqs:
+for req in get_route::requests:
     with begin():
         result = store[req.query.key]
-    get_resps[req.id] = match result:
+    get_route_replies[req.id] = match result:
         case `some(v): v
-        case `none:    http.not_found("no such key\n")
+        case `none:    (code=404, body="no such key\n")
 
 # Write count as a declarative aggregate over the /set request stream — a view,
-# not mutable state.  `set_reqs` fans out to both the writer loop above and
+# not mutable state.  `set_route::requests` fans out to both the writer loop above and
 # this counter.
-for req in stats_reqs:
+for req in stats_route::requests:
     with txn = begin():
-        num_writes = count(set_reqs.restrict(\r -> r.time < txn::now()))
-        stats_resps[req.id] = str(num_writes) + "\n"
+        num_writes = count(set_route::requests.restrict(\r -> r.time < txn::now()))
+        stats_route_replies[req.id] = str(num_writes) + "\n"
+get_route::respond(get_route_replies)
+set_route::respond(set_route_replies)
+stats_route::respond(stats_route_replies)

@@ -523,8 +523,8 @@ decides the comparison `true` once the elements seen sum to `100`. With `a₀ = 
 The supports within one map are closed under union ([Well-formed maps](#well-formed-maps)), so the
 runtime can keep any of them.
 
-The alarm feed of `time::alarms()` is not an escape. Its path from feed to source runs through the
-runtime, and its held rows are a producer state ([`time::alarms()`](#timealarms)).
+An alarm sink is not an escape. Its path from sink to source runs through the runtime, and its held
+rows are a producer state ([Alarms](#alarms)).
 
 **[Decided]** — an observation in `𝑂ᵣ` keeps its value for the rest of the run; one outside it was
 never observed ([The durability condition](#the-durability-condition)). Recovery asks an observation
@@ -659,7 +659,7 @@ acknowledged.
 ### Outputs are keyed
 
 A feed is a function over its domain
-([8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)),
+([8.4 Deferred collections](chl-spec.md#84-deferred-collections)),
 so every row appended to a feed has a key, its **feed key**: the site of the `<<` and the position
 at which it ran, `(𝑠, 𝑝)`. The position is the full position, because a feed declared inside a loop
 is a new feed at each iteration. A row fed inside a transaction's body leaves with the attempt that
@@ -1141,10 +1141,11 @@ the next record the partition holds, so a read that returns a later offset than 
 states `none` at the offsets between. An offset the source took and has not released, and that
 retention has since removed, fails recovery under the rule above.
 
-#### `time::alarms()`
+#### Alarms
 
-`time::alarms()` returns a pair: a `set_expiry` feed and an `expiries` source
-([`time::alarms()`](chl-spec.md#timealarms)). The program feeds alarm rows to `set_expiry`, and each
+An alarm module exposes a sink and a source, called `set_expiry` and `expiries` here
+([chl-spec.md, "Alarms"](chl-spec.md#alarms)). The program feeds alarm rows to `set_expiry`, and
+each
 row comes out of `expiries` once the clock reads at or after the row's `at` field. A row fed to the
 pair does not escape the run. The rows the pair holds, its pending alarms, are its producer state
 and are checkpointed as [Checkpoints](#checkpoints) describes. An alarm row
@@ -1179,7 +1180,7 @@ A transaction refuses `AffectWorld`
 ([Transactions are keyed](#transactions-are-keyed-by-their-site-and-position)). Work that has to
 happen after a commit is appended to a feed inside the transaction, which holds the row until the
 transaction commits and drops it if it does not
-([8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)).
+([8.4 Deferred collections](chl-spec.md#84-deferred-collections)).
 A loop outside any transaction consumes the feed and makes the call, passing the row's feed key as
 the call's idempotency key:
 
@@ -1365,9 +1366,9 @@ The model's consequences:
   `<<=` takes one more component in its feed key: the defined collection's operator in its
   generation, and the row's key in it, as a loop over a collection contributes ([Terms](#terms)).
   Without it, two alarms defined by one `<<=` share a message identity, and recovery drops the
-  second ([`time::alarms()`](#timealarms)). Whether `<<=` survives at all is **[Open]** in 4.4.
+  second ([Alarms](#alarms)). Whether `<<=` survives at all is **[Open]** in 4.4.
 
-- **[8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)**
+- **[8.4 Deferred collections](chl-spec.md#84-deferred-collections)**
   indexes a reply inside a transaction by commit tick, and mutability.md's `by_commit_time` keys a
   reply by `Txn`. Under the model a reply's key is its feed key, the transaction's position without
   the attempt index ([Outputs are keyed](#outputs-are-keyed)), as #809 keys it. CHL also has no
@@ -1381,9 +1382,9 @@ The model's consequences:
   transactional clock. #585's
   section 7.5 still carries a clock floor and needs to drop it.
 
-- **[`time::alarms()`](chl-spec.md#timealarms)** says a process exit discards held rows. Held rows
+- **[Alarms](chl-spec.md#alarms)** says a process exit discards held rows. Held rows
   are a producer state and are recovered, and each row's message identity is its feed key
-  ([`time::alarms()`](#timealarms)).
+  ([Alarms](#alarms)).
 
 - **The effects work's readings** state that a reading belongs to its version of the program, that
   a reload may take it again, and that a reading survives a crash only as the producer state

@@ -51,19 +51,21 @@
 //! `const(x)` wrappers, which would otherwise require special
 //! recognition downstream.
 //!
-//! # Products holding functions and feed handles
+//! # Products holding functions and feeds
 //!
-//! A tuple or record literal holding a function or feed handle is split into one binding per
-//! component when every use projects it. Each computed component stays bound once, and an alias
-//! of a feed handle reaches its declaration. A projection directly on such a literal folds to
-//! the selected component (`src/ccl/design/optimization.md`, "Functions held in products").
+//! A tuple or record literal holding a function or a feed's read is split into one binding per
+//! component when every use projects it. Each computed component stays bound once, and a feed's
+//! read reaches its declaration, whose channel delivers the feed's final value. A read keeps the
+//! feed's place type on its `Var`, since a read is typed where it is used, so the component's
+//! type says what it holds. A projection directly on such a literal folds to the selected
+//! component (`src/ccl/design/optimization.md`, "Functions held in products").
 //!
 //! This pass runs **before** [`crate::ccl::channelize`] (so the unified
 //! letrec phase can route an in-loop feed against inlined writers, and a
 //! defer-mediating UDF reaches its call site before channelize routes it), so it
 //! *does* see [`Defer`]/[`Feed`]/[`Define`] nodes and `Type::History` (feed) domains.
 //! Beta-reduction goes through the defer-aware [`crate::ccl::subst::Subst`]
-//! engine, whose `Feed`/`Define` arms rename a fed-to handle correctly when a
+//! engine, whose `Feed`/`Define` arms rename a fed-to place correctly when a
 //! defer-mediating UDF is inlined (`g(mydefer)` for `def g(out): out << e`
 //! renames `out` → `mydefer`). Generators are defer-returning (their body ends
 //! in the yield-defer), so inlining preserves their output.
@@ -101,7 +103,7 @@ use std::collections::HashSet;
 /// UDFs, list-producing UDFs, and curried functions all qualify. A collection is
 /// left intact.
 ///
-/// Literal product projections fold here when the product holds a function or feed handle
+/// Literal product projections fold here when the product holds a function or a feed's read
 /// ([`fold_product_projection`]); `crate::ccl::simplify` folds ordinary data tuples.
 pub fn inline_compute_lambdas(expr: Expr) -> Expr {
     let mut expr = inline_impl(expr, &mut BinderScope::default());
@@ -198,7 +200,7 @@ fn should_inline(bound_ty: &Type) -> bool {
 // Functions held in products
 // ---------------------------------------------------------------------------
 
-/// Whether `ty` contains a compute function or feed handle that must be resolved before
+/// Whether `ty` contains a compute function or a feed's read that must be resolved before
 /// operator conversion or channelization (`src/ccl/design/optimization.md`,
 /// "Functions held in products").
 fn holds_function_or_feed(ty: &Type) -> bool {
@@ -234,13 +236,13 @@ fn product_components(expr: &Expr) -> Option<Vec<(ProjKey, &Expr)>> {
     }
 }
 
-/// Whether a tuple or record literal holds a function or feed handle, at the types its
+/// Whether a tuple or record literal holds a function or a feed's read, at the types its
 /// component values carry.
 fn product_holds_function_or_feed(expr: &Expr) -> bool {
     product_components(expr).is_some_and(|components| {
         components
             .iter()
-            .any(|(_, e)| holds_function_or_feed(&e.ty))
+            .any(|(_, e)| holds_function_or_feed(&e.ty) || product_holds_function_or_feed(e))
     })
 }
 
@@ -264,7 +266,7 @@ fn into_product_components(expr: Expr) -> Vec<(ProjKey, Expr)> {
 }
 
 /// `(𝑎₀, …, 𝑎ₙ).𝑖 ⟹ 𝑎ᵢ`, and the same for a record literal's field, where the literal
-/// holds a function or feed handle.
+/// holds a function or a feed's read.
 ///
 /// A literal is folded whichever component the projection reads. Folding only the
 /// components that hold a compute function would leave `(f=𝑔, k=1).k` with the function
@@ -375,7 +377,7 @@ fn only_projected(name: &Name, expr: &Expr) -> bool {
 }
 
 /// `let 𝑟 = (𝑘₀=𝑎₀, …) in body ⟹ let 𝑐₀ = 𝑎₀ in … body[𝑟.𝑘ᵢ ↦ 𝑐ᵢ]`, for a product that
-/// holds a function or feed handle and is used only through projections ([`only_projected`]).
+/// holds a function or a feed's read and is used only through projections ([`only_projected`]).
 ///
 /// Each component is then a binding of its own type: a function inlines to its
 /// calls, and a collection stays bound once, so no component is recomputed per
@@ -426,6 +428,7 @@ fn split_product_let(binding: &TypedBinding, product: Expr, body: Expr) -> Expr 
         .fold(body, |body, ((_, component), (_, binder))| {
             // A component's binder stands for no name the source writes.
             let component_binding = TypedBinding {
+                parameter_mode: Default::default(),
                 name: binder,
                 occurrence: crate::ccl::Occurrence::mint(),
                 ty: component.ty.clone(),
@@ -494,10 +497,10 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 /// (`crate::ccl::mut_read`, "What ends a segment"):
 ///
 /// - a [`TypedExprNode::MutWrite`] target, which is the write itself; and
-/// - a **handle** — a bare reference whose node carries the `Mut` history
+/// - a **place** mention — a bare reference whose node carries the `Mut` history
 ///   rather than the value — in an [`TypedExprNode::Apply`]'s function or
 ///   argument position, or a component of a call's argument tuple, which is where a
-///   pass-by-reference writer takes it.
+///   borrowing call lends it to a writer.
 ///   The callee's body is not in hand here: this pass expands a UDF at the
 ///   binding that holds it, which is above the call, so a call in `expr` is
 ///   still an unexpanded `Apply` when this runs.
@@ -508,25 +511,12 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 fn is_mut_written(name: &Name, expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::MutWrite { name: target, .. } if target == name => true,
-        TypedExprNode::Apply { function, argument }
-            if is_handle_to(function, name)
-                || is_handle_to(argument, name)
-                || matches!(&argument.node, TypedExprNode::Tuple(components)
-                    if components.iter().any(|c| is_handle_to(c, name))) =>
-        {
-            true
+        TypedExprNode::Borrow(place) => {
+            matches!(&place.node, TypedExprNode::Var(target) if target == name)
+                && place.ty.as_place().is_some_and(|ty| ty.kind.is_exclusive())
         }
         _ => expr.any_child(|e| is_mut_written(name, e)),
     }
-}
-
-/// Is `e` a bare reference to `name` carrying its `Mut` history — the shape a
-/// handle position takes (`src/ccl/design/mutability.md`, "A mutable variable
-/// read is an explicit operation")? A read of the same variable is stamped with
-/// the value type by the rule that emits it, so the stamp is what tells the two
-/// apart.
-fn is_handle_to(e: &Expr, name: &Name) -> bool {
-    matches!(&e.node, TypedExprNode::Var(n) if n == name) && e.ty.mut_value_type().is_some()
 }
 
 /// Whether `definiens` reads a mutable variable that `body` writes.
@@ -987,7 +977,7 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// This pass runs **before** [`crate::ccl::channelize`] (see the module
 /// docs), so it *does* encounter `Defer`/`Feed`/`Define` nodes; beta-reduction
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
-/// which renames a fed-to handle when a defer-mediating UDF is inlined. The
+/// which renames a fed-to place when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `channelize::lift_defer`.
 fn inline_impl(expr: Expr, scope: &mut BinderScope) -> Expr {
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || inline_node(expr, scope))
@@ -1065,7 +1055,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
             // binder rather than its definiens (`crate::ccl::BindingTransparency`),
             // so collapsing the binding would leave those types naming a binder
             // the tree no longer holds. And a binder bound to a mutable variable's
-            // read — `k = acc`, whose definiens carries the `Mut` handle — would put
+            // read — `k = acc`, whose definiens carries the `Mut` place type — would put
             // the variable into the types inside its scope, which no type may name
             // (`src/ccl/design/mutability.md`, "A read is named while inference
             // runs"). Any other transparent binder's definiens is what inference
@@ -1076,7 +1066,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
                 && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
                     || spelled_in_a_type(&body, &binding.name));
 
-            // A product holding a function or feed handle is bound one component at a time,
+            // A product holding a function or a feed's read is bound one component at a time,
             // so each component inlines, aliases its channel, or stays shared on its own type.
             //
             // `inline.anf_product` below rewrites the same `let 𝑝 = (…) in … 𝑝.𝑘 …`
@@ -1109,8 +1099,25 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
                 // Alias collapse: the `Let` and its `Var` bound-expr die, the
                 // body is promoted. Nothing is minted, so the recording exists
                 // only to own the substitution's copies.
+                // Substitution can expose a literal product behind an alias; normalize
+                // the resulting body so its projections receive the same rewrites.
                 let _g = provenance::enter(node_id, "inline.alias", provenance::Nature::Machinery);
-                return substitute(body, &binding.name, &bound_expr);
+                if binding.ty.fun_kind() == Some(&FunKind::Compute) {
+                    return inline_impl(
+                        substitute_function(body, &binding.name, &bound_expr),
+                        scope,
+                    );
+                }
+                if binding.ty == bound_expr.ty {
+                    // A place's row type can mention a binder inside the continuation.
+                    // Renaming keeps each use's type instead of copying that type under
+                    // the binder it describes.
+                    let mut body = body;
+                    crate::ccl::subst::Subst::rename(binding.name, repl_name.clone())
+                        .rewrite_expr(&mut body);
+                    return inline_impl(body, scope);
+                }
+                return inline_impl(substitute(body, &binding.name, &bound_expr), scope);
             }
 
             // **An A-normalization temp naming a closed atom** is an alias as well. The pass
@@ -1125,7 +1132,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
                 )
             {
                 let _g = provenance::enter(node_id, "inline.alias", provenance::Nature::Machinery);
-                return substitute(body, &binding.name, &bound_expr);
+                return inline_impl(substitute(body, &binding.name, &bound_expr), scope);
             }
 
             // **An A-normalization temp read once.** The temp exists to give
@@ -1264,7 +1271,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
         // ANF defer-returning Compose source: when the first element of a Compose
         // (i.e. the for-loop iteration source) is itself a defer-returning
         // expression, wrap it in a fresh `let __for_src_N = source` binding so
-        // that `lift_defer` can physically rename its inner defer handle,
+        // that `lift_defer` can physically rename the feed place its inner `Defer` declares,
         // preventing two same-named `__result` defers from coexisting in
         // `channelize`. Re-running `inline_impl` on the wrapping `Let`
         // triggers the defer lift on the new binding.
@@ -1836,12 +1843,66 @@ fn substitute_floating_lets(
 /// parameter reaches the function's body as a call of its own, its readings and sites reached
 /// through that call (`docs/chl-spec.md`, "Inputs from outside the program").
 fn substitute_one(body: Expr, param: TypedBinding, value: Expr, scope: &mut BinderScope) -> Expr {
+    // A borrowed place is what the parameter names in the body: its writes and feeds land on
+    // the place the caller lent. Inlining consumes the borrow.
+    let value = match value.node {
+        TypedExprNode::Borrow(place) => *place,
+        node => Expr { node, ..value },
+    };
     if matches!(value.node, TypedExprNode::Lambda { .. }) {
         inline_and_beta_reduce(body, &param.name, &value, scope, &PredMemo::new())
     } else if is_shared_computation(&value, &param.name, &body) {
         bind_argument(param, value, body)
     } else {
         substitute(body, &param.name, &value)
+    }
+}
+
+/// Substitute the function `value` for `name` in `body`, where each use is a call of its own:
+/// the readings and sites in each use's copy are reached through that use, as a named function's
+/// are ([`reached_through`]; `docs/chl-spec.md`, "Inputs from outside the program"). A copy that
+/// is a reference takes the use's site, so two calls through one alias of a writer are two
+/// places that feed its channel.
+///
+/// Each use is first renamed apart, so that [`substitute`] places every copy and keeps its
+/// capture avoidance. A mention in a type slot is not a use, and takes the plain copy.
+fn substitute_function(body: Expr, name: &Name, value: &Expr) -> Expr {
+    let mut uses = Vec::new();
+    let mut body = body;
+    rename_uses(&mut body, name, &mut uses);
+    let body = uses.into_iter().fold(body, |body, (renamed, call)| {
+        let mut copy = value.clone();
+        if let Some(call) = call {
+            if matches!(copy.node, TypedExprNode::Var(_)) {
+                copy.site = Some(call);
+            } else {
+                reached_through(&mut copy, &call);
+            }
+        }
+        substitute(body, &renamed, &copy)
+    });
+    substitute(body, name, value)
+}
+
+/// Rename every free use of `name` in `e` to a name of its own, recording each with its call
+/// site, where it is a call.
+fn rename_uses(e: &mut Expr, name: &Name, uses: &mut Vec<(Name, Option<std::rc::Rc<Site>>)>) {
+    let call = e.site.clone();
+    match &mut e.node {
+        TypedExprNode::Var(n) if n == name => {
+            let renamed = Name::fresh_like(name);
+            uses.push((renamed.clone(), call));
+            *n = renamed;
+        }
+        TypedExprNode::Lambda { params, .. } if params.iter().any(|p| &p.name == name) => {}
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if &binding.name == name => {
+            rename_uses(bound_expr, name, uses);
+        }
+        _ => e.walk_children_mut(|child| rename_uses(child, name, uses)),
     }
 }
 
@@ -1934,9 +1995,9 @@ fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeE
     // the value the mutable variable holds and the refinements it supplies are the ones on that
     // value type. The two sides are otherwise recorded at different levels: the deref
     // decides what the operand was *constrained* against, so the parameter holds the
-    // value type, while the argument node keeps its `Mut` stamp — the handle has to
+    // value type, while the argument node keeps its `Mut` stamp — the place type has to
     // survive on the bare `Var` for the phase to find the read. Comparing the stamp
-    // against the parameter would ask a handle to entail a fact about a value. See
+    // against the parameter would ask a place type to entail a fact about a value. See
     // `src/ccl/design/mutability.md`, "`Mut` is a CCL type".
     let mut supplied: Vec<Refinement> = arg_ty
         .refinements()
@@ -2592,19 +2653,19 @@ mod tests {
     }
 
     /// A **mutable variable** argument in a value position: the demanded refinement rides the
-    /// value the mutable variable holds, not the handle stamped on the `Var`.
+    /// value the mutable variable holds, not the place type stamped on the `Var`.
     ///
     /// `def id(v): v` called as `x := 5; id(x)` is the surface shape. The read derefs
     /// the *constraint*, so the parameter acquires the dereferenced
     /// `{Int | __elem == 5}`, while the argument node keeps `Mut({Int | __elem == 5}, D)`
-    /// — the handle has to survive on the bare `Var` for the phase to find the read. The
-    /// two sides therefore sit at different levels, and only reading through the handle
+    /// — the place type has to survive on the bare `Var` for the phase to find the read. The
+    /// two sides therefore sit at different levels, and only reading through the place
     /// compares them at the same one.
     #[test]
     fn refined_outer_param_discharged_by_mut_var_argument() {
         let int = Type::Base(BaseType::Int);
         let singleton = crate::ccl::infer::lit_singleton(&Lit::Int(5));
-        let handle = Type::mutable(Type::Txn, singleton.clone());
+        let place_ty = Type::mutable(Type::Txn, singleton.clone());
         let udf_ty = fn_ty(singleton.clone(), int.clone());
 
         let lambda = TypedExpr::lambda(
@@ -2614,21 +2675,21 @@ mod tests {
             TypedExpr::var("v").with_ty(int.clone()),
         )
         .with_ty(udf_ty.clone());
-        let arg = TypedExpr::var("x").with_ty(handle);
+        let arg = TypedExpr::var("x").with_ty(place_ty);
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("id").with_ty(udf_ty)).with_ty(int);
         let expr = TypedExpr::let_bind("id", Occurrence::mint(), lambda, call);
 
         assert_eq!(inline_compute_lambdas(expr), arg);
     }
 
-    /// Reading through the handle does not weaken the guard: a mutable variable whose *value*
+    /// Reading through the place does not weaken the guard: a mutable variable whose *value*
     /// carries a different refinement than the parameter demands still asserts.
     #[test]
     #[should_panic(expected = "does not entail")]
     fn mut_var_argument_with_other_refinement_still_asserts() {
         let int = Type::Base(BaseType::Int);
         let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
-        let handle = Type::mutable(Type::Txn, crate::ccl::infer::lit_singleton(&Lit::Int(7)));
+        let place_ty = Type::mutable(Type::Txn, crate::ccl::infer::lit_singleton(&Lit::Int(7)));
         let udf_ty = fn_ty(demanded.clone(), int.clone());
 
         let lambda = TypedExpr::lambda(
@@ -2639,7 +2700,7 @@ mod tests {
         )
         .with_ty(udf_ty.clone());
         let call = TypedExpr::apply(
-            TypedExpr::var("x").with_ty(handle),
+            TypedExpr::var("x").with_ty(place_ty),
             TypedExpr::var("id").with_ty(udf_ty),
         )
         .with_ty(int);

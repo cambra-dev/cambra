@@ -24,13 +24,20 @@ predicate can refer to the parameters. `opaque_output` renames the binder to the
 binder it mints itself, so later passes read a lambda's result through one binder
 (`opaque_output::output_body`).
 
-A `Mut(…)` or `Feed(…)` parameter is a binder like any other, stamped with a history type whose
-domain inference fills; a transactional `Mut(…, Txn)` parameter fixes its domain to `Txn`. A mutable
-write and a feed keep the parameter name as their target, and inlining substitutes the caller's
-mutable variable or channel for it from the call's argument tuple. A call of such a function lowers
-each argument that is a bare name as the variable it names (`Passing::ByReference`), bypassing the
-out-of-block read gate a value read takes; inference decides from the callee's parameter types
-which components pass by reference.
+A parameter the body writes, feeds or passes on with `&` borrows a place, which a `Mut(…)` or
+`Feed(…)` annotation states and the body's uses otherwise infer (`lower_params`); a transactional
+`Mut(…, Txn)` parameter fixes its domain to `Txn`. A mutable write and a feed keep the parameter
+name as their target, and inlining substitutes the place the caller lent for it from the call's
+argument list. A call lowers each argument as a value, except one written `&x`, which lowers to a
+`Borrow` of the place and bypasses the out-of-block read gate a value read takes
+(`lower_call_arg`).
+
+Parameters with ordinary annotations retain those annotations on their binders. A `def` output
+annotation inserts an annotated binding for `__output` inside the lambda body. Its refinement
+predicate can therefore refer to function parameters. Once inference has checked the annotation,
+it renames the binding to a compiler output name
+(`opaque_output::canonicalize_written_result`), so `opaque_output::output_body` peels a written
+result as it peels the result binding `opaque_output` mints.
 
 A call passing other than one argument lowers them as its argument list
 (`TypedExprNode::Arguments`), `f()` included, so that inference can tell it from a tuple passed as
@@ -38,6 +45,8 @@ one argument (`docs/chl-spec.md`, "Parameter lists"). Inference types a lambda o
 parameter as a function of their parameter list, its codomain reading each parameter by its name
 (`Type::fun_of_params`), and inlining substitutes the arguments of each call for them, so a lambda
 left past inlining binds one parameter, the form `lambda_elim` eliminates.
+The borrow checks after inference ([mutability.md](mutability.md#feed-is-a-ccl-type)) reject
+overlapping mutable borrows and callbacks that outlive their places. Deferred borrows are shared.
 
 Explicitly nested lambdas can still produce the internal `curry` combinator and are not generally
 compilable through operator conversion. CHL has no built-in surface `curry` function.
@@ -71,8 +80,8 @@ it reads its source as a comprehension does, through `unbox`
 ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). The composition carries
 a data-function annotation. The comprehension phase indexes it by its position before inference,
 `λ 𝑟 → (𝑟 ▷ (source ▷ unbox)) ▷ (λ x → body)`, the form a comprehension's generator takes, so an
-element whose type reads its position, a group of a group-by, is typed under the loop's binder. A loop that feeds an existing defer handle needs no result binding. A loop with `yield`
-creates a result defer handle and replaces each `yield 𝑒` with a feed to that handle:
+element whose type reads its position, a group of a group-by, is typed under the loop's binder. A loop that feeds an existing feed place needs no result binding. A loop with `yield`
+creates a result feed place and replaces each `yield 𝑒` with a feed to that place:
 
 ```text
 def f(xs):
@@ -132,15 +141,15 @@ nested inside such a conditional is unsupported.
 bound to a minted name, and only then does each component pattern bind from the name its value
 is under, so `b, a = (a, b)` reads both old values.
 
-A tuple literal under a tuple pattern of the same length binds each element directly, at every
-depth of nesting, so the statement builds no tuple it only takes apart. Any other value is bound
-once to a minted name, and component `𝑖` reads its projection `.𝑖`. A feed handle projected out of
-a tuple or record literal reaches `channelize` as an alias of its channel. The inline pass splits
-the literal into one binding per component, so a computed component is still evaluated once
-([Functions held in products](optimization.md#functions-held-in-products)). A handle chosen at run
-time does not reach its declaration
+A tuple literal under a tuple pattern of the same length binds each element directly, at every depth
+of nesting, so the statement builds no tuple it only takes apart. Any other value is bound once to a
+minted name, and component `𝑖` reads its projection `.𝑖`. A source product stores collection reads
+of Feeds. The inline pass splits a static product containing these reads into component bindings,
+retaining computed siblings once and keeping unrelated fields independent of a Feed's contents
+([optimization.md, "Functions held in products"](optimization.md#functions-held-in-products)).
+Writable references cannot be stored in source data structures
 ([mutability.md, "`Feed` is a CCL type"](mutability.md#feed-is-a-ccl-type);
-[chl-spec.md, "A deferred collection inside a data structure [Open]"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure-open)).
+[chl-spec.md, "A deferred collection inside a data structure"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure)).
 
 A `for` binder that is a pattern or `_` lowers as the loop over a minted name whose body starts
 with the assignment `𝑝 = 𝑒` (`ForPattern` in `lower/loops.rs`), so every loop site lowers a binder
@@ -158,19 +167,14 @@ the two is an error. Feed and define expressions have type `Unit`.
 
 | CHL | Lowered role |
 |---|---|
-| `x: Feed(V)` | Bind a `Defer` handle |
+| `x: Feed(V)` | Bind the feed place a `Defer` declares |
 | `x << value` | Add a `Feed(x, value)` contribution |
 | `x <<= value` | Add the sole `Define(x, value)` contribution |
 
-`x: Feed(V)` becomes `let x : Feed(V) = Defer in body`, the `Defer` imaging the annotation
-(`feed_declaration` in `lower/stmts.rs`). A declaration with any other annotation is refused, since
-only a feed is introduced with no value. A feed or define in statement position is sequenced through
-`ExprStmt`. A `Feed(…)` parameter is a named binder, so inlining substitutes the handle the caller
-passed for it. A top-level
-`𝑝 = http_serve(port, method, path)` binds `𝑝` to the tuple `(Source(requests), responses)`, where
-`responses` names a `Defer` that a `let` around the statement binds. Both names are minted from the
-route, and `responses` is the sink's name for compilation, so the program's sink record reads the
-channel whatever `𝑝` binds.
+`x: Feed(V)` becomes `let x : Feed(V) = Defer in body`, the `Defer` imaging the annotation.
+A declaration with any other annotation requires an initializer. Feed and define statements
+sequence through `ExprStmt`. A borrowed parameter is a named binder, so inlining substitutes the
+place the caller lent for it.
 
 `out = test_sink()` binds a response `Defer` to a `TestSink` registered by the test through
 `GlobalContext::register_test_sink`. This form exists only under `cfg(test)`. `sink_declaration` in `lower/sinks.rs` recognizes both sink declarations; non-top-level
@@ -184,18 +188,18 @@ loops, so channelization handles them like feeds from other expressions. It elim
 `Feed`, `Define`, and `ExprStmt` before downstream passes run.
 
 For each cluster of consecutive defer bindings, channelization extracts its feeds or define from the
-cluster body and builds a channel expression for each handle. Multiple feeds combine with `Copair`
-(`++`), each contribution under its feed's site's tag ([sites.md](sites.md#channel-tags)). Feeds
-inside iteration retain their iteration context. An extracted feed takes a copy of each binding it
-reads in the scope it leaves: a `let`, or a channel group, which is what a feed declared beneath the
-extracted one, as in a loop body, has become by then. A recurrence group is not copied. A multi-arm
-feeding `Case` inside a loop produces a refined-source channel for each feeding arm. A guarded
-feeding `Case` outside iteration uses a one-shot lift, and a feeding `match` arm there feeds through
-its tag's projection of the scrutinee. The cluster becomes a mutually scoped `Feed`-kind `LetRec`.
-Recognition later orders an acyclic group as `Let` bindings; an unguarded cycle between channels is
-rejected.
+cluster body and builds a channel expression for each feed place. Multiple feeds combine with
+`Copair` (`++`), each contribution under its feed's site's tag ([sites.md](sites.md#channel-tags)).
+Feeds inside iteration retain their iteration context. An extracted feed takes a copy of each
+binding it reads in the scope it leaves: a `let`, or a channel group, which is what a feed declared
+beneath the extracted one, as in a loop body, has become by then. A recurrence group is not copied.
+A multi-arm feeding `Case` inside a loop produces a refined-source channel for each feeding arm. A
+guarded feeding `Case` outside iteration uses a one-shot lift, and a feeding `match` arm there feeds
+through its tag's projection of the scrutinee. The cluster becomes a mutually scoped `Feed`-kind
+`LetRec`. Recognition later orders an acyclic group as `Let` bindings; an unguarded cycle between
+channels is rejected.
 
-`channelize` also lifts defer-returning bindings and substitutes aliases that carry defer handles.
+`channelize` also lifts defer-returning bindings and substitutes aliases that carry feed places.
 It drops the `ExprStmt` nodes after their feed contributions have been extracted. The
 [mutability design](mutability.md) records the phase order; `channelize.rs` documents its
 extraction cases and structural errors.
@@ -204,11 +208,11 @@ extraction cases and structural errors.
 
 Inference checks `Defer`, `Feed`, and `Define` on the source-shaped tree. A defer has a transient
 `Feed` history type with rigid domain `ChanDom(d)`, and each contribution is constrained to its
-handle. The domain name lets consumers type against the handle before the channel is assembled.
+feed place. The domain name lets consumers type against the place before the channel is assembled.
 Channelization stamps constructed nodes from their typed children, then substitutes each rigid
 name with its assembled domain and erases the `Feed` history wrapper. This does not require a
 second inference pass. The strict post-channelization type check verifies the result. See
-[Feed handles as invariant histories](type-inference.md#feed-handles-as-invariant-histories).
+[Feed places as invariant histories](type-inference.md#feed-places-as-invariant-histories).
 
 For a structured mutation loop, `emit_for` checks that the source is a function, binds its domain to
 the loop's position and its codomain at the position to the loop target, and checks the body as a

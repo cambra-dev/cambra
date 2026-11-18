@@ -1943,7 +1943,7 @@ fn seed_pairings_go(
                 }
             }
         }
-        // A feed handle reads through to its read view, its `function`, during coalescing
+        // A feed place type reads through to its read view, its `function`, during coalescing
         // (`dissolve_read_feeds`), so the use side may be the dissolved `Fun` where the
         // definition still carries the `History`, or the other way round. Either way the
         // functions pair.

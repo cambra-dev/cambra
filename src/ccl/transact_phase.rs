@@ -2797,7 +2797,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
         TypedExprNode::ExprStmt { expr, body } => {
             let node_id = block.node_id;
             let body = splice_block(*body, rest);
-            let ty = body.ty.clone();
+            let ty = body.ty.read_value_type().clone();
             let capabilities =
                 crate::ccl::capabilities::of_parts(&[&expr.capabilities, &body.capabilities]);
             Expr {
@@ -2851,7 +2851,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
         // chain ending in `Unit`;
         // any other terminal is unexpected — sequence it defensively before rest.
         _ => {
-            let ty = rest.ty.clone();
+            let ty = rest.ty.read_value_type().clone();
             // A freshly-synthesized defensive sequencing wrapper.
             Expr::new(TypedExprNode::ExprStmt {
                 expr: Box::new(block),
@@ -2997,14 +2997,10 @@ fn partition_spine(
 /// Prepend a list of effect expressions (lifted induction `MutWrite`s) onto a
 /// spine as `ExprStmt` statements, preserving their original order.
 fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
-    effects.into_iter().rev().fold(rest, |rest, effect| {
-        let ty = rest.ty.clone();
-        Expr::new(TypedExprNode::ExprStmt {
-            expr: Box::new(effect),
-            body: Box::new(rest),
-        })
-        .with_ty(ty)
-    })
+    effects
+        .into_iter()
+        .rev()
+        .fold(rest, |rest, effect| Expr::expr_stmt(effect, rest))
 }
 
 /// Reject an **induction-only transaction**: a `with begin():` block that writes
@@ -3235,7 +3231,7 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 /// - A **write** inside a later block is a `MutWrite` targeting `x`; a **read** inside one
 ///   is a bare `Var(x)` in the writer body. Outside a block both are already refused by
 ///   inference, since no block supplies the `Transaction` they require.
-/// - A **pass-by-reference argument** is the one mention lowering lets through — a
+/// - A **borrowed argument** is the one mention lowering lets through — a
 ///   `Mut`-typed argument is a bare `Var` by rule, so `lower_call_arg` bypasses the
 ///   gate — and `inline` beta-reduces it into the callee body, where it becomes one of
 ///   the two above.
@@ -3279,7 +3275,7 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), Located<String>> {
             TypedExprNode::MutWrite { name, .. } if awaited.contains(name) => {
                 return Err(used_up(name, e));
             }
-            // The await itself. Its operand is a handle, not a read, so the `Var` is
+            // The await itself. Its operand is a place, not a read, so the `Var` is
             // not descended into — otherwise the await would report itself.
             TypedExprNode::Apply { argument, function }
                 if matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal)) =>

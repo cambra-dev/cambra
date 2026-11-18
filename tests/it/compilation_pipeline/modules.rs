@@ -795,6 +795,19 @@ fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str
     assert_refused(&program(root, &[("scaled", SCALED)]), needle);
 }
 
+#[rstest]
+#[case::feed("pub events: Feed(Int)")]
+#[case::inferred_feed("pub events: Feed(_)")]
+#[case::mut_var("pub count := 0")]
+#[case::transactional_mut_var("pub count: Mut(Int, Txn) := 0")]
+fn public_place_declarations_are_refused(#[case] declaration: &str) {
+    let errors = compile_errors(&program("run producer", &[("producer", declaration)]));
+    assert!(
+        errors.contains("a place declaration cannot be public"),
+        "{errors}"
+    );
+}
+
 /// Importing a module whose top level requires or causes what none of its scopes discharges is
 /// an error at the `import`, pointing at the statement that does (`docs/chl-spec.md`,
 /// "Shareable modules"): binding a sink, reading a source, declaring a transactional
@@ -811,15 +824,10 @@ fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str
     stock: Mut(Int, Txn) := 0
     pub n = 1
 "}, "its top level causes `WriteTxn(stock)`", "stock: Mut(Int, Txn) := 0")]
-#[case::a_public_feed(
-    "pub events: Feed(_)\n",
-    "its top level causes `Append(events)`",
-    "pub events: Feed(_)"
-)]
 #[case::a_route(indoc! {"
-    requests, responses = http_serve(\"8080\", \"GET\", \"/x\")
+    run std::http(port=\"8080\", method=\"GET\", path=\"/x\") as server
     pub n = 1
-"}, "its top level requires `ObserveWorld`", "http_serve")]
+"}, "it runs another module", "run std::http")]
 #[timeout(Duration::from_secs(10))]
 fn importing_a_module_that_is_run_is_refused(
     #[case] library: &str,
@@ -907,8 +915,8 @@ fn an_imported_function_writes_the_callers_state(
     let root = formatdoc! {"
         {import}a: Mut(Int, Txn) := 100
         b: Mut(Int, Txn) := 0
-        {draw}(a, 10)
-        {transfer}(a, b, 30)
+        {draw}(&a, 10)
+        {transfer}(&a, &b, 30)
         await_final(a) * 1000 + await_final(b)
     "};
     check_program_scalar(&program(&root, &[("bank", bank)]), Value::Int(60_030));
@@ -929,14 +937,14 @@ fn an_imported_function_feeds_the_callers_feed(
     let logs = indoc! {"
         pub def note(o: Feed(Int), x: Int):
             o << x
-        pub def note_twice(o, x):
+        pub def note_twice(o: Feed(_), x):
             o << x
             o << x * 10
     "};
     let root = formatdoc! {"
         {import}out: Feed(_)
-        {note}(out, 1)
-        {note_twice}(out, 2)
+        {note}(&out, 1)
+        {note_twice}(&out, 2)
         sum(out)
     "};
     check_program_scalar(&program(&root, &[("logs", logs)]), Value::Int(23));
@@ -963,8 +971,8 @@ fn an_imported_function_writes_the_callers_induction_variable(
     let root = formatdoc! {"
         {import}cnt: Mut(Int) := 0
         for x in [1, 2, 3]:
-            {bump}(cnt)
-            {add}(cnt, x)
+            {bump}(&cnt)
+            {add}(&cnt, x)
         cnt
     "};
     check_program_scalar(&program(&root, &[("counter", counter)]), Value::Int(9));

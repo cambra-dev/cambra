@@ -856,25 +856,30 @@ pub enum InferError {
         /// Omitted from the message; excluded by [`Self::same_defect`].
         origin: String,
     },
-    /// A [`Type::History`]-typed expression appears in a value position but is not
-    /// a bare variable reference — the second-class discipline's rule 1 (see
-    /// `src/ccl/design/mutability.md`, "`Mut` is a CCL type"). A mutable value must
-    /// be traceable to a single introduction, so a computed/conditional
-    /// expression of `Mut` type is rejected, reported by [`check_mut_discipline`], and
-    /// so is a non-variable argument to a `Mut` parameter, which emission reports at the
-    /// call.
-    MutNotBareVariable {
+    /// A `Mut(V)` type whose value type `V` has a function type causing an effect on a place:
+    /// appending to a feed or writing a mutable variable. Such a type is not well-formed, which
+    /// keeps a Feed or a Mut from being inside a Mut (`docs/chl-spec.md`, "Places and values").
+    MutValueActsOnPlace {
         /// The expression written in CCL. Omitted from the message; excluded by
         /// [`Self::same_defect`].
         at: String,
+        /// The value type `V` of the ill-formed `Mut(V)`.
+        ty: Type,
+        /// The effect a function type in the value type causes.
+        effect: Box<crate::ccl::capabilities::Effect>,
     },
-    /// A [`Type::History`] appears nested inside a composite type — the
-    /// second-class discipline's rule 2. `Mut` is legal only at a top-level
-    /// binding/parameter/expression position and at a function *domain*
-    /// (pass-by-reference); a `Mut` in a tuple/record/variant payload, a
-    /// `Feed` payload, a function *codomain* (never a return type), or as a
-    /// child of another `Mut` breaks the "writer set is statically known"
-    /// guarantee. Reported by [`check_mut_discipline`].
+    /// A use of the `Mut` or `Feed` place `name` that breaks the borrowing discipline
+    /// (`docs/chl-spec.md`, "Places and values").
+    Place {
+        /// The base name of the place, or of the binder or parameter the defect is about.
+        name: String,
+        /// What is wrong with the use.
+        defect: PlaceDefect,
+    },
+    /// A place type, `Mut(…)` or `Feed(…)`, nested inside another type: a place type stands only
+    /// as the whole type of a declaration or a parameter, or as a function type's parameter
+    /// ([`crate::ccl::place::visit_places`]). Lowering refuses a written one; this reports an
+    /// inferred one, from [`check_places`].
     MutInCompositeType {
         /// The expression written in CCL. Omitted from the message; excluded by
         /// [`Self::same_defect`].
@@ -882,31 +887,40 @@ pub enum InferError {
         /// The composite type that illegally contains a `Mut`.
         ty: Type,
     },
-    /// A bare-variable argument to a `Mut` parameter does not name a mutable
-    /// variable — its (peeled) type is not [`Type::History`]. The second-class
-    /// discipline's rule 1: a `Mut` argument must be a `Mut`-*introduced* variable,
-    /// so the callee's writes advance a real mutable variable the caller shares. A plain value would
-    /// otherwise satisfy the lenient pass-by-reference coercion (`V <: Mut(V,
-    /// D)`) and be silently mutated in name only. Emission reports it at the call.
-    MutArgNotMutable {
-        /// The argument written in CCL. Omitted from the message; excluded by
-        /// [`Self::same_defect`].
-        at: String,
-    },
     /// A parameter written `Mut(V)`, a mutable variable, that is passed a transactional
     /// variable, `Mut(V, Txn)`: two types (`docs/chl-spec.md`, "6.2 Non-purity as type wrappers"). Reported by
-    /// [`check_mut_discipline`].
+    /// [`transactional_args_to_mut_params`].
     TransactionalArgToMutParam { param: String },
     /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
     /// [`Type::History`] — a write to something that was never introduced as a
     /// mutable variable. Writes require a mutable (they never mean "shadow an
-    /// immutable"); introduce the mutable variable with `:=` (or annotate a pass-by-reference
-    /// parameter `Mut(…)`). Emission reports it at the write: a `def` named by a write and
+    /// immutable"); introduce the mutable variable with `:=`, and a parameter the body writes
+    /// borrows. Emission reports it at the write: a `def` named by a write and
     /// nothing else leaves no binder after monomorphization, and the write names one there.
     MutWriteToNonMutable {
         /// The base name of the write target.
         name: String,
     },
+}
+
+/// What [`InferError::Place`] reports about a place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceDefect {
+    /// Two exclusive borrows of one place in one call.
+    BorrowedTwice,
+    /// A function writes an induction variable it captures.
+    CapturedInductionWrite,
+    /// A `&` argument reaches a parameter that receives a value.
+    ValueParameterBorrowed,
+    /// A feed's target is not a Feed place.
+    FeedTargetNotAPlace,
+    /// A value reaches a parameter that borrows, without `&`.
+    BorrowMissing,
+    /// A `&` lends a value variable, or a path from one: only a place can be lent.
+    BorrowsAValue,
+    /// A `&` lends a path from a place variable, `&s.a`, which is planned
+    /// (`docs/chl-spec.md`, "Places and values").
+    BorrowsPartOfAPlace,
 }
 
 impl InferError {
@@ -955,9 +969,8 @@ impl InferError {
                 | InferError::UnresolvedPartial { at, .. }
                 | InferError::UnresolvedTupleWidth { at, .. }
                 | InferError::TypeParamEscapes { at, .. }
-                | InferError::MutNotBareVariable { at }
-                | InferError::MutArgNotMutable { at }
-                | InferError::MutInCompositeType { at, .. } => at.clear(),
+                | InferError::MutInCompositeType { at, .. }
+                | InferError::MutValueActsOnPlace { at, .. } => at.clear(),
                 _ => {}
             }
             let types = std::cell::RefCell::new(Vec::new());
@@ -1150,7 +1163,8 @@ impl InferError {
                 each(required);
                 each(found);
             }
-            InferError::MutInCompositeType { ty, .. } => each(ty),
+            InferError::MutInCompositeType { ty, .. }
+            | InferError::MutValueActsOnPlace { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
             InferError::OpaqueEscape { ty, .. } => each(ty),
             InferError::InstanceCallContains { at, within, .. } => {
@@ -1181,6 +1195,7 @@ impl InferError {
             | InferError::EscapesItsVariable { .. }
             | InferError::HandsOutItsVariable { .. }
             | InferError::Unsupported(_)
+            | InferError::Place { .. }
             | InferError::EmptyCase { .. }
             | InferError::UnhandledConstructors { .. }
             | InferError::UnresolvedHole { .. }
@@ -1190,8 +1205,6 @@ impl InferError {
             | InferError::UnresolvedTupleWidth { .. }
             | InferError::IncompatibleBounds { .. }
             | InferError::TupleWidthConflict { .. }
-            | InferError::MutNotBareVariable { .. }
-            | InferError::MutArgNotMutable { .. }
             | InferError::TransactionalArgToMutParam { .. }
             | InferError::TypeParamEscapes { .. }
             | InferError::ParamReadsBinder { .. }
@@ -1556,19 +1569,27 @@ fn tuple_width(ty: &Type) -> Option<usize> {
     }
 }
 
-/// The hint for a product `found` where the product `expected` is required. A type
-/// parameter found is read as its bound, which is what the definition knows of it.
-/// The hint for a mismatch between a [`Type::Record`] and a [`Type::Tuple`].
-///
-/// The two are the same thing — a product — keyed differently, by field *name* and by
-/// *position*, so a mismatch between them is never about depth: it is always that one
-/// keying was used where the other applies, which the bare shapes do not say. It is the
-/// failure `r.0` and `t.name` produce, and the required side of such an edge is a
-/// projection's *partial* shape (`(?31)` names only the position it reads), so the raw
-/// message reads as internal machinery rather than as the mistake.
-///
-/// Both messages are facts about the *pair*, true whichever side the solver reports as
-/// "expected" — an application's domain can be raised from either side of its edge.
+/// The hint for a call whose function, known only once inference solves it, takes a parameter
+/// list of another length than the arguments the call passes: the late form of
+/// [`InferError::CallArity`], for a callee read through a field or returned by another call.
+/// `expected` is the function the call expects and `found` the one it reached.
+fn call_arity_hint(ctx: &str, expected: &Type, found: &Type) -> Option<String> {
+    let length = |ty: &Type| match ty.peel_refinements() {
+        Type::Fun { binder, .. } => Some(binder.parameter_count().unwrap_or(1)),
+        _ => None,
+    };
+    let (args, params) = (length(expected)?, length(found)?);
+    (ctx == "this call" && args != params).then(|| {
+        format!(
+            "hint: the function takes {params} argument{}, got {args}",
+            if params == 1 { "" } else { "s" }
+        )
+    })
+}
+
+/// The hint for a product mismatch: named versus positional fields, incompatible tuple widths,
+/// or a fixed-width tuple required from an open tuple bound. A type parameter found is read at
+/// its bound, which is all its definition knows.
 fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
     let found = match found {
         Type::Param(p) => p.bound.as_ref().unwrap_or(found),
@@ -1838,6 +1859,9 @@ impl std::fmt::Debug for InferError {
                         "Type mismatch for {ctx}: expected {expected_text}, found {found_text}"
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
+                        write!(f, "\n  {hint}")?;
+                    }
+                    if let Some(hint) = call_arity_hint(ctx, expected, found) {
                         write!(f, "\n  {hint}")?;
                     }
                     if let Some(hint) = option_variant_hint(expected, found) {
@@ -2345,19 +2369,68 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
-            InferError::MutNotBareVariable { .. } => {
+            InferError::MutValueActsOnPlace { ty, effect, .. } => {
                 write!(
                     f,
-                    "a value of a `Mut(…)` type must be a mutable variable named where it is \
-                     used, not a computed expression"
+                    "the type `Mut({})` is not well-formed: a `Mut(…)`'s value type cannot have a \
+                     function type that appends to a feed or writes a mutable variable, and this one \
+                     has one causing `{effect}`, so a Feed or a Mut would be inside a Mut",
+                    w.ty(ty)
                 )
+            }
+            InferError::Place { name, defect } => {
+                let place = if name.is_empty() {
+                    "a place".to_string()
+                } else {
+                    format!("`{name}`")
+                };
+                match defect {
+                    PlaceDefect::BorrowedTwice => write!(
+                        f,
+                        "{place} is reached twice in one call, by two `&` arguments or by a \
+                         borrow and captured access; a mutable borrow is exclusive"
+                    ),
+                    PlaceDefect::CapturedInductionWrite => write!(
+                        f,
+                        "a function writes the mutable variable {place} it captures; an \
+                         induction variable's writes need their position in its history, so \
+                         pass it to a borrowed parameter with `&` instead"
+                    ),
+                    PlaceDefect::ValueParameterBorrowed => write!(
+                        f,
+                        "{place} is a value parameter, so it cannot borrow: pass the value \
+                         without `&`, or write or feed {place} in the function to make it borrow"
+                    ),
+                    PlaceDefect::BorrowMissing if name.is_empty() => write!(
+                        f,
+                        "this argument goes to a parameter that borrows; pass a named Mut or \
+                         Feed place with `&`"
+                    ),
+                    PlaceDefect::BorrowMissing => write!(
+                        f,
+                        "{place} goes to a parameter that borrows it; pass `&{name}`"
+                    ),
+                    PlaceDefect::BorrowsAValue => write!(
+                        f,
+                        "cannot borrow {place}: it is a value, and `&` lends a Mut or Feed place"
+                    ),
+                    PlaceDefect::BorrowsPartOfAPlace => write!(
+                        f,
+                        "this `&` lends part of {place}; lending a projected part of a place is \
+                         planned and not supported yet, so a borrow lends a whole place variable"
+                    ),
+                    PlaceDefect::FeedTargetNotAPlace => write!(
+                        f,
+                        "{place} is not a Feed place: a feed target is a declared Feed or a \
+                         borrowed Feed parameter"
+                    ),
+                }
             }
             InferError::MutInCompositeType { ty, .. } => {
                 write!(
                     f,
-                    "a `Mut(…)` type cannot be part of another type, such as a tuple, a \
-                     record, a feed's values or a function's result: {}",
-                    w.ty(ty)
+                    "{}",
+                    crate::ccl::place::nested_place_message(&w.ty(ty).to_string())
                 )
             }
             InferError::TransactionalArgToMutParam { param } => {
@@ -2368,19 +2441,11 @@ impl std::fmt::Debug for InferError {
                      transactional variable is written `Mut(…, Txn)`"
                 )
             }
-            InferError::MutArgNotMutable { .. } => {
-                write!(
-                    f,
-                    "argument to a `Mut` parameter must be a mutable variable, not a \
-                     plain value"
-                )
-            }
             InferError::MutWriteToNonMutable { name } => {
                 write!(
                     f,
                     "cannot write `{name}` with `:=` / `+=`: `{name}` is not a mutable \
-                     variable. Introduce it with `:=` (or, for a pass-by-reference \
-                     parameter, annotate it `Mut(...)`)"
+                     variable. Introduce it with `:=`"
                 )
             }
         }
@@ -2739,8 +2804,13 @@ fn clear_annotations(expr: &mut Expr) {
 /// with no annotations left in it must not split the `Rc` sharing that downstream
 /// per-predicate memos dedup on.
 fn clear_annotations_in(expr: &mut Expr, predicates: &PredMemo<()>) -> bool {
+    // A written result is told from an inferred one by its binder's name, which this records
+    // in the compiler output name.
+    crate::ccl::opaque_output::canonicalize_written_result(expr);
     let mut cleared = expr.user_annotation.take().is_some();
-    expr.walk_binders_mut(|b| cleared |= b.user_annotation.take().is_some());
+    expr.walk_binders_mut(|b| {
+        cleared |= b.user_annotation.take().is_some();
+    });
     // Annotations also ride expressions hanging off *type* slots — a refinement's
     // predicate — and those nodes are outside `walk_children` entirely. Inference
     // reads them there (`groupby` stamps the key relation that ties `__gb_k` to its
@@ -3418,13 +3488,13 @@ fn collect_type_errors(
             );
         }
         Type::History { history_kind, .. } => {
-            // A history handle at the strict wall is a compiler bug — a `Feed`
+            // A place type at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, an `Overwrite`
             // history by the unified phase (`transact_phase` / `mut_elim`).
             if strictness.rejects_transients() {
                 let what = match history_kind {
-                    HistoryKind::Append => "feed handle type survived channelize",
-                    HistoryKind::Overwrite => "mutable-reference type survived the unified phase",
+                    HistoryKind::Append => "feed place type survived channelize",
+                    HistoryKind::Overwrite => "mutable place type survived the unified phase",
                 };
                 errors.push(InferError::Unsupported(format!(
                     "{what} at `{context_sym}`"
@@ -3620,48 +3690,43 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Second-class `Mut` discipline
+// Place checks after inference
 // ---------------------------------------------------------------------------
 
-/// Enforce the second-class `Mut` discipline's rules on resolved types (design doc
-/// `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
-/// second-class (downward-only)"): a structural pass over the coalesced tree, the last
-/// step of a run of inference ([`super::run_with_params`]), so its errors are reported
-/// with coalesce's. Every rule reads a node's or binder's `ty`.
-///
-/// The two rules, both of which keep a mutable value statically traceable to
-/// a single introduction (so the writer set of every mutable variable is known):
-///
-/// 1. A `Mut`-typed *value* must be a bare variable reference — no computed
-///    expression of `Mut` type ([`InferError::MutNotBareVariable`]). A *conditional*
-///    over two mutable variables is not caught here: a mutable read derefs into the
-///    arms' join exactly as it derefs into a tuple element, so the selection types as a
-///    plain value and there is no `Mut` left on the node. What the rule is protecting —
-///    a selected mutable variable reaching a position that writes through it — is the
-///    argument rule emission checks where it passes an argument by reference
-///    ([`InferError::MutArgNotMutable`]).
-/// 2. `Mut` may not appear inside any composite type — only at a top-level
-///    binding/parameter/expression position, a function *domain* or one of its
-///    parameters, and a call's argument or one of its arguments
-///    ([`InferError::MutInCompositeType`]).
-///
-/// There is no third rule about an *unannotated* binding holding a `Mut`. It was
-/// needed while a `Let` could bind a mutable variable, so that `b = a` did not silently
-/// alias one; now only [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda`
-/// param can, and an initializer that is a mutable variable *reads* at a `Let` (`emit_let`
-/// derefs it). The alias is unrepresentable rather than rejected, and writing
-/// through the copy is the write emission refuses ([`InferError::MutWriteToNonMutable`])
-/// — which blames the write rather than the binding. Asserted in debug by
-/// [`debug_assert_no_mut_var_let`].
-pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
+/// The checks on `Mut` and `Feed` places that need the resolved tree. A place type stands only
+/// as the whole type of a declaration or a parameter, or as a function type's parameter
+/// ([`crate::ccl::place::visit_places`], which lowering applies to written types), and a
+/// `Mut(V)` is well-formed only if no function type in `V` acts on a place. A `&` reaches only
+/// a parameter that borrows, one call reaches an exclusive place at most once
+/// ([`exclusive_borrows`]), and a function writes no induction variable it captures
+/// ([`captured_induction_writes`]). The rules a node's own typing decides, a binding holding a
+/// place, a missing `&`, a feed target that is no place, are refused where the node is emitted,
+/// before any mismatch it would also meet. See `src/ccl/design/mutability.md`, "`Feed` is a CCL
+/// type".
+pub fn check_places(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     debug_assert_no_mut_var_let(expr);
     let mut errors = Vec::new();
-    check_mut_discipline_go(expr, false, &mut errors);
+    let mut places = HashMap::new();
+    fn collect_places(expr: &Expr, places: &mut HashMap<Name, crate::ccl::place::PlaceKind>) {
+        expr.walk_binders(|binding| {
+            if let Some(place) = binding.ty.as_place() {
+                places.insert(binding.name.clone(), place.kind);
+            }
+        });
+        expr.walk_children(|child| collect_places(child, places));
+    }
+    collect_places(expr, &mut places);
+    check_places_go(expr, false, &mut errors);
+    exclusive_borrows(expr, &places, &mut errors);
+    captured_induction_writes(expr, &places, &mut errors);
     // A function returning a mutable variable carries it at the lambda, its binding and each
     // use, so a nested `Mut` is reported once per value.
-    let (nested, mut errors): (Vec<_>, Vec<_>) = errors
-        .into_iter()
-        .partition(|e| matches!(e.error, InferError::MutInCompositeType { .. }));
+    let (nested, mut errors): (Vec<_>, Vec<_>) = errors.into_iter().partition(|e| {
+        matches!(
+            e.error,
+            InferError::MutInCompositeType { .. } | InferError::MutValueActsOnPlace { .. }
+        )
+    });
     errors.extend(one_per_value(expr, nested));
     if errors.is_empty() {
         Ok(())
@@ -3674,20 +3739,21 @@ pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
 ///
 /// This is what retired the discipline's third rule. `emit_let` reads through an
 /// initializer that is a mutable variable, so the only binders left are
-/// [`TypedExprNode::MutDecl`] (a `:=` introduction) and a pass-by-reference
+/// [`TypedExprNode::MutDecl`] (a `:=` introduction) and a borrowed
 /// `Lambda` param — both declarations by construction. Checked rather than argued,
 /// because the failure is silent: a mutable variable reaching a `Let` binder is an alias,
 /// and an alias means a mutable variable with an unknown writer set.
 ///
-/// A **feed** handle on a `Let` is legal and common (`let d = Defer in …`), which is
-/// why this keys on `mut_value_type` (`Overwrite` only) and not `is_handle`.
+/// A **feed** place on a `Let` is legal and common (`let d = Defer in …`), which is
+/// why this keys on `mut_value_type` (`Overwrite` only) and not `is_place`.
 fn debug_assert_no_mut_var_let(expr: &Expr) {
     if let TypedExprNode::Let { binding, .. } = &expr.node {
         debug_assert!(
-            binding.ty.mut_value_type().is_none(),
+            binding.ty.mut_value_type().is_none()
+                || binding.parameter_mode == crate::ccl::place::ParameterMode::Borrow,
             "a `let` binder is bound at a mutable variable (`{}` : {}); an initializer that is a mutable \
-             variable must read through, and only a `MutDecl` or a pass-by-reference \
-             param may bind one",
+             variable must read through, and only a `MutDecl`, a borrowed \
+             param, or a compiler `Temporary` transporting one may bind one",
             binding.name,
             binding.ty
         );
@@ -3695,63 +3761,64 @@ fn debug_assert_no_mut_var_let(expr: &Expr) {
     expr.walk_children(debug_assert_no_mut_var_let);
 }
 
-/// Rule 2's position-aware type walk. `allow_mut` is `true` only where a `Mut`
-/// is legal: at the root of a checked type and at a function *domain*
-/// (pass-by-reference). Every other position — a `Fun` codomain, a
-/// `Tuple`/`Record`/`Variant` element, a `Feed` payload, or either child of a
-/// `Mut` — sets it `false`, so a `Mut` seen there is reported.
-///
-/// A `Refinement` passes `allow_mut` *through* to its base (mirroring
-/// [`Type::mut_value_type`]): a refined mutable variable at a legal position stays
-/// legal, while a refined `Mut` buried in a composite is still caught because the
-/// enclosing composite already set `allow_mut = false`.
+/// The first effect on a place, an append to a feed or a write of a mutable variable, that a
+/// function type in `ty` causes. A collection type's own capabilities state what ran where the
+/// collection was built, so they are not read; the function types inside it are.
+fn effect_on_a_place(ty: &Type) -> Option<crate::ccl::capabilities::Effect> {
+    use crate::ccl::capabilities::{Capability, Effect};
+    if let Type::Fun {
+        capabilities,
+        fun_kind,
+        ..
+    } = ty
+        && !fun_kind.resolved().is_data()
+        && let Some(effect) = capabilities.set().items().find_map(|c| match c {
+            Capability::Causes(
+                e @ (Effect::Append(_) | Effect::Write(_) | Effect::WriteTxn(_)),
+            ) => Some(e),
+            _ => None,
+        })
+    {
+        return Some(effect);
+    }
+    let mut found = None;
+    ty.walk_children(|t| {
+        if found.is_none() {
+            found = effect_on_a_place(t);
+        }
+    });
+    found
+}
+
+/// Rule 2 on a type: a place type stands only where [`crate::ccl::place::visit_places`]
+/// allows one, the root of a checked type (`allow_mut`) or a function's parameter, and a
+/// `Mut(V)` is well-formed only where no function type in `V` acts on a place.
 fn check_no_nested_mut(
     ty: &Type,
     allow_mut: bool,
     at: &dyn Fn() -> String,
     errors: &mut Vec<InferError>,
 ) {
-    match ty {
-        // Only an `Overwrite` history is a `Mut` for rule 2; a `Feed` history is a
-        // feed channel (legal nested — e.g. a feed handle in a function
-        // codomain or a tuple), so it falls through to the composite `_` arm
-        // below, whose children are still walked with `allow_mut = false` (a
-        // `Overwrite` buried in a feed's value/domain is a nested violation).
-        Type::History {
-            history_kind: HistoryKind::Overwrite,
-            ..
-        } => {
-            let (domain, value, _) = ty.history_parts().expect("matched a history");
-            if !allow_mut {
-                errors.push(InferError::MutInCompositeType {
-                    at: at(),
-                    ty: ty.clone(),
-                });
-            }
-            // Either child of a `Mut` is a nested (illegal) position.
-            check_no_nested_mut(value, false, at, errors);
-            check_no_nested_mut(domain, false, at, errors);
+    crate::ccl::place::visit_places(ty, allow_mut, &mut |place, allowed| {
+        if !allowed {
+            errors.push(InferError::MutInCompositeType {
+                at: at(),
+                ty: place.clone(),
+            });
         }
-        // A domain that is a product is a parameter list, each component a parameter.
-        Type::Fun {
-            domain, codomain, ..
-        } => {
-            match domain.peel_refinements() {
-                Type::Tuple(ts) => ts
-                    .iter()
-                    .for_each(|t| check_no_nested_mut(t, true, at, errors)),
-                Type::DepTuple(cs) => cs
-                    .iter()
-                    .for_each(|(_, t)| check_no_nested_mut(t, true, at, errors)),
-                _ => check_no_nested_mut(domain, true, at, errors),
-            }
-            check_no_nested_mut(codomain, false, at, errors);
+        // `Mut(V)` is well-formed only where no function type in `V` causes an effect on a
+        // place, so a Feed or a Mut is never inside a Mut.
+        let (_, value, kind) = place.history_parts().expect("visits a history");
+        if kind == HistoryKind::Overwrite
+            && let Some(effect) = effect_on_a_place(value)
+        {
+            errors.push(InferError::MutValueActsOnPlace {
+                at: at(),
+                ty: value.clone(),
+                effect: Box::new(effect),
+            });
         }
-        Type::Refinement(base, _) => check_no_nested_mut(base, allow_mut, at, errors),
-        // Tuple / Record / Variant / feed-history payloads (and inert leaves): a
-        // `Mut` anywhere below here is nested, so drop `allow_mut` to `false`.
-        _ => ty.walk_children(|c| check_no_nested_mut(c, false, at, errors)),
-    }
+    });
 }
 
 /// Rule 2 (no nested `Mut`) on a single binder slot. Binder slots are unreachable by
@@ -3759,7 +3826,7 @@ fn check_no_nested_mut(
 /// [`TypedExpr::walk_binders`](crate::ccl::TypedExpr::walk_binders).
 ///
 /// There is no longer a rule about an *undeclared* binder holding a `Mut`: only
-/// [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda` param can bind a
+/// [`TypedExprNode::MutDecl`] and a borrowed `Lambda` param can bind a
 /// mutable variable, both of which are declarations by construction. A `Let` cannot —
 /// `emit_let` reads through an initializer that is a mutable variable, so `b = a` binds `b` at `a`'s
 /// value. That is asserted rather than checked; see [`debug_assert_no_mut_var_let`].
@@ -3776,8 +3843,32 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
 
 /// `argument` says `expr` is a call's argument, under the `let`s A-normalization put around it:
 /// a tuple there is the call's arguments, each passed to one parameter, so a component may be a
-/// mutable variable as a parameter may.
-fn check_mut_discipline_go(expr: &Expr, argument: bool, errors: &mut Vec<LocatedInferError>) {
+/// borrowed place as a parameter may.
+fn check_places_go(expr: &Expr, argument: bool, errors: &mut Vec<LocatedInferError>) {
+    // A value parameter inference bound at a place received a `&` at a call: the parameter
+    // reads, and nothing it does borrows (`docs/chl-spec.md`, "Places and values"). The body's
+    // own reads of it would only repeat that defect.
+    if let TypedExprNode::Lambda { params, .. } = &expr.node {
+        let borrowed: Vec<&TypedBinding> = params
+            .iter()
+            .filter(|param| {
+                param.parameter_mode == crate::ccl::place::ParameterMode::Value
+                    && param.ty.is_place()
+            })
+            .collect();
+        if !borrowed.is_empty() {
+            errors.extend(borrowed.into_iter().map(|param| {
+                LocatedInferError::new(
+                    InferError::Place {
+                        name: param.name.source_spelling().unwrap_or_default().to_string(),
+                        defect: PlaceDefect::ValueParameterBorrowed,
+                    },
+                    expr.node_id(),
+                )
+            }));
+            return;
+        }
+    }
     // This node's own violations, stamped with its id below.
     let mut here: Vec<InferError> = Vec::new();
 
@@ -3796,18 +3887,6 @@ fn check_mut_discipline_go(expr: &Expr, argument: bool, errors: &mut Vec<Located
         expr.node,
         TypedExprNode::Let { .. } | TypedExprNode::MutDecl { .. } | TypedExprNode::ExprStmt { .. }
     );
-
-    // Rule 1(a): a `Mut`-typed value must be a bare variable reference. `Var`
-    // is the traceable base case; a forwarder is transparent (see above).
-    // Everything else with a `Mut` type computes or selects it (a conditional
-    // `Case`, a `Tuple`/`Apply`/`Cast`, …) and is rejected. A `MutWrite`'s
-    // target is a `Name`, not a child node, so it never surfaces here.
-    if expr.ty.mut_value_type().is_some()
-        && !forwards_tail
-        && !matches!(expr.node, TypedExprNode::Var(_))
-    {
-        here.push(InferError::MutNotBareVariable { at: symbolic(expr) });
-    }
 
     // Rule 2 on this node's own type. A forwarder's type is its tail's, so the
     // tail's own check already covers it — skip to avoid ancestor-chain dupes.
@@ -3833,18 +3912,138 @@ fn check_mut_discipline_go(expr: &Expr, argument: bool, errors: &mut Vec<Located
     );
     match &expr.node {
         TypedExprNode::Apply { function, argument } => {
-            check_mut_discipline_go(function, false, errors);
-            check_mut_discipline_go(argument, true, errors);
+            check_places_go(function, false, errors);
+            check_places_go(argument, true, errors);
         }
         // An argument's `let`s pass it along as their body.
         TypedExprNode::Let {
             bound_expr, body, ..
         } if argument => {
-            check_mut_discipline_go(bound_expr, false, errors);
-            check_mut_discipline_go(body, true, errors);
+            check_places_go(bound_expr, false, errors);
+            check_places_go(body, true, errors);
         }
-        _ => expr.walk_children(|e| check_mut_discipline_go(e, false, errors)),
+        _ => expr.walk_children(|e| check_places_go(e, false, errors)),
     }
+}
+
+/// A compute function's latent capabilities. A collection's capabilities record what ran when
+/// it was built, rather than an access its value can perform during a later call.
+fn function_capabilities(ty: &Type) -> Option<&crate::ccl::capabilities::Capabilities> {
+    match ty.peel_refinements() {
+        Type::Fun {
+            fun_kind,
+            capabilities,
+            ..
+        } if !fun_kind.resolved().is_data() => Some(capabilities),
+        _ => None,
+    }
+}
+
+/// A function's latent writes name only places outside its own binders. Induction places,
+/// whether declared or borrowed, cannot be written through such a capture. Transactional and
+/// deferred places permit captured writes (`docs/chl-spec.md`, "Places and values").
+fn captured_induction_writes(
+    expr: &Expr,
+    places: &HashMap<Name, crate::ccl::place::PlaceKind>,
+    errors: &mut Vec<LocatedInferError>,
+) {
+    if matches!(expr.node, TypedExprNode::Lambda { .. })
+        && let Some(capabilities) = function_capabilities(&expr.ty)
+        && let Some(name) = capabilities.set().items().find_map(|capability| {
+            let crate::ccl::capabilities::Capability::Causes(effect) = capability else {
+                return None;
+            };
+            let name = effect.variable()?;
+            places
+                .get(name)
+                .is_some_and(|kind| !kind.allows_captured_writes())
+                .then(|| name.clone())
+        })
+    {
+        errors.push(LocatedInferError::new(
+            InferError::Place {
+                name: name.source_spelling().unwrap_or_default().to_string(),
+                defect: PlaceDefect::CapturedInductionWrite,
+            },
+            expr.node_id(),
+        ));
+    }
+    expr.walk_children(|child| captured_induction_writes(child, places, errors));
+}
+
+/// Check each call's exclusive borrows on the resolved tree: a mutable variable, induction or
+/// transactional, is reached at most once through explicit loans, the callee's captures and
+/// argument functions (`docs/chl-spec.md`, "Places and values"). A feed's borrows are shared:
+/// contributions need no order.
+fn exclusive_borrows(
+    expr: &Expr,
+    places: &HashMap<Name, crate::ccl::place::PlaceKind>,
+    errors: &mut Vec<LocatedInferError>,
+) {
+    fn parts(argument: &Expr) -> Vec<&Expr> {
+        match &argument.node {
+            TypedExprNode::Arguments(components) | TypedExprNode::Tuple(components) => {
+                components.iter().collect()
+            }
+            TypedExprNode::Let { body, .. } => parts(body),
+            _ => vec![argument],
+        }
+    }
+    /// The variables the functions nested in `ty` require or cause something of.
+    fn reached(ty: &Type, out: &mut Vec<Name>) {
+        if let Some(capabilities) = function_capabilities(ty) {
+            out.extend(
+                capabilities
+                    .set()
+                    .items()
+                    .filter_map(|c| c.variable().cloned()),
+            );
+        }
+        ty.walk_children(|t| reached(t, out));
+    }
+    if let TypedExprNode::Apply { function, argument } = &expr.node {
+        let parts = parts(argument);
+        let mut borrowed: Vec<&Name> = Vec::new();
+        let mut twice = |name: &Name| {
+            errors.push(LocatedInferError::new(
+                InferError::Place {
+                    name: name.source_spelling().unwrap_or_default().to_string(),
+                    defect: PlaceDefect::BorrowedTwice,
+                },
+                expr.node_id(),
+            ));
+        };
+        for part in &parts {
+            if let TypedExprNode::Borrow(place) = &part.node
+                && let TypedExprNode::Var(name) = &place.node
+                && places.get(name).is_some_and(|kind| kind.is_exclusive())
+            {
+                if borrowed.contains(&name) {
+                    twice(name);
+                } else {
+                    borrowed.push(name);
+                }
+            }
+        }
+        if let Some(capabilities) = function_capabilities(&function.ty) {
+            for name in &borrowed {
+                if capabilities.names(name) {
+                    twice(name);
+                }
+            }
+        }
+        for part in parts
+            .iter()
+            .filter(|p| !matches!(p.node, TypedExprNode::Borrow(_)))
+        {
+            let mut names = Vec::new();
+            reached(&part.ty, &mut names);
+            if let Some(name) = borrowed.iter().find(|b| names.contains(b)) {
+                twice(name);
+            }
+        }
+    }
+    expr.walk_children(|c| exclusive_borrows(c, places, errors));
 }
 
 // ---------------------------------------------------------------------------
@@ -3865,6 +4064,43 @@ mod tests {
         AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, CompareKind, Expr,
         Lit, LogicKind, Type, TypedBinding, TypedExpr, TypedExprNode,
     };
+
+    #[test]
+    fn a_returned_functions_capabilities_do_not_overlap_the_callees_loan() {
+        use crate::ccl::capabilities::{Capabilities, CapabilitySet, Effect};
+        let counter = Name::fresh("counter");
+        let int = Type::Base(BaseType::Int);
+        let unit = || Expr::lit(Lit::Unit).with_ty(Type::Base(BaseType::Unit));
+        let history = Type::history(Type::Txn, int.clone(), HistoryKind::Overwrite);
+        let mut effects = CapabilitySet::default();
+        effects.causes.insert(Effect::WriteTxn(counter.clone()));
+        let mut callback = Expr::lambda(
+            Name::fresh("amount"),
+            Occurrence::mint(),
+            int.clone(),
+            unit(),
+        );
+        callback.ty = callback.ty.with_capabilities(Capabilities::known(effects));
+        let result = callback.ty.clone();
+        let maker = Expr::lambda(
+            Name::fresh("other"),
+            Occurrence::mint(),
+            history.clone(),
+            callback,
+        );
+        let loan = Expr::borrow(Expr::var(&counter).with_ty(history.clone()));
+        let call = Expr::apply(loan, maker).with_ty(result);
+        let body = Expr::expr_stmt(call, unit());
+        let program = Expr::mut_decl(
+            counter,
+            Occurrence::mint(),
+            history,
+            Expr::lit(Lit::Int(0)).with_ty(int),
+            body,
+        )
+        .with_ty(Type::Base(BaseType::Unit));
+        assert!(check_places(&program).is_ok());
+    }
 
     #[test]
     fn defect_identity_ignores_sites_and_bound_binder_spelling() {
@@ -4212,10 +4448,10 @@ mod tests {
         assert_eq!(result, Err(vec![InferError::UnboundVariable("y".into())]));
     }
 
-    /// The handle-target forms resolve their target by name; an unbound target is
+    /// The place-target forms resolve their target by name; an unbound target is
     /// an `UnboundVariable`, as for a `Var` use, blamed on the target-form node.
     #[test]
-    fn test_infer_unbound_handle_target() {
+    fn test_infer_unbound_feed_target() {
         let cases = [
             Expr::feed("ghost", Occurrence::mint(), Expr::lit(Lit::Int(1))),
             Expr::define("ghost", Occurrence::mint(), Expr::lit(Lit::Int(1))),
@@ -4264,6 +4500,7 @@ mod tests {
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "p".into(),
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
@@ -4469,6 +4706,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4502,6 +4740,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4526,6 +4765,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut bad = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4562,6 +4802,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4605,6 +4846,7 @@ mod tests {
             let mut ctx = TypeInferenceContext::new();
             let mut expr = TypedExpr::new(TypedExprNode::Lambda {
                 params: vec![TypedBinding {
+                    parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: "m".into(),
                     ty: Type::infer(),
@@ -4666,6 +4908,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut ident = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4691,6 +4934,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut consume = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4755,6 +4999,7 @@ mod tests {
         // let x : String = 42 in x  =>  AnnotationMismatch
         let mut expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::infer(),
@@ -5437,6 +5682,7 @@ mod tests {
             );
             let mut expr = TypedExpr::new(TypedExprNode::Lambda {
                 params: vec![TypedBinding {
+                    parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::infer(),
@@ -5483,6 +5729,7 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
                 params: vec![TypedBinding {
+                    parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::infer(),
@@ -5519,6 +5766,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::infer(),
@@ -5988,6 +6236,7 @@ mod tests {
     fn test_check_fully_typed_ok_nested() {
         let lambda = Expr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
@@ -6076,6 +6325,7 @@ mod tests {
         let arg = Expr::lit(Lit::Int(42)); // ty: Hole
         let func = Expr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
@@ -6133,6 +6383,7 @@ mod tests {
         // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
         let expr = Expr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Infer(var), // unsolved
@@ -6434,6 +6685,7 @@ mod tests {
         // domain is String — typecheck must detect this.
         let lambda = Expr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::String),
@@ -6621,7 +6873,7 @@ mod tests {
 
     /// A predicate holding a `defer` is source form until planning lifts it: the check
     /// between channelize and planning takes it, and the check of planning's output reports
-    /// the feed handle it binds.
+    /// the feed place it binds.
     #[test]
     fn a_defer_in_a_predicate_is_an_error_only_after_planning() {
         let feed = Type::feed(Type::UIntRange(3), Type::Base(BaseType::Int));
@@ -6646,10 +6898,10 @@ mod tests {
             &InstanceTable::builtin(),
             CheckMode::Full,
         )
-        .expect_err("a feed handle in a predicate passed");
+        .expect_err("a feed place in a predicate passed");
         assert!(
             errs.iter()
-                .any(|e| format!("{e:?}").contains("feed handle type survived channelize")),
+                .any(|e| format!("{e:?}").contains("feed place type survived channelize")),
             "{errs:?}"
         );
     }

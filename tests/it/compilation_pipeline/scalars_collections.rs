@@ -876,15 +876,15 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     "},
     Value::Int(56),
 )]
-// A feed handle read out of a tuple is the channel it names, whether the tuple is taken apart
+// A feed place read out of a tuple is the channel it names, whether the tuple is taken apart
 // where it is written or bound to a name first.
-#[case("out: Feed(_); o, k = (out, 3); o << k; sum(out)", Value::Int(3))]
+#[case("out: Feed(_); o, k = (out, 3); out << k; sum(o)", Value::Int(3))]
 #[case(
-    "out: Feed(_); t = (1, (2, out)); o = t.1.1; o << t.0; sum(out)",
+    "out: Feed(_); t = (1, (2, out)); o = t.1.1; out << t.0; sum(o)",
     Value::Int(1)
 )]
 #[case(
-    "out: Feed(_); t = (1, (2, out)); a, (b, o) = t; o << a + b; sum(out)",
+    "out: Feed(_); t = (1, (2, out)); a, (b, o) = t; out << a + b; sum(o)",
     Value::Int(3)
 )]
 // A pattern binds in a loop body, a function body and a transaction block as at the top level.
@@ -1035,7 +1035,7 @@ fn a_mutable_assignment_to_the_wildcard_declares_nothing() {
             x := 0
             _ := 0
             for i in [1, 2, 3]:
-                _ := bump(x)
+                _ := bump(&x)
             x
         "},
         Value::Int(3),

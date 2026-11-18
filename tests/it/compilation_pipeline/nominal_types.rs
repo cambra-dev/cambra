@@ -1781,7 +1781,7 @@ fn method_errors_name_what_is_wrong() {
 
                 1
             "#},
-            "an associated function with a pass-by-reference parameter is not supported yet",
+            "an associated function with a borrowed parameter is not supported yet",
         ),
         (
             indoc! {r#"

@@ -6676,6 +6676,7 @@ mod variant_ctor_tests {
 
     fn binding(name: &str, ty: Type) -> TypedBinding {
         TypedBinding {
+            parameter_mode: Default::default(),
             occurrence: Occurrence::mint(),
             name: name.into(),
             ty,

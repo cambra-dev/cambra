@@ -356,7 +356,7 @@ impl OperatorSchemes {
         let get_prev_txn = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
 
         // AwaitFinal: ∀ν. Mut(ν, Txn) → ν. The domain is the mutable variable
-        // **handle**, not a value, and its sequencing domain is the concrete `Txn`
+        // **place**, not a value, and its sequencing domain is the concrete `Txn`
         // rather than a quantified one — see the field's doc for what that pins.
         let nu = fresh_var(BODY_LEVEL);
         let await_final =
@@ -706,6 +706,7 @@ mod tests {
         // rejects it on *kind* before the codomain orderability under test.
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,

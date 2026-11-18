@@ -38,6 +38,15 @@ conservative: a matching rebind or write can block alias removal even if no part
 be affected. The binding remains eligible for the function-inlining check that follows. Removing
 an alias here also keeps lambda elimination from lifting that alias into a `const(x)` wrapper.
 
+Alias substitution revisits the resulting body. A substituted place can make a tuple literal
+projectable after the first visit, so returning the substituted tree alone would leave the same
+place unresolved when reached through an A-normalization alias.
+
+At equal types, alias collapse renames the binder, so each occurrence keeps its type. A Feed's
+row type can describe a binder inside the continuation, and copying that type into the
+continuation as a term replacement would capture it. A binding at a different type is substituted
+as a term.
+
 ### Function binding eligibility
 
 The second rewrite checks the type of the bound expression. It expands a `Type::Fun` binding
@@ -65,6 +74,12 @@ rewrite below can copy a bound value into a literal element. The type-level deci
 
 ### Substitution and beta-reduction
 
+A curried call can retain a computed earlier argument in a sharing `Let` around the next lambda.
+For a compute-function application, the named-call reducer continues beneath that binding and
+keeps it around the remaining application. This preserves one computation of the argument and
+exposes the next lambda to the existing beta-reduction rule. Collection applications keep their
+bindings.
+
 For an eligible binding, the pass substitutes the bound expression at free occurrences of its
 name and removes the `Let`. At a call whose function position is that name, including a chain of
 applications for a curried call, it reduces an application when the substituted function is a
@@ -82,6 +97,10 @@ missed by the ordinary expression walk.
 An anonymous application is left for later passes: lambda elimination's rules read its shape,
 and a group-by's partition applied to its key is recognized as a lambda of its own.
 
+Beta reduction consumes a `Borrow` argument before substituting its place into a named
+parameter. Value arguments retain their source-position reads: a later explicit mutable borrow
+blocks inlining a read binding across that call. Deferred borrows do not impose that ordering.
+
 Beta-reduction has a further condition for a refined outer parameter: the argument's type must
 entail the parameter's refinements. The pass asserts when it cannot establish that condition,
 since dropping the parameter without preserving its precondition would be unsound. The query runs
@@ -89,7 +108,7 @@ under the binders enclosing the call, a transparent `let` at its definition too
 ([The scope a query runs in](type-inference.md#the-scope-a-query-runs-in)): an argument naming a
 binder, `__anf + 2` where `__anf = 1 + 3`, is decided by what the binder is. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
-`Apply(Tuple(...), Proj(Index(i)))`. A tuple that holds a function or feed handle is folded here
+`Apply(Tuple(...), Proj(Index(i)))`. A tuple that holds a function or a feed's read is folded here
 ([Functions held in products](#functions-held-in-products)), and
 `simplify::try_literal_tuple_projection` folds every other such shape later. Both folds read only a
 bare literal, so beta-reduction floats the `Let` chain wrapping an argument out around the reduced
@@ -113,7 +132,7 @@ are a value position: op-conversion compiles the whole literal to one table read
 graph-build time, so an element is sequenced against nothing and the move changes no
 order. A definiens reading a mutable variable the body may write stays bound, because the
 read would otherwise move past the write. Two mentions count as a write: a `MutWrite` to
-that variable, and a handle passed to a callee, whose body this pass has not expanded at
+that variable, and a place lent to a callee, whose body this pass has not expanded at
 the binding it is rewriting.
 
 The relocated definiens carries A-normalization's bindings for its own compound
@@ -133,27 +152,29 @@ domain mismatch.
 ### Functions held in products
 
 A tuple or record that holds a function has no tile, because a tile carries values and not
-functions. One that holds a feed handle hides the handle from `channelize`, which resolves a
-feed's target through `Var` aliases only. The inliner takes such a product apart until each
-function it holds sits in call position, where it inlines as a let-bound one does, and each handle
-it holds is an alias of its channel. A product **holds a function or feed handle** when one of its
-components is a compute function or a feed handle, or is itself a product holding one
-(`holds_function_or_feed`).
+functions. The inliner takes such a product apart until each function it holds sits in call
+position, where it inlines as a let-bound one does. A product **holds a compute function** when
+one of its components is a compute function or is itself a product holding one.
+
+The same product rewrites separate Feed collection reads before channelization
+(`holds_function_or_feed`). A component expression can carry a reference type while its
+product's recorded type contains ordinary read values. Nested literals are inspected through
+their component expressions too. Splitting keeps unrelated scalar fields independent of a
+Feed's contents and keeps each computed component bound once.
 
 Two rewrites do it:
 
 - **A projection of a literal is folded.** `(𝑎₀, …, 𝑎ₙ).𝑖` becomes `𝑎ᵢ`, and likewise a record
-  literal's field, when the literal holds a function or feed handle (`fold_product_projection`).
-  The literal is folded whichever component is read: folding only the function and handle
-  components would leave `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function or handle
-  passed to a multi-argument function reaches its use, since the parameter is a component of the
-  argument tuple.
+  literal's field, when the literal holds a function or a feed's read
+  (`fold_product_projection`). The literal is folded whichever component is read: folding only
+  the function and feed components would leave `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function passed to a
+  multi-argument function reaches its call, since the parameter is a component of the argument
+  tuple.
 - **A let-bound literal is split.** `let 𝑟 = (𝑘₀=𝑎₀, …) in body` becomes one `let` per component,
   with each `𝑟.𝑘ᵢ` in the body replaced by that component's binder (`split_product_let`). A
-  function component then inlines, a handle component is an alias of its channel, and a
-  collection component stays bound once, so nothing is recomputed per use. The split applies only
-  when every use of `𝑟` is a projection. A whole use, such as `𝑟` placed in a list, leaves the
-  binding as it is.
+  function component then inlines, and a collection component stays bound once, so nothing is
+  recomputed per use. The split applies only when every use of `𝑟` is a projection. A whole use,
+  such as `𝑟` placed in a list, leaves the binding as it is.
 
 A lambda that reaches call position through a fold, as in `use(\x -> x + 1, 1)`, is beta-reduced
 there (`beta_reduce_folded_call`). A lambda written in call position is not this case: lowering

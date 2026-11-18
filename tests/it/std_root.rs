@@ -1,11 +1,8 @@
 //! The std root's CHL sources (`stdlib/README.md`), loaded through the programs under
 //! `stdlib/tests/` that import or run them.
 //!
-//! The compiler does not embed the std root, so each program loads against the sources under
-//! `stdlib/src/` in its place ([`LoadedProgram::load_with_std`]). Every std module uses constructs the
-//! compiler lacks, so the programs are loaded and not compiled: each program, and every std module
-//! it reaches, must parse and resolve its module paths. The `[proposed]` lines in the modules record
-//! what each one waits on.
+//! Programs load against `stdlib/src/` through `LoadedProgram::load_with_std`.
+//! HTTP runtime tests separately exercise the embedded module; proposed modules only load here.
 
 use std::path::{Path, PathBuf};
 

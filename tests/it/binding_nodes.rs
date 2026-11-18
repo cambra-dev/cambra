@@ -18,6 +18,7 @@ use cambra::chl_parser::ModulePath;
 /// A binding of `name` with no type and the given annotation.
 fn binding(name: &str, user_annotation: Option<Type>) -> TypedBinding {
     TypedBinding {
+        parameter_mode: Default::default(),
         occurrence: Occurrence::mint(),
         name: name.into(),
         ty: Type::Hole,

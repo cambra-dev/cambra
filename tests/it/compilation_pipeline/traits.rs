@@ -2525,9 +2525,9 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
     );
 }
 
-/// A trait's signature states a pass-by-reference parameter as a `def` does, `Mut(V, Txn)` or
-/// `Feed(V)`: the caller's variable or feed is the argument, and an instance's function
-/// writes it, called directly, through a requirement, or through a requirement that passes
+/// A trait's signature states a borrowed parameter as a `def` does, `Mut(V, Txn)` or
+/// `Feed(V)`: the caller lends its place as the argument, and an instance's function
+/// writes it, called directly, through a requirement, or through a requirement that lends
 /// the module's own variable (`docs/chl-spec.md`, "Declaring a trait").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -2542,7 +2542,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                 with begin():
                     s := s - n
                 n
-        summon(Take(Box))::take(Box::new(1), stock, 3)
+        summon(Take(Box))::take(Box::new(1), &stock, 3)
         await_final(stock)
     "},
     7
@@ -2559,8 +2559,8 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                     s := s - n
                 n
         def generic(T, a: T, st: Mut(Int, Txn), n: Int) requires t: Take(T):
-            t::take(a, st, n)
-        generic(Box::new(1), stock, 3)
+            t::take(a, &st, n)
+        generic(Box::new(1), &stock, 3)
         await_final(stock)
     "},
     7
@@ -2577,7 +2577,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                     s := s - n
                 n
         def generic(T, a: T, n: Int) requires t: Take(T):
-            t::take(a, stock, n)
+            t::take(a, &stock, n)
         generic(Box::new(1), 3)
         await_final(stock)
     "},
@@ -2593,7 +2593,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                 o << n
                 n
         out: Feed(Int)
-        summon(Put(Box))::put(Box::new(1), out, 3)
+        summon(Put(Box))::put(Box::new(1), &out, 3)
         sum(out)
     "},
     3
@@ -2609,7 +2609,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                 with begin():
                     s := Amount::new(s.extract() + 1)
                 0
-        summon(Bump(Amount))::bump(stock)
+        summon(Bump(Amount))::bump(&stock)
         await_final(stock).extract()
     "},
     11
@@ -2625,7 +2625,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                 with begin():
                     s := s - n
                 n
-        summon(Take(Box))::take(Box::new(1), stock, 3)
+        summon(Take(Box))::take(Box::new(1), &stock, 3)
         await_final(stock)
     "},
     7
@@ -2640,9 +2640,9 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
                 c += n
                 n
         t := 0
-        x = summon(Add(Box))::add(Box::new(0), t, 4)
+        x = summon(Add(Box))::add(Box::new(0), &t, 4)
         for y in [1, 2]:
-            summon(Add(Box))::add(Box::new(0), t, y)
+            summon(Add(Box))::add(Box::new(0), &t, y)
         t + x
     "},
     11
@@ -2670,10 +2670,13 @@ fn a_trait_function_takes_a_history_parameter(#[case] code: &str, #[case] expect
     "}
 )]
 fn a_trait_signature_refuses_history_types_beyond_parameters(#[case] code: &str) {
-    check_compile_error(code, "unknown type application");
+    check_compile_error(
+        code,
+        "a `Mut(…)` type is written only as the whole type of a declaration or a parameter",
+    );
 }
 
-/// An instance restating a pass-by-reference parameter states the signature's history type, so
+/// An instance restating a borrowed parameter states the signature's history type, so
 /// one of another kind is refused.
 #[test]
 fn an_instance_restating_a_parameter_states_its_history() {

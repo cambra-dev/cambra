@@ -9,17 +9,12 @@
 //! This isolates the storefront's revenue view: without the `restrict`, the
 //! aggregate is only defined when the feed closes — for a server, never.
 //!
-//! **Currently blocked at `import std::http`.**  The std root has no `http`
-//! module yet.  Behind it: feed elements carrying transaction time,
-//! `restrict`/`sum` over a feed, and structured requests.  This pins the missing
-//! module.
+//! The HTTP runs load. Indexed response assignment remains unsupported;
+//! transaction-time feed fields and structured requests are also sketches.
 
 use super::common::expect_compile_error;
 
 #[test]
-fn ledger_balance_currently_blocked_at_import() {
-    expect_compile_error(
-        include_str!("program.cambra"),
-        "no module `std::http`: the std root has no module `http`",
-    );
+fn ledger_balance_currently_blocked_at_indexed_response() {
+    expect_compile_error(include_str!("program.cambra"), "`m[k]` is a keyed write");
 }

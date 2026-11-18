@@ -1232,13 +1232,13 @@ pub struct CompactType {
     /// this position names these rather than the union
     /// ([`super::coalesce::CoalesceError::DomainJoinConflict`]).
     pub met_refinements: Option<MetRefinements>,
-    /// History-handle `(value, domain, kind)`, if a [`Type::History`]
+    /// Place type `(value, domain, kind)`, if a [`Type::History`]
     /// contributed here — a mutable variable (`kind: Overwrite`) or a feed channel
     /// (`kind: Feed`).
     ///
-    /// Both children recurse at the **same polarity** as the handle itself: a
+    /// Both children recurse at the **same polarity** as the place type itself: a
     /// history is invariant in both at the constraint level (`constrain_go`
-    /// checks both directions when two same-kind handles meet), so by the time
+    /// checks both directions when two same-kind place types meet), so by the time
     /// compaction runs both directions' information has already been propagated
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
@@ -3705,7 +3705,7 @@ fn compact_go_inner(
     // **An elimination reads the outermost function** (`crate::ccl::subst::Elim`). A variable
     // or a refinement passes it on to what it stands for and a function consumes it; any other
     // type is not a collection, so nothing is eliminated, and in particular not a collection
-    // nested in it, as a feed handle's payload is. The solver and a substitution drop it at
+    // nested in it, as a feed place type's payload is. The solver and a substitution drop it at
     // the same place (`eliminate_at`, `Subst::eliminate_top`).
     if !matches!(ty, Type::Infer(_) | Type::Refinement(..) | Type::Fun { .. })
         && let Some((_, rest)) = subst_acc.top_elim()

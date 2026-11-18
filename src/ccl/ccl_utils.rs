@@ -816,6 +816,7 @@ fn reduce_application(
                 let body =
                     Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
                 let param = TypedBinding {
+                    parameter_mode: Default::default(),
                     name: k,
                     occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
@@ -969,6 +970,7 @@ fn normal_function_value(
 
 fn normal_lambda(name: Name, body: Expr, ty: &Type) -> Expr {
     let param = TypedBinding {
+        parameter_mode: Default::default(),
         name,
         occurrence: Occurrence::PLACEHOLDER,
         ty: Type::Hole,
@@ -1062,6 +1064,7 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
                 head: crate::ccl::PatternHead::Tag(tag.clone()),
                 head_occurrence: Occurrence::PLACEHOLDER,
                 binding: TypedBinding {
+                    parameter_mode: Default::default(),
                     name: payload,
                     occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
@@ -2024,6 +2027,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         panic!("a loop runs over a collection, got {}", source.ty)
     };
     let position = TypedBinding {
+        parameter_mode: Default::default(),
         name: position.unwrap_or_else(Name::iter_record),
         occurrence: Occurrence::mint(),
         ty: (*domain).clone(),
@@ -2327,15 +2331,15 @@ pub(crate) fn maps_each_position_to_itself(e: &Expr) -> bool {
 }
 
 /// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`, reading each
-/// end through its read view ([`Type::read_view`]), so a chain headed by a feed handle types as
-/// the collection the handle reads as. A `Hole` here means a genuinely untyped input (the
+/// end through its read view ([`Type::read_view`]), so a chain headed by a feed place types as
+/// the collection the place reads as. A `Hole` here means a genuinely untyped input (the
 /// untyped-mode pipeline); `channelize`'s debug residue assert and the strict wall backstop the
 /// typed mode.
 pub(crate) fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
     let d = elts.first().and_then(|e| e.ty.read_view().domain());
     let c = elts.last().and_then(|e| e.ty.read_view().codomain());
     // `fun_like`, not `Type::fun`: the chain is the head read through the rest, so it is a
-    // collection exactly when the head is. The head is routinely a feed handle that
+    // collection exactly when the head is. The head is routinely a feed place that
     // `channelize` has not yet turned into a `Type::Fun`, which `fun_like` reads as the read
     // view it states.
     match (d, c) {
@@ -2998,7 +3002,7 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
 /// number of such free uses ([`crate::ccl::free_names`], which states the binding rules
 /// once). [`TypedExprNode::Feed`] / [`TypedExprNode::Define`] /
 /// [`TypedExprNode::MutWrite`] target names count as occurrences (they are *uses* of the
-/// handle / mutable variable), while a [`TypedExprNode::Transact`] mutable variable key does
+/// feed place / mutable variable), while a [`TypedExprNode::Transact`] mutable variable key does
 /// not (it is a field label). A predicate shared by `Rc` across slots counts once.
 ///
 /// Several passes skip work when [`is_free`] says no (`inline_in_type_predicates`' early
@@ -3007,74 +3011,6 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
 /// [`Expr::walk_type_slots`] does.
 pub fn count_free(name: &Name, expr: &Expr) -> usize {
     crate::ccl::free_names::count(name, expr, crate::ccl::free_names::EVERY_READ)
-}
-
-/// A named binding or an expression being followed through transparent products.
-#[derive(Clone, Copy)]
-pub(crate) enum ValueReference<'a> {
-    Name(&'a Name),
-    Expr(&'a Expr),
-}
-
-/// Follow aliases and select literal-product components. A whole product or a computed
-/// definition stays named; an unknown projection stops at the binding that supplies its value.
-pub(crate) fn resolve_product_reference<'a>(
-    mut value: ValueReference<'a>,
-    definition: impl Fn(&Name) -> Option<&'a Expr>,
-) -> ValueReference<'a> {
-    let mut path = Vec::new();
-    let mut local = HashMap::new();
-    loop {
-        match value {
-            ValueReference::Name(name) => {
-                let Some(expr) = local.get(name).copied().or_else(|| definition(name)) else {
-                    return value;
-                };
-                let follows = matches!(expr.node, TypedExprNode::Var(_))
-                    || matches!(&expr.node, TypedExprNode::Apply { function, .. }
-                        if matches!(function.node, TypedExprNode::Proj(_)))
-                    || (!path.is_empty()
-                        && matches!(
-                            expr.node,
-                            TypedExprNode::Tuple(_)
-                                | TypedExprNode::Record(_)
-                                | TypedExprNode::Let { .. }
-                                | TypedExprNode::ExprStmt { .. }
-                        ));
-                if !follows {
-                    return value;
-                }
-                value = ValueReference::Expr(expr);
-            }
-            ValueReference::Expr(expr) => match &expr.node {
-                TypedExprNode::Var(name) => value = ValueReference::Name(name),
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    body,
-                } => {
-                    if binding.transparency == BindingTransparency::Transparent {
-                        local.insert(&binding.name, bound_expr.as_ref());
-                    }
-                    value = ValueReference::Expr(body);
-                }
-                TypedExprNode::ExprStmt { body, .. } => value = ValueReference::Expr(body),
-                TypedExprNode::Apply { argument, function }
-                    if let TypedExprNode::Proj(key) = &function.node =>
-                {
-                    path.push(key);
-                    value = ValueReference::Expr(argument);
-                }
-                _ => {
-                    let Some(component) = path.pop().and_then(|key| expr.product_component(key))
-                    else {
-                        return value;
-                    };
-                    value = ValueReference::Expr(component);
-                }
-            },
-        }
-    }
 }
 
 /// Returns `true` if `name` appears free anywhere in `expr` — either in
@@ -3255,7 +3191,7 @@ pub fn free_names(expr: &Expr) -> BTreeSet<Name> {
 }
 
 /// [`free_names`] without the names a `Feed`, `Define` or `MutWrite` writes: the variables
-/// `expr` reads. A write's target is a handle bound elsewhere, which a caller copying the
+/// `expr` reads. A write's target is a place bound elsewhere, which a caller copying the
 /// bindings a term reads must not copy.
 pub fn free_reads(expr: &Expr) -> BTreeSet<Name> {
     crate::ccl::free_names::names(

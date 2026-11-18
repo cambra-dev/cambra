@@ -1,7 +1,8 @@
 //! Lambda / `def` / parameter lowering.
 //!
 //! A lambda or a function lowers to one [`Expr::Lambda`] over its parameters, each a named
-//! binder ([`lower_params`]).
+//! binder ([`lower_params`]). A parameter receives a value, or borrows a place its caller
+//! lends with `&`.
 
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
@@ -22,7 +23,7 @@ use crate::{
 /// a lambda's result is read through.
 pub(crate) const OUTPUT_BINDER: &str = "__output";
 
-/// If `param` is annotated `Mut(…)` (a pass-by-reference mutable-variable parameter),
+/// If `param` is annotated `Mut(…)` (a borrowed mutable-variable parameter),
 /// return its mutable type `Mut(V, D)` and whether it is **transactional**
 /// (`Mut(V, Txn)`). Returns `None` for any non-`Mut` annotation (or an
 /// unannotated parameter). Mirrors the `Mut(…)` stamping of an induction
@@ -66,7 +67,7 @@ fn mut_param_history_type(
 }
 
 /// The history type a `Mut(…)` or `Feed(…)` annotation on `param` states, if it has one: the
-/// parameters a caller passes by reference.
+/// parameters that borrow a place a caller lends.
 fn history_param_type(
     param: &Param,
     ctx: &mut LoweringContext,
@@ -77,7 +78,46 @@ fn history_param_type(
     }
 }
 
-/// If `param` is annotated `Feed(T)` (a pass-by-reference deferred output),
+/// Uses of a free parameter determine whether it receives a value or borrows a place.
+#[derive(Default)]
+struct ParameterUses {
+    mutable: bool,
+    deferred: bool,
+    borrow: bool,
+}
+
+fn parameter_uses(body: &Expr, name: &Name) -> ParameterUses {
+    use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
+
+    fn visit(expr: &Expr, name: &Name, uses: &mut ParameterUses) {
+        match &expr.node {
+            TypedExprNode::Feed { name: target, .. }
+            | TypedExprNode::Define { name: target, .. }
+                if target == name =>
+            {
+                uses.deferred = true
+            }
+            TypedExprNode::MutWrite { name: target, .. } if target == name => uses.mutable = true,
+            TypedExprNode::Borrow(place)
+                if crate::ccl::ccl_utils::is_free_in_value(name, place) =>
+            {
+                uses.borrow = true
+            }
+            _ => {}
+        }
+        for_each_scoped_item(expr, &mut |item| {
+            if let ScopedItem::Child { expr, binders } = item
+                && !binders.names().any(|bound| bound == name)
+            {
+                visit(expr, name, uses);
+            }
+        });
+    }
+    let mut uses = ParameterUses::default();
+    visit(body, name, &mut uses);
+    uses
+}
+/// If `param` is annotated `Feed(T)` (a borrowed deferred output),
 /// return its history type `Feed(T)`.
 ///
 /// The `Append` sibling of [`mut_param_history_type`]: both annotations name a
@@ -133,7 +173,7 @@ pub(super) fn feed_annotation_type(
             "`Feed` takes one type argument: `Feed(T)`",
         )));
     };
-    Some(lower_type_expr(value, ctx).map(|t| Type::feed(Type::Hole, t)))
+    Some(place_value_type(value, ctx).map(|t| Type::feed(Type::Hole, t)))
 }
 
 /// Wrap `body_expr` in one lambda over `params`, each a named binder: `(x, y): body` →
@@ -142,8 +182,8 @@ pub(super) fn feed_annotation_type(
 /// The lambda's argument is the product of the parameters' types, so a call with several
 /// arguments applies it to the tuple of them ([`super::exprs`]'s `apply_to_args`) and a call
 /// with none to the unit. Each parameter stays a binder through inlining, which substitutes
-/// the argument's components for them: a `Mut(…)` parameter's writes and a `Feed(…)`
-/// parameter's feeds then land on the variable and the channel the caller passed. A later
+/// the argument's components for them: a borrowed parameter's writes and feeds then land on
+/// the place the caller lent with `&`. A later
 /// parameter's annotation may read the earlier parameters, as a dependent tuple's component
 /// reads the components before it.
 pub(super) fn lower_params(
@@ -157,21 +197,41 @@ pub(super) fn lower_params(
             param.name.as_str(),
             ctx.occurrence_at(param.name_span),
         );
-        // A `Mut(…)` parameter is a pass-by-reference mutable variable: bound at `Mut(V, D)`
+        // A `Mut(…)` parameter is a borrowed mutable variable: bound at `Mut(V, D)`
         // so body references carry `Mut` (reads deref, writes lower to `MutWrite`), and
         // inference fills an induction domain from each call's argument; `Mut(V)` given a
         // transactional variable is refused there. A `Feed(…)` parameter is bound at its
         // feed type the same way. A `Mut(…)`/`Feed(…)` annotation names a history carrier
         // rather than an ordinary type, so it lowers here and not through
         // `lower_type_annotation`.
-        if let Some(history_ty) = history_param_type(param, ctx).transpose()? {
+        // A parameter the body writes, feeds or passes on with `&` borrows a place, which a
+        // `Mut(…)`/`Feed(…)` annotation states and the body's uses otherwise infer: a write
+        // makes it a `Mut`, a feed a `Feed`, and a forwarded borrow leaves the kind to
+        // inference (`docs/chl-spec.md`, "Places and values").
+        let uses = parameter_uses(&body_expr, &Name::raw(param.name.as_str()));
+        let stated = history_param_type(param, ctx).transpose()?;
+        let place = stated.clone().or_else(|| {
+            if uses.deferred {
+                Some(Type::feed(Type::Hole, Type::Hole))
+            } else if uses.mutable {
+                Some(Type::mutable(Type::Hole, Type::Hole))
+            } else {
+                None
+            }
+        });
+        if place.is_some() || uses.borrow {
+            binding.parameter_mode = crate::ccl::place::ParameterMode::Borrow;
+        }
+        if let Some(place) = &place {
+            binding.ty = place.clone();
+        }
+        if let Some(history_ty) = stated {
             // The carrier is both the binder type and its declaration: the declaration keeps
             // the domain as written, which inference fills in the binder type.
             let occurrence = param
                 .annotation
                 .as_ref()
                 .map_or_else(Occurrence::mint, |ann| ctx.occurrence_at(ann.ty.span));
-            binding.ty = history_ty.clone();
             binding.declare(Annotation::new(history_ty, occurrence));
         } else if let Some(ann) = &param.annotation {
             // Any *other* annotation (`int`, `List[T]`, …) is a **checking-mode**
@@ -686,7 +746,7 @@ pub(super) fn lower_function_body(
     // on exit), keyed on the pre-uniquify name a sibling function or outer
     // binding could reuse.
     //
-    //  - A `Mut(_, Txn)`-annotated parameter is a pass-by-reference transactional
+    //  - A `Mut(_, Txn)`-annotated parameter is a borrowed transactional
     //    mutable variable: register it so a body `x := …` / `x += …` inside a `with
     //    begin():` block is classified as a commit (the cross-function writer
     //    `def transfer(src, dst: Mut(_, Txn), …)`), and a bare read of it is gated.
@@ -745,10 +805,10 @@ pub(super) fn lower_function_body(
     // parameter `a`.
     let mut body_expr = body_result?;
     if let Some(output) = output {
-        let output_ty = Annotation::new(
-            lower_type_expr(output, ctx)?,
-            ctx.occurrence_at(output.span),
-        );
+        // A function's result is never a place.
+        let output_type = lower_type_expr(output, ctx)?;
+        refuse_misplaced_place(&output_type, false, output.span)?;
+        let output_ty = Annotation::new(output_type, ctx.occurrence_at(output.span));
         let ret = ctx.tag_image(Expr::var(OUTPUT_BINDER), output.span);
         body_expr = ctx.tag_image(
             Expr::let_bind_annotated(OUTPUT_BINDER, Occurrence::mint(), body_expr, ret, output_ty),
@@ -791,16 +851,14 @@ mod tests {
 
         f
         "#})]
-    // The *output* annotation may name a parameter: it rides a `let` inside the
-    // lambda, so uncurrying rewrites it to the tuple projection along with the
-    // body.
+    // The output annotation rides a `let` inside the lambda, in the scope of its parameters.
     #[case::output_annotation(indoc::indoc! {r#"
         def f(a: Int, b: Int) => {Int where _ >= a}:
             a + b
 
         f
         "#})]
-    // An enclosing `def`'s parameter: a curried binder, so the telescope is real.
+    // An enclosing `def`'s parameter remains in scope for the nested annotation.
     #[case::enclosing_param(
         indoc::indoc! {r#"
             def g(k: Int):

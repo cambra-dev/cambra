@@ -44,6 +44,10 @@ member of the shared import or run passed, at the type the Module type gives it 
 not a `Type`](#a-module-type-is-not-a-type)). Specialization and planning see the member, and
 checking against the Module type costs one `let`.
 
+Mut and Feed declarations are private. A module exports a Feed's final collection with an ordinary
+value binding, `pub events = out`. Exported functions may capture and contribute to the private
+Feed. Other modules call those functions to supply input.
+
 ## Pipeline
 
 ```
@@ -270,9 +274,11 @@ a user's `` `some `` builds that module's own tag.
   run path, `eu::out` (`LoweringContext::register_sinks`). The program's tail reads it through the
   binder the run's chain minted (`LoweringContext::run_sink_names`). A run's mutable variables are
   labeled by run path in history records, so two runs keep two histories.
-- **A run's feed is fed through its run name.** `a::events << e` feeds the run's public feed, as
-  `events << e` does inside it: a feed's target may be qualified (`feed_target`). Declaring a
-  public feed makes its module a run, so no import name reaches a feed.
+- **A run exports ordinary value bindings.** With a private `out: Feed(_)` and `pub events = out`,
+  `a::events` reads the run's final collection. An input function such as `a::emit(e)` contributes
+  through the private place. Exporting a writer keeps that Feed's `Append` effect beyond the
+  module's top level and requires a run. A private Feed used wholly inside the module has its
+  contributions discharged at that scope; declaring one alone does not require a run.
 - **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
   an error at the second `run` statement, with a note at the first. A route's address is a
   constant, so a module takes it from a `const` parameter and each run serves the address its
@@ -350,19 +356,17 @@ top-level member, public and private, so that `m::hidden` can say the member is 
 The interface holds no contract. A module's check infers its members' contracts (`check_module`),
 and `cambra check` prints them with the interface (`Interface::written`).
 
-A call of a `def` with a `Mut(…)` or `Feed(…)` parameter lowers an argument that is a bare name as
-the variable it names (`LoweringContext::history_param_fns`). The interface marks such a member
-so a user's call site lowers its arguments alike: a qualified callee reads the mark from the member,
-and a `use` name of such a `def` is registered in `history_param_fns` when its module begins
-lowering.
+A borrow is written `&x` at the call, through a qualified name, a `use` name or a function field
+alike, so lowering a call needs no callee registry, and the interface records nothing about a
+member's parameters for its callers' lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
-(`transactional_vars`, `type_aliases`, `history_param_fns`, `shadow_depth`, `nominal_types`,
+(`transactional_vars`, `type_aliases`, `shadow_depth`, `nominal_types`,
 `associated_functions`, `used_nominal`, `traits`) covers one module. The
-entries a module seeds from interfaces and from its parameters' Module types, `Txn` members in
-`transactional_vars` and `Mut`- and `Feed`-parameter functions in `history_param_fns`, are keyed
-by qualified spelling. The `MutWrite` shape a `:=` to one lowers to then applies to `eu::stock` and
-`audit::stock` exactly as it applies to `stock` inside its own module.
+transactional members a module seeds from interfaces and its parameters' Module types are keyed
+by qualified spelling in `transactional_vars`. The out-of-block read gate and the `MutWrite` shape
+then apply to `eu::stock` and
+`audit::stock` exactly as they apply to `stock` inside its own module.
 
 A module with no syntax tree or an uncontained lowering error has no usable interface. A
 reference or a `use` item into it adds no error: that module's errors account for it. Contained
@@ -536,18 +540,10 @@ argument's members are those of the run or shared import it names, or, for a par
 those of that parameter's argument (`module_names`). A default names an import, checked while the
 module lowers and taken by a run that passes no argument.
 
-A polymorphic entry's `let` carries its polymorphic type, as a `def` with type parameters does. A
-feed entry, `Feed(T)`, is a feed handle with its domain left to inference, and `audit::events << e`
-feeds the argument's feed through the `let`.
-
-A transactional variable's entry, `stock: Mut(V, Txn)`, declares a variable rather than binding a
-`let`, since no `let` binds a `Mut`. Where the module is checked on its own, that declaration
-stands for the argument's variable, and the module reaches it as `p::stock`. Creating a run removes
-it and resolves the spelling `p::stock` to the argument's variable itself (`mut_entries`), so a
-write through the parameter writes the argument's history. In its place a function nothing calls
-writes and reads the variable at `V` (`rebind_mut_entry`), which checks the argument's value type
-is `V` both ways, as `Mut` is invariant. A binding exported in an interface carries its
-spelling and its view, so a module reaching `h::k` reaches what `k` does in `h`.
+A polymorphic entry's `let` carries its polymorphic type, as a `def` with type parameters does.
+Feed outputs are ordinary collection entries; input functions carry contributions into their
+module. A binding exported in an interface carries its spelling and its view, so a module
+reaching `h::k` reaches what `k` does in `h`.
 
 A type member of a Module type is a `TypeEntry`, an alias for the entries after it. An exact one,
 `Name = T`, is `T`. An abstract one, `Name <: T` or `Name: K`, is a declared `Type::Param`, and
@@ -582,18 +578,15 @@ through `n`, in scope throughout `m` (`LoweringContext::begin_module`).
 ### Intrinsics resolve by identity
 
 The std root ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)) is CHL source
-embedded in the binary. A std file has a `FileId` and a path like any other, `<std>/http.cambra` for
-`std::http`, so an error inside it renders against its source. The `http` status helpers are
-ordinary CHL functions there.
+embedded in the binary. Each file has a `FileId` and a path, such as `<std>/http.cambra`, so
+errors inside it render against its source.
 
-A std module may bind an intrinsic, meaning a builtin source, sink constructor, or special form. The
-interface records the member as that intrinsic. Lowering recognizes a special form by what the
-callee resolves to: `reqs, resps = http::serve(…)` is the `http_serve` tuple form because
-`http::serve` resolves to the intrinsic.
-
-An address argument of `http::serve` is a constant, as of `http_serve`. Route uniqueness across
-runs is checked as linking creates each run ([Runs](#runs)), since two runs of one module may serve
-one address.
+`run std::http(…) as server` exposes `server::requests` and `server::respond(values)`. The embedded
+module uses an internal `http_serve` declaration primitive that directly binds a request source
+and private response Feed. User code cannot call that primitive. `respond` consumes collection
+values. A module exports a Feed read with an ordinary public value binding.
+Address arguments are constants. Linking checks route uniqueness as each run is created
+([Runs](#runs)).
 
 ### Registries keyed by spelling
 
@@ -906,8 +899,10 @@ payload, with a diagnostic saying the inspector shows one file.
 
 ## Worked example: two storefronts and an audit log
 
-The example uses **[Decided]** surface that is not implemented (`Feed(…)` declarations, `in`
-guards, `!`) and surface this design adds.
+The example uses private Feed declarations, exported collection reads, and an input function that
+writes a transactional variable. Structured HTTP requests, indexed responses and structured
+response serialization remain **[Open]** extensions
+([chl-spec.md, "7.3 Sources"](chl-spec.md#73-sources)).
 
 `catalog.cambra`, a library:
 
@@ -919,86 +914,104 @@ pub def sale_price(item: Item, qty: Int) => Dollars:
     max([(item.price * qty) // 2, item.cost * qty])
 ```
 
-`audit_api.cambra`, a library holding the interface as a type:
+`audit_api.cambra`, a library holding the event type:
 
 ```python
 pub Event = {app: String, event: String}
-pub AuditLog = Module{events: Feed(Event)}
 ```
 
-`audit.cambra`, a runnable module whose Module type is a subtype of `AuditLog`:
+`audit.cambra`, a runnable module that keeps the events it receives:
 
 ```python
-import std::http
 import audit_api use Event
 
-pub events: Feed(Event)
+log: Mut(List(Event), Txn) := []
 
-reqs, resps = http::serve("9000", "GET", "/events")
-for req in reqs:
-    resps[req.http::id] = [e.audit_api::app + ": " + e.audit_api::event for e in events]
+pub def receive(events):
+    for e in events:
+        with begin():
+            log := log ++ [e]
+
+run std::http(port="9000", method="GET", path="/events") as endpoint
+replies: Feed(String)
+for req in endpoint::requests:
+    entries = with begin():
+        [e.audit_api::app + ": " + e.audit_api::event for e in log]
+    replies << str(entries)
+endpoint::respond(replies)
 ```
 
-`storefront.cambra`, a runnable module with parameters:
+`storefront.cambra`, a runnable module with parameters that exports its events:
 
 ```python
-import std::http
 import catalog
-import audit_api
+import audit_api use Event
 
 const param port: String
 param region: String
-param audit: audit_api::AuditLog
 
 items: Map(String, catalog::Item) = [
     "tee" -> (catalog::price=25, catalog::cost=11),
     "mug" -> (catalog::price=12, catalog::cost=5),
 ]
 stock: Mut(Map(String, Int), Txn) := ["tee" -> 500, "mug" -> 200]
+_events: Feed(Event)
+pub events = _events
 
-order_reqs, order_resps = http::serve(port, "POST", "/order")
+run std::http(port=port, method="POST", path="/order") as orders
+replies: Feed(String)
 
-for req in order_reqs:
-    order = req.http::body
+for req in orders::requests:
+    order = req.body
     result = with begin():
         if order.sku in items and order.sku in stock:
             s = stock[order.sku]!
             if s >= order.qty:
                 stock[order.sku] := s - order.qty
-                audit::events << (audit_api::app=region, audit_api::event="order " + order.sku)
+                _events << (audit_api::app=region, audit_api::event="order " + order.sku)
                 str(catalog::sale_price(items[order.sku]!, order.qty))
             else:
                 "out of stock"
         else:
             "unknown item"
-    order_resps[req.http::id] = result
+    replies << result
+orders::respond(replies)
 ```
 
 `deploy.cambra`, the root:
 
 ```python
 run audit
-run storefront(port="8080", region="eu", audit=audit) as eu
-run storefront(port="8081", region="us", audit=audit) as us
+run storefront(port="8080", region="eu") as eu
+run storefront(port="8081", region="us") as us
+audit::receive(eu::events ++ us::events)
 ```
 
 What each rule contributes:
 
 - `catalog` is shareable, so `storefront` imports it, and both storefront runs reach its one
   shared import.
-- `storefront` checks alone: its parameters are typed by their annotations. Each `run` checks its
-  arguments: the run `audit` has an `events` member of type `Feed(audit_api::Event)`, so its Module
-  type is a subtype of `AuditLog` by width.
-- `items` and `stock` belong to each run: `eu::stock` and `us::stock` are two variables.
-- `eu` and `us` feed one `audit::events`, because the root hands both the same run.
-- Labels from another module are qualified: `catalog::price`, `audit_api::app`, `req.http::body`.
+- `storefront` checks alone: its parameters are typed by their annotations, and each `run` checks
+  its arguments.
+- `items`, `stock` and `_events` belong to each run: `eu::stock` and `us::stock` are two
+  variables, and `eu::events` and `us::events` two collections.
+- A module exports values and takes input through functions. Each storefront exports its events,
+  and the root passes them to `audit::receive` in a call below the runs, so no run's arguments
+  name a run below it ([chl-spec.md, "9.11 The module graph"](chl-spec.md#911-the-module-graph)).
+- An order's event is fed inside its transaction, so a denied order records none.
+- `receive` writes each event into `log` in a transaction, and the `/events` handler reads `log`
+  in a transaction of its own. A request is answered with the events committed before its
+  transaction. A handler reading the whole of `events` instead would wait for the feed to be
+  complete, which a live store never is.
+- Labels from another module are qualified: `catalog::price`, `audit_api::app`.
   The request body's `sku` and `qty` are written unqualified, which assumes the **[Open]** rule for
   data from outside the program gives them to the handler's module ([chl-spec.md, "9.12 Field
   labels and tags belong to a module"](chl-spec.md#912-field-labels-and-tags-belong-to-a-module)).
 - The routes are `8080 POST /order`, `8081 POST /order`, and `9000 GET /events`, distinct after
   linking binds each run's `port`.
-- A reload adding `run storefront(port="8082", region="ap", audit=audit) as ap` starts a third store
-  with its initial stock. Removing `us` needs `@Discard run storefront as us`.
+- A reload adding `run storefront(port="8082", region="ap") as ap` starts a third store with its
+  initial stock, and the root passes `ap::events` to `audit::receive` as well. Removing `us` needs
+  `@Discard run storefront as us`.
 
 ---
 
@@ -1014,8 +1027,8 @@ The work that remains, one PR per item, each updating the spec and design docs i
    wrote, which needs a named wrapper type that every comparison looks through, and a diagnostic
    eliding the qualifier on its own module's members, which needs a diagnostic's text formatted once
    the error has a location ([Names carry their home](#names-carry-their-home)).
-4. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
-   removed.
+4. **The std root.** `std::http` exposes request and response members through a run. Its internal
+   `http_serve` declaration primitive remains private to the embedded module.
 5. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
 6. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps
@@ -1052,9 +1065,6 @@ the [Implementation stack](#implementation-stack).
   value. Comparing an omitted argument with one equal to its default needs the default evaluated
   at link time too: until then they reach two shared imports, where chl-spec.md's
   "9.2 Imports" has them reach one ([Imports](#imports)).
-- **`Feed(…)` declarations** ([chl-spec.md, "8.4 Feeds are the second form of
-  mutability"](chl-spec.md#84-feeds-are-the-second-form-of-mutability)), for a public feed with no
-  initializer.
 - **A user-facing output sink**, since trailing expressions are removed. The spec defines no sink a
   script can write to ([chl-spec.md, "10. Sinks"](chl-spec.md#10-sinks)).
 - **`rec` bindings**, for cycles in the module graph ([chl-spec.md, "13. Reserved for future

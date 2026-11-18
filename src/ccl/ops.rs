@@ -748,10 +748,10 @@ pub enum Builtin {
 
     /// `await_final : Mut(𝑉, Txn) ⇒ 𝑉` — the **terminal read** of a transactional
     /// mutable variable: its final committed value, once the whole commit history is
-    /// complete. Applied to the mutable variable *handle* (`x ▷ await_final`), which is
+    /// complete. Applied to the mutable variable's *place* (`x ▷ await_final`), which is
     /// why its domain is a `Mut` and not a `𝑉`: `await_final` reduces the history rather than
-    /// consuming one sampled value, so the operand is a handle position like a
-    /// pass-by-reference argument or a write target (see
+    /// consuming one sampled value, so the operand is a place position like a
+    /// borrowing argument or a write target (see
     /// `src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
     /// Its scheme `∀ν. Mut(ν, Txn) ⇒ ν` lives in
     /// [`crate::ccl::infer::OperatorSchemes`] — the domain pins `Txn`, so awaiting

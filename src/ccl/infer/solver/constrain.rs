@@ -107,10 +107,10 @@ pub enum ConstrainError {
     },
     /// A non-feed type flowed into a [`Type::History`] requirement — e.g.
     /// a plain value or a collection passed to a function that feeds its parameter.
-    /// The reverse direction is fine (a feed reads as its collection); only a
-    /// feed handle cannot be conjured from a value.
+    /// Value-position typing reads a feed explicitly; subtyping cannot grant
+    /// write capability to an ordinary value.
     NotAFeed {
-        /// The non-feed type that was required to be a feed handle.
+        /// The non-feed type that was required to be a feed place.
         found: Box<Type>,
         /// The feed type demanded.
         required: Box<Type>,
@@ -835,11 +835,7 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &Constrai
         ),
         (Repr::Known(set), Repr::Var(v1)) => {
             for item in set.items() {
-                v1.record(ScopedCapability {
-                    item,
-                    bound: crate::ccl::capabilities::Bound::Escaping,
-                    at: None,
-                });
+                v1.record(ScopedCapability { item, at: None });
             }
         }
         // A known set is a type the compiler built or materialized, which bounds nothing: a
@@ -2377,17 +2373,17 @@ fn constrain_go_impl(
             Ok(())
         }
 
-        // A mutable handle is invariant in BOTH value and domain: a `Mut`
+        // A mutable place type is invariant in BOTH value and domain: a `Mut`
         // parameter both reads its value (covariant) and writes it
         // (contravariant), so the values equate; and the domain must equate so a
         // `Mut` param's fresh per-call domain resolves to the argument mutable variable's
-        // domain (pass-by-reference — the two-way edge is what carries the
+        // domain (borrowing — the two-way edge is what carries the
         // resolution back to the caller). Value/domain edges run under *identity*
         // like a `Feed` payload: a `Mut`'s value and domain are plain types, not
         // content in a Pi binder's scope, so discharges accumulated on the way to
-        // the handle do not transport in.
+        // the place type do not transport in.
         // Two histories of the **same kind** equate invariantly in both value
-        // and domain (a mutable param reads *and* writes; a feed handle both feeds
+        // and domain (a mutable param reads *and* writes; a feed place both feeds
         // and is read). A cross-kind pair (a mutable variable demanded as a feed, or vice
         // versa) is *not* matched here: it falls through to the `(_, Append)` arm below,
         // which accepts any left-hand shape, so a mutable variable demanded as a feed
@@ -2434,15 +2430,15 @@ fn constrain_go_impl(
         }
         // There is deliberately **no deref arm here.** A mutable variable mention that denotes
         // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so a
-        // handle reaching this relation is a handle: the only edges that carry one are
-        // a pass-by-reference argument against its parameter, which the invariance arm
+        // place type reaching this relation is a place: the only edges that carry one are
+        // a lent argument against its borrowed parameter, which the invariance arm
         // above relates, and a write's target.
         //
         // As a subtyping rule the deref was a coercion in disguise — it made `Mut(V)`
         // sit *below* `V` while `Mut` is invariant in `V`, and it fired against a fresh
-        // inference variable, so nothing downstream could tell a read from a handle
-        // being passed along. That is precisely why passing a mutable variable to a `Mut(V)`
-        // parameter needed a separate compensating contribution: the handle was gone
+        // inference variable, so nothing downstream could tell a read from a place
+        // being lent. That is precisely why passing a mutable variable to a `Mut(V)`
+        // parameter needed a separate compensating contribution: the place type was gone
         // before the invariance rule could see it.
 
         // Variable on lhs, rhs has compatible level: record the upper edge in
@@ -2730,41 +2726,30 @@ fn constrain_go_impl(
             }
         }
 
-        // Feed handles are invariant in the payload: feeding writes into
+        // Feed place types are invariant in the payload: feeding writes into
         // the channel (contravariant) while reading consumes it
-        // (covariant), so a feed handle meeting a feed handle equates the
+        // (covariant), so two feed place types meeting equate the
         // payloads. The bidirectional edge is what carries a feed
         // contribution made through a function parameter back to the
         // caller's channel — with a one-way edge the callee's contribution
         // would land on the parameter variable and never reach the
         // argument's payload.
-        // The payload edges run under *identity* morphisms: a feed handle's
+        // The payload edges run under *identity* morphisms: a feed place type's
         // payload is the channel's plain value type, not content living
         // inside a Pi binder's scope, so apply-site discharges accumulated
-        // on the way to the handle do not transport into it. (They also
+        // on the way to the place type do not transport into it. (They also
         // must not: the invariant two-way edge would make two distinct
         // discharges meet at one payload variable — the non-invertible
         // bridge corner — for ordinary chained defer functions. The cost is
         // that a binder-dependent refinement *inside* a fed value's type is
-        // not discharged across the handle — out of scope alongside the
+        // not discharged across the place type — out of scope alongside the
         // filter-feed-through-UDF gaps (see design/mutability.md §4 and the
         // `ccl/channelize.rs` module docs).)
-        // A feed is below its read view `domain ⤇ value`, the collection it accumulates. A
-        // reader whose operand is typed as a feed derefs it where it is emitted
-        // (`emit::emit_value_read`); this rule reads the feed a call returns, which reaches
-        // its reader as an inference variable whose feed bound arrives later.
-        (
-            Type::History {
-                function,
-                history_kind: HistoryKind::Append,
-            },
-            _,
-        ) => constrain_go(function, rhs, sl, sr, cache, scope),
         // Nothing but a feed satisfies a feed requirement: a feed reads as its collection,
-        // but a feed handle cannot be conjured from a value, a collection included
+        // but a feed place cannot be conjured from a value, a collection included
         // (`g(5)` or `g([1, 2])` where `g` feeds its parameter, `x = [1, 2]; x << 3`). A
         // `<<` targeting a `:=` mutable variable lands here
-        // too, as the handle it is — the left side matches `_`, so the cross-kind pair
+        // too, as the place it is — the left side matches `_`, so the cross-kind pair
         // the invariance arm above declined needs no rule of its own.
         (
             _,
@@ -4777,7 +4762,7 @@ mod tests {
             .expect_err("[A, B] must not flow into v whose upper is [A]");
     }
 
-    // --- Feed handles (`Type::History { kind: Feed }`) ---
+    // --- Feed places (`Type::History { kind: Feed }`) ---
 
     /// A feed history over `domain ⤇ value`. Its read view is the whole
     /// collection `Fun { domain, value }` (unlike an `Overwrite`, which derefs to the
@@ -4812,35 +4797,42 @@ mod tests {
     }
 
     #[test]
-    fn feed_reads_transparently_as_a_collection() {
-        // feed(D, Int) <: (D ⤇ Int) — a non-feed consumer reads the read view,
-        // which is the accumulated *collection*…
+    fn a_feed_requires_an_explicit_value_read() {
         let d = Type::UIntRange(3);
+        let reference = feed_ty(d.clone(), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
         assert!(
             constrain_subtype(
-                &feed_ty(d.clone(), prim(BaseType::Int)),
+                &reference,
+                &data_fun(d.clone(), prim(BaseType::Int)),
+                &mut cache
+            )
+            .is_err()
+        );
+        let mut cache = ConstrainCache::new();
+        assert!(
+            constrain_subtype(
+                reference.read_value_type(),
                 &data_fun(d.clone(), prim(BaseType::Int)),
                 &mut cache
             )
             .is_ok()
         );
-        // …but the read view's value still has to match the consumer.
         let mut cache = ConstrainCache::new();
-        assert!(matches!(
+        assert!(
             constrain_subtype(
-                &feed_ty(d.clone(), prim(BaseType::Int)),
+                reference.read_value_type(),
                 &data_fun(d, prim(BaseType::String)),
                 &mut cache
-            ),
-            Err(ConstrainError::Mismatch { .. })
-        ));
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn plain_value_is_not_a_feed() {
         // Int </: feed(D, Int) and (D ⤇ Int) </: feed(D, Int) — a feed reads as its
-        // collection, but a feed handle cannot be conjured from a value, a
+        // collection, but a feed place cannot be conjured from a value, a
         // collection included.
         for value in [
             prim(BaseType::Int),
@@ -4859,22 +4851,19 @@ mod tests {
     }
 
     #[test]
-    fn feed_in_var_bounds_discharges_through_read() {
-        // `x << y` chains feed(D, ρ_y) as a lower bound of ρ_x; a later read
-        // `ρ_x <: (D ⤇ Int)` must discharge through the feed handle
-        // transparently.
+    fn a_reference_in_variable_bounds_does_not_implicitly_read() {
         let d = Type::UIntRange(3);
         let x = fresh_var(0);
         let mut cache = ConstrainCache::new();
         constrain_subtype(&feed_ty(d.clone(), prim(BaseType::Int)), &x, &mut cache).unwrap();
-        assert!(constrain_subtype(&x, &data_fun(d, prim(BaseType::Int)), &mut cache).is_ok());
+        assert!(constrain_subtype(&x, &data_fun(d, prim(BaseType::Int)), &mut cache).is_err());
     }
 
     #[test]
     fn feed_var_coalesces_to_feed() {
         // A var bounded by feed(D, Int) coalesces carrying the Feed
         // constructor (the `history_slot` survives compact → simplify →
-        // coalesce). An `Overwrite` handle reaching a variable survives the same
+        // coalesce). An `Overwrite` place type reaching a variable survives the same
         // way — the relation holds no rule that would collapse it to its value,
         // because a read derefs at the rule that emits it instead.
         use crate::ccl::infer::solver::simplify_type;
@@ -5294,7 +5283,7 @@ mod tests {
         );
     }
 
-    // --- Mutable handles (`Type::History { kind: Overwrite }`) ---
+    // --- Mutable places (`Type::History { kind: Overwrite }`) ---
 
     /// A mutable variable over `domain` holding `value`. Argument order is
     /// [`Type::mutable`]'s rather than the `Mut(value, domain)` rendering's, so the two
@@ -5311,7 +5300,7 @@ mod tests {
 
     #[test]
     fn mut_meets_mut_invariantly() {
-        // Mut(?v0,?d0) <: Mut(?v1,?d1) equates values AND domains (pass-by-ref):
+        // Mut(?v0,?d0) <: Mut(?v1,?d1) equates values AND domains (a borrow):
         // the callee's per-call domain resolves to the argument mutable variable's domain,
         // and the value is invariant (read + write). A value flowing into v1
         // reaches v0 through the two-way edge, so a conflicting read of v0 fails.
@@ -5341,9 +5330,9 @@ mod tests {
         // `Int <: Mut(Int, D)` is **not** a subtyping fact, the mirror of
         // `Mut(V) <: V` not being one: a mutable variable is neither above nor below its
         // value, and a relation that coerces either way cannot tell a read from a
-        // handle. A position that means the value says so itself — `emit_apply`
-        // reads through the parameter's handle for a pass-by-reference argument,
-        // and every other operand derefs at `emit::emit_value_read`.
+        // place. A position that means the value says so itself — `emit_apply`
+        // passes a lent place as itself and reads every other argument,
+        // and any other operand derefs at `emit::emit_value_read`.
         let m = mut_ty(prim(BaseType::UInt), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
         assert!(matches!(

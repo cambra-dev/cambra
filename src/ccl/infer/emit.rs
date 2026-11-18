@@ -23,7 +23,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
-use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
+use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::{
     Assoc, MethodRow, MethodTarget, Signature, Trait, function_over, replace_params,
@@ -92,6 +92,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
     let recorded_ty = expr.ty.clone();
     let has_ann = expr.user_annotation.is_some();
     let mut ty = match &mut expr.node {
+        TypedExprNode::Borrow(place) => emit_borrow(place, ctx)?,
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
@@ -423,7 +424,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Begin { body, .. } => emit_begin(body, ctx)?,
 
         // The feed/define target lookup is Emit-specific (Check maintains no
-        // scope): resolve the feed handle's type from the environment exactly
+        // scope): resolve the feed place's type from the environment exactly
         // as a `Var` use would. Instantiation is a no-op for the common
         // monomorphic defer binding; for a feed-typed lambda param it
         // returns the param type verbatim.
@@ -510,12 +511,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             ctx.record_transactional_access(name);
             ctx.note_handed_out(name, &var_ty, false);
             // The written value flows into the mutable variable's *value* type, not
-            // the `Mut` handle itself — which is what a write means: it updates `V`.
+            // the `Mut` place itself — which is what a write means: it updates `V`.
             // Nothing would deref it on the way in, since the relation holds no
             // mutable variable rule; naming `V` here is the whole of it.
             let mut_value = var_ty.mut_value_type();
             // A write's target is a mutable variable: a binder bound at its history, which a
-            // `:=` introduction and a pass-by-reference parameter are and nothing else is
+            // `:=` introduction and a borrowed parameter are and nothing else is
             // (`src/ccl/design/mutability.md`, "Mutability is the type (no lowering
             // registry)"). `x = 0; x += 1` writes a value.
             let Some(mut_val) = mut_value else {
@@ -523,11 +524,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     name: name.base().to_string(),
                 }));
             };
-            // The *target* is a handle, resolved by name above. The written **value** is
+            // The *target* is a place, resolved by name above. The written **value** is
             // an ordinary value position, so a mutable variable mention there reads: `b := a`
             // between two mutable variables writes `a`'s current value into `b`.
             // The key is an ordinary value position, like the written value: a mutable
-            // variable mentioned there reads rather than passing its handle along.
+            // variable mentioned there reads rather than lending its place along.
             let key_ty = match key {
                 Some(k) => Some(emit_value_read(k, ctx)?),
                 None => None,
@@ -579,12 +580,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             .user_annotation
             .clone()
             .expect("user_annotation is present");
-        // An annotation names the value at this position unless it is itself a handle, so a
+        // An annotation names the value at this position unless it is itself a place type, so a
         // mutable variable mention under one reads (`src/ccl/design/mutability.md`, "A
         // mutable variable read is an explicit operation"). The condition is the
         // annotation's own shape and nothing narrower: reading the generator-source stamp
         // off the term instead would make the rule depend on which stamp lowering used.
-        if !annotation.is_handle() {
+        if !annotation.is_place() {
             ty = read_value(expr, &ty, ctx);
         }
         // A **concrete** function kind on the annotation is a *provenance stamp*:
@@ -1049,8 +1050,8 @@ pub(super) fn emit_lambda<C: Typing>(
     // them crosses whole (`InferCtx::contribution_crossing`); the first names it.
     let group = params.first().map(|p| p.name.clone());
     // A lambda's result passes its value along, as a statement's continuation does: a
-    // mutable variable it ends in is read, and a feed stays the handle the function hands
-    // back (`docs/chl-spec.md`, "8.3 Reads").
+    // mutable variable or a feed it ends in is read, since a function never returns a place
+    // (`docs/chl-spec.md`, "8.3 Reads").
     // Where the body's labels go depends on the lambda's kind, which a lowering stamp
     // states where there is one, as `emit_node` applies to this result.
     let (emitted, capabilities) = ctx.function_body(stamped.unwrap_or(recorded), |ctx| {
@@ -1147,7 +1148,7 @@ fn emit_under_params<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let Some((param, rest)) = params.split_first_mut() else {
-        return emit_passed_read(body, ctx);
+        return emit_value_read(body, ctx);
     };
     let ty = match first {
         Some(ty) => ty,
@@ -1213,6 +1214,7 @@ fn bind_parameter<C: Typing>(
         ctx.type_annotation_predicates(&mut simple)?;
     }
     param.ty = simple.clone();
+    ctx.prepare_place_read(param, &simple)?;
     Ok(simple)
 }
 
@@ -1373,9 +1375,10 @@ pub(super) fn emit_apply<C: Typing>(
         return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
     }
     // The arguments of a call with several are a tuple, which A-normalization may have put
-    // under `let`s naming its operands. A component taken by reference passes its handle;
-    // the other components pass values. The callee is emitted first to supply their modes.
-    // A method and a lambda applied where it stands read their argument's type, so they are
+    // under `let`s naming its operands, and each component passes to one parameter: a borrowed
+    // place as itself, a value read ([`emit_tuple`]). The callee is emitted first, since its
+    // domain's later components may read the arguments before them. A method and a lambda
+    // applied where it stands read their argument's type, so they are
     // emitted after it.
     //
     // A call passing other than one argument passes a list of them, which only a function of a
@@ -1390,18 +1393,24 @@ pub(super) fn emit_apply<C: Typing>(
             TypedExprNode::Method { .. } | TypedExprNode::Lambda { .. }
         )
     });
-    let (raw_arg_ty, fn_ty, passed) = if let Some((tuple, width)) = arguments {
+    let (fn_ty, arg_ty) = if arguments.is_some() {
         let fn_ty = emit_function(function, ctx)?;
-        let params = parameter_type(function, &fn_ty)
-            .and_then(|param| param_components(param, width))
-            .filter(|params| params.iter().any(|p| p.history_parts().is_some()));
-        let passed = params.is_some();
-        if let Some(params) = params {
-            ctx.pass_arguments(tuple, params);
-        }
-        (ctx.subexpr(argument)?, fn_ty, passed)
+        // Each component is typed by the tuple's rule: a borrowed place keeps its place type,
+        // and a value is read ([`emit_tuple`]).
+        (fn_ty, ctx.subexpr(argument)?)
     } else {
         let raw_arg_ty = ctx.subexpr(argument)?;
+        // A borrowed place passes as itself; `await_final` takes the variable whose final
+        // value it awaits; every other argument is a value, which reads a place.
+        let arg_ty = if matches!(argument.node, TypedExprNode::Borrow(_))
+            || matches!(
+                function.node,
+                TypedExprNode::Builtin(crate::ccl::Builtin::AwaitFinal)
+            ) {
+            raw_arg_ty.clone()
+        } else {
+            read_value(argument, &raw_arg_ty, ctx)
+        };
         // A method call's function is resolved here, the argument now typed: the receiver's
         // type picks the candidate that replaces the placeholder.
         if matches!(function.node, TypedExprNode::Method { .. }) {
@@ -1420,8 +1429,7 @@ pub(super) fn emit_apply<C: Typing>(
             && matches!(param.ty, Type::Hole)
         {
             let slot = ctx.binding_slot(&mut param.ty);
-            let read = read_value(argument, &raw_arg_ty, ctx);
-            ctx.require_sub(&read, &slot, &|| "this argument".to_string())?;
+            ctx.require_sub(&arg_ty, &slot, &|| "this argument".to_string())?;
         }
         // `(𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` is a loop's step at the position `𝑟`, the form a `for`
         // loop lowers to (`lower::loops::tagged_for_loop`): `𝑥` is `𝑠`'s value at `𝑟`.
@@ -1454,25 +1462,12 @@ pub(super) fn emit_apply<C: Typing>(
                 };
             }
         }
-        (raw_arg_ty, emit_function(function, ctx)?, false)
+        (emit_function(function, ctx)?, arg_ty)
     };
-    // **The one position where a mutable variable's handle survives.** If the parameter is a
-    // mutable variable the argument is passed *by reference* and the handle must reach the
-    // parameter, so the invariance rule relates the two value types directly — that is
-    // what makes the callee's writes and the caller's declaration one constraint rather
-    // than two edges that have to agree. Every other argument is a value position, so a
-    // mutable variable mention there reads.
-    //
-    // Deciding it here is sound because a pass-by-reference parameter is bound at its
-    // `Mut(V, D)` by the only code that mints one (`lower::functions::lower_params`). A call
-    // of several arguments passes each component of its tuple to one parameter.
-    // The tuple's rule passed each argument to its parameter already.
-    let arg_ty = if passed {
-        raw_arg_ty
-    } else {
-        let param_ty = parameter_type(function, &fn_ty).cloned();
-        passed_argument(argument, &raw_arg_ty, param_ty.as_ref(), ctx)?
-    };
+    if ctx.reads_argument_lists() {
+        call_arity(function, &fn_ty, list)?;
+    }
+    borrowed_arguments(function, &fn_ty, argument, ctx)?;
     // The application's type is the function's codomain with its Pi binder
     // discharged to the argument (dependent application, design §5). `apply`
     // also pins the function/argument shapes with the one-way Apply edges
@@ -1496,12 +1491,19 @@ pub(super) fn emit_apply<C: Typing>(
         TypedExprNode::Proj(key @ ProjKey::Index(_)) => projection(key),
         _ => "this call".to_string(),
     };
-    if ctx.reads_argument_lists() {
-        call_arity(function, &fn_ty, list)?;
-    }
-    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), list, &|| {
-        at.clone()
-    });
+    // A borrow's place is what a dependent codomain reads.
+    let argument_term = match &argument.node {
+        TypedExprNode::Borrow(place) => &**place,
+        _ => argument,
+    };
+    let applied = ctx.apply(
+        &fn_ty,
+        &arg_ty,
+        argument_term,
+        declared.as_ref(),
+        list,
+        &|| at.clone(),
+    );
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;
     }
@@ -1553,6 +1555,142 @@ fn call_arity(function: &Expr, fn_ty: &Type, list: Option<usize>) -> Result<(), 
         },
         function.node_id(),
     ))
+}
+
+/// `&𝑝` lends the place `𝑝` names. A place is a place variable, a declared `Mut` or `Feed` or a
+/// parameter that borrows, or a path from one, `s.items` or `xs[i]`, and lowering lends nothing
+/// else (`lower::exprs::lower_call_arg`). A value is never lent, and lending a path from a place
+/// is planned (`docs/chl-spec.md`, "Places and values"), so a borrow lends a whole place variable.
+fn emit_borrow<C: Typing>(place: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
+    let root = path_root(place).expect("lowering lends only a name or a path from one");
+    let node = place.node_id();
+    let refuse = |defect| {
+        Err(LocatedInferError::new(
+            InferError::Place {
+                name: root.source_spelling().unwrap_or_default().to_string(),
+                defect,
+            },
+            node,
+        ))
+    };
+    if !matches!(place.node, TypedExprNode::Var(_)) {
+        return refuse(if ctx.binds_place(&root) {
+            crate::ccl::infer::PlaceDefect::BorrowsPartOfAPlace
+        } else {
+            crate::ccl::infer::PlaceDefect::BorrowsAValue
+        });
+    }
+    let ty = ctx.subexpr(place)?;
+    // A parameter that borrows has no place type yet where its body is emitted.
+    if !ty.is_place() && !matches!(ty, Type::Infer(_)) {
+        return refuse(crate::ccl::infer::PlaceDefect::BorrowsAValue);
+    }
+    Ok(ty)
+}
+
+/// The variable the path `e` starts from: `e` itself, the target of a projection `𝑟.𝑓`, or
+/// the collection of a lookup `𝑥𝑠[𝑘]`, which lowers to the collection applied to the key or,
+/// checked, to `lookup?` applied to the pair.
+fn path_root(e: &Expr) -> Option<Name> {
+    match &e.node {
+        TypedExprNode::Var(name) => Some(name.clone()),
+        TypedExprNode::Apply { function, argument } => match &function.node {
+            TypedExprNode::Proj(_) => path_root(argument),
+            TypedExprNode::Builtin(crate::ccl::Builtin::LookupChecked) => match &argument.node {
+                TypedExprNode::Tuple(pair) => path_root(pair.first()?),
+                _ => None,
+            },
+            _ => path_root(function),
+        },
+        _ => None,
+    }
+}
+
+/// Check a call's borrows against its parameters, one argument per parameter: the argument
+/// itself, or each component of the tuple of several. A place passed without `&` to a
+/// parameter that borrows is refused, naming the missing `&`, rather than reported as a place
+/// meeting a value. A borrowed place records what the callee may do with it: read and write a
+/// `Mut`, append to a `Feed` (`docs/chl-spec.md`, "Discharging requirements and effects").
+fn borrowed_arguments<C: Typing>(
+    function: &Expr,
+    fn_ty: &Type,
+    argument: &Expr,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    if matches!(function.node, TypedExprNode::Builtin(_)) {
+        return Ok(());
+    }
+    let parts: Vec<&Expr> = match argument_parts(argument) {
+        Some(parts) => parts.iter().collect(),
+        None => vec![argument],
+    };
+    let params: Option<Vec<Type>> = match fn_ty.peel_refinements() {
+        Type::Fun { domain, .. } if parts.len() == 1 => Some(vec![(**domain).clone()]),
+        Type::Fun { domain, .. } => param_components(domain, parts.len()),
+        _ => None,
+    };
+    for (j, part) in parts.into_iter().enumerate() {
+        let param = params.as_ref().and_then(|ps| ps.get(j));
+        match &part.node {
+            TypedExprNode::Borrow(place) => {
+                let TypedExprNode::Var(name) = &place.node else {
+                    continue;
+                };
+                // A declared place's type is known where it is borrowed. One still unknown
+                // here is a borrowed parameter forwarded before inference settles its kind,
+                // and a parameter's reads and writes are its caller's, so the forwarding call
+                // records none.
+                let borrowed = place
+                    .ty
+                    .as_place()
+                    .or_else(|| param.and_then(Type::as_place));
+                if let Some(borrowed) = borrowed {
+                    match borrowed.kind {
+                        crate::ccl::place::PlaceKind::Mutable
+                        | crate::ccl::place::PlaceKind::Transactional => {
+                            ctx.record_capability(Capability::Requires(Requirement::read(
+                                name.clone(),
+                            )));
+                            ctx.record_capability(Capability::Causes(Effect::Write(name.clone())));
+                        }
+                        crate::ccl::place::PlaceKind::Deferred => {
+                            ctx.record_capability(Capability::Causes(Effect::Append(name.clone())));
+                        }
+                    }
+                }
+            }
+            TypedExprNode::Builtin(_) => {}
+            _ if param.is_some_and(Type::is_place) => {
+                // A read A-normalization named has no source spelling of its own.
+                let name = match &part.node {
+                    TypedExprNode::Var(name) => {
+                        name.source_spelling().unwrap_or_default().to_string()
+                    }
+                    _ => String::new(),
+                };
+                return Err(LocatedInferError::new(
+                    InferError::Place {
+                        name,
+                        defect: crate::ccl::infer::PlaceDefect::BorrowMissing,
+                    },
+                    part.node_id(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The arguments of the list `argument` is, under the `let`s A-normalization puts around a
+/// call's argument ([`argument_tuple`]); a check meets the list as the tuple inference rewrote
+/// it to.
+fn argument_parts(argument: &Expr) -> Option<&[Expr]> {
+    match &argument.node {
+        TypedExprNode::Arguments(components) | TypedExprNode::Tuple(components) => Some(components),
+        TypedExprNode::Let { body, .. } => argument_parts(body),
+        _ => None,
+    }
 }
 
 /// Check the key against the collection domain's base and return the supplied value type.
@@ -1905,116 +2043,6 @@ fn param_components(param: &Type, width: usize) -> Option<Vec<Type>> {
     }
 }
 
-/// The type `argument`, of type `raw`, passes to a parameter of type `param`.
-///
-/// A pass-by-reference parameter's argument names a mutable variable where it is passed
-/// (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
-/// (downward-only)"): a bare variable whose own type is `Mut`, read through the
-/// A-normalization temps naming it ([`written_variable`]). A computed argument
-/// (`bump(x if c else y)`) has no one introduction to write, and a plain `x` holds no
-/// mutable variable for the caller to observe the write through.
-fn passed_argument<C: Typing>(
-    argument: &Expr,
-    raw: &Type,
-    param: Option<&Type>,
-    ctx: &mut C,
-) -> Result<Type, LocatedInferError> {
-    // A node under an annotation that is not a handle reads (`emit_node`), which here would
-    // read the handle this position has to pass. Only lowering annotates an expression (a
-    // source `x: T = e` annotates the binding), and it annotates generator sources, the
-    // kind stamps on `Compose` and lambda nodes, and a `**` exponent, none of which is a
-    // pass-by-reference argument.
-    debug_assert!(
-        param.is_none_or(|param| param.mut_value_type().is_none())
-            || argument.user_annotation.is_none(),
-        "a pass-by-reference argument carries no annotation, got {:?}",
-        argument.user_annotation
-    );
-    if param.is_some_and(|param| param.mut_value_type().is_some()) {
-        let refused = match written_variable(argument, ctx) {
-            TempNames::Computed => Some(InferError::MutNotBareVariable {
-                at: symbolic(argument),
-            }),
-            TempNames::Variable(_, ty) if ty.mut_value_type().is_none() => {
-                Some(InferError::MutArgNotMutable {
-                    at: symbolic(argument),
-                })
-            }
-            // The callee may read and write the variable, so the call does, whether or not the
-            // callee does (`docs/chl-spec.md`, "Discharging requirements and effects"). Passing
-            // a transactional variable needs no transaction: the callee writes it in a block of
-            // its own, or requires one.
-            TempNames::Variable(variable, _) => {
-                ctx.record_capability(Capability::Requires(Requirement::read(variable.clone())));
-                ctx.record_capability(Capability::Causes(Effect::Write(variable)));
-                None
-            }
-        };
-        if let Some(error) = refused {
-            return Err(LocatedInferError::new(error, argument.node_id()));
-        }
-    }
-    Ok(match (param, raw.mut_value_type()) {
-        // A handle reaching its pass-by-reference parameter: invariance relates the two
-        // value types directly, in both directions.
-        (Some(param), Some(_)) if param.mut_value_type().is_some() => raw.clone(),
-        // A mutable variable an A-normalization temp names, which the check above passed:
-        // the temp holds the variable's value. So the value edge is emitted here, against
-        // the parameter's value, rather than left to the relation. A value meeting a handle
-        // is not a subtyping fact, and making it one is what put a coercion back in the
-        // lattice: the rule that knows this position is pass-by-reference is the rule that
-        // should read through the handle. The application edge below then relates handle
-        // to handle.
-        (Some(param), None) if param.mut_value_type().is_some() => {
-            let value = param
-                .mut_value_type()
-                .expect("guarded by the match arm")
-                .clone();
-            let read = read_value(argument, raw, ctx);
-            ctx.require_sub(&read, &value, &|| "pass-by-reference argument".to_string())?;
-            param.clone()
-        }
-        // A feed reaching a `Feed` parameter: the callee may feed it, so the call does, as
-        // for a `Mut` parameter.
-        (Some(param), None) if param.as_feed().is_some() && raw.as_feed().is_some() => {
-            if let TypedExprNode::Var(a) = &argument.node {
-                ctx.record_capability(Capability::Causes(Effect::Append(a.clone())));
-            }
-            raw.clone()
-        }
-        // Every other position is a value position, so a mutable variable mention reads. A
-        // feed is passed as the handle it is: the parameter's constraints decide whether
-        // the callee feeds it or reads it.
-        _ => read_passed(argument, raw, ctx),
-    })
-}
-
-/// The domain of the function an application's `function`, of type `fn_ty`, applies: read off
-/// the head of a spine of applications, `f(a)(b)`, whose type states the functions each
-/// application returns where the applied type is a variable.
-fn parameter_type<'t>(function: &'t Expr, fn_ty: &'t Type) -> Option<&'t Type> {
-    let mut head = function;
-    let mut applied = 0usize;
-    while let TypedExprNode::Apply {
-        function: inner, ..
-    } = &head.node
-    {
-        head = inner;
-        applied += 1;
-    }
-    let mut ty = if applied == 0 { fn_ty } else { &head.ty };
-    for _ in 0..applied {
-        let Type::Fun { codomain, .. } = ty.peel_refinements() else {
-            return None;
-        };
-        ty = codomain;
-    }
-    match ty.peel_refinements() {
-        Type::Fun { domain, .. } => Some(domain),
-        _ => None,
-    }
-}
-
 pub(super) fn emit_binop<C: Typing>(
     operator_node_id: NodeId,
     op: BinOpKind,
@@ -2090,30 +2118,18 @@ pub(super) fn emit_tuple<C: Typing>(
     elts: &mut [Expr],
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // A call's arguments, which its callee takes some of by reference: each passes to its
-    // parameter ([`passed_argument`]), a mutable variable's handle to a `Mut` parameter.
-    if let Some(params) = ctx.take_arguments(ctx.current_node()) {
-        let mut fields = BTreeMap::new();
-        for ((i, e), param) in elts.iter_mut().enumerate().zip(&params) {
-            let raw = ctx.subexpr(e)?;
-            fields.insert(
-                FieldKey::Index(i),
-                passed_argument(e, &raw, Some(param), ctx)?,
-            );
-        }
-        return Ok(product(fields));
-    }
     let mut fields = BTreeMap::new();
     for (i, e) in elts.iter_mut().enumerate() {
-        // A bare mutable read in a tuple denotes its *value* (reads deref, design
-        // doc "a bare reference denotes the value"), so the product field takes
-        // the dereferenced element type. The element node stays a bare `Var`
-        // carrying `Mut` (rule 1 accepts it; the phase erases the type later) —
-        // only the *composite type* is dereferenced, so a `Mut` never appears
-        // nested in it. A non-`Mut` element is unchanged, a feed included: a tuple passes
-        // its elements along (a function's arguments travel in one), and a reader of the
-        // element reads it.
-        fields.insert(FieldKey::Index(i), emit_passed_read(e, ctx)?);
+        // Product fields store values read through either history kind. A call's argument
+        // tuple is the one product a component may be a borrowed place in, which passes as
+        // itself.
+        let ty = ctx.subexpr(e)?;
+        let field = if matches!(e.node, TypedExprNode::Borrow(_)) {
+            ty
+        } else {
+            read_value(e, &ty, ctx)
+        };
+        fields.insert(FieldKey::Index(i), field);
     }
     Ok(product(fields))
 }
@@ -2127,9 +2143,10 @@ pub(super) fn emit_record<C: Typing>(
     for entry in fs.iter_mut() {
         // Deref a bare mutable read to its value, as in `emit_tuple`: the field
         // takes the dereferenced type so no `Mut` appears in the record type.
+        let ty = ctx.subexpr(&mut entry.value)?;
         fields.insert(
             FieldKey::Name(entry.label.clone()),
-            emit_passed_read(&mut entry.value, ctx)?,
+            read_value(&entry.value, &ty, ctx),
         );
     }
     Ok(product(fields))
@@ -2163,31 +2180,19 @@ pub(super) fn emit_expr_stmt<C: Typing>(
         }
         Ok(())
     })?;
-    // The continuation's value is passed along: a mutable variable reads, and a feed stays
-    // the handle a function hands back (`x: Feed(_); x << n; x`).
-    emit_passed_read(body, ctx)
-}
-
-/// The type of the variable `argument` is as the program wrote it, read through the
-/// A-normalization temps naming it ([`Typing::note_temp`]): a temp bound to a mutable
-/// variable holds that variable's value, and the variable is what the program passed.
-/// [`TempNames::Computed`] for a computed argument.
-pub(super) fn written_variable<C: Typing>(argument: &Expr, ctx: &C) -> TempNames {
-    match &argument.node {
-        TypedExprNode::Var(name) if name.is_anf_temp() => ctx
-            .temp_written(name)
-            .expect("an A-normalization temp is recorded by its let before its body is emitted"),
-        TypedExprNode::Var(name) => TempNames::Variable(name.clone(), argument.ty.clone()),
-        _ => TempNames::Computed,
+    // A statement continuation produces a value read.
+    {
+        let ty = ctx.subexpr(body)?;
+        Ok(read_value(body, &ty, ctx))
     }
 }
 
-/// Type a `Defer` node: a fresh feed handle. `let d = Defer in body` binds
+/// Type a `Defer` node: a fresh feed place. `let d = Defer in body` binds
 /// `d : Feed(ρ)`, with `ρ` accumulating the channel's eventual type from
 /// the feeds/defines targeting `d` and discharging into the reads of `d`.
 ///
 /// A bare `Defer` RHS is never generalized (`should_generalize` requires a
-/// lambda RHS), so every use of the binding shares one handle — feeds and
+/// lambda RHS), so every use of the binding shares one place — feeds and
 /// reads of the same defer meet in one `ρ`. A defer minted *inside* a
 /// generalized function body (`λn → let x = Defer in …`) generalizes with
 /// the function and instantiates a fresh `ρ` per call site — exactly the
@@ -2203,45 +2208,25 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
     Type::feed(ctx.fresh(), ctx.fresh())
 }
 
-/// Deref a handle to what a read of it yields: a mutable variable to its value
-/// ([`Type::mut_value_type`]), a feed to the collection `domain ⤇ value` it accumulates, its
-/// binder included where a row reads its position ([`Type::read_view`]). A no-op on every
-/// other type.
+/// Read a state reference in a value position. Mutable variables yield their
+/// current value; Feeds yield their collection. Non-reference values retain
+/// their refinements. Both history kinds use the same rule and call sites.
 pub(super) fn read_through(ty: &Type) -> Type {
-    if ty.as_feed().is_some() {
-        return ty.read_view().into_owned();
-    }
-    read_mut(ty)
+    ty.read_value_type().clone()
 }
 
-/// Deref a mutable variable reference to its value type, leaving a feed the handle it is:
-/// the read of a position that passes its value along rather than consuming it — a `let`
-/// initializer, an argument, a tuple element or record field, a statement's continuation.
-/// A feed passed along stays a feed, and wherever it lands, the constraints there decide
-/// whether it is fed (a feed meets a feed) or read (a feed is below its collection).
-pub(super) fn read_mut(ty: &Type) -> Type {
-    ty.mut_value_type().unwrap_or(ty).clone()
+/// Type a value position using the common history read. Writable argument positions
+/// and write targets preserve references; subtype constraints never perform the read.
+fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
+    let ty = ctx.subexpr(e)?;
+    Ok(read_value(e, &ty, ctx))
 }
 
-/// The expression a body ultimately **denotes**, seen through the tail positions that
-/// carry their continuation's value.
-///
-/// A tail position reports a value where a mutable variable is read — a program ending in a
-/// read of its accumulator has that accumulator's *value* — so the handle is no longer
-/// visible in the enclosing node's type. Anything that must reason about the handle
-/// rather than the value asks the term instead, which is what this walks to.
-///
-/// Every tail is walked, [`TypedExprNode::MutDecl`] included: a mutable variable does not
-/// escape its introduction either, so a function whose body ends in a read of a
-/// mutable variable it declared is the same escape as one that returns a parameter. Each of
-/// these nodes reports its continuation's value, and none of them is a place a
-/// handle stops being one.
-///
-/// The `let __output : 𝑇 = body in __output` binding [`opaque_output`] puts at a lambda's
-/// tail denotes `body`, so the walk continues into `body` rather than stopping at the
-/// `__output` read, whose type is the definiens' already-dereffed value.
-///
-/// [`opaque_output`]: crate::ccl::opaque_output
+/// The expression a body denotes, seen through the tail positions that carry their
+/// continuation's value: a tail reports a value where a mutable variable is read, so the
+/// place is no longer visible in the enclosing node's type, and anything asking about the
+/// place asks the term this walks to. The `let __output : 𝑇 = body in __output` binding
+/// [`crate::ccl::opaque_output`] puts at a lambda's tail denotes `body`.
 fn denoted_expr(e: &Expr) -> &Expr {
     if let Some(body) = crate::ccl::opaque_output::output_body(e) {
         return denoted_expr(body);
@@ -2254,65 +2239,16 @@ fn denoted_expr(e: &Expr) -> &Expr {
     }
 }
 
-/// Emit a **value read**: a mutable variable or feed mention here is a *read*, so its handle
-/// derefs to the value it holds, or for a feed to its collection ([`read_through`]).
-///
-/// This is the ordinary case. A mutable variable's handle survives in exactly three
-/// positions — a pass-by-reference argument (see [`emit_apply`]), a `MutWrite` target, which
-/// is resolved by name rather than as a subexpression, and `await_final`'s operand, which
-/// `emit_apply` reads off the head of the spine as the first of those
-/// (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation") —
-/// and the mutability discipline is
-/// what makes that enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var`,
-/// and rule 2 keeps `Mut` out of every composite, so a parent always knows whether the
-/// operand it is about to constrain is a handle position without inspecting it.
-///
-/// Dereffing *here* rather than inside the subtyping relation is the point. A rule
-/// `Mut(V) <: V` reads as "a mutable variable is a subtype of its value", which is a coercion
-/// wearing a subtyping rule's clothes: it makes `Mut(V)` sit below `V` while `Mut` is
-/// invariant in `V`, and it fires against a fresh inference variable, so it cannot tell
-/// a read from a handle being passed along.
-///
-/// A feed is not second-class: it passes along through the positions [`read_mut`] names and
-/// out of a function as its result. So a feed can reach a reader as an inference variable
-/// (a call's result), where the relation's rule that a feed is below its collection reads
-/// it; a reader whose operand is typed as a feed derefs it here.
-fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
-    let ty = ctx.subexpr(e)?;
-    Ok(read_value(e, &ty, ctx))
-}
-
-/// `ty`, the type of `e`, read as a value: a mutable variable's handle becomes its value
-/// ([`read_through`]). A read of the mutable variable `x` requires `Read(x)`, and of a
-/// transactional one `Transaction` too (`src/ccl/design/type-inference.md`, "Capability
-/// variables"), so this records them; a mention that stays a handle, passed by reference or to
-/// `await_final`, reads nothing.
+/// `ty`, the type of `e`, read as a value ([`Typing::read_value_type`]). A read of the mutable
+/// variable `e` names requires `Read` of it, and of a transactional one `Transaction` too
+/// (`src/ccl/design/type-inference.md`, "Capability variables"), so this records the read.
 fn read_value<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) -> Type {
-    record_value_read(e, ty, ctx);
-    read_through(ty)
-}
-
-/// Type `e` at a position that passes its value along ([`read_mut`]): a mutable variable
-/// reads, as in [`emit_value_read`], and a feed stays the handle it is.
-fn emit_passed_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
-    let ty = ctx.subexpr(e)?;
-    Ok(read_passed(e, &ty, ctx))
-}
-
-/// `ty`, the type of `e`, read as [`read_mut`] reads it, recording the read as [`read_value`]
-/// does.
-fn read_passed<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) -> Type {
-    record_value_read(e, ty, ctx);
-    read_mut(ty)
-}
-
-/// Record the read of the mutable variable `e` names, when `ty` is its handle.
-fn record_value_read<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) {
     if ty.mut_value_type().is_some()
         && let TypedExprNode::Var(name) = &denoted_expr(e).node
     {
         ctx.record_read(name, e);
     }
+    ctx.read_value_type(ty)
 }
 
 /// A feed into `target` as a diagnostic names it: by the target's name, or as
@@ -2325,12 +2261,12 @@ fn feed_role(target: &Name) -> String {
 }
 
 /// Type a `Feed { name, value }`: the fed value contributes one element to
-/// the target handle's channel; the feed expression itself is `Unit` (it is
+/// the target place's channel; the feed expression itself is `Unit` (it is
 /// statement-positioned — channelize extracts the value into a channel and
 /// leaves `Unit` residue).
 ///
 /// The contribution is `Fun(fresh δ, value_ty)`, constrained into the target
-/// handle whose domain is the rigid `ChanDom(d)` — so `δ` pins to that name
+/// place whose domain is the rigid `ChanDom(d)` — so `δ` pins to that name
 /// rather than a free `Infer`, and `channelize` erases `ChanDom(d)` to the
 /// concrete channel domain (a source domain, or a `Variant` union of feed
 /// sites) by substitution.
@@ -2349,7 +2285,7 @@ pub(super) fn emit_feed(
     // site that shows why no later fixup could: the payload is wrapped into a `Fun`
     // codomain, and two contributions to one channel become `Fun` lower bounds that
     // are *joined* (codomains lub'd) rather than constrained against a demand. There
-    // is no demand for a handle to be reconciled against — an undereferenced
+    // is no demand for a place to be reconciled against — an undereferenced
     // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
     let value_ty = emit_value_read(value, ctx)?;
     let channel = feed_channel(target, target_ty, label, ctx)?;
@@ -2358,7 +2294,7 @@ pub(super) fn emit_feed(
     Ok(prim(BaseType::Unit))
 }
 
-/// Type a `Define { name, value }`: the defined value *is* the handle's
+/// Type a `Define { name, value }`: the defined value *is* the place's
 /// eventual payload (`x <<= v` sets the whole channel); the define
 /// expression itself is `Unit`, like `Feed`.
 pub(super) fn emit_define(
@@ -2372,7 +2308,7 @@ pub(super) fn emit_define(
     constrain_into_feed(target, target_ty, &value_ty, label, ctx)
 }
 
-/// Land `payload_sub` inside the feed handle `target_ty`, returning `Unit`
+/// Land `payload_sub` inside the feed place `target_ty`, returning `Unit`
 /// (the type of the feed/define expression itself).
 fn constrain_into_feed(
     target: &Name,
@@ -2386,16 +2322,12 @@ fn constrain_into_feed(
     Ok(prim(BaseType::Unit))
 }
 
-/// The channel a feed or define into a handle of type `target_ty` flows into: the history's
+/// The channel a feed or define into a place of type `target_ty` flows into: the history's
 /// data function `domain ⤇ value`, its read view. A **data** function, so a collection defined
 /// into it meets a collection.
 ///
-/// A known storage binding supplies its inferred contract, including its key binder. An alias
-/// or projection is checked against that same contract. A target whose storage is unknown is
-/// demanded to be a feed by `target <: Feed(ρf)`, whose read view is the channel. The call-site
-/// argument edge `Feed(ρ_arg) <: param` meets that bound, and the invariant Feed/Feed rule carries
-/// the contribution back into the caller's channel. A non-feed argument fails the same meeting
-/// with `NotAFeed`.
+/// A declaration or annotated parameter supplies its contract, including its key binder.
+/// A write cannot infer Feed capability for an unresolved ordinary parameter.
 fn feed_channel(
     target: &Name,
     target_ty: &Type,
@@ -2409,11 +2341,22 @@ fn feed_channel(
     if target_ty.as_feed().is_some() {
         return Ok(target_ty.read_view().into_owned());
     }
-    let rho_value = ctx.fresh();
-    let rho_domain = ctx.fresh();
-    let required = Type::feed(rho_domain.clone(), rho_value.clone());
-    ctx.require_sub(target_ty, &required, &|| format!("the target of {label}"))?;
-    Ok(Type::data_fun(rho_domain, rho_value))
+    let error = if matches!(target_ty.peel_refinements(), Type::Infer(_)) {
+        InferError::Place {
+            name: target.base().to_string(),
+            defect: crate::ccl::infer::PlaceDefect::FeedTargetNotAPlace,
+        }
+    } else {
+        let required = Type::feed(ctx.fresh(), ctx.fresh());
+        super::map_constrain_err(
+            super::solver::ConstrainError::NotAFeed {
+                found: Box::new(target_ty.clone()),
+                required: Box::new(required),
+            },
+            &format!("the target of {label}"),
+        )
+    };
+    Err(ctx.raise(error))
 }
 
 pub(super) fn emit_copair<C: Typing>(
@@ -2629,20 +2572,12 @@ pub(super) fn emit_let<C: Typing>(
     // A right-hand side holding a statement recovered from has untyped nodes, so, like one
     // that did not type, it has no value to discharge.
     let defined = defined && ctx.recoveries() == recoveries_before;
-    if binding.name.is_anf_temp() {
-        let written = written_variable(bound_expr, ctx);
-        ctx.note_temp(&binding.name, written);
-    }
-    // A feed declaration (`Defer`) declares the feed the `let` binds. Any other `let` of a feed
-    // names one declared elsewhere, a parameter's or another module's, which is not this scope's.
     let declares_feed = matches!(bound_expr.node, TypedExprNode::Defer);
-    // The body passes its value along, as every tail does: a mutable variable it ends in is
-    // read.
     let body_ty = ctx.scoped_let(binding, defined.then_some(&*bound_expr), scheme, |ctx| {
         if declares_feed {
             ctx.declare_mutable(&binding.name, &binding.ty);
         }
-        emit_passed_read(body, ctx)
+        ctx.subexpr(body)
     })?;
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
@@ -3034,7 +2969,7 @@ fn emit_let_bound<C: Typing>(
         }
     };
     // A `let d = Defer` binding names its channel's domain rigidly — replace
-    // the handle's (fresh, otherwise-unconstrained) domain var with the
+    // the place's (fresh, otherwise-unconstrained) domain var with the
     // literal nominal `ChanDom(d)`, so every consumer of a read of `d` types
     // concretely against the rigid name (no `Infer` channel-domain residue).
     // The slot must hold the *literal* rigid type, not a var pinned to it: a
@@ -3053,7 +2988,7 @@ fn emit_let_bound<C: Typing>(
     {
         // The value variable is minted again here, at the binding's level rather than the
         // right-hand side's: a `let` of a `Defer` binds monomorphically, so the channel's
-        // element type stands where the handle is bound. A contribution from a generalized
+        // element type stands where the place is bound. A contribution from a generalized
         // `def` then lowers the variables it carries to this level, so `def f(y): out << y`
         // leaves `y` monomorphic; at the right-hand side's level `y` would be quantified,
         // and the channel would receive the generic variable rather than what each call
@@ -3069,28 +3004,26 @@ fn emit_let_bound<C: Typing>(
         let key = Name::fresh("__key");
         let domain = Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level()));
         let element = ctx.scoped(&key, &domain, |ctx| ctx.fresh());
-        let handle = Type::history_keyed(key, domain, element, crate::ccl::HistoryKind::Append);
+        let place_ty = Type::history_keyed(key, domain, element, crate::ccl::HistoryKind::Append);
         let body = body.expect("a `defer` is bound by a `let`, which has a body");
         ctx.note_feed_places(&binding.name, feed_places(&binding.name, body));
-        bound_expr.ty = handle.clone();
-        handle
+        bound_expr.ty = place_ty.clone();
+        place_ty
     } else {
         bound_ty
     };
-    // An initializer that is a mutable variable **reads**: `b = a` off a mutable `a` binds `b`
-    // at `a`'s *value*, a snapshot, exactly as `a + 1` or `f(a)` read it — the same
-    // rule [`read_mut`] applies to a tuple element, a record field, and an argument. That is the whole reason a `Let` can never bind a mutable variable: the alias
-    // `b = a` would otherwise create is unrepresentable rather than merely
-    // forbidden, so no discipline rule has to reject it.
-    //
-    // [`read_mut`] leaves a **feed** the handle it is, which is what a `Let` needs: a feed
-    // channel stays a handle here (`let d = Defer in …`, the `Append` arm above, and an
-    // alias `log = out`).
-    //
-    // Applying it *before* the annotation arms is what leaves `_` needing no
-    // special case: `b: _ = a` completes its unspecified position from an already
-    // deref'd `bound_ty`, so it means what `b = a` means.
-    let bound_ty = read_passed(bound_expr, &bound_ty, ctx);
+    // Source initializers read values before checking annotations. Declaration and
+    // compiler parameter bindings retain the reference being introduced or borrowed.
+    let bound_ty = if matches!(
+        bound_expr.node,
+        TypedExprNode::Defer | TypedExprNode::Abstract
+    ) || binding.ty.is_place()
+        || binding.parameter_mode == crate::ccl::place::ParameterMode::Borrow
+    {
+        bound_ty
+    } else {
+        read_value(bound_expr, &bound_ty, ctx)
+    };
     // An exact annotation *is* what the binder binds at (below), so its refinement
     // predicates ride `binding.ty` to the post-inference wall. Type them here —
     // the predicates mention the enclosing scope's bindings, not the binder's own
@@ -3264,76 +3197,36 @@ fn scoped_group<C: Typing, R>(
     }
 }
 
-/// The places in `body` that feed `defer`, through aliases and static products too: each `<<`,
-/// each `<<=`, and each call receiving the handle. Computed data siblings carry no handle.
+/// The places in `body` that feed `defer`: each `<<` and `<<=` naming it, and each call
+/// lending it with `&`. A place has one name, so no alias or product reaches it.
 fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
-    use crate::ccl::ccl_utils::{ValueReference, resolve_product_reference};
-    fn carries(defer: &Name, e: &Expr, definitions: &HashMap<&Name, &Expr>) -> bool {
-        match resolve_product_reference(ValueReference::Expr(e), |name| {
-            definitions.get(name).copied()
-        }) {
-            ValueReference::Name(name) if name == defer => true,
-            ValueReference::Name(name) => definitions
-                .get(name)
-                .is_some_and(|value| carries(defer, value, definitions)),
-            ValueReference::Expr(value) => match &value.node {
-                TypedExprNode::Tuple(_) | TypedExprNode::Record(_) | TypedExprNode::List(_) => {
-                    value.any_child(|child| carries(defer, child, definitions))
-                }
-                TypedExprNode::Case { branches, .. } => branches
-                    .iter()
-                    .any(|branch| carries(defer, &branch.body, definitions)),
-                _ => false,
-            },
+    fn lends(defer: &Name, argument: &Expr) -> bool {
+        match &argument.node {
+            TypedExprNode::Borrow(place) => {
+                matches!(&place.node, TypedExprNode::Var(name) if name == defer)
+            }
+            TypedExprNode::Tuple(parts) => parts.iter().any(|part| lends(defer, part)),
+            TypedExprNode::Let { body, .. } => lends(defer, body),
+            _ => false,
         }
     }
-    fn walk<'a>(
-        defer: &Name,
-        e: &'a Expr,
-        definitions: &mut HashMap<&'a Name, &'a Expr>,
-        places: &mut Vec<NodeId>,
-    ) {
-        if let TypedExprNode::Let {
-            binding,
-            bound_expr,
-            ..
-        } = &e.node
-            && binding.transparency == crate::ccl::BindingTransparency::Transparent
-        {
-            definitions.insert(&binding.name, bound_expr);
-        }
+    fn walk(defer: &Name, e: &Expr, places: &mut Vec<NodeId>) {
         match &e.node {
             TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. }
-                if matches!(resolve_product_reference(ValueReference::Name(name), |name| {
-                    definitions.get(name).copied()
-                }), ValueReference::Name(origin) if origin == defer) =>
+                if name == defer =>
             {
                 places.push(e.node_id())
             }
-            // Reading a product component or Iterable::elements feeds nothing.
-            TypedExprNode::Apply { argument, function }
-                if !matches!(
-                    function.node,
-                    TypedExprNode::Builtin(_) | TypedExprNode::Proj(_)
-                ) && !is_iterable_elements(function)
-                    && carries(defer, argument, definitions) =>
-            {
+            TypedExprNode::Apply { argument, .. } if lends(defer, argument) => {
                 places.push(e.node_id())
             }
             _ => {}
         }
-        e.walk_children(|c| walk(defer, c, definitions, places));
+        e.walk_children(|c| walk(defer, c, places));
     }
     let mut places = Vec::new();
-    walk(defer, body, &mut HashMap::new(), &mut places);
+    walk(defer, body, &mut places);
     places
-}
-
-/// Whether `function` is `Iterable::elements`, the call a loop reads its source through.
-fn is_iterable_elements(function: &Expr) -> bool {
-    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, Trait};
-    matches!(&function.node, TypedExprNode::TraitFn { trait_, function, .. }
-        if *trait_ == Trait::iterable() && function.as_str() == ITERABLE_ELEMENTS)
 }
 
 /// Emit/check a `letrec` group (design doc `src/ccl/design/mutability.md`,
@@ -3474,7 +3367,8 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // specializing it would duplicate the mutable variable.
     let body_ty = ctx.scoped_mut(&binding.name, &history, |ctx| {
         ctx.declare_mutable(&binding.name, &history);
-        emit_passed_read(body, ctx)
+        let ty = ctx.subexpr(body)?;
+        Ok(read_value(body, &ty, ctx))
     })?;
     // The body type is returned as-is, *not* through `close_let_type`. A `let`'s
     // binder can be discharged into the lifted type because the binder simply *is*
@@ -3584,7 +3478,7 @@ pub(super) fn emit_begin<C: Typing>(
     ctx.transaction_body(valued, |ctx| {
         ctx.in_transaction(|ctx| {
             let ty = ctx.subexpr(body)?;
-            Ok(read_passed(body, &ty, ctx))
+            Ok(read_value(body, &ty, ctx))
         })
     })
 }
@@ -3733,7 +3627,7 @@ pub(super) fn emit_list<C: Typing>(
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
     // it — see `src/ccl/design/type-inference.md`, "The domain join needs `box`".
-    Ok(fun_ty(Type::index_range(n), read_through(&elem_ty)))
+    Ok(fun_ty(Type::index_range(n), ctx.read_value_type(&elem_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -3856,7 +3750,7 @@ pub(super) fn emit_case<C: Typing>(
     // See `src/ccl/design/type-inference.md`, "Case inference" and
     // "The domain join needs box".
     //
-    // Mutable-variable arms contribute values, not handles. Writable-argument validation
+    // Mutable-variable arms contribute values, not places. Writable-argument validation
     // still examines the argument node; selecting a value here does not create an alias.
     let result_ty = ctx.fresh();
     // The constructors the arms so far name, which a default arm knows did not build the value.
@@ -4637,9 +4531,9 @@ fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, Loca
         "Case guard".to_string()
     })?;
     // A **value** operand: the arms join, and rule 2 keeps `Mut` out of every
-    // composite, so a mutable variable mention in an arm is a read. Letting the handle
+    // composite, so a mutable variable mention in an arm is a read. Letting the place
     // through instead makes the join itself `Mut`-typed — `x if c else y` over two
-    // mutable variables would denote a handle whose writer the compiler cannot trace, and
+    // mutable variables would denote a place whose writer the compiler cannot trace, and
     // the position that catches that (`bump(x if c else y)`) reads the argument
     // *node*, not its type, precisely because the type is a value.
     emit_value_read(&mut b.body, ctx)

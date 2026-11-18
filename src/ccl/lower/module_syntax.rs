@@ -3,7 +3,7 @@
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
 //! depth, and the module lowers nothing when it finds one. It refuses
-//! `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, a write to another
+//! `@RenamedFrom`, `@Discard`, `pub` on a place declaration, a write to another
 //! module's member, and a method named through an attribute's qualifier,
 //! `x.mod::Price::discounted`. A qualified value, type, label, or tag reaches
 //! lowering, which resolves it against the module's names that denote a module
@@ -48,17 +48,6 @@ pub(super) fn refuse_module_syntax(module: &ChlModule) -> ModuleSyntax {
 }
 
 /// Spell a qualified name as written: `shop::eu::stock`.
-/// Whether `annotation` is `Mut(V, Txn)`, a transactional mutable variable's.
-fn is_txn_annotation(annotation: &TypeAnnotation) -> bool {
-    matches!(
-        &annotation.ty.node,
-        ChlExpr::Call { func, args }
-            if matches!(&func.node, ChlExpr::Name(head) if head == "Mut")
-                && matches!(args.as_slice(), [_, domain]
-                    if matches!(&domain.node, ChlExpr::Name(d) if d == "Txn"))
-    )
-}
-
 fn spell(qualifier: &[Spanned<SmolStr>], name: &str) -> String {
     let mut out = String::new();
     for segment in qualifier {
@@ -178,19 +167,11 @@ impl Refusals {
                     ChlStmt::Assign { .. }
                     | ChlStmt::AnnAssign { .. }
                     | ChlStmt::FunctionDef { .. } => {}
-                    // A public mutable variable is a transactional one: an induction
-                    // variable stays in its module (`docs/chl-spec.md`, "9.10 Induction
-                    // variables stay in their module").
-                    ChlStmt::MutAssign { annotation, .. }
-                        if annotation.as_ref().is_some_and(is_txn_annotation) => {}
-                    ChlStmt::MutAssign { .. } => self.refuse(
+                    ChlStmt::Declare { .. }
+                    | ChlStmt::MutAssign { .. }
+                    | ChlStmt::LoadFrom { .. } => self.refuse(
                         *keyword,
-                        "a public mutable variable is transactional, `pub x: Mut(V, Txn) := …`: \
-                         an induction variable stays in its module",
-                    ),
-                    ChlStmt::LoadFrom { .. } => self.refuse(
-                        *keyword,
-                        "a public `@LoadFrom` declaration is not supported yet",
+                        "a place declaration cannot be public; export a value read or a function instead",
                     ),
                     // `pub` on a `type` exports it, and on any other statement it is a
                     // parse error.
@@ -571,7 +552,9 @@ impl Refusals {
                 self.expr(left);
                 self.expr(right);
             }
-            ChlExpr::UnaryOp { operand, .. } | ChlExpr::Unwrap(operand) => self.expr(operand),
+            ChlExpr::Borrow(operand)
+            | ChlExpr::UnaryOp { operand, .. }
+            | ChlExpr::Unwrap(operand) => self.expr(operand),
             ChlExpr::BoolOp { operands, .. } => {
                 for operand in operands {
                     self.expr(operand);
@@ -716,10 +699,27 @@ mod tests {
         assert_eq!(refused[0].0, "pub");
         assert_eq!(
             refused[0].1,
-            "a public mutable variable is transactional, `pub x: Mut(V, Txn) := …`: an \
-             induction variable stays in its module"
+            "a place declaration cannot be public; export a value read or a function instead"
         );
         assert_eq!(refused[1].0, "mod::Price::zero");
+    }
+
+    #[test]
+    fn public_place_declarations_are_refused_at_the_keyword() {
+        for source in [
+            "pub events: Feed(Int)",
+            "pub events: Feed(_)",
+            "pub stock: Mut(Int) := 0",
+            "pub stock: Mut(Int, Txn) := 0",
+        ] {
+            let refused = refusals(source);
+            assert_eq!(refused.len(), 1, "{source}: {refused:#?}");
+            assert_eq!(refused[0].0, "pub");
+            assert_eq!(
+                refused[0].1,
+                "a place declaration cannot be public; export a value read or a function instead"
+            );
+        }
     }
 
     /// A value binding, a `def` and a type alias take `pub`, and a qualified

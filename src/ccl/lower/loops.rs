@@ -96,7 +96,7 @@ pub(super) fn for_body_has_exceptions(stmts: &[Spanned<ChlStmt>]) -> bool {
 /// Return `true` if the loop body's **terminal** statement is a bare *effect*
 /// expression — a call (or other expression) that is neither a `yield` nor a
 /// `<<` feed, e.g. `for x in xs: bump(cnt)`. Such a terminal is a hidden-writer
-/// / side-effect statement (a pass-by-reference call may write an outer mutable variable,
+/// / side-effect statement (a borrowing call may write an outer mutable variable,
 /// invisible pre-inference), which [`lower_direct_mirror_loop`] carries. A
 /// terminal that reassigns the loop variable (`x += 1`) or a non-mutable is *not*
 /// a bare effect and stays rejected by the generator path. Gates the
@@ -190,13 +190,13 @@ pub(super) fn lower_generator_for(
             )
         })?;
         let for_node = tagged_for_loop(iter_var, target.span, source, for_body, for_span, ctx);
-        let handle = ctx.tag_machinery(
+        let feed_var = ctx.tag_machinery(
             Expr::var(defer_name.clone()),
             for_span,
             "lower.generator_defer",
         );
         let seq = ctx.tag_machinery(
-            Expr::expr_stmt(for_node, handle),
+            Expr::expr_stmt(for_node, feed_var),
             for_span,
             "lower.generator_defer",
         );
@@ -842,7 +842,7 @@ fn lower_for_body_stmt(
                 );
                 Ok(ctx.tag_image(feed, stmt.span))
             }
-            // `r << e` — direct feed into a named defer handle.
+            // `r << e` — direct feed into a named feed place.
             // Note: when inside a yield-bearing generator (defer_name is Some),
             // `r` is not validated to equal defer_name; a mismatch would
             // type-check via inference but could produce confusing behaviour.
@@ -1152,9 +1152,9 @@ fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
     })
 }
 
-/// Whether `body` holds a bare effect statement — a call that may hide a pass-by-reference
-/// write ([`for_body_terminal_is_bare_effect`]) — anywhere a write in it would reach the
-/// enclosing loops: in a branch, an arm or a deeper loop.
+/// Whether `body` holds a bare effect statement — a call that may hide a write through a
+/// borrowed parameter ([`for_body_terminal_is_bare_effect`]) — anywhere a write in it would
+/// reach the enclosing loops: in a branch, an arm or a deeper loop.
 fn body_has_bare_call(body: &[Spanned<ChlStmt>]) -> bool {
     body.iter().any(|stmt| match &stmt.node {
         ChlStmt::Expr(value) => !matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }),
@@ -1358,7 +1358,7 @@ fn lower_nested_loop(
     // A nested loop is folded as a recurrence over what it writes of the loops around it,
     // so one that writes none of their mutable variables has nothing to fold. One that feeds
     // is a feed-only loop; one whose body only binds or writes variables of its own is not
-    // realized yet. A bare call may be a pass-by-reference write (`bump(y)`), which lowering
+    // realized yet. A bare call may write through a borrow (`bump(y)`), which lowering
     // runs too early to see, so a body holding one and no feed is left for `mut_elim` to
     // classify, as a flat loop's is: it drops one whose calls turn out to write nothing.
     let mut writes = Vec::new();
@@ -1403,12 +1403,12 @@ fn lower_nested_loop(
         ) {
             return Err(LoweringError::internal(for_span, gap));
         }
-        // A bare call may write an outer mutable variable by reference, which lowering
+        // A bare call may write an outer mutable variable through a borrow, which lowering
         // cannot see and this route does not fold. `lower_for_body_stmts` refuses one in a
         // loop body, which is what makes the route sound.
         debug_assert!(
             !body_has_bare_call(body_stmts),
-            "a feed-only nested loop lowered a body holding a bare call: a by-reference write \
+            "a feed-only nested loop lowered a body holding a bare call: a write through a borrow \
              in it would be dropped, since this route folds no recurrence"
         );
         return Ok(tagged_for_loop(
@@ -1437,6 +1437,7 @@ fn lower_nested_loop(
         Expr::new(TypedExprNode::For {
             position: Box::new(Name::raw(LOOP_POSITION)),
             target: TypedBinding {
+                parameter_mode: Default::default(),
                 name: iter_var.into(),
                 occurrence,
                 ty: Type::Hole,
@@ -1489,7 +1490,7 @@ fn body_introduced_mut_vars(
 /// The body lowers statement-by-statement without read-your-writes
 /// shadowing: writes to `acc_names` become [`TypedExprNode::MutWrite`]
 /// markers, `<<` feeds and `yield`s become [`TypedExprNode::Feed`] markers,
-/// a bare expression statement (e.g. a call to a pass-by-reference writer
+/// a bare expression statement (e.g. a call to a writer that borrows
 /// `bump(cnt)`) becomes a side-effect `ExprStmt`, and their embedded reads
 /// stay bare `Var`s. The phase threads the recurrence, the read-your-writes
 /// shadowing, and hoists each in-loop feed to an ordinary feed of the loop's
@@ -1536,6 +1537,7 @@ pub(super) fn lower_direct_mirror_loop(
         Expr::new(TypedExprNode::For {
             position: Box::new(Name::raw(LOOP_POSITION)),
             target: TypedBinding {
+                parameter_mode: Default::default(),
                 name: iter_var.into(),
                 occurrence,
                 ty: Type::Hole,
@@ -1860,7 +1862,7 @@ fn lower_loop_body_chain_scoped(
             }
             // A bare expression statement — the `Feed`/`Yield` guards above
             // did not match, so this is an ordinary side-effect (e.g. a call
-            // to a pass-by-reference writer, `bump(cnt)`). Sequence it before
+            // to a writer that borrows, `bump(cnt)`). Sequence it before
             // the rest; its value is discarded (the loop body is a statement),
             // so it is an expression statement, which inference refuses when it
             // causes nothing ([`EXPRESSION_STATEMENT`]).

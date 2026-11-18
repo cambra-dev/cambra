@@ -279,7 +279,7 @@ pub(super) fn lower_stmts_recovering(
 /// `ExprStmt(<body>, Record{sink: Var(sink), …})`, built from the sink-bound
 /// names in sorted order for determinism. A run's sink is read through the
 /// binder its chain minted, since its key is qualified by the run path
-/// ([`LoweringContext::run_sink_names`]).
+/// ([`LoweringContext::sink_reads`]).
 pub(super) fn finish_program(
     stmts: &[Spanned<ChlStmt>],
     body: Expr,
@@ -290,8 +290,14 @@ pub(super) fn finish_program(
     if ctx.sink_bindings.is_empty() {
         return (body, errors);
     }
-    let own: HashSet<&str> = registered.iter().map(|(key, _)| key.as_str()).collect();
+    let own: HashSet<&str> = registered.iter().map(|sink| sink.key.as_str()).collect();
     errors.extend(sink_rebindings(stmts, &own));
+    for sink in &registered {
+        ctx.sink_reads.insert(
+            sink.key.clone(),
+            (Name::raw(sink.binding.as_str()), sink.label.clone()),
+        );
+    }
 
     // The node, its output `Var`s, and the tail `ExprStmt` are program-owned
     // plumbing with no owning statement; they carry the whole-program span.
@@ -301,13 +307,11 @@ pub(super) fn finish_program(
     let outs = sink_names
         .iter()
         .map(|n| {
-            let name = ctx
-                .run_sink_names
-                .get(n)
-                .cloned()
-                .unwrap_or_else(|| Name::raw(n.as_str()));
-            // A run's sink is labeled in its run, as its mutable variables are.
-            let label = name.field_key();
+            let (name, label) = ctx.sink_reads.get(n).cloned().unwrap_or_else(|| {
+                let name = Name::raw(n.as_str());
+                let label = name.field_key();
+                (name, label)
+            });
             let var = ctx.tag_machinery(Expr::var(name), program_span, "lower.sink_outputs");
             (label, var)
         })
@@ -447,7 +451,6 @@ pub(super) fn lower_stmts_inner(
     // must stop affecting those names when the block exits, on success and error alike.
     // Induction mutability has no lowering registry; its history type is checked later.
     let snapshot = ctx.snapshot_transactional();
-    let saved_history_param_fns = ctx.history_param_fns.clone();
     let saved_unreadable = ctx.unreadable.clone();
     let saved_unreadable_module = ctx.unreadable_module;
 
@@ -464,7 +467,6 @@ pub(super) fn lower_stmts_inner(
         })
     });
     ctx.restore_transactional(snapshot);
-    ctx.history_param_fns = saved_history_param_fns;
     ctx.unreadable = saved_unreadable;
     ctx.unreadable_module = saved_unreadable_module;
     result
@@ -516,6 +518,11 @@ pub(super) fn lower_final_stmt(
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
             lower_try(last.span, body, handlers, &scope, ctx)
+        }
+        ChlStmt::Define { target, value } => {
+            let value = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
+            let definition = lower_define(target, value, ctx)?;
+            Ok(ctx.tag_image(definition, last.span))
         }
         ChlStmt::For {
             target,
@@ -574,7 +581,7 @@ pub(super) fn lower_final_stmt(
                 }
                 // A non-yielding, non-feeding loop whose body's terminal
                 // statement is a bare *effect* expression — a call that may hide
-                // a pass-by-reference mutable write (`for x in xs: bump(cnt)`),
+                // a write to a borrowed place (`for x in xs: bump(&cnt)`),
                 // invisible pre-inference — is a valid final statement: the loop
                 // runs and its mutable-variable value is simply unobserved (`Unit`). Mirror
                 // `lower_middle_stmt`'s hidden-writer path (with `Unit` as the
@@ -601,7 +608,7 @@ pub(super) fn lower_final_stmt(
             }
             lower_generator_for(target, iter, for_body, &scope, last.span, ctx)
         }
-        // A `+=` as the final statement is a mutable write — a pass-by-reference
+        // A `+=` as the final statement is a mutable write — a borrowing
         // writer body (`def bump(c): c += 1`) or a program ending in a mutable-variable
         // update with no trailing read. Emit a *bare* `MutWrite` (no
         // continuation) so inlining splices it into the caller's sequence and
@@ -617,7 +624,7 @@ pub(super) fn lower_final_stmt(
         }
         // A bare `x := e` as the final statement is a mutable-variable *write* when `x` is
         // already in scope (a mutation-loop body's terminal write, an inlined
-        // pass-by-ref writer, or a program ending in a mutable-variable update): a bare
+        // borrowing writer, or a program ending in a mutable-variable update): a bare
         // `MutWrite` the letrec phase normalizes. A `:=` *introduction* (a fresh
         // name) can't be a value-producing final statement — it falls through to
         // the "must end in a value" error. Mutability is checked post-inference.
@@ -771,15 +778,9 @@ pub(super) fn lower_middle_stmt(
             match decl {
                 #[cfg(test)]
                 SinkDecl::Test { name } => lower_test_sink(name, target.span, stmt.span, body, ctx),
-                SinkDecl::Http(decl) => lower_http_serve(
-                    *decl,
-                    target,
-                    *transparency,
-                    stmt.span,
-                    value.span,
-                    body,
-                    ctx,
-                ),
+                SinkDecl::Http(decl) => {
+                    lower_http_serve(*decl, target, stmt.span, value.span, body, ctx)
+                }
             }
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
@@ -1291,23 +1292,16 @@ pub(super) fn lower_middle_stmt(
                 let lets = parameter.entry_lets();
                 return Ok(lets.into_iter().rev().fold(body, |body, (binder, ty)| {
                     let value = ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span);
-                    // A transactional variable's entry declares one, which stands for the
-                    // argument's where the module is checked on its own, and which each run
-                    // replaces by the argument's own (`ProgramLowering::bind_module_parameter`).
-                    // Each member is a binder the parameter's Module type names, not one the
-                    // statement writes, so it records at the statement.
-                    let bound = if is_mut_entry(&ty) {
-                        Expr::mut_decl(binder.raw(), Occurrence::mint(), ty, value, body)
-                    } else {
-                        Expr::let_bind_annotated(
-                            binder.raw(),
-                            Occurrence::mint(),
-                            value,
-                            body,
-                            Annotation::new(ty, Occurrence::mint()),
-                        )
-                    };
-                    ctx.tag_image(bound, stmt.span)
+                    // Each member is a binder the parameter's Module type names, not
+                    // one the statement writes, so it records at the statement.
+                    let bound = Expr::let_bind_annotated(
+                        binder.raw(),
+                        Occurrence::mint(),
+                        value,
+                        body,
+                        Annotation::new(ty, Occurrence::mint()),
+                    );
+                    ctx.tag_image(bound.binding_a_place(), stmt.span)
                 }));
             }
             let value = match default {
@@ -1369,7 +1363,7 @@ pub(super) fn lower_middle_stmt(
                 ),
                 None => Expr::let_bind(name.node.as_str(), occurrence, value, body),
             };
-            Ok(ctx.tag_image(bound, stmt.span))
+            Ok(ctx.tag_image(bound.binding_a_place(), stmt.span))
         }
         // Parse-recovery placeholder: the statement stands in as one lowering failed in
         // does, binding the names its head does. Its parse error reports it.
@@ -2159,9 +2153,9 @@ pub(super) fn mut_annotation_parts(
         unreachable!("`is_mut_type` matched a call")
     };
     match args.as_slice() {
-        [value] => Some(lower_type_expr(value, ctx).map(|t| (t, false))),
+        [value] => Some(place_value_type(value, ctx).map(|t| (t, false))),
         [value, domain] => {
-            let value_ty = match lower_type_expr(value, ctx) {
+            let value_ty = match place_value_type(value, ctx) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
             };
@@ -2182,7 +2176,7 @@ pub(super) fn mut_annotation_parts(
 }
 
 /// Pre-register every `x: Mut(V, Txn) := e` transactional-variable introduction
-/// (and every pass-by-reference-`Mut` `def`) in `stmts` with the lowering
+/// (and every `def` with a borrowed `Mut` parameter) in `stmts` with the lowering
 /// context.
 ///
 /// for-loop is lowered *before* the `:=` introduction that precedes it
@@ -2254,27 +2248,12 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                     ctx.register_transactional(id.as_str());
                 }
             }
-            // Blocks lower call sites before preceding definitions. Record reference-taking
-            // names first, so argument lowering knows their passing mode. The last definition
-            // of a name determines the record, including a definition with value parameters.
-            ChlStmt::FunctionDef { name, params, .. } => {
-                let has_history_param = params.iter().any(|p| {
-                    p.annotation
-                        .as_ref()
-                        .is_some_and(|a| is_mut_annotation(a) || is_feed_type(&a.ty))
-                });
-                if has_history_param {
-                    ctx.register_history_param_fn(name.node.as_str());
-                } else {
-                    ctx.unregister_history_param_fn(name.node.as_str());
-                }
-            }
             _ => {}
         }
     }
 }
 
-/// Whether a binder annotation is a pass-by-reference `Mut(…)` form.
+/// Whether a binder annotation is the `Mut(…)` form of a borrowed parameter.
 ///
 /// Reads the annotation's *type* only. This runs during pre-registration, before
 /// the mode is validated, so a bounded `Mut(…)` still answers `true` here and is
@@ -2291,13 +2270,6 @@ pub(super) fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
 fn is_mut_type(ty: &Spanned<ChlExpr>) -> bool {
     matches!(&ty.node, ChlExpr::Call { func, .. }
         if matches!(&func.node, ChlExpr::Name(head) if head.as_str() == "Mut"))
-}
-
-/// Whether `ty` is a `Feed(…)` type, by the head it is written with, as [`is_mut_type`] reads
-/// `Mut(…)`.
-pub(super) fn is_feed_type(ty: &Spanned<ChlExpr>) -> bool {
-    matches!(&ty.node, ChlExpr::Call { func, .. }
-        if matches!(&func.node, ChlExpr::Name(head) if head.as_str() == "Feed"))
 }
 
 /// Lower a binder's type annotation, applying its [`AnnotationMode`].
@@ -2386,19 +2358,38 @@ pub(super) fn feed_declaration(
 /// type, and then the right-hand side must be one that can be polymorphic: a
 /// lambda, or a name, which inference refuses if it names a monomorphic binding
 /// (`docs/chl-spec.md`, "Polymorphic type annotations"). A bounded
-/// polymorphic annotation, whose meaning the spec leaves open, is refused here. A
-/// `Feed(…)` annotation states a feed's history type ([`feed_annotation_type`]).
+/// polymorphic annotation, whose meaning the spec leaves open, is refused here. A place type,
+/// written or reached through an alias, is refused: an ordinary binding holds a value
+/// (`docs/chl-spec.md`, "Places and values").
 pub(super) fn lower_let_annotation(
     name: &str,
     annotation: &TypeAnnotation,
     value: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
-    // `Feed(…)` names a history carrier, which a binder states and no other type position
-    // spells ([`feed_annotation_type`]).
-    if let Some(ty) = feed_annotation_type(annotation, name, annotation.ty.span, ctx) {
-        return ty;
+    let ty = lower_let_annotation_type(annotation, value, ctx)?;
+    let stated = match &ty {
+        Type::BoundedHole(bound) => bound,
+        ty => ty,
+    };
+    if stated.is_place() {
+        return Err(LoweringError::unsupported(
+            annotation.ty.span,
+            format!(
+                "`{name}` cannot hold a `Mut` or `Feed` place: an ordinary binding holds a \
+                 value. Declare a feed with `{name}: Feed(T)` or a mutable variable with \
+                 `{name} := e`, and bind a place's value with `{name} = x`"
+            ),
+        ));
     }
+    Ok(ty)
+}
+
+fn lower_let_annotation_type(
+    annotation: &TypeAnnotation,
+    value: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
     ctx.open_tuples = match annotation.mode {
         AnnotationMode::Bounded => OpenTuples::Bound,
         AnnotationMode::Exact => OpenTuples::Refused,
@@ -3771,10 +3762,10 @@ pub(super) fn check_pending_requirements(ctx: &mut LoweringContext) -> Vec<Lower
 /// types it fixes unify with the requirement's, so some types are an instance of both, and each
 /// associated type `below` bounds, read at the types that unification gives the head's
 /// variables, may be below its bound ([`traits::may_be_below`]). The collection rule is a
-/// candidate beside the rows ([`Trait::collection_rule_admits`]), and makes the operand its own
+/// candidate beside the rows ([`Trait::structural_rule_admits`]), and makes the operand its own
 /// `Elements`.
 ///
-/// [`Trait::collection_rule_admits`]: crate::ccl::infer::solver::traits::Trait::collection_rule_admits
+/// [`Trait::structural_rule_admits`]: crate::ccl::infer::solver::traits::Trait::structural_rule_admits
 fn requirement_satisfiable(
     trait_: &crate::ccl::infer::solver::traits::Trait,
     args: &[Type],
@@ -3785,7 +3776,7 @@ fn requirement_satisfiable(
     use crate::ccl::infer::solver::traits::{
         Assoc, ITERABLE_ELEMENTS_ASSOC, apply_unifier, unifier,
     };
-    let by_rule = trait_.collection_rule_admits(args, assoc)
+    let by_rule = trait_.structural_rule_admits(args, assoc)
         && below.iter().all(|(name, bound)| {
             *name != Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into())
                 || traits::may_be_below(&args[0], bound)
@@ -3988,6 +3979,7 @@ pub(super) fn lower_try_over(
         lowered.push(crate::ccl::expr::Handler {
             catches,
             binding: TypedBinding {
+                parameter_mode: Default::default(),
                 name: binder.into(),
                 occurrence: h
                     .binding
@@ -4054,7 +4046,51 @@ pub(super) fn lower_type_expr(
 /// Every nested position lowers through `lower_type_expr`, so a
 /// polymorphic type inside another type, written or reached through an alias, is
 /// refused there.
+///
+/// A written type's root is where a place type may stand, and nowhere else: one nested in another
+/// type is refused here (`docs/chl-spec.md`, "Places and values").
 pub(super) fn lower_type_expr_or_poly(
+    annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    ctx.type_depth += 1;
+    let lowered = lower_type_expr_inner(annotation, ctx);
+    ctx.type_depth -= 1;
+    let ty = lowered?;
+    if ctx.type_depth == 0 {
+        refuse_misplaced_place(&ty, true, annotation.span)?;
+    }
+    Ok(ty)
+}
+
+/// Lower the value type of a `Mut(…)` or `Feed(…)` written apart from it, which is no place's
+/// position: a place type is part of no other type.
+pub(super) fn place_value_type(
+    value: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    let ty = lower_type_expr(value, ctx)?;
+    refuse_misplaced_place(&ty, false, value.span)?;
+    Ok(ty)
+}
+
+/// Refuse a place type in `ty` standing where none may ([`crate::ccl::place::misplaced`]);
+/// `at_top` says whether `ty` is itself in a place's position.
+pub(super) fn refuse_misplaced_place(
+    ty: &Type,
+    at_top: bool,
+    span: Span,
+) -> Result<(), LoweringError> {
+    match crate::ccl::place::misplaced(ty, at_top) {
+        Some(place) => Err(LoweringError::unsupported(
+            span,
+            crate::ccl::place::nested_place_message(&crate::ccl::chl_print::chl_type(place)),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn lower_type_expr_inner(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
@@ -4669,33 +4705,20 @@ fn lower_module_type(
                 ),
             ));
         }
-        // A feed entry is a feed handle, its domain left to inference as a
-        // `Feed` parameter's is.
-        let ty = match &field.value.node {
-            ChlExpr::Call { func, args } => match (&func.node, args.as_slice()) {
-                // A public mutable variable is transactional, and an entry names one.
-                (ChlExpr::Name(head), [value, domain])
-                    if head == "Mut" && matches!(&domain.node, ChlExpr::Name(d) if d == "Txn") =>
-                {
-                    AliasType::Type(Type::mutable(Type::Txn, lower_type_expr(value, ctx)?))
-                }
-                (ChlExpr::Name(head), _) if head == "Mut" => {
-                    return Err(LoweringError::unsupported(
-                        field.value.span,
-                        format!(
-                            "`{}` is a mutable variable, which another module reaches only when it \
-                             is transactional: `{}: Mut(V, Txn)`",
-                            field.name, field.name
-                        ),
-                    ));
-                }
-                (ChlExpr::Name(head), [value]) if head == "Feed" => {
-                    AliasType::Type(Type::feed(Type::Hole, lower_type_expr(value, ctx)?))
-                }
-                _ => lower_alias_type(&field.value, ctx)?,
-            },
-            _ => lower_alias_type(&field.value, ctx)?,
-        };
+        // A place is never public, so no module could supply one for the entry.
+        if matches!(&field.value.node, ChlExpr::Call { func, .. }
+            if matches!(&func.node, ChlExpr::Name(head) if head == "Mut" || head == "Feed"))
+        {
+            return Err(LoweringError::unsupported(
+                field.value.span,
+                format!(
+                    "`{}` is a place, and a Module entry cannot be one: a module exports a \
+                     value read or an input function instead",
+                    field.name
+                ),
+            ));
+        }
+        let ty = lower_alias_type(&field.value, ctx)?;
         module.entries.push(ModuleEntry {
             name: field.name.clone(),
             ty,
@@ -4792,6 +4815,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         ChlExpr::ListComp(_) | ChlExpr::GenExp(_) => "a comprehension",
         ChlExpr::Yield(_) => "a `yield`",
         ChlExpr::Feed { .. } => "a feed",
+        ChlExpr::Borrow(_) => "a borrow",
         ChlExpr::Block(_) => "a block",
         // `Error` is a parser recovery placeholder, which the caller surfaces
         // through `ParseResult::errors` before this message is ever read.
@@ -4893,8 +4917,8 @@ fn collect_variant_arms(
 }
 
 /// The capitalized names the type language spells that are not base types: the
-/// constructors [`lower_type_application`] dispatches on, the two heads resolved
-/// ahead of it (`Mut` in [`mut_annotation_parts`], `Feed` on a `def` parameter),
+/// constructors [`lower_type_application`] dispatches on, the head `Mut` resolved
+/// ahead of it in [`mut_annotation_parts`],
 /// `Mut`'s sequencing domain `Txn`, and the compiler-provided nominal type `Option`
 /// ([`crate::ccl::nominal::builtin`]).
 ///
@@ -5942,6 +5966,12 @@ fn lower_type_application(
         )
     };
     match head {
+        "Feed" => {
+            let [value] = args else {
+                return Err(arity_err("one value type"));
+            };
+            Ok(Type::feed(Type::Hole, lower_type_expr(value, ctx)?))
+        }
         // `Array(n, T)` = `0..n ⤇ T` — a static index range. `n` is an integer
         // literal (the length is known at annotation time).
         "Array" => {
@@ -6047,9 +6077,12 @@ fn lower_type_application(
             };
             Ok(Type::collection_of(lower_type_expr(elem, ctx)?))
         }
-        // `Mut(…)` and `Feed(…)` in a nested position are refused: a binder or a trait
-        // signature's parameter states them (`mut_annotation_parts`,
-        // `lower::traits::signature_input`), and no other type position spells them.
+        // A binder or a trait signature's parameter states a `Mut(…)` (`mut_annotation_parts`,
+        // `lower::traits::signature_input`), and no other type position spells one.
+        "Mut" => Err(LoweringError::unsupported(
+            span,
+            "a `Mut(…)` type is written only as the whole type of a declaration or a parameter",
+        )),
         other => Err(LoweringError::unsupported(
             span,
             format!("unknown type application: `{other}(…)`"),
@@ -6224,6 +6257,7 @@ pub(super) fn lower_match_over(
                 head,
                 head_occurrence: ctx.occurrence_at(pat.tag_span),
                 binding: TypedBinding {
+                    parameter_mode: Default::default(),
                     name: binder.into(),
                     occurrence: binder_occurrence,
                     ty: Type::Hole,

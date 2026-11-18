@@ -6,8 +6,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::capabilities::{
-    Blame, Bound as CapabilityBound, Capabilities, Capability, CapabilitySet, CapabilityVar,
-    CapabilityVarId, Effect, Every, Filter, Repr, Requirement, ScopedCapability, Upper,
+    Blame, Capabilities, Capability, CapabilitySet, CapabilityVar, CapabilityVarId, Effect, Every,
+    Filter, PlaceBinder, PlaceBinders, Repr, Requirement, ScopedCapability, Upper,
 };
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::barrier::EdgeReport;
@@ -32,7 +32,7 @@ use crate::util::ScopeStack;
 use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
 use super::solve::value_type;
-use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
+use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceTable, MethodCall, MethodRow, Trait, TraitObligation,
@@ -140,9 +140,6 @@ pub(super) fn should_generalize(
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
 pub(super) struct InferCtx {
-    /// The parameters each call's argument tuple about to be emitted passes its components to
-    /// ([`Typing::pass_arguments`]).
-    arguments: HashMap<NodeId, Vec<Type>>,
     /// The program's trait instances, from which every obligation emission mints takes
     /// its candidates.
     pub(super) instances: Rc<InstanceTable>,
@@ -159,8 +156,9 @@ pub(super) struct InferCtx {
     /// use mints takes and is keyed by.
     /// The capability variable of the tree's root, once it has been emitted.
     root_capabilities: Option<Rc<CapabilityVar>>,
-    /// Where each mutable variable and feed in scope is bound, for the capability that names it.
-    capability_binders: HashMap<Name, CapabilityBinder>,
+    /// Where each mutable variable and feed in scope is bound, for the capabilities that name
+    /// it: function boundaries read it to drop the capabilities naming what their bodies bind.
+    place_binders: PlaceBinders,
     /// Each statement emitted, with the variable collecting what it causes and the one of
     /// the body it stands in.
     capability_statements: Vec<(NodeId, Rc<CapabilityVar>, Option<CapabilityVarId>)>,
@@ -211,6 +209,7 @@ pub(super) struct InferCtx {
     /// defining scope and become generalizable at the binding site.
     pub(super) level: Level,
     pred_memo: TermMemo,
+    place_reads: HashMap<crate::ccl::InferVarId, Type>,
     /// One predicate `Rc` per distinct literal *value*, for the singleton
     /// refinements `emit_node` stamps on `Lit` nodes.
     ///
@@ -351,8 +350,6 @@ pub(super) struct InferCtx {
     /// The innermost statement owning each emitted node, including annotation copies.
     statement_owners: HashMap<NodeId, NodeId>,
     current_statement: Option<NodeId>,
-    /// What each A-normalization temp emitted so far names ([`Typing::note_temp`]).
-    temps_written: HashMap<Name, TempNames>,
     /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
     /// [`Self::require_contribution`] and [`Typing::close_let_type`]: one per binder of the
     /// name, innermost last, pushed where the binder is entered and popped where its scope
@@ -477,12 +474,12 @@ struct CapabilityFrame {
 
 impl CapabilityFrame {
     /// What reaches this frame's variable from its body's: nothing naming a variable the
-    /// frame's own body binds.
-    fn filter(&self) -> Filter {
+    /// frame's own body binds, which `binders` says.
+    fn filter(&self, binders: &PlaceBinders) -> Filter {
         Filter {
             of_causes: None,
             when_data: None,
-            below: Some(self.depth),
+            below: Some((self.depth, binders.clone())),
             discharges: Default::default(),
             at: None,
             stated: Default::default(),
@@ -600,7 +597,7 @@ struct TryFrame {
 }
 
 /// The capabilities of every function nested in `ty`, including functions reached through
-/// inference variables' lower bounds. Scope checks read the whole value a scope hands outward.
+/// inference variables' lower bounds, and not a collection's own. Scope checks read the whole value a scope hands outward.
 fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
     fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<ScopedCapability>) {
         if let Type::Infer(v) = ty.peel_refinements() {
@@ -618,7 +615,16 @@ fn type_capabilities(ty: &Type) -> Vec<ScopedCapability> {
             }
             return;
         }
-        if let Type::Fun { capabilities, .. } = ty {
+        // A collection runs where it is built, so what it does is its builder's, done there: only
+        // a function's capabilities are latent in its type. The functions a collection holds
+        // are still read.
+        if let Type::Fun {
+            capabilities,
+            fun_kind,
+            ..
+        } = ty
+            && !fun_kind.resolved().is_data()
+        {
             out.extend(match capabilities.repr() {
                 Repr::Var(v) => v.resolved().into_iter().collect(),
                 _ => Capabilities::capabilities_of(capabilities),
@@ -709,24 +715,6 @@ impl Declared {
     fn named_by(self, top: &Every) -> bool {
         (self.variable && top.names_mutable_variables()) || (self.feed && top.names_feeds())
     }
-}
-
-/// Where a mutable variable or feed is bound, for the [`ScopedCapability`] naming it.
-#[derive(Clone, Copy)]
-struct CapabilityBinder {
-    depth: u32,
-    /// A parameter's history is its argument's, so the call records what is done to it, and
-    /// the function's type does not ([`crate::ccl::capabilities::Bound::Parameter`]).
-    parameter: bool,
-    /// A transactional mutable variable, or a parameter passed one: reading or writing it
-    /// requires `Transaction`, and its capabilities are `ReadTxn` and `WriteTxn`.
-    transactional: bool,
-    /// A feed, which a clause names in `Append(f)`; every other binder here is a mutable
-    /// variable.
-    feed: bool,
-    /// No scope's end discharges what is done to it: a public feed or a declared transactional
-    /// variable, which belong to the run.
-    escapes: bool,
 }
 
 /// A variable a write or an append hands a value to ([`InferCtx::handed_out`]).
@@ -876,7 +864,6 @@ impl InferCtx {
     /// never in a state where an error has no node to blame.
     pub(super) fn new(sources: HashMap<String, Type>, root: NodeId) -> Self {
         Self {
-            arguments: HashMap::new(),
             scopes: ScopeStack::default(),
             sources,
             cache: ConstrainCache::new(),
@@ -922,14 +909,14 @@ impl InferCtx {
             failed_nodes: Vec::new(),
             statement_owners: HashMap::new(),
             current_statement: None,
-            temps_written: HashMap::new(),
             method_calls: vec![Vec::new()],
             selected_methods: Rc::default(),
+            place_reads: HashMap::new(),
             capability_frames: vec![CapabilityFrame { depth: 0 }],
             node_capabilities: Vec::new(),
             use_capabilities: Default::default(),
             root_capabilities: None,
-            capability_binders: HashMap::new(),
+            place_binders: PlaceBinders::default(),
             capability_statements: Vec::new(),
             effect_loops: Vec::new(),
             ordered_loops: Vec::new(),
@@ -953,7 +940,7 @@ impl InferCtx {
             .expect("the tree's root is emitted before its top level's effects are read");
         // The top level's frame keeps out what names a variable the top level binds, as a
         // function body's frame does what its body binds.
-        let filter = CapabilityFrame { depth: 0 }.filter();
+        let filter = CapabilityFrame { depth: 0 }.filter(&self.place_binders);
         root.resolved()
             .iter()
             .filter_map(|c| filter.pass(c))
@@ -1192,9 +1179,11 @@ impl InferCtx {
                 && depth == 0
                 && matches!(history_kind, crate::ccl::ty::HistoryKind::Append)
                 && self.public.contains(name);
-            self.capability_binders.insert(
+            // The run's state outlives every scope; any other variable's scope drops what names
+            // it.
+            self.place_binders.bind(
                 name.clone(),
-                CapabilityBinder {
+                PlaceBinder {
                     depth,
                     parameter: !declares,
                     transactional,
@@ -1254,7 +1243,7 @@ impl InferCtx {
         // binds one that stays in the module: `Effect`, `Context`, `Write(*)` and `Read(*)` an
         // induction variable, `Effect` and `Append(*)` a private feed.
         let binds_own = |feed: bool| {
-            self.capability_binders.values().any(|b| {
+            self.place_binders.any(|b| {
                 b.depth == 0 && !b.parameter && !b.escapes && !b.transactional && b.feed == feed
             })
         };
@@ -1266,7 +1255,7 @@ impl InferCtx {
             for capability in type_capabilities(ty) {
                 let every =
                     matches!(&capability.item, Capability::Every(every) if own.named_by(every));
-                if capability.bound != CapabilityBound::At(0) && !every {
+                if self.place_binders.depth_of(&capability.item) != Some(0) && !every {
                     continue;
                 }
                 match &capability.item {
@@ -1285,7 +1274,9 @@ impl InferCtx {
     pub(super) fn escaping_results(&self) -> Vec<LocatedInferError> {
         let beyond = |ty: &Type, depth, binds: Declared| {
             type_capabilities(ty).into_iter().find(|l| {
-                matches!(l.bound, CapabilityBound::At(at) if at >= depth)
+                self.place_binders
+                    .depth_of(&l.item)
+                    .is_some_and(|at| at >= depth)
                     || matches!(&l.item, Capability::Every(every) if binds.named_by(every))
             })
         };
@@ -1655,7 +1646,7 @@ impl InferCtx {
     fn of_family(&self, item: Capability) -> Capability {
         let transactional = item
             .variable()
-            .and_then(|x| self.capability_binders.get(x))
+            .and_then(|x| self.place_binders.get(x))
             .is_some_and(|b| b.transactional);
         match item {
             Capability::Causes(Effect::Write(x)) if transactional => {
@@ -1690,18 +1681,7 @@ impl InferCtx {
             }
             other => other,
         };
-        let binder = item
-            .variable()
-            .and_then(|n| self.capability_binders.get(n).copied());
-        ScopedCapability {
-            item,
-            bound: match binder {
-                Some(b) if b.parameter => CapabilityBound::Parameter,
-                Some(b) if !b.escapes => CapabilityBound::At(b.depth),
-                _ => CapabilityBound::Escaping,
-            },
-            at: None,
-        }
+        ScopedCapability { item, at: None }
     }
 
     /// The capability variable each parameter `set` names opened to.
@@ -2634,7 +2614,7 @@ impl InferCtx {
             // spelling outright (`lower::stmts::check_mut_decl_annotation`), so a
             // wrapper here means a `Mut` annotation reached a binder without passing
             // that check.
-            Type::BoundedHole(bound) if bound.is_handle() => {
+            Type::BoundedHole(bound) if bound.is_place() => {
                 unreachable!(
                     "a bounded annotation wraps a history ({bound}); `<:` on a `Mut(…)` \
                      annotation is rejected at lowering"
@@ -3024,35 +3004,21 @@ impl InferCtx {
         r
     }
 
-    /// The binding a handle reaches through transparent aliases and product projections.
-    fn target_origin<'a>(&'a self, target: &'a Name) -> &'a Name {
-        use crate::ccl::ccl_utils::{ValueReference, resolve_product_reference};
-        match resolve_product_reference(ValueReference::Name(target), |name| {
-            match self.exit_of(name) {
-                ScopeExit::Discharge(definition) => Some(definition),
-                _ => None,
-            }
-        }) {
-            ValueReference::Name(origin) => origin,
-            ValueReference::Expr(_) => target,
-        }
-    }
-
-    /// The inferred contract at a handle's storage binding, when that binding is known.
+    /// The inferred contract at a place's storage binding, when that binding is known.
     pub(super) fn feed_contract(&self, target: &Name) -> Option<Type> {
-        let binding = self.scopes.lookup(self.target_origin(target))?;
+        let binding = self.scopes.lookup(target)?;
         binding.scheme.body.as_feed()?;
         Some(binding.scheme.instantiate(self.level))
     }
 
-    /// A handle received through a joined binder contributes to its incoming contract,
+    /// A place received through a joined binder contributes to its incoming contract,
     /// outside that binder. Its aliases do not introduce a new storage scope.
     fn contribution_crossing(
         &self,
         target: &Name,
         history: &Type,
     ) -> Option<(Telescope, Vec<Name>)> {
-        let origin = self.target_origin(target);
+        let origin = target;
         if matches!(self.exit_of(origin), ScopeExit::Join) {
             let (scope, mut crossed) = self.telescope.split_at(origin)?;
             let group = self.parameter_groups.get(origin).unwrap_or(origin);
@@ -3130,7 +3096,7 @@ impl InferCtx {
     /// contract the call's argument edge carries to the caller
     /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its target").
     pub(super) fn feed_row(&mut self, target: &Name, value: &Type, channel: &Type) -> Type {
-        if matches!(self.exit_of(self.target_origin(target)), ScopeExit::Join) {
+        if matches!(self.exit_of(target), ScopeExit::Join) {
             let Type::Fun { codomain, .. } = channel.peel_refinements() else {
                 unreachable!(
                     "a feed's channel is the data function `domain ⤇ value`, got {channel}"
@@ -3138,7 +3104,7 @@ impl InferCtx {
             };
             return (**codomain).clone();
         }
-        let Some((_, crossed)) = self.telescope.split_at(self.target_origin(target)) else {
+        let Some((_, crossed)) = self.telescope.split_at(target) else {
             return value.clone();
         };
         let loops = &self.loop_sources;
@@ -3222,10 +3188,7 @@ impl InferCtx {
         });
         let keyable =
             keyed.is_some() && !loops.is_empty() && !in_transaction && only_lets_and_loops;
-        let places = self
-            .feed_places
-            .get(self.target_origin(target))
-            .map_or(&[][..], Vec::as_slice);
+        let places = self.feed_places.get(target).map_or(&[][..], Vec::as_slice);
         if keyable && let Some(&other) = places.iter().find(|&&p| p != self.current_node_id) {
             for x in &loops {
                 self.fed_elsewhere.insert(x.clone(), other);
@@ -3600,6 +3563,38 @@ impl Typing for InferCtx {
         true
     }
 
+    fn read_value_type(&self, ty: &Type) -> Type {
+        if let Type::Infer(variable) = ty
+            && let Some(value) = self.place_reads.get(&variable.uid)
+        {
+            value.clone()
+        } else {
+            ty.read_value_type().clone()
+        }
+    }
+
+    fn prepare_place_read(
+        &mut self,
+        parameter: &TypedBinding,
+        ty: &Type,
+    ) -> Result<(), LocatedInferError> {
+        if parameter.parameter_mode == crate::ccl::place::ParameterMode::Borrow
+            && let Type::Infer(variable) = ty
+        {
+            let value = self
+                .require_trait(
+                    Trait::place_value(),
+                    parameter.occurrence.id(),
+                    &[ty],
+                    Some(Assoc::Output),
+                    &|| "the value read from a borrowed place".to_string(),
+                )?
+                .expect("PlaceValue associates its read type");
+            self.place_reads.insert(variable.uid, value);
+        }
+        Ok(())
+    }
+
     fn defer_method(
         &mut self,
         function: &mut Expr,
@@ -3712,20 +3707,16 @@ impl Typing for InferCtx {
         self.recoveries += 1;
     }
 
-    fn note_temp(&mut self, temp: &Name, written: TempNames) {
-        self.temps_written.insert(temp.clone(), written);
-    }
-
-    fn temp_written(&self, temp: &Name) -> Option<TempNames> {
-        self.temps_written.get(temp).cloned()
-    }
-
     fn poisoned_reads(&self) -> usize {
         self.poisoned_reads
     }
 
     fn binds(&self, name: &Name) -> bool {
         self.scopes.lookup(name).is_some()
+    }
+
+    fn binds_place(&self, name: &Name) -> bool {
+        self.place_binders.get(name).is_some()
     }
 
     fn recoveries(&self) -> usize {
@@ -3891,7 +3882,6 @@ impl Typing for InferCtx {
                         Rc::clone(&opened),
                         of_causes,
                     )),
-                    bound: CapabilityBound::Escaping,
                     at: None,
                 });
                 // `E <: Effect except RunTransaction`: what each use passes for the
@@ -4155,7 +4145,7 @@ impl Typing for InferCtx {
             .last_mut()
             .and_then(|lambda| lambda.body.take())
             .expect("a lambda's body is emitted inside its frame");
-        var.flows_from(&body, frame.filter());
+        var.flows_from(&body, frame.filter(&self.place_binders));
         // A `_` in a parameter's type whose capabilities reach a bounded clause of the `def`
         // takes the bound, so a use passing more is refused at the call.
         var.bound_holes_reaching();
@@ -4226,7 +4216,7 @@ impl Typing for InferCtx {
     }
 
     fn note_handed_out(&mut self, target: &Name, ty: &Type, appends: bool) {
-        let Some(binder) = self.capability_binders.get(target) else {
+        let Some(binder) = self.place_binders.get(target) else {
             return;
         };
         // The run's state outlives every scope, a parameter's argument the function's, and
@@ -4285,7 +4275,7 @@ impl Typing for InferCtx {
             let Some(name) = item.variable() else {
                 continue;
             };
-            let binder = self.capability_binders.get(name);
+            let binder = self.place_binders.get(name);
             let fits = match &item {
                 Capability::Causes(Effect::Append(_)) => binder.is_some_and(|b| b.feed),
                 Capability::Causes(Effect::WriteTxn(_)) => binder.is_some_and(|b| b.transactional),
@@ -4322,7 +4312,7 @@ impl Typing for InferCtx {
 
     fn record_transactional_access(&mut self, name: &Name) {
         if self
-            .capability_binders
+            .place_binders
             .get(name)
             .is_some_and(|b| b.transactional)
         {
@@ -4344,7 +4334,7 @@ impl Typing for InferCtx {
         };
         let var = Rc::clone(var);
         let prev = self.enter_node(mention.node_id());
-        if let Some(transactional) = self.capability_binders.get(name).map(|b| b.transactional) {
+        if let Some(transactional) = self.place_binders.get(name).map(|b| b.transactional) {
             if transactional {
                 var.record(
                     self.capability(
@@ -4595,6 +4585,20 @@ impl Typing for InferCtx {
     ) -> R {
         self.parameter_groups
             .insert(parameter.name.clone(), group.clone());
+        if parameter.parameter_mode == crate::ccl::place::ParameterMode::Borrow
+            && matches!(ty, Type::Infer(_))
+        {
+            self.place_binders.bind(
+                parameter.name.clone(),
+                PlaceBinder {
+                    depth: self.capability_frame().depth,
+                    parameter: true,
+                    transactional: false,
+                    feed: false,
+                    escapes: false,
+                },
+            );
+        }
         self.scoped(&parameter.name, ty, f)
     }
 
@@ -4740,18 +4744,22 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &lifted else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        let bound = Bound::with_subst(body_ty, Subst::discharge(name.clone(), definition));
+        let read_body = self.read_value_type(&body_ty);
+        let discharge = Subst::discharge(name.clone(), definition);
+        if read_body != body_ty {
+            let read_lifted = self.fresh();
+            let Type::Infer(read_variable) = &read_lifted else {
+                unreachable!()
+            };
+            let bound = Bound::with_subst(read_body, discharge.clone());
+            enforce_bound_scope(read_variable, "lower", &bound);
+            read_variable.bounds.borrow_mut().lower_mut().push(bound);
+            self.place_reads.insert(v.uid, read_lifted);
+        }
+        let bound = Bound::with_subst(body_ty, discharge);
         enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         lifted
-    }
-
-    fn pass_arguments(&mut self, tuple: NodeId, params: Vec<Type>) {
-        self.arguments.insert(tuple, params);
-    }
-
-    fn take_arguments(&mut self, tuple: NodeId) -> Option<Vec<Type>> {
-        self.arguments.remove(&tuple)
     }
 
     fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
@@ -5122,7 +5130,11 @@ fn passed_variable(argument: &Expr) -> Option<&Name> {
 
 pub(super) fn list_component(passed: &Expr, j: usize) -> Expr {
     match &passed.node {
-        TypedExprNode::Tuple(parts) => parts[j].clone_preserving_ids(),
+        // A borrow's place is what a later parameter's type reads, as one argument's is.
+        TypedExprNode::Tuple(parts) => match &parts[j].node {
+            TypedExprNode::Borrow(place) => place.clone_preserving_ids(),
+            _ => parts[j].clone_preserving_ids(),
+        },
         TypedExprNode::Let { body, .. } => {
             let mut out = passed.clone_preserving_ids();
             let TypedExprNode::Let { body: inner, .. } = &mut out.node else {

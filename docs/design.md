@@ -101,19 +101,25 @@ The compiler recognises comprehension shapes and emits specialised dataflow: an 
 
 ### Sources, sinks, and feeds
 
-Programs interact with the world through **sources** (`stdin`, `http_serve(...)`) and through **sinks** (`stdout`, http responses).
+Programs interact with the world through **sources** (`stdin`, `std::http` requests) and through
+**sinks** (`stdout`, http responses).
 
 Sources are simply collections of data that comes in from outside of the program.
 As more data comes in to a source, its corresponding collection grows, and expressions defined over that collection can proceed with their computation.
 
 Sinks are collections of data that go out of the program. They are defined as expressions over sources, and eventually compiled into terminal nodes in the program's dataflow graph.
 
-CHL provides a primitive called **feeds** to make it ergonomic to define append-only collections (such as sinks). Given a feed variable `d`, you can append
-data to it using `d << data`. Generators (`yield`) are syntax sugar over feeds:
-a function with `yield`s has a hidden result-collection variable, and each
-`yield` translates exactly to a feed append into that collection — so the
-compiler query-plans generators and feeds uniformly.
-A feed is declared with no value, `out: Feed(_)`, or arrives from a builtin like `http_serve`.
+CHL provides a primitive called **feeds** to make it ergonomic to define append-only collections
+(such as sinks). Given a feed variable `d`, you can append data to it using `d << data`. Generators
+(`yield`) are syntax sugar over feeds: a function with `yield`s has a hidden result-collection
+variable, and each `yield` translates exactly to a feed append into that collection — so the
+compiler query-plans generators and feeds uniformly. A feed is declared with no value,
+`out: Feed(_)`. Place declarations are private; a module exports an ordinary read explicitly,
+`pub values = out`. Feed and Mut are places. Places do not move or occur in stored data. Ordinary
+value positions read their contents. `&` borrows a place for a call, and parameter modes infer from
+writes, contributions and forwarding. Mutable borrows are exclusive; deferred borrows are shared. A
+callback cannot outlive a captured place. The compiler checks this discipline before inlining
+([Places](../src/ccl/design/mutability.md#feed-is-a-ccl-type)).
 
 The APIs of library sources and sinks are **[Open]**.
 
@@ -223,13 +229,13 @@ The connections between the layers above and the capabilities Cambra claims:
 | Feature | Status |
 | --- | --- |
 | Comprehensions, with hash-join and keyed-aggregate planning | Implemented |
-| Streaming sources and sinks (`stdin`, `http_serve`) | Implemented |
+| Streaming sources and sinks (`stdin`, `std::http`) | Implemented |
 | Generator functions | Implemented (single-`for` bodies; general shapes **[Planned]**) |
 | `:=` mutation and loop accumulators (induction histories) | Implemented |
 | Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented; naming a transaction, `with txn = begin():`, **[Decided]** |
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
-| Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |
+| Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `std::http` implemented |
 | Function requirements and effects (`requires` / `causes`) | Implemented |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |

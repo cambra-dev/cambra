@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::ccl::chl_print::Writer;
-use crate::ccl::{HistoryKind, InferVar, InferVarId, Type};
+use crate::ccl::{InferVar, InferVarId, Type};
 
 use super::compact::{CompactGraph, CompactType, CompactVariant};
 use crate::ccl::FieldKey;
@@ -577,13 +577,6 @@ fn coalesce_compact_go(
     polarity: bool,
     scope: &[crate::ccl::ty::Witness],
 ) -> Result<Type, CoalesceError> {
-    // A feed is below its read view `domain ⤇ value`, which settles a feed meeting other
-    // contributions at one position before the contribution count below
-    // ([`dissolve_read_feeds`]). A feed handle alone at a position keeps its constructor;
-    // so do two handles meeting (their `history_slot`s merged upstream). This is the
-    // join-variable counterpart of `constrain_go`'s rule that a feed reads as its
-    // collection.
-    let ct = &dissolve_read_feeds(ct.clone(), polarity);
     let related = relate_params_by_bounds(ct, polarity);
     let ct = related.as_ref().unwrap_or(ct);
     // Count concrete (non-variable) contributions to pick the output
@@ -984,82 +977,6 @@ fn coalesce_compact_go(
         }
     }
     Ok(out)
-}
-
-/// Settle a position's feed `history_slot` against its other contributions, by the rule that
-/// a feed is below its read view `domain ⤇ value`.
-///
-/// At a negative position the bounds meet, and the meet of a feed and the collection it
-/// reads as is the feed: a parameter the body both feeds and reads, or feeds and returns,
-/// is a feed. The collection slot is dropped and anything else stays beside the feed, so
-/// a feed meeting a scalar there still fails as two shapes. At a positive position the
-/// contributions join, and the join of a feed and anything but a feed is above the feed's
-/// read view, so the feed dissolves into it: `x + 1` joins `x`'s read view with `Int`.
-///
-/// This performs at most one merge per position: reconstructing the channel as a
-/// `fun`-slot type and merging it leaves `history_slot` empty, so the loop
-/// exits. A *chained* defer read (a feed handle nested in the payload) rides
-/// inside the merged `fun` codomain and is resolved by ordinary recursion in
-/// [`coalesce_compact_go`], not by re-entering here. A mutable-variable slot, or a lone
-/// feed with no other content, is left intact. The `while` form is a defensive
-/// fixpoint; the body never re-arms `history_slot`.
-fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
-    while let Some(history) = ct.history_slot.take() {
-        // Only a *feed channel* dissolves into a read view; a mutable variable is read as
-        // its scalar value, never merged into the surrounding type.
-        if history.kind != HistoryKind::Append {
-            ct.history_slot = Some(history);
-            break;
-        }
-        if !polarity {
-            ct.fun = None;
-            ct.history_slot = Some(history);
-            break;
-        }
-        let has_other = !ct.atoms.is_empty()
-            || ct.rec.is_some()
-            || ct.dep_tuple.is_some()
-            || ct.family.is_some()
-            || ct.var.is_some()
-            || ct.fun.is_some();
-        if !has_other {
-            ct.history_slot = Some(history);
-            break;
-        }
-        let super::compact::CompactHistory {
-            name,
-            value,
-            domain,
-            ..
-        } = history;
-        // The channel is the `domain ⤇ value` function; reconstruct it as a
-        // `fun`-slot CompactType (exactly what the old single-payload slot held)
-        // and merge it into the read view.
-        //
-        // Not [`CompactType::value`]: this re-expresses content already at this
-        // position rather than arriving as a second bound, so it imposes no refinement
-        // of its own and leaves `refinements` at the merge identity. Building it
-        // as a value would intersect the position's own refinements away at a positive
-        // polarity (see `CompactType::refinements`).
-        let chan = CompactType {
-            fun: Some(super::compact::CompactFun {
-                // The function's binder: the row at `𝑘` may read `𝑘`.
-                binder: name.into(),
-                binders: Vec::new(),
-                // A feed's read view is a collection: a data function.
-                kind: super::compact::KindPin::Data,
-                capabilities: Default::default(),
-                // A read view is over its channel domain, not over an index of its own.
-                domains_disagree: false,
-                domain,
-                combined: None,
-                codomain: value,
-            }),
-            ..Default::default()
-        };
-        ct = CompactType::merge(polarity, ct, chan);
-    }
-    ct
 }
 
 /// How a position's polarity reads in a diagnostic.

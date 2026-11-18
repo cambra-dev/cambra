@@ -73,8 +73,7 @@ pub(super) fn lower_call(
             let Some(member) = ctx.member(q, func.span)? else {
                 return Ok(Expr::error());
             };
-            let passing = Passing::of(member.history_param);
-            return lower_application(member.name.raw(), func.span, args, passing, ctx);
+            return lower_application(member.name.raw(), func.span, args, ctx);
         }
         _ => return lower_expression_call(func, args, ctx),
     };
@@ -201,13 +200,13 @@ pub(super) fn lower_call(
         }
         // `await_final(x)` — the terminal read of a transactional mutable variable: `x`'s
         // final committed value once its whole commit history completes (CHL spec,
-        // "`await_final`"). Lowers to `x ▷ await_final` — the handle applied to the
+        // "`await_final`"). Lowers to `x ▷ await_final` — the place applied to the
         // reducing builtin; `transact_phase` replaces it with `final_or_default`
         // over the mutable variable's history binding.
         //
         // The argument is resolved **by name**, like a write's target and unlike an
         // ordinary call argument: `await_final` reduces the mutable variable's history rather
-        // than consuming a value, so the operand is a handle position and never goes
+        // than consuming a value, so the operand is a place position and never goes
         // through the value-reading `lower_expr` (whose out-of-block read gate would
         // reject the very read this is).
         Some(SurfaceBuiltin::AwaitFinal) => {
@@ -392,45 +391,7 @@ pub(super) fn lower_call(
                      `x: Feed(T)`, or `x: Feed(_)` to infer its value type",
                 ));
             }
-            // A `def` with a pass-by-reference `Mut` or `Feed` parameter takes a bare mutable
-            // variable or feed as that argument. Beta-reduction on inlining then substitutes
-            // the argument variable for the named parameter — the route by which a
-            // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable, and a
-            // feed of a `Feed` parameter on the caller's channel.
-            let passing = Passing::of(ctx.is_history_param_fn(name));
-            lower_application(Name::raw(name), func.span, args, passing, ctx)
-        }
-    }
-}
-
-/// How a call's arguments lower.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Passing {
-    /// Each argument is a value ([`lower_expr`]).
-    Values,
-    /// The callee has a pass-by-reference `Mut` or `Feed` parameter, so an argument may be a
-    /// bare mutable variable or feed ([`lower_call_arg`]).
-    ByReference,
-}
-
-impl Passing {
-    /// [`Passing::ByReference`] for a callee with a pass-by-reference parameter.
-    pub(super) fn of(by_reference: bool) -> Self {
-        if by_reference {
-            Passing::ByReference
-        } else {
-            Passing::Values
-        }
-    }
-
-    fn lower(
-        self,
-        arg: &Spanned<ChlExpr>,
-        ctx: &mut LoweringContext,
-    ) -> Result<Expr, LoweringError> {
-        match self {
-            Passing::Values => lower_expr(arg, ctx),
-            Passing::ByReference => lower_call_arg(arg, ctx),
+            lower_application(Name::raw(name), func.span, args, ctx)
         }
     }
 }
@@ -444,10 +405,8 @@ impl Passing {
 /// inliner leaves that call unresolved, and `inline::check_calls_resolved` refuses it
 /// (`src/ccl/design/optimization.md`, "Functions held in products").
 ///
-/// Builtins, sources, and the bare-variable arguments of a `Mut`-parameter `def` are
-/// all decided by the callee's spelling, so none of them applies here: each argument is a
-/// value. A `Mut`-parameter function reached through a field is therefore passed a value
-/// where it takes a mutable variable, and inference refuses the call.
+/// A borrow is written `&x` at the call whatever the callee is, so a function reached
+/// through a field takes its arguments as a named one does.
 fn lower_expression_call(
     func: &Spanned<ChlExpr>,
     args: &[Spanned<ChlExpr>],
@@ -469,7 +428,7 @@ fn lower_expression_call(
         // Left in call position, the lambda would reach `lambda_elim` unreduced.
         let callee_name = ctx.fresh_callee_name();
         let lambda = lower_expr(func, ctx)?;
-        let call = apply_to_args(args, func.span, Passing::Values, ctx, |ctx| {
+        let call = apply_to_args(args, func.span, ctx, |ctx| {
             Ok(ctx.tag_machinery(
                 Expr::var(callee_name.clone()),
                 func.span,
@@ -482,7 +441,7 @@ fn lower_expression_call(
         let bound = Expr::let_bind(callee_name, Occurrence::mint(), lambda, call);
         return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
     }
-    apply_to_args(args, func.span, Passing::Values, ctx, |ctx| {
+    apply_to_args(args, func.span, ctx, |ctx| {
         let mut callee = lower_expr(func, ctx)?;
         // A field callee is a call of the function the field holds: inlining reaches that
         // function's body through this place (`crate::ccl::site`).
@@ -498,13 +457,12 @@ fn lower_expression_call(
 /// `args(a, b, …) ▷ f` and `f()` → `args() ▷ f`. The arguments lower first.
 ///
 /// The list pairs with a lambda's parameter list ([`lower_lambda`]), and a tuple passed as one
-/// argument, `f((a, b))`, is not one. An argument lowers as `passing` says: a value lowers through
-/// `lower_expr`, where the out-of-block transactional read gate applies, and an argument a
-/// `Mut`-param callee takes may be a bare mutable variable, which bypasses the gate.
+/// argument, `f((a, b))`, is not one. An argument lowers through [`lower_call_arg`]: a value
+/// through `lower_expr`, where the out-of-block transactional read gate applies, and an explicit
+/// `&` operand as the place it lends, which bypasses the gate.
 pub(super) fn apply_to_args(
     args: &[Spanned<ChlExpr>],
     call_span: Span,
-    passing: Passing,
     ctx: &mut LoweringContext,
     callee: impl FnOnce(&mut LoweringContext) -> Result<Expr, LoweringError>,
 ) -> Result<Expr, LoweringError> {
@@ -514,11 +472,11 @@ pub(super) fn apply_to_args(
             Ok(Expr::apply(none, callee(ctx)?))
         }
         [arg] => {
-            let arg = passing.lower(arg, ctx)?;
+            let arg = lower_call_arg(arg, ctx)?;
             Ok(Expr::apply(arg, callee(ctx)?))
         }
         _ => {
-            let lowered: Result<Vec<_>, _> = args.iter().map(|a| passing.lower(a, ctx)).collect();
+            let lowered: Result<Vec<_>, _> = args.iter().map(|a| lower_call_arg(a, ctx)).collect();
             // The list is manufactured packing: the source call writes its arguments only.
             let args_span = args[0].span.join(args[args.len() - 1].span);
             let list = ctx.tag_machinery(Expr::arguments(lowered?), args_span, "lower.call_tuple");
@@ -533,11 +491,10 @@ pub(super) fn lower_application(
     callee: Name,
     func_span: Span,
     args: &[Spanned<ChlExpr>],
-    passing: Passing,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let site = ctx.places.site(func_span);
-    apply_to_args(args, func_span, passing, ctx, |ctx| {
+    apply_to_args(args, func_span, ctx, |ctx| {
         let mut callee = ctx.reference(callee, func_span);
         // The call's place, which inlining extends the sites of the body it copies here with.
         callee.site = Some(site);
@@ -754,25 +711,67 @@ pub(super) fn lower_subscript(
     Ok(Expr::apply(key, collection))
 }
 
-/// Lower a user-function call argument. A **bare variable** argument is the only
-/// shape a pass-by-reference `Mut` parameter accepts (design doc
-/// `src/ccl/design/mutability.md`, rule 1: "a `Mut`-typed value must be a bare
-/// variable reference"), so it is lowered directly to a `Var` — bypassing the
-/// out-of-block transactional read gate in [`super::lower_expr`]. Whether it is
-/// a by-reference mutable-variable pass (e.g. `transfer(a, b, amt)` for
-/// `a: Mut(_, Txn)`) or an ordinary value read is decided downstream by the
-/// callee's inferred parameter type; lowering cannot know the signature (it runs
-/// before inference). A non-bare argument is a computed value expression and
-/// lowers through [`super::lower_expr`], where the gate still applies.
+/// Preserve an explicit borrow's operand; ordinary arguments use value lowering.
 pub(super) fn lower_call_arg(
     arg: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if let ChlExpr::Name(id) = &arg.node {
-        Ok(ctx.tag_image(Expr::var(id.as_str().to_string()), arg.span))
-    } else {
-        lower_expr(arg, ctx)
+    let Some(place) = borrowed_place(arg) else {
+        return lower_expr(arg, ctx);
+    };
+    // A place is a place variable or a path from one; a call or an operation yields a value,
+    // never a place (`docs/chl-spec.md`, "Places and values").
+    if !is_path(&place.node) {
+        return Err(LoweringError::unsupported(
+            place.span,
+            "`&` lends a place, a place variable or a path from one such as `s.items` or `xs[i]`, \
+             and a call or an operation yields a value",
+        ));
     }
+    let place_expr = match &place.node {
+        ChlExpr::Name(id) => ctx.tag_image(Expr::var(id.as_str().to_string()), place.span),
+        _ => lower_expr(&place, ctx)?,
+    };
+    Ok(ctx.tag_image(Expr::borrow(place_expr), arg.span))
+}
+
+/// Whether `expr` is a name or a path from one, `s.items` or `xs[i]`.
+fn is_path(expr: &ChlExpr) -> bool {
+    match expr {
+        ChlExpr::Name(_) => true,
+        ChlExpr::Attribute { target, .. } | ChlExpr::Subscript { target, .. } => {
+            is_path(&target.node)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn borrowed_place(expr: &Spanned<ChlExpr>) -> Option<Spanned<ChlExpr>> {
+    let node = match &expr.node {
+        ChlExpr::Borrow(place) => return Some((**place).clone()),
+        ChlExpr::Attribute {
+            target,
+            attr,
+            attr_span,
+            attr_qualifier,
+        } => ChlExpr::Attribute {
+            target: Box::new(borrowed_place(target)?),
+            attr: attr.clone(),
+            attr_span: *attr_span,
+            attr_qualifier: attr_qualifier.clone(),
+        },
+        ChlExpr::Subscript {
+            target,
+            index,
+            checked,
+        } => ChlExpr::Subscript {
+            target: Box::new(borrowed_place(target)?),
+            index: index.clone(),
+            checked: *checked,
+        },
+        _ => return None,
+    };
+    Some(Spanned::new(expr.span, node))
 }
 
 pub(super) fn lower_binop(
@@ -914,7 +913,7 @@ pub(super) fn lower_feed(
     value: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let Some(name) = feed_target(target, "handle binding", ctx)? else {
+    let Some(name) = feed_target(target, ctx)? else {
         return Ok(Expr::error());
     };
     let occurrence = ctx.occurrence_at(feed_target_span(target));
@@ -939,11 +938,11 @@ pub(super) fn feed_target_span(target: &Spanned<ChlExpr>) -> Span {
 /// The feed `target` names: a name, or another module's member, `a::events`
 /// (`docs/chl-spec.md`, "9.9 Running"), or `None` when that module has errors of
 /// its own. `x << v` is an expression form, so the target is parsed as an
-/// `Expr` rather than an `AssignTarget`; `context` names the position in the
-/// error for any other form.
+/// `Expr` rather than an `AssignTarget`. Any other form is refused: a place is part of no
+/// value, so a component or a call's result names no feed (`docs/chl-spec.md`, "Places and
+/// values").
 pub(super) fn feed_target(
     target: &Spanned<ChlExpr>,
-    context: &str,
     ctx: &LoweringContext,
 ) -> Result<Option<Name>, LoweringError> {
     match &target.node {
@@ -951,7 +950,8 @@ pub(super) fn feed_target(
         ChlExpr::Qualified(q) => Ok(ctx.member(q, target.span)?.map(|member| member.name.raw())),
         _ => Err(LoweringError::unsupported(
             target.span,
-            format!("{context}: only a name or a qualified name is a feed target"),
+            "`<<` appends to a feed named by itself, `out`, or as another module's member, \
+             `m::events`: a feed is part of no value, so no component or call result is one",
         )),
     }
 }
@@ -961,7 +961,7 @@ pub(super) fn lower_define(
     value: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let name = extract_name_target(target, "handle defining")?;
+    let name = extract_name_target(target, "feed definition")?;
     let occurrence = ctx.occurrence_at(target.span);
     Ok(Expr::define(name, occurrence, value))
 }

@@ -171,7 +171,7 @@ fn clauses_of(code: &str, member: &str) -> String {
         pub def counted(xs):
             c := 0
             for x in xs:
-                inc(c)
+                inc(&c)
             c
     "},
     "counted",
@@ -184,7 +184,7 @@ fn clauses_of(code: &str, member: &str) -> String {
             with begin():
                 x += 1
         pub def bump_stock(n: Int):
-            bump(stock)
+            bump(&stock)
     "},
     "bump_stock",
     "requires ReadTxn(Module::*) causes RunTransaction, WriteTxn(Module::*)"
@@ -293,40 +293,37 @@ fn a_function_type_with_clauses_is_parenthesized(#[case] code: &str, #[case] lin
     assert!(interface.lines().any(|l| l == line), "{interface}");
 }
 
-/// A feed reached through a second name is not tracked: a capability is keyed by the name it is
-/// recorded through, and a feed handle, unlike a `Mut` one, is a value that travels
-/// (`src/ccl/design/type-inference.md`, "4.9 Capabilities"). These pin the current output, which
-/// names the parameter, the alias and the projection, where each should be `Append(out)`; the
-/// mutability redesign decides how a feed travels.
+/// Borrowed Feed parameters retain their target's effects. Bindings and product fields
+/// contain ordinary collection reads and carry no append effect.
 #[rstest]
 #[case::an_unannotated_parameter(
     indoc! {"
         def emit(o, v: Int):
             o << v
         pub def emit_out(v: Int):
-            emit(out, v)
+            emit(&out, v)
     "},
     "emit_out",
-    "causes Append(o)"
+    "causes Append(out)"
 )]
 #[case::an_alias(
     indoc! {"
         pub def via_alias(v: Int):
-            log: Feed(_) = out
-            log << v
+            log = out
+            sum(log) + v
     "},
     "via_alias",
-    "causes Append(log)"
+    ""
 )]
 #[case::a_projection(
     indoc! {"
         pub def via_tuple(v: Int):
             p = (out, v)
             q = p.0
-            q << v
+            sum(q) + v
     "},
     "via_tuple",
-    "causes Append(q)"
+    ""
 )]
 // An annotated parameter is tracked: its capability is its argument's.
 #[case::an_annotated_parameter(
@@ -334,12 +331,12 @@ fn a_function_type_with_clauses_is_parenthesized(#[case] code: &str, #[case] lin
         def emit(o: Feed(Int), v: Int):
             o << v
         pub def emit_out(v: Int):
-            emit(out, v)
+            emit(&out, v)
     "},
     "emit_out",
     "causes Append(out)"
 )]
-fn a_feed_reached_through_another_name(
+fn feed_borrows_keep_effects_and_reads_are_values(
     #[case] code: &str,
     #[case] member: &str,
     #[case] expected: &str,
@@ -875,10 +872,10 @@ fn a_statement_calling_a_parameter_is_kept() {
         def bump(c: Mut(Int)):
             c += 1
         pub def tick(n: Int):
-            bump(cnt)
+            bump(&cnt)
             n
     "},
-    "has `Write(cnt)`"
+    "a function writes the mutable variable `cnt` it captures"
 )]
 fn a_public_function_naming_an_induction_variable_is_refused(
     #[case] code: &str,
@@ -909,7 +906,7 @@ const TAKE: &str = indoc! {"
             n
 
     def generic(T, a: T, s: Mut(Int, Txn), n: Int) requires t: Take(T) causes only RunTransaction, t::Writes:
-        t::take(a, s, n)
+        t::take(a, &s, n)
 "};
 
 /// A checked module prints a trait's associated effect types and its functions' clauses, and a
@@ -931,7 +928,7 @@ fn a_checked_module_prints_what_its_traits_cause() {
                     s := s - n
                 n
         pub def generic(T, a: T, s: Mut(Int, Txn), n: Int) requires t: Take(T):
-            t::take(a, s, n)
+            t::take(a, &s, n)
     "});
     assert_eq!(
         interface,
@@ -1007,14 +1004,14 @@ fn a_checked_module_names_each_unnamed_requirement() {
 #[case::a_call_at_an_instance(
     indoc! {"
         def direct(n: Int) causes only RunTransaction:
-            summon(Take(Box))::take(Box::new(1), stock, n)
+            summon(Take(Box))::take(Box::new(1), &stock, n)
     "},
     "this has `WriteTxn(stock)`, which the definition's clause"
 )]
 #[case::a_call_through_a_requirement(
     indoc! {"
         def through(n: Int) causes only RunTransaction:
-            generic(Box::new(1), stock, n)
+            generic(Box::new(1), &stock, n)
     "},
     "this has `WriteTxn(stock)`, which the definition's clause"
 )]
@@ -1023,16 +1020,16 @@ fn a_checked_module_names_each_unnamed_requirement() {
 #[case::a_call_through_an_inferred_requirement(
     indoc! {"
         def inferred(a, s: Mut(Int, Txn), n: Int):
-            summon(Take(_))::take(a, s, n)
+            summon(Take(_))::take(a, &s, n)
         def through_inferred(n: Int) causes only RunTransaction:
-            inferred(Box::new(1), stock, n)
+            inferred(Box::new(1), &stock, n)
     "},
     "this has `WriteTxn(stock)`, which the definition's clause"
 )]
 #[case::a_requirement_beyond_its_bound(
     indoc! {"
         def narrow(T, a: T, s: Mut(Int, Txn), n: Int) requires t: Take(T) causes only RunTransaction:
-            t::take(a, s, n)
+            t::take(a, &s, n)
     "},
     "this has `t::Writes`, which the definition's clause"
 )]
@@ -1052,7 +1049,7 @@ const INFERRED_LIB: &str = indoc! {"
         def take(t, s, n):
             n
     pub def inferred(a, s: Mut(Int, Txn), n: Int):
-        summon(Take(_))::take(a, s, n)
+        summon(Take(_))::take(a, &s, n)
 "};
 
 /// A requirement inference adds to a definition states a member for each associated effect type
@@ -1064,8 +1061,8 @@ fn an_inferred_requirement_states_its_associated_effect_types() {
     let interface = interface_of(INFERRED_LIB);
     assert!(
         interface.contains(
-            "pub inferred: forall (A) (A, Mut(Int, Txn), Int) => Int requires r: Take(A) causes \
-             r::Writes"
+            "pub inferred: forall (A) (A, Mut(Int, Txn), Int) => Int requires r: Take(A) \
+             causes r::Writes"
         ),
         "{interface}"
     );
@@ -1086,7 +1083,7 @@ fn an_inferred_requirement_does_what_each_use_selects(
     #[case] refused: Option<&str>,
 ) {
     let root = format!(
-        "{}    lib::inferred({argument}, stock, n)\nvia(3)\n",
+        "{}    lib::inferred({argument}, &stock, n)\nvia(3)\n",
         indoc! {"
             import lib
             stock: Mut(Int, Txn) := 10
@@ -1113,8 +1110,8 @@ fn an_inferred_requirement_does_what_each_use_selects(
 /// requirement, compiles and runs.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::directly("summon(Take(Box))::take(Box::new(1), stock, 3)")]
-#[case::through_a_requirement("generic(Box::new(1), stock, 3)")]
+#[case::directly("summon(Take(Box))::take(Box::new(1), &stock, 3)")]
+#[case::through_a_requirement("generic(Box::new(1), &stock, 3)")]
 fn a_trait_whose_instance_writes_state_runs(#[case] call: &str) {
     super::helpers::check_program_scalar(
         &program(&format!("{TAKE}\n{call}\n"), &[]),
@@ -1290,7 +1287,7 @@ fn a_function_returning_a_closure_over_its_variable_is_refused(
             c := 1
             m := \\x -> c + x
         f := \\x -> x
-        stash(f)
+        stash(&f)
     "},
     "this writes to `m` a function that has `Read(c)`"
 )]
@@ -1551,7 +1548,7 @@ fn a_read_is_its_mentions_effect() {
                     s := s - n
                 n
         pub def run_take(n: Int) => Int:
-            summon(Take(Box))::take(Box::new(1), stock, n)
+            summon(Take(Box))::take(Box::new(1), &stock, n)
     "},
     "pub run_take: Int => Int requires ReadTxn(*) causes RunTransaction, WriteTxn(*)"
 )]

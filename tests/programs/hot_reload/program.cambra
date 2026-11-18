@@ -1,11 +1,17 @@
 entries := ""
 
-sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
-peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+http_sign_resps_replies: Feed(String)
+sign_reqs = http_sign_resps::requests
+run std::http(port="{PORT}", method="GET", path="/peek") as http_peek_resps
+http_peek_resps_replies: Feed(String)
+peek_reqs = http_peek_resps::requests
 
 for entry in sign_reqs:
     entries := entries + entry + "\n"
-    sign_resps << entries
+    http_sign_resps_replies << entries
 
 for req in peek_reqs:
-    peek_resps << "peek\n"
+    http_peek_resps_replies << "peek\n"
+http_sign_resps::respond(http_sign_resps_replies)
+http_peek_resps::respond(http_peek_resps_replies)

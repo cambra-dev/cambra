@@ -645,7 +645,7 @@ fn alias_is_the_value_type_of_a_mut_parameter() {
 
             acc: Mut(Int) := 0
             for i in [1, 2, 3]:
-                bump(acc, i)
+                bump(&acc, i)
 
             acc
         "#},

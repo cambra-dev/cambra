@@ -498,7 +498,7 @@ is read and written as a `Mut`. The block reads its own writes. Nothing outside 
 before the commit: another transaction sees a cell's new content at the commit's version, and the
 enclosing loop sees a write to an outer `Mut` at that loop step. A denied or aborted transaction
 leaves no write. An append to a feed inside a block is therefore a contribution only on commit,
-which is the gating [spec 8.4](../../../docs/chl-spec.md#84-feeds-are-the-second-form-of-mutability)
+which is the gating [spec 8.4](../../../docs/chl-spec.md#84-deferred-collections)
 states for a reply fed inside `with begin():`. A `OnceMap` definition inside a block is partial
 ([Totality and transactions](#totality-and-transactions)).
 
@@ -1572,7 +1572,7 @@ that land with it. Work not listed here is in [Future work](#future-work).
 | `Feed(𝑇)`, a history under the append merge law, which can be aliased and moved | `Feed(𝑇)`, a deferred collection with no history, no alias and no move |
 | A keyed feed, `resps[req.id] = …` ([spec 7.3](../../../docs/chl-spec.md#73-sources), sketch) | `OnceMap(𝐾, 𝑉)`: `m[k] = v` defines a key once, and the map is total |
 | A lookup in a feed decides absence only once the feed is complete ([spec 3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)), or at a cut such as `o.time < now` | A loop writes the elements into a cell, and a transaction reads the cell at its version |
-| A feed handle in a tuple ("A deferred collection inside a data structure [Open]") | No handle: a deferred collection is never stored, and its final value is |
+| A feed place stored in a tuple ("A deferred collection inside a data structure [Open]") | None: a deferred collection is never stored, and its final value is |
 | Public feeds and `Mut`s, and a public feed with contributions from other modules ([spec 9.9](../../../docs/chl-spec.md#99-running)) | No public place; a module exports values, and other modules pass input through its functions |
 | A sink that returns a feed for its caller to fill | A sink that takes the collection as an argument ([Sinks](#sinks)) |
 | `await_final` on a top-level `Mut(𝑉, Txn)`, named directly ([spec 8.6](../../../docs/chl-spec.md#86-await_final)) | `await_final` and `history` on a cell or a `Ref` ([history and await_final](#history-and-await_final)) |
@@ -1595,7 +1595,7 @@ Proposals for the owners of each part.
   reversed. `->` becomes a postfix operator beside `.`, the field access through a `Ref`, and
   prefix `*` is the dereference, binding looser than the postfix operators. A lambda keeps
   `\x -> body`.
-- **[Spec 8.4](../../../docs/chl-spec.md#84-feeds-are-the-second-form-of-mutability).** "Feeds are
+- **[Spec 8.4](../../../docs/chl-spec.md#84-deferred-collections).** "Feeds are
   the second form of mutability" becomes: a feed is a deferred collection, an immutable place with
   no history ([Deferred collections](#deferred-collections)).
 - **[Spec 3.7](../../../docs/chl-spec.md#37-feed-operator-).** `fanout` takes the collection it fans

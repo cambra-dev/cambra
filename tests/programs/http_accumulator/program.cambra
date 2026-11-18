@@ -15,8 +15,11 @@
 
 entries := ""
 
-sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+http_sign_resps_replies: Feed(String)
+sign_reqs = http_sign_resps::requests
 
 for entry in sign_reqs:
     entries := entries + entry + "\n"
-    sign_resps << entries
+    http_sign_resps_replies << entries
+http_sign_resps::respond(http_sign_resps_replies)

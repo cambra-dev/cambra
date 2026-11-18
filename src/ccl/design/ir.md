@@ -263,7 +263,7 @@ these nodes into a causal `LetRec` or, for sequential positions, shadowing `Let`
 
 `MutDecl` is the node that introduces a mutable variable in an expression body. A `Let` over a
 mutable initializer binds the value read from it; `b = a` does not create a mutable alias. A
-`Lambda` parameter may also bind a mutable history for pass-by-reference calls. This distinction
+`Lambda` parameter may also bind a mutable history as a borrowed parameter. This distinction
 is structural and remains available after source annotations are cleared by inference. See
 [mutability](mutability.md) for read and write rules.
 
@@ -447,6 +447,18 @@ one domain and are merged where an input splits them; a realized conditional's l
 distinct candidates of a sum and are merged under the sum's bound. See
 [Compiling a conditional collection](collections.md#compiling-a-conditional-collection).
 
+### `Borrow` — a place argument
+
+`Borrow(place)` denotes a temporary borrow, written `&x` in a source call. `Type::as_place`
+classifies mutable and deferred places and exposes their ordinary read type. `ParameterMode`
+records a source parameter's value or borrow mode independently of the type inferred at a use.
+Unmarked arguments read values. Place types never nest in source values.
+
+The marker survives inference so later checks distinguish a borrow from a value read of the same
+variable. Dependent application substitutes the underlying place identity; the borrow marker is not
+an ordinary value term. After inference, `check_places` refuses a `&` reaching a value parameter, an exclusive place reached twice among one call's arguments (`exclusive_borrows`), and a function writing an induction variable it captures (`captured_induction_writes`). A borrowed parameter is an ordinary binder of its function, so a function capturing it cannot outlive the call (`InferCtx::escaping_results`). Beta reduction consumes the marker when
+substituting its place into a named parameter. No `Borrow` reaches channelization or planning.
+
 ### The program's outputs are a trailing `Record`
 
 A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at
@@ -587,7 +599,7 @@ for one collection. See [type inference](type-inference.md) for witness subtypin
 | `SharedHole(id)` | Lowering positions that must share one inferred type. | Annotation normalization maps equal ids to one inference variable. |
 | `BoundedHole(𝑇)` | An annotation slot constrained below 𝑇. | Annotation normalization creates an inference variable with an upper bound. |
 | `Infer(var)` | Solver variable with level and bounds. | Coalescing resolves it where required; strict typecheck rejects a survivor. |
-| `History` | Mutable or deferred-output handle over a domain. | Mutability phases or `channelize` erase it to a function type. |
+| `History` | Place type of a mutable variable or feed over a domain. | Mutability phases or `channelize` erase it to a function type. |
 | `ChanDom(name, level)` | Nominal domain of a defer channel. | `channelize` substitutes its assembled domain. |
 
 `Hole` has no identity, while `SharedHole` links positions before inference. Neither is a value
@@ -595,7 +607,7 @@ type. `BoundedHole` is also an annotation obligation, not a union of all subtype
 `Infer` may remain temporarily where a value has not been exercised; strict typecheck requires a
 fully resolved tree before operator conversion. Lowering does not mint solver variables.
 
-`History { function, history_kind }` denotes a handle over the data function
+`History { function, history_kind }` denotes a place over the data function
 `function : domain ⤇ value`. `Overwrite` is a mutable variable, rendered `Mut(value, domain)`:
 ordinary reads yield its value, and its phase builds carry-forward histories. `Append` is a feed
 channel, rendered `feed(domain ⤇ value)`: reads yield the whole collection, with no off-path
