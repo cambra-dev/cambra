@@ -1125,21 +1125,22 @@ fn a_correlated_comprehension_without_an_aggregate_over_a_collection() {
     else {
         panic!("a comprehension yielding a collection per row tiles as a collection")
     };
-    let mut got: Vec<(usize, Value, Value)> = Vec::new();
+    // A row is named by its key: the rows, like a group's entries, come in no particular order.
+    let mut got: Vec<(Value, Value, Value)> = Vec::new();
     for g in 0..outer.len() {
         let (start, end) = groups.row_run(g);
         for j in start..end {
-            got.push((g, inner.index_at(j), values.index_at(j)));
+            got.push((outer.index_at(g), inner.index_at(j), values.index_at(j)));
         }
     }
-    got.sort_by_key(|(g, k, _)| (*g, format!("{k:?}")));
+    got.sort_by_key(|(row, k, _)| (format!("{row:?}"), format!("{k:?}")));
     assert_eq!(
         got,
         vec![
-            (0, Value::String("a".into()), Value::Int(1)),
-            (0, Value::String("b".into()), Value::Int(2)),
-            (1, Value::String("a".into()), Value::Int(2)),
-            (1, Value::String("b".into()), Value::Int(4)),
+            (Value::UInt(0), Value::String("a".into()), Value::Int(1)),
+            (Value::UInt(0), Value::String("b".into()), Value::Int(2)),
+            (Value::UInt(1), Value::String("a".into()), Value::Int(2)),
+            (Value::UInt(1), Value::String("b".into()), Value::Int(4)),
         ]
     );
 }

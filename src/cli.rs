@@ -64,7 +64,7 @@ fn service_inspected(
 const MORSEL_ROWS_VAR: &str = "CAMBRA_MORSEL_ROWS";
 
 /// The rows a dispatched run's cut of a work package targets where [`MORSEL_ROWS_VAR`] is unset.
-const DEFAULT_MORSEL_ROWS: usize = 1024;
+const DEFAULT_MORSEL_ROWS: usize = 65_536;
 
 /// Compile and run `loaded` through the dispatcher, printing its `main` output.
 /// Compilation or planning errors return `Err(())`.
