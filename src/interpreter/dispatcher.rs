@@ -35,6 +35,7 @@ use crate::interpreter::{
 
 pub(crate) mod loop_scope;
 mod plan;
+pub(crate) mod transaction_scope;
 
 #[cfg(test)]
 pub(crate) use plan::walk_routes;
@@ -2809,31 +2810,47 @@ impl Entry {
     }
 }
 
-// Whether this thread is in a compiled program's dispatched run (`run_program`), which a debug
-// build checks no cache invalidation is delivered in.
+// The dispatched run this thread is in (`run_program`), `0` outside one: a debug build checks no
+// cache invalidation is delivered in a run, and a breaker records the run that consumed it
+// (`ProducerBase::reads_input`).
 //
-// shared-state-ok: a debug check's one bit. Nothing crosses it between operators; the run sets it
-// and the consumers a notification passes read it.
+// shared-state-ok: one run's id per thread. Nothing crosses it between operators; the run sets it
+// and the producers it reaches read it.
 thread_local! {
-    // shared-state-ok: the flag itself, for the reason on the macro above. The checker's upward
+    // shared-state-ok: the id itself, for the reason on the macro above. The checker's upward
     // scan stops at `thread_local! {`, so the note above does not reach this line.
-    static IN_A_RUN: Cell<bool> = const { Cell::new(false) };
+    static IN_A_RUN: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Execute `run` within a dispatched pipeline's evaluation context.
+/// The id the next outermost run takes ([`in_a_run`]). Ids start at `1`, since `0` is no run.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+
+/// Execute `run` within a dispatched pipeline's evaluation context. An outermost call starts a
+/// run with an id of its own; a nested call stays in the run around it.
 pub(crate) fn in_a_run<R>(run: impl FnOnce() -> R) -> R {
-    struct Leave(bool);
+    struct Leave(u64);
     impl Drop for Leave {
         fn drop(&mut self) {
             IN_A_RUN.with(|in_a_run| in_a_run.set(self.0));
         }
     }
-    let _leave = Leave(IN_A_RUN.with(|in_a_run| in_a_run.replace(true)));
+    let around = IN_A_RUN.with(Cell::get);
+    let id = match around {
+        0 => NEXT_RUN.fetch_add(1, Ordering::Relaxed),
+        id => id,
+    };
+    let _leave = Leave(IN_A_RUN.with(|in_a_run| in_a_run.replace(id)));
     run()
 }
 
 /// Whether this thread is inside a compiled program's dispatched run ([`in_a_run`]).
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn is_in_a_run() -> bool {
+    current_run() != 0
+}
+
+/// The id of the dispatched run this thread is in, `0` outside one ([`in_a_run`]).
+pub(crate) fn current_run() -> u64 {
     IN_A_RUN.with(Cell::get)
 }
 
@@ -3251,6 +3268,9 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
+        if let Some(producer) = breaker.as_producer() {
+            producer.base().consumed_in_this_run();
+        }
         breaker.consume_impl(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
@@ -3326,6 +3346,7 @@ fn finish_with(
             .take()
             .expect("a reach calls the breaker it reaches once");
         let released = breaker.input_released(input);
+        let asked = consumed.clone();
         dispatcher.ensure(
             consumed.is_none_or(|consumed| {
                 unreleased(&consumed, &released, &breaker.input_tiling(input)).is_none()
@@ -3333,7 +3354,11 @@ fn finish_with(
             || {
                 format!(
                     "pipeline {p} finishes after its input has released every guard the \
-                     pipeline consumed"
+                     pipeline consumed: {} released {released:?}, consumed {asked:?}",
+                    breaker
+                        .as_producer()
+                        .map(|producer| producer.name())
+                        .unwrap_or_else(|| "sink".to_owned())
                 )
             },
         );
