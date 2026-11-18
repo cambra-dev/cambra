@@ -53,6 +53,7 @@ use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::feed_nest::LoopFeed;
 use crate::ccl::opaque_output;
 use crate::ccl::{
@@ -437,7 +438,7 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
         } if some_branch_writes(&branches) => {
             for br in branches.iter_mut() {
                 let body = std::mem::take(&mut br.body);
-                br.body = splice_branch_value(name, body, cont.clone());
+                br.body = splice_branch_value(name, body, cont.duplicate());
             }
             let ty = branches
                 .first()
@@ -456,7 +457,11 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
                 node: other,
                 ..branch
             };
-            Subst::discharge_env_in_place(cont, &HashMap::from([(name.clone(), terminal)]))
+            Subst::discharge_env_in_place(
+                cont,
+                &HashMap::from([(name.clone(), terminal)]),
+                crate::ccl::Ids::Fresh,
+            )
         }
     }
 }
@@ -616,7 +621,7 @@ fn push_binding_into_branches(name: &Name, mut case: Expr, cont: Expr) -> Expr {
     };
     for br in branches.iter_mut() {
         let branch_body = std::mem::take(&mut br.body);
-        br.body = splice_branch_value(name, branch_body, cont.clone());
+        br.body = splice_branch_value(name, branch_body, cont.duplicate());
     }
     case.ty = cont.ty.clone();
     if matches!(case.ty, Type::Base(BaseType::Unit)) {
@@ -667,7 +672,7 @@ fn push_continuation_into_case(e: &mut Expr) -> Option<Expr> {
         };
         for br in branches.iter_mut() {
             let branch_body = std::mem::take(&mut br.body);
-            br.body = splice_after_unit(branch_body, body.as_ref().clone());
+            br.body = splice_after_unit(branch_body, body.as_ref().duplicate());
         }
         case.ty = body.ty.clone();
         case
@@ -1678,7 +1683,11 @@ fn rewrite_keyed_writes(expr: &mut Expr, value_tys: &HashMap<Name, Type>) {
         )
     });
     let arg_ty = Type::Tuple(vec![map_ty.clone(), key.ty.clone(), value.ty.clone()]);
-    let mut arg = Expr::tuple(vec![tvar(name, map_ty.clone()), *key, (**value).clone()]);
+    let mut arg = Expr::tuple(vec![
+        tvar(name, map_ty.clone()),
+        *key,
+        (**value).duplicate(),
+    ]);
     arg.ty = arg_ty.clone();
     let mut insert = Expr::builtin(Builtin::Insert);
     insert.ty = Type::fun(arg_ty, map_ty.clone());
@@ -1830,7 +1839,7 @@ fn unboxed_source(iter: &Expr) -> Expr {
         provenance::Nature::Machinery,
     );
     let Some(stamp) = crate::ccl::ty::unbox_type(&value_ty) else {
-        return iter.clone();
+        return iter.duplicate();
     };
     let source = Rc::new(source_value(iter));
     let unboxed_ty = crate::ccl::ty::unboxed_type(&value_ty, &source)
@@ -1847,7 +1856,7 @@ fn unboxed_source(iter: &Expr) -> Expr {
 /// ([`fun_parts`]), as `erase_mut` leaves the source node.
 fn source_value(iter: &Expr) -> Expr {
     let _frame = provenance::copy_frame("mut_elim.projected_source");
-    let mut source = iter.clone();
+    let mut source = iter.duplicate();
     source.ty = source_fun(&iter.ty);
     source
 }
@@ -2074,7 +2083,7 @@ fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev
     let mut ty = ty.clone();
     crate::ccl::subst::rewrite_pairing_projections(p, components, &mut ty);
     if crate::ccl::subst::type_free_vars(&ty).contains(p) {
-        ty = Subst::discharge(p.clone(), whole.clone()).apply_type(&ty);
+        ty = Subst::discharge(p.clone(), whole.duplicate()).apply_type(&ty);
     }
     assert!(
         !crate::ccl::subst::type_free_vars(&ty).contains(prev),
@@ -2294,11 +2303,11 @@ fn transform_loop(
                 // paths that split per feed. One lambda carries the whole body
                 // here, however many arms feed, so there is no product to hand to
                 // any one feed statement.
-                let body = strip_trailing_unit(loop_body.clone());
+                let body = strip_trailing_unit(loop_body.duplicate());
                 // The lambda's binder stands for the loop's target.
                 let mut lambda = Expr::lambda(
                     target.name.clone(),
-                    target.occurrence.clone(),
+                    target.occurrence.duplicate(),
                     target.ty.clone(),
                     body,
                 );
@@ -2371,7 +2380,7 @@ fn carry_position(
     let tuple_ty = Type::Tuple(vec![item_ty.clone(), dom.clone()]);
     let source_ty = iter.ty.clone();
     let tuple = Expr::tuple(vec![
-        Expr::apply(at_x.clone(), iter).with_ty(item_ty.clone()),
+        Expr::apply(at_x.duplicate(), iter).with_ty(item_ty.clone()),
         at_x,
     ])
     .with_ty(tuple_ty.clone());
@@ -2521,7 +2530,7 @@ pub(crate) fn fold_induction_loop(
             "letrec.carried_position",
             provenance::Nature::Expansion,
         );
-        carried = carry_position(position, target.clone(), iter.clone(), loop_body);
+        carried = carry_position(position, target.duplicate(), iter.duplicate(), loop_body);
         (&carried.0, &carried.1, carried.2)
     } else {
         (target, iter, loop_body)
@@ -2586,7 +2595,7 @@ pub(crate) fn fold_induction_loop(
         let component = |i: usize, ty: &Type| {
             let mut proj = Expr::proj_index(i);
             proj.ty = Type::fun(item_ty.clone(), ty.clone());
-            let mut app = Expr::apply(item.clone(), proj);
+            let mut app = Expr::apply(item.duplicate(), proj);
             app.ty = ty.clone();
             app
         };
@@ -2831,14 +2840,14 @@ fn transform_feed_only_loop(
         feed.ty = unit.clone();
         let mut lambda = Expr::lambda(
             target.name.clone(),
-            target.occurrence.clone(),
+            target.occurrence.duplicate(),
             target.ty.clone(),
             feed,
         );
         lambda.ty = Type::fun(target.ty.clone(), unit);
         let own = position.refreshed();
         let lambda = Subst::rename(position.clone(), own.clone()).apply_expr(&lambda);
-        let each = crate::ccl::ccl_utils::indexed_loop(Some(own), iter.clone(), lambda);
+        let each = crate::ccl::ccl_utils::indexed_loop(Some(own), iter.duplicate(), lambda);
         // As above: `expr_stmt` carries the continuation's type itself.
         body_out = Expr::expr_stmt(each, body_out);
     }
@@ -3204,15 +3213,16 @@ fn close_over(e: Expr, kept: &[Kept]) -> Expr {
             {
                 Subst::discharge_env_in_place(
                     out,
-                    &HashMap::from([(b.name.clone(), value.clone())]),
+                    &HashMap::from([(b.name.clone(), value.duplicate())]),
+                    crate::ccl::Ids::Fresh,
                 )
             }
             Kept::Let(_, b, value) => {
-                let mut b = b.clone();
+                let mut b = b.duplicate();
                 let body = refresh_let_binder(&mut b, out);
-                Expr::let_in(b, value.clone(), body)
+                Expr::let_in(b, value.duplicate(), body)
             }
-            Kept::Group(bs) => close_recurrence_group(bs.clone(), Vec::new(), Vec::new(), out),
+            Kept::Group(bs) => close_recurrence_group(bs.duplicate(), Vec::new(), Vec::new(), out),
         };
     }
     out
@@ -3441,7 +3451,7 @@ impl<'a> WriterWalk<'a> {
                 let bound = if is_writing_case(&bound_expr) {
                     self.walk_value_case(*bound_expr, kept)
                 } else {
-                    Subst::discharge_env_in_place(*bound_expr, &self.env)
+                    Subst::discharge_env_in_place(*bound_expr, &self.env, crate::ccl::Ids::Fresh)
                 };
                 if binding.transparency == BindingTransparency::Transparent && keeps(&bound) {
                     // The binder's type too: a filter reading a snapshot puts the
@@ -3463,7 +3473,7 @@ impl<'a> WriterWalk<'a> {
                 init,
                 body,
             } => {
-                let seed = Subst::discharge_env_in_place(*init, &self.env);
+                let seed = Subst::discharge_env_in_place(*init, &self.env, crate::ccl::Ids::Fresh);
                 self.named_at.insert(b.name.clone(), b.occurrence.id());
                 let seed = bind_value(kept, &b.name, b.occurrence, seed);
                 self.env.insert(b.name, seed);
@@ -3519,7 +3529,11 @@ impl<'a> WriterWalk<'a> {
                             "writer walk: a write to `{name}`, which the writer's write set \
                              does not hold, would be dropped from the decision"
                         );
-                        let value = Subst::discharge_env_in_place(*value, &self.env);
+                        let value = Subst::discharge_env_in_place(
+                            *value,
+                            &self.env,
+                            crate::ccl::Ids::Fresh,
+                        );
                         self.named_at.insert(name.clone(), name_occurrence.id());
                         let value = bind_value(kept, &name, name_occurrence, value);
                         self.env.insert(name.clone(), value);
@@ -3534,7 +3548,11 @@ impl<'a> WriterWalk<'a> {
                         row,
                         site: fed_at,
                     } => {
-                        let value = Subst::discharge_env_in_place(*value, &self.env);
+                        let value = Subst::discharge_env_in_place(
+                            *value,
+                            &self.env,
+                            crate::ccl::Ids::Fresh,
+                        );
                         let row = Subst::discharge_env_in_type(&row, &self.env);
                         self.feed(name, value, row, site, 0, fed_at);
                         self.walk_chain(*body, kept)
@@ -3589,7 +3607,11 @@ impl<'a> WriterWalk<'a> {
                             site: fed_at,
                         } in crate::ccl::channelize::loop_contributions(feed_loop)
                         {
-                            let value = Subst::discharge_env_in_place(view, &self.env);
+                            let value = Subst::discharge_env_in_place(
+                                view,
+                                &self.env,
+                                crate::ccl::Ids::Fresh,
+                            );
                             let ty = value.ty.clone();
                             self.feed(defer, value, ty, site, levels, fed_at);
                         }
@@ -3628,10 +3650,18 @@ impl<'a> WriterWalk<'a> {
                         // iteration domain, say.
                         let (mut hist_binding, hist_def) = fold.binding;
                         Subst::discharge_env_in_binder(&mut hist_binding, &self.env);
-                        let hist_def = Subst::discharge_env_in_place(hist_def, &self.env);
+                        let hist_def = Subst::discharge_env_in_place(
+                            hist_def,
+                            &self.env,
+                            crate::ccl::Ids::Fresh,
+                        );
                         kept.push(Kept::Group(vec![(hist_binding, hist_def)]));
                         for (b, def) in fold.reads {
-                            let def = Subst::discharge_env_in_place(def, &self.env);
+                            let def = Subst::discharge_env_in_place(
+                                def,
+                                &self.env,
+                                crate::ccl::Ids::Fresh,
+                            );
                             kept.push(Kept::Let(None, b, def));
                         }
                         // Typed from the fold's own accumulators: an inner loop may write a
@@ -3664,7 +3694,11 @@ impl<'a> WriterWalk<'a> {
                             // The view reads the inner history, whose binding the environment
                             // was discharged into above, and its type can read this level's
                             // binders as well, a fed row filtered by this loop's variable say.
-                            let view = Subst::discharge_env_in_place(view, &self.env);
+                            let view = Subst::discharge_env_in_place(
+                                view,
+                                &self.env,
+                                crate::ccl::Ids::Fresh,
+                            );
                             let ty = view.ty.clone();
                             self.feed(defer, view, ty, site, levels, fed_at);
                         }
@@ -3696,7 +3730,7 @@ impl<'a> WriterWalk<'a> {
                 if is_writing_case(&end) {
                     self.walk_value_case(end, kept)
                 } else {
-                    Subst::discharge_env_in_place(end, &self.env)
+                    Subst::discharge_env_in_place(end, &self.env, crate::ccl::Ids::Fresh)
                 }
             }
         }
@@ -3843,15 +3877,15 @@ impl<'a> WriterWalk<'a> {
                 .is_some_and(|b| matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))),
             "a statement `Case` ends in the `true` complement (totality)"
         );
-        let before = self.env.clone();
+        let before = self.env.duplicate();
         let taps_before = self.held_as_taps.clone();
         let mut arms: Vec<Arm> = Vec::with_capacity(branches.len());
         let mut priors: Vec<Expr> = Vec::new();
         for br in branches {
-            let guard = Subst::discharge_env_in_place(br.guard, &before);
+            let guard = Subst::discharge_env_in_place(br.guard, &before, crate::ccl::Ids::Fresh);
             let pi = synthesize_arm_predicate(&guard, &priors);
-            priors.push(guard.clone());
-            self.env = before.clone();
+            priors.push(guard.duplicate());
+            self.env = before.duplicate();
             self.held_as_taps = taps_before.clone();
             // The branch's bindings stay apart from the block's: binding one around the
             // decision would evaluate it on rows that never take the branch. Each value
@@ -3874,7 +3908,7 @@ impl<'a> WriterWalk<'a> {
                 feeds: feeds_before..self.feeds.len(),
             });
         }
-        self.env = before.clone();
+        self.env = before.duplicate();
         self.held_as_taps = taps_before;
         // Sorted, so the binders the merge mints come out in one order on every run. A
         // variable before the `Case` changes where a branch leaves it holding another value,
@@ -3946,7 +3980,7 @@ impl<'a> WriterWalk<'a> {
                 .iter()
                 .map(|(guard, env, taps)| Branch {
                     pattern: None,
-                    guard: guard.clone(),
+                    guard: guard.duplicate(),
                     body: self.leaving_value(name, env, taps, as_tap),
                 })
                 .collect();
@@ -4010,8 +4044,10 @@ impl<'a> WriterWalk<'a> {
         as_tap: bool,
     ) -> Expr {
         match env.get(name) {
-            Some(value) if !as_tap || taps.contains(name) => value.clone(),
-            Some(value) => crate::ccl::ccl_utils::tap_fired(value.clone(), self.written_ty(name)),
+            Some(value) if !as_tap || taps.contains(name) => value.duplicate(),
+            Some(value) => {
+                crate::ccl::ccl_utils::tap_fired(value.duplicate(), self.written_ty(name))
+            }
             None => {
                 debug_assert!(
                     as_tap,
@@ -4088,7 +4124,7 @@ impl<'a> WriterWalk<'a> {
                 feed_slots.push((a, i, tap, fire));
             }
         }
-        let pis: Vec<Expr> = arms.iter().map(|arm| arm.pi.clone()).collect();
+        let pis: Vec<Expr> = arms.iter().map(|arm| arm.pi.duplicate()).collect();
         let branches: Vec<Branch> = arms
             .into_iter()
             .enumerate()
@@ -4104,18 +4140,18 @@ impl<'a> WriterWalk<'a> {
                     arm.written
                         .iter()
                         .find(|(w, _)| w == name)
-                        .map_or_else(|| bool_lit(false), |(_, path)| path.clone())
+                        .map_or_else(|| bool_lit(false), |(_, path)| path.duplicate())
                 }));
                 slots.extend(arm.end);
                 for &(owner, i, _, fire) in &feed_slots {
                     let f = &self.feeds[i];
                     if owner == a {
                         slots.push(crate::ccl::ccl_utils::tap_gated(
-                            f.fire.clone(),
-                            f.value.clone(),
+                            f.fire.duplicate(),
+                            f.value.duplicate(),
                             f.ty.clone(),
                         ));
-                        slots.extend(fire.map(|_| f.fire.clone()));
+                        slots.extend(fire.map(|_| f.fire.duplicate()));
                     } else {
                         slots.push(crate::ccl::ccl_utils::tap_idle(f.ty.clone()));
                         slots.extend(fire.map(|_| bool_lit(false)));
@@ -4267,9 +4303,13 @@ impl<'a> WriterWalk<'a> {
                     let unit = unit_expr();
                     return (name.field_key(), unit, bool_lit(false), declared.clone());
                 };
-                let value = self.env.get(name).cloned().unwrap_or_else(|| {
-                    panic!("writer walk: `{name}`, which the writer writes, holds no value")
-                });
+                let value = self
+                    .env
+                    .get(name)
+                    .map(Duplicate::duplicate)
+                    .unwrap_or_else(|| {
+                        panic!("writer walk: `{name}`, which the writer writes, holds no value")
+                    });
                 // A tap holds the written value where the write fires, which is where its
                 // projection is read.
                 let value = if self.held_as_taps.contains(name) {
@@ -4281,7 +4321,7 @@ impl<'a> WriterWalk<'a> {
                 } else {
                     value
                 };
-                (name.field_key(), value, fire.clone(), declared.clone())
+                (name.field_key(), value, fire.duplicate(), declared.clone())
             })
             .collect();
         let taps: Vec<(Label, Expr, Type, Expr)> = self
@@ -4290,9 +4330,9 @@ impl<'a> WriterWalk<'a> {
             .map(|f| {
                 (
                     f.field.clone(),
-                    f.value.clone(),
+                    f.value.duplicate(),
                     f.ty.clone(),
-                    f.fire.clone(),
+                    f.fire.duplicate(),
                 )
             })
             .collect();
@@ -4452,7 +4492,7 @@ fn copy_into_inner_writers(e: &mut Expr, scope: &mut Vec<Kept>, in_history: bool
             })
             .collect();
         if !copies.is_empty() {
-            *e = Subst::discharge_env_in_place(std::mem::take(e), &copies);
+            *e = Subst::discharge_env_in_place(std::mem::take(e), &copies, crate::ccl::Ids::Fresh);
         }
         return;
     }
@@ -4467,8 +4507,8 @@ fn copy_into_inner_writers(e: &mut Expr, scope: &mut Vec<Kept>, in_history: bool
         // The scope holds the value for copying, and the `let` itself stays in the tree.
         scope.push(Kept::Let(
             None,
-            binding.clone(),
-            bound_expr.clone_preserving_ids(),
+            binding.duplicate(),
+            bound_expr.as_ref().clone_preserving_ids(),
         ));
         copy_into_inner_writers(body, scope, in_history);
         scope.pop();
@@ -4520,18 +4560,18 @@ fn reads(name: &Name, e: &Expr) -> bool {
 /// where `pi` holds, as the merged value's nested `Case` is.
 fn conjoin_path(pi: &Expr, path: &Expr) -> Expr {
     if is_true_lit(pi) {
-        return path.clone();
+        return path.duplicate();
     }
     if is_true_lit(path) {
-        return pi.clone();
+        return pi.duplicate();
     }
     Expr::new(TypedExprNode::Case {
         scrutinee: None,
         branches: vec![
             Branch {
                 pattern: None,
-                guard: pi.clone(),
-                body: path.clone(),
+                guard: pi.duplicate(),
+                body: path.duplicate(),
             },
             Branch {
                 pattern: None,

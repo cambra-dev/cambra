@@ -34,6 +34,7 @@ use super::schemes::OperatorSchemes;
 use super::solve::value_type;
 use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
 use super::{coalesce_for_error, map_constrain_err};
+use crate::ccl::Duplicate;
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceTable, MethodCall, MethodRow, Trait, TraitObligation,
 };
@@ -2431,7 +2432,7 @@ impl InferCtx {
             obligation.refine_output(crate::ccl::infer::solver::traits::OutputRefinement {
                 assoc,
                 template,
-                operands: operands.iter().map(|e| (*e).clone()).collect(),
+                operands: operands.iter().map(|e| (*e).duplicate()).collect(),
             });
         }
         obligation.assume(&self.assumptions);

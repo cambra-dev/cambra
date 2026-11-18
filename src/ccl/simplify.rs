@@ -50,6 +50,7 @@
 //! | Uncurry of a nest | `(s ≫ curry(g)) ▷ uncurry(n)` and the forms in [`try_uncurry_curried`] | `⟨⟨.0 ≫ s, .1⟩, .2, …⟩ ≫ (g ▷ uncurry(n − 1))` | ✗ (drops structure) |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, count_free, is_builtin, walk_quoted_terms_mut,
 };
@@ -440,7 +441,7 @@ fn into_zip_arms(expr: Expr) -> Vec<Expr> {
 /// pair; otherwise over the arms' shared domain, to the tuple of their codomains, under the
 /// first binder an arm names.
 fn zip_of(arms: Vec<Expr>, fun_kind: &FunKind) -> Expr {
-    if let Ok([f, g]) = <[Expr; 2]>::try_from(arms.clone()) {
+    if let Ok([f, g]) = <[Expr; 2]>::try_from(arms.duplicate()) {
         return zip_pair(f, g, fun_kind);
     }
     let ty = arms
@@ -1724,7 +1725,7 @@ fn try_apply_zip(expr: &mut Expr) -> bool {
             let (x, m) = take_zip(left);
             let (f, g) = take_zip(take_compose_head(m));
             // Both legs read `𝑥`, so the second takes a copy of its own.
-            let x_again = x.clone();
+            let x_again = x.duplicate();
             vec![zip_pair(
                 applied(x, f, mint_kind),
                 applied(x_again, g, mint_kind),
@@ -1893,7 +1894,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             // Distribution places `left` on every leg of the zip.
             let arms = into_zip_arms(right)
                 .into_iter()
-                .map(|arm| arm_chain(left.clone(), arm))
+                .map(|arm| arm_chain(left.duplicate(), arm))
                 .collect();
             vec![zip_of(arms, mint_kind)]
         },
@@ -2078,7 +2079,7 @@ fn restate_behind(f: &mut Expr, curry_ty: &Type) -> Restated {
     let binder = Expr::var(&c).with_ty(input.clone());
     fn restate(term: &mut Expr, read: &Expr, binder: &Expr) -> bool {
         if crate::ccl::eq_term_modulo_ty_slots(term, read) {
-            *term = binder.clone();
+            *term = binder.duplicate();
             return true;
         }
         let mut changed = false;
@@ -2230,8 +2231,11 @@ mod tests {
         let expr = Expr::let_bind(
             name.clone(),
             Occurrence::mint(),
-            proj.clone(),
-            typed_compose2(var_of(&name, fun_ty(pair.clone(), int_ty())), users.clone()),
+            proj.duplicate(),
+            typed_compose2(
+                var_of(&name, fun_ty(pair.clone(), int_ty())),
+                users.duplicate(),
+            ),
         );
         assert_eq!(simplify(expr), typed_compose2(proj, users));
     }
@@ -2248,7 +2252,7 @@ mod tests {
             var("f").with_ty(ty.clone()),
             typed_compose2(var_of(&name, ty.clone()), var_of(&name, ty.clone())),
         );
-        assert_eq!(simplify(expr.clone()), expr);
+        assert_eq!(simplify(expr.duplicate()), expr);
     }
 
     /// A source binding is recognized by its binding, so the rule leaves every binder it
@@ -2262,7 +2266,7 @@ mod tests {
             var("f").with_ty(ty.clone()),
             typed_compose2(var("s").with_ty(ty.clone()), var("g").with_ty(ty.clone())),
         );
-        assert_eq!(simplify(expr.clone()), expr);
+        assert_eq!(simplify(expr.duplicate()), expr);
     }
 
     /// Compose identity (left): id ≫ f  ⟹  f
@@ -2305,7 +2309,7 @@ mod tests {
         let g_ty = fun_ty(int_ty(), int_ty());
         let f = var("f").with_ty(f_ty.clone());
         let g = var("g").with_ty(g_ty.clone());
-        let zip = zip_pair(f.clone(), g, &FunKind::Compute); // A -> (B, C)
+        let zip = zip_pair(f.duplicate(), g, &FunKind::Compute); // A -> (B, C)
         let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
         let expr = typed_compose2(zip, Expr::proj_index(0).with_ty(proj_ty));
         assert_eq!(simplify(expr), f);
@@ -2320,11 +2324,11 @@ mod tests {
         let g = var("g").with_ty(ty.clone());
         let b = var("b").with_ty(ty.clone());
 
-        let zip = zip_pair(f.clone(), g, &FunKind::Compute);
+        let zip = zip_pair(f.duplicate(), g, &FunKind::Compute);
         let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
         let proj = Expr::proj_index(0).with_ty(proj_ty);
 
-        let expr = typed_compose(vec![a.clone(), zip, proj, b.clone()]);
+        let expr = typed_compose(vec![a.duplicate(), zip, proj, b.duplicate()]);
         let expected = typed_compose(vec![a, f, b]);
         assert_eq!(simplify(expr), expected);
     }
@@ -2335,7 +2339,7 @@ mod tests {
         let lit1 = Expr::lit(Lit::Int(1)).with_ty(int_ty());
         let lit2 = Expr::lit(Lit::Int(2)).with_ty(int_ty());
         let tup_ty = Type::Tuple(vec![int_ty(), int_ty()]);
-        let tuple = Expr::tuple(vec![lit1, lit2.clone()]).with_ty(tup_ty.clone());
+        let tuple = Expr::tuple(vec![lit1, lit2.duplicate()]).with_ty(tup_ty.clone());
         let proj = Expr::proj_index(1).with_ty(fun_ty(tup_ty, int_ty()));
         let expr = Expr::apply(tuple, proj).with_ty(int_ty());
         assert_eq!(simplify(expr), lit2);
@@ -2355,7 +2359,7 @@ mod tests {
         let xs = var("xs").with_ty(xs_ty.clone());
         let proj = Expr::proj_index(0).with_ty(fun_ty(xs_ty, int_ty()));
         let expr = Expr::apply(xs, proj).with_ty(int_ty());
-        assert_eq!(simplify(expr.clone()), expr);
+        assert_eq!(simplify(expr.duplicate()), expr);
     }
 
     /// Recurses through composition: a `Tuple(…).0` nested inside a Compose
@@ -2365,7 +2369,7 @@ mod tests {
         let lit1 = Expr::lit(Lit::Int(1)).with_ty(int_ty());
         let lit2 = Expr::lit(Lit::Int(2)).with_ty(int_ty());
         let tup_ty = Type::Tuple(vec![int_ty(), int_ty()]);
-        let tuple = Expr::tuple(vec![lit1.clone(), lit2]).with_ty(tup_ty.clone());
+        let tuple = Expr::tuple(vec![lit1.duplicate(), lit2]).with_ty(tup_ty.clone());
         let proj = Expr::proj_index(0).with_ty(fun_ty(tup_ty, int_ty()));
         let projection = Expr::apply(tuple, proj).with_ty(int_ty());
         // Wrap the projection inside a const(...) so it appears as a sub-expression.
@@ -2382,7 +2386,7 @@ mod tests {
         let g_ty = fun_ty(int_ty(), int_ty());
         let f = var("f").with_ty(f_ty.clone());
         let g = var("g").with_ty(g_ty.clone());
-        let zip = zip_pair(f, g.clone(), &FunKind::Compute); // A -> (B, C)
+        let zip = zip_pair(f, g.duplicate(), &FunKind::Compute); // A -> (B, C)
         let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
         let expr = typed_compose2(zip, Expr::proj_index(1).with_ty(proj_ty));
         assert_eq!(simplify(expr), g);
@@ -2397,11 +2401,11 @@ mod tests {
         let g = var("g").with_ty(ty.clone());
         let b = var("b").with_ty(ty.clone());
 
-        let zip = zip_pair(f, g.clone(), &FunKind::Compute);
+        let zip = zip_pair(f, g.duplicate(), &FunKind::Compute);
         let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
         let proj = Expr::proj_index(1).with_ty(proj_ty);
 
-        let expr = typed_compose(vec![a.clone(), zip, proj, b.clone()]);
+        let expr = typed_compose(vec![a.duplicate(), zip, proj, b.duplicate()]);
         let expected = typed_compose(vec![a, g, b]);
         assert_eq!(simplify(expr), expected);
     }
@@ -2415,8 +2419,8 @@ mod tests {
         let proj1_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
 
         let expr = zip_pair(
-            typed_compose2(f.clone(), Expr::proj_index(0).with_ty(proj0_ty)),
-            typed_compose2(f.clone(), Expr::proj_index(1).with_ty(proj1_ty)),
+            typed_compose2(f.duplicate(), Expr::proj_index(0).with_ty(proj0_ty)),
+            typed_compose2(f.duplicate(), Expr::proj_index(1).with_ty(proj1_ty)),
             &FunKind::Compute,
         );
         assert_eq!(simplify(expr), f);
@@ -2433,13 +2437,13 @@ mod tests {
 
         let expr = zip_pair(
             typed_compose(vec![
-                f.clone(),
-                g.clone(),
+                f.duplicate(),
+                g.duplicate(),
                 Expr::proj_index(0).with_ty(proj_ty.clone()),
             ]),
             typed_compose(vec![
-                f.clone(),
-                g.clone(),
+                f.duplicate(),
+                g.duplicate(),
                 Expr::proj_index(1).with_ty(proj_ty),
             ]),
             &FunKind::Compute,
@@ -2465,11 +2469,11 @@ mod tests {
         let proj0_ty = fun_ty(triple_ty.clone(), int_ty());
         let proj1_ty = fun_ty(triple_ty.clone(), int_ty());
         let expr = zip_pair(
-            typed_compose2(f.clone(), Expr::proj_index(0).with_ty(proj0_ty)),
+            typed_compose2(f.duplicate(), Expr::proj_index(0).with_ty(proj0_ty)),
             typed_compose2(f, Expr::proj_index(1).with_ty(proj1_ty)),
             &FunKind::Compute,
         );
-        let before = expr.clone();
+        let before = expr.duplicate();
         assert_eq!(simplify(expr), before);
     }
 
@@ -2486,9 +2490,9 @@ mod tests {
 
         let g = var("g").with_ty(g_ty.clone());
         let h = var("h").with_ty(h_ty.clone());
-        let curry_h = curry_at(h.clone(), curry_h_ty.clone());
+        let curry_h = curry_at(h.duplicate(), curry_h_ty.clone());
 
-        let zip = zip_pair(g.clone(), curry_h, &FunKind::Compute);
+        let zip = zip_pair(g.duplicate(), curry_h, &FunKind::Compute);
         let apply_ty = fun_ty(
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
@@ -2522,16 +2526,16 @@ mod tests {
 
         let g = var("g").with_ty(g_ty.clone());
         let h = var("h").with_ty(h_ty.clone());
-        let curry_h = curry_at(h.clone(), curry_h_ty.clone());
+        let curry_h = curry_at(h.duplicate(), curry_h_ty.clone());
 
-        let zip = zip_pair(g.clone(), curry_h, &FunKind::Compute);
+        let zip = zip_pair(g.duplicate(), curry_h, &FunKind::Compute);
         let apply_ty = fun_ty(
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         );
         let apply = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
 
-        let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
+        let expr = typed_compose(vec![aa.duplicate(), zip, apply, bb.duplicate()]);
 
         let id_ty = fun_ty(a_ty.clone(), a_ty.clone());
         let expected = typed_compose(vec![
@@ -2556,9 +2560,9 @@ mod tests {
 
         let f = var("f").with_ty(f_ty.clone());
         let g = var("g").with_ty(g_ty.clone());
-        let const_g = typed_const(g.clone(), a_ty.clone());
+        let const_g = typed_const(g.duplicate(), a_ty.clone());
 
-        let zip = zip_pair(f.clone(), const_g, &FunKind::Compute);
+        let zip = zip_pair(f.duplicate(), const_g, &FunKind::Compute);
         let apply_ty = fun_ty(
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
@@ -2598,12 +2602,12 @@ mod tests {
         let f = var("f").with_ty(int_fn.clone());
         let g = var("g").with_ty(int_fn.clone());
         let m = paired_functions(
-            typed_const(f.clone(), int_ty()),
-            typed_const(g.clone(), int_ty()),
+            typed_const(f.duplicate(), int_ty()),
+            typed_const(g.duplicate(), int_ty()),
             Builtin::Compose,
             int_fn,
         );
-        let simplified = simplify(apply_to(x.clone(), m, int_ty()));
+        let simplified = simplify(apply_to(x.duplicate(), m, int_ty()));
         assert_eq!(
             crate::ccl::symbolic::symbolic(&simplified),
             crate::ccl::symbolic::symbolic(&typed_compose(vec![x, f, g])),
@@ -2620,14 +2624,14 @@ mod tests {
         let f = var("f").with_ty(int_fn.clone());
         let g = var("g").with_ty(int_fn);
         let m = paired_functions(
-            typed_const(f.clone(), int_ty()),
-            typed_const(g.clone(), int_ty()),
+            typed_const(f.duplicate(), int_ty()),
+            typed_const(g.duplicate(), int_ty()),
             Builtin::Zip,
             fun_ty(int_ty(), pair.clone()),
         );
-        let simplified = simplify(apply_to(x.clone(), m, pair));
+        let simplified = simplify(apply_to(x.duplicate(), m, pair));
         let expected = zip_pair(
-            typed_compose2(x.clone(), f),
+            typed_compose2(x.duplicate(), f),
             typed_compose2(x, g),
             &FunKind::Compute,
         );
@@ -2645,7 +2649,7 @@ mod tests {
         let h = var("h").with_ty(int_fn.clone());
         let constant =
             Expr::builtin(Builtin::Const).with_ty(fun_ty(int_ty(), fun_ty(int_ty(), int_ty())));
-        let m = typed_compose2(h.clone(), constant);
+        let m = typed_compose2(h.duplicate(), constant);
         let simplified = simplify(apply_to(x, m, int_ty()));
         assert_eq!(
             crate::ccl::symbolic::symbolic(&simplified),
@@ -2671,16 +2675,16 @@ mod tests {
 
         let f = var("f").with_ty(f_ty.clone());
         let g = var("g").with_ty(g_ty.clone());
-        let const_g = typed_const(g.clone(), a_ty.clone());
+        let const_g = typed_const(g.duplicate(), a_ty.clone());
 
-        let zip = zip_pair(f.clone(), const_g, &FunKind::Compute);
+        let zip = zip_pair(f.duplicate(), const_g, &FunKind::Compute);
         let apply_ty = fun_ty(
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         );
         let apply = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
 
-        let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
+        let expr = typed_compose(vec![aa.duplicate(), zip, apply, bb.duplicate()]);
         let expected = typed_compose(vec![aa, f, g, bb]);
 
         assert_eq!(simplify(expr), expected);
@@ -2708,7 +2712,7 @@ mod tests {
         // meaningful, not vacuous.
         let unguarded = typed_compose2(
             var("f").with_ty(fun_ty(int_ty(), int_ty())),
-            const_k.clone(),
+            const_k.duplicate(),
         );
         assert!(
             !matches!(simplify(unguarded).node, TypedExprNode::Compose(_)),
@@ -2718,7 +2722,7 @@ mod tests {
         // With an `iterate` at the head, the compose is intact.
         let guarded = typed_compose2(make_iterate(trivially_true_predicate(int_ty())), const_k);
         assert_eq!(
-            simplify(guarded.clone()),
+            simplify(guarded.duplicate()),
             guarded,
             "const-reduce must not drop the iterate source"
         );
@@ -2780,7 +2784,7 @@ mod tests {
             vec![source()],
         ];
         for tail in tails {
-            let term = map_domain_of(iteration_then(tail.clone()), positions());
+            let term = map_domain_of(iteration_then(tail.duplicate()), positions());
             assert_eq!(simplify(term), iteration(), "tail: {tail:?}");
         }
     }
@@ -2798,14 +2802,14 @@ mod tests {
             iteration_then(vec![values_by_position("xs"), keep]),
             positions(),
         );
-        assert_eq!(simplify(term.clone()), term);
+        assert_eq!(simplify(term.duplicate()), term);
     }
 
     /// A step that iterates is a source of its own; dropping it strands the iteration.
     #[test]
     fn map_domain_keeps_a_chain_with_a_second_iteration() {
         let term = map_domain_of(iteration_then(vec![iteration()]), positions());
-        assert_eq!(simplify(term.clone()), term);
+        assert_eq!(simplify(term.duplicate()), term);
     }
 
     /// A collection that is not iteration-led has no known relation between values and keys.
@@ -2816,7 +2820,7 @@ mod tests {
     fn map_domain_of_a_collection_typed_like_the_identity_is_left_alone() {
         let permutation = var("xs").with_ty(Type::data_fun(positions(), positions()));
         let term = map_domain_of(permutation, positions());
-        assert_eq!(simplify(term.clone()), term);
+        assert_eq!(simplify(term.duplicate()), term);
     }
 
     /// `zip` inner-joins its arms on their keys, so an arm that narrows narrows the pair:
@@ -2829,14 +2833,14 @@ mod tests {
             .with_ty(fun_ty(int_ty(), int_ty()));
         let pair = zip_pair(identity, tagged, &FunKind::Compute);
         let term = map_domain_of(iteration_then(vec![pair]), positions());
-        assert_eq!(simplify(term.clone()), term);
+        assert_eq!(simplify(term.duplicate()), term);
     }
 
     /// The same zip with arms that keep the keys is dropped like any other value step.
     #[test]
     fn map_domain_drops_a_chain_whose_zip_arms_keep_the_keys() {
         let identity = id().with_ty(fun_ty(int_ty(), int_ty()));
-        let pair = zip_pair(identity.clone(), identity, &FunKind::Compute);
+        let pair = zip_pair(identity.duplicate(), identity, &FunKind::Compute);
         let term = map_domain_of(iteration_then(vec![pair]), positions());
         assert_eq!(simplify(term), iteration());
     }
@@ -2859,7 +2863,7 @@ mod tests {
 
         let guarded = typed_compose2(restricted, const_k);
         assert_eq!(
-            simplify(guarded.clone()),
+            simplify(guarded.duplicate()),
             guarded,
             "const-reduce must not drop the restrict (its upstream iterate guards it)"
         );
@@ -2877,7 +2881,7 @@ mod tests {
         let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
         let compose = typed_compose2(vp, const_k);
         assert_eq!(
-            simplify(compose.clone()),
+            simplify(compose.duplicate()),
             compose,
             "const-reduce must not collapse past variant_project (drops the tag restriction)"
         );
@@ -2907,7 +2911,7 @@ mod tests {
         let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
         let compose = typed_compose2(filter, const_k);
         assert_eq!(
-            simplify(compose.clone()),
+            simplify(compose.duplicate()),
             compose,
             "const-reduce must not collapse past filter_values (drops the filter)"
         );
@@ -2927,7 +2931,7 @@ mod tests {
         let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
         let p0 = Expr::proj_index(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
 
-        let p0_f = typed_compose2(p0, f.clone());
+        let p0_f = typed_compose2(p0, f.duplicate());
         let zip = zip_pair(p1, p0_f, &FunKind::Compute);
         let apply = Expr::builtin(Builtin::Apply).with_ty(fun_ty(
             Type::Tuple(vec![b_ty.clone(), bc_ty.clone()]),
@@ -2965,7 +2969,7 @@ mod tests {
             c_ty.clone(),
         ));
         let g = var("g").with_ty(fun_ty(c_ty, c2_ty.clone()));
-        let inner_compose = typed_compose(vec![zip, apply, g.clone()]);
+        let inner_compose = typed_compose(vec![zip, apply, g.duplicate()]);
 
         let curry_ty = fun_ty(a_ty, fun_ty(b_ty, c2_ty));
         let expr = curry_at(inner_compose, curry_ty.clone());
@@ -2993,10 +2997,10 @@ mod tests {
         let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
         let p0 = Expr::proj_index(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
 
-        let zip = zip_pair(p1, typed_compose2(p0, f.clone()), &FunKind::Compute);
+        let zip = zip_pair(p1, typed_compose2(p0, f.duplicate()), &FunKind::Compute);
         let apply = Expr::builtin(Builtin::Apply)
             .with_ty(fun_ty(Type::Tuple(vec![b_ty.clone(), bc_ty.clone()]), c_ty));
-        let inner_compose = typed_compose(vec![zip, apply, g.clone()]);
+        let inner_compose = typed_compose(vec![zip, apply, g.duplicate()]);
 
         let bc2_ty = fun_ty(b_ty, c2_ty);
         let curry_ty = fun_ty(a_ty, bc2_ty.clone());
@@ -3049,7 +3053,11 @@ mod tests {
                 Type::Tuple(vec![b_ty.clone(), a_ty.clone()]),
                 c_ty.clone(),
             ));
-            typed_compose(vec![zip_pair(p1, arm, &FunKind::Compute), apply, g.clone()])
+            typed_compose(vec![
+                zip_pair(p1, arm, &FunKind::Compute),
+                apply,
+                g.duplicate(),
+            ])
         };
         // `(k: A) ⤇ (B ⤇ Bool)` — a named, data-kinded curry type.
         let curry_ty = |domain: Type| Type::Fun {
@@ -3111,7 +3119,7 @@ mod tests {
         let curry_f_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
         let curry_var =
             Expr::builtin(Builtin::Curry).with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
-        let curry_f = Expr::apply(f.clone(), curry_var).with_ty(curry_f_ty.clone());
+        let curry_f = Expr::apply(f.duplicate(), curry_var).with_ty(curry_f_ty.clone());
 
         let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
@@ -3146,7 +3154,7 @@ mod tests {
         let curry_f_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
         let curry_var =
             Expr::builtin(Builtin::Curry).with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
-        let curry_f = Expr::apply(f.clone(), curry_var).with_ty(curry_f_ty.clone());
+        let curry_f = Expr::apply(f.duplicate(), curry_var).with_ty(curry_f_ty.clone());
 
         let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
@@ -3159,7 +3167,7 @@ mod tests {
             c_ty.clone(),
         ));
 
-        let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
+        let expr = typed_compose(vec![aa.duplicate(), zip, apply, bb.duplicate()]);
         let expected = typed_compose(vec![aa, f, bb]);
         assert_eq!(simplify(expr), expected);
     }
@@ -3188,7 +3196,7 @@ mod tests {
         // Typed as the dependent chain it is, never as the plain one `typed_compose2` states.
         let mut compose = Expr::compose(vec![f, c]);
         compose.ty = dependent("k");
-        assert_eq!(simplify(compose.clone()), compose);
+        assert_eq!(simplify(compose.duplicate()), compose);
     }
 
     /// Flatten: f ≫ g ≫ h (binary tree)  ⟹  Compose([f, g, h])
@@ -3199,7 +3207,7 @@ mod tests {
         let g = var("g").with_ty(f_ty.clone());
         let h = var("h").with_ty(f_ty.clone());
 
-        let expr = typed_compose2(f.clone(), typed_compose2(g.clone(), h.clone()));
+        let expr = typed_compose2(f.duplicate(), typed_compose2(g.duplicate(), h.duplicate()));
         let expected = typed_compose(vec![f, g, h]);
         assert_eq!(simplify(expr), expected);
     }
@@ -3212,7 +3220,7 @@ mod tests {
         let g = var("g").with_ty(f_ty.clone());
         let h = var("h").with_ty(f_ty.clone());
 
-        let expr = typed_compose2(typed_compose2(f.clone(), g.clone()), h.clone());
+        let expr = typed_compose2(typed_compose2(f.duplicate(), g.duplicate()), h.duplicate());
         let expected = typed_compose(vec![f, g, h]);
         assert_eq!(simplify(expr), expected);
     }
@@ -3226,14 +3234,14 @@ mod tests {
 
         let id_val = id().with_ty(fun_ty(a_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(a_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(id_val, f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(id_val, f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g = typed_compose2(p0, g.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
         let zip2 = zip_pair(p0_g, p1, &FunKind::Compute);
 
         let expr = typed_compose2(zip1, zip2);
@@ -3251,14 +3259,14 @@ mod tests {
 
         let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(h.clone(), f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(h.duplicate(), f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g = typed_compose2(p0, g.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
         let zip2 = zip_pair(p0_g, p1, &FunKind::Compute);
 
         let expr = typed_compose2(zip1, zip2);
@@ -3275,14 +3283,14 @@ mod tests {
 
         let id_val = id().with_ty(fun_ty(a_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(a_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(id_val, f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(id_val, f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g = typed_compose2(p0, g.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
         let zip2 = zip_pair(p1, p0_g, &FunKind::Compute);
 
         let expr = typed_compose2(zip1, zip2);
@@ -3300,14 +3308,14 @@ mod tests {
 
         let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(h.clone(), f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(h.duplicate(), f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g = typed_compose2(p0, g.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
         let zip2 = zip_pair(p1, p0_g, &FunKind::Compute);
 
         let expr = typed_compose2(zip1, zip2);
@@ -3326,7 +3334,7 @@ mod tests {
 
         let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(h.clone(), f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(h.duplicate(), f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let i = var("i").with_ty(fun_ty(b_ty.clone(), d_ty.clone()));
@@ -3335,8 +3343,8 @@ mod tests {
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g = typed_compose2(p0, g.clone());
-        let p1_i = typed_compose2(p1, i.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
+        let p1_i = typed_compose2(p1, i.duplicate());
         let zip2 = zip_pair(p0_g, p1_i, &FunKind::Compute);
 
         let expr = typed_compose2(zip1, zip2);
@@ -3359,14 +3367,14 @@ mod tests {
         let aa = var("a").with_ty(fun_ty(x_ty.clone(), x_ty.clone()));
         let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(h.clone(), f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(h.duplicate(), f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g = typed_compose2(p0, g.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
         let zip2 = zip_pair(p0_g, p1, &FunKind::Compute);
 
         let bb = var("b").with_ty(fun_ty(
@@ -3374,7 +3382,7 @@ mod tests {
             x_ty.clone(),
         ));
 
-        let expr = typed_compose(vec![aa.clone(), zip1, zip2, bb.clone()]);
+        let expr = typed_compose(vec![aa.duplicate(), zip1, zip2, bb.duplicate()]);
         let expected = typed_compose(vec![
             aa,
             zip_pair(typed_compose2(h, g), f, &FunKind::Compute),
@@ -3394,7 +3402,7 @@ mod tests {
 
         let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
         let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
-        let zip1 = zip_pair(h.clone(), f.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(h.duplicate(), f.duplicate(), &FunKind::Compute);
 
         let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
         let k = var("k").with_ty(fun_ty(c_ty.clone(), d_ty.clone()));
@@ -3403,7 +3411,7 @@ mod tests {
         let p0 = Expr::proj_index(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
 
-        let p0_g_k = typed_compose(vec![p0, g.clone(), k.clone()]);
+        let p0_g_k = typed_compose(vec![p0, g.duplicate(), k.duplicate()]);
         let zip2 = zip_pair(p0_g_k, p1, &FunKind::Compute);
 
         let expr = typed_compose2(zip1, zip2);
@@ -3420,10 +3428,10 @@ mod tests {
 
         let expr = typed_compose2(
             id().with_ty(f_ty.clone()),
-            typed_compose2(f.clone(), g.clone()),
+            typed_compose2(f.duplicate(), g.duplicate()),
         );
         let once = simplify(expr);
-        let twice = simplify(once.clone());
+        let twice = simplify(once.duplicate());
         assert_eq!(once, twice);
     }
 
@@ -3441,7 +3449,7 @@ mod tests {
         let p1 = Expr::proj_index(1).with_ty(fun_ty(tup_ty.clone(), int_ty()));
         let zip = zip_pair(p0, p1, &FunKind::Compute);
 
-        let expr = typed_compose2(f.clone(), zip.clone());
+        let expr = typed_compose2(f.duplicate(), zip.duplicate());
         let simplified = simplify(expr);
 
         // Should NOT distribute because left is not a zip
@@ -3457,7 +3465,7 @@ mod tests {
 
         let f0 = var("f0").with_ty(int_fun.clone());
         let f1 = var("f1").with_ty(int_fun.clone());
-        let zip1 = zip_pair(f0.clone(), f1.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(f0.duplicate(), f1.duplicate(), &FunKind::Compute);
 
         // Both .0 and .1 are simplifying projections
         let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
@@ -3465,7 +3473,7 @@ mod tests {
 
         let zip2 = zip_pair(p0, p1, &FunKind::Compute);
 
-        let expr = typed_compose2(zip1.clone(), zip2);
+        let expr = typed_compose2(zip1.duplicate(), zip2);
         let simplified = simplify(expr);
 
         // Should distribute: ⟨f0 ≫ .0, f1 ≫ .1⟩
@@ -3482,7 +3490,7 @@ mod tests {
 
         let f0 = var("f0").with_ty(int_fun.clone());
         let f1 = var("f1").with_ty(int_fun.clone());
-        let zip1 = zip_pair(f0.clone(), f1.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(f0.duplicate(), f1.duplicate(), &FunKind::Compute);
 
         // .0 ≫ g and .1 ≫ h are composes starting with projections (simplifying)
         let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
@@ -3491,19 +3499,19 @@ mod tests {
         let g = var("g").with_ty(int_fun.clone());
         let h = var("h").with_ty(int_fun.clone());
 
-        let p0_g = typed_compose2(p0, g.clone());
-        let p1_h = typed_compose2(p1, h.clone());
+        let p0_g = typed_compose2(p0, g.duplicate());
+        let p1_h = typed_compose2(p1, h.duplicate());
         let zip2 = zip_pair(p0_g, p1_h, &FunKind::Compute);
 
-        let expr = typed_compose2(zip1.clone(), zip2);
+        let expr = typed_compose2(zip1.duplicate(), zip2);
         let simplified = simplify(expr);
 
         // Should distribute: ⟨f0 ≫ (.0 ≫ g), f1 ≫ (.1 ≫ h)⟩
         // Which flattens to: ⟨f0 ≫ .0 ≫ g, f1 ≫ .1 ≫ h⟩
         // Then product_beta simplifies: ⟨f0 ≫ g, f1 ≫ h⟩
         let expected = zip_pair(
-            typed_compose2(f0.clone(), g),
-            typed_compose2(f1.clone(), h),
+            typed_compose2(f0.duplicate(), g),
+            typed_compose2(f1.duplicate(), h),
             &FunKind::Compute,
         );
         assert_eq!(simplified, expected);
@@ -3571,7 +3579,7 @@ mod tests {
         let aa = var("a").with_ty(int_fun.clone());
         let f0 = var("f0").with_ty(int_fun.clone());
         let f1 = var("f1").with_ty(int_fun.clone());
-        let zip1 = zip_pair(f0.clone(), f1.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(f0.duplicate(), f1.duplicate(), &FunKind::Compute);
 
         // Both .0 and .1 are simplifying projections
         let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
@@ -3580,7 +3588,7 @@ mod tests {
 
         let bb = var("b").with_ty(fun_ty(int_pair, int_ty()));
 
-        let expr = typed_compose(vec![aa.clone(), zip1.clone(), zip2, bb.clone()]);
+        let expr = typed_compose(vec![aa.duplicate(), zip1.duplicate(), zip2, bb.duplicate()]);
         let simplified = simplify(expr);
 
         // Should distribute: ⟨f0 ≫ .0, f1 ≫ .1⟩ then simplify via product_beta to ⟨f0, f1⟩
@@ -3597,18 +3605,18 @@ mod tests {
 
         let f0 = var("f0").with_ty(int_fun.clone());
         let f1 = var("f1").with_ty(int_fun.clone());
-        let zip1 = zip_pair(f0.clone(), f1.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(f0.duplicate(), f1.duplicate(), &FunKind::Compute);
 
         // Both arms are composes: projection followed by identity
         let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(int_pair, int_ty()));
         let id_fn = id().with_ty(int_fun.clone());
 
-        let p0_id = typed_compose2(p0, id_fn.clone());
+        let p0_id = typed_compose2(p0, id_fn.duplicate());
         let p1_id = typed_compose2(p1, id_fn);
         let zip2 = zip_pair(p0_id, p1_id, &FunKind::Compute);
 
-        let expr = typed_compose2(zip1.clone(), zip2);
+        let expr = typed_compose2(zip1.duplicate(), zip2);
         let simplified = simplify(expr);
 
         // Should distribute and simplify back to zip1 via product_beta
@@ -3624,18 +3632,18 @@ mod tests {
 
         let f0 = var("f0").with_ty(int_fun.clone());
         let f1 = var("f1").with_ty(int_fun.clone());
-        let zip1 = zip_pair(f0.clone(), f1.clone(), &FunKind::Compute);
+        let zip1 = zip_pair(f0.duplicate(), f1.duplicate(), &FunKind::Compute);
 
         // .0 ≫ id and .1 ≫ id are projections composed with identity (simplifying)
         let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
         let p1 = Expr::proj_index(1).with_ty(fun_ty(int_pair, int_ty()));
         let id_fn = id().with_ty(int_fun.clone());
 
-        let p0_id = typed_compose2(p0, id_fn.clone());
+        let p0_id = typed_compose2(p0, id_fn.duplicate());
         let p1_id = typed_compose2(p1, id_fn);
         let zip2 = zip_pair(p0_id, p1_id, &FunKind::Compute);
 
-        let expr = typed_compose2(zip1.clone(), zip2);
+        let expr = typed_compose2(zip1.duplicate(), zip2);
         let simplified = simplify(expr);
 
         // After distribution: ⟨f0 ≫ (.0 ≫ id), f1 ≫ (.1 ≫ id)⟩

@@ -341,7 +341,7 @@ fn close_all(ty: &Type) -> Type {
             let domain = close_all(domain);
             let codomain = close_all(codomain);
             let codomain = match name {
-                Some(b) => close_pi_binder(b, &codomain),
+                Some(b) => close_pi_binder(b, &codomain, cambra::ccl::Ids::Fresh),
                 None => codomain,
             };
             Type::Fun {
