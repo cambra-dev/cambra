@@ -1167,7 +1167,6 @@ impl Execution {
         pipeline: PipelineId,
     ) {
         self.attach_body(Scope::Loop(store.clone()), pipeline, dispatcher);
-        induction(store).mark_entry_scope();
         // A drive's source offers its pushes only to a scope that takes its positions from them,
         // which the run sets once its scopes are attached.
         induction(store).forget_through_drive();
