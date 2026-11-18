@@ -884,9 +884,8 @@ an input collection. A universal release clears the accumulators and retained an
 releases the input universally.
 
 `ExtractAggregate` emits `AggregateKind::extract` only when its input has a terminal flag and that
-flag is true. An empty aggregation tile is not a completed fold of an empty collection.
-Construction with `only_terminal: false` is unsupported and panics. A universal output release
-releases its input universally; an empty release has no effect.
+flag is true. An empty aggregation tile is not a completed fold of an empty collection. A
+universal output release releases its input universally; an empty release has no effect.
 
 `MapExtractAggregate` accepts a collection chain of any positive depth ending in an aggregation.
 It replaces that aggregation with the extracted value and retains only the innermost keys whose

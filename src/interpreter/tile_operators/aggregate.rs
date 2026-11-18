@@ -186,21 +186,14 @@ pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
     base: OperatorBase,
     kind: AggregateKind,
-    only_terminal: bool,
 }
 
 impl ExtractAggregate {
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind, only_terminal: bool) -> Self {
-        let tiling = if only_terminal {
-            Tiling::Scalar(input.extent())
-        } else {
-            todo!("functions on partial aggregates")
-        };
+    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new(Tiling::Scalar(input.extent())),
             input,
             kind,
-            only_terminal,
         }
     }
 }
@@ -229,7 +222,6 @@ impl TileOperator for ExtractAggregate {
                 .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
             kind: self.kind,
-            only_terminal: self.only_terminal,
         })
     }
 }
@@ -238,7 +230,6 @@ struct ExtractAggregateProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     kind: AggregateKind,
-    only_terminal: bool,
 }
 
 impl TileProducer for ExtractAggregateProducer {
@@ -274,14 +265,10 @@ impl TileProducer for ExtractAggregateProducer {
         if terminal.is_empty() {
             return self.tiling().empty_tile();
         }
-        if self.only_terminal {
-            if terminal.index_at(0).as_bool() {
-                self.kind.extract(*accumulator)
-            } else {
-                self.tiling().empty_tile()
-            }
+        if terminal.index_at(0).as_bool() {
+            self.kind.extract(*accumulator)
         } else {
-            todo!()
+            self.tiling().empty_tile()
         }
     }
 
@@ -1448,7 +1435,6 @@ mod extract_aggregate_projection_tests {
                 base: ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &tiling),
                 input: Box::new(input),
                 kind: AggregateKind::Sum,
-                only_terminal: true,
             },
             pulled,
         )
