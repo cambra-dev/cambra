@@ -1,5 +1,5 @@
-//! A scripted input that grows, drops what it holds released, and notifies, with the regions,
-//! steps and generator the dispatcher tests of the pipeline breakers share.
+//! A scripted input that grows and drops what it holds released, with the regions, steps and
+//! generator the dispatcher tests of the pipeline breakers share.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -110,7 +110,7 @@ impl TileProducer for Input {
         node
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         self.source.borrow_mut().pulled.push(guard.clone());
         if released_whole(&guard, self.obsolete_guard()) {
             self.source.borrow_mut().wasted += 1;
@@ -151,8 +151,7 @@ pub(crate) fn released_whole(guard: &TileGuard, released: &TileGuard) -> bool {
     }
 }
 
-/// A region of the universe: the guard a consumer hands a breaker, the projection an input
-/// notifies, and the keys a model counts.
+/// A region of the universe: the guard a consumer hands a breaker, and the keys a model counts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Region {
     Keys(u64, u64),
@@ -214,7 +213,6 @@ pub(crate) fn keys_predicate(first: u64, last: u64) -> Predicate {
 pub(crate) enum Step {
     /// A row arrives at the input, which drops it when it holds the key's region released.
     Add(u64),
-    Notify(Region),
     Consume(Region),
     /// The breaker's consumer releases a region of the breaker's output.
     Release(Region),
@@ -249,12 +247,10 @@ impl Rng {
     }
 
     /// A step of a random run. A release names one of `names` half the time, the keys consumed
-    /// so far or the groups they fall in, so that it reaches what the breaker holds. A breaker
-    /// that listens to no notification draws none.
-    pub(crate) fn step_among(&mut self, names: &BTreeSet<u64>, notify: bool) -> Step {
+    /// so far or the groups they fall in, so that it reaches what the breaker holds.
+    pub(crate) fn step_among(&mut self, names: &BTreeSet<u64>) -> Step {
         match self.below(20) {
             0..=5 => Add(self.below(KEYS)),
-            6..=7 if notify => Notify(self.region()),
             8 => Close,
             9..=13 => Consume(self.region()),
             _ => Release(self.release_region(names)),
@@ -273,7 +269,7 @@ impl Rng {
 }
 
 use Region::{All, Keys};
-use Step::{Add, Close, Consume, Notify, Release};
+use Step::{Add, Close, Consume, Release};
 
 /// The keys a guard has been released at: those of the universe, and whether the keys beyond it,
 /// which only the universal guard names.
@@ -284,8 +280,7 @@ pub(crate) struct Released {
 }
 
 impl Released {
-    /// Whether releasing `region` adds nothing: the release wrapper passes a release on only when
-    /// it grows what is released.
+    /// Whether every key `region` names has been released.
     pub(crate) fn covers(&self, region: Region) -> bool {
         region.keys().is_subset(&self.keys) && (!matches!(region, All) || self.beyond)
     }
@@ -331,7 +326,8 @@ impl InputModel {
     }
 
     /// A pull at `region`: the keys it answers, and what the answer states complete, which the
-    /// breaker releases the input at.
+    /// breaker releases the input at. That release reaches the input even where it releases
+    /// nothing new: the release wrapper passes every release on.
     pub(crate) fn pull(&mut self, region: Region) -> (BTreeSet<u64>, Predicate) {
         if self.released.covers(region) {
             self.wasted += 1;
@@ -352,26 +348,33 @@ impl InputModel {
             true => predicate(&region.guard()),
             false => points(held.iter().copied()),
         };
-        let grows = match self.closed {
-            true => !self.released.covers(region),
-            false => !held.is_subset(&self.released.keys),
-        };
-        if grows {
-            self.releases.push(stated.clone());
-        }
         match self.closed {
             true => self.released.add(region),
-            false => self.released.keys.extend(held),
+            false => self.released.keys.extend(held.iter().copied()),
         }
+        self.record(stated.clone());
         (answered, stated)
     }
 
-    /// The input is released at `region`.
+    /// The input is released at `region`, which reaches it even where it releases nothing new.
     pub(crate) fn release(&mut self, region: Region) {
-        if !self.released.covers(region) {
-            self.releases.push(predicate(&region.guard()));
-        }
         self.released.add(region);
+        self.record(predicate(&region.guard()));
+    }
+
+    /// The input is released at `keys`, which an earlier pull's release already covers: the
+    /// release reaches the input and releases nothing new.
+    pub(crate) fn release_again(&mut self, keys: Predicate) {
+        self.record(keys);
+    }
+
+    /// A release at `keys` reaches the input, as the universal guard once the input is released
+    /// whole.
+    fn record(&mut self, keys: Predicate) {
+        self.releases.push(match self.drained() {
+            true => Predicate::True,
+            false => keys,
+        });
     }
 
     /// Whether the input has been released whole, which a pipeline finishes after.
@@ -459,7 +462,7 @@ impl TileProducer for NestedInput {
         node
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         self.source.borrow_mut().pulled.push(guard.clone());
         if released_whole(&guard, self.obsolete_guard()) {
             self.source.borrow_mut().wasted += 1;
@@ -547,7 +550,7 @@ impl TileProducer for ReadsBreaker {
         node
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         self.breaker.borrow_mut().get(guard)
     }
 

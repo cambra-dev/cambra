@@ -793,6 +793,7 @@ impl InductionStoreProducer {
         let drive = self.drive();
         self.reach_local(drive, &mut |breaker, input| {
             let none = breaker.input_tiling(input).empty_guard();
+
             breaker.consume_impl(input, none);
         });
     }
@@ -911,16 +912,8 @@ impl InductionStoreProducer {
         self.run().body.set_waiting(Some(waiting), entry.as_ref());
     }
 
-    /// Mark the entry in front of the store's input as the scope's, so a push that reaches it
-    /// and that the scope's pipeline does not take offers the scope its waiting positions, from
-    /// the run's start ([`Entry::wake`](crate::interpreter::dispatcher::Entry)).
-    pub(super) fn mark_entry_scope(&mut self) {
-        if let Some(entry) = self.base().placement.clone() {
-            entry.set_scope(Some(self.run().body.offers.clone()));
-        }
-    }
-
-    /// End a request over `covers`. For a flat store, the positions of `covers` the store has not
+    /// End a request over `covers`; `waited` is whether positions waited for inputs when the
+    /// request began. For a flat store, the positions of `covers` the store has not
     /// decided wait for inputs until the store is terminal: a request that ends before the
     /// drive's source delivers a position leaves its undecided positions waiting, so the push that
     /// delivers one wakes the scope (`Entry::wake`) and offers them again, since the drive's
@@ -1372,7 +1365,7 @@ mod tests {
 
         /// The store as a consuming breaker answers it.
         fn snapshot(&self) -> Tile {
-            let mut store = induction(&self.scope);
+            let store = induction(&self.scope);
             let guard = store.tiling().universal_guard();
             store.get(guard)
         }
@@ -1585,7 +1578,7 @@ mod tests {
         let mut pulls = 0;
         drive.visit_input_producers(&mut |role, input| {
             if role == "source" {
-                pulls = input.base().reads;
+                pulls = input.base().reads.get();
             }
         });
         pulls
