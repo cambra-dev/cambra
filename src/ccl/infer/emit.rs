@@ -1456,7 +1456,13 @@ fn keyed_access_value<C: Typing>(
 /// `Option`.
 ///
 /// The key is related to the collection's keys and nothing is applied at it
-/// ([`keyed_access_value`]); presence is what the operator decides at runtime.
+/// ([`keyed_access_value`]); presence is what the operator decides at runtime. The answer is
+/// refined by whether `𝑘` is among the keys the collection's type admits
+/// ([`crate::ccl::nominal::lookup_checked_refinement`]) where that refinement is exact: the
+/// collection is not a sum, its codomain does not depend on its key, and `𝑘` is in the
+/// encoding's term fragment. An unencodable refinement in a query's antecedent fails the whole
+/// query (`smt_undecided_is_mismatch` in `src/ccl/infer/solver/constrain.rs`), so any other
+/// lookup answers the plain `Option`.
 fn emit_lookup_checked<C: Typing>(
     function: &mut Expr,
     collection: &Type,
@@ -1484,7 +1490,30 @@ fn emit_lookup_checked<C: Typing>(
         None,
         &|| "the value a checked lookup answers".to_string(),
     )?;
-    let result = Type::option_of(at_key);
+    let readable = !collection
+        .fun_kind()
+        .is_some_and(|kind| matches!(kind.resolved(), crate::ccl::KindPin::Sum(_)))
+        && !binder
+            .as_ref()
+            .is_some_and(|b| crate::ccl::subst::codomain_depends_on(b, &codomain))
+        && crate::ccl::infer::solver::smt::in_term_fragment(key);
+    let site = function.node_id();
+    let derive = || {
+        let answer = Type::option_of(at_key.clone());
+        if !readable {
+            return answer;
+        }
+        let _g = crate::ccl::provenance::enter(
+            site,
+            "infer.lookup_checked",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        match crate::ccl::nominal::lookup_checked_refinement(key, &keys, &codomain, &at_key) {
+            Some(refinement) => Type::refined_one(answer, refinement),
+            None => answer,
+        }
+    };
+    let result = ctx.checked_lookup_answer(&derive, &function.ty);
     // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
     // passes read a consistent type off the node. The domain is the pair the operator is
     // applied to, which is what op-conversion reads to size its output.

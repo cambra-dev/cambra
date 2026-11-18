@@ -381,8 +381,9 @@ Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin applic
 3. `keyed_access_value` constrains the key below the domain's base, peeling refinements. The
    base of a range `0..𝑛` is `UInt`, so a list's checked lookup at a key outside the range types
    and answers `none`.
-4. The rule returns `Option` of the value type and stamps the builtin with the concrete
-   pair-to-Option function type.
+4. The rule returns `Option` of the value type, refined as
+   [The checked lookup's refinement](#the-checked-lookups-refinement) gives, and stamps the
+   builtin with the concrete pair-to-Option function type.
 
 The key constraint is directional. Joining the lookup key and collection keys at a common
 supertype would admit a wrong-base key by widening instead of rejecting it.
@@ -395,6 +396,35 @@ covers tuple targets and range domains. A tuple is a product, not a collection l
 Emission computes the dependent result once. Later type checks recover the payload from the
 stamped operator type rather than substituting again into predicates that planning may have
 converted to point-free form. A second discharge could produce a different embedded term.
+
+#### The checked lookup's refinement
+
+For `𝑐` typed `{𝐾 | 𝑝} ⤇ {𝑉 | 𝑞}`, the answer of `𝑐[𝑘]` is
+`{Option(𝑉) | (present and not (__elem ▷ ctor_is(Option::none)) and 𝑞[__elem ▷ ctor_payload(Option::some)/__elem]) or (not present and __elem ▷ ctor_is(Option::none))}`,
+where `present` is `𝑝[𝑘/__elem]` (`nominal::lookup_checked_refinement`). The answer is `some`
+exactly when the key is present, and its payload satisfies the codomain's refinements. The
+refinement reads `𝑘` and none of `𝑐`.
+
+A range `0..𝑛` carries its bound in its type rather than in a refinement, so for a range domain
+`present` also conjoins `𝑘 < (𝑛 ▷ int_to_uint)`. CCL has no `UInt` literal, and the SMT encoding
+reads `int_to_uint` of a non-negative literal as that literal.
+
+`present` occurs negated, so a refinement that states part of `𝐾`'s membership is unsound. The rule
+answers a plain `Option` wherever `present` cannot state all of it:
+
+- `𝐾` is neither a base type nor a range.
+- One of `𝑝`'s predicates reads an element outside its own refinement.
+- `𝑐`'s type is a sum.
+- `𝑐`'s codomain depends on its key.
+- `𝑘` is outside the term fragment (`in_term_fragment`). An unencodable refinement in a query's
+  antecedent fails the query (`smt_undecided_is_mismatch`).
+
+A predicate of `𝑞` that reads an element outside its own refinement is left out of the `some`
+branch. Leaving it out only weakens the answer.
+
+A check reads the refinement back from the stamp (`Typing::checked_lookup_answer`) for the same
+reason that it reads the payload back. A transparent `let`'s scope exit substitutes the key
+binder's definition into the tree, and that definition need not be in the term fragment.
 
 #### Runtime readiness and answer shape
 

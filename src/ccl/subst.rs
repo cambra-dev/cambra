@@ -3310,6 +3310,16 @@ pub fn shift_elems(t: &TypedExpr, by: u32) -> TypedExpr {
     .apply_expr(t)
 }
 
+/// `predicate`, a refinement's predicate, stated of `term` rather than of the refinement's
+/// element: `predicate[term/__elem]`.
+pub fn discharge_elem(predicate: &TypedExpr, term: &TypedExpr) -> TypedExpr {
+    Subst::of_binders(BTreeMap::from([(
+        Name::elem(),
+        Mapping::Discharge(Rc::new(term.clone_preserving_ids())),
+    )]))
+    .apply_expr(predicate)
+}
+
 /// The binders the inference variables in `e`'s type slots may resolve to types naming, at
 /// any depth, the predicates their refinements carry included: each variable's telescope,
 /// lexical entries and opaque binders both (`Subst::suspended`).

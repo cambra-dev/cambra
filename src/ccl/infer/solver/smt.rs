@@ -422,7 +422,7 @@ pub fn defined_as(ty: Type, definition: &TypedExpr) -> Type {
 /// Whether `e` is built only from the node forms [`Encode::expr`] translates: integer and boolean
 /// literals, paths, and unary and binary operators over them. An operator the encoding has no
 /// rule for still fails there, which drops the assumption.
-fn in_term_fragment(e: &TypedExpr) -> bool {
+pub(crate) fn in_term_fragment(e: &TypedExpr) -> bool {
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_) | Lit::Bool(_)) | TypedExprNode::Var(_) => true,
         TypedExprNode::Apply { .. } => Path::of(e).is_some(),
@@ -1203,6 +1203,14 @@ impl<'a> Encode<'a> {
                 };
                 let (int, uint) = (self.expr(int)?, self.expr(uint)?);
                 Ok(self.ctx.eq(int, uint))
+            }
+            // `𝑛 ▷ int_to_uint` of a non-negative literal is the `UInt` `𝑛`. A checked lookup's
+            // refinement spells a range's bound this way, since CCL has no `UInt` literal.
+            TypedExprNode::Apply { function, argument }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::IntToUint))
+                    && matches!(argument.node, TypedExprNode::Lit(Lit::Int(n)) if n >= 0) =>
+            {
+                self.expr(argument)
             }
             // Which constructor built a nominal value: its tag ("Nominal values").
             TypedExprNode::Apply { function, argument }

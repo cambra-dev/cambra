@@ -6330,7 +6330,9 @@ fn a_checked_lookup_is_not_an_application() {
     let m = "m = map([(1, 10), (2, 20)])\n";
     // A key that is certainly absent still type-checks: presence is not a typing question.
     assert_eq!(
-        infer_program(&format!("{m}m[9]")).to_string(),
+        infer_program(&format!("{m}m[9]"))
+            .peel_refinements()
+            .to_string(),
         "Option(Int)"
     );
     // The proven form is the pair to it, and it still demands the membership its domain
@@ -6404,6 +6406,7 @@ fn checked_lookup_boundaries() {
             f"#})
         .codomain()
         .expect("f is a function")
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );
@@ -6418,6 +6421,7 @@ fn checked_lookup_on_a_set_is_membership_as_a_value() {
         infer_program(indoc::indoc! {r#"
             s = set([1, 2, 3])
             s[1]"#})
+        .peel_refinements()
         .to_string(),
         "Option(Unit)"
     );
@@ -6445,6 +6449,7 @@ fn a_product_keys_a_collection() {
             m = map([((1, 2), 10), ((3, 4), 20)])
             m[(1, 2)]
         "#})
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );
@@ -6453,6 +6458,7 @@ fn a_product_keys_a_collection() {
             m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
             m[(a=1, b=2)]
         "#})
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );
@@ -6461,6 +6467,7 @@ fn a_product_keys_a_collection() {
             s = set([(1, 2), (3, 4)])
             s[(1, 2)]
         "#})
+        .peel_refinements()
         .to_string(),
         "Option(Unit)"
     );
@@ -6496,6 +6503,7 @@ fn checked_lookup_on_a_map_answers_an_option_of_the_value() {
         infer_program(indoc::indoc! {r#"
             m = map([(1, 10), (2, 20)])
             m[1]"#})
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );

@@ -943,6 +943,10 @@ impl Printer {
                 Prec::Not,
                 format!("not {}", at_least(argument.written(), Prec::Not)),
             )),
+            TypedExprNode::Builtin(Builtin::IntToUint) => {
+                let (_, x) = argument.written();
+                written((Prec::Postfix, format!("int_to_uint({x})")))
+            }
             // A constructor's observers, as a predicate writes them: `Option`'s by its methods
             // `is_none` and `value`. Another type's constructors have no surface spelling.
             TypedExprNode::Builtin(Builtin::CtorIs(c))

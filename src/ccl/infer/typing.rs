@@ -910,4 +910,14 @@ pub(super) trait Typing {
         key: &Expr,
         stamped: &Type,
     ) -> Type;
+
+    /// The type a checked lookup `𝑐[𝑘]` answers: `derive()`, an `Option` of the value at the
+    /// key, refined by what the lookup states about the key and the collection.
+    ///
+    /// **Emission derives it; a check reads it back** from `stamped`, the type emission left on
+    /// the operator node, for the reason [`Self::keyed_value_at`] does. The refinement reads
+    /// the key term, and a later pass rewrites that term: a transparent `let`'s scope exit
+    /// substitutes the key binder's definition, which may lie outside the fragment the
+    /// refinement is stated for.
+    fn checked_lookup_answer(&mut self, derive: &dyn Fn() -> Type, stamped: &Type) -> Type;
 }

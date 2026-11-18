@@ -1282,6 +1282,20 @@ the payload of `o`, or `w` when `o` is `Option::none`:
 unwrap_or : (o: Option(T), w: T) => {T where (o.is_none() and _ == w) or (not o.is_none() and _ == o.value())}
 ```
 
+The compiler refines a lookup by whether its key is present. For `c` of type
+`{K where p} |=> {V where q}`, the key `k` is present where `p` holds of `k`, and for a list of
+length `n` also where `k < int_to_uint(n)`. Where `k` is built from integer and boolean literals,
+names, field reads and operators, `c[k]` is:
+
+```
+{Option(V) where (present and not _.is_none() and q(_.value())) or (not present and _.is_none())}
+```
+
+Here `q(_.value())` stands for `q` stated of the payload. A lookup into a `Map(K, V)`, into a
+collection whose value type depends on its key, or into a collection whose key type is neither a
+base type nor a list's range is `Option(V)`
+([The checked lookup's refinement](../src/ccl/design/collections.md#the-checked-lookups-refinement)).
+
 `c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
 `in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
 is a type error at `!`, not a runtime unwrap failure. `!` has postfix precedence;

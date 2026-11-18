@@ -924,8 +924,14 @@ impl Typing for CheckCtx {
     ) -> Type {
         let payload = stamped
             .codomain()
-            .and_then(|answer| answer.option_payload().cloned());
+            .and_then(|answer| answer.peel_refinements().option_payload().cloned());
         payload.unwrap_or_else(|| {
+            panic!("emit_lookup_checked stamps `lookup?` with `(pair) ⇒ Option(payload)`, got {stamped}")
+        })
+    }
+
+    fn checked_lookup_answer(&mut self, _derive: &dyn Fn() -> Type, stamped: &Type) -> Type {
+        stamped.codomain().unwrap_or_else(|| {
             panic!("emit_lookup_checked stamps `lookup?` with `(pair) ⇒ Option(payload)`, got {stamped}")
         })
     }

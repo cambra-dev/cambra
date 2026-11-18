@@ -469,6 +469,93 @@ impl CtorRef {
     }
 }
 
+/// The refinement the checked lookup `𝑐[key]` answers an `Option(payload)` at, where `𝑐` is
+/// typed `{𝐾 | 𝑝} ⤇ {𝑉 | 𝑞}` with `𝐾` the `domain` and `𝑉` the `codomain`:
+/// `(present and not (__elem ▷ ctor_is(Option::none)) and 𝑞[__elem ▷ ctor_payload(Option::some)/__elem])
+/// or (not present and __elem ▷ ctor_is(Option::none))`, where `present` is `𝑝[key/__elem]`,
+/// conjoined with `key < (𝑛 ▷ int_to_uint)` for a range `0..𝑛`
+/// (`src/ccl/design/collections.md`, "The checked lookup's refinement").
+///
+/// `None` where `present` cannot state the whole of `𝐾`'s membership: `𝐾` is neither a base
+/// type nor a range, or one of its predicates reads an element outside its own refinement.
+/// `present` occurs negated, so stating part of it would be unsound. A predicate of `𝑉` that
+/// reads an element outside its own refinement is left out, which only weakens the answer.
+pub fn lookup_checked_refinement(
+    key: &crate::ccl::TypedExpr,
+    domain: &Type,
+    codomain: &Type,
+    payload: &Type,
+) -> Option<Refinement> {
+    use crate::ccl::subst::{discharge_elem, free_elem_indices};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, LogicKind, TypedExpr, UnaryOpKind};
+    let bool_ty = Type::Base(BaseType::Bool);
+    // CCL has no `UInt` literal, so a range's bound is spelled `𝑛 ▷ int_to_uint`.
+    let uint_lit = |n: i64| {
+        let int_to_uint = TypedExpr::builtin(crate::ccl::Builtin::IntToUint)
+            .with_ty(crate::ccl::ty::int_to_uint_type(|_| {}));
+        TypedExpr::apply(
+            TypedExpr::lit(Lit::Int(n)).with_ty(Type::Base(BaseType::Int)),
+            int_to_uint,
+        )
+        .with_ty(Type::Base(BaseType::UInt))
+    };
+    let local = |r: &Refinement| free_elem_indices(&r.predicate).iter().all(|&up| up == 0);
+    let mut present = Vec::new();
+    match domain.peel_refinements() {
+        Type::UIntRange(n) => present.push(
+            TypedExpr::binop(
+                key.clone_preserving_ids(),
+                BinOpKind::Compare(CompareKind::Less),
+                uint_lit(i64::try_from(*n).ok()?),
+            )
+            .with_ty(bool_ty.clone()),
+        ),
+        Type::Base(_) => {}
+        _ => return None,
+    }
+    for r in domain.refinements() {
+        if !local(r) {
+            return None;
+        }
+        present.push(discharge_elem(&r.predicate, key));
+    }
+    let args = [payload.clone()];
+    let option = option();
+    let none = CtorRef {
+        decl: Rc::clone(&option),
+        ctor: V_NONE.name().into(),
+    };
+    let some = CtorRef {
+        decl: option,
+        ctor: V_SOME.name().into(),
+    };
+    let elem = || TypedExpr::var(Name::elem()).with_ty(Type::option_of(payload.clone()));
+    let is_none = || ctor_is(elem(), &none, &args);
+    let not = |e: TypedExpr| TypedExpr::unary(UnaryOpKind::Not, e).with_ty(bool_ty.clone());
+    let and = |l: TypedExpr, r: TypedExpr| {
+        TypedExpr::binop(l, BinOpKind::BoolLogic(LogicKind::And), r).with_ty(bool_ty.clone())
+    };
+    let all = |terms: Vec<TypedExpr>| {
+        terms
+            .into_iter()
+            .reduce(&and)
+            .unwrap_or_else(|| TypedExpr::lit(Lit::Bool(true)).with_ty(bool_ty.clone()))
+    };
+    let value = ctor_payload(elem(), &some, &args);
+    let mut some_arm = vec![all(present.clone()), not(is_none())];
+    some_arm.extend(
+        codomain
+            .refinements()
+            .iter()
+            .filter(|r| local(r))
+            .map(|r| discharge_elem(&r.predicate, &value)),
+    );
+    let none_arm = and(not(all(present)), is_none());
+    let predicate = TypedExpr::binop(all(some_arm), BinOpKind::BoolLogic(LogicKind::Or), none_arm)
+        .with_ty(bool_ty);
+    Some(Refinement::born(Rc::new(predicate)))
+}
+
 /// The compiler-provided declaration `name` names, if any.
 pub fn builtin(name: &str) -> Option<Rc<NominalDecl>> {
     (name == OPTION).then(option)

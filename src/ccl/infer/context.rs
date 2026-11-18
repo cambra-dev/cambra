@@ -4846,6 +4846,11 @@ impl Typing for InferCtx {
             None => codomain.clone(),
         }
     }
+
+    /// Emission derives the answer; the operator's type is not stamped yet.
+    fn checked_lookup_answer(&mut self, derive: &dyn Fn() -> Type, _stamped: &Type) -> Type {
+        derive()
+    }
 }
 
 /// Mark each variable in a constant family's normalized body as standing for a hole of the
