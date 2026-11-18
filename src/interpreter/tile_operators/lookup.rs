@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use std::borrow::Cow;
+#[cfg(test)]
+use std::sync::PoisonError;
 
 use bit_set::BitSet;
 
@@ -49,21 +51,21 @@ enum LookupSource {
     /// Both operands still terms, so each compiles as its own source: the collection is read
     /// once and every key answered against it.
     Split {
-        collection: Box<dyn TileOperator>,
-        keys: Box<dyn TileOperator>,
+        collection: Arc<dyn TileOperator>,
+        keys: Arc<dyn TileOperator>,
     },
     /// One stream of `(collection, key)` rows, the point-free form of a lookup inside an
     /// iteration. Field 0 carries either a nested function tile — one collection shared by
     /// every row — or a scalar column of materialized map values, one per row.
-    Paired(Box<dyn TileOperator>),
+    Paired(Arc<dyn TileOperator>),
 }
 
 impl CheckedLookup {
     /// Look keys up in `collection`, with both operands as their own sources. The answer
     /// takes the keys' shape: a scalar for `m[1]`, a stream wherever the keys are one.
     pub fn split(
-        collection: Box<dyn TileOperator>,
-        keys: Box<dyn TileOperator>,
+        collection: Arc<dyn TileOperator>,
+        keys: Arc<dyn TileOperator>,
         option_extent: Extent,
     ) -> Self {
         let tiling = answer_tiling(keys.tiling(), option_extent);
@@ -75,7 +77,7 @@ impl CheckedLookup {
 
     /// Look each row's key up in that row's collection, over an assembled stream of
     /// `(collection, key)` pairs. The answer's domain is the stream's own.
-    pub fn paired(pairs: Box<dyn TileOperator>, option_extent: Extent) -> Result<Self, String> {
+    pub fn paired(pairs: Arc<dyn TileOperator>, option_extent: Extent) -> Result<Self, String> {
         let Tiling::DataFunction { domain, codomain } = pairs.tiling() else {
             return Err(format!(
                 "`lookup?` over an assembled pair needs a stream of rows, got {}",
@@ -177,12 +179,12 @@ impl TileOperator for CheckedLookup {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let source = match &mut self.source {
+        let source = match &self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
             // absence, so when it settles after the keys it is the input that completes the
             // answer — subscribed with a consumer of its own it would settle with nobody
@@ -193,13 +195,12 @@ impl TileOperator for CheckedLookup {
                 // position; the collection is read whole, since every key is answered against
                 // all of it.
                 let keeps_keys = keys.tiling().is_data_function();
-                let keys =
-                    subscribe_forwarding_keeping_keys_if(keeps_keys, &mut **keys, &shared, cx);
-                let collection = subscribe_forwarding(&mut **collection, &shared, cx);
+                let keys = subscribe_forwarding_keeping_keys_if(keeps_keys, keys, &shared, cx);
+                let collection = subscribe_forwarding(collection, &shared, cx);
                 ProducerSource::Split { collection, keys }
             }
             // One input, carrying both operands, so there is nothing to share.
-            LookupSource::Paired(pairs) => ProducerSource::Paired(pairs.subscribe(
+            LookupSource::Paired(pairs) => ProducerSource::Paired(pairs.clone().subscribe(
                 pairs.tiling().universal_guard(),
                 // The pairs are pulled at the projection, and each answer sits at its
                 // row's position.
@@ -212,7 +213,7 @@ impl TileOperator for CheckedLookup {
             base: ProducerBase::new(
                 CheckedLookupProducer::alloc_id(),
                 &self.base.tiling,
-                &self.base,
+                self.clone(),
                 cx,
             ),
             source,
@@ -703,13 +704,13 @@ impl CheckedLookupProducer {
 pub struct Lookup {
     /// The input's tiling with the pair at `level` replaced by the value read.
     base: OperatorBase,
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     level: CurryLevel,
 }
 
 impl Lookup {
     /// Read each row's key in its collection, for the `(key, collection)` rows at `level`.
-    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Result<Self, String> {
+    pub fn new_at(input: Arc<dyn TileOperator>, level: CurryLevel) -> Result<Self, String> {
         let Tiling::Record(fields) = input.tiling().values_at(level) else {
             return Err(format!(
                 "`apply` reads a key in a collection, so its rows are `(key, collection)` \
@@ -761,16 +762,18 @@ impl TileOperator for Lookup {
     }
 
     fn subscribe(
-        &mut self,
+        self: Arc<Self>,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         Box::new(LookupProducer {
-            base: ProducerBase::new(LookupProducer::alloc_id(), self.tiling(), &self.base, cx),
-            input: self
-                .input
-                .subscribe(self.input.tiling().universal_guard(), consumer, cx),
+            base: ProducerBase::new(LookupProducer::alloc_id(), self.tiling(), self.clone(), cx),
+            input: self.input.clone().subscribe(
+                self.input.tiling().universal_guard(),
+                consumer,
+                cx,
+            ),
             level: self.level,
         })
     }
@@ -1102,7 +1105,10 @@ mod tests {
             "the rows are open, so what they hold is named beneath them: {taken:?}"
         );
         lookup.release(taken.clone());
-        assert_eq!(*released.borrow(), vec![taken]);
+        assert_eq!(
+            *released.read().unwrap_or_else(PoisonError::into_inner),
+            vec![taken]
+        );
     }
 
     /// A **one-level** stream is the same rule at depth zero: an undecided key's row is left
@@ -1198,7 +1204,10 @@ mod tests {
             );
             lookup.release(guard);
         }
-        assert_eq!(*pulled.borrow(), [keys_between(0, 0), keys_between(1, 1)]);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            [keys_between(0, 0), keys_between(1, 1)]
+        );
     }
 
     /// Each row's key is read in that row's own collection, not in one every row shares.
@@ -1330,9 +1339,17 @@ mod projection_tests {
                 (5, none()),
             ]
         );
-        assert_eq!(*key_pulls.borrow(), vec![keys_between(2, 5)]);
+        assert_eq!(
+            *key_pulls.read().unwrap_or_else(PoisonError::into_inner),
+            vec![keys_between(2, 5)]
+        );
         let universal = Tiling::data_function(int(), Tiling::Scalar(int())).universal_guard();
-        assert_eq!(*collection_pulls.borrow(), vec![universal]);
+        assert_eq!(
+            *collection_pulls
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+            vec![universal]
+        );
     }
 
     /// Consecutive morsels, with the first released before the second is taken, as a worker
@@ -1352,7 +1369,10 @@ mod projection_tests {
                 (7, none()),
             ]
         );
-        assert_eq!(key_pulls.borrow()[1], keys_between(4, 7));
+        assert_eq!(
+            key_pulls.read().unwrap_or_else(PoisonError::into_inner)[1],
+            keys_between(4, 7)
+        );
     }
 
     #[test]
@@ -1367,7 +1387,16 @@ mod projection_tests {
         let (mut lookup, key_pulls, collection_pulls) = lookup_over_streams();
         let tile = lookup.read_in_pipeline(lookup.tiling().empty_guard());
         assert!(answers(&tile).is_empty());
-        assert!(key_pulls.borrow().is_empty() && collection_pulls.borrow().is_empty());
+        assert!(
+            key_pulls
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+                && collection_pulls
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+        );
     }
 
     /// One key answers one value, which has no keys to project.

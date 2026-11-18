@@ -30,6 +30,7 @@ pub mod value_probe;
 pub use binop::*;
 pub use http_server::HttpServerDataSource;
 pub use notifications::*;
+pub use producer_releases::SourceReaderRetirement;
 pub use scalar_expr::ScalarProgram;
 pub use stdio::*;
 pub use subscribe_context::*;
@@ -41,8 +42,8 @@ pub use types::*;
 pub use unary_op::*;
 
 use smol_str::{SmolStr, format_smolstr};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::RwLock;
 
 // ============================================================================
 // Consumer Protocol
@@ -58,21 +59,21 @@ use std::rc::Rc;
 /// is not walked: a package it queues, or a complete region it records, fails the run unless a
 /// walk took the same path (`src/interpreter/design-dispatcher.md`, "Running a compiled
 /// program").
-pub trait Consumer {
+pub trait Consumer: Send + Sync {
     /// Record an announced region and deliver it toward its dispatcher entries.
     fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 }
 
-/// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
+/// Blanket implementation: Arc<RwLock<C>> implements Consumer when C does.
 // shared-state-ok: this is what makes a shared *notification* handle a consumer;
 // a wakeup carries no value, so it is not a dataflow edge.
-impl<C: Consumer + ?Sized> Consumer for Rc<RefCell<C>> {
+impl<C: Consumer + ?Sized> Consumer for Arc<RwLock<C>> {
     fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        self.borrow_mut().notify(region, landing)
+        notify_shared(self, region, landing)
     }
 }
 
-/// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
+/// A boxed consumer is one, so it can be shared behind an `Arc<RwLock<_>>` as a
 /// [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
     fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
@@ -82,7 +83,7 @@ impl Consumer for Box<dyn Consumer> {
 
 /// Blanket implementation: FnMut() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
-impl<F: FnMut()> Consumer for F {
+impl<F: FnMut() + Send + Sync> Consumer for F {
     fn notify(&mut self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
         if landing.is_delivery() {
             self()
