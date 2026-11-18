@@ -1175,7 +1175,7 @@ that were already subscribed expose only the inputs they still hold. The impleme
 
 `visit_inputs` is required on every operator. The graph walk and the default `TileOperator::inspect`
 implementation both read it; an omitted input can remove an edge or subtree from both. Its callback
-borrows each target only for the call, permitting inputs held behind `RefCell`, including fan inputs
+borrows each target only for the call, permitting inputs held behind a lock, including fan inputs
 and `CycleSlot` contents. `inspect_annotation` supplies non-input metadata such as a constant's
 value or variant tag.
 

@@ -358,7 +358,7 @@ waiting therefore cannot be lost. A worker failure wakes waiters and stops furth
 does a panic in a thread that publishes (`notify`, `start_source`, `close`, `land`, `finish`,
 queueing a reader), worker or not.
 
-These guarantees concern scheduling. Breakers use `Rc<RefCell<_>>`, and the production driver runs
-them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
+These guarantees concern scheduling. Breakers are `Send + Sync`, each behind an `Arc<RwLock<_>>`
+(`BreakerHandle`), and the production driver runs them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
 need additional coordination before parallel execution. Atomic-ordering proofs and queue storage
 mechanics are documented beside their implementation in `dispatcher.rs`.
