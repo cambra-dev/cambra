@@ -2797,6 +2797,7 @@ pub(crate) fn in_a_run<R>(run: impl FnOnce() -> R) -> R {
 }
 
 /// Whether this thread is inside a compiled program's dispatched run ([`in_a_run`]).
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn is_in_a_run() -> bool {
     IN_A_RUN.with(Cell::get)
 }
@@ -3143,6 +3144,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
+
         breaker.consume_impl(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
@@ -3324,7 +3326,7 @@ mod tests {
                 }
             }
 
-            fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
                 self.tiling().empty_tile()
             }
 

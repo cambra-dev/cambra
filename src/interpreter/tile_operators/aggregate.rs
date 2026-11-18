@@ -199,7 +199,7 @@ impl TileProducer for AggregateProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
@@ -212,7 +212,7 @@ impl TileProducer for AggregateProducer {
 
     /// An accumulator has no keys to project, so the projection is all of it or none. The
     /// input is read whole whatever the consumer asks.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection =
             projection_of_one_value(&self.name(), "is one accumulator", &projection_guard);
         if projection == Projection::Nothing {
@@ -221,10 +221,6 @@ impl TileProducer for AggregateProducer {
         if self.obsolete_guard().is_universal() {
             return self.tiling().empty_tile();
         }
-        if !self.base.reads_input() {
-            return self.answer();
-        }
-        self.fold_input(self.input.tiling().universal_guard());
         self.answer()
     }
 
@@ -426,7 +422,7 @@ impl TileProducer for ExtractAggregateProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
@@ -437,17 +433,13 @@ impl TileProducer for ExtractAggregateProducer {
         Some(self)
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection =
             projection_of_one_value(&self.name(), "extracts one value", &projection_guard);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        if !self.base.reads_input() {
-            return self.extracted.clone();
-        }
-        let input_result = self.input.get(self.input.tiling().universal_guard());
-        self.extract(input_result)
+        self.extracted.clone()
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -610,7 +602,7 @@ impl TileProducer for MapExtractAggregateProducer {
 
     /// Every level keeps the input's keys and only the unfinished ones drop, so the input is
     /// pulled at the projection, and the answer keeps its keys.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1190,7 +1182,7 @@ impl TileProducer for MapAggregateProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
     /// The keys at every level are the input's, with each group beneath one whole, so the input
@@ -1198,25 +1190,15 @@ impl TileProducer for MapAggregateProducer {
     /// earlier stay held, and a pull names the keys it wants. What the answers state is kept
     /// across pulls with the accumulators, since a pull beneath the groups' keys states only the
     /// elements it reads (`Stated::settled`).
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        if !self.base.reads_input() {
-            return match &self.stated {
-                None => self.tiling().empty_tile(),
-                Some(stated) => self.build(stated, &projection),
-            };
+        match &self.stated {
+            None => self.tiling().empty_tile(),
+            Some(stated) => self.build(stated, &projection),
         }
-        let stated = self.read_input(projection.guard(self.input.tiling()));
-        let stated = match self.stated.take() {
-            Some(before) => before.union(&stated).settled(self.accumulators.keys()),
-            None => stated,
-        };
-        let answer = self.build(&stated, &projection);
-        self.stated = Some(stated);
-        answer
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -3234,10 +3216,16 @@ mod aggregate_consuming_tests {
         let mut extract = extract_over(&source);
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
-        let pulls = (extract.input.base().reads, source.borrow().pulled.len());
+        let pulls = (
+            extract.input.base().reads.get(),
+            source.borrow().pulled.len(),
+        );
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
         assert_eq!(
-            (extract.input.base().reads, source.borrow().pulled.len()),
+            (
+                extract.input.base().reads.get(),
+                source.borrow().pulled.len()
+            ),
             pulls
         );
     }
@@ -3250,9 +3238,9 @@ mod aggregate_consuming_tests {
         extract.begin_run();
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
         extract.release(scalar_tiling().universal_guard());
-        let pulls = extract.input.base().reads;
+        let pulls = extract.input.base().reads.get();
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().universal_guard());
-        assert_eq!(extract.input.base().reads, pulls);
+        assert_eq!(extract.input.base().reads.get(), pulls);
     }
 
     #[test]
@@ -3273,7 +3261,7 @@ mod aggregate_consuming_tests {
         extract.consume_in_pipeline(InputId::ONLY, sum_tiling().empty_guard());
         assert!(source.borrow().pulled.is_empty());
         assert_eq!(
-            extract.input.base().reads,
+            extract.input.base().reads.get(),
             0,
             "the input is not pulled either"
         );

@@ -255,83 +255,22 @@ impl TileProducer for ExtractFinalProducer {
     }
 
     fn answers_from_state(&self) -> bool {
-        !self.base.reads_input()
+        true
     }
 
     /// The final position of a stream is one value, or one collection that a release takes
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        if projection_of_one_value(&self.name(), "extracts one final value", &projection_guard)
+    fn get_impl(&self, guard: TileGuard) -> Tile {
+        if projection_of_one_value(&self.name(), "extracts one final value", &guard)
             == Projection::Nothing
+            || self.obsolete_guard().is_universal()
         {
             return self.tiling().empty_tile();
         }
-        // Scalar columns use the declared extent, retaining variant arms absent from the
-        // selected value so downstream merges see the declared layout.
-        let empty = self.tiling().empty_tile();
-        if self.obsolete_guard().is_universal() {
-            return empty;
-        }
-        if !self.base.reads_input() {
-            return self.final_tile.clone().unwrap_or(empty);
-        }
-        if let Some(tile) = &self.final_tile {
-            return tile.clone();
-        }
-        let source_tiling = self.source.tiling().clone();
-        let source_tile = self.source.get(source_tiling.universal_guard());
-        if !source_tile.is_terminal() {
-            // Release UInt positions below the highest live position without waiting for
-            // completion. Retain that position because it can still supply the final value.
-            if let Some(keys) = source_tile.live_keys() {
-                let max_pos = keys
-                    .filter_map(|(_, key)| match key {
-                        Value::UInt(p) => Some(p),
-                        _ => None,
-                    })
-                    .max();
-                if let Some(max_pos) = max_pos
-                    && max_pos >= 1
-                {
-                    self.source
-                        .release(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::at_or_below(Value::UInt(max_pos - 1)),
-                        )));
-                }
-            }
-            return empty;
-        }
-        // Release the completed source before selecting its final value or pulling the default.
-        self.source.release(source_tiling.universal_guard());
-        let Tile::DataFunction {
-            domain, deleted, ..
-        } = &source_tile
-        else {
-            panic!("ExtractFinal source must be a collection tile");
-        };
-        // The position being indexed is this collection's key, and what it holds is
-        // everything below it: a value where the values are a column, a whole collection
-        // where they are one.
-        // TODO don't assume sorting; we need to sort by the key value instead.
-        let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
-        if let Some(final_idx) = live_outer {
-            let tile = self.value_at(&source_tile, final_idx);
-            self.final_tile = Some(tile.clone());
-            self.complete = true;
-            self.merged = self.source.tiling().empty_tile();
-            return tile;
-        }
-        // No live positions remain. Cache the default only once it is complete.
-        match self.pull_default() {
-            Some(tile) => {
-                self.final_tile = Some(tile.clone());
-                self.complete = true;
-                self.merged = self.source.tiling().empty_tile();
-                tile
-            }
-            None => empty,
-        }
+        self.final_tile
+            .clone()
+            .unwrap_or_else(|| self.tiling().empty_tile())
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -368,6 +307,22 @@ impl Breaker for ExtractFinalProducer {
         self.keep_greatest_key();
         self.source.release(upstream_guard);
         if !self.source.obsolete_guard().is_universal() {
+            let greatest = self
+                .merged
+                .live_keys()
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, key)| match key {
+                    Value::UInt(position) => Some(position),
+                    _ => None,
+                })
+                .max();
+            if let Some(greatest) = greatest.filter(|position| *position > 0) {
+                self.source
+                    .release(TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::at_or_below(Value::UInt(greatest - 1)),
+                    )));
+            }
             return;
         }
         let Tile::DataFunction {
@@ -519,7 +474,7 @@ mod tests {
 
     impl TileProducer for PartialSourceProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
@@ -572,7 +527,7 @@ mod tests {
 
     impl TileProducer for TerminalSourceProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 self.domain.clone(),
                 Box::new(Tile::Scalar(self.codomain_tile.clone())),
@@ -624,7 +579,7 @@ mod tests {
 
     impl TileProducer for DelayedDefaultProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             if self.ready.get() {
                 Tile::Scalar(ColumnValue::Ints(vec![42]))
             } else {

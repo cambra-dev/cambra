@@ -208,6 +208,7 @@ impl TileOperator for CheckedLookup {
             )),
         };
         Box::new(CheckedLookupProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::new(
                 CheckedLookupProducer::alloc_id(),
                 &self.base.tiling,
@@ -220,6 +221,7 @@ impl TileOperator for CheckedLookup {
 }
 
 struct CheckedLookupProducer {
+    dropped_rows: [DroppedRows; 2],
     base: ProducerBase,
     source: ProducerSource,
 }
@@ -423,12 +425,12 @@ impl CheckedLookupProducer {
     }
 }
 
-/// Compact `tile`, which `input` produced, releasing to `input` the rows that drops.
-fn compact_releasing(tile: &mut Tile, input: &mut Box<dyn TileProducer>) {
+/// Compact `tile` and retain its dropped-row guard for the next native release.
+fn compact_recording(tile: &mut Tile, retained: &DroppedRows) {
     let dropped = tile.deleted_keys_guard();
     tile.compact();
     if let Some(dropped) = dropped {
-        input.release(dropped);
+        retained.remember(dropped);
     }
 }
 
@@ -459,7 +461,7 @@ impl TileProducer for CheckedLookupProducer {
     /// `(collection, key)` rows, is pulled at the projection while the collection is read whole:
     /// every key is answered against all of it. One answer for one key is a scalar and has no
     /// keys to project.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -475,6 +477,14 @@ impl TileProducer for CheckedLookupProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        match &mut self.source {
+            ProducerSource::Split { collection, keys } => {
+                self.dropped_rows[0].release_to(&mut **collection);
+                self.dropped_rows[1].release_to(&mut **keys);
+            }
+            ProducerSource::Paired(pairs) => self.dropped_rows[0].release_to(&mut **pairs),
+        }
+
         // A **domain** release names positions of the answer, and the answer is one option per
         // key at the key's own domain position — so it names key positions and passes through
         // to whatever supplies them. The **collection** is not positional: every key is
@@ -511,7 +521,7 @@ impl TileProducer for CheckedLookupProducer {
 
 impl CheckedLookupProducer {
     /// The answer to the keys `projection` names.
-    fn lookup(&mut self, projection: &Projection) -> Tile {
+    fn lookup(&self, projection: &Projection) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
             // One answer per row at one level, and a collection of answers per row —
@@ -531,12 +541,12 @@ impl CheckedLookupProducer {
         // released or filtered-out key as present. Compacting drops those rows and clears the
         // bitset, which is also what leaves the answer with no deletions of its own. A dropped
         // row reaches no consumer and answers no key, so each leg is released through it.
-        match &mut self.source {
+        match &self.source {
             ProducerSource::Split { collection, keys } => {
                 let mut key_tile = keys.get(projection.guard(keys.tiling()));
-                compact_releasing(&mut key_tile, keys);
+                compact_recording(&mut key_tile, &self.dropped_rows[1]);
                 let mut coll = collection.get(collection.tiling().universal_guard());
-                compact_releasing(&mut coll, collection);
+                compact_recording(&mut coll, &self.dropped_rows[0]);
                 match key_tile {
                     // One key: the scalar form `m[k]`, the key pivoted to one column where
                     // it is a product. An empty column is a key that has not arrived, so
@@ -566,7 +576,7 @@ impl CheckedLookupProducer {
             // An assembled stream of `(collection, key)` rows.
             ProducerSource::Paired(pairs) => {
                 let mut tile = pairs.get(projection.guard(pairs.tiling()));
-                compact_releasing(&mut tile, pairs);
+                compact_recording(&mut tile, &self.dropped_rows[0]);
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty tile, and this operator does the same until its rows arrive.
                 let Tile::DataFunction {
@@ -802,7 +812,7 @@ impl TileProducer for LookupProducer {
     }
 
     /// Read only the requested rows, each carrying its own key and collection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -984,6 +994,7 @@ mod tests {
     fn lookup_over(keys: (Tile, Tiling), coll: (Tile, Tiling)) -> CheckedLookupProducer {
         let tiling = answer_tiling(&keys.1, option_of_int());
         CheckedLookupProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
             source: ProducerSource::Split {
                 collection: Box::new(TestTileProducer::new(coll.0, coll.1)),
@@ -1074,6 +1085,7 @@ mod tests {
         let (coll, coll_tiling) = collection(false);
         let tiling = answer_tiling(&keys_tiling, option_of_int());
         let mut lookup = CheckedLookupProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
             source: ProducerSource::Split {
                 collection: Box::new(TestTileProducer::new(coll, coll_tiling)),
@@ -1276,6 +1288,7 @@ mod projection_tests {
         );
         let tiling = answer_tiling(&key_stream_tiling(), option_of_int());
         let lookup = CheckedLookupProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
             source: ProducerSource::Split {
                 collection: Box::new(collection),
@@ -1363,6 +1376,7 @@ mod projection_tests {
     fn a_single_key_rejects_a_key_projection() {
         let tiling = answer_tiling(&Tiling::Scalar(int()), option_of_int());
         let mut lookup = CheckedLookupProducer {
+            dropped_rows: Default::default(),
             base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
             source: ProducerSource::Split {
                 collection: Box::new(TestTileProducer::new(

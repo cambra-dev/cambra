@@ -777,7 +777,7 @@ impl TileProducer for UnionProducer {
     /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
     /// projection reaches each arm as what it names under that arm's tag, as a release does, and
     /// an arm it names nothing of is not pulled.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         // Closed first, so a pull of every arm reads as the pull of everything it is.
         let projection_guard = projection_guard.closed_over(self.tiling());
         let projection = projection_guard.projection_for(self);
@@ -789,7 +789,7 @@ impl TileProducer for UnionProducer {
         {
             let tiles: Vec<Tile> = self
                 .inputs
-                .iter_mut()
+                .iter()
                 .zip(&self.tags)
                 .map(|(p, tag)| match under_arm(keys, level.index(), tag) {
                     under if under.is_false() => p.tiling().empty_tile(),
@@ -823,7 +823,7 @@ impl TileProducer for UnionProducer {
         };
         let tiles: Vec<Tile> = self
             .inputs
-            .iter_mut()
+            .iter()
             .enumerate()
             .map(|(arm, p)| {
                 // An arm the consumer has fully released contributes nothing.
@@ -1011,7 +1011,7 @@ mod tests {
         impl TileProducer for OuterOnly {
             impl_producer_base!();
 
-            fn get_impl(&mut self, guard: TileGuard) -> Tile {
+            fn get_impl(&self, guard: TileGuard) -> Tile {
                 self.input.get(guard)
             }
 
@@ -1652,7 +1652,7 @@ mod tests {
             fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
                 node
             }
-            fn get_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_impl(&self, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
             fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1818,7 +1818,7 @@ mod tests {
     /// A pull naming keys of one arm pulls that arm at what it names there, and not the other.
     #[test]
     fn a_tagged_pull_reaches_only_the_arm_it_names() {
-        let (mut producer, logs, _) = union_logging_pulls();
+        let (producer, logs, _) = union_logging_pulls();
         let only_two = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
         let tile = producer.get(tagged_guard(vec![Predicate::False, only_two.clone()]));
         assert!(logs[0].borrow().is_empty(), "arm 0 is named nothing of");
@@ -1840,7 +1840,7 @@ mod tests {
     /// A pull naming keys of both arms pulls each at what it names under its own tag.
     #[test]
     fn a_tagged_pull_reaches_each_arm_at_its_own_keys() {
-        let (mut producer, logs, _) = union_logging_pulls();
+        let (producer, logs, _) = union_logging_pulls();
         let one = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
         let two = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
         let tile = producer.get(tagged_guard(vec![one.clone(), two.clone()]));
@@ -1861,7 +1861,7 @@ mod tests {
     fn tagged_pulls_of_each_arm_answer_what_everything_does() {
         let (mut whole, _, _) = union_logging_pulls();
         let everything = whole.read_in_pipeline(whole.tiling().universal_guard());
-        let (mut by_arm, _, _) = union_logging_pulls();
+        let (by_arm, _, _) = union_logging_pulls();
         let mut entries =
             entries_of(&by_arm.get(tagged_guard(vec![Predicate::True, Predicate::False])));
         entries.extend(entries_of(
@@ -1873,7 +1873,7 @@ mod tests {
     /// A tagged pull of every arm is the pull of everything, and its answer is terminal.
     #[test]
     fn a_tagged_pull_of_every_arm_answers_everything() {
-        let (mut producer, pulled, _) = union_logging_pulls();
+        let (producer, pulled, _) = union_logging_pulls();
         let tile = producer.get(tagged_guard(vec![Predicate::True, Predicate::True]));
         for log in &pulled {
             assert!(log.borrow().iter().all(TileGuard::is_universal), "{log:?}");
@@ -2334,7 +2334,7 @@ mod projection_tests {
 
     #[test]
     fn merged_branches_asked_for_nothing_pull_nothing() {
-        let (mut union, even_pulled, odd_pulled) = merged_branches(true);
+        let (union, even_pulled, odd_pulled) = merged_branches(true);
         let tile = union.get(stream_tiling().empty_guard());
         assert!(int_entries(&tile).is_empty());
         assert!(even_pulled.borrow().is_empty() && odd_pulled.borrow().is_empty());

@@ -110,7 +110,7 @@ impl TileProducer for Input {
         node
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         self.source.borrow_mut().pulled.push(guard.clone());
         if released_whole(&guard, self.obsolete_guard()) {
             self.source.borrow_mut().wasted += 1;
@@ -459,7 +459,7 @@ impl TileProducer for NestedInput {
         node
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         self.source.borrow_mut().pulled.push(guard.clone());
         if released_whole(&guard, self.obsolete_guard()) {
             self.source.borrow_mut().wasted += 1;
@@ -547,7 +547,7 @@ impl TileProducer for ReadsBreaker {
         node
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_impl(&self, guard: TileGuard) -> Tile {
         self.breaker.borrow_mut().get(guard)
     }
 
