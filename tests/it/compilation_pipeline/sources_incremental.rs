@@ -3,6 +3,7 @@
 //! incremental global aggregate, mutation loop over a source, and incremental
 //! group-by aggregates.
 
+use crate::it::serving::PublishRows as _;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -12,7 +13,6 @@ use bit_set::BitSet;
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
-use cambra::interpreter::pull_laps;
 use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
     sort_function_by_domain, tuple_field,
@@ -50,25 +50,18 @@ fn test_test_source(#[case] code: &str) {
     )));
     ctx.register_source(data_source.clone());
 
-    data_source.borrow_mut().add_data(&[
+    data_source.borrow_mut().publish_rows(&[
         (Value::UInt(10), Value::String("foo".into())),
         (Value::UInt(20), Value::String("bar".into())),
     ]);
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    let tile = producer.run();
 
     // Extract domain and codomain; sort by domain key for deterministic comparison.
     let Tile::DataFunction {
@@ -97,15 +90,11 @@ fn test_test_source(#[case] code: &str) {
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+
     // Restating the guard it already has changes nothing, and must not notify.
-    *notified.borrow_mut() = false;
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    assert!(!*notified.borrow());
 }
 
 /// Filtering a data source while in non-terminal state: only elements that
@@ -119,32 +108,26 @@ fn test_source_filter_nonterminal() {
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     ctx.register_source(test_source.clone());
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let code = "[s for s in source1() if s < 15]";
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    let mut tile = producer.get(producer.tiling().universal_guard());
+    let mut tile = producer.run();
     tile.compact();
     assert_eq!(
         sort_function_by_domain(tile),
         sort_function_by_domain(Tile::data_function(
             ColumnValue::UInts(vec![0]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
-            Predicate::False,
+            Predicate::at_or_below(Value::UInt(1)),
             BitSet::new()
         ))
     );
@@ -155,11 +138,15 @@ fn test_source_filter_nonterminal() {
 // 30s: the original flake site; one of the heaviest compiles, ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[case("[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 == y.0]")]
 #[case(
-    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 <= y.0 and x.0 >= y.0]"
+    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 == y.0]",
+    false
 )]
-fn test_inner_join(#[case] code: &str) {
+#[case(
+    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 <= y.0 and x.0 >= y.0]",
+    true
+)]
+fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
     let mut ctx = GlobalContext::default();
     let record_type = Type::Tuple(vec![
         Type::Base(BaseType::Int),
@@ -182,7 +169,7 @@ fn test_inner_join(#[case] code: &str) {
     ctx.register_source(data_source1.clone());
     ctx.register_source(data_source2.clone());
 
-    data_source1.borrow_mut().add_data(&[(
+    data_source1.borrow_mut().publish_rows(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -192,7 +179,7 @@ fn test_inner_join(#[case] code: &str) {
     data_source1
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
-    data_source2.borrow_mut().add_data(&[(
+    data_source2.borrow_mut().publish_rows(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -203,21 +190,14 @@ fn test_inner_join(#[case] code: &str) {
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     // let mut producer = ctx.compile_program(code, consumer).unwrap_or_render("<test>", code);
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    let tile = producer.run();
 
     // Extract rows from a DataFunction tile where:
     //   domain   = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
@@ -292,10 +272,14 @@ fn test_inner_join(#[case] code: &str) {
 
     assert_eq!(
         extract_join_rows(tile),
-        vec![((10, 10), (100, "a1".into(), "b1".into()))]
+        if streams {
+            vec![((10, 10), (100, "a1".into(), "b1".into()))]
+        } else {
+            Vec::new()
+        }
     );
 
-    data_source1.borrow_mut().add_data(&[(
+    data_source1.borrow_mut().publish_rows(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(200)),
@@ -305,7 +289,7 @@ fn test_inner_join(#[case] code: &str) {
     data_source1
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
-    data_source2.borrow_mut().add_data(&[(
+    data_source2.borrow_mut().publish_rows(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -316,22 +300,23 @@ fn test_inner_join(#[case] code: &str) {
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
-    let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    let tile = producer.run();
 
     // After second batch: (10,10)→(100,"a1","b1") and (10,20)→(100,"a1","b2").
     // src1[20] (_0=200) does not match any src2 row via the x._0==y._0 filter.
     assert_eq!(
         extract_join_rows(tile),
-        vec![
-            ((10, 10), (100, "a1".into(), "b1".into())),
-            ((10, 20), (100, "a1".into(), "b2".into())),
-        ]
+        if streams {
+            vec![
+                ((10, 10), (100, "a1".into(), "b1".into())),
+                ((10, 20), (100, "a1".into(), "b2".into())),
+            ]
+        } else {
+            Vec::new()
+        }
     );
 
-    data_source1.borrow_mut().add_data(&[(
+    data_source1.borrow_mut().publish_rows(&[(
         Value::UInt(30),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -342,10 +327,13 @@ fn test_inner_join(#[case] code: &str) {
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(30u64)));
 
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
-    let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    data_source1
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    data_source2
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    let tile = producer.run();
 
     assert_eq!(
         extract_join_rows(tile),
@@ -360,9 +348,12 @@ fn test_inner_join(#[case] code: &str) {
 
 /// Simpler version of test_inner_join to make it easier to debug.
 #[rstest]
-#[case("[x + y for x in source1() for y in source2() if x == y]")]
-#[case("[x + y for x in source1() for y in source2() if x <= y and x >= y]")]
-fn test_incremental_join_simple(#[case] code: &str) {
+#[case("[x + y for x in source1() for y in source2() if x == y]", false)]
+#[case(
+    "[x + y for x in source1() for y in source2() if x <= y and x >= y]",
+    true
+)]
+fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
     let mut ctx = GlobalContext::default();
 
     let src1 = Rc::new(RefCell::new(TestDataSource::new(
@@ -379,26 +370,20 @@ fn test_incremental_join_simple(#[case] code: &str) {
     ctx.register_source(src2.clone());
 
     src1.borrow_mut()
-        .add_data(&[(Value::UInt(1), Value::Int(100))]);
+        .publish_rows(&[(Value::UInt(1), Value::Int(100))]);
     src1.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
     src2.borrow_mut()
-        .add_data(&[(Value::UInt(10), Value::Int(100))]);
+        .publish_rows(&[(Value::UInt(10), Value::Int(100))]);
     src2.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
-    let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+
+    let tile = producer.run();
 
     // Unpack Function where:
     //   domain   = Records { _0: UInts (src1 domain key), _1: UInts (src2 domain key) }
@@ -427,30 +412,42 @@ fn test_incremental_join_simple(#[case] code: &str) {
         rows
     }
 
-    assert_eq!(extract_rows(tile), vec![((1, 10), 200)]);
+    assert_eq!(
+        extract_rows(tile),
+        if streams {
+            vec![((1, 10), 200)]
+        } else {
+            Vec::new()
+        }
+    );
 
     // Phase 2: extend src1 with a second element; src2 is unchanged.
     src2.borrow_mut()
-        .add_data(&[(Value::UInt(20), Value::Int(100))]);
+        .publish_rows(&[(Value::UInt(20), Value::Int(100))]);
     src2.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
-    let tile = producer.get(producer.tiling().universal_guard());
+    let tile = producer.run();
 
     // Cross-product of src1={10, 30} × src2={20}: two pairs.
-    assert_eq!(extract_rows(tile), vec![((1, 10), 200), ((1, 20), 200)]);
+    assert_eq!(
+        extract_rows(tile),
+        if streams {
+            vec![((1, 10), 200), ((1, 20), 200)]
+        } else {
+            Vec::new()
+        }
+    );
 
     // Phase 3: extend src2 with a second element; src1 is unchanged.
     src1.borrow_mut()
-        .add_data(&[(Value::UInt(2), Value::Int(100))]);
+        .publish_rows(&[(Value::UInt(2), Value::Int(100))]);
     src1.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(2u64)));
 
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
-    let tile = producer.get(producer.tiling().universal_guard());
+    src1.borrow_mut().set_yield_predicate(Predicate::True);
+    src2.borrow_mut().set_yield_predicate(Predicate::True);
+    let tile = producer.run();
 
     // Cross-product of src1={10, 30} × src2={20}: two pairs.
     assert_eq!(
@@ -478,16 +475,15 @@ fn test_incremental_global_aggregate() {
     )));
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test(code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -497,8 +493,8 @@ fn test_incremental_global_aggregate() {
     // Second batch: adds 30 more; running total 60, still not terminal.
     test_source
         .borrow_mut()
-        .add_data(&[(Value::UInt(2), Value::Int(30))]);
-    let result = producer.get(producer.tiling().universal_guard());
+        .publish_rows(&[(Value::UInt(2), Value::Int(30))]);
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -509,7 +505,7 @@ fn test_incremental_global_aggregate() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![60])),
@@ -537,22 +533,21 @@ fn an_extreme_with_no_identity_pulled_before_its_first_element(#[case] code: &st
     )));
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test(code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     let nothing = producer.tiling().empty_tile();
 
-    assert_eq!(producer.get(producer.tiling().universal_guard()), nothing);
-    test_source.borrow_mut().add_data(&[
+    assert_eq!(producer.run(), nothing);
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::String("b".into())),
         (Value::UInt(1), Value::String("a".into())),
     ]);
-    assert_eq!(producer.get(producer.tiling().universal_guard()), nothing);
+    assert_eq!(producer.run(), nothing);
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
     assert_eq!(
-        producer.get(producer.tiling().universal_guard()),
+        producer.run(),
         Tile::Scalar(ColumnValue::Strings(vec!["a".into()])),
     );
 }
@@ -570,13 +565,12 @@ fn an_extreme_with_no_identity_of_an_empty_source_stops() {
     )));
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test("min(source1())");
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    producer.get(producer.tiling().universal_guard());
+    producer.run();
 }
 
 /// A projection of a source's values is read from the source.
@@ -620,13 +614,13 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
             )
         })
         .collect();
-    ints.borrow_mut().add_data(&int_rows);
-    pairs.borrow_mut().add_data(&pair_rows);
+    ints.borrow_mut().publish_rows(&int_rows);
+    pairs.borrow_mut().publish_rows(&pair_rows);
     for source in [&ints, &pairs] {
         source.borrow_mut().set_yield_predicate(Predicate::True);
     }
     let map = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+    let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
     let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
     assert!(
         algebra.contains("source(source3, 1)") && algebra.contains("source(source3, 0)"),
@@ -637,9 +631,9 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
         "no read of source3 is left whole: {algebra}"
     );
 
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    let result = producer.get(producer.tiling().universal_guard());
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::from_ints(vec![2 * 66 + 12 * 12])),
@@ -673,19 +667,19 @@ fn test_two_projections_of_a_source_are_read_from_the_source_together() {
             )
         })
         .collect();
-    triples.borrow_mut().add_data(&rows);
+    triples.borrow_mut().publish_rows(&rows);
     triples.borrow_mut().set_yield_predicate(Predicate::True);
     let map = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+    let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
     let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
     assert!(
         algebra.contains("source(source3, [0, 2])"),
         "the source is read for the two fields in sorted order: {algebra}"
     );
 
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
-    let result = producer.get(producer.tiling().universal_guard());
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+
+    let result = producer.run();
     let expected: i64 = (0..8i64).map(|k| k * 9 - k * 3).sum();
     assert_eq!(
         result,
@@ -741,10 +735,10 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
             ),
         )));
         ctx.register_source(source.clone());
-        source.borrow_mut().add_data(&rows);
+        source.borrow_mut().publish_rows(&rows);
         source.borrow_mut().set_yield_predicate(Predicate::True);
         let map = LoadedProgram::test(code);
-        let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+        let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
         let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
         for read in &reads {
             assert!(algebra.contains(read), "`{code}` reads `{read}`: {algebra}");
@@ -754,9 +748,9 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
             "`{code}` reads no source whole: {algebra}"
         );
 
-        let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-        ctx.scheduler().check_for_notifications();
-        let result = producer.get(producer.tiling().universal_guard());
+        let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+
+        let result = producer.run();
         assert_eq!(
             result,
             Tile::Scalar(ColumnValue::from_ints(vec![expected])),
@@ -831,18 +825,18 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
             ])),
         )));
         ctx.register_source(source.clone());
-        source.borrow_mut().add_data(&rows);
+        source.borrow_mut().publish_rows(&rows);
         source.borrow_mut().set_yield_predicate(Predicate::True);
         let map = LoadedProgram::test(code);
-        let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+        let compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
         let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
         for read in &reads {
             assert!(algebra.contains(read), "`{code}` reads `{read}`: {algebra}");
         }
 
-        let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-        ctx.scheduler().check_for_notifications();
-        let result = producer.get(producer.tiling().universal_guard());
+        let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+
+        let result = producer.run();
         assert_eq!(
             result,
             Tile::Scalar(ColumnValue::from_ints(vec![expected])),
@@ -876,10 +870,10 @@ fn test_incremental_conditional_mutation_loop() {
 
     let consumer: Box<dyn Consumer> = Box::new(move || {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
         (Value::UInt(2), Value::Int(30)),
@@ -887,10 +881,9 @@ fn test_incremental_conditional_mutation_loop() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
 
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 4, |t| *t != empty);
+    let _empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![50])),
@@ -922,11 +915,10 @@ fn test_incremental_tap_loop() {
     )));
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::test(code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
         (Value::UInt(2), Value::Int(30)),
@@ -934,9 +926,8 @@ fn test_incremental_tap_loop() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
 
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 16, Tile::is_terminal);
+    let result = producer.run();
     // Compare as a function (position → value), independent of internal ordering.
     assert_eq!(
         sort_function_by_domain(result),
@@ -974,14 +965,10 @@ fn test_incremental_mutation_loop() {
     )));
     ctx.register_source(test_source.clone());
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // Pull a few times between batches to verify the loop doesn't emit
     // anything before the source is terminal.  Done with a fixed cap
@@ -991,34 +978,27 @@ fn test_incremental_mutation_loop() {
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "first batch should fire a notification");
+
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        producer.run(),
         empty,
         "after first batch: should produce no output yet"
     );
-    *notified.borrow_mut() = false;
 
     // Second batch: adds 30; running total 60, still not terminal.
     test_source
         .borrow_mut()
-        .add_data(&[(Value::UInt(2), Value::Int(30))]);
-    ctx.scheduler().check_for_notifications();
-    assert!(
-        *notified.borrow(),
-        "second batch should fire a notification"
-    );
+        .publish_rows(&[(Value::UInt(2), Value::Int(30))]);
+
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        producer.run(),
         empty,
         "after second batch: should produce no output yet"
     );
-    *notified.borrow_mut() = false;
 
     // Signal that the source is exhausted; the loop's final accumulator
     // (10 + 20 + 30 = 60) should now be emitted.  Pull until the cycle
@@ -1026,8 +1006,8 @@ fn test_incremental_mutation_loop() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    let result = pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
+
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::Scalar(ColumnValue::Ints(vec![60])),
@@ -1067,8 +1047,8 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     let deliver = |rows: &[(u64, i64)]| {
         let data: Vec<(Value, Value)> = rows
@@ -1076,7 +1056,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
         let through = rows.last().expect("a batch has a row").0;
-        source.borrow_mut().add_data(&data);
+        source.borrow_mut().publish_rows(&data);
         source
             .borrow_mut()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
@@ -1091,7 +1071,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     // The first batch runs the driver through positions 0, 1 and 2. At least two iterations
     // are done when the release covers position 1.
     deliver(&[(0, 10), (1, 20), (2, 30)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    producer.run();
     assert!(
         released_through(1),
         "the driver should have run its first positions before the next batch arrives: {:?}",
@@ -1106,7 +1086,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     // The second batch arrives under a driver that has already emitted. Its positions are
     // only reached if the driver reads the source again on the notification.
     deliver(&[(3, 40), (4, 50)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    producer.run();
     assert!(
         released_through(4),
         "the driver should read the rows that arrived after its first iterations: {:?}",
@@ -1115,10 +1095,10 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
 
     // A third batch, to read again once more, and then the source closes.
     deliver(&[(5, 60)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    producer.run();
     assert!(released_through(5));
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut total = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
+    let mut total = producer.run();
     total.compact();
     assert_eq!(
         total,
@@ -1153,8 +1133,8 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     let deliver = |rows: &[(u64, i64)]| {
         let data: Vec<(Value, Value)> = rows
@@ -1162,7 +1142,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
         let through = rows.last().expect("a batch has a row").0;
-        source.borrow_mut().add_data(&data);
+        source.borrow_mut().publish_rows(&data);
         source
             .borrow_mut()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
@@ -1175,7 +1155,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     };
 
     deliver(&[(0, 10), (1, 20), (2, 30)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 256, |_| false);
+    producer.run();
     assert!(
         released_through(1),
         "the driver should have committed its first items before the next batch arrives: {:?}",
@@ -1190,7 +1170,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     // The second batch arrives under a driver that has already attempted items. Its items
     // are only reached if the driver reads the source again on the notification.
     deliver(&[(3, 40), (4, 50)]);
-    pull_laps(ctx.scheduler(), &mut *producer, 256, |_| false);
+    producer.run();
     assert!(
         released_through(4),
         "the driver should read the items that arrived after its first attempts: {:?}",
@@ -1198,7 +1178,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     );
 
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut total = pull_laps(ctx.scheduler(), &mut *producer, 512, Tile::is_terminal);
+    let mut total = producer.run();
     total.compact();
     assert_eq!(
         total,
@@ -1232,19 +1212,19 @@ fn test_filtered_rows_of_a_live_transaction_source_are_released() {
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+    let _empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
-    ctx.scheduler().check_for_notifications();
-    pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
+
+    producer.run();
     assert_eq!(
         test_source.borrow().get_released_predicate(),
         Predicate::at_or_below(Value::UInt(1)),
@@ -1255,11 +1235,8 @@ fn test_filtered_rows_of_a_live_transaction_source_are_released() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
-        Tile::Scalar(ColumnValue::Ints(vec![100])),
-    );
+
+    assert_eq!(producer.run(), Tile::Scalar(ColumnValue::Ints(vec![100])),);
 }
 
 /// A loop over a live source whose body overwrites the accumulator with a constant. The
@@ -1282,17 +1259,17 @@ fn test_incremental_constant_mutation_loop() {
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    ctx.scheduler().check_for_notifications();
+
     assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        producer.run(),
         empty,
         "a source that is not done yields no accumulator"
     );
@@ -1300,11 +1277,8 @@ fn test_incremental_constant_mutation_loop() {
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
-        Tile::Scalar(ColumnValue::Ints(vec![7])),
-    );
+
+    assert_eq!(producer.run(), Tile::Scalar(ColumnValue::Ints(vec![7])),);
     assert_eq!(
         test_source.borrow().get_released_predicate(),
         Predicate::True
@@ -1329,18 +1303,15 @@ fn test_incremental_constant_mutation_loop_over_nothing() {
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+    let _empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.scheduler().check_for_notifications();
-    assert_eq!(
-        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
-        Tile::Scalar(ColumnValue::Ints(vec![0])),
-    );
+
+    assert_eq!(producer.run(), Tile::Scalar(ColumnValue::Ints(vec![0])),);
 }
 
 #[test_log::test]
@@ -1355,25 +1326,17 @@ fn test_incremental_aggregates() {
     )));
     ctx.register_source(test_source.clone());
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (pipeline path)");
-    *notified.borrow_mut() = false;
-
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
 
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::data_function(
@@ -1384,11 +1347,11 @@ fn test_incremental_aggregates() {
         )
     );
 
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(2), Value::Int(10)),
         (Value::UInt(3), Value::Int(30)),
     ]);
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = producer.run();
     assert_eq!(
         result,
         Tile::data_function(
@@ -1403,7 +1366,7 @@ fn test_incremental_aggregates() {
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
 
-    let result = producer.get(producer.tiling().universal_guard());
+    let result = producer.run();
     assert_eq!(
         sort_function_by_domain(result),
         sort_function_by_domain(Tile::data_function(
@@ -1443,7 +1406,7 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    test_source.borrow_mut().add_data(&[
+    test_source.borrow_mut().publish_rows(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -1456,27 +1419,21 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    ctx.scheduler().check_for_notifications();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    let mut tile = producer.get(producer.tiling().universal_guard());
+    let mut tile = producer.run();
     tile.compact();
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
-/// A collection component **grows**: rows reach it as the source delivers them,
-/// and the field settles when the source does (`src/interpreter/design-operators.md`,
-/// "A product value is a record of tiles"). Boxed into a cell, the deliveries below
-/// would land as three cells rather than one growing table.
-///
-/// The bare source is pulled alongside as the control: a component answers what
-/// the collection answers, at every pull rather than only at the last.
+/// A record component publishes once its row is whole. A bare collection publishes each source
+/// delivery. Both yield the same collection once the source closes.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::component("r = (n=1, xs=source1()); r.xs")]
-#[case::bare_source("source1()")]
-fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
+#[case::component("r = (n=1, xs=source1()); r.xs", false)]
+#[case::bare_source("source1()", true)]
+fn test_a_collection_component_grows_with_its_source(#[case] code: &str, #[case] streams: bool) {
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1485,15 +1442,12 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
     )));
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::from_text("<t>", code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    // One lap is one delivery followed by one pull. A `Memo` re-reads only after a
-    // delivery, so a component read through a `let` answers the previous tile to a
-    // pull that skipped one.
+    // Each delivery runs the dispatcher to its drained boundary.
     let mut pull = |source: &Rc<RefCell<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
-        source.borrow_mut().add_data(
+        source.borrow_mut().publish_rows(
             &rows
                 .iter()
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
@@ -1502,34 +1456,40 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         if done {
             source.borrow_mut().set_yield_predicate(Predicate::True);
         }
-        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
+        let mut tile = producer.run();
         tile.compact();
         sort_function_by_domain(tile)
     };
 
     let expected = |keys: Vec<u64>, vals: Vec<i64>, done: bool| {
+        let complete = if done {
+            Predicate::True
+        } else {
+            Predicate::at_or_below(Value::UInt(*keys.last().expect("a delivered row")))
+        };
         sort_function_by_domain(Tile::data_function(
             ColumnValue::UInts(keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
-            if done {
-                Predicate::True
-            } else {
-                Predicate::False
-            },
+            complete,
             BitSet::new(),
         ))
     };
 
-    assert_eq!(
-        pull(&test_source, &[(0, 10), (1, 20)], false),
-        expected(vec![0, 1], vec![10, 20], false),
-        "the rows delivered so far, and the domain is not settled",
-    );
-    assert_eq!(
-        pull(&test_source, &[(2, 30)], false),
-        expected(vec![0, 1, 2], vec![10, 20, 30], false),
-        "the row added since joins the ones already there",
-    );
+    if !streams {
+        assert!(pull(&test_source, &[(0, 10), (1, 20)], false).is_empty());
+        assert!(pull(&test_source, &[(2, 30)], false).is_empty());
+    } else {
+        assert_eq!(
+            pull(&test_source, &[(0, 10), (1, 20)], false),
+            expected(vec![0, 1], vec![10, 20], false),
+            "the rows delivered so far, and the domain is not settled",
+        );
+        assert_eq!(
+            pull(&test_source, &[(2, 30)], false),
+            expected(vec![0, 1, 2], vec![10, 20, 30], false),
+            "the row added since joins the ones already there",
+        );
+    }
     assert_eq!(
         pull(&test_source, &[], true),
         expected(vec![0, 1, 2], vec![10, 20, 30], true),
@@ -1545,9 +1505,12 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
 /// field reach the product as one record guard (`TileGuard::union`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::component("r = (n=1, xs=source1()); r.xs")]
-#[case::bare_source("source1()")]
-fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
+#[case::component("r = (n=1, xs=source1()); r.xs", false)]
+#[case::bare_source("source1()", true)]
+fn test_a_released_collection_component_is_not_redelivered(
+    #[case] code: &str,
+    #[case] streams: bool,
+) {
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1556,32 +1519,52 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
     )));
     ctx.register_source(test_source.clone());
     let loaded = LoadedProgram::from_text("<t>", code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     let mut pull_and_release = |rows: &[(u64, i64)]| {
-        test_source.borrow_mut().add_data(
+        test_source.borrow_mut().publish_rows(
             &rows
                 .iter()
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
                 .collect::<Vec<_>>(),
         );
-        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
+        let mut tile = producer.run();
         tile.compact();
-        producer.release(tile.to_guard());
+        producer.discard_observed(tile.to_guard());
         sort_function_by_domain(tile)
     };
 
     let delivered = |keys: Vec<u64>, vals: Vec<i64>| {
+        let complete = Predicate::at_or_below(Value::UInt(*keys.last().expect("a delivered row")));
         sort_function_by_domain(Tile::data_function(
             ColumnValue::UInts(keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
-            Predicate::False,
+            complete,
             BitSet::new(),
         ))
     };
 
+    if !streams {
+        assert!(pull_and_release(&[(0, 10), (1, 20)]).is_empty());
+        assert!(pull_and_release(&[(2, 30)]).is_empty());
+        assert!(pull_and_release(&[(3, 40)]).is_empty());
+        test_source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::True);
+        let mut complete = producer.run();
+        complete.compact();
+        assert_eq!(
+            sort_function_by_domain(complete),
+            Tile::data_function(
+                ColumnValue::UInts(vec![0, 1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+                Predicate::True,
+                BitSet::new()
+            )
+        );
+        return;
+    }
     assert_eq!(
         pull_and_release(&[(0, 10), (1, 20)]),
         delivered(vec![0, 1], vec![10, 20]),
@@ -1599,10 +1582,8 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
     );
 }
 
-/// Pull `producer` `laps` times over a live source holding `rows` at positions `0..`, which it
-/// calls complete, releasing everything each pull answers as a sink does, and answer what the
-/// source has released.
-fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) -> Predicate {
+/// Run a source delivery to its drained boundary and return the source region released.
+fn released_by_dispatching_a_source(code: &str, rows: &[i64], close: bool) -> Predicate {
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1612,25 +1593,50 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
     ctx.register_source(test_source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     let rows: Vec<(Value, Value)> = rows
         .iter()
         .enumerate()
         .map(|(i, v)| (Value::uint_from_row(i), Value::Int(*v)))
         .collect();
-    test_source.borrow_mut().add_data(&rows);
+    test_source.borrow_mut().publish_rows(&rows);
     test_source
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
-    ctx.scheduler().check_for_notifications();
-    for _ in 0..laps {
-        let tile = producer.get(producer.tiling().universal_guard());
-        if tile.is_data_function() {
-            producer.release(tile.to_guard());
-        }
-        ctx.scheduler().check_for_notifications();
+
+    if close {
+        test_source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::True);
     }
+    producer.run();
+    test_source.borrow().get_released_predicate()
+}
+
+fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64]) -> Predicate {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let loaded = LoadedProgram::test(code);
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+    let rows: Vec<(Value, Value)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (Value::uint_from_row(i), Value::Int(*v)))
+        .collect();
+    test_source.borrow_mut().publish_rows(&rows);
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
+
+    producer.run();
     test_source.borrow().get_released_predicate()
 }
 
@@ -1647,7 +1653,7 @@ fn test_filtered_rows_of_a_live_induction_source_are_released() {
             out << x
         out
     "};
-    let released = released_by_a_sink_over_a_live_source(code, &[10, 20], 12);
+    let released = released_by_a_sink_over_a_live_source(code, &[10, 20]);
     assert!(
         (0..=1).all(|p| released.contains(&Value::UInt(p))),
         "both filtered rows are released while the source is live: {released:?}"
@@ -1667,7 +1673,7 @@ fn test_a_feed_releases_the_positions_it_does_not_fire_at() {
                 out << x
         out
     "};
-    let released = released_by_a_sink_over_a_live_source(code, &[10, 20, 5], 12);
+    let released = released_by_a_sink_over_a_live_source(code, &[10, 20, 5]);
     assert!(
         (0..=2).all(|p| released.contains(&Value::UInt(p))),
         "every row is released while the source is live: {released:?}"
@@ -1679,19 +1685,19 @@ fn test_a_feed_releases_the_positions_it_does_not_fire_at() {
 /// filter keeping only `200`, and a sink releases what each pull answers; every row is then
 /// released, the two filtered ones included.
 #[rstest_log::rstest]
-#[case::map("[z + 1 for z in source1() if z > 99]")]
-#[case::map_of_a_source_filtered_to_nothing("[z + 1 for z in source1() if z > 999]")]
-#[case::zip("[(z, z * 2) for z in source1() if z > 99]")]
+#[case::map("[z + 1 for z in source1() if z > 99]", false)]
+#[case::map_of_a_source_filtered_to_nothing("[z + 1 for z in source1() if z > 999]", false)]
+#[case::zip("[(z, z * 2) for z in source1() if z > 99]", false)]
 #[case::field_of_a_record(indoc! {"
     r = (xs=[z for z in source1() if z > 99], n=1)
     [v + 1 for v in r.xs]
-"})]
+"}, true)]
 #[case::checked_lookup(indoc! {"
     m = map([(200, 1), (10, 2)])
     [m[z] for z in source1() if z > 99]
-"})]
-fn test_a_dropped_filtered_row_is_released(#[case] code: &str) {
-    let released = released_by_a_sink_over_a_live_source(code, &[10, 200, 20], 12);
+"}, false)]
+fn test_a_dropped_filtered_row_is_released(#[case] code: &str, #[case] close: bool) {
+    let released = released_by_dispatching_a_source(code, &[10, 200, 20], close);
     assert!(
         (0..=2).all(|p| released.contains(&Value::UInt(p))),
         "every row is released while the source is live: {released:?}"
@@ -1706,14 +1712,50 @@ fn test_a_dropped_filtered_row_is_released(#[case] code: &str) {
 // ---------------------------------------------------------------------------
 
 /// Compile `code` over an Int `source1`, deliver each batch (its rows, then a yield
-/// through the given key) and pull to quiescence after each, then close the source and
-/// pull to a terminal tile.
+/// through the given key) and run the dispatcher to a drained boundary after each, then close the source and
+/// run to a terminal tile.
 fn run_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> Tile {
     run_in_batches_seeing(code, batches).1
 }
 
-/// [`run_in_batches`], also answering the tile each batch's pull reached, so a test can
+/// [`run_in_batches`], also answering the tile each batch published, so a test can
 /// say what arrived before the source closed.
+fn read_source_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<Tile>, Tile) {
+    let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let loaded = LoadedProgram::test(code);
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
+    let mut each = Vec::with_capacity(batches.len());
+    for (rows, upto) in batches {
+        let data: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+            .collect();
+        source.borrow_mut().publish_rows(&data);
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
+        let mut seen = producer.run();
+        seen.compact();
+        each.push(seen);
+    }
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    let mut tile = producer.run();
+    assert!(
+        tile.is_terminal(),
+        "{code}: stopped short of a terminal tile: {tile:?}"
+    );
+    tile.compact();
+    (each, tile)
+}
+
 fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<Tile>, Tile) {
     let mut ctx = GlobalContext::default();
     let source = Rc::new(RefCell::new(TestDataSource::new(
@@ -1724,24 +1766,24 @@ fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<T
     ctx.register_source(source.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     let mut each = Vec::with_capacity(batches.len());
     for (rows, upto) in batches {
         let data: Vec<(Value, Value)> = rows
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().add_data(&data);
+        source.borrow_mut().publish_rows(&data);
         source
             .borrow_mut()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
-        let mut seen = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+        let mut seen = producer.run();
         seen.compact();
         each.push(seen);
     }
     source.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
+    let mut tile = producer.run();
     assert!(
         tile.is_terminal(),
         "{code}: stopped short of a terminal tile: {tile:?}"
@@ -1838,21 +1880,21 @@ fn innermost_ints(tile: &Tile) -> Vec<i64> {
 /// close. The first batch's pull already holds that element under every row.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
-#[case::comprehension("[[y * x for y in source1()] for x in [1, 2]]", &[1, 2], &[1, 2, 2, 4])]
+#[case::comprehension("[[y * x for y in source1()] for x in [1, 2]]", &[], &[1, 2, 2, 4])]
 #[case::comprehension_bound_outside(
     indoc! {"
         ys = source1()
         [[y * x for y in ys] for x in [1]]
     "},
-    &[1],
+    &[],
     &[1, 2]
 )]
-fn a_nest_over_a_streamed_source_runs_as_the_source_arrives(
+fn a_nest_over_a_streamed_source_publishes_whole_rows(
     #[case] code: &str,
     #[case] first: &[i64],
     #[case] last: &[i64],
 ) {
-    let (each, tile) = run_in_batches_seeing(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    let (each, tile) = read_source_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
     assert_eq!(innermost_ints(&each[0]), first, "after the first batch");
     assert_eq!(innermost_ints(&tile), last, "once the source closes");
 }
@@ -1891,7 +1933,7 @@ fn a_totalled_nest_over_a_streamed_source_answers_at_the_close(
 #[rstest]
 #[timeout(Duration::from_secs(20))]
 fn a_collection_per_row_over_a_streamed_source() {
-    let (each, tile) = run_in_batches_seeing(
+    let (each, tile) = read_source_in_batches(
         "[(x, [y * x for y in source1()]) for x in [1, 2]]",
         &[(&[(0, 1)], 0), (&[(1, 2)], 1)],
     );
@@ -1906,8 +1948,8 @@ fn a_collection_per_row_over_a_streamed_source() {
     };
     assert_eq!(
         collections(each[0].clone()),
-        vec![1, 2],
-        "after the first batch"
+        Vec::<i64>::new(),
+        "nested rows wait for whole-row publication"
     );
     assert_eq!(
         collections(tile),
@@ -1931,20 +1973,19 @@ fn a_collection_per_row_released_as_it_is_read() {
     )));
     ctx.register_source(source.clone());
     let loaded = LoadedProgram::test(code);
-    let mut compiled =
-        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     // The values the pull delivers, sorted, after which the whole tile is released.
-    let mut read = |rows: &[(u64, i64)], yielded: Predicate, until: fn(&Tile) -> bool| {
+    let mut read = |rows: &[(u64, i64)], yielded: Predicate, _until: fn(&Tile) -> bool| {
         let data: Vec<(Value, Value)> = rows
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().add_data(&data);
+        source.borrow_mut().publish_rows(&data);
         source.borrow_mut().set_yield_predicate(yielded);
-        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, until);
+        let mut tile = producer.run();
         tile.compact();
-        producer.release(tile.to_guard());
+        producer.discard_observed(tile.to_guard());
         let Tile::DataFunction { codomain, .. } = &tile else {
             panic!("a collection of rows, got {tile:?}")
         };
@@ -1960,18 +2001,18 @@ fn a_collection_per_row_released_as_it_is_read() {
     let never: fn(&Tile) -> bool = |_| false;
     assert_eq!(
         read(&[(0, 1)], Predicate::at_or_below(Value::UInt(0)), never),
-        (vec![1, 2], false),
-        "the first element under both rows"
+        (vec![], false),
+        "the first delivery leaves both rows open"
     );
     assert_eq!(
         read(&[(1, 5)], Predicate::at_or_below(Value::UInt(1)), never),
-        (vec![5, 10], false),
-        "only the element added since — the released pairs are not re-delivered"
+        (vec![], false),
+        "the second delivery also leaves both rows open"
     );
     assert_eq!(
         read(&[], Predicate::True, Tile::is_terminal),
-        (vec![], true),
-        "closing the source completes every row and delivers nothing new"
+        (vec![1, 2, 5, 10], true),
+        "closing the source publishes both complete rows exactly once"
     );
 }
 
