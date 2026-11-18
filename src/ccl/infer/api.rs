@@ -27,94 +27,6 @@ use crate::ccl::{
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
-// InferArena
-// ---------------------------------------------------------------------------
-
-/// Scope the thread-local state of a run that its [`Solver`] does not hold: the capability
-/// variables given an upper bound, the edges out of `try` bodies and the ordering requirements
-/// ([`crate::ccl::capabilities`]), the predicate derivations coalesce reads, and, in debug
-/// builds, the trait-narrowing audit trail and the requirement sweep's window. Capability
-/// variables keep their state on their handles.
-///
-/// What a run records on its inference, funkind and barrier variables lives in the run's
-/// [`Solver`] and is released with it; see `src/ccl/design/type-inference.md`, "3.2 The solver:
-/// who owns inference variables". Inference is non-reentrant: at most one arena is active per
-/// thread, which debug builds check.
-pub struct InferArena {
-    /// The raw-pointer `PhantomData` suppresses the `Send`/`Sync` auto traits: the state the
-    /// guard scopes is this thread's, so it drops on the thread that opened it. Also
-    /// unconstructible outside this module's `new`.
-    _not_send_sync: std::marker::PhantomData<*const ()>,
-    /// The run's predicate derivations, which coalesce reads to share equal copies of one
-    /// predicate.
-    _derivations: crate::ccl::ccl_utils::RecordingDerivations,
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    /// Whether an [`InferArena`] is open on this thread.
-    static ARENA_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-impl InferArena {
-    /// Open the scope on this thread.
-    pub fn new() -> Self {
-        #[cfg(debug_assertions)]
-        ARENA_OPEN.with(|open| {
-            assert!(
-                !open.replace(true),
-                "inference is non-reentrant: an InferArena is already active on this thread"
-            );
-        });
-        Self::enter();
-        InferArena {
-            _derivations: crate::ccl::ccl_utils::RecordingDerivations::start(),
-            _not_send_sync: std::marker::PhantomData,
-        }
-    }
-
-    /// Clear the scoped state and begin again, for a run that starts over: inference after a
-    /// statement failed ([`super::run_with_params`]).
-    pub(crate) fn restart(&mut self) {
-        Self::exit();
-        Self::enter();
-        self._derivations.restart();
-    }
-
-    fn enter() {
-        crate::ccl::capabilities::upper_arena_enter();
-        // The trait-narrowing audit trail is per-run: checking one run's obligations against
-        // another's graph would resolve variables of a solver that has been dropped.
-        #[cfg(debug_assertions)]
-        crate::ccl::infer::solver::traits::clear_watch_log();
-        // So is the requirement sweep's narrowing window, and for a sharper reason: its mark
-        // indexes a process-global obligation counter, so one left behind by an earlier run on
-        // this thread sits below everything this run mints and would make the check pass
-        // without checking.
-        #[cfg(debug_assertions)]
-        crate::ccl::infer::solver::traits::unseal_emission();
-    }
-
-    fn exit() {
-        crate::ccl::capabilities::upper_arena_exit();
-    }
-}
-
-impl Default for InferArena {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for InferArena {
-    fn drop(&mut self) {
-        Self::exit();
-        #[cfg(debug_assertions)]
-        ARENA_OPEN.with(|open| open.set(false));
-    }
-}
-
-// ---------------------------------------------------------------------------
 // TypeInferenceContext
 // ---------------------------------------------------------------------------
 
@@ -2360,15 +2272,7 @@ pub fn infer(
     expr: &mut Expr,
     ctx: &mut TypeInferenceContext,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    // The arena owns every inference variable minted by the passes below
-    // (captured through the thread-local mint sink). Its lifetime spans both
-    // Pass 1 (constraint emission) and Pass 2 (coalesce); when it drops here
-    // — on the `Ok` and the `?`/error paths alike — its `Drop` clears every
-    // variable's bounds, breaking the `Rc` cycles that would otherwise leak
-    // the whole variable graph. See [`InferArena`].
-    let mut arena = InferArena::new();
     let ty = super::run(
-        &mut arena,
         expr,
         &ctx.source_types,
         &ctx.instances,
@@ -2511,10 +2415,7 @@ pub fn check_module(
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
 ) -> ModuleCheckResult {
-    // The arena tears down every variable the check mints, as for `infer`.
-    let mut arena = InferArena::new();
     let outcome = super::run_with_params(
-        &mut arena,
         expr,
         &ctx.source_types,
         &ctx.instances,

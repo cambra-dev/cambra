@@ -2913,7 +2913,7 @@ impl Subst {
         // builds rather than rewrites), so `born` is the right spelling; the
         // vacuous case returned above kept the source's `Rc` instead.
         let new_pred = Rc::new(new_pred);
-        crate::ccl::ccl_utils::record_derivation(&r.predicate, &new_pred);
+        crate::ccl::ccl_utils::record_derivation(solver, &r.predicate, &new_pred);
         crate::ccl::Refinement::born(new_pred)
     }
 

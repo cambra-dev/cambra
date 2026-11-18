@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::ccl::capabilities::{CapabilityRun, CapabilityState, CapabilityVar};
 use crate::ccl::infer_var::{
     BarrierState, BarrierVar, InferState, InferVar, InferVarId, SuspendedMemberships,
 };
@@ -114,6 +115,10 @@ pub struct Solver {
     funkinds: Table<FunKindVar, FunKindState>,
     /// What is recorded on each barrier variable.
     barriers: Table<BarrierVar, BarrierState>,
+    /// What is recorded on each capability variable.
+    capabilities: Table<CapabilityVar, CapabilityState>,
+    /// What the run records about capabilities beyond each variable's state.
+    pub(crate) capability_run: CapabilityRun,
     /// How many facts have been written to funkind variables: the bounds, stamps and sources
     /// [`FunKindVar::resolved`] reads. Every write bumps it, so an answer cached at the current
     /// count is still the answer.
@@ -124,6 +129,28 @@ pub struct Solver {
     pub(crate) funkind_names: u64,
     /// The memberships recorded on suspensions ([`crate::ccl::infer_var::SuspendedMembership`]).
     pub(crate) suspended_memberships: SuspendedMemberships,
+    /// The predicate each predicate the run derived was derived from
+    /// ([`crate::ccl::ccl_utils::record_derivation`]).
+    pub(crate) derivations: crate::ccl::ccl_utils::Derivations,
+    /// One list per materialization in progress, innermost last
+    /// ([`crate::ccl::infer::solver::coalesce::collecting_memberships`]).
+    pub(crate) pending_memberships:
+        Vec<Vec<crate::ccl::infer::solver::coalesce::PendingMembership>>,
+    /// The variables whose sums are being read, so a cycle through them answers no
+    /// (`compact`'s `projects_a_uint_range`).
+    pub(crate) reading_sums: std::collections::HashSet<InferVarId>,
+    /// Every watch the run has established, the audit trail
+    /// [`crate::ccl::infer::solver::traits::verify_narrowing_is_complete`] checks.
+    #[cfg(debug_assertions)]
+    pub(crate) watch_log: Vec<(
+        Rc<crate::ccl::infer::solver::traits::TraitObligation>,
+        u8,
+        crate::ccl::Type,
+    )>,
+    /// The obligation-counter high-water mark when the requirement sweep finished, or `None`
+    /// before it runs ([`crate::ccl::infer::solver::traits::seal_emission`]).
+    #[cfg(debug_assertions)]
+    pub(crate) emission_mark: Option<u32>,
     /// The substitution entries dropped on reaching a variable, checked when the run ends
     /// ([`crate::ccl::subst::check_dropped_entries`]).
     #[cfg(debug_assertions)]
@@ -154,15 +181,29 @@ impl Solver {
             infer_slots: HashMap::new(),
             funkinds: Table::default(),
             barriers: Table::default(),
+            capabilities: Table::default(),
+            capability_run: CapabilityRun::default(),
             funkind_facts: 0,
             funkind_names: 0,
             suspended_memberships: SuspendedMemberships::default(),
+            derivations: Default::default(),
+            pending_memberships: Vec::new(),
+            reading_sums: Default::default(),
+            #[cfg(debug_assertions)]
+            watch_log: Vec::new(),
+            #[cfg(debug_assertions)]
+            emission_mark: None,
             #[cfg(debug_assertions)]
             dropped: Default::default(),
             held_answers: Vec::new(),
             #[cfg(debug_assertions)]
             fixed_compactions: None,
         }
+    }
+
+    /// This solver's identity.
+    pub(crate) fn id(&self) -> SolverId {
+        self.id
     }
 
     /// The solver of a **graph-free** operation: a type operation run outside every typing
@@ -259,6 +300,40 @@ impl Solver {
         self.barriers.get_mut(self.id, var)
     }
 
+    /// The home the capability variable this solver mints next gets.
+    pub(crate) fn next_capability_home(&self) -> Home {
+        self.reach(format_args!("a fresh capability variable"));
+        self.capabilities.next_home(self.id)
+    }
+
+    /// Take ownership of a capability handle minted at [`Self::next_capability_home`].
+    pub(crate) fn adopt_capability(&mut self, var: &Rc<CapabilityVar>, state: CapabilityState) {
+        self.capabilities.adopt(self.id, var, state);
+    }
+
+    /// What has been recorded on the capability `var`. Only the solver that minted it reads
+    /// it: a capability variable never leaves the run that minted it.
+    pub(crate) fn capability_state(&self, var: &CapabilityVar) -> &CapabilityState {
+        self.reach(format_args!("{var:?}"));
+        self.own_capability(var);
+        self.capabilities.get(self.id, var)
+    }
+
+    /// What has been recorded on the capability `var`, for recording more.
+    pub(crate) fn capability_state_mut(&mut self, var: &CapabilityVar) -> &mut CapabilityState {
+        self.reach(format_args!("{var:?}"));
+        self.own_capability(var);
+        self.capabilities.get_mut(self.id, var)
+    }
+
+    fn own_capability(&self, var: &CapabilityVar) {
+        assert_eq!(
+            var.home().solver,
+            self.id,
+            "{var:?} is read outside the run that minted it"
+        );
+    }
+
     /// The home the funkind variable this solver mints next gets.
     pub(crate) fn next_funkind_home(&self) -> Home {
         self.reach(format_args!("a fresh funkind variable"));
@@ -321,6 +396,15 @@ impl Handle for InferVar {
     }
     fn home(&self) -> Option<Home> {
         InferVar::home(self)
+    }
+}
+
+impl Handle for CapabilityVar {
+    fn key(&self) -> u32 {
+        self.uid.0
+    }
+    fn home(&self) -> Option<Home> {
+        Some(CapabilityVar::home(self))
     }
 }
 

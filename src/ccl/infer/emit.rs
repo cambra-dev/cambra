@@ -161,7 +161,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     // A block's bound copied with the definition is failed by what this use
                     // passes, so it is reported here.
                     for copy in instance.capability_copies.values() {
-                        copy.note_use(node_id);
+                        copy.note_use(ctx.solver(), node_id);
                     }
                     ctx.record_order_assumptions(&instance.capability_copies);
                     ctx.assume_at_use(&instance.obligations);

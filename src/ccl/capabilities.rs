@@ -6,6 +6,7 @@
 //! data function, and its type's capabilities are always [`Capabilities::none`].
 
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::infer::solver::state::Home as SolverHome;
 use crate::ccl::ty::RenderCtx;
 use smol_str::SmolStr;
 use std::{
@@ -114,12 +115,9 @@ impl Hash for OrderableIfRequiredBy {
     }
 }
 
-thread_local! {
-    static ORDER_REQUIREMENTS: RefCell<Option<Vec<Requirement>>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn order_requirements() -> Vec<Requirement> {
-    ORDER_REQUIREMENTS.with(|r| r.borrow().clone().unwrap_or_default())
+/// The ordering requirements the run has recorded ([`Requirement::record`]).
+pub(crate) fn order_requirements(solver: &Solver) -> Vec<Requirement> {
+    solver.capability_run.order_requirements.clone()
 }
 
 impl Requirement {
@@ -189,17 +187,14 @@ impl Requirement {
         self
     }
 
-    pub(crate) fn record(&self) {
+    pub(crate) fn record(&self, solver: &mut Solver) {
         if self.ordering().is_none() {
             return;
         }
-        ORDER_REQUIREMENTS.with(|slot| {
-            if let Some(rs) = slot.borrow_mut().as_mut()
-                && !rs.contains(self)
-            {
-                rs.push(self.clone());
-            }
-        });
+        let rs = &mut solver.capability_run.order_requirements;
+        if !rs.contains(self) {
+            rs.push(self.clone());
+        }
     }
 
     pub fn ordering(&self) -> Option<&Rc<OrderableIfRequiredBy>> {
@@ -433,7 +428,7 @@ impl Raised {
     /// variable generalizes into a type parameter, so it is decided as one ([`covers`]).
     /// `None` while the type may still resolve.
     pub(crate) fn decided_type(&self, solver: &mut Solver) -> Option<crate::ccl::Type> {
-        if SETTLED.with(Cell::get) {
+        if solver.capability_run.settled {
             crate::ccl::infer::solve::resolve_var_type(solver, &self.ty).ok()
         } else {
             self.resolved(solver)
@@ -1666,9 +1661,17 @@ pub struct Children {
     parts: Vec<(Capabilities, Option<Rc<[crate::ccl::Type]>>)>,
     /// Whether the node is a `with begin():` block, which supplies `Transaction`.
     begin: bool,
-    /// The set the parts union, and the count of capability facts it was read at: still the
-    /// answer while no fact has been written since, as for [`CapabilityVar::resolved`].
-    read_at: RefCell<Option<(u64, CapabilitySet)>>,
+    /// The set the parts union, and the solver and its count of capability facts it was read
+    /// at: still the answer while that solver has written no fact since, as for
+    /// [`CapabilityVar::resolved`]. The node holding the union can be shared, and each solver
+    /// counts its own facts, so the count alone names no reading.
+    read_at: RefCell<
+        Option<(
+            crate::ccl::infer::solver::state::SolverId,
+            u64,
+            CapabilitySet,
+        )>,
+    >,
 }
 
 /// Equality and hashing read the parts, not what reading them answered.
@@ -1736,14 +1739,14 @@ impl Children {
 
     /// The set the parts union, read through [`Capabilities::set`].
     fn set(&self, solver: &mut Solver) -> CapabilitySet {
-        let now = capability_facts();
-        if let Some((at, set)) = &*self.read_at.borrow()
-            && *at == now
+        let now = (solver.id(), solver.capability_run.facts);
+        if let Some((id, at, set)) = &*self.read_at.borrow()
+            && (*id, *at) == now
         {
             return set.clone();
         }
         let set = self.union(solver, &mut |solver, part| part.set_in(solver));
-        *self.read_at.borrow_mut() = Some((capability_facts(), set.clone()));
+        *self.read_at.borrow_mut() = Some((solver.id(), solver.capability_run.facts, set.clone()));
         set
     }
 }
@@ -1957,9 +1960,9 @@ impl Eq for Catch {}
 
 /// Mark the exceptions' types resolved: a resolution of a capability variable computed before
 /// now may have let through an exception a [`Catch`] stops.
-pub fn exceptions_settled() {
-    SETTLED.with(|settled| settled.set(true));
-    capability_fact_written();
+pub fn exceptions_settled(solver: &mut Solver) {
+    solver.capability_run.settled = true;
+    solver.capability_run.facts += 1;
 }
 
 impl Catch {
@@ -2039,21 +2042,29 @@ pub struct PartlyCaught {
 /// An edge out of a `try` body, with the variable collecting the body's capabilities.
 type TryEdge = (Rc<Catch>, Rc<CapabilityVar>);
 
-thread_local! {
-    /// Each edge out of a `try` body in the active inference run: a definition's own, and each
-    /// use's copy. `None` outside a run.
-    static TRY_EDGES: RefCell<Option<Vec<TryEdge>>> = const { RefCell::new(None) };
-    /// What [`partly_caught`] has answered in the active run, so each is reported once.
-    static PARTLY_REPORTED: RefCell<HashSet<(NodeId, String, String)>> =
-        RefCell::new(HashSet::new());
-    /// Whether the active run's exceptions' types are settled ([`exceptions_settled`]).
-    static SETTLED: Cell<bool> = const { Cell::new(false) };
+/// What a run records about capabilities beyond each variable's own state.
+#[derive(Default)]
+pub(crate) struct CapabilityRun {
+    /// The ordering requirements recorded ([`Requirement::record`]).
+    order_requirements: Vec<Requirement>,
+    /// Each capability variable given an upper bound, checked once emission is complete
+    /// ([`exceeded_uppers`]).
+    bounded: Vec<Rc<CapabilityVar>>,
+    /// Each edge out of a `try` body: a definition's own, and each use's copy.
+    try_edges: Vec<TryEdge>,
+    /// What [`partly_caught`] has answered, so each is reported once.
+    partly_reported: HashSet<(NodeId, String, String)>,
+    /// Whether the exceptions' types are settled ([`exceptions_settled`]).
+    settled: bool,
+    /// How many facts have been written to capability variables. A resolution computed at the
+    /// current count is still the answer.
+    facts: u64,
 }
 
-/// Each `try` clause of the active run taking part of the type of an exception its body
+/// Each `try` clause of the run taking part of the type of an exception its body
 /// raises, not answered before. Read once the exceptions' types are settled.
 pub(crate) fn partly_caught(solver: &mut Solver) -> Vec<PartlyCaught> {
-    let edges = TRY_EDGES.with(|slot| slot.borrow().clone().unwrap_or_default());
+    let edges = solver.capability_run.try_edges.clone();
     let mut out = Vec::new();
     for (catch, body) in edges {
         for capability in body.resolved(solver) {
@@ -2068,7 +2079,7 @@ pub(crate) fn partly_caught(solver: &mut Solver) -> Vec<PartlyCaught> {
             };
             let clause = catch.clauses[i].clone();
             let key = (catch.node, clause.to_string(), ty.to_string());
-            if PARTLY_REPORTED.with(|reported| reported.borrow_mut().insert(key)) {
+            if solver.capability_run.partly_reported.insert(key) {
                 out.push(PartlyCaught {
                     node: catch.node,
                     clause,
@@ -2180,43 +2191,33 @@ static CAPABILITY_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn next_capability_var_id() -> CapabilityVarId {
     CapabilityVarId(CAPABILITY_VAR_COUNTER.load(Ordering::Relaxed))
 }
-
-thread_local! {
-    /// How many facts have been written to capability variables on this thread. A resolution
-    /// computed at the current count is still the answer.
-    static CAPABILITY_FACTS: Cell<u64> = const { Cell::new(0) };
-}
-
-fn capability_fact_written() {
-    CAPABILITY_FACTS.with(|n| n.set(n.get() + 1));
-}
-
-fn capability_facts() -> u64 {
-    CAPABILITY_FACTS.with(Cell::get)
-}
-
 /// The capabilities of a function type that inference has not finished collecting: the capabilities
 /// recorded on it, and the variables whose capabilities flow into it through a [`Filter`].
 ///
 /// A function body's variable is its type's capabilities, and a call's is the capabilities the call
-/// site expects of its callee. Identity (`uid`) is immutable and outside the cells, so
-/// equality and hashing never read what has been recorded, as for
-/// [`crate::ccl::ty::FunKindVar`].
+/// site expects of its callee. The handle is the variable's identity; what has been recorded on
+/// it is a [`CapabilityState`] in the [`Solver`] that minted it, the only solver that reads it.
 pub struct CapabilityVar {
     pub uid: CapabilityVarId,
-    level: Cell<Level>,
-    own: RefCell<BTreeSet<ScopedCapability>>,
-    incoming: RefCell<Vec<(Rc<CapabilityVar>, Filter)>>,
-    resolved_at: RefCell<Option<(u64, BTreeSet<ScopedCapability>)>>,
+    home: SolverHome,
+}
+
+/// What a run has recorded on a [`CapabilityVar`].
+#[derive(Default)]
+pub(crate) struct CapabilityState {
+    level: Level,
+    own: BTreeSet<ScopedCapability>,
+    incoming: Vec<(Rc<CapabilityVar>, Filter)>,
+    resolved_at: Option<(u64, BTreeSet<ScopedCapability>)>,
     /// The sets this variable may not exceed, checked once emission is complete
     /// ([`exceeded_uppers`]).
-    uppers: RefCell<Vec<Upper>>,
+    uppers: Vec<Upper>,
     /// Where the written function type this variable stands for is written, when a clause
     /// of it ends in `_`, which a bounded clause it reaches then bounds
     /// ([`CapabilityVar::bound_holes_reaching`]).
-    hole: Cell<Option<chl_parser::ast::Span>>,
+    hole: Option<chl_parser::ast::Span>,
     /// An effect input supplied at a use. Empty lower bounds do not establish purity.
-    pub(crate) open_input: Cell<bool>,
+    open_input: bool,
 }
 
 /// A set a [`CapabilityVar`] may not exceed, and what a failure reports.
@@ -2322,35 +2323,7 @@ pub struct Exceeded {
     pub blame: Blame,
 }
 
-thread_local! {
-    /// Every capability variable with an upper bound in the active inference run, with the
-    /// lifetime of `crate::ccl::infer_var`'s arenas. `None` outside a run, where an upper
-    /// bound records nowhere and is not checked.
-    static UPPER_ARENA: RefCell<Option<Vec<Rc<CapabilityVar>>>> = const { RefCell::new(None) };
-}
-
-/// Begin collecting the capability variables given an upper bound, and the edges out of `try`
-/// bodies.
-pub(crate) fn upper_arena_enter() {
-    ORDER_REQUIREMENTS.with(|r| *r.borrow_mut() = Some(Vec::new()));
-    UPPER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
-    TRY_EDGES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
-    PARTLY_REPORTED.with(|reported| reported.borrow_mut().clear());
-    SETTLED.with(|settled| settled.set(false));
-}
-
-/// Stop collecting, and drop each variable's upper bounds.
-pub(crate) fn upper_arena_exit() {
-    ORDER_REQUIREMENTS.with(|r| r.borrow_mut().take());
-    TRY_EDGES.with(|slot| slot.borrow_mut().take());
-    PARTLY_REPORTED.with(|reported| reported.borrow_mut().clear());
-    SETTLED.with(|settled| settled.set(false));
-    for var in UPPER_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default()) {
-        var.uppers.borrow_mut().clear();
-    }
-}
-
-/// Each upper bound of the active run that its variable's capabilities exceed, in the order the
+/// Each upper bound of the run that its variable's capabilities exceed, in the order the
 /// bounds were recorded.
 #[expect(
     clippy::mutable_key_type,
@@ -2358,11 +2331,11 @@ pub(crate) fn upper_arena_exit() {
               and a trait hashes and orders by its module path and name"
 )]
 pub(crate) fn exceeded_uppers(solver: &mut Solver) -> Vec<Exceeded> {
-    let vars = UPPER_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default());
+    let vars = solver.capability_run.bounded.clone();
     let mut out = Vec::new();
     for var in vars {
         let capabilities = var.resolved(solver);
-        for upper in var.uppers.borrow().iter() {
+        for upper in var.uppers(solver).iter() {
             if let Some(capability) = capabilities.iter().find(|l| !upper.admits(solver, &l.item)) {
                 out.push(Exceeded {
                     capability: capability.clone(),
@@ -2375,25 +2348,49 @@ pub(crate) fn exceeded_uppers(solver: &mut Solver) -> Vec<Exceeded> {
 }
 
 impl CapabilityVar {
-    pub fn fresh(level: Level) -> Rc<CapabilityVar> {
-        Rc::new(CapabilityVar {
+    pub fn fresh(solver: &mut Solver, level: Level) -> Rc<CapabilityVar> {
+        let var = Rc::new(CapabilityVar {
             uid: CapabilityVarId(CAPABILITY_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            level: Cell::new(level),
-            own: RefCell::new(BTreeSet::new()),
-            incoming: RefCell::new(Vec::new()),
-            resolved_at: RefCell::new(None),
-            uppers: RefCell::new(Vec::new()),
-            hole: Cell::new(None),
-            open_input: Cell::new(false),
-        })
+            home: solver.next_capability_home(),
+        });
+        solver.adopt_capability(
+            &var,
+            CapabilityState {
+                level,
+                ..CapabilityState::default()
+            },
+        );
+        var
+    }
+
+    pub(crate) fn home(&self) -> SolverHome {
+        self.home
+    }
+
+    fn state<'s>(&self, solver: &'s Solver) -> &'s CapabilityState {
+        solver.capability_state(self)
+    }
+
+    fn state_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut CapabilityState {
+        solver.capability_state_mut(self)
+    }
+
+    /// Whether an effect input supplied at a use flows in here: empty lower bounds do not
+    /// establish purity.
+    pub(crate) fn open_input(&self, solver: &Solver) -> bool {
+        self.state(solver).open_input
+    }
+
+    pub(crate) fn set_open_input(&self, solver: &mut Solver, open: bool) {
+        self.state_mut(solver).open_input = open;
     }
 
     fn has_open_ordering_input(&self, solver: &mut Solver) -> bool {
         let mut seen = HashSet::new();
-        let mut stack = self.incoming();
-        if self.open_input.get()
+        let mut stack = self.incoming(solver);
+        if self.open_input(solver)
             && stack.is_empty()
-            && self.own.borrow().is_empty()
+            && self.state(solver).own.is_empty()
             && !self.excludes_ordering(solver)
         {
             return true;
@@ -2406,8 +2403,8 @@ impl CapabilityVar {
             {
                 continue;
             }
-            let incoming = var.incoming();
-            if var.open_input.get() && incoming.is_empty() && var.own.borrow().is_empty() {
+            let incoming = var.incoming(solver);
+            if var.open_input(solver) && incoming.is_empty() && var.state(solver).own.is_empty() {
                 return true;
             }
             stack.extend(incoming);
@@ -2416,7 +2413,7 @@ impl CapabilityVar {
     }
 
     pub(crate) fn excludes_ordering(&self, solver: &mut Solver) -> bool {
-        self.uppers.borrow().iter().any(|upper| {
+        self.uppers(solver).iter().any(|upper| {
             upper.of_causes
                 && upper.set.named_causes.is_empty()
                 && upper.set.vars.is_empty()
@@ -2430,8 +2427,8 @@ impl CapabilityVar {
 
     /// Mark this variable as a written function type's whose clause ends in `_`, written at
     /// `at`.
-    pub fn mark_hole(&self, at: chl_parser::ast::Span) {
-        self.hole.set(Some(at));
+    pub fn mark_hole(&self, solver: &mut Solver, at: chl_parser::ast::Span) {
+        self.state_mut(solver).hole = Some(at);
     }
 
     /// Bound each hole flowing into this variable by this variable's bounds, through the
@@ -2443,8 +2440,8 @@ impl CapabilityVar {
         reason = "a `Requirement` reaches a `Type` only through its trait declaration, and a \
                   trait hashes and orders by its module path and name"
     )]
-    pub fn bound_holes_reaching(self: &Rc<Self>) {
-        let uppers = self.uppers();
+    pub fn bound_holes_reaching(self: &Rc<Self>, solver: &mut Solver) {
+        let uppers = self.uppers(solver);
         if uppers.is_empty() {
             return;
         }
@@ -2453,7 +2450,7 @@ impl CapabilityVar {
             HashMap::new();
         let mut stack = vec![(Rc::clone(self), BTreeSet::new())];
         while let Some((w, discharged)) = stack.pop() {
-            for (source, filter) in w.incoming() {
+            for (source, filter) in w.incoming(solver) {
                 let mut on_path = discharged.clone();
                 on_path.extend(filter.discharges.iter().cloned());
                 let updated = match reached.get_mut(&source.uid) {
@@ -2475,10 +2472,10 @@ impl CapabilityVar {
             }
         }
         for (hole, discharged) in reached.into_values() {
-            let Some(at) = hole.hole.get() else {
+            let Some(at) = hole.state(solver).hole else {
                 continue;
             };
-            let (requires_closed, causes_closed) = hole.closed();
+            let (requires_closed, causes_closed) = hole.closed(solver);
             for upper in &uppers {
                 let of_requires = upper.of_requires && !requires_closed;
                 let of_causes = upper.of_causes && !causes_closed;
@@ -2497,28 +2494,34 @@ impl CapabilityVar {
                         of_requires
                     };
                     if side {
-                        hole.record(ScopedCapability {
-                            item,
-                            bound: Bound::Escaping,
-                            at: None,
-                        });
+                        hole.record(
+                            solver,
+                            ScopedCapability {
+                                item,
+                                bound: Bound::Escaping,
+                                at: None,
+                            },
+                        );
                     }
                 }
-                hole.bound_above(Upper {
-                    set,
-                    of_requires,
-                    of_causes,
-                    forbidden: upper.forbidden.clone(),
-                    blame: Blame::Written(at),
-                });
+                hole.bound_above(
+                    solver,
+                    Upper {
+                        set,
+                        of_requires,
+                        of_causes,
+                        forbidden: upper.forbidden.clone(),
+                        blame: Blame::Written(at),
+                    },
+                );
             }
         }
     }
 
     /// Bound this variable by `upper`. A set already bounding it is not recorded again, so
     /// a `def`'s `only` clause and the annotation stamping it report once.
-    pub fn bound_above(self: &Rc<Self>, upper: Upper) {
-        let mut uppers = self.uppers.borrow_mut();
+    pub fn bound_above(self: &Rc<Self>, solver: &mut Solver, upper: Upper) {
+        let uppers = &self.state(solver).uppers;
         if uppers.iter().any(|u| {
             u.set == upper.set
                 && u.of_requires == upper.of_requires
@@ -2527,26 +2530,23 @@ impl CapabilityVar {
         }) {
             return;
         }
-        if uppers.is_empty() {
-            UPPER_ARENA.with(|slot| {
-                if let Some(arena) = slot.borrow_mut().as_mut() {
-                    arena.push(Rc::clone(self));
-                }
-            });
+        let first = uppers.is_empty();
+        if first {
+            solver.capability_run.bounded.push(Rc::clone(self));
         }
-        uppers.push(upper);
+        self.state_mut(solver).uppers.push(upper);
     }
 
     /// The sets bounding this variable.
-    pub fn uppers(&self) -> Vec<Upper> {
-        self.uppers.borrow().clone()
+    pub fn uppers(&self, solver: &Solver) -> Vec<Upper> {
+        self.state(solver).uppers.clone()
     }
 
     /// Note that this variable is a copy the use at `at` made of a definition's: a block's
     /// bound on it is failed by what the use passes, so it is reported there. A copy is noted by
     /// the use that made it; a later instantiation reaching the same variable keeps that use.
-    pub fn note_use(&self, at: NodeId) {
-        for upper in self.uppers.borrow_mut().iter_mut() {
+    pub fn note_use(&self, solver: &mut Solver, at: NodeId) {
+        for upper in self.state_mut(solver).uppers.iter_mut() {
             if let Blame::NestedTransaction { used_at, .. } = &mut upper.blame
                 && used_at.is_none()
             {
@@ -2555,45 +2555,48 @@ impl CapabilityVar {
         }
     }
 
-    pub fn level(&self) -> Level {
-        self.level.get()
+    pub fn level(&self, solver: &Solver) -> Level {
+        self.state(solver).level
     }
 
     /// Lower this variable's level to `level`, when a type at a shallower level comes to
     /// hold it: it is no longer local to the scope it was minted in, so an instantiation
     /// of that scope's scheme shares it rather than copying it.
-    pub fn lower_level(&self, level: Level) {
-        if level < self.level.get() {
-            self.level.set(level);
+    pub fn lower_level(&self, solver: &mut Solver, level: Level) {
+        let state = self.state_mut(solver);
+        if level < state.level {
+            state.level = level;
         }
     }
 
     /// Record `capability` on this variable.
-    pub fn record(&self, capability: ScopedCapability) {
-        if self.own.borrow_mut().insert(capability) {
-            capability_fact_written();
+    pub fn record(&self, solver: &mut Solver, capability: ScopedCapability) {
+        if self.state_mut(solver).own.insert(capability) {
+            solver.capability_run.facts += 1;
         }
     }
 
     /// Record that what `source` holds, through `filter`, is held here too.
-    pub fn flows_from(&self, source: &Rc<CapabilityVar>, filter: Filter) {
+    pub fn flows_from(&self, solver: &mut Solver, source: &Rc<CapabilityVar>, filter: Filter) {
         if source.uid == self.uid && filter.discharges.is_empty() {
             return;
         }
-        let mut incoming = self.incoming.borrow_mut();
-        if !incoming
+        if !self
+            .state(solver)
+            .incoming
             .iter()
             .any(|(v, f)| v.uid == source.uid && *f == filter)
         {
             if let Some(catch) = &filter.catches {
-                TRY_EDGES.with(|slot| {
-                    if let Some(edges) = slot.borrow_mut().as_mut() {
-                        edges.push((Rc::clone(catch), Rc::clone(source)));
-                    }
-                });
+                solver
+                    .capability_run
+                    .try_edges
+                    .push((Rc::clone(catch), Rc::clone(source)));
             }
-            incoming.push((Rc::clone(source), filter));
-            capability_fact_written();
+            self.state_mut(solver)
+                .incoming
+                .push((Rc::clone(source), filter));
+            solver.capability_run.facts += 1;
         }
     }
 
@@ -2648,16 +2651,16 @@ impl CapabilityVar {
         let allows = |filter: &Filter| {
             direction.is_none() || filter.of_causes.is_none() || direction == filter.of_causes
         };
-        let own = |v: &CapabilityVar| {
-            v.own
-                .borrow()
+        let own = |solver: &Solver, v: &CapabilityVar| {
+            v.state(solver)
+                .own
                 .iter()
                 .filter(|c| direction.is_none_or(|d| c.item.of_causes() == d))
                 .cloned()
                 .collect::<BTreeSet<_>>()
         };
-        let now = CAPABILITY_FACTS.with(Cell::get);
-        if let Some((at, capabilities)) = &*self.resolved_at.borrow()
+        let now = solver.capability_run.facts;
+        if let Some((at, capabilities)) = &self.state(solver).resolved_at
             && direction.is_none()
             && *at == now
         {
@@ -2668,8 +2671,8 @@ impl CapabilityVar {
         let mut nodes: HashMap<CapabilityVarId, Rc<CapabilityVar>> = HashMap::new();
         let mut stack: Vec<Rc<CapabilityVar>> = Vec::new();
         let mut sets: HashMap<CapabilityVarId, BTreeSet<ScopedCapability>> = HashMap::new();
-        sets.insert(self.uid, own(self));
-        for (v, filter) in self.incoming.borrow().iter() {
+        sets.insert(self.uid, own(solver, self));
+        for (v, filter) in self.state(solver).incoming.iter() {
             if allows(filter) {
                 stack.push(Rc::clone(v));
             }
@@ -2678,26 +2681,26 @@ impl CapabilityVar {
             if v.uid == self.uid || nodes.contains_key(&v.uid) {
                 continue;
             }
-            sets.insert(v.uid, own(&v));
-            for (w, filter) in v.incoming.borrow().iter() {
+            sets.insert(v.uid, own(solver, &v));
+            for (w, filter) in v.state(solver).incoming.iter() {
                 if allows(filter) {
                     stack.push(Rc::clone(w));
                 }
             }
             nodes.insert(v.uid, v);
         }
-        let incoming_of = |uid: CapabilityVarId| -> Vec<(Rc<CapabilityVar>, Filter)> {
+        let incoming_of = |solver: &Solver, uid: CapabilityVarId| {
             if uid == self.uid {
-                self.incoming.borrow().clone()
+                self.incoming(solver)
             } else {
-                nodes[&uid].incoming.borrow().clone()
+                nodes[&uid].incoming(solver)
             }
         };
         let ids: Vec<CapabilityVarId> = sets.keys().copied().collect();
         loop {
             let mut changed = false;
             for &id in &ids {
-                for (src, filter) in incoming_of(id) {
+                for (src, filter) in incoming_of(solver, id) {
                     if !allows(&filter) || !filter.holds(solver) {
                         continue;
                     }
@@ -2707,8 +2710,8 @@ impl CapabilityVar {
                     // error. A `def`'s `only` clause passes on what its body does, which a
                     // caller's constructs, a `try` say, still read.
                     let written: Vec<Upper> = src
+                        .state(solver)
                         .uppers
-                        .borrow()
                         .iter()
                         .filter(|u| matches!(u.blame, Blame::Written(_)))
                         .cloned()
@@ -2739,21 +2742,24 @@ impl CapabilityVar {
         }
         let out = sets.remove(&self.uid).expect("the variable's own set");
         if direction.is_none() {
-            *self.resolved_at.borrow_mut() = Some((now, out.clone()));
+            self.state_mut(solver).resolved_at = Some((now, out.clone()));
         }
         out
     }
 
     /// This variable and every variable flowing into it, through edges whose filters hold
     /// or do not.
-    pub fn reaching(self: &Rc<Self>) -> BTreeMap<CapabilityVarId, Rc<CapabilityVar>> {
+    pub fn reaching(
+        self: &Rc<Self>,
+        solver: &Solver,
+    ) -> BTreeMap<CapabilityVarId, Rc<CapabilityVar>> {
         let mut out = BTreeMap::new();
         let mut stack = vec![Rc::clone(self)];
         while let Some(v) = stack.pop() {
             if out.contains_key(&v.uid) {
                 continue;
             }
-            stack.extend(v.incoming().into_iter().map(|(w, _)| w));
+            stack.extend(v.incoming(solver).into_iter().map(|(w, _)| w));
             out.insert(v.uid, v);
         }
         out
@@ -2761,8 +2767,8 @@ impl CapabilityVar {
 
     /// Whether an upper bound closes the requirements, and the effects, this variable
     /// holds: a written clause without `_` states them exactly.
-    pub fn closed(&self) -> (bool, bool) {
-        let uppers = self.uppers.borrow();
+    pub fn closed(&self, solver: &Solver) -> (bool, bool) {
+        let uppers = &self.state(solver).uppers;
         (
             uppers.iter().any(|u| u.of_requires),
             uppers.iter().any(|u| u.of_causes),
@@ -2770,11 +2776,11 @@ impl CapabilityVar {
     }
 
     /// Whether `pred` holds of this variable or of any variable flowing into it.
-    pub fn reaches(&self, pred: &dyn Fn(&CapabilityVar) -> bool) -> bool {
+    pub fn reaches(&self, solver: &Solver, pred: &dyn Fn(&Solver, &CapabilityVar) -> bool) -> bool {
         let mut seen = HashSet::new();
         let mut stack: Vec<Rc<CapabilityVar>> =
-            self.incoming().into_iter().map(|(v, _)| v).collect();
-        if pred(self) {
+            self.incoming(solver).into_iter().map(|(v, _)| v).collect();
+        if pred(solver, self) {
             return true;
         }
         seen.insert(self.uid);
@@ -2782,10 +2788,10 @@ impl CapabilityVar {
             if !seen.insert(v.uid) {
                 continue;
             }
-            if pred(&v) {
+            if pred(solver, &v) {
                 return true;
             }
-            stack.extend(v.incoming().into_iter().map(|(w, _)| w));
+            stack.extend(v.incoming(solver).into_iter().map(|(w, _)| w));
         }
         false
     }
@@ -2796,13 +2802,13 @@ impl CapabilityVar {
         reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
                   and a trait hashes and orders by its module path and name"
     )]
-    pub fn own(&self) -> BTreeSet<ScopedCapability> {
-        self.own.borrow().clone()
+    pub fn own(&self, solver: &Solver) -> BTreeSet<ScopedCapability> {
+        self.state(solver).own.clone()
     }
 
     /// The edges into this variable.
-    pub fn incoming(&self) -> Vec<(Rc<CapabilityVar>, Filter)> {
-        self.incoming.borrow().clone()
+    pub fn incoming(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Filter)> {
+        self.state(solver).incoming.clone()
     }
 }
 
@@ -3054,14 +3060,14 @@ impl Capabilities {
     }
 
     /// The level of a variable, the deepest of a union's parts, and 0 for a known set.
-    pub fn level(&self) -> Level {
+    pub fn level(&self, solver: &Solver) -> Level {
         match self.repr() {
             Repr::Known(_) | Repr::Written(_) => 0,
-            Repr::Var(v) => v.level(),
+            Repr::Var(v) => v.level(solver),
             Repr::Children(children) => children
                 .parts
                 .iter()
-                .map(|(part, _)| part.level())
+                .map(|(part, _)| part.level(solver))
                 .max()
                 .unwrap_or(0),
         }
@@ -3516,8 +3522,8 @@ pub fn own_state_as_module(
 /// left open by its body is polymorphic in it, as it is in an open type
 /// (`docs/chl-spec.md`, "Writing requirements and effects"), and `type_level` leaves capabilities
 /// out.
-pub fn input_capability_level(ty: &crate::ccl::Type) -> Level {
-    fn go(ty: &crate::ccl::Type, positive: bool) -> Level {
+pub fn input_capability_level(solver: &Solver, ty: &crate::ccl::Type) -> Level {
+    fn go(solver: &Solver, ty: &crate::ccl::Type, positive: bool) -> Level {
         match ty {
             crate::ccl::Type::Fun {
                 domain,
@@ -3526,19 +3532,20 @@ pub fn input_capability_level(ty: &crate::ccl::Type) -> Level {
                 ..
             } => {
                 let own = match capabilities.repr() {
-                    Repr::Var(v) if !positive => v.level(),
+                    Repr::Var(v) if !positive => v.level(solver),
                     _ => 0,
                 };
-                own.max(go(domain, !positive)).max(go(codomain, positive))
+                own.max(go(solver, domain, !positive))
+                    .max(go(solver, codomain, positive))
             }
             other => {
                 let mut level = 0;
-                other.walk_children(|child| level = level.max(go(child, positive)));
+                other.walk_children(|child| level = level.max(go(solver, child, positive)));
                 level
             }
         }
     }
-    go(ty, true)
+    go(solver, ty, true)
 }
 
 /// Lower every capability variable in `ty` to at most `level`: `ty` is becoming a bound of a
@@ -3547,13 +3554,13 @@ pub fn input_capability_level(ty: &crate::ccl::Type) -> Level {
 /// Separate from [`crate::ccl::infer::solver::type_level`], which leaves capabilities out: an
 /// capability variable decides nothing about whether a definition is polymorphic, and counting it
 /// there would generalize every function.
-pub fn lower_capability_levels(ty: &crate::ccl::Type, level: Level) {
+pub fn lower_capability_levels(solver: &mut Solver, ty: &crate::ccl::Type, level: Level) {
     if let crate::ccl::Type::Fun { capabilities, .. } = ty
         && let Repr::Var(v) = capabilities.repr()
     {
-        v.lower_level(level);
+        v.lower_level(solver, level);
     }
-    ty.walk_children(|child| lower_capability_levels(child, level));
+    ty.walk_children(|child| lower_capability_levels(solver, child, level));
 }
 
 #[cfg(test)]

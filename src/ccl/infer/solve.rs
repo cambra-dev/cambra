@@ -2362,9 +2362,10 @@ fn resolve_binder_slot(
     level: Level,
     ctx: &mut CoalesceCtx,
 ) {
-    let (resolved, pending) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
-        resolve_var_type(solver, slot)
-    });
+    let (resolved, pending) =
+        crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
+            resolve_var_type(solver, slot)
+        });
     let label = label();
     match resolved {
         Ok(ty) => *slot = ty,
@@ -2425,9 +2426,10 @@ fn decide_suspended_memberships(solver: &mut Solver, root: NodeId, ctx: &mut Coa
             _ => root,
         };
         let label = "a membership recorded on a suspension".to_string();
-        let (resolved, _) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
-            resolve_var_type(solver, &sum)
-        });
+        let (resolved, _) =
+            crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
+                resolve_var_type(solver, &sum)
+            });
         let mut sum = match resolved {
             Ok(sum) => sum,
             Err(err) => {
@@ -2945,7 +2947,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         TypedExprNode::Feed { value, row, .. } => {
             coalesce_node(solver, value, level, ctx);
             let (resolved, pending) =
-                crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
+                crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
                     resolve_var_type(solver, row)
                 });
             if let Ok(ty) = resolved {
@@ -3081,9 +3083,10 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         return;
     }
     let label = crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), expr);
-    let (resolved, pending) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
-        resolve_var_type(solver, &expr.ty)
-    });
+    let (resolved, pending) =
+        crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
+            resolve_var_type(solver, &expr.ty)
+        });
     match resolved {
         // A node every path through which raises has no value, so nothing bounds its type
         // from below: it stands at what its position expects of it. Its own variable resolves
@@ -3752,9 +3755,9 @@ fn coalesce_type_predicates_go(
                     crate::ccl::ccl_utils::type_element_reads_from_base(pred, &base);
                     true
                 });
-                crate::ccl::ccl_utils::record_derivation(&entered, &r.predicate);
+                crate::ccl::ccl_utils::record_derivation(solver, &entered, &r.predicate);
                 *r = scope.close(solver, r);
-                share_with_its_origin(ctx, r);
+                share_with_its_origin(solver, ctx, r);
             });
         }
         Type::Fun {
@@ -3880,8 +3883,8 @@ fn coalesce_type_predicates_go(
 /// compares refinements nested in type slots type-blind, and two copies made under different
 /// substitutions can differ there in the names they read, so both reads are compared too: the
 /// allocation kept is in scope wherever the discarded one was.
-fn share_with_its_origin(ctx: &mut CoalesceCtx, r: &mut crate::ccl::Refinement) {
-    let origin = crate::ccl::ccl_utils::derivation_origin(&r.predicate);
+fn share_with_its_origin(solver: &Solver, ctx: &mut CoalesceCtx, r: &mut crate::ccl::Refinement) {
+    let origin = crate::ccl::ccl_utils::derivation_origin(solver, &r.predicate);
     let made = &mut ctx
         .coalesced_by_origin
         .entry(Rc::as_ptr(&origin))
@@ -5292,7 +5295,6 @@ mod tests {
     #[test]
     fn unresolved_materialization_preserves_variable_identity() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let first = crate::ccl::infer::solver::fresh_var(solver, 0);
         let second = crate::ccl::infer::solver::fresh_var(solver, 0);
         let mut resolve = |ty: &Type| {
