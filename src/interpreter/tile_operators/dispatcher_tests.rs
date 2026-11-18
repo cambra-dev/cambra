@@ -1,8 +1,9 @@
 //! The dispatcher of `crate::interpreter::dispatcher` driving real breakers and scripted ones over
 //! scripted inputs.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 
 use std::collections::BTreeSet;
 
@@ -30,7 +31,7 @@ const UNBOUNDED: usize = usize::MAX;
 /// A breaker the test keeps a typed handle on, and passes to the driver as a [`BreakerHandle`].
 // shared-state-ok: the test reads the breaker through this handle after the driver has run it; no
 // tile passes between operators through it.
-type Held<T> = Rc<RefCell<T>>;
+type Held<T> = Arc<RwLock<T>>;
 
 fn consume(pipeline: usize, guard: TileGuard) -> Event {
     Event::Consume {
@@ -44,14 +45,14 @@ fn finished(pipeline: usize) -> Event {
 }
 
 fn memo_over_rows(rows: std::ops::Range<u64>) -> Held<MemoProducer> {
-    Rc::new(RefCell::new(MemoProducer::over(
+    Arc::new(RwLock::new(MemoProducer::over(
         Box::new(Input::over(&source(rows))),
         &ints(),
     )))
 }
 
 fn memo_reading(read: &BreakerHandle) -> Held<MemoProducer> {
-    Rc::new(RefCell::new(MemoProducer::over(
+    Arc::new(RwLock::new(MemoProducer::over(
         Box::new(ReadsBreaker::of(read)),
         &ints(),
     )))
@@ -111,7 +112,7 @@ impl Scripted {
         held: TileGuard,
         releases: Option<TileGuard>,
     ) -> Held<Scripted> {
-        Rc::new(RefCell::new(Scripted {
+        Arc::new(RwLock::new(Scripted {
             base: ProducerBase::unowned(Self::alloc_id(), &ints()),
             input,
             held,
@@ -123,7 +124,7 @@ impl Scripted {
     /// A breaker that holds `held` and cuts it into `cut`.
     fn cutting(held: TileGuard, cut: Vec<TileGuard>) -> Held<Scripted> {
         let scripted = Self::holding(held);
-        scripted.borrow_mut().cut = Some(cut);
+        scripted.write().unwrap_or_else(PoisonError::into_inner).cut = Some(cut);
         scripted
     }
 }
@@ -180,7 +181,12 @@ fn one_pipeline_consumes_everything_then_finishes() {
         vec![consume(0, ints().universal_guard()), finished(0)]
     );
     assert_eq!(
-        entries(&memo.borrow_mut().get(ints().universal_guard())),
+        entries(
+            &memo
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(ints().universal_guard())
+        ),
         rows_of(0..6)
     );
 }
@@ -206,7 +212,12 @@ fn a_reader_memo_consumes_the_guard_its_source_pushed() {
         ]
     );
     assert_eq!(
-        entries(&reader.borrow_mut().get(ints().universal_guard())),
+        entries(
+            &reader
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(ints().universal_guard())
+        ),
         rows_of(0..6)
     );
 }
@@ -220,12 +231,17 @@ fn an_aggregate_folds_what_the_memo_below_it_pushed() {
     let events = run_over(vec![vec![], vec![0]], &[memo_handle, sum.clone()]);
     assert_eq!(events[1], consume(1, ints().universal_guard()));
     assert!(
-        memo.borrow().final_guard().is_empty(),
+        memo.read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .final_guard()
+            .is_empty(),
         "the aggregate released what it read"
     );
     let total: i64 = (0..6).map(value).sum();
-    let Tile::Aggregation { accumulator, .. } =
-        sum.borrow_mut().get(sum_tiling().universal_guard())
+    let Tile::Aggregation { accumulator, .. } = sum
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sum_tiling().universal_guard())
     else {
         panic!("an aggregation")
     };
@@ -236,14 +252,24 @@ fn an_aggregate_folds_what_the_memo_below_it_pushed() {
 #[test]
 fn a_partly_released_breaker_pushes_only_what_is_left() {
     let memo = memo_over_rows(0..6);
-    memo.borrow_mut().begin_run();
-    memo.borrow_mut()
+    memo.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .begin_run();
+    memo.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .consume_impl(InputId::ONLY, ints().universal_guard());
-    memo.borrow_mut().release(keys_between(2, 3));
-    push_to(&mut *memo.borrow_mut(), &[1]);
+    memo.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .release(keys_between(2, 3));
+    push_to(
+        &mut *memo.write().unwrap_or_else(PoisonError::into_inner),
+        &[1],
+    );
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        memo.borrow_mut().finish(InputId::ONLY, pushes)
+        memo.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     let package = dispatcher.pop().expect("one package for the reader");
     assert_eq!(package.pipeline, PipelineId(1));
@@ -480,9 +506,13 @@ fn finish_with_a_package_queued_panics() {
     ];
     wire(&[vec![], vec![0]], &breakers);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    breakers[0].borrow_mut().begin_run();
     breakers[0]
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .begin_run();
+    breakers[0]
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .consume_impl(InputId::ONLY, ints().universal_guard());
     dispatcher.close(PipelineId(0));
     finish_pipeline(&dispatcher, &breakers, PipelineId(0));
@@ -643,11 +673,11 @@ enum Top {
 fn run_chain(top: Top, rows: usize) -> (Vec<Event>, Shared, BreakerHandle, Tiling) {
     let source = source(SPARSE);
     let base: BreakerHandle = match top {
-        Top::MapSum | Top::MapSumThenMemo => Rc::new(RefCell::new(MemoProducer::over(
+        Top::MapSum | Top::MapSumThenMemo => Arc::new(RwLock::new(MemoProducer::over(
             Box::new(NestedInput::over(&source)),
             &nested_tiling(),
         ))),
-        _ => Rc::new(RefCell::new(MemoProducer::over(
+        _ => Arc::new(RwLock::new(MemoProducer::over(
             Box::new(Input::over(&source)),
             &ints(),
         ))),
@@ -677,7 +707,7 @@ fn run_chain(top: Top, rows: usize) -> (Vec<Event>, Shared, BreakerHandle, Tilin
             );
             breakers.push(middle.clone());
             let memo: BreakerHandle =
-                Rc::new(RefCell::new(MemoProducer::over(reading(&middle), &tiling)));
+                Arc::new(RwLock::new(MemoProducer::over(reading(&middle), &tiling)));
             (memo, tiling)
         }
     };
@@ -729,8 +759,14 @@ fn every_chain_answers_the_same_at_every_morsel_size() {
     ] {
         let outcome = |rows| {
             let (_, _, breaker, tiling) = run_chain(top, rows);
-            let held = breaker.borrow().final_guard();
-            let answer = breaker.borrow_mut().get(tiling.universal_guard());
+            let held = breaker
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .final_guard();
+            let answer = breaker
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(tiling.universal_guard());
             (held, answer.to_guard(), rows_only(answer))
         };
         let whole = outcome(UNBOUNDED);
@@ -750,7 +786,10 @@ fn an_aggregate_over_a_memo_becomes_terminal_at_every_morsel_size() {
             accumulator,
             terminal,
             ..
-        } = sum.borrow_mut().get(sum_tiling().universal_guard())
+        } = sum
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(sum_tiling().universal_guard())
         else {
             panic!("an aggregation")
         };
@@ -770,7 +809,10 @@ fn an_extraction_over_a_memo_extracts_at_every_morsel_size() {
     for rows in [1, 3, UNBOUNDED] {
         let (_, _, extract, _) = run_chain(Top::Final, rows);
         assert_eq!(
-            extract.borrow_mut().get(int().universal_guard()),
+            extract
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(int().universal_guard()),
             Tile::Scalar(ColumnValue::Ints(vec![value(11)])),
             "at morsels of {rows}"
         );
@@ -786,7 +828,7 @@ fn an_extraction_over_a_memo_extracts_at_every_morsel_size() {
 #[test]
 fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
     let source = source(SPARSE);
-    let memo: BreakerHandle = Rc::new(RefCell::new(MemoProducer::over(
+    let memo: BreakerHandle = Arc::new(RwLock::new(MemoProducer::over(
         Box::new(Input::over(&source)),
         &ints(),
     )));
@@ -802,7 +844,11 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
         ]
     );
     assert_eq!(partition_gap(&ints().universal_guard(), &morsels), None);
-    assert_eq!(source.borrow().pulled, morsels, "one pull per morsel");
+    assert_eq!(
+        source.read().unwrap_or_else(PoisonError::into_inner).pulled,
+        morsels,
+        "one pull per morsel"
+    );
     let (_, before) = morsels.split_last().expect("three morsels");
     let released_twice: Vec<_> = before
         .iter()
@@ -811,7 +857,10 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
         .flat_map(|morsel| [morsel.clone(), morsel])
         .collect();
     assert_eq!(
-        source.borrow().released,
+        source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .released,
         released_twice,
         "two releases per morsel"
     );
@@ -852,14 +901,24 @@ fn a_memos_morsels_partition_its_final_guard_and_leave_out_released_keys() {
 #[test]
 fn a_partly_released_source_pushes_morsels_over_what_is_left() {
     let memo = memo_over_rows(0..6);
-    memo.borrow_mut().begin_run();
-    memo.borrow_mut()
+    memo.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .begin_run();
+    memo.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .consume_impl(InputId::ONLY, ints().universal_guard());
-    memo.borrow_mut().release(keys_between(2, 3));
-    push_to(&mut *memo.borrow_mut(), &[1]);
+    memo.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .release(keys_between(2, 3));
+    push_to(
+        &mut *memo.write().unwrap_or_else(PoisonError::into_inner),
+        &[1],
+    );
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        memo.borrow_mut().finish(InputId::ONLY, pushes)
+        memo.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     let mut morsels = Vec::new();
     while let Some(package) = dispatcher.pop() {
@@ -873,13 +932,21 @@ fn a_partly_released_source_pushes_morsels_over_what_is_left() {
 #[test]
 fn a_breaker_of_one_value_pushes_one_morsel() {
     let sum = aggregate_over(Box::new(Input::over(&source(SPARSE))), &sum_tiling());
-    sum.borrow_mut().begin_run();
-    sum.borrow_mut()
+    sum.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .begin_run();
+    sum.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .consume_impl(InputId::ONLY, ints().universal_guard());
-    push_to(&mut *sum.borrow_mut(), &[1]);
+    push_to(
+        &mut *sum.write().unwrap_or_else(PoisonError::into_inner),
+        &[1],
+    );
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        sum.borrow_mut().finish(InputId::ONLY, pushes)
+        sum.write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     let package = dispatcher.pop().expect("one morsel");
     assert_eq!(package.guard, sum_tiling().universal_guard());
@@ -923,13 +990,15 @@ fn random_morsel_sizes_partition_and_answer_the_same() {
         }
 
         let total = |rows| {
-            let memo: BreakerHandle = Rc::new(RefCell::new(MemoProducer::over(
+            let memo: BreakerHandle = Arc::new(RwLock::new(MemoProducer::over(
                 Box::new(Input::over(&source_rows(&keys))),
                 &ints(),
             )));
             let sum = aggregate_over(Box::new(ReadsBreaker::of(&memo)), &sum_tiling());
             run_cut(vec![vec![], vec![0]], &[memo, sum.clone()], rows);
-            sum.borrow_mut().get(sum_tiling().universal_guard())
+            sum.write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(sum_tiling().universal_guard())
         };
         assert_eq!(total(rows), total(UNBOUNDED), "{trace}");
     }
@@ -942,10 +1011,16 @@ fn random_morsel_sizes_partition_and_answer_the_same() {
 fn overlapping_morsels_are_refused() {
     let cut = vec![keys_between(0, 5), ints().universal_guard()];
     let breaker = Scripted::cutting(ints().universal_guard(), cut);
-    push_to(&mut *breaker.borrow_mut(), &[1]);
+    push_to(
+        &mut *breaker.write().unwrap_or_else(PoisonError::into_inner),
+        &[1],
+    );
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        breaker.borrow_mut().finish(InputId::ONLY, pushes)
+        breaker
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
 }
 
@@ -992,7 +1067,10 @@ fn a_final_guard_pushed_twice_is_pushed_once() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         for _ in 0..2 {
-            breakers[0].borrow_mut().finish(InputId::ONLY, pushes);
+            breakers[0]
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .finish(InputId::ONLY, pushes);
         }
     });
     let pushed: Vec<_> = std::iter::from_fn(|| dispatcher.pop())
@@ -1082,7 +1160,10 @@ fn ordered_reader() -> (Dispatcher, Vec<BreakerHandle>) {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.order(PipelineId(1));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        breakers[0].borrow_mut().finish(InputId::ONLY, pushes)
+        breakers[0]
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     (dispatcher, breakers)
 }
@@ -1363,18 +1444,21 @@ fn an_aggregate_pushes_its_value_once_it_is_final() {
     );
     let total: i64 = (0..6).map(value).sum();
     assert_eq!(
-        extract.borrow_mut().get(scalar.universal_guard()),
+        extract
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(scalar.universal_guard()),
         Tile::Scalar(ColumnValue::Ints(vec![total]))
     );
 }
 
 /// A consumer that hands everything to the boxed consumer it holds, so a test can share one
-/// behind an `Rc` as a breaker's push target.
+/// behind an `Arc` as a breaker's push target.
 struct Boxed(Box<dyn Consumer>);
 
 impl Consumer for Boxed {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -1434,12 +1518,16 @@ fn a_push_lands_restated_by_the_chain_and_past_the_gate() {
     let shared = gated_entry(&input);
     let arm = forwarding_consumer_tagging(&shared, FieldKey::Index(1));
     scripted
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Boxed(arm))));
+        .pushing_to(Arc::new(Boxed(arm)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+        scripted
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| package.guard)
@@ -1465,12 +1553,16 @@ fn a_push_naming_every_tag_whole_lands_universal() {
     let shared = gated_entry(&input);
     let path = forwarding_consumer_keeping_keys(&shared);
     scripted
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Boxed(path))));
+        .pushing_to(Arc::new(Boxed(path)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+        scripted
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| package.guard)
@@ -1483,18 +1575,18 @@ struct Paths(Vec<Box<dyn Consumer>>);
 
 impl Consumer for Paths {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        for path in &mut self.0 {
+        for path in &self.0 {
             path.notify(region, landing);
         }
     }
 }
 
 /// The routes a push of key 0 takes through `consumer` ([`Landing::route`]).
-fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
+fn walk(consumer: &dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
     let mut landing = crate::interpreter::dispatcher::Landing::route();
     consumer.notify(
         &Projection::admitting(Predicate::point(Value::UInt(0))),
@@ -1510,11 +1602,11 @@ fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Rout
 fn a_route_walk_and_a_probe_record_whether_each_path_keeps_its_keys() {
     let shared = gated_entry(&ints());
 
-    let mut paths = Paths(vec![
+    let paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
     ]);
-    let reached: Vec<_> = walk(&mut paths)
+    let reached: Vec<_> = walk(&paths)
         .into_iter()
         .map(|route| route.pipeline)
         .collect();
@@ -1541,27 +1633,37 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
     struct Cycle(test_helpers::InputConsumer);
     impl Consumer for Cycle {
         fn notify(
-            &mut self,
+            &self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
-            if let Some(back) = self.0.borrow_mut().as_mut() {
+            let back = self
+                .0
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(back) = back {
                 back.notify(region, landing);
             }
         }
     }
-    let back = Rc::new(RefCell::new(None));
+    let back = Arc::new(RwLock::new(None));
     let shared = shared_consumer(Box::new(Cycle(back.clone())));
-    *back.borrow_mut() = Some(forwarding_consumer_keeping_keys(&shared));
+    *back.write().unwrap_or_else(PoisonError::into_inner) =
+        Some(forwarding_consumer_keeping_keys(&shared).into());
     let scripted = Scripted::cutting(keys_between(0, 1), vec![keys_between(0, 1)]);
     let path = forwarding_consumer_keeping_keys(&shared);
     scripted
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Boxed(path))));
+        .pushing_to(Arc::new(Boxed(path)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+        scripted
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
 }
 
@@ -1578,23 +1680,27 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
     );
     let scripted = Scripted::cutting(ints().universal_guard(), vec![low.clone(), high.clone()]);
     let (feed, input) = NotifyingOp::new(ints().empty_tile(), ints());
-    let fan = FanOut::new(Box::new(feed));
+    let fan = FanOut::new(std::sync::Arc::new(feed));
     let mut cx = SubscribeContext::new();
     let _slots: Vec<_> = (1..=2)
         .map(|reader| {
             let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(reader), ints());
-            let mut slot = fan.slot();
+            let slot = fan.slot();
             let guard = slot.tiling().universal_guard();
-            slot.subscribe(guard, Box::new(entry), &mut cx)
+            slot.clone().subscribe(guard, Box::new(entry), &mut cx)
         })
         .collect();
     scripted
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Rc::new(RefCell::new(Through(input))));
+        .pushing_to(Arc::new(Through(input)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+        scripted
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish(InputId::ONLY, pushes)
     });
     let mut queued: Vec<(usize, TileGuard)> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| (package.pipeline.0, package.guard))
@@ -1611,15 +1717,11 @@ struct Through(test_helpers::InputConsumer);
 
 impl Consumer for Through {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.0
-            .borrow_mut()
-            .as_mut()
-            .expect("the operator was subscribed")
-            .notify(region, landing);
+        test_helpers::subscribed(&self.0).notify(region, landing);
     }
 }
 
@@ -1684,7 +1786,9 @@ fn appended_shared_pushes_are_deduplicated_without_reusing_the_original_graphs_r
     for pipeline in [0, 2, 3] {
         let mut pushes = dispatcher.pushes(PipelineId(pipeline));
         {
-            let breaker = breakers[pipeline].borrow();
+            let breaker = breakers[pipeline]
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             pushes.push_final(breaker.as_producer().expect("a scripted breaker pushes"));
         }
         dispatcher.land(pushes);
