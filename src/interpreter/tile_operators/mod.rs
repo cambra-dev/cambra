@@ -905,10 +905,12 @@ pub struct ProducerBase {
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
     #[cfg(test)]
-    pub(crate) reads: u64,
+    pub(crate) reads: std::cell::Cell<u64>,
     /// The last tile `get` returned, for the debug check that the complete region never
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
-    pub(crate) last_output: Option<Tile>,
+    // shared-state-ok: this producer's debug record of its last output, which `get` changes
+    // through `&self`; no other operator holds it.
+    pub(crate) last_output: RefCell<Option<Tile>>,
     /// For a pipeline breaker, the consumer its pushes climb (`dispatcher::Pushes`), which is
     /// its reader's chain; for a range (`IterateExtent`), the consumer a planner pushes its region
     /// through once. `None` for every other producer.
@@ -916,36 +918,9 @@ pub struct ProducerBase {
     /// For a pipeline breaker, the pipeline the [`Entry`](crate::interpreter::dispatcher::Entry)
     /// at its input queues for, which a planner sets. `None` for every other producer.
     pub(crate) placement: Option<crate::interpreter::dispatcher::Placement>,
-    /// The id of the last dispatched run that consumed this breaker, `0` before any
-    /// ([`reads_input`](Self::reads_input)).
-    consumed_in_run: std::sync::atomic::AtomicU64,
 }
 
 impl ProducerBase {
-    /// A breaker reads its input directly only inside another scheduled pipeline. Its own
-    /// placement delegates execution to consume; outside execution a read observes held state.
-    /// A breaker the run consumes runs in a pipeline of its own even where its entry is unplaced,
-    /// as a source of a scope's body is (`Body::activate`), so it also answers from held
-    /// state.
-    pub(crate) fn reads_input(&self) -> bool {
-        let run = crate::interpreter::dispatcher::current_run();
-        run != 0
-            && self.placement.as_ref().is_none_or(|at| at.get().is_none())
-            && self
-                .consumed_in_run
-                .load(std::sync::atomic::Ordering::Relaxed)
-                != run
-    }
-
-    /// Record that the current dispatched run consumes this breaker
-    /// ([`reads_input`](Self::reads_input)).
-    pub(crate) fn consumed_in_this_run(&self) {
-        self.consumed_in_run.store(
-            crate::interpreter::dispatcher::current_run(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
     /// Initialize a producer for `owner`'s operator.
     pub(crate) fn new(
         id: usize,
@@ -962,11 +937,10 @@ impl ProducerBase {
             obsolete_guard: tiling.empty_guard(),
 
             #[cfg(test)]
-            reads: 0,
-            last_output: None,
+            reads: std::cell::Cell::new(0),
+            last_output: RefCell::new(None),
             downstream: None,
             placement: None,
-            consumed_in_run: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1007,11 +981,10 @@ impl ProducerBase {
             obsolete_guard: tiling.empty_guard(),
 
             #[cfg(test)]
-            reads: 0,
-            last_output: None,
+            reads: std::cell::Cell::new(0),
+            last_output: RefCell::new(None),
             downstream: None,
             placement: Some(Rc::new(std::cell::Cell::new(None))),
-            consumed_in_run: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -1830,6 +1803,25 @@ pub trait BreakingProducer: TileProducer + Breaker {
     }
 }
 
+/// Input rows omitted from an answer, retained until its consumer delivers a release.
+#[derive(Default)]
+pub(crate) struct DroppedRows(RefCell<Option<TileGuard>>);
+impl DroppedRows {
+    pub(crate) fn remember(&self, guard: TileGuard) {
+        let mut retained = self.0.borrow_mut();
+        *retained = Some(match retained.take() {
+            Some(before) => before.union(&guard),
+            None => guard,
+        });
+    }
+    pub(crate) fn release_to(&self, input: &mut dyn TileProducer) {
+        let released = self.0.borrow_mut().take();
+        if let Some(guard) = released {
+            input.release(guard);
+        }
+    }
+}
+
 /// Live runtime counterpart of a [`TileOperator`].
 ///
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
@@ -1902,6 +1894,15 @@ pub trait TileProducer {
         &self.base().obsolete_guard
     }
 
+    /// The region [`get`](Self::get) answers nothing in: the
+    /// [`obsolete_guard`](Self::obsolete_guard), and what the producer's shared state has released
+    /// for its consumer without a call of [`release`](Self::release). The debug checks in `get`
+    /// hold an answer to this region. The default is the obsolete guard; a fan-out's current-value
+    /// slot overrides it (`src/interpreter/design-operators.md`, "Reclaiming the changelog").
+    fn withheld_guard(&self) -> std::borrow::Cow<'_, TileGuard> {
+        std::borrow::Cow::Borrowed(self.obsolete_guard())
+    }
+
     /// Call [`get_impl`](Self::get_impl), remove released scalar record cells, and check
     /// the result.
     /// Tiling conformance is asserted in every build; release, structural and completeness
@@ -1911,20 +1912,20 @@ pub trait TileProducer {
     /// it because the input does, and any other cuts its own answer. It panics on a pull whose
     /// projection names keys at a level [`restates`](Self::restates) refuses.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
-    fn get(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get(&self, projection_guard: TileGuard) -> Tile {
         #[cfg(test)]
         {
-            self.base_mut().reads += 1;
+            self.base().reads.set(self.base().reads.get() + 1);
         }
         #[cfg(debug_assertions)]
         let _pull = {
             pull_levels::check_not_answering_from_state(|| self.name(), &projection_guard);
             pull_levels::check_input_level(
-                pull_levels::address_of(&*self),
+                pull_levels::address_of(self),
                 || self.name(),
                 &projection_guard,
             );
-            pull_levels::PullFrame::enter(&*self, &projection_guard)
+            pull_levels::PullFrame::enter(self, &projection_guard)
         };
         let asked = cfg!(debug_assertions).then(|| projection_guard.clone());
         // A producer has no exact answer to a pull at keys it does not restate, so the pull is
@@ -1943,18 +1944,22 @@ pub trait TileProducer {
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
-        if let Some(cells) = self.obsolete_guard().released_cells() {
+        if let Some(cells) = self.obsolete_guard().clone().released_cells() {
             result.remove_guarded(cells);
         }
         // A duplicate scalar delivery can append cells without identifying the repeated
         // positions. Check every released region here, not just universal releases.
         // See `src/interpreter/design-operators.md`, "The release contract".
-        debug_assert!(
-            !result.contains_guarded(self.obsolete_guard()),
-            "{} returned data it had released: {result:?} overlaps {:?}",
-            self.name(),
-            self.obsolete_guard(),
-        );
+        // Computed only in a debug build, where the checks read it: a current-value slot's
+        // withheld guard locks the fan-out's shared state.
+        let withheld = cfg!(debug_assertions).then(|| self.withheld_guard());
+        if let Some(withheld) = &withheld {
+            assert!(
+                !result.contains_guarded(withheld),
+                "{} returned data it had released: {result:?} overlaps {withheld:?}",
+                self.name(),
+            );
+        }
         trace!(
             "{} produced {:?} for tiling {}",
             self.name(),
@@ -1974,21 +1979,27 @@ pub trait TileProducer {
                 );
             }
         }
-        if cfg!(debug_assertions) {
+        if let Some(withheld) = &withheld {
             // A pull states completeness only for the region it returns, so the last output
             // is compared inside that region: a producer asked for one region after another
             // withdraws nothing it said of the first.
             let region = asked.as_ref().and_then(|asked| Projection::of(asked).ok());
-            let last_in_region = self.base().last_output.as_ref().map(|last| {
-                let mut last = last.clone();
-                if let Some(region) = &region {
-                    last.restrict_to(region, self.tiling());
-                }
-                last
-            });
+            let last_in_region = self
+                .base()
+                .last_output
+                .borrow()
+                .clone()
+                .as_ref()
+                .map(|last| {
+                    let mut last = last.clone();
+                    if let Some(region) = &region {
+                        last.restrict_to(region, self.tiling());
+                    }
+                    last
+                });
             if let Some(last) = &last_in_region
                 && let Some(violation) =
-                    completeness_violation(&self.name(), last, &result, self.obsolete_guard())
+                    completeness_violation(&self.name(), last, &result, withheld)
             {
                 panic!(
                     "{violation}\nin the producer tree:\n{}",
@@ -2000,13 +2011,13 @@ pub trait TileProducer {
             }
             // The statement a later pull is held to holds each region's last answer: this pull
             // replaces its own region and leaves the others as they were.
-            let stated = match (&region, self.base_mut().last_output.take()) {
+            let stated = match (&region, self.base().last_output.borrow().clone()) {
                 (Some(Projection::Nothing), Some(last)) => last,
                 (Some(region @ Projection::Keys { .. }), Some(mut last)) => {
                     last.restrict_to(&Projection::Everything.minus(region), self.tiling());
                     // A pull at keys drops from the record what has been released: the
                     // comparison exempts a released row and no later answer holds it.
-                    last.remove_guarded(self.obsolete_guard().clone());
+                    last.remove_guarded(withheld.clone().into_owned());
                     last.compact();
                     let mut answered = result.clone();
                     answered.restrict_to(region, self.tiling());
@@ -2020,7 +2031,7 @@ pub trait TileProducer {
                 }
                 (_, None) => result.clone(),
             };
-            self.base_mut().last_output = Some(stated);
+            *self.base().last_output.borrow_mut() = Some(stated);
         }
         assert!(
             result.check_from(self.tiling()),
@@ -2037,14 +2048,14 @@ pub trait TileProducer {
             base.id,
             || self.name(),
             &result,
-            &base.obsolete_guard,
+            self.obsolete_guard(),
         );
         result
     }
 
     /// Produce the tile for `projection_guard`, honoring accumulated releases and completeness.
     /// The [`get`](Self::get) wrapper supplies validation, not general projection or reclamation.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile;
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile;
 
     /// The collection levels whose keys this producer restates. A producer that declares more
     /// than the outermost keys reads its projection with [`TileGuard::projection_for`]
@@ -2065,20 +2076,21 @@ pub trait TileProducer {
         Some(level)
     }
 
-    /// Whether a pull of this producer answers from the state `consume_impl` built: `true` for a
-    /// breaker that does not read its input ([`ProducerBase::reads_input`]), which is a placed
-    /// breaker and any breaker outside a dispatched run, and for a store at every pull; `false`
-    /// for every other producer. Such a pull starts no pull of any producer, which the `get`
-    /// wrapper checks in a debug build (`check_not_answering_from_state`).
+    /// Whether a pull of this producer answers from the state `consume_impl` built: `true` at every
+    /// pull for a breaker, a store included, except a transaction's driver and writer
+    /// (`TransactDriverProducer`, `TransactWriterProducer`); `false` for every other producer. Such
+    /// a pull starts no pull of any producer, which the `get` wrapper checks in a debug build
+    /// (`check_not_answering_from_state`).
     fn answers_from_state(&self) -> bool {
         false
     }
 
     /// Permanently release a region after checking its shape and normalizing it.
     /// Accumulate the region in [`obsolete_guard`](Self::obsolete_guard), closed over the tiling
-    /// ([`TileGuard::closed_over`]), and call [`release_impl`](Self::release_impl) only if
-    /// accumulation changes the stored guard: with the universal guard when the closure makes the
-    /// stored guard universal, and with the normalized argument otherwise. See
+    /// ([`TileGuard::closed_over`]), and deliver every release to [`release_impl`](Self::release_impl), including repeated or empty
+    /// releases, so retained input rows discovered by later reads can be reclaimed. Pass the
+    /// universal guard once the stored guard is universal, and the normalized argument
+    /// otherwise. Native release callbacks must be idempotent. See
     /// `src/interpreter/design-operators.md`, "The release contract".
     fn release(&mut self, obsolete_guard: TileGuard) {
         trace!("{} release: {obsolete_guard:?}", self.name());
@@ -2092,17 +2104,14 @@ pub trait TileProducer {
         let obsolete_guard = TileGuard::flatten_or(vec![obsolete_guard]);
         // Closed over the tiling, so releases of a union's arms one by one add up to its whole.
         let accumulated = self.base().obsolete_guard.union(&obsolete_guard);
-        let new_guard = accumulated.clone().closed_over(self.tiling());
-        if new_guard != self.base().obsolete_guard {
-            // The closure can make the stored guard universal while the argument names only the
-            // last arm, and `release_impl` reclaims everything only on a universal guard.
-            let released = match new_guard.is_universal() && !accumulated.is_universal() {
-                true => self.tiling().universal_guard(),
-                false => obsolete_guard,
-            };
-            self.base_mut().obsolete_guard = new_guard;
-            self.release_impl(released);
-        }
+        self.base_mut().obsolete_guard = accumulated.closed_over(self.tiling());
+        // `release_impl` reclaims everything only on a universal guard, and the closure can make
+        // the stored guard universal while the argument names one arm or repeats a part.
+        let released = match self.base().obsolete_guard.is_universal() {
+            true => self.tiling().universal_guard(),
+            false => obsolete_guard,
+        };
+        self.release_impl(released);
     }
 
     /// Honor or reject the normalized release argument, already included in the obsolete guard.
@@ -2308,6 +2317,48 @@ pub(crate) mod test_helpers {
         }
     }
     impl<P: super::Breaker + ?Sized> ConsumeInPipeline for P {}
+
+    /// The first shared breaker on the chain under `producer`, `producer` included. The walk
+    /// stops at it, so it never follows a cycle back through the breaker.
+    pub(crate) fn first_breaker(
+        producer: &dyn TileProducer,
+    ) -> Option<crate::interpreter::dispatcher::BreakerHandle> {
+        if let Some(handle) = &producer.base().breaker_handle {
+            return handle.upgrade();
+        }
+        let mut found = None;
+        producer.visit_input_producers(&mut |_, input| {
+            if found.is_none() {
+                found = first_breaker(input);
+            }
+        });
+        found
+    }
+
+    /// The drive an induction store's body reads: the first shared breaker on the body's chain.
+    pub(crate) fn drive_of(
+        store: &dyn TileProducer,
+    ) -> crate::interpreter::dispatcher::BreakerHandle {
+        let mut found = None;
+        store.visit_input_producers(&mut |role, input| {
+            if role == "body" {
+                found = first_breaker(input);
+            }
+        });
+        found.expect("the store's body reads its drive")
+    }
+
+    /// Have every breaker in the chain under `producer` consume its input whole, the breakers
+    /// beneath it first, as the pipelines feeding them do before a reader reads them. A breaker
+    /// reached through several readers consumes once per reader; a consume after its input is
+    /// released whole reads nothing.
+    pub(crate) fn consume_breakers(producer: &mut dyn TileProducer) {
+        producer.visit_input_producers_mut(&mut |_, input| consume_breakers(input));
+        if let Some(breaker) = producer.as_breaking_mut() {
+            let whole = breaker.input_tiling(super::InputId::ONLY).universal_guard();
+            breaker.consume_in_pipeline(super::InputId::ONLY, whole);
+        }
+    }
 
     pub(crate) trait Announce: super::Consumer {
         fn announce(&mut self, region: &Projection) {
@@ -2572,7 +2623,7 @@ pub(crate) mod test_helpers {
             crate::interpreter::Restates::Every
         }
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
             self.pulled.borrow_mut().push(projection_guard.clone());
             let mut tile = match &self.script {
                 Some(script) => script.borrow().clone(),
@@ -2696,7 +2747,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
             let mut tile = self.tile.borrow().clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
@@ -3004,7 +3055,7 @@ pub(crate) mod test_helpers {
     fn a_producer_that_holds_a_key_it_recorded_absent_is_reported() {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
         let (first, tiling) = answered(0, 1, (0, 1));
-        let (mut producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
+        let (producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
         producer.get(producer.tiling().universal_guard());
         *answer.borrow_mut() = answered(0, 5, (0, 1)).0;
         producer.get(producer.tiling().universal_guard());
@@ -3018,7 +3069,7 @@ pub(crate) mod test_helpers {
     fn a_key_recorded_absent_at_one_region_and_held_at_another_is_reported() {
         use crate::interpreter::tile_operators::test_helpers::{ScriptedProducer, keys_between};
         let (first, tiling) = answered(0, 1, (0, 1));
-        let (mut producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
+        let (producer, answer) = ScriptedProducer::new(recording_absent(first, &[5]), tiling);
         producer.get(keys_between(0, 1));
         *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
         producer.get(keys_between(4, 7));
@@ -3029,7 +3080,7 @@ pub(crate) mod test_helpers {
     fn an_answer_that_leaves_out_the_record_of_absence_withdraws_nothing() {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
         let (first, tiling) = answered(0, 1, (0, 1));
-        let (mut producer, answer) =
+        let (producer, answer) =
             ScriptedProducer::new(recording_absent(first.clone(), &[5]), tiling);
         producer.get(producer.tiling().universal_guard());
         *answer.borrow_mut() = first;
@@ -3044,7 +3095,7 @@ pub(crate) mod test_helpers {
     fn a_key_held_after_an_answer_that_left_out_its_absence_is_reported() {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
         let (first, tiling) = answered(0, 1, (0, 1));
-        let (mut producer, answer) =
+        let (producer, answer) =
             ScriptedProducer::new(recording_absent(first.clone(), &[5]), tiling);
         producer.get(producer.tiling().universal_guard());
         *answer.borrow_mut() = first;
@@ -3103,7 +3154,7 @@ pub(crate) mod test_helpers {
     fn a_producer_asked_for_two_regions_in_turn_may_repeat_its_first_answer() {
         use crate::interpreter::tile_operators::test_helpers::{ScriptedProducer, keys_between};
         let (first, tiling) = answered(0, 3, (0, 3));
-        let (mut producer, answer) = ScriptedProducer::new(first.clone(), tiling);
+        let (producer, answer) = ScriptedProducer::new(first.clone(), tiling);
         producer.get(keys_between(0, 3));
         *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
         producer.get(keys_between(4, 7));
@@ -3120,7 +3171,7 @@ pub(crate) mod test_helpers {
     fn a_producer_that_retracts_a_region_after_a_pull_of_another_is_reported() {
         use crate::interpreter::tile_operators::test_helpers::{ScriptedProducer, keys_between};
         let (first, tiling) = answered(0, 3, (0, 3));
-        let (mut producer, answer) = ScriptedProducer::new(first, tiling);
+        let (producer, answer) = ScriptedProducer::new(first, tiling);
         producer.get(keys_between(0, 3));
         *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
         producer.get(keys_between(4, 7));
@@ -3160,7 +3211,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
 
@@ -3176,7 +3227,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
 
@@ -3221,7 +3272,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
@@ -3265,7 +3316,7 @@ mod tests {
             visit("input", &*self.input);
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             use super::FunctionGuard;
             use crate::interpreter::{Predicate, Value};
             self.input
@@ -3309,7 +3360,7 @@ mod tests {
     fn a_pull_that_unwinds_leaves_no_record_behind() {
         use super::FunctionGuard;
         use crate::interpreter::{Predicate, Value};
-        let (mut deepening, tiling) = deepening();
+        let (deepening, tiling) = deepening();
         let outermost =
             TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(0))));
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3318,7 +3369,7 @@ mod tests {
         assert!(unwound.is_err(), "the pull beneath its declaration panics");
         assert!(super::pull_levels::PULLS.with_borrow(Vec::is_empty));
         let (tile, _) = super::test_helpers::two_levels_of_ints();
-        let (mut input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling);
+        let (input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling);
         input.get(outermost);
     }
 
@@ -3342,7 +3393,7 @@ mod tests {
             true
         }
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
             self.input.get(projection_guard)
         }
 
@@ -3369,7 +3420,7 @@ mod tests {
                                pulled ProjectionSpy"
     )]
     fn an_answer_from_state_that_pulls_its_input_panics() {
-        let (mut answer, tiling) = pulling_state_answer();
+        let (answer, tiling) = pulling_state_answer();
         answer.get(tiling.universal_guard());
     }
 
@@ -3378,14 +3429,14 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn an_answer_from_state_that_unwinds_leaves_no_record_behind() {
-        let (mut answer, tiling) = pulling_state_answer();
+        let (answer, tiling) = pulling_state_answer();
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             answer.get(tiling.universal_guard())
         }));
         assert!(unwound.is_err(), "the answer from state that pulls panics");
         assert!(super::pull_levels::PULLS.with_borrow(Vec::is_empty));
         let (tile, _) = super::test_helpers::two_levels_of_ints();
-        let (mut input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling.clone());
+        let (input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling.clone());
         input.get(tiling.universal_guard());
     }
 
@@ -3396,7 +3447,7 @@ mod tests {
         base: ProducerBase,
         answer: PullingStateAnswer,
         input: Box<dyn TileProducer>,
-        in_progress_after_unwind: Option<usize>,
+        in_progress_after_unwind: std::cell::Cell<Option<usize>>,
     }
 
     #[cfg(debug_assertions)]
@@ -3408,12 +3459,13 @@ mod tests {
             visit("input", &*self.input);
         }
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, projection_guard: TileGuard) -> Tile {
             let whole = self.answer.tiling().universal_guard();
             let unwound =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.answer.get(whole)));
             assert!(unwound.is_err(), "the answer from state that pulls panics");
-            self.in_progress_after_unwind = Some(super::pull_levels::PULLS.with_borrow(Vec::len));
+            self.in_progress_after_unwind
+                .set(Some(super::pull_levels::PULLS.with_borrow(Vec::len)));
             self.input.get(projection_guard)
         }
 
@@ -3428,15 +3480,15 @@ mod tests {
         let (answer, tiling) = pulling_state_answer();
         let (tile, _) = super::test_helpers::two_levels_of_ints();
         let (input, ..) = super::test_helpers::ProjectionSpy::new(tile, tiling.clone());
-        let mut outer = CatchingPull {
+        let outer = CatchingPull {
             base: ProducerBase::unowned(CatchingPull::alloc_id(), &tiling),
             answer,
             input: Box::new(input),
-            in_progress_after_unwind: None,
+            in_progress_after_unwind: std::cell::Cell::new(None),
         };
         outer.get(tiling.universal_guard());
         assert_eq!(
-            outer.in_progress_after_unwind,
+            outer.in_progress_after_unwind.get(),
             Some(1),
             "the outer pull alone is in progress"
         );
@@ -3450,7 +3502,7 @@ mod tests {
     impl TileProducer for OneRow {
         impl_producer_base!();
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
             Tile::Scalar(ColumnValue::Ints(vec![7]))
         }
 
@@ -3486,7 +3538,7 @@ mod tests {
             base: OperatorBase::new(int_tiling()),
         };
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let producer = op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(producer.operator_id(), op.operator_id());
 
         producer.get(int_tiling().universal_guard());

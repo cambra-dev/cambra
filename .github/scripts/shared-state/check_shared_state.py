@@ -85,6 +85,18 @@ EXPECTED_EXCEPTIONS = [
     # it. No other operator reaches the cell.
     ("src/interpreter/tile_operators/iterate/cartesian.rs", "shared cell of `CartesianIteration`"),
     ("src/interpreter/tile_operators/iterate.rs", "shared cell of `CartesianIteration`"),
+    # A pipeline chain producer's own state, which `get` and `release` change through `&self`. No
+    # other operator holds the producer.
+    ("src/interpreter/tile_operators/combinators.rs", "cell of `Vec<HeldRow>`"),
+    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
+    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
+    ("src/interpreter/tile_operators/fan.rs", "cell of `HashMap<usize, TileGuard>`"),
+    ("src/interpreter/tile_operators/fan.rs", "cell of `Vec<HashSet<Vec<Value>>>`"),
+    ("src/interpreter/tile_operators/fan.rs", "cell of `Predicate`"),
+    ("src/interpreter/tile_operators/map.rs", "cell of `Option<HeldBeneathKeys>`"),
+    # Every producer's debug record of its last output (`ProducerBase::last_output`), which `get`
+    # changes through `&self`.
+    ("src/interpreter/tile_operators/mod.rs", "cell of `Option<Tile>`"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `RouteTable`"),
     # The test sink's accumulator: a sink is a terminal consumer at the I/O boundary,
@@ -95,11 +107,6 @@ EXPECTED_EXCEPTIONS = [
     # doc. `subscribe` installs its consumer on the input before the producer exists, and the cell
     # connects the two; what crosses it is a region, never a tile.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
-    # `DirtyRegion`, the regions a `Memo` must read: what it has not read and what its input
-    # has notified since; see its type doc. The input's consumer and the memo share it so a
-    # notification marks the region at once, and a notification carries a region, which a one-bit
-    # flag cannot hold.
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Projection`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what
