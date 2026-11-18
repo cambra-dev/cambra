@@ -887,6 +887,7 @@ fn keep_recorded_absence(last: &Tile, stated: &mut Tile) {
 }
 
 /// Identity, output shape, release state and notification/probe handles for a producer.
+#[derive(Clone)]
 pub struct ProducerBase {
     /// Instance-unique ID, allocated by [`TileProducer::alloc_id`].
     pub id: usize,
@@ -902,12 +903,12 @@ pub struct ProducerBase {
     /// Output tiling for this producer.
     pub tiling: Tiling,
     /// Obsolete region of the tiling
-    pub obsolete_guard: TileGuard,
+    pub obsolete_guard: Arc<RwLock<TileGuard>>,
     #[cfg(test)]
-    pub(crate) reads: std::sync::atomic::AtomicU64,
+    pub(crate) reads: Arc<std::sync::atomic::AtomicU64>,
     /// The last tile `get` returned, for the debug check that the complete region never
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
-    pub(crate) last_output: RwLock<Option<Tile>>,
+    pub(crate) last_output: Arc<RwLock<Option<Tile>>>,
     /// For a pipeline breaker, the consumer its pushes climb (`dispatcher::Pushes`), which is
     /// its reader's chain; for a range (`IterateExtent`), the consumer a planner pushes its region
     /// through once. `None` for every other producer.
@@ -931,11 +932,11 @@ impl ProducerBase {
             node_id: owner.operator_id(),
             probes: cx.probes().clone(),
             tiling: tiling.clone(),
-            obsolete_guard: tiling.empty_guard(),
+            obsolete_guard: Arc::new(RwLock::new(tiling.empty_guard())),
 
             #[cfg(test)]
-            reads: std::sync::atomic::AtomicU64::new(0),
-            last_output: RwLock::new(None),
+            reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_output: Arc::new(RwLock::new(None)),
             downstream: None,
             placement: None,
         }
@@ -975,11 +976,11 @@ impl ProducerBase {
             node_id: None,
             probes: ProbeSlot::default(),
             tiling: tiling.clone(),
-            obsolete_guard: tiling.empty_guard(),
+            obsolete_guard: Arc::new(RwLock::new(tiling.empty_guard())),
 
             #[cfg(test)]
-            reads: std::sync::atomic::AtomicU64::new(0),
-            last_output: RwLock::new(None),
+            reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_output: Arc::new(RwLock::new(None)),
             downstream: None,
             placement: Some(crate::interpreter::dispatcher::Placement::default()),
         }
@@ -1063,12 +1064,11 @@ mod pull_levels {
                 Some(Some(level)) => {
                     let mut inputs = Vec::new();
                     producer.visit_input_producers(&mut |role, input| {
-                        inputs.push((
-                            address_of(input),
-                            role.to_owned(),
-                            producer.input_level(role, level),
-                        ));
+                        inputs.push((address_of(input), role.to_owned(), None));
                     });
+                    for (_, role, declared) in &mut inputs {
+                        *declared = producer.input_level(role, level);
+                    }
                     Some(PullFrame {
                         producer: producer.name(),
                         level,
@@ -1500,14 +1500,20 @@ impl InputId {
 ///
 /// [`consume_impl`]: Self::consume_impl
 pub trait Breaker {
-    /// Pull input `input` at `guard`, a guard of the tiling that input answers, merge the answer into
-    /// this breaker's state, and release the input at the guard the answer states once the
-    /// answer is taken.
-    ///
-    /// # Panics
-    ///
-    /// When the breaker cannot consume its input's shape.
-    fn consume_impl(&mut self, input: InputId, guard: TileGuard);
+    /// Projection level at which independent dispatcher claims may consume this breaker.
+    fn parallel_level(&self) -> Option<CurryLevel> {
+        None
+    }
+
+    /// Read the existing input, integrate into synchronized native state, and release
+    /// consumed input after dropping the output-state lock.
+    fn consume_impl(&self, input: InputId, guard: TileGuard);
+
+    fn finish_parallel_input(&mut self) {}
+
+    fn requires_ordered_input(&self) -> bool {
+        false
+    }
 
     /// Initialize per-run publication and loop control before the first package executes.
     fn begin_run(&mut self) {}
@@ -1572,8 +1578,8 @@ pub trait Breaker {
 /// A placed producer's [`get_impl`](TileProducer::get_impl) reads state without pulling its input.
 pub trait BreakingProducer: TileProducer + Breaker {
     /// Store keys whose writers have all completed. Other breakers declare none.
-    fn completed_keys(&self) -> &[Value] {
-        &[]
+    fn completed_keys(&self) -> Vec<Value> {
+        Vec::new()
     }
 
     /// The complete output region, including keys known absent and output already released.
@@ -1596,12 +1602,12 @@ pub trait BreakingProducer: TileProducer + Breaker {
     fn final_guard(&self) -> TileGuard {
         let held = self.complete();
         let obsolete = self.obsolete_guard();
-        let left = match names_collection_keys(obsolete) {
-            true => match keys_released_whole(obsolete) {
+        let left = match names_collection_keys(&obsolete) {
+            true => match keys_released_whole(&obsolete) {
                 Some(released) if !held.is_empty() => guard_minus(&held, &released),
                 _ => held,
             },
-            false => guard_minus(&held, obsolete),
+            false => guard_minus(&held, &obsolete),
         };
         left.closed_over(self.tiling())
     }
@@ -1661,7 +1667,7 @@ impl DroppedRows {
             None => guard,
         });
     }
-    pub(crate) fn release_to(&self, input: &mut dyn TileProducer) {
+    pub(crate) fn release_to(&self, input: &dyn TileProducer) {
         let released = self
             .0
             .write()
@@ -1741,8 +1747,12 @@ pub trait TileProducer: Send + Sync {
 
     /// Returns the current obsolete guard for this producer. The producer will
     /// never return any more data in the guarded region via `get`.
-    fn obsolete_guard(&self) -> &TileGuard {
-        &self.base().obsolete_guard
+    fn obsolete_guard(&self) -> TileGuard {
+        self.base()
+            .obsolete_guard
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Call [`get_impl`](Self::get_impl), remove released scalar record cells, and check
@@ -1795,7 +1805,7 @@ pub trait TileProducer: Send + Sync {
         // positions. Check every released region here, not just universal releases.
         // See `src/interpreter/design-operators.md`, "The release contract".
         debug_assert!(
-            !result.contains_guarded(self.obsolete_guard()),
+            !result.contains_guarded(&self.obsolete_guard()),
             "{} returned data it had released: {result:?} overlaps {:?}",
             self.name(),
             self.obsolete_guard(),
@@ -1824,23 +1834,21 @@ pub trait TileProducer: Send + Sync {
             // is compared inside that region: a producer asked for one region after another
             // withdraws nothing it said of the first.
             let region = asked.as_ref().and_then(|asked| Projection::of(asked).ok());
-            let last_in_region = self
+            let mut history = self
                 .base()
                 .last_output
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-                .as_ref()
-                .map(|last| {
-                    let mut last = last.clone();
-                    if let Some(region) = &region {
-                        last.restrict_to(region, self.tiling());
-                    }
-                    last
-                });
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let last_in_region = history.as_ref().map(|last| {
+                let mut last = last.clone();
+                if let Some(region) = &region {
+                    last.restrict_to(region, self.tiling());
+                }
+                last
+            });
             if let Some(last) = &last_in_region
                 && let Some(violation) =
-                    completeness_violation(&self.name(), last, &result, self.obsolete_guard())
+                    completeness_violation(&self.name(), last, &result, &self.obsolete_guard())
             {
                 panic!(
                     "{violation}\nin the producer tree:\n{}",
@@ -1852,14 +1860,7 @@ pub trait TileProducer: Send + Sync {
             }
             // The statement a later pull is held to holds each region's last answer: this pull
             // replaces its own region and leaves the others as they were.
-            let stated = match (
-                &region,
-                self.base()
-                    .last_output
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ) {
+            let stated = match (&region, history.take()) {
                 (Some(Projection::Nothing), Some(last)) => last,
                 (Some(region @ Projection::Keys { .. }), Some(mut last)) => {
                     last.restrict_to(&Projection::Everything.minus(region), self.tiling());
@@ -1879,11 +1880,7 @@ pub trait TileProducer: Send + Sync {
                 }
                 (_, None) => result.clone(),
             };
-            *self
-                .base()
-                .last_output
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(stated);
+            *history = Some(stated);
         }
         assert!(
             result.check_from(self.tiling()),
@@ -1900,7 +1897,7 @@ pub trait TileProducer: Send + Sync {
             base.id,
             || self.name(),
             &result,
-            self.obsolete_guard(),
+            &self.obsolete_guard(),
         );
 
         result
@@ -1945,37 +1942,33 @@ pub trait TileProducer: Send + Sync {
     /// universal guard when the closure makes the stored guard universal, and the normalized
     /// argument otherwise. Native release callbacks must be idempotent. See
     /// `src/interpreter/design-operators.md`, "The release contract".
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release(&self, guard: TileGuard) {
         assert!(
-            obsolete_guard.check_from(self.tiling()),
-            "{obsolete_guard:?} vs {:?}",
+            guard.check_from(self.tiling()),
+            "{guard:?} vs {:?}",
             self.tiling()
         );
-        // Released in canonical form (`TileGuard::flatten_or`), so a region naming everything
-        // beneath some keys reaches `release_impl` as those keys.
-        let obsolete_guard = TileGuard::flatten_or(vec![obsolete_guard]);
-        // Closed over the tiling, so releases of a union's arms one by one add up to its whole.
-        let accumulated = self.base().obsolete_guard.union(&obsolete_guard);
-        let new_guard = accumulated.clone().closed_over(self.tiling());
-        if new_guard != self.base().obsolete_guard {
-            // The closure can make the stored guard universal while the argument names only the
-            // last arm, and `release_impl` reclaims everything only on a universal guard.
-            let released = match new_guard.is_universal() && !accumulated.is_universal() {
-                true => self.tiling().universal_guard(),
-                false => obsolete_guard,
-            };
-            self.base_mut().obsolete_guard = new_guard;
-            self.release_impl(released);
+        let guard = TileGuard::flatten_or(vec![guard]);
+        let mut obsolete = self
+            .base()
+            .obsolete_guard
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let accumulated = obsolete.union(&guard);
+        *obsolete = accumulated.closed_over(self.tiling());
+        let released = if obsolete.is_universal() {
+            self.tiling().universal_guard()
         } else {
-            self.release_impl(obsolete_guard);
-        }
+            guard
+        };
+        drop(obsolete);
+        self.release_impl(released);
     }
 
     /// Honor or reject the normalized release argument, already included in the obsolete guard.
     /// Reclaim local state and forward releases according to this operator's input usage.
     /// Ignoring an unsupported guard does not cancel the wrapper's accumulated promise.
-    fn release_impl(&mut self, obsolete_guard: TileGuard);
+    fn release_impl(&self, obsolete_guard: TileGuard);
 
     /// What this producer keeps of its own between pulls ([`ProducerStateInfo`]).
     ///
@@ -2117,38 +2110,6 @@ impl ProducerStateInfo {
     pub fn holding(values: usize) -> Self {
         ProducerStateInfo { values }
     }
-}
-
-/// A producer that participates in a cyclic operator graph as an **append-only,
-/// position-stable sequencing source** — the commit operator's recurrence (and
-/// the changelog induction store) rely on this contract:
-///
-/// 1. Its output tile is append-only along the sequencing domain: a value once
-///    emitted at a position is never changed (only `release` shrinks the view).
-/// 2. Positions are absolute and never shift; a released prefix may be compacted
-///    away, but the live suffix keeps its position values.
-/// 3. Because a released prefix desyncs a fanned slot, a stateful sequencing
-///    producer is wired with exactly one consumer (the cycle uses
-///    [`FanOut::new_cyclic`] around the *operator*; the producer itself is never
-///    fanned). Fanning one is a wiring bug, not a user error.
-/// 4. `release` is the acknowledgment: a released prefix signals the region is
-///    committed/consumed, and the producer advances its append/compaction cursor
-///    in response.
-///
-/// Implementing this trait is a deliberate statement that the producer obeys the
-/// contract above. Invariant (2)'s position-stability is maintained *by
-/// construction* (the engine/window appends immutable positions and only
-/// compacts released prefixes); [`Self::debug_assert_position_invariant`] does
-/// not re-derive it. It cheaply checks the producer's own append/compaction
-/// **bookkeeping** — the per-cursor/per-writer state whose desync is how a
-/// compaction or wiring bug would actually manifest — in debug builds.
-pub(crate) trait CyclicSequencingProducer: TileProducer {
-    /// Debug-only check of the append/compaction bookkeeping backing the
-    /// append-only / position-stable invariant (contract item 2), called from
-    /// the producer's `get` path — e.g. that per-writer cursors stay aligned
-    /// with the writer set. A failure is a compaction or wiring bug, not a user
-    /// error; a no-op in release builds.
-    fn debug_assert_position_invariant(&self);
 }
 
 /// Represents a step on a path through a Tile structure
@@ -2498,7 +2459,7 @@ pub(crate) mod test_helpers {
             tile
         }
 
-        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        fn release_impl(&self, obsolete_guard: TileGuard) {
             self.released
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2625,7 +2586,7 @@ pub(crate) mod test_helpers {
             tile
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// An operator whose producer is a [`ScriptedProducer`] over a cell the test keeps, so a
@@ -3058,6 +3019,79 @@ pub(crate) mod test_helpers {
         producer.get(keys_between(0, 3));
     }
 
+    #[test]
+    fn a_release_of_other_keys_does_not_wait_for_an_in_flight_read() {
+        use std::sync::{
+            Mutex, RwLock,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        struct PausedSnapshot {
+            base: ProducerBase,
+            tile: RwLock<Tile>,
+            pause_next_read: AtomicBool,
+            entered: mpsc::Sender<()>,
+            released: Mutex<mpsc::Receiver<()>>,
+        }
+        impl TileProducer for PausedSnapshot {
+            impl_producer_base!();
+            fn get_impl(&self, guard: TileGuard) -> Tile {
+                let mut tile = self.tile.read().unwrap().clone();
+                tile.restrict_to(&guard.projection_for(self), self.tiling());
+                if self.pause_next_read.swap(false, Ordering::SeqCst) {
+                    self.entered.send(()).unwrap();
+                    self.released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("releasing another key must not wait for this read");
+                }
+                tile
+            }
+            fn release_impl(&self, guard: TileGuard) {
+                let mut tile = self.tile.write().unwrap();
+                tile.remove_guarded(guard);
+                tile.compact();
+            }
+        }
+
+        let tiling = Tiling::data_function(
+            crate::interpreter::Extent::uint_range(2),
+            Tiling::Scalar(crate::interpreter::Extent::Base(
+                crate::interpreter::BaseType::Int,
+            )),
+        );
+        let (entered, started) = mpsc::channel();
+        let (finished, released) = mpsc::channel();
+        let producer = PausedSnapshot {
+            base: ProducerBase::unowned(PausedSnapshot::alloc_id(), &tiling),
+            tile: RwLock::new(int_column(vec![0, 1], Predicate::True)),
+            pause_next_read: AtomicBool::new(true),
+            entered,
+            released: Mutex::new(released),
+        };
+        let first = keys_between(0, 0);
+        let second = keys_between(1, 1);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| producer.get(first));
+            started.recv_timeout(Duration::from_secs(10)).unwrap();
+            let reclaimer = scope.spawn(|| {
+                producer.release(second.clone());
+                finished.send(()).unwrap();
+            });
+            reclaimer.join().unwrap();
+            let answer = reader.join().unwrap();
+            let Tile::DataFunction { domain, .. } = answer else {
+                panic!("a collection snapshot")
+            };
+            assert_eq!(domain, ColumnValue::UInts(vec![0]));
+        });
+        assert!(producer.obsolete_guard().subsumes(&second));
+        assert!(!producer.tile.read().unwrap().contains_guarded(&second));
+    }
+
     /// A [`TileProducer`] that answers with a fixed tile, less what it has been released, and
     /// records every release guard it is handed, for asserting that a release *propagates*.
     pub(crate) struct ReleaseSpy {
@@ -3094,7 +3128,7 @@ pub(crate) mod test_helpers {
             self.tile.clone()
         }
 
-        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        fn release_impl(&self, obsolete_guard: TileGuard) {
             self.released
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -3113,7 +3147,7 @@ pub(crate) mod test_helpers {
             self.tile.clone()
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// A [`TileProducer`] that **honors** the release contract: it answers with a
@@ -3161,7 +3195,7 @@ pub(crate) mod test_helpers {
             tile
         }
 
-        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        fn release_impl(&self, obsolete_guard: TileGuard) {
             self.released
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -3210,7 +3244,7 @@ mod tests {
                 ))))
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     #[cfg(debug_assertions)]
@@ -3282,7 +3316,7 @@ mod tests {
             self.input.get(projection_guard)
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     #[cfg(debug_assertions)]
@@ -3354,7 +3388,7 @@ mod tests {
             self.input.get(projection_guard)
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     /// An answer from state that unwinds inside another pull leaves that pull's record in place,
@@ -3391,7 +3425,7 @@ mod tests {
             Tile::Scalar(ColumnValue::Ints(vec![7]))
         }
 
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     struct Leaf {
@@ -3651,4 +3685,21 @@ mod tests {
             );
         }
     }
+}
+
+/// Independent position claims of a native input. Nested materialization retains whole rows.
+fn parallel_input_level(input: &dyn TileProducer, inner: bool) -> Option<CurryLevel> {
+    let tiling = input.tiling();
+    let level = if matches!(tiling.domain_extent(), Some(Extent::UIntRange(_))) {
+        CurryLevel::OUTERMOST
+    } else if inner
+        && matches!(tiling,
+        Tiling::DataFunction { codomain, .. }
+        if matches!(&**codomain, Tiling::DataFunction { domain: Extent::UIntRange(_), .. }))
+    {
+        CurryLevel::new(1)
+    } else {
+        return None;
+    };
+    (!input.restates().refuses(level)).then_some(level)
 }

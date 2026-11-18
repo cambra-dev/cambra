@@ -101,7 +101,7 @@ when its sources close. Main-output packages are ordered. Returning several tile
 the collection's value or imply an order among its elements.
 
 The binary runs every program through the dispatcher, including under `--inspect` and `--control`.
-`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 1024. Compilation builds the graph
+`CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 65,536. Compilation builds the graph
 without executing sinks. A planning refusal reports an error before execution.
 
 Transaction and induction drivers sample the store's committed snapshot. The planner waits for
@@ -358,3 +358,47 @@ These guarantees concern scheduling. Breakers use `Rc<RefCell<_>>`, and the prod
 them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
 need additional coordination before parallel execution. Atomic-ordering proofs and queue storage
 mechanics are documented beside their implementation in `dispatcher.rs`.
+
+## Shared native pipeline execution
+
+A run that names no number of workers takes `CAMBRA_LOCAL_DOP`, or one where it is unset
+(`default_workers`). `run_program_with_workers` names the number for one run, as a parameter.
+All runs use the same planner, dispatcher queues, claim loop, and native breakers. With one worker
+the coordinator consumes every claim itself and the run starts no thread (`WorkerPool::new`).
+
+A pipeline owns its subscribed non-breaker producer chain. Its upstream breaker readers share
+canonical breaker handles. Workers retain those handles and call the existing breaker's immutable
+`consume_impl`; they construct no operator chains, input readers, or secondary topology.
+`get` and `get_impl` read the existing operands directly.
+
+Memo, aggregate, and map-aggregate inputs can execute independent finite-position claims.
+Memo materialization admits flat rows. Grouped folds can partition the innermost finite position
+level. Checked sums and their producing dependencies preserve input order: the planner orders every
+pipeline such a breaker reads (`order_inputs_of_ordered_breakers`). Control scopes, sinks,
+and shapes without independent position projections keep their coordinator handlers.
+
+A worker reads and computes its claimed region before taking the output-state lock. Memo merges
+under its cache lock. Aggregates fold received values under the shared accumulator lock.
+Map-aggregate folds into its shared group map under one lock. There are no worker-local aggregate
+maps or delta-flush buffers.
+
+The native `consume_impl(&self)` integrates output, drops its output-state lock, and releases
+consumed input through the existing producer chain. The coordinator publishes newly complete
+output and acknowledges the dispatcher claim. Batches contain at most four claims, so publication
+proceeds while producing dependencies remain open. A worker holds its breaker's handle shared for
+one claim at a time. The coordinator's push takes the handle exclusively, so it waits for at most
+one claim of each other worker on the pipeline, and it reads the breaker with no claim between
+the merge of its rows and the release of its input.
+
+A worker that panics sets a flag the other workers read before each claim, and they consume no
+further claim. The coordinator resumes the panic on its own thread, and the pool joins its workers
+as it unwinds (`a_worker_panic_ends_the_run_with_that_panic`).
+
+Reads and releases lock the retained state they access, without an operator-wide operation
+lock. A cache read copies an owned tile under its state lock; computation continues on that
+snapshot. Release accumulates obsolete guards under their own lock, then reclaims retained
+state through the native callback. Memo cache locks are dropped before forwarding releases upstream.
+Canonical breaker handles allow shared access to both reads and releases. Stateful control
+operators protect their retained state with a mutex because consumption and reclamation mutate
+it. There are no worker input-retention pins or deferred worker releases. Workers join before
+the run returns its operators on pause, cancellation, or unwinding.
