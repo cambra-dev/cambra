@@ -126,6 +126,18 @@ impl WriterRun {
         shared.activate(&self.placements, dispatcher);
         self.hold_followers(dispatcher);
         let (shared, _) = self.attached();
+        // The request establishes readiness of the external source. Materialize any
+        // source pipelines inside this writer before advancing its driver; the
+        // driver may read a breaker carrying another transaction's reply.
+        for local in 0..self.members.len() {
+            let pipeline = shared.global(PipelineId(local));
+            if local != self.driver.0 && dispatcher.is_source(pipeline) {
+                reach_member(&self.members[local], &mut |breaker, input| {
+                    dispatcher
+                        .queue_round(pipeline, &breaker.input_tiling(input).universal_guard());
+                });
+            }
+        }
         dispatcher.queue_round(shared.global(self.driver), guard);
         dispatcher.queue_round(shared.step, guard);
     }

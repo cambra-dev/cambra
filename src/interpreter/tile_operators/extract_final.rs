@@ -120,6 +120,9 @@ struct ExtractFinalProducer {
     base: ProducerBase,
     source: Box<dyn TileProducer>,
     default: Option<Box<dyn TileProducer>>,
+    state: Mutex<FinalValueState>,
+}
+struct FinalValueState {
     /// Cached result, re-emitted until release. May remain absent after source completion
     /// while waiting for the default. Collection-valued results retain a whole sub-tile.
     final_tile: Option<Tile>,
@@ -152,13 +155,15 @@ impl ExtractFinalProducer {
         default: Option<Box<dyn TileProducer>>,
     ) -> Self {
         let merged = source.tiling().empty_tile();
-        Self {
+        ExtractFinalProducer {
             base,
             source,
             default,
-            final_tile: None,
-            complete: false,
-            merged,
+            state: Mutex::new(FinalValueState {
+                final_tile: None,
+                complete: false,
+                merged,
+            }),
         }
     }
 
@@ -195,10 +200,10 @@ impl ExtractFinalProducer {
     /// # Panics
     ///
     /// For a source declared total that emitted no value.
-    fn pull_default(&mut self) -> Option<Tile> {
+    fn pull_default(&self) -> Option<Tile> {
         let extent = self.tiling().extent();
         let yields_a_level = self.tiling().is_data_function();
-        let Some(default) = self.default.as_mut() else {
+        let Some(default) = self.default.as_ref() else {
             panic!(
                 "ExtractFinal over a source declared total emitted no value; the \
                  partition feeding it was not exhaustive"
@@ -224,13 +229,16 @@ impl ExtractFinalProducer {
 }
 
 impl TileProducer for ExtractFinalProducer {
+    impl_producer_base!();
+
     fn state_info(&self) -> ProducerStateInfo {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         ProducerStateInfo::holding(
-            self.merged.cell_count() + self.final_tile.as_ref().map_or(0, Tile::cell_count),
+            state.merged.cell_count() + state.final_tile.as_ref().map_or(0, Tile::cell_count),
         )
     }
-
-    impl_producer_base!();
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("source", &*self.source);
@@ -266,23 +274,30 @@ impl TileProducer for ExtractFinalProducer {
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
     fn get_impl(&self, guard: TileGuard) -> Tile {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         if projection_of_one_value(&self.name(), "extracts one final value", &guard)
             == Projection::Nothing
             || self.obsolete_guard().is_universal()
         {
             return self.tiling().empty_tile();
         }
-        self.final_tile
+        state
+            .final_tile
             .clone()
             .unwrap_or_else(|| self.tiling().empty_tile())
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.final_tile = None;
-            self.merged = self.source.tiling().empty_tile();
+            state.final_tile = None;
+            state.merged = self.source.tiling().empty_tile();
             self.source.release(self.source.tiling().universal_guard());
-            if let Some(d) = self.default.as_mut() {
+            if let Some(d) = self.default.as_ref() {
                 d.release(d.tiling().universal_guard());
             }
         }
@@ -290,28 +305,65 @@ impl TileProducer for ExtractFinalProducer {
 }
 
 impl Breaker for ExtractFinalProducer {
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.source.tiling().clone()
+    }
+
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.source.obsolete_guard().clone()
+    }
+
+    /// Pushes the extracted value, as every breaker pushes its final guard.
+    ///
+    /// # Panics
+    ///
+    /// When the output is unreleased and no value has been extracted: the source has not been
+    /// released whole, or the default it fell back to has not converged. A dispatcher issues no
+    /// `consume_impl` after the finish, so nothing would read that default again, and pushing
+    /// nothing would leave the reader with no value.
+    fn finish(&mut self, _input: InputId, pushes: &mut Pushes<'_>) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        assert!(
+            self.obsolete_guard().is_universal() || state.final_tile.is_some(),
+            "{} finishes after it extracted its value: the source released whole and any \
+             default it fell back to converged",
+            self.name()
+        );
+        drop(state_guard);
+        pushes.push_final(self);
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+
     /// Merges the source rows it answers at `guard`, a guard of the source's tiling, keeps the
     /// row at the greatest key, and releases the source at what the answer stated. Rows merge in
     /// the order they arrive, so the last row is not the final one: the key says which is. Once
     /// the source has been released whole the value is extracted, or the default read when the
     /// source held nothing.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume_impl(&self, _: InputId, guard: TileGuard) {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
         debug_assert!(
             guard.check_from(self.source.tiling()),
             "{} consumes a guard of its source's tiling: {guard:?}",
             self.name()
         );
-        if self.obsolete_guard().is_universal() || self.final_tile.is_some() || guard.is_empty() {
+        if self.obsolete_guard().is_universal() || state.final_tile.is_some() || guard.is_empty() {
             return;
         }
         let mut answered = self.source.get(guard);
         let upstream_guard = answered.to_guard();
         answered.compact();
-        self.merged.merge(answered);
-        self.keep_greatest_key();
+        state.merged.merge(answered);
+        self.keep_greatest_key(state);
         self.source.release(upstream_guard);
         if !self.source.obsolete_guard().is_universal() {
-            let greatest = self
+            let greatest = state
                 .merged
                 .live_keys()
                 .into_iter()
@@ -331,48 +383,18 @@ impl Breaker for ExtractFinalProducer {
         }
         let Tile::DataFunction {
             domain, deleted, ..
-        } = &self.merged
+        } = &mut state.merged
         else {
             panic!("ExtractFinal source must be a collection tile");
         };
-        self.final_tile = match greatest_live_key(domain, deleted) {
-            Some(final_idx) => Some(self.value_at(&self.merged, final_idx)),
+        state.final_tile = match greatest_live_key(domain, deleted) {
+            Some(final_idx) => Some(self.value_at(&state.merged, final_idx)),
             None => self.pull_default(),
         };
-        if self.final_tile.is_some() {
-            self.complete = true;
-            self.merged = self.source.tiling().empty_tile();
+        if state.final_tile.is_some() {
+            state.complete = true;
+            state.merged = self.source.tiling().empty_tile();
         }
-    }
-
-    fn input_tiling(&self, _: InputId) -> Tiling {
-        self.source.tiling().clone()
-    }
-
-    fn input_released(&self, _: InputId) -> TileGuard {
-        self.source.obsolete_guard().clone()
-    }
-
-    /// Pushes the extracted value, as every breaker pushes its final guard.
-    ///
-    /// # Panics
-    ///
-    /// When the output is unreleased and no value has been extracted: the source has not been
-    /// released whole, or the default it fell back to has not converged. A dispatcher issues no
-    /// `consume_impl` after the finish, so nothing would read that default again, and pushing
-    /// nothing would leave the reader with no value.
-    fn finish(&mut self, _input: InputId, pushes: &mut Pushes<'_>) {
-        assert!(
-            self.obsolete_guard().is_universal() || self.final_tile.is_some(),
-            "{} finishes after it extracted its value: the source released whole and any \
-             default it fell back to converged",
-            self.name()
-        );
-        pushes.push_final(self);
-    }
-
-    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
-        Some(self)
     }
 }
 
@@ -380,7 +402,10 @@ impl BreakingProducer for ExtractFinalProducer {
     /// The extracted value, once there is one: none while the source has not drained, or while a
     /// default it fell back to has not converged. The next `consume_impl` reads the default again.
     fn complete(&self) -> TileGuard {
-        match self.complete {
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+
+        match state.complete {
             true => self.tiling().universal_guard(),
             false => self.tiling().empty_guard(),
         }
@@ -391,13 +416,13 @@ impl ExtractFinalProducer {
     /// Drop every merged row but the one at the greatest key, which is the only one an
     /// extraction can still need, where the values are a column of scalars. Any other shape of
     /// value keeps every merged row.
-    fn keep_greatest_key(&mut self) {
+    fn keep_greatest_key(&self, state: &mut FinalValueState) {
         let Tile::DataFunction {
             domain,
             codomain,
             deleted,
             ..
-        } = &self.merged
+        } = &state.merged
         else {
             return;
         };
@@ -409,11 +434,11 @@ impl ExtractFinalProducer {
         };
         let Tile::DataFunction {
             domain_predicate, ..
-        } = &self.merged
+        } = &state.merged
         else {
             return;
         };
-        self.merged = Tile::data_function(
+        state.merged = Tile::data_function(
             domain.select_indices(std::iter::once(idx), 1),
             Box::new(Tile::Scalar(values.select_indices(std::iter::once(idx), 1))),
             domain_predicate.clone(),
@@ -487,7 +512,7 @@ mod tests {
                 bit_set::BitSet::new(),
             )
         }
-        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        fn release_impl(&self, obsolete_guard: TileGuard) {
             if let TileGuard::Function(FunctionGuard::Domain(released)) = &obsolete_guard
                 && let Some(Value::UInt(w)) = released.as_at_or_below()
             {
@@ -543,7 +568,7 @@ mod tests {
                 bit_set::BitSet::new(),
             )
         }
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     fn named_variant(arms: &[(&str, Extent)]) -> Extent {
@@ -597,7 +622,7 @@ mod tests {
                 self.tiling().empty_tile()
             }
         }
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
 
     fn int_source(keys: Vec<u64>, values: Vec<i64>) -> TerminalSource {
@@ -1000,14 +1025,24 @@ mod consuming_tests {
         let source = source(0..10);
         let mut extract = final_over(&source, None);
         extract.consume_in_pipeline(InputId::ONLY, keys_between(2, 5));
-        assert!(extract.merged.cell_count() > 0);
-        assert_eq!(extract.state_info().values, extract.merged.cell_count());
-        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
-        assert_eq!(offer(&mut extract), Some(value(9)));
-        assert_eq!(extract.merged.cell_count(), 0);
+        assert!(extract.state.get_mut().unwrap().merged.cell_count() > 0);
         assert_eq!(
             extract.state_info().values,
-            extract.final_tile.as_ref().unwrap().cell_count()
+            extract.state.get_mut().unwrap().merged.cell_count()
+        );
+        extract.consume_in_pipeline(InputId::ONLY, ints().universal_guard());
+        assert_eq!(offer(&mut extract), Some(value(9)));
+        assert_eq!(extract.state.get_mut().unwrap().merged.cell_count(), 0);
+        assert_eq!(
+            extract.state_info().values,
+            extract
+                .state
+                .get_mut()
+                .unwrap()
+                .final_tile
+                .as_ref()
+                .unwrap()
+                .cell_count()
         );
         extract.release(extract.tiling().universal_guard());
         assert_eq!(extract.state_info().values, 0);
@@ -1030,7 +1065,7 @@ mod consuming_tests {
         let expected = extract.value_at(&tile, 1);
         extract.consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
         assert_eq!(extract.get(extract.tiling().universal_guard()), expected);
-        assert_eq!(extract.merged.cell_count(), 0);
+        assert_eq!(extract.state.get_mut().unwrap().merged.cell_count(), 0);
         assert_eq!(extract.state_info().values, expected.cell_count());
     }
 
