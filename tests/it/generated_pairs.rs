@@ -2128,6 +2128,16 @@ fn cell_program(name: &str) -> String {
         .unwrap_or_else(|| panic!("no cell is named `{name}`"))
 }
 
+#[test]
+fn nested_folds_keep_released_ancestors_released() {
+    for cell in [
+        "three_loop_feed_writing_every_loop/binder_in_nested_comp[i]",
+        "three_loop_feed_writing_every_loop/binder_in_nested_comp[q]",
+    ] {
+        assert_eq!(classify(&cell_program(cell)), Outcome::Agrees, "{cell}");
+    }
+}
+
 /// Each [`UNDEFINED`] cell is refused by the interpreter, which is its answer.
 #[test]
 fn undefined_cells_are_refused_by_the_interpreter() {
