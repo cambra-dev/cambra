@@ -1329,6 +1329,7 @@ impl Tile {
     ///
     /// For a tile with no collection at `level`.
     pub fn restrict_to_paths(&mut self, level: CurryLevel, keys: &Predicate) {
+        self.state_derived();
         let Tile::DataFunction { domain, .. } = self.values_at_level_above(level) else {
             panic!("only a collection has keys to restrict at {level}, got {self:?}")
         };
