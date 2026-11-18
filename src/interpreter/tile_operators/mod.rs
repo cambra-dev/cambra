@@ -1596,6 +1596,10 @@ pub trait Breaker {
     /// When the breaker cannot consume its input's shape.
     fn consume(&mut self, input: InputId, guard: TileGuard);
 
+    /// Refresh source metadata before announcing or consuming source work.
+    #[doc(hidden)]
+    fn refresh_sources(&mut self) {}
+
     /// Initialize per-run publication and loop control before the first package executes.
     fn begin_run(&mut self) {}
 
@@ -1724,6 +1728,64 @@ pub trait BreakingProducer: TileProducer + Breaker {
     fn entry_placements(&self, input: InputId) -> Vec<crate::interpreter::dispatcher::Placement> {
         self.entry_placement(input).into_iter().collect()
     }
+}
+
+/// Coordinator preparation of an existing transaction input chain. It advances each inline
+/// control or breaker once; published dependencies and recurrence snapshots are boundaries.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ReadPreparation {
+    visited: std::collections::HashSet<usize>,
+}
+impl ReadPreparation {
+    pub(crate) fn prepare<P: TileProducer + ?Sized>(&mut self, producer: &mut P) {
+        let address = std::ptr::from_ref(&*producer).cast::<()>() as usize;
+        if !self.visited.insert(address)
+            || producer.recurrence_of().is_some()
+            || producer.store_read().is_some()
+            || producer
+                .base()
+                .placement
+                .as_ref()
+                .is_some_and(|at| at.get().is_some())
+        {
+            return;
+        }
+        producer.refresh_source();
+        producer.prepare_read(self);
+    }
+    pub(crate) fn inputs<P: TileProducer + ?Sized>(&mut self, producer: &mut P) {
+        producer.visit_input_producers_mut(&mut |_, input| self.prepare(input));
+    }
+    pub(crate) fn consume<P: TileProducer + ?Sized>(&mut self, producer: &mut P) {
+        if let Some(breaker) = producer.as_breaking_mut() {
+            for input in 0..breaker.inputs() {
+                let input = InputId(input);
+                let whole = breaker.input_tiling(input).universal_guard();
+                breaker.consume(input, whole);
+            }
+        }
+    }
+}
+
+/// Refresh source leaves before their regions are announced or consumed, without advancing
+/// transactional or loop control. Other published pipelines own the sources below their stores.
+pub(crate) fn refresh_source_inputs<P: TileProducer + ?Sized>(producer: &mut P) {
+    fn visit<P: TileProducer + ?Sized>(
+        producer: &mut P,
+        seen: &mut std::collections::HashSet<usize>,
+    ) {
+        let address = std::ptr::from_ref(&*producer).cast::<()>() as usize;
+        if !seen.insert(address)
+            || producer.recurrence_of().is_some()
+            || producer.store_read().is_some()
+        {
+            return;
+        }
+        producer.refresh_source();
+        producer.visit_input_producers_mut(&mut |_, input| visit(input, seen));
+    }
+    visit(producer, &mut Default::default());
 }
 
 /// Live runtime counterpart of a [`TileOperator`].
@@ -2078,6 +2140,17 @@ pub trait TileProducer: Send + Sync {
     fn data_sources(&self) -> Vec<Arc<RwLock<dyn DataSourceDomainExtentImpl>>> {
         Vec::new()
     }
+
+    /// Explicit coordinator advancement before a transaction control phase reads snapshots.
+    #[doc(hidden)]
+    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
+        prepared.inputs(self);
+        prepared.consume(self);
+    }
+
+    /// Refresh this source leaf's published domain metadata, leaving reads observational.
+    #[doc(hidden)]
+    fn refresh_source(&mut self) {}
 
     /// This producer as a pipeline breaker, where it is one.
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
@@ -2537,7 +2610,11 @@ pub(crate) mod test_helpers {
             crate::interpreter::Restates::Every
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            projection_guard: TileGuard,
+        ) -> Tile {
             self.pulled
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2670,7 +2747,11 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            projection_guard: TileGuard,
+        ) -> Tile {
             let mut tile = self
                 .tile
                 .read()
@@ -3036,7 +3117,11 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _projection_guard: TileGuard,
+        ) -> Tile {
             self.tile.clone()
         }
 
@@ -3055,7 +3140,11 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _projection_guard: TileGuard,
+        ) -> Tile {
             self.tile.clone()
         }
 
@@ -3100,7 +3189,11 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _projection_guard: TileGuard,
+        ) -> Tile {
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
@@ -3146,13 +3239,19 @@ mod tests {
             visit("input", &*self.input);
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _projection_guard: TileGuard,
+        ) -> Tile {
             use super::FunctionGuard;
             use crate::interpreter::{Predicate, Value};
-            self.input
-                .get(TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                    TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(1)))),
-                ))))
+            _cx.get(
+                &*self.input,
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                    FunctionGuard::Domain(Predicate::point(Value::UInt(1))),
+                )))),
+            )
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
@@ -3210,7 +3309,11 @@ mod tests {
     impl TileProducer for OneRow {
         impl_producer_base!();
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _projection_guard: TileGuard,
+        ) -> Tile {
             Tile::Scalar(ColumnValue::Ints(vec![7]))
         }
 

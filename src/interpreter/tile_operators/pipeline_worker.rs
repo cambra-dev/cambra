@@ -330,8 +330,11 @@ impl TileProducer for InputReader {
             guard,
         )
     }
-    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
-        self.get(guard)
+    fn get_impl(&self, cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
+        cx.get(
+            &**self.input.read().unwrap_or_else(PoisonError::into_inner),
+            guard,
+        )
     }
     fn release_impl(&mut self, guard: TileGuard) {
         self.cx.release(

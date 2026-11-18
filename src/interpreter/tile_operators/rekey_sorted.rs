@@ -345,6 +345,9 @@ impl RekeySortedProducer {
 }
 
 impl Breaker for RekeySortedProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     fn consume(&mut self, _: InputId, guard: TileGuard) {
         let tile = self.read_input(guard.clone());
         self.output.merge(tile);
@@ -429,7 +432,7 @@ impl Complete {
 mod tests {
     use super::*;
     use crate::interpreter::BaseType;
-    use crate::interpreter::tile_operators::test_helpers::{ReadInPipeline as _, ReleaseSpy};
+    use crate::interpreter::tile_operators::test_helpers::ReleaseSpy;
     use bit_set::BitSet;
     use std::collections::HashMap;
 

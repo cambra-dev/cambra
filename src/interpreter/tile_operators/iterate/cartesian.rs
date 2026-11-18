@@ -236,10 +236,11 @@ impl CartesianIteration {
         ProducerStateInfo::holding(self.sides.iter().map(|side| side.tile.cell_count()).sum())
     }
 
-    pub(super) fn get(&mut self, guard: TileGuard, tiling: &Tiling, obsolete: &TileGuard) -> Tile {
-        if !guard.is_empty() {
-            self.read(obsolete);
-        }
+    pub(super) fn refresh(&mut self, obsolete: &TileGuard) {
+        self.read(obsolete);
+    }
+
+    pub(super) fn get(&self, guard: TileGuard, tiling: &Tiling, obsolete: &TileGuard) -> Tile {
         self.offer(guard, tiling, obsolete)
     }
 
@@ -333,6 +334,7 @@ mod tests {
         )
     }
     fn rows(head: &mut dyn TileProducer) -> usize {
+        head.refresh_source();
         let mut tile = head.read_in_pipeline(head.tiling().universal_guard());
         tile.compact();
         let Tile::DataFunction { domain, .. } = tile else {
@@ -557,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cartesian_iterator_is_a_leaf_and_reads_arrivals_on_get() {
+    fn a_cartesian_iterator_is_a_leaf_and_refreshes_before_reads() {
         let (a, b) = (source("a"), source("b"));
         add(&a, &[0], prefix(0));
         add(&b, &[0], prefix(0));
@@ -568,6 +570,12 @@ mod tests {
         p.visit_input_producers(&mut |_, _| panic!("an extent iterator is a leaf"));
         assert_eq!(rows(&mut *p), 1);
         add(&a, &[1], prefix(1));
+        // Reading observes the last refresh; it does not ingest newly arrived source keys.
+        let snapshot = p.read_in_pipeline(p.tiling().universal_guard());
+        let Tile::DataFunction { domain, .. } = snapshot else {
+            panic!("a product is a collection")
+        };
+        assert_eq!(domain.len(), 1);
         assert_eq!(rows(&mut *p), 2);
         assert_eq!(rows(&mut *p), 2);
     }

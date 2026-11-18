@@ -72,7 +72,9 @@ use crate::interpreter::{
 
 use crate::interpreter::operator_conversion::{store_key, store_key_name};
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
-use crate::interpreter::tile_operators::{ExecutionContext, InputId};
+use crate::interpreter::tile_operators::{
+    ExecutionContext, InputId, ReadPreparation, refresh_source_inputs,
+};
 use crate::interpreter::tile_operators::{
     OperatorBase, ProducerStateInfo, column_of_rows, impl_operator_base, impl_producer_base,
     read_again_toward, stored_value_tile, with_values_at,
@@ -978,6 +980,9 @@ impl SteppedStore for InductionStoreProducer {
 /// cover one row and include a closing round before releasing that row. See
 /// `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 impl Breaker for InductionStoreProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     fn begin_run(&mut self) {
         self.breaker.last_finishes = 0;
         self.begin_loop_run();
@@ -1202,6 +1207,9 @@ impl SteppedStore for CommitProducer {
 /// including an empty-write proposal, which takes a tick when it commits
 /// (`src/interpreter/design-operators.md`, "Ready transaction decisions").
 impl Breaker for CommitProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     fn begin_run(&mut self) {
         self.breaker.last_finishes = 0;
         if self.breaker.snapshot.is_none() && self.seed_producers.is_empty() {
@@ -2757,6 +2765,7 @@ impl CommitProducer {
     /// Pull writer `k`, and answer the proposals it holds that the store has neither attempted
     /// nor taken, with the step of each and the source position of its item.
     fn new_proposals(&mut self, k: usize) -> Vec<(u64, Position, Proposal)> {
+        ReadPreparation::default().prepare(&mut *self.writer_producers[k]);
         let guard = self.writer_producers[k].tiling().universal_guard();
         let (tile, _) = split_transact_stream(self.writer_producers[k].get(guard));
         let Tile::DataFunction {
@@ -6079,6 +6088,9 @@ fn rows_whole_beneath(beneath: &Predicate) -> Predicate {
 /// store has decided the position before it. See `src/interpreter/design-dispatcher.md`, "A loop in
 /// rounds".
 impl Breaker for InductionDriverProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     /// One step at `guard`, emitting a position only inside the region it names: a drive with
     /// rows above it is asked for a path of every level.
     fn consume(&mut self, _: InputId, guard: TileGuard) {
@@ -6636,6 +6648,7 @@ impl TileOperator for TransactDriver {
                 )));
         }
         Box::new(TransactDriverProducer {
+            rendered: self.tiling().empty_tile(),
             base: ProducerBase::new(
                 TransactDriverProducer::alloc_id(),
                 self.tiling(),
@@ -6671,6 +6684,7 @@ impl TileOperator for TransactDriver {
 }
 
 struct TransactDriverProducer {
+    rendered: Tile,
     base: ProducerBase,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
@@ -6776,35 +6790,9 @@ impl TransactDriverProducer {
     }
 }
 
-impl TileProducer for TransactDriverProducer {
-    fn input_entry(&self, input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
-        (input == "source").then(|| self.source_entry.clone())
-    }
-
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("store", &*self.store_producer);
-        visit("source", &*self.source_producer);
-    }
-
-    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
-        visit("store", &mut *self.store_producer);
-        visit("source", &mut *self.source_producer);
-    }
-
-    /// The drive reads its source again at its next pull; it reads its store at every one.
-    fn read_again(&mut self, input: &str) {
-        if input == "source" {
-            self.source_news.record(&Projection::Everything);
-        }
-    }
-
-    fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.window.held_values())
-    }
-
-    impl_producer_base!();
-
-    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+impl TransactDriverProducer {
+    fn advance(&mut self, prepared: &mut ReadPreparation) -> Tile {
+        prepared.prepare(&mut *self.source_producer);
         // Read the source after a notification or consuming delivery. Between those arrivals
         // and the drive's own releases its tile does not grow, so the last decode still answers.
         // A release removes what the driver has finished with. The drive
@@ -6994,6 +6982,45 @@ impl TileProducer for TransactDriverProducer {
             ),
             (SmolStr::from(F_DECIDED), decided_tile(&positions, decided)),
         ]));
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.compact();
+        tile
+    }
+}
+
+impl TileProducer for TransactDriverProducer {
+    fn input_entry(&self, input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
+        (input == "source").then(|| self.source_entry.clone())
+    }
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
+        visit("source", &*self.source_producer);
+    }
+
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("source", &mut *self.source_producer);
+    }
+
+    /// The drive reads its source again at its next pull; it reads its store at every one.
+    fn read_again(&mut self, input: &str) {
+        if input == "source" {
+            self.source_news.record(&Projection::Everything);
+        }
+    }
+
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.window.held_values())
+    }
+
+    impl_producer_base!();
+
+    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
+        self.rendered = self.advance(prepared);
+    }
+    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+        let mut tile = self.rendered.clone();
         tile.remove_guarded(self.obsolete_guard().clone());
         tile.compact();
         tile
@@ -7795,7 +7822,7 @@ impl TileProducer for TransactWriterProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
+    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
         let store_tile = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -7851,6 +7878,7 @@ impl TileProducer for TransactWriterProducer {
         // below, off the driver: the driver emits a row once per `(item, frontier)`,
         // so a position appearing here is a distinct attempt, and re-pulling at an
         // unchanged pair adds none.
+        prepared.prepare(&mut *self.body_producer);
         let body_tile = self
             .body_producer
             .get(self.body_producer.tiling().universal_guard());
@@ -7859,6 +7887,7 @@ impl TileProducer for TransactWriterProducer {
         // pull, or the one still in flight from an earlier one. Reading it here
         // rather than counting positions independently keeps the writer and the
         // driver from inventing two numberings that could drift.
+        prepared.prepare(&mut *self.driver_producer);
         let (driver_tile, decided) = split_transact_stream(
             self.driver_producer
                 .get(self.driver_producer.tiling().universal_guard()),
@@ -7971,6 +8000,8 @@ impl TileProducer for TransactWriterProducer {
             }
         }
         self.debug_assert_position_invariant();
+    }
+    fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
         // A release naming part of a proposal rather than the proposal leaves it in the
         // window (`release_impl`), so what it names is withheld here.
         let mut tile = self.render();
@@ -8967,7 +8998,7 @@ mod tests {
 
         impl_producer_base!();
         fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
-            let in_tile = self.input.get(self.input.tiling().universal_guard());
+            let in_tile = _cx.get(&*self.input, self.input.tiling().universal_guard());
             let Tile::DataFunction {
                 domain,
                 codomain,
@@ -10009,7 +10040,7 @@ mod tests {
 
         impl_producer_base!();
         fn get_impl(&self, _cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
-            let tile = self.inner.get(projection_guard);
+            let tile = _cx.get(&*self.inner, projection_guard);
             let (rows, _) = split_transact_stream(tile.clone());
             if let Tile::DataFunction { domain, .. } = &rows {
                 let mut seen = self.seen.write().unwrap_or_else(PoisonError::into_inner);
@@ -10524,9 +10555,10 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&self, _cx: &mut ExecutionContext, _projection_guard: TileGuard) -> Tile {
-            let store = self
-                .store_producer
-                .get(self.store_producer.tiling().universal_guard());
+            let store = _cx.get(
+                &*self.store_producer,
+                self.store_producer.tiling().universal_guard(),
+            );
             // ⊥ (empty) until the watermark covers `t`; then `key`'s value there.
             let resolved = match decode_store(&store) {
                 Some((frontier, entries)) if frontier >= pos(self.t) => {

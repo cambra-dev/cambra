@@ -1556,6 +1556,9 @@ fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
 }
 
 impl Breaker for MemoProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     fn finish_worker_input(&mut self) {
         let mut input = self.input();
         let whole = input.tiling().universal_guard();
@@ -1674,6 +1677,14 @@ impl BreakingProducer for MemoProducer {
 }
 
 impl TileProducer for MemoProducer {
+    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
+        if self.base.reads_input() && self.dirty.intersects(&Projection::Everything) {
+            prepared.inputs(self);
+            let whole = self.input_tiling(InputId::ONLY).universal_guard();
+            self.consume(InputId::ONLY, whole);
+        }
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(
             self.cached_tile
@@ -2124,7 +2135,7 @@ mod tests {
         pulls: Arc<Cell<usize>>,
         standing: Arc<Cell<bool>>,
         /// What the last tile called complete, which a pull with nothing new still states.
-        complete: Option<Predicate>,
+        complete: RwLock<Option<Predicate>>,
     }
 
     impl Scripted {
@@ -2190,7 +2201,7 @@ mod tests {
                 tiles: self.tiles.clone(),
                 pulls: self.pulls.clone(),
                 standing: self.notifier.standing.clone(),
-                complete: None,
+                complete: RwLock::new(None),
             })
         }
     }
@@ -2212,13 +2223,17 @@ mod tests {
                     .pop_front(),
                 false => None,
             };
-            match (next, &self.complete) {
+            let mut complete = self
+                .complete
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            match (next, &*complete) {
                 (Some(tile), _) => {
                     if let Tile::DataFunction {
                         domain_predicate, ..
                     } = &tile
                     {
-                        self.complete = Some(domain_predicate.clone());
+                        *complete = Some(domain_predicate.clone());
                     }
                     tile
                 }
@@ -2615,7 +2630,7 @@ mod projection_tests {
     fn a_notification_during_a_memo_read_survives_that_read() {
         struct NotifyingInput {
             base: ProducerBase,
-            consumer: Box<dyn Consumer>,
+            consumer: RwLock<Box<dyn Consumer>>,
             reads: Arc<Cell<usize>>,
         }
 
@@ -2626,7 +2641,10 @@ mod projection_tests {
                 let reads = self.reads.get() + 1;
                 self.reads.set(reads);
                 if reads == 1 {
-                    self.consumer.announce(&Projection::Everything);
+                    self.consumer
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .announce(&Projection::Everything);
                 }
                 self.tiling().empty_tile()
             }
@@ -2638,7 +2656,7 @@ mod projection_tests {
         let reads = Arc::new(Cell::new(0));
         let input = NotifyingInput {
             base: ProducerBase::unowned(NotifyingInput::alloc_id(), &ints()),
-            consumer: dirty.consumer(Box::new(|| {})),
+            consumer: RwLock::new(dirty.consumer(Box::new(|| {}))),
             reads: reads.clone(),
         };
         let mut memo = MemoProducer::new(
@@ -4108,9 +4126,10 @@ mod cycle_tests {
         impl_producer_base!();
 
         fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
-            let read = self
-                .recurrence
-                .get(self.recurrence.tiling().universal_guard());
+            let read = _cx.get(
+                &*self.recurrence,
+                self.recurrence.tiling().universal_guard(),
+            );
             self.wiring
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -4122,8 +4141,10 @@ mod cycle_tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .release_recurrence
             {
-                self.recurrence
-                    .release(self.recurrence.tiling().universal_guard());
+                _cx.release(
+                    &*self.recurrence,
+                    self.recurrence.tiling().universal_guard(),
+                );
             }
             self.answer.clone()
         }

@@ -158,6 +158,12 @@ impl SinkBreaker {
 }
 
 impl Breaker for SinkBreaker {
+    fn refresh_sources(&mut self) {
+        if let Some(input) = Self::input(&self.producer).as_mut() {
+            refresh_source_inputs(&mut **input);
+        }
+    }
+
     fn finish_worker_input(&mut self) {
         let mut slot = Self::input(&self.producer);
         let input = slot.as_mut().expect("a sink has subscribed its producer");

@@ -205,6 +205,7 @@ impl ExtractFinalProducer {
             );
         };
         let default_tiling = default.tiling().clone();
+        ReadPreparation::default().prepare(&mut **default);
         let default_tile = default.get(default_tiling.universal_guard());
         // A collection-valued position falls back to the whole collection, so the default
         // is the tile it is rather than a value to rebuild a column from. It has converged
@@ -224,6 +225,12 @@ impl ExtractFinalProducer {
 }
 
 impl TileProducer for ExtractFinalProducer {
+    fn prepare_read(&mut self, prepared: &mut ReadPreparation) {
+        prepared.prepare(&mut *self.source);
+        let whole = self.input_tiling(InputId::ONLY).universal_guard();
+        self.consume(InputId::ONLY, whole);
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(
             self.merged.cell_count() + self.final_tile.as_ref().map_or(0, Tile::cell_count),
@@ -286,6 +293,9 @@ impl TileProducer for ExtractFinalProducer {
 }
 
 impl Breaker for ExtractFinalProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     /// Merges the source rows it answers at `guard`, a guard of the source's tiling, keeps the
     /// row at the greatest key, and releases the source at what the answer stated. Rows merge in
     /// the order they arrive, so the last row is not the final one: the key says which is. Once

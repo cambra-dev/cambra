@@ -2772,6 +2772,7 @@ impl LivePipeline {
         if self.closed {
             return false;
         }
+        reach(self.pipeline, &mut |breaker, _| breaker.refresh_sources());
         let mut changed = !self.starts.is_empty();
         let mut arrivals = self.input.empty_guard();
         for start in std::mem::take(&mut self.starts) {
@@ -3295,7 +3296,11 @@ mod tests {
             Some(CurryLevel::new(level.index() + 1))
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _guard: TileGuard,
+        ) -> Tile {
             self.tiling().empty_tile()
         }
 
@@ -3344,7 +3349,11 @@ mod tests {
             None
         }
 
-        fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
+        fn get_impl(
+            &self,
+            _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+            _guard: TileGuard,
+        ) -> Tile {
             self.tiling().empty_tile()
         }
 

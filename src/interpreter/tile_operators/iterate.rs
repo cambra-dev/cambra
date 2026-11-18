@@ -338,7 +338,7 @@ impl TileProducer for IterateExtentProducer {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
             let obsolete = self.obsolete_guard().clone();
-            let Iteration::Cartesian(cartesian) = &mut self.iteration else {
+            let Iteration::Cartesian(cartesian) = &self.iteration else {
                 unreachable!()
             };
             return cartesian.get(projection_guard, &tiling, &obsolete);
@@ -380,6 +380,13 @@ impl TileProducer for IterateExtentProducer {
             },
         )));
         tile
+    }
+
+    fn refresh_source(&mut self) {
+        let obsolete = self.obsolete_guard().clone();
+        if let Iteration::Cartesian(cartesian) = &mut self.iteration {
+            cartesian.refresh(&obsolete);
+        }
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

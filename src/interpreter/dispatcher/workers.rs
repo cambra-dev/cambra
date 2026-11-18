@@ -835,7 +835,11 @@ mod tests {
         }
         impl TileProducer for FailingRelease {
             impl_producer_base!();
-            fn get_impl(&self, _cx: &mut ExecutionContext, _: TileGuard) -> Tile {
+            fn get_impl(
+                &self,
+                _cx: &mut crate::interpreter::tile_operators::ExecutionContext,
+                _: TileGuard,
+            ) -> Tile {
                 self.tiling().empty_tile()
             }
             fn release_impl(&mut self, _: TileGuard) {

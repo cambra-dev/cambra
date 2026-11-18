@@ -950,7 +950,7 @@ mod tests {
             impl_producer_base!();
 
             fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
-                self.input.get(guard)
+                _cx.get(&self.input, guard)
             }
 
             fn release_impl(&mut self, guard: TileGuard) {

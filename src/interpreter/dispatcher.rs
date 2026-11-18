@@ -2979,6 +2979,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
+        breaker.refresh_sources();
         breaker.consume(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()

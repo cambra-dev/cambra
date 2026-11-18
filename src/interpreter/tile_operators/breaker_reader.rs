@@ -114,12 +114,12 @@ mod tests {
                 visit("input", &*self.input);
             }
             fn get_impl(&self, _cx: &mut ExecutionContext, _: TileGuard) -> Tile {
-                self.input
-                    .get(
-                        CurryLevel::new(1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::point(Value::UInt(0)),
-                        ))),
-                    )
+                _cx.get(
+                    &*self.input,
+                    CurryLevel::new(1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::point(Value::UInt(0)),
+                    ))),
+                )
             }
             fn release_impl(&mut self, _: TileGuard) {}
         }

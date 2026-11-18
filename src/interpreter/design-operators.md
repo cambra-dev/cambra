@@ -2218,8 +2218,16 @@ producer's identity. Releases issued inside a native read are recorded there. A 
 node releases along with its cumulative input guard only after native consumption and any local
 aggregation flush have integrated output. The coordinator applies them to the canonical chain before
 publication and acknowledgement. Canonical native reads call the same `get_impl` and apply their
-recorded releases after the read. Producers requiring exclusive access retain `get_exclusive_impl`;
-worker admission rejects chains containing those nodes, except shared breaker boundaries.
+recorded releases after the read. Every producer implements this shared read interface. Stateful
+transaction controls remain coordinator-only; worker admission still excludes their chains.
+
+Before collecting proposals, the commit store prepares its existing writer chain. Preparation
+walks the actual input graph once, stops at placed pipelines and recurrence/store snapshots, and
+runs inline breakers through their native consumption callbacks. The transaction driver then
+retains its current attempt stream and the writer retains its proposals; their getters only
+render those snapshots. Source polling separately refreshes Cartesian extent metadata before
+announcing regions, and native consumption refreshes it before reading. Neither operation adds
+another operator graph or makes an ordinary read advance transaction control.
 
 `ConsumeState` borrows a worker's input cursor and retained aggregation buffers for a batch. Workers
 call `consume_impl(&self, state, input, guard)` on the canonical breaker under a shared runtime guard.

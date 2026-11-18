@@ -277,6 +277,9 @@ impl TileProducer for AggregateProducer {
 }
 
 impl Breaker for AggregateProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     fn requires_ordered_input(&self) -> bool {
         self.kind == AggregateKind::Sum
     }
@@ -568,6 +571,9 @@ impl TileProducer for ExtractAggregateProducer {
 }
 
 impl Breaker for ExtractAggregateProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     /// Pulls the input at `guard`, a guard of the aggregation, and extracts its value once the
     /// input is terminal. A terminal input is released at what it stated, which is all of it. A
     /// partial one states nothing releasable, so it is left for the next consume. Once the value
@@ -1421,6 +1427,9 @@ impl TileProducer for MapAggregateProducer {
 }
 
 impl Breaker for MapAggregateProducer {
+    fn refresh_sources(&mut self) {
+        refresh_source_inputs(self);
+    }
     fn requires_ordered_input(&self) -> bool {
         self.state
             .read()
