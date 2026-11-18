@@ -1402,7 +1402,8 @@ fn values_ending_function_blocks(expr: &TypedExpr) -> Vec<NodeId> {
 
 /// One run of inference over `expr`, as [`run_with_params`] describes. A run that fails before
 /// coalesce settles its tree's capabilities as coalesce does
-/// ([`solve::settle_capabilities`]), so no capability variable leaves it either way.
+/// ([`solve::settle_capabilities`]), and every run closes what it hands back besides
+/// ([`solve::close_outputs`]), so nothing of the run's capability variables leaves it.
 fn run_once(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
@@ -1427,9 +1428,41 @@ fn run_once(
         ctx.instances = Rc::clone(instances);
         ctx
     };
-    let result = attempt_run(&mut sub_ctx, expr, params, reported, public, marks);
-    if result.is_err() {
-        solve::settle_capabilities(&mut sub_ctx.solver, expr);
+    let mut result = attempt_run(&mut sub_ctx, expr, params, reported, public, marks);
+    match &mut result {
+        Err(failure) => {
+            solve::settle_capabilities(&mut sub_ctx.solver, expr);
+            solve::close_outputs(&mut sub_ctx.solver, &mut failure.errors, &mut [], &mut []);
+        }
+        Ok(inferred) => solve::close_outputs(
+            &mut sub_ctx.solver,
+            &mut inferred.inert,
+            &mut inferred.schemes,
+            &mut inferred.top_level,
+        ),
+    }
+    #[cfg(debug_assertions)]
+    {
+        solve::assert_capabilities_settled(expr);
+        let mut seen = HashSet::new();
+        let (errors, schemes): (&[LocatedInferError], &[(Name, _)]) = match &result {
+            Ok(inferred) => (&inferred.inert, &inferred.schemes),
+            Err(failure) => (&failure.errors, &[]),
+        };
+        let mut types = Vec::new();
+        for e in errors {
+            e.error.clone().map_types(&mut |ty| {
+                types.push(ty.clone());
+                ty.clone()
+            });
+        }
+        for (_, scheme) in schemes {
+            let scheme: &solver::display::InferredPoly = scheme;
+            types.extend(scheme.poly.types().cloned());
+        }
+        for ty in &types {
+            solve::assert_type_closed(ty, &mut seen);
+        }
     }
     result
 }
