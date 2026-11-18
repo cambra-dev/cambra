@@ -80,27 +80,6 @@ JUSTIFICATION = re.compile(r"//\s*shared-state-ok:\s*\S")
 # Duplicate entries are meaningful — two sites in one file with the same shape are
 # two exceptions. Test code is not listed: `_blank_test_items` skips it entirely.
 EXPECTED_EXCEPTIONS = [
-    # A Cartesian iteration's state, twice: the producer's field and the field of its own leaf
-    # consumer (`CartesianSource`), which ingests arrivals from data sources at the I/O boundary into
-    # it. No other operator reaches the cell.
-    ("src/interpreter/tile_operators/iterate/cartesian.rs", "shared cell of `CartesianIteration`"),
-    ("src/interpreter/tile_operators/iterate.rs", "shared cell of `CartesianIteration`"),
-    # A pipeline chain producer's own state, which `get` and `release` change through `&self`. No
-    # other operator holds the producer.
-    ("src/interpreter/tile_operators/combinators.rs", "cell of `Vec<HeldRow>`"),
-    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
-    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
-    ("src/interpreter/tile_operators/fan.rs", "cell of `HashMap<usize, TileGuard>`"),
-    ("src/interpreter/tile_operators/fan.rs", "cell of `Vec<HashSet<Vec<Value>>>`"),
-    ("src/interpreter/tile_operators/fan.rs", "cell of `Predicate`"),
-    ("src/interpreter/tile_operators/map.rs", "cell of `Option<HeldBeneathKeys>`"),
-    # Every producer's debug record of its last output (`ProducerBase::last_output`), which `get`
-    # changes through `&self`.
-    ("src/interpreter/tile_operators/mod.rs", "cell of `Option<Tile>`"),
-    # An HTTP route's requests from the dispatcher thread. A `Receiver` is not `Sync` and a data
-    # source is; each poll reaches it through `get_mut`. The external boundary; no operator's output
-    # crosses it.
-    ("src/interpreter/http_server.rs", "cell of `Receiver<RouteMessage>`"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `RouteTable`"),
     # A sink consumer's placement, which the planner writes before a run and `notify` reads. What
@@ -154,6 +133,19 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<Offers>`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
+    # The notification caches in front of a pairing operator's inputs (`SharedDelivered`) and of
+    # an aligned operator's arms (`SharedAligned`): the regions each input has delivered, which the
+    # consumers in front of the inputs read and grow on each delivery. What crosses them is
+    # predicates, never a tile.
+    ("src/interpreter/notifications.rs", "shared cell of `Delivered`"),
+    ("src/interpreter/notifications.rs", "shared cell of `AlignedDelivered`"),
+    # `WholeOnceComplete::delivered`: which of a record's fields have delivered, set by each
+    # field's notification. What crosses it is one flag per field, never a tile.
+    ("src/interpreter/notifications.rs", "cell of `Vec<bool>`"),
+    # `MemoProducer::reading_input`: held shared by each consume while it reads the input and
+    # exclusively by a release of the input, so a release waits for the consumes in flight. It
+    # guards no data.
+    ("src/interpreter/tile_operators/fanout.rs", "cell of `()`"),
     # The placement an entry and its breaker share, which the planner writes before a run; what
     # crosses it is a pipeline's index. See `Placement`.
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<PipelineId>`"),
@@ -172,6 +164,40 @@ EXPECTED_EXCEPTIONS = [
     # never a tile passed between operators.
     ("src/interpreter/tile_operators/fanout.rs", "cell of `Box<dyn TileProducer>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `Option<TileGuard>`"),
+    # A breaker's own state. Several worker threads consume one breaker, so `get`,
+    # `consume_impl` and `release` take `&self` and change it under the lock
+    # (`src/interpreter/design-dispatcher.md`, "Shared native pipeline execution"). No other
+    # operator holds the producer, so nothing crosses the cell between operators.
+    ("src/interpreter/tile_operators/aggregate.rs", "cell of `Tile`"),
+    ("src/interpreter/tile_operators/aggregate.rs", "cell of `ExtractedAggregate`"),
+    ("src/interpreter/tile_operators/aggregate.rs", "cell of `MapAggregateState`"),
+    ("src/interpreter/tile_operators/extract_final.rs", "cell of `FinalValueState`"),
+    ("src/interpreter/tile_operators/fanout.rs", "cell of `Tile`"),
+    ("src/interpreter/tile_operators/rekey_sorted.rs", "cell of `RekeyState`"),
+    # A pipeline chain producer's own state. Several worker threads pull one pipeline's chain, so
+    # `get` and `release` change it through `&self` under the lock. No other operator holds the
+    # producer.
+    ("src/interpreter/tile_operators/combinators.rs", "cell of `Vec<HeldRow>`"),
+    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
+    ("src/interpreter/tile_operators/combinators.rs", "cell of `Predicate`"),
+    ("src/interpreter/tile_operators/fan.rs", "cell of `ZipState`"),
+    ("src/interpreter/tile_operators/map.rs", "cell of `Option<HeldBeneathKeys>`"),
+    # Every producer's release state and its debug record of its last output (`ProducerBase`),
+    # which `release` and `get` change through `&self`; no other operator holds them.
+    ("src/interpreter/tile_operators/mod.rs", "cell of `TileGuard`"),
+    ("src/interpreter/tile_operators/mod.rs", "cell of `Option<Tile>`"),
+    # A sink breaker's own state at the I/O boundary, which each consume changes through `&self`;
+    # nothing reads it back into the graph.
+    ("src/interpreter/tile_operators/sink_breaker.rs", "cell of `Hands`"),
+    # A Cartesian iteration's state, twice: the producer's field and the field of its own leaf
+    # consumer (`CartesianSource`), which ingests arrivals from data sources at the I/O boundary into
+    # it. No other operator reaches the cell.
+    ("src/interpreter/tile_operators/iterate/cartesian.rs", "shared cell of `CartesianIteration`"),
+    ("src/interpreter/tile_operators/iterate.rs", "shared cell of `CartesianIteration`"),
+    # An HTTP route's requests from the dispatcher thread. A `Receiver` is not `Sync` and a data
+    # source is; each poll reaches it through `get_mut`. The external boundary; no operator's output
+    # crosses it.
+    ("src/interpreter/http_server.rs", "cell of `Receiver<RouteMessage>`"),
     # `PRODUCER_COUNTERS`, the producer ID allocator; see its comment.
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     # The record of pulls in progress that the `get` wrapper checks each input's pull
@@ -202,10 +228,9 @@ ALLOWED_INNER = {
     # No entry here spells a *slot*. `Option<Box<dyn TileOperator>>` and the bare
     # `Box<dyn TileOperator>` are both deliberately absent, because either shape
     # hand-rolls what `CycleSlot` already is, and `CycleSlot` carries its own
-    # justification — a second copy has to argue for itself. `FanOut`'s owned
-    # input is the one live site of the bare form and is listed by path in
-    # `EXPECTED_EXCEPTIONS` instead, so allowing the *kind* would blanket-excuse
-    # every future hand-rolled one to save a single annotation.
+    # justification — a second copy has to argue for itself. No site holds either
+    # form, and allowing the *kind* would blanket-excuse every future hand-rolled
+    # one.
     "Option<Box<dyn TileProducer>>": "late-wired producer slot",
     "Option<Box<dyn TileProducer>>": "late-wired producer slot",
     # A fan-out and its branches are one logical operator; the shared state is
