@@ -260,8 +260,7 @@ impl MapResultProducer {
     /// Whether a projection of the keys is also a projection of the function operand's keys: a
     /// one-level stream whose values are its keys, mapped one level in, over a collection
     /// operand. The keys a projection admits are then the keys the function is looked up at.
-    /// Anywhere else the lookups are not known before the input is read, and the operand is
-    /// read whole.
+    /// Other collection lookups derive their keys from the input's values after reading it.
     fn projection_reaches_function(&self) -> bool {
         self.values_are_keys
             && self.level == CurryLevel::new(1)
@@ -303,7 +302,16 @@ impl MapResultProducer {
             Projection::Keys { .. } if self.projection_reaches_function() => {
                 projection.guard(self.function.tiling())
             }
-            _ => self.function.tiling().universal_guard(),
+            _ if f_tiling.is_data_function() => {
+                let arguments =
+                    scalar_tile_to_column_value(input_tile.values_at(self.level).clone());
+                Projection::keys_at(
+                    CurryLevel::OUTERMOST,
+                    Predicate::from_column_value(&arguments),
+                )
+                .guard(&f_tiling)
+            }
+            _ => f_tiling.universal_guard(),
         };
         let function_tile = self.function.get(function_guard);
 
@@ -623,11 +631,17 @@ impl TileProducer for MapResultProducer {
         Restates::Above(self.level)
     }
 
-    /// The function operand is pulled at the projection where the projection reaches it
-    /// ([`projection_reaches_function`](Self::projection_reaches_function)), and read whole
-    /// otherwise.
+    /// The input keeps the requested level. A collection function is read at its outermost
+    /// keys, derived from the arguments, unless the projection reaches it directly.
     fn input_level(&self, role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        (role == "input" || self.projection_reaches_function()).then_some(level)
+        if role == "input" || self.projection_reaches_function() {
+            Some(level)
+        } else {
+            self.function
+                .tiling()
+                .is_data_function()
+                .then_some(CurryLevel::OUTERMOST)
+        }
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -1486,7 +1500,9 @@ mod nested_projection_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
+    use crate::interpreter::tile_operators::test_helpers::{
+        ProjectionSpy, ReleaseSpy, TestTileProducer,
+    };
     use bit_set::BitSet;
 
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
@@ -1609,7 +1625,7 @@ mod tests {
         );
 
         // Create test producers
-        let function_producer = TestTileProducer::new(two_level_fn_tile, function_tiling);
+        let function_producer = ProjectionSpy::new(two_level_fn_tile, function_tiling).0;
         let input_producer = TestTileProducer::new(one_level_fn_tile, input_tiling);
 
         // Create MapResultProducer and test it
@@ -1821,7 +1837,7 @@ mod tests {
         let mut map_result = MapResultProducer {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
-            function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
+            function: Box::new(ProjectionSpy::new(two_level_fn_tile, function_tiling).0),
             values_are_keys: false,
             level: CurryLevel::new(1),
         };
@@ -1891,7 +1907,7 @@ mod tests {
         let mut producer = MapResultProducer {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
-            function: Box::new(TestTileProducer::new(f, fn_tiling)),
+            function: Box::new(ProjectionSpy::new(f, fn_tiling).0),
             values_are_keys: false,
             level: CurryLevel::new(1),
         };
@@ -2580,10 +2596,10 @@ mod projection_tests {
     }
 
     /// A stream whose values are indexes into the table, not its own keys: the lookups are
-    /// known only once the stream is read, so the table is read whole and never released
-    /// for a part of the stream.
+    /// read from the requested rows. Releasing those rows does not release table keys that
+    /// other rows may still reference.
     #[test]
-    fn a_stream_of_indexes_reads_the_table_whole() {
+    fn a_stream_of_indexes_reads_only_the_referenced_table_keys() {
         let (mut map, logs) = map_result(
             stream(vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
             table(),
@@ -2596,11 +2612,30 @@ mod projection_tests {
         assert_eq!(*logs.input_pulled.borrow(), [keys_between(0, 1)]);
         assert_eq!(
             *logs.function_pulled.borrow(),
-            [table().1.universal_guard()],
-            "the table is pulled in full"
+            [keys_between(8, 9)],
+            "the table is pulled at the arguments, not the input positions"
         );
         map.release(keys_between(0, 1));
         assert!(logs.function_released.borrow().is_empty());
+    }
+
+    #[test]
+    fn repeated_arguments_remain_readable_after_releasing_an_earlier_row() {
+        let (mut map, logs) = map_result(
+            stream(vec![8, 8, 2, 8, 4, 5, 6, 7, 8, 9]),
+            table(),
+            output_tiling(),
+            false,
+            CurryLevel::new(1),
+        );
+        assert_eq!(int_entries(&map.get(keys_between(0, 0))), [(0, 180)]);
+        map.release(keys_between(0, 0));
+        assert_eq!(int_entries(&map.get(keys_between(1, 1))), [(1, 180)]);
+        assert!(logs.function_released.borrow().is_empty());
+        assert_eq!(
+            *logs.function_pulled.borrow(),
+            [keys_between(8, 8), keys_between(8, 8)]
+        );
     }
 
     /// `map(-)` applies a scalar function value: the projection is the stream's, and the
@@ -2733,7 +2768,7 @@ mod projection_tests {
     }
 
     #[test]
-    fn a_projection_of_groups_reaches_the_groups_and_reads_the_table_whole() {
+    fn a_projection_of_groups_reads_only_their_members_from_the_table() {
         let (mut map, logs) = lookup_over_groups();
         let answer = map.get(groups_one_and_three());
         let Tile::DataFunction { domain, .. } = &answer else {
@@ -2747,7 +2782,11 @@ mod projection_tests {
         assert_eq!(*logs.input_pulled.borrow(), [groups_one_and_three()]);
         assert_eq!(
             *logs.function_pulled.borrow(),
-            [table().1.universal_guard()]
+            [Projection::keys_at(
+                CurryLevel::OUTERMOST,
+                Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2, 3])),
+            )
+            .guard(&table().1)]
         );
     }
 

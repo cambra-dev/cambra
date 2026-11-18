@@ -3294,12 +3294,14 @@ impl TileProducer for StoreFinalReadProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if self.released {
             return self.tiling().empty_tile();
         }
         if self.levels_above > 0 {
-            return self.per_row();
+            let mut tile = self.per_row();
+            tile.restrict_to(&projection_guard.projection_for(self), self.tiling());
+            return tile;
         }
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
@@ -3332,7 +3334,10 @@ impl TileProducer for StoreFinalReadProducer {
         // decided frontier, or the seed where nothing wrote it — and, for an induction
         // store that ran no position at all, where nothing is decided either.
         let value = store_value_now(&store, &self.key);
-        stored_value_tile(value.into_iter().collect(), &self.value_extent)
+        let mut tile = stored_value_tile(value.into_iter().collect(), &self.value_extent);
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.restrict_to(&projection_guard.projection_for(self), self.tiling());
+        tile
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // Under rows the output's levels are the store's, so a release of rows names the
@@ -9385,6 +9390,56 @@ mod tests {
             BitSet::new(),
         );
         assert!(matches!(seed_value(&empty_map), Ok(Value::Function(b)) if b.is_empty()));
+    }
+
+    /// A collection-valued final read bounds projected completeness and keeps released keys absent.
+    #[test]
+    fn a_final_collection_read_projects_and_releases_its_keys() {
+        let value_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let value = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10, 20, 30]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let value_extent = value_tiling.extent();
+        let key = acct("xs");
+        let engine = CommitEngine::new(HashMap::from([(
+            key.clone(),
+            seed_value(&value).unwrap_or_else(|_| panic!("a closed collection is a value")),
+        )]));
+        let store_tiling = full_store_tiling(
+            commit_clock_domain(),
+            HashMap::from([("xs".into(), Tiling::Scalar(value_extent.clone()))]),
+        );
+        let mut tile = engine.render_full_store_tile(&store_tiling);
+        let Tile::Store { terminal, .. } = &mut tile else {
+            unreachable!()
+        };
+        *terminal = true;
+        let mut read = StoreFinalRead::new(
+            Box::new(FixedSource {
+                tiling: store_tiling,
+                tile,
+            }),
+            key,
+            value_extent,
+        );
+        let mut cx = Default::default();
+        let mut producer =
+            read.subscribe(read.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        for key in [1, 2] {
+            let projection = Projection::admitting(Predicate::point(Value::UInt(key)));
+            let guard = projection.guard(producer.tiling());
+            let mut expected = value.clone();
+            expected.restrict_to(&projection, producer.tiling());
+            assert_eq!(producer.get(guard.clone()), expected);
+            producer.release(guard.clone());
+            assert!(producer.get(guard).is_empty());
+        }
     }
 
     /// A settled read reclaims the history below the store's frontier on every pull.

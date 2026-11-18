@@ -796,14 +796,18 @@ impl TileProducer for LookupProducer {
         visit("input", &*self.input);
     }
 
-    /// The input is read whole, since each row's key is looked up in that row's collection, and
-    /// the answer is cut to the projection over the keys above the rows.
+    /// Each answer keeps the keys above its `(key, collection)` row.
+    fn restates(&self) -> Restates {
+        Restates::Above(self.level)
+    }
+
+    /// Read only the requested rows, each carrying its own key and collection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+        let mut tile = self.input.get(projection.guard(self.input.tiling()));
         let Tiling::Scalar(out_extent) = self.tiling().values_at(self.level) else {
             unreachable!("`Lookup::new_at` puts one value at the level")
         };
@@ -1162,6 +1166,29 @@ mod tests {
             input: Box::new(TestTileProducer::new(tile, tiling)),
             level: CurryLevel::new(1),
         }
+    }
+
+    #[test]
+    fn a_lookup_morsel_reads_only_its_rows_and_keeps_the_next_row() {
+        use crate::interpreter::tile_operators::test_helpers::{ProjectionSpy, keys_between};
+
+        let mut lookup = keyed_rows(1);
+        let tiling = lookup.input.tiling().clone();
+        let tile = lookup.input.get(tiling.universal_guard());
+        let (input, pulled, _) = ProjectionSpy::new(tile, tiling);
+        lookup.input = Box::new(input);
+
+        for (position, value) in [(0, 20), (1, 30)] {
+            let guard = keys_between(position, position);
+            let out = lookup.get(guard.clone());
+            assert_eq!(*out.key_levels()[0].1, ColumnValue::UInts(vec![position]));
+            assert_eq!(
+                scalar_tile_to_column_value(out.deepest_values().clone()),
+                ColumnValue::Ints(vec![value]),
+            );
+            lookup.release(guard);
+        }
+        assert_eq!(*pulled.borrow(), [keys_between(0, 0), keys_between(1, 1)]);
     }
 
     /// Each row's key is read in that row's own collection, not in one every row shares.
