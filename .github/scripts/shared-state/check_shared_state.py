@@ -90,11 +90,6 @@ EXPECTED_EXCEPTIONS = [
     # doc. `subscribe` installs its consumer on the input before the producer exists, and the cell
     # connects the two; what crosses it is a region, never a tile.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
-    # `DirtyRegion`, the regions a `Memo` must read: what it has not read and what its input
-    # has notified since; see its type doc. The input's consumer and the memo share it so a
-    # notification marks the region at once, and a notification carries a region, which a one-bit
-    # flag cannot hold.
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Projection`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what

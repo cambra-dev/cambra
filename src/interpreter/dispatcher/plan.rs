@@ -3714,7 +3714,7 @@ mod tests {
                         let position = steps[index];
                         steps[index] += 1;
                         let snapshot = {
-                            let mut store = induction(scopes[index].as_ref().unwrap());
+                            let store = induction(scopes[index].as_ref().unwrap());
                             let guard = store.tiling().universal_guard();
                             store.get(guard)
                         };
@@ -3840,7 +3840,7 @@ mod tests {
             Some(CurryLevel::new(level.index() + 1))
         }
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 
@@ -3951,7 +3951,7 @@ mod tests {
     impl TileProducer for OutermostOnlyProducer {
         impl_producer_base!();
 
-        fn get_impl(&mut self, guard: TileGuard) -> Tile {
+        fn get_impl(&self, guard: TileGuard) -> Tile {
             self.pulled.borrow_mut().push(guard.clone());
             let mut tile = self.tile.clone();
             tile.restrict_to(&guard.projection(&self.name()), self.tiling());
@@ -3971,7 +3971,7 @@ mod tests {
         let input = OutermostOnly::new();
         let pulled = input.pulled.clone();
         let mut uncurry = Uncurry::new_at(Box::new(input), CurryLevel::new(1));
-        let mut producer = uncurry.subscribe(
+        let producer = uncurry.subscribe(
             uncurry.tiling().universal_guard(),
             Box::new(|| {}),
             &mut SubscribeContext::new(),
@@ -4021,7 +4021,7 @@ mod tests {
             None
         }
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_impl(&self, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 
