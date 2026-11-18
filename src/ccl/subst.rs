@@ -1737,7 +1737,7 @@ impl Subst {
             );
             return e.copied(self.ids);
         }
-        let mut out = with_transport_memo(|| self.apply_expr_inner(solver, e));
+        let mut out = with_transport_memo(solver, |solver| self.apply_expr_inner(solver, e));
         // What `e` did of its own, renamed, the result does too: a term replacing it brings its
         // own besides. Over its rebuilt children it does what they do.
         out.own_capabilities = crate::ccl::capabilities::of_parts_in(
@@ -2898,7 +2898,7 @@ impl Subst {
         if self.is_id() {
             return r.clone();
         }
-        with_transport_memo(|| self.force_refinement_scoped(solver, r))
+        with_transport_memo(solver, |solver| self.force_refinement_scoped(solver, r))
     }
 
     fn force_refinement_scoped(
@@ -2924,7 +2924,7 @@ impl Subst {
         // the same term once rewritten, and the same one kept where the substitution is
         // vacuous, so neither the rewrite nor the scan deciding vacuity repeats per occurrence
         // ([`with_transport_memo`]).
-        if let Some(answer) = transport_memo_get(&r.predicate, &restricted) {
+        if let Some(answer) = transport_memo_get(solver, &r.predicate, &restricted) {
             return answer;
         }
         let answer = if restricted.acts_on(solver, &r.predicate) {
@@ -2944,7 +2944,7 @@ impl Subst {
         } else {
             r.clone()
         };
-        transport_memo_put(&r.predicate, restricted, &answer);
+        transport_memo_put(solver, &r.predicate, restricted, &answer);
         answer
     }
 
@@ -2983,7 +2983,7 @@ impl Subst {
         // builds rather than rewrites), so `born` is the right spelling; the
         // vacuous case returned above kept the source's `Rc` instead.
         let new_pred = Rc::new(new_pred);
-        crate::ccl::ccl_utils::record_derivation(&r.predicate, &new_pred);
+        crate::ccl::ccl_utils::record_derivation(solver, &r.predicate, &new_pred);
         crate::ccl::Refinement::born(new_pred)
     }
 
@@ -3061,7 +3061,7 @@ impl Subst {
         if self.is_id() {
             return ty.clone();
         }
-        with_transport_memo(|| self.apply_type_inner(solver, ty))
+        with_transport_memo(solver, |solver| self.apply_type_inner(solver, ty))
     }
 
     /// [`Self::apply_type_in`] outside every typing run, through
@@ -4519,13 +4519,8 @@ thread_local! {
 /// ([`with_transport_memo`]). Keyed by the predicate's allocation; each entry keeps its origin
 /// alive, so the allocation is not reused while the memo stands.
 #[derive(Default)]
-struct TransportMemo {
+pub(crate) struct TransportMemo {
     entries: HashMap<PredicateId, Vec<(Rc<TypedExpr>, Subst, crate::ccl::Refinement)>>,
-}
-
-thread_local! {
-    static TRANSPORT_MEMO: std::cell::RefCell<Option<TransportMemo>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f`, a transport application ([`Subst::apply_type`], [`Subst::apply_expr`],
@@ -4534,44 +4529,49 @@ thread_local! {
 /// through its walk for the same reason: a predicate shared across the type slots of the term
 /// being substituted stays shared in the result (`src/ccl/design/type-inference.md`, "Sharing
 /// is an invariant, not an optimization detail").
-pub(crate) fn with_transport_memo<R>(f: impl FnOnce() -> R) -> R {
-    if TRANSPORT_MEMO.with(|m| m.borrow().is_some()) {
-        return f();
+///
+/// The memo lives in `solver` while the outermost application runs. An entry is the rewrite of
+/// its predicate under its substitution wherever it is read, so a memo a panicking application
+/// leaves standing stays correct in a solver whose run is ending.
+pub(crate) fn with_transport_memo<R>(solver: &mut Solver, f: impl FnOnce(&mut Solver) -> R) -> R {
+    if solver.transport_memo.is_some() {
+        return f(solver);
     }
-    struct Clear;
-    impl Drop for Clear {
-        fn drop(&mut self) {
-            TRANSPORT_MEMO.with(|m| m.borrow_mut().take());
-        }
-    }
-    TRANSPORT_MEMO.with(|m| *m.borrow_mut() = Some(TransportMemo::default()));
-    let _clear = Clear;
-    f()
+    solver.transport_memo = Some(TransportMemo::default());
+    let out = f(solver);
+    solver.transport_memo = None;
+    out
 }
 
 /// The rewrite of `predicate` under `subst` an earlier occurrence in this application made.
-fn transport_memo_get(predicate: &Rc<TypedExpr>, subst: &Subst) -> Option<crate::ccl::Refinement> {
-    TRANSPORT_MEMO.with(|m| {
-        let memo = m.borrow();
-        memo.as_ref()?
-            .entries
-            .get(&Rc::as_ptr(predicate))?
-            .iter()
-            .find(|(_, s, _)| s == subst)
-            .map(|(_, _, r)| r.clone())
-    })
+fn transport_memo_get(
+    solver: &Solver,
+    predicate: &Rc<TypedExpr>,
+    subst: &Subst,
+) -> Option<crate::ccl::Refinement> {
+    solver
+        .transport_memo
+        .as_ref()?
+        .entries
+        .get(&Rc::as_ptr(predicate))?
+        .iter()
+        .find(|(_, s, _)| s == subst)
+        .map(|(_, _, r)| r.clone())
 }
 
 /// Record `rewritten` as `predicate`'s rewrite under `subst` for this application.
-fn transport_memo_put(predicate: &Rc<TypedExpr>, subst: Subst, rewritten: &crate::ccl::Refinement) {
-    TRANSPORT_MEMO.with(|m| {
-        if let Some(memo) = m.borrow_mut().as_mut() {
-            memo.entries
-                .entry(Rc::as_ptr(predicate))
-                .or_default()
-                .push((Rc::clone(predicate), subst, rewritten.clone()));
-        }
-    });
+fn transport_memo_put(
+    solver: &mut Solver,
+    predicate: &Rc<TypedExpr>,
+    subst: Subst,
+    rewritten: &crate::ccl::Refinement,
+) {
+    if let Some(memo) = solver.transport_memo.as_mut() {
+        memo.entries
+            .entry(Rc::as_ptr(predicate))
+            .or_default()
+            .push((Rc::clone(predicate), subst, rewritten.clone()));
+    }
 }
 
 /// Run `f` with one memo for the binder conversions it performs ([`ConversionMemo`]), or

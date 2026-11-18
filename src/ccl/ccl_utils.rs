@@ -3884,60 +3884,27 @@ impl TermMemo {
 /// (`src/ccl/design/type-inference.md`, "Copies of one predicate share after coalesce").
 /// Keyed by the derived predicate's allocation; each entry keeps both terms alive, so neither
 /// address is reused while the run lasts.
-type Derivations = HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>;
+pub(crate) type Derivations = HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>;
 
-thread_local! {
-    static DERIVATIONS: RefCell<Option<Derivations>> = const { RefCell::new(None) };
-}
-
-/// Records derivations ([`record_derivation`]) until dropped. One per inference run, held by
-/// [`crate::ccl::infer::InferArena`].
-pub(crate) struct RecordingDerivations(());
-
-impl RecordingDerivations {
-    pub(crate) fn start() -> Self {
-        DERIVATIONS.with(|d| *d.borrow_mut() = Some(HashMap::new()));
-        RecordingDerivations(())
-    }
-
-    /// Forget every derivation recorded so far, for a run that starts over.
-    pub(crate) fn restart(&mut self) {
-        DERIVATIONS.with(|d| *d.borrow_mut() = Some(HashMap::new()));
-    }
-}
-
-impl Drop for RecordingDerivations {
-    fn drop(&mut self) {
-        DERIVATIONS.with(|d| d.borrow_mut().take());
-    }
-}
-
-/// Record that `to` was derived from `from`, while a run records derivations.
-pub(crate) fn record_derivation(from: &Rc<Expr>, to: &Rc<Expr>) {
+/// Record in `solver`'s run that `to` was derived from `from`.
+pub(crate) fn record_derivation(solver: &mut Solver, from: &Rc<Expr>, to: &Rc<Expr>) {
     if Rc::ptr_eq(from, to) {
         return;
     }
-    DERIVATIONS.with(|d| {
-        if let Some(d) = d.borrow_mut().as_mut() {
-            d.entry(Rc::as_ptr(to))
-                .or_insert_with(|| (Rc::clone(to), Rc::clone(from)));
-        }
-    });
+    solver
+        .derivations
+        .entry(Rc::as_ptr(to))
+        .or_insert_with(|| (Rc::clone(to), Rc::clone(from)));
 }
 
-/// The predicate `predicate` was derived from, through every recorded derivation: itself
-/// where none is recorded.
-pub(crate) fn derivation_origin(predicate: &Rc<Expr>) -> Rc<Expr> {
-    DERIVATIONS.with(|d| {
-        let d = d.borrow();
-        let mut at = Rc::clone(predicate);
-        if let Some(d) = d.as_ref() {
-            while let Some((_, from)) = d.get(&Rc::as_ptr(&at)) {
-                at = Rc::clone(from);
-            }
-        }
-        at
-    })
+/// The predicate `predicate` was derived from, through every derivation `solver`'s run
+/// recorded: itself where none is recorded.
+pub(crate) fn derivation_origin(solver: &Solver, predicate: &Rc<Expr>) -> Rc<Expr> {
+    let mut at = Rc::clone(predicate);
+    while let Some((_, from)) = solver.derivations.get(&Rc::as_ptr(&at)) {
+        at = Rc::clone(from);
+    }
+    at
 }
 
 /// Reachable refinements in walk order, deduplicated by predicate allocation.

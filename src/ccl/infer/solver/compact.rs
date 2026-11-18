@@ -96,13 +96,15 @@ pub enum AtomKey {
 /// [`Type::without_pi_names`] strips (references are indices, so nothing else names a binder). `==`
 /// on a refinement ignores its predicate's type slots, so the atom is keyed by `Type`'s own `Hash`,
 /// which ignores them too, and not by the content hash, which reads them. Two unequal projections
-/// sharing a hash are told apart by `rank`, the order in which this thread first met each
-/// ([`rank_among_equal_hashes`]).
+/// sharing a hash are told apart by `rank`, the order in which the run's solver first met each
+/// ([`rank_among_equal_hashes`]). Ranks are the solver's, so only atoms one solver made are
+/// compared.
 #[derive(Debug, Clone)]
 pub struct ClosedAtom {
     hash: u64,
     rank: usize,
     ty: Rc<Type>,
+    solver: crate::ccl::infer::solver::state::SolverId,
 }
 
 impl ClosedAtom {
@@ -111,7 +113,7 @@ impl ClosedAtom {
         &self.ty
     }
 
-    fn new(ty: &Type) -> Self {
+    fn new(solver: &mut Solver, ty: &Type) -> Self {
         debug_assert!(
             !crate::ccl::subst::type_contains_infer(ty),
             "a closed atom holds no inference variable, so the solver holds it whole: {ty}"
@@ -125,38 +127,41 @@ impl ClosedAtom {
         };
         ClosedAtom {
             hash,
-            rank: rank_among_equal_hashes(hash, unnamed),
+            rank: rank_among_equal_hashes(solver, hash, unnamed),
             ty: Rc::new(ty.clone()),
+            solver: solver.id(),
+        }
+    }
+
+    /// The pair the atom compares by. Ranks from two solvers do not compare.
+    fn identity(&self, other: &Self) -> ((u64, usize), (u64, usize)) {
+        debug_assert_eq!(
+            self.solver, other.solver,
+            "closed atoms ranked by two solvers compared: {} and {}",
+            self.ty, other.ty
+        );
+        ((self.hash, self.rank), (other.hash, other.rank))
+    }
+}
+
+/// Where `unnamed` stands among the distinct atoms `solver` has met with `hash`: the same for
+/// every atom `==` to it, and different for every other. A hash almost always has one, so this
+/// decides only between two unequal atoms whose hashes collide.
+fn rank_among_equal_hashes(solver: &mut Solver, hash: u64, unnamed: Type) -> usize {
+    let bucket = solver.closed_atoms.entry(hash).or_default();
+    match bucket.iter().position(|t| *t == unnamed) {
+        Some(rank) => rank,
+        None => {
+            bucket.push(unnamed);
+            bucket.len() - 1
         }
     }
 }
 
-thread_local! {
-    /// The distinct unnamed tuples met with each hash, in the order met.
-    static MET: std::cell::RefCell<HashMap<u64, Vec<Type>>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-
-/// Where `unnamed` stands among the distinct tuples this thread has met with `hash`: the same
-/// for every tuple `==` to it, and different for every other. A hash almost always has one, so
-/// this decides only between two unequal tuples whose hashes collide.
-fn rank_among_equal_hashes(hash: u64, unnamed: Type) -> usize {
-    MET.with(|met| {
-        let mut met = met.borrow_mut();
-        let bucket = met.entry(hash).or_default();
-        match bucket.iter().position(|t| *t == unnamed) {
-            Some(rank) => rank,
-            None => {
-                bucket.push(unnamed);
-                bucket.len() - 1
-            }
-        }
-    })
-}
-
 impl PartialEq for ClosedAtom {
     fn eq(&self, other: &Self) -> bool {
-        (self.hash, self.rank) == (other.hash, other.rank)
+        let (a, b) = self.identity(other);
+        a == b
     }
 }
 impl Eq for ClosedAtom {}
@@ -167,7 +172,8 @@ impl PartialOrd for ClosedAtom {
 }
 impl Ord for ClosedAtom {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.hash, self.rank).cmp(&(other.hash, other.rank))
+        let (a, b) = self.identity(other);
+        a.cmp(&b)
     }
 }
 impl std::hash::Hash for ClosedAtom {
@@ -180,7 +186,7 @@ impl AtomKey {
     /// The atom `ty` contributes, or `None` for a non-atomic type. Shared with
     /// the sibling specialization-key walk, which classifies leaves the same way
     /// (see `src/ccl/infer/solver/spec_key.rs`).
-    pub(super) fn from_type(ty: &Type) -> Option<AtomKey> {
+    pub(super) fn from_type(solver: &mut Solver, ty: &Type) -> Option<AtomKey> {
         match ty {
             Type::Base(b) => Some(AtomKey::Prim(b.clone())),
             Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
@@ -189,8 +195,8 @@ impl AtomKey {
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
-            Type::WitnessProjection(_) => Some(AtomKey::Projection(ClosedAtom::new(ty))),
-            Type::FamilyApp(_) => Some(AtomKey::Family(ClosedAtom::new(ty))),
+            Type::WitnessProjection(_) => Some(AtomKey::Projection(ClosedAtom::new(solver, ty))),
+            Type::FamilyApp(_) => Some(AtomKey::Family(ClosedAtom::new(solver, ty))),
             _ => None,
         }
     }
@@ -867,26 +873,15 @@ fn projects_a_uint_range(solver: &mut Solver, p: &crate::ccl::ty::WitnessProject
     let Type::Infer(v) = p.term.ty.peel_refinements() else {
         return false;
     };
-    thread_local! {
-        /// The variables whose sums are being read, so a cycle through them answers no.
-        static READING: std::cell::RefCell<HashSet<InferVarId>> =
-            std::cell::RefCell::new(HashSet::new());
-    }
-    /// Removes its variable from `READING` on drop, so a `compact_type` that unwinds leaves no
-    /// entry behind for a later read on the same thread.
-    struct Reading(InferVarId);
-    impl Drop for Reading {
-        fn drop(&mut self) {
-            READING.with(|r| r.borrow_mut().remove(&self.0));
-        }
-    }
-    if !READING.with(|r| r.borrow_mut().insert(v.uid)) {
+    // The variables whose sums are being read, so a cycle through them answers no. A
+    // `compact_type` that unwinds leaves its entry behind in a run that is ending.
+    if !solver.reading_sums.insert(v.uid) {
         return false;
     }
-    let reading = Reading(v.uid);
-    // This query runs under `READING`, so its result must not enter the batch's root cache.
+    // This query runs while `reading_sums` holds `v`, which answers a cycle through it, so its
+    // result must not enter a fixed-graph batch's memo ([`with_fixed_graph_compactions`]).
     let term = compact_type_with(solver, &p.term.ty, true, false).term;
-    drop(reading);
+    solver.reading_sums.remove(&v.uid);
     term.fun
         .and_then(|f| f.binders.get(p.position).map(|w| w.type_kind.clone()))
         .is_some_and(|k| match k {
@@ -2545,7 +2540,7 @@ fn compact_type_with(
     }
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
-    let term = crate::ccl::subst::with_transport_memo(|| {
+    let term = crate::ccl::subst::with_transport_memo(solver, |solver| {
         compact_go(solver, ty, true, &Subst::id(), Position::default(), &mut st)
     });
     debug_assert!(
@@ -3310,7 +3305,7 @@ fn capabilities_at(
         && let crate::ccl::capabilities::Repr::Var(v) = capabilities.repr()
     {
         set.vars = if pol {
-            v.reaching()
+            v.reaching(solver)
         } else {
             std::iter::once((v.uid, Rc::clone(v))).collect()
         };
@@ -3844,7 +3839,7 @@ fn compact_go_inner(
         | Type::Undetermined(_)
         | Type::ChanDom(..)
         | Type::Param(_)
-        | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
+        | Type::Txn => CompactType::from_atom(AtomKey::from_type(solver, ty).unwrap()),
         // Component `𝑘` compacts under the binders of the `𝑘` components before it, as a
         // codomain compacts under its function's: each is a crossing for what lands below,
         // and a component's binder shadows the accumulated substitution after it.
@@ -3914,7 +3909,7 @@ fn compact_go_inner(
             for held in ty.held_terms_mut() {
                 st.scope.close_held(solver, held);
             }
-            let atom = AtomKey::from_type(&ty).unwrap_or_else(|| {
+            let atom = AtomKey::from_type(solver, &ty).unwrap_or_else(|| {
                 unreachable!("a substitution keeps a holding type's form or reads it back: {ty}")
             });
             CompactType::from_atom(atom)
@@ -5111,7 +5106,6 @@ mod tests {
     #[test]
     fn final_graph_compactions_are_isolated_between_batches_and_modes() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
@@ -5187,7 +5181,6 @@ mod tests {
     #[test]
     fn final_graph_compactions_release_their_graph_on_unwind() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
@@ -5293,7 +5286,6 @@ mod tests {
     #[test]
     fn final_graph_compactions_collect_memberships_on_every_read() {
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let variable = fresh_var(solver, 0);
         let Type::Infer(v) = &variable else {
             unreachable!()
@@ -5306,10 +5298,11 @@ mod tests {
             .push(crate::ccl::ty::TypeKind::Type);
         with_fixed_graph_compactions(solver, |solver| {
             for _ in 0..2 {
-                let (resolved, pending) = super::super::coalesce::collecting_memberships(|| {
-                    let graph = compact_type(solver, &variable);
-                    coalesce_compact(solver, &graph)
-                });
+                let (resolved, pending) =
+                    super::super::coalesce::collecting_memberships(solver, |solver| {
+                        let graph = compact_type(solver, &variable);
+                        coalesce_compact(solver, &graph)
+                    });
                 assert_eq!(resolved.unwrap(), Type::Base(BaseType::Int));
                 assert_eq!(pending.len(), 1);
                 assert_eq!(pending[0].found, Type::Base(BaseType::Int));
@@ -5322,7 +5315,6 @@ mod tests {
     fn bound_eligibility_is_shared_across_views_and_polarities() {
         use crate::ccl::infer_var::{InferVar, Telescope};
         let solver = &mut Solver::new();
-        let _arena = crate::ccl::infer::InferArena::new();
         let x = Name::raw("x");
         let telescope = Telescope::empty().extended(x.clone());
         let variable = InferVar::fresh_in(solver, 0, &telescope);

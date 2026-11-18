@@ -134,7 +134,7 @@ pub(super) fn should_generalize(
     };
     polymorphic_form
         && (type_level(solver, &def.ty) > level
-            || crate::ccl::capabilities::input_capability_level(&def.ty) > level)
+            || crate::ccl::capabilities::input_capability_level(solver, &def.ty) > level)
 }
 
 /// Emission context for Cambra's inference algorithm (Pass 1).
@@ -681,7 +681,11 @@ fn receives_a_value(solver: &mut Solver, ty: &Type) -> bool {
 }
 
 /// Whether one of `targets` flows into `var`, through any edge whatever it filters.
-fn reaches_any(var: &Rc<CapabilityVar>, targets: &HashSet<CapabilityVarId>) -> bool {
+fn reaches_any(
+    solver: &Solver,
+    var: &Rc<CapabilityVar>,
+    targets: &HashSet<CapabilityVarId>,
+) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![Rc::clone(var)];
     while let Some(v) = stack.pop() {
@@ -689,7 +693,7 @@ fn reaches_any(var: &Rc<CapabilityVar>, targets: &HashSet<CapabilityVarId>) -> b
             return true;
         }
         if seen.insert(v.uid) {
-            stack.extend(v.incoming().into_iter().map(|(source, _)| source));
+            stack.extend(v.incoming(solver).into_iter().map(|(source, _)| source));
         }
     }
     false
@@ -1015,7 +1019,7 @@ impl InferCtx {
     /// a `try` stops. The `try`s are taken innermost first, because what reaches an outer one's
     /// body is what its inner ones let through.
     pub(super) fn settle_catches(&mut self) -> Vec<LocatedInferError> {
-        crate::ccl::capabilities::exceptions_settled();
+        crate::ccl::capabilities::exceptions_settled(&mut self.solver);
         // A call of a function no value of the definition's own flows into, such as a
         // parameter's, causes what each use passes. A `try` reaching one may catch at any use,
         // so none of its clauses is dead at the definition.
@@ -1027,12 +1031,12 @@ impl InferCtx {
             .collect();
         let mut errors = Vec::new();
         for t in &self.capability_tries {
-            if reaches_any(&t.var, &open)
-                || t.var.reaches(&|v| {
-                    v.open_input.get()
-                        && v.incoming().is_empty()
-                        && v.own().is_empty()
-                        && !v.closed().1
+            if reaches_any(&self.solver, &t.var, &open)
+                || t.var.reaches(&self.solver, &|solver, v| {
+                    v.open_input(solver)
+                        && v.incoming(solver).is_empty()
+                        && v.own(solver).is_empty()
+                        && !v.closed(solver).1
                 })
             {
                 continue;
@@ -1169,9 +1173,9 @@ impl InferCtx {
         &mut self,
         node: &TypedExprNode,
     ) -> (Capabilities, Capabilities) {
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
-        let own = CapabilityVar::fresh(self.level, &self.telescope);
-        var.flows_from(&own, Filter::default());
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
+        let own = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
+        var.flows_from(&mut self.solver, &own, Filter::default());
         self.node_capabilities.push(NodeCapabilities {
             var: Rc::clone(&var),
             own: Rc::clone(&own),
@@ -1198,6 +1202,7 @@ impl InferCtx {
         {
             match parent.inflow {
                 Inflow::All => parent.var.flows_from(
+                    &mut self.solver,
                     &node.var,
                     Filter {
                         at: node.at,
@@ -1206,6 +1211,7 @@ impl InferCtx {
                     },
                 ),
                 Inflow::DischargesTransaction => parent.var.flows_from(
+                    &mut self.solver,
                     &node.var,
                     Filter {
                         discharges: [Requirement::transaction()].into_iter().collect(),
@@ -1291,9 +1297,10 @@ impl InferCtx {
         // Each capability crossing into the node entered at it: the lambda, or the composition
         // or cast, the function is.
         let at = Some(self.current_node_id);
-        let node = self.node_capability_var();
+        let node = Rc::clone(self.node_capability_var());
         match kind {
             Some(crate::ccl::ty::FunKind::Data(_)) => node.flows_from(
+                &mut self.solver,
                 var,
                 Filter {
                     at,
@@ -1301,6 +1308,7 @@ impl InferCtx {
                 },
             ),
             Some(crate::ccl::ty::FunKind::Var(kind)) => node.flows_from(
+                &mut self.solver,
                 var,
                 Filter {
                     when_data: Some(Rc::clone(kind)),
@@ -1600,15 +1608,15 @@ impl InferCtx {
     }
 
     pub(super) fn record_order_assumptions(
-        &self,
+        &mut self,
         copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
     ) {
         for var in copies.values() {
-            for capability in var.own() {
+            for capability in var.own(&self.solver) {
                 if let Capability::Requires(r) = capability.item
                     && let Some(order) = r.ordering()
                 {
-                    r.record();
+                    r.record(&mut self.solver);
                     order
                         .assumptions
                         .borrow_mut()
@@ -1624,7 +1632,7 @@ impl InferCtx {
     /// it. A body that interacts only through a function passed to it learns so later.
     pub(super) fn check_loop_orders(&mut self) -> Vec<LocatedInferError> {
         let mut errors = Vec::new();
-        for requirement in crate::ccl::capabilities::order_requirements() {
+        for requirement in crate::ccl::capabilities::order_requirements(&self.solver) {
             let Some(order) = requirement.ordering() else {
                 continue;
             };
@@ -1728,11 +1736,14 @@ impl InferCtx {
     /// at the definition, where each use fills a copy of its own, so a statement or a block
     /// reaching one may do something and is not reported.
     pub(super) fn does_nothing(&mut self) -> Vec<(NodeId, InferError)> {
-        let undetermined = |v: &CapabilityVar| {
-            self.capability_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
+        let undetermined = |solver: &Solver, v: &CapabilityVar| {
+            self.capability_calls.contains(&v.uid)
+                && v.incoming(solver).is_empty()
+                && v.own(solver).is_empty()
         };
         let mut idle = |var: &CapabilityVar| {
-            var.resolved_set(&mut self.solver).causes_nothing() && !var.reaches(&undetermined)
+            var.resolved_set(&mut self.solver).causes_nothing()
+                && !var.reaches(&self.solver, &undetermined)
         };
         let empty: Vec<&(NodeId, Rc<CapabilityVar>)> = self
             .capability_transactions
@@ -1795,7 +1806,7 @@ impl InferCtx {
                         order.iter.clone(),
                         self.assumptions.clone(),
                     );
-                    r.record();
+                    r.record(&mut self.solver);
                     Capability::Requires(r)
                 } else {
                     Capability::Requires(r)
@@ -1838,24 +1849,28 @@ impl InferCtx {
                 .or_insert_with(|| {
                     // An instance's associated effect is shared by all its uses. Only the
                     // run's state is in scope for that program-wide variable.
-                    let var = CapabilityVar::fresh(0, &self.capability_frames[0].outer);
+                    let var =
+                        CapabilityVar::fresh(&mut self.solver, 0, &self.capability_frames[0].outer);
                     if !param.param.clause_except.is_empty() {
                         let mut set = CapabilitySet::default();
                         let every = Every::of_direction(param.of_causes)
                             .less(&mut self.solver, param.param.clause_except.clone());
                         set.add_every_in(&mut self.solver, every);
-                        var.bound_above(Upper {
-                            set,
-                            of_requires: !param.of_causes,
-                            of_causes: param.of_causes,
-                            forbidden: Default::default(),
-                            blame: Blame::Bound(
-                                param
-                                    .param
-                                    .bound_at
-                                    .expect("a bound taking `except` is written"),
-                            ),
-                        });
+                        var.bound_above(
+                            &mut self.solver,
+                            Upper {
+                                set,
+                                of_requires: !param.of_causes,
+                                of_causes: param.of_causes,
+                                forbidden: Default::default(),
+                                blame: Blame::Bound(
+                                    param
+                                        .param
+                                        .bound_at
+                                        .expect("a bound taking `except` is written"),
+                                ),
+                            },
+                        );
                     }
                     var
                 }),
@@ -1895,7 +1910,7 @@ impl InferCtx {
             .map(|p| {
                 (
                     p.param.id,
-                    CapabilityVar::fresh(self.level, &self.telescope),
+                    CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope),
                 )
             })
             .collect();
@@ -1953,8 +1968,9 @@ impl InferCtx {
                     .iter()
                     .find(|(id, _)| *id == link.assoc)
                 {
+                    let effect = self.instance_effect(own);
                     link.target
-                        .flows_from(&self.instance_effect(own), Filter::default());
+                        .flows_from(&mut self.solver, &effect, Filter::default());
                 }
             }
             for assumption in link.obligation.assumptions() {
@@ -1964,7 +1980,8 @@ impl InferCtx {
                     .find(|(id, _)| *id == link.assoc)
                     && let Some(var) = self.opened_clause_params.get(&member.param.id)
                 {
-                    link.target.flows_from(var, Filter::default());
+                    link.target
+                        .flows_from(&mut self.solver, var, Filter::default());
                 }
             }
         }
@@ -2000,8 +2017,9 @@ impl InferCtx {
                 .iter()
                 .find(|(id, _)| *id == link.assoc)
             {
+                let effect = self.instance_effect(own);
                 link.target
-                    .flows_from(&self.instance_effect(own), Filter::default());
+                    .flows_from(&mut self.solver, &effect, Filter::default());
             }
             return true;
         }
@@ -2014,7 +2032,8 @@ impl InferCtx {
                 .find(|(id, _)| *id == link.assoc)
                 && let Some(var) = self.opened_clause_params.get(&member.param.id)
             {
-                link.target.flows_from(var, Filter::default());
+                link.target
+                    .flows_from(&mut self.solver, var, Filter::default());
             }
             return true;
         }
@@ -2039,7 +2058,8 @@ impl InferCtx {
                 continue;
             }
             if !matches!(item, Capability::Param(_)) {
-                var.record(self.stated_capability(item));
+                let stated = self.stated_capability(item);
+                var.record(&mut self.solver, stated);
             }
         }
         if written.open_requires && written.open_causes {
@@ -2070,7 +2090,7 @@ impl InferCtx {
             .zip(self.clause_param_vars(&written.set))
         {
             let rigid: Vec<_> = var
-                .own()
+                .own(&self.solver)
                 .into_iter()
                 .filter_map(|l| match l.item {
                     Capability::Param(p) => Some(crate::ccl::capabilities::ClauseParam {
@@ -2096,13 +2116,16 @@ impl InferCtx {
         if open_requires && open_causes {
             return;
         }
-        var.bound_above(Upper {
-            set,
-            of_requires: !open_requires,
-            of_causes: !open_causes,
-            forbidden: std::collections::BTreeSet::new(),
-            blame,
-        });
+        var.bound_above(
+            &mut self.solver,
+            Upper {
+                set,
+                of_requires: !open_requires,
+                of_causes: !open_causes,
+                forbidden: std::collections::BTreeSet::new(),
+                blame,
+            },
+        );
     }
 
     /// Normalize the operands of built-in requirements before recording and bounding a clause.
@@ -2139,8 +2162,8 @@ impl InferCtx {
             return Capabilities::none();
         }
         let written = self.normalize_written(written);
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
-        var.open_input.set(written.open_causes);
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
+        var.set_open_input(&mut self.solver, written.open_causes);
         // A parameter a clause names relates both ways with the position: what flows in is
         // what the parameter stands for, and the position holds what it stands for. The items
         // the clause lists beside it are the position's own, so they stay out of it.
@@ -2157,6 +2180,7 @@ impl InferCtx {
             .zip(self.clause_param_vars(&written.set))
         {
             var.flows_from(
+                &mut self.solver,
                 &param,
                 Filter {
                     of_causes: Some(p.of_causes),
@@ -2165,6 +2189,7 @@ impl InferCtx {
                 },
             );
             param.flows_from(
+                &mut self.solver,
                 &var,
                 Filter {
                     of_causes: Some(p.of_causes),
@@ -2175,7 +2200,7 @@ impl InferCtx {
         }
         self.bound_written(&var, &written, Blame::Written(written.at));
         if written.open_requires || written.open_causes {
-            var.mark_hole(written.at);
+            var.mark_hole(&mut self.solver, written.at);
         }
         Capabilities::var(var)
     }
@@ -2183,10 +2208,12 @@ impl InferCtx {
     /// The capabilities a call site expects of its callee: a fresh variable whose capabilities flow
     /// into the enclosing function body's, through the body's filter.
     fn call_capabilities(&mut self) -> Capabilities {
-        let call = CapabilityVar::fresh(self.level, &self.telescope);
+        let call = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         self.capability_calls.insert(call.uid);
         let at = Some(self.current_node_id);
-        self.node_capability_var().flows_from(
+        let node = Rc::clone(self.node_capability_var());
+        node.flows_from(
+            &mut self.solver,
             &call,
             Filter {
                 at,
@@ -4118,15 +4145,18 @@ impl Typing for InferCtx {
                     || *decl == crate::ccl::nominal::context())
             {
                 let of_causes = *decl == crate::ccl::nominal::effect();
-                let var = CapabilityVar::fresh(self.level, &self.telescope);
-                var.open_input.set(of_causes);
-                var.record(LocatedCapability {
-                    item: Capability::Param(crate::ccl::capabilities::ClauseParam::whole(
-                        Rc::clone(&opened),
-                        of_causes,
-                    )),
-                    at: None,
-                });
+                let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
+                var.set_open_input(&mut self.solver, of_causes);
+                var.record(
+                    &mut self.solver,
+                    LocatedCapability {
+                        item: Capability::Param(crate::ccl::capabilities::ClauseParam::whole(
+                            Rc::clone(&opened),
+                            of_causes,
+                        )),
+                        at: None,
+                    },
+                );
                 // `E <: Effect except RunTransaction`: what each use passes for the
                 // parameter holds none of what the bound takes away, and each use's copy of
                 // the variable keeps the bound (`freshen_capability_var`).
@@ -4135,15 +4165,18 @@ impl Typing for InferCtx {
                     let every = Every::of_direction(of_causes)
                         .less(&mut self.solver, opened.clause_except.clone());
                     set.add_every_in(&mut self.solver, every);
-                    var.bound_above(Upper {
-                        set,
-                        of_requires: !of_causes,
-                        of_causes,
-                        forbidden: Default::default(),
-                        blame: Blame::Bound(
-                            p.bound_at.expect("a bound taking `except` is written"),
-                        ),
-                    });
+                    var.bound_above(
+                        &mut self.solver,
+                        Upper {
+                            set,
+                            of_requires: !of_causes,
+                            of_causes,
+                            forbidden: Default::default(),
+                            blame: Blame::Bound(
+                                p.bound_at.expect("a bound taking `except` is written"),
+                            ),
+                        },
+                    );
                 }
                 // Keyed by the opened parameter too, which the opened requirements' associated
                 // effect types name.
@@ -4321,7 +4354,7 @@ impl Typing for InferCtx {
         recorded: &Type,
         f: impl FnOnce(&mut Self) -> R,
     ) -> (R, Capabilities) {
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         // A `def`'s clauses, which lowering stamps on the lambda whose body is the `def`'s:
         // what they list is the function's whatever its body does, and a clause under `only`
         // bounds what the body may add (`docs/chl-spec.md`, "Writing requirements and
@@ -4351,6 +4384,7 @@ impl Typing for InferCtx {
             {
                 if written.of_instance.is_some() {
                     param.flows_from(
+                        &mut self.solver,
                         &var,
                         Filter {
                             of_causes: Some(p.of_causes),
@@ -4360,6 +4394,7 @@ impl Typing for InferCtx {
                     );
                 } else {
                     var.flows_from(
+                        &mut self.solver,
                         &param,
                         Filter {
                             of_causes: Some(p.of_causes),
@@ -4393,25 +4428,25 @@ impl Typing for InferCtx {
             .last_mut()
             .and_then(|lambda| lambda.body.take())
             .expect("a lambda's body is emitted inside its frame");
-        var.flows_from(&body, Filter::default());
+        var.flows_from(&mut self.solver, &body, Filter::default());
         // A `_` in a parameter's type whose capabilities reach a bounded clause of the `def`
         // takes the bound, so a use passing more is refused at the call.
-        var.bound_holes_reaching();
+        var.bound_holes_reaching(&mut self.solver);
         self.settle_by_kind(&var, recorded.fun_kind());
         (r, Capabilities::var(var))
     }
 
     fn composed_capabilities(&mut self, recorded: &Type, parts: &[Type]) -> Capabilities {
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         for part in parts {
             if let Type::Fun { capabilities, .. } = part.peel_refinements() {
                 match capabilities.repr() {
-                    Repr::Var(v) => var.flows_from(v, Filter::default()),
+                    Repr::Var(v) => var.flows_from(&mut self.solver, v, Filter::default()),
                     Repr::Known(_) => {
                         for capability in
                             Capabilities::capabilities_of(&mut self.solver, capabilities)
                         {
-                            var.record(capability);
+                            var.record(&mut self.solver, capability);
                         }
                     }
                     Repr::Written(_) => unreachable!(
@@ -4550,13 +4585,14 @@ impl Typing for InferCtx {
 
     fn record_capability(&mut self, item: Capability) {
         if let Capability::Requires(r) = &item {
-            r.record();
+            r.record(&mut self.solver);
         }
         // Recorded on the node, whatever binds the variable: a node's capabilities are what
         // evaluating it does. What names a variable stops at the first capability variable
         // minted outside its binder ([`CapabilityVar::in_scope`]).
         let capability = self.capability(self.of_family(item));
-        self.node_capability_var().record(capability);
+        let node = Rc::clone(self.node_capability_var());
+        node.record(&mut self.solver, capability);
     }
 
     fn record_transactional_access(&mut self, name: &Name) {
@@ -4581,17 +4617,13 @@ impl Typing for InferCtx {
         let prev = self.enter_node(mention.node_id());
         if let Some(transactional) = self.places.get(name).map(|b| b.transactional) {
             if transactional {
-                var.record(
-                    self.capability(
-                        self.of_family(Capability::Requires(Requirement::transaction())),
-                    ),
-                );
+                let capability = self
+                    .capability(self.of_family(Capability::Requires(Requirement::transaction())));
+                var.record(&mut self.solver, capability);
             }
-            var.record(
-                self.capability(
-                    self.of_family(Capability::Requires(Requirement::read(name.clone()))),
-                ),
-            );
+            let capability = self
+                .capability(self.of_family(Capability::Requires(Requirement::read(name.clone()))));
+            var.record(&mut self.solver, capability);
         }
         self.leave_node(prev);
     }
@@ -4602,7 +4634,7 @@ impl Typing for InferCtx {
         }
         // The statement's own variable, which keeps everything it does, the enclosing
         // function's own variables included: a statement that writes one does something.
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         self.node_capabilities.push(NodeCapabilities {
             var: Rc::clone(&var),
             // Not a node of its own: what it records is the statement's.
@@ -4638,7 +4670,7 @@ impl Typing for InferCtx {
     ) -> (R, bool) {
         // A variable of its own around the body's, as a statement's, keeping what names the
         // enclosing function's own variables: an accumulator may be one.
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         self.node_capabilities.push(NodeCapabilities {
             var: Rc::clone(&var),
             own: Rc::clone(&var),
@@ -4686,8 +4718,9 @@ impl Typing for InferCtx {
             .iter()
             .find(|l| l.node == node)
             .expect("a loop's effects are recorded before its requirement");
-        let guard = CapabilityVar::fresh(self.level, &self.telescope);
+        let guard = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         guard.flows_from(
+            &mut self.solver,
             &body.var,
             Filter {
                 except: body
@@ -4749,7 +4782,7 @@ impl Typing for InferCtx {
         // A variable of its own around the body's, as a statement's: the body's capabilities,
         // the function's own variables included, stay on it, and only the edge out of it stops
         // what is caught.
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         let catch = Rc::new(crate::ccl::capabilities::Catch::new(node, catches.to_vec()));
         self.node_capabilities.push(NodeCapabilities {
             var: Rc::clone(&var),
@@ -4788,17 +4821,20 @@ impl Typing for InferCtx {
         // a call through a polymorphic definition's parameter is checked at each use. The
         // `Begin` node lets it in less `Transaction`, which it supplies ([`Inflow`]).
         let node = self.current_node_id;
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
-        var.bound_above(Upper {
-            set: CapabilitySet::default(),
-            of_requires: false,
-            of_causes: false,
-            forbidden: [Effect::RunTransaction].into_iter().collect(),
-            blame: Blame::NestedTransaction {
-                block: node,
-                used_at: None,
+        let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
+        var.bound_above(
+            &mut self.solver,
+            Upper {
+                set: CapabilitySet::default(),
+                of_requires: false,
+                of_causes: false,
+                forbidden: [Effect::RunTransaction].into_iter().collect(),
+                blame: Blame::NestedTransaction {
+                    block: node,
+                    used_at: None,
+                },
             },
-        });
+        );
         self.node_capabilities.push(NodeCapabilities {
             own: Rc::clone(&var),
             var,
@@ -5287,10 +5323,9 @@ impl Typing for InferCtx {
         if let Type::Infer(_) = fn_ty.peel_refinements()
             && let Repr::Var(call) = capabilities.repr()
         {
-            call.open_input.set(
-                !receives_a_value(&mut self.solver, fn_ty)
-                    && !kind.is_some_and(|k| k.resolved_in(&self.solver).is_data()),
-            );
+            let open = !receives_a_value(&mut self.solver, fn_ty)
+                && !kind.is_some_and(|k| k.resolved_in(&self.solver).is_data());
+            call.set_open_input(&mut self.solver, open);
             self.capability_calls_of_variables
                 .push((Rc::clone(call), fn_ty.clone()));
         }

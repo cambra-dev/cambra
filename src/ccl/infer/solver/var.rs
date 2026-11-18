@@ -1,12 +1,13 @@
 //! One solver variable: what every unknown a typing run solves for has, whatever it is solved
 //! for (`src/ccl/design/type-inference.md`, "One solver variable").
 //!
-//! A type variable, a funkind variable and a barrier variable are each a [`SolverVar`] over the
-//! sort it stands for: [`crate::ccl::Type`], [`crate::ccl::ty::FunKind`] and
-//! [`crate::ccl::infer_var::Barrier`]. What every variable has is written here once: an
-//! identity, the solver holding what is recorded on it, and the binders in scope where it
-//! stands. What differs is a parameter ([`Solved`]): what a handle of the sort carries beside
-//! those, fixed where it is minted, and what a run records on it ([`Recorded`]).
+//! A type variable, a funkind variable, a barrier variable and a capability variable are each a
+//! [`SolverVar`] over the sort it stands for: [`crate::ccl::Type`], [`crate::ccl::ty::FunKind`],
+//! [`crate::ccl::infer_var::Barrier`] and [`crate::ccl::capabilities::Capabilities`]. What every
+//! variable has is written here once: an identity, the solver holding what is recorded on it,
+//! and the binders in scope where it stands. What differs is a parameter ([`Solved`]): what a
+//! handle of the sort carries beside those, fixed where it is minted, and what a run records on
+//! it ([`Recorded`]).
 
 use std::fmt;
 use std::rc::Rc;
@@ -26,7 +27,7 @@ pub trait Solved: Sized + 'static {
     fn next_id() -> Self::Id;
     /// The identity as a number: the key of a variable's state in a solver that did not mint it.
     fn key(id: Self::Id) -> u32;
-    /// How a variable of this sort prints: `?3`, `κ3`, `:>3`.
+    /// How a variable of this sort prints: `?3`, `κ3`, `:>3`, `ε3`.
     fn fmt_var(id: Self::Id, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 }
 
@@ -42,8 +43,8 @@ pub struct SolverVar<V: Solved> {
     /// outside every run, which no run records on.
     pub(crate) home: Option<Home>,
     /// The binders in scope where the variable stands: what a fact recorded on it may name. A
-    /// funkind variable's and a barrier variable's are empty: no fact recorded on one is read
-    /// against a scope.
+    /// funkind variable's, a barrier variable's and a capability variable's are empty: no fact
+    /// recorded on one is read against a scope.
     pub telescope: Telescope,
     /// What this sort of variable carries besides ([`Solved::Fixed`]).
     pub(crate) fixed: V::Fixed,
