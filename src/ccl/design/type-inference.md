@@ -1643,7 +1643,10 @@ outside every run takes `Solver::none()`, which panics on reaching an inference 
 or a funkind variable that a solver minted. A funkind variable no solver minted reads as unrecorded
 through it. The type operations most used outside a run have a form that passes it: `Type::pi`
 takes no solver, and `Type::pi_in` takes the run's. A pass after inference whose tree still holds a finished run's variables takes
-`Solver::scratch()`, through which each reads as unrecorded.
+`Solver::scratch()`, through which each reads as unrecorded. A rendering takes a `RenderCtx`
+(`ty.rs`), which lends it a solver for each read. Inside a run it lends the run's, so a type renders
+what the run has recorded on its variables (`symbolic_in`, `Type::rendered_in`,
+`chl_print::Writer::ty_with`); `Display` renders through a scratch one.
 
 The solver indexes the inference variables it minted by identity, so a caller holding only a
 recorded id, compaction materializing a position say, finds the variable without a scan

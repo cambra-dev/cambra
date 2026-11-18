@@ -70,6 +70,17 @@ impl Writer {
         .annotation(ty)
     }
 
+    /// `ty` written in CHL, reading its variables through `ctx`: a type a run renders while
+    /// it holds the run's variables.
+    pub fn ty_with(&self, ctx: &crate::ccl::ty::RenderCtx<'_>, ty: &Type) -> String {
+        Printer {
+            ctx: Some(ctx),
+            variables: Rc::clone(&self.variables),
+            ..Printer::for_type(ty)
+        }
+        .annotation(ty)
+    }
+
     /// An inferred polymorphic type written in CHL ([`chl_inferred_poly`]).
     pub fn inferred_poly(&self, inferred: &InferredPoly) -> String {
         self.inferred_poly_in(inferred, None)
@@ -137,7 +148,10 @@ pub fn chl_inferred_poly_in(inferred: &InferredPoly, home: Option<&[SmolStr]>) -
 }
 
 #[derive(Default)]
-struct Printer {
+struct Printer<'c, 'r> {
+    /// What the text reads a variable through: a run's solver, or a scratch one outside every
+    /// run ([`crate::ccl::ty::RenderCtx`]).
+    ctx: Option<&'c crate::ccl::ty::RenderCtx<'r>>,
     /// The functions the walk has descended into the codomain of, innermost last: the
     /// spelling of each one's binder, or `None` for one that names none. A reference
     /// `index` crossings out reads entry `len - 1 - index`, as
@@ -183,9 +197,17 @@ enum Prec {
 /// depth of the environment that expression is written in.
 type Env<'a> = Vec<(&'a Name, &'a Expr, usize)>;
 
-impl Printer {
+impl Printer<'_, '_> {
+    /// Read through the context's solver, or a scratch one where there is none.
+    fn read<R>(&self, f: impl FnOnce(&mut Solver) -> R) -> R {
+        match self.ctx {
+            Some(ctx) => ctx.read(f),
+            None => f(&mut Solver::scratch()),
+        }
+    }
+
     /// A printer for `ty`, holding the spellings its names have.
-    fn for_type(ty: &Type) -> Printer {
+    fn for_type(ty: &Type) -> Self {
         let mut taken = HashSet::new();
         type_spellings(ty, &mut taken);
         Printer {
@@ -295,7 +317,10 @@ impl Printer {
                         "{} <: {}{}",
                         p.param.spelling,
                         self.component(bound),
-                        crate::ccl::capabilities::except_text(&p.param.clause_except)
+                        self.read(|solver| crate::ccl::capabilities::except_text(
+                            solver,
+                            &p.param.clause_except
+                        ))
                     ),
                     None => p.param.spelling.to_string(),
                 },
@@ -331,7 +356,7 @@ impl Printer {
         format!(
             "forall ({}) {body}{}",
             params.join(", "),
-            crate::ccl::capabilities::clauses(&mut Solver::scratch(), requires, &capabilities)
+            self.read(|solver| crate::ccl::capabilities::clauses(solver, requires, &capabilities))
         )
     }
 
@@ -568,7 +593,7 @@ impl Printer {
         let dependent = name.filter(|n| crate::ccl::subst::codomain_depends_on(n, codomain));
         // The domain is written only where the form shows it: `Array` and `Source` name
         // theirs by a length and a source.
-        let shown_domain = !(fun_kind.resolved_in(&Solver::scratch()).is_data()
+        let shown_domain = !(self.read(|solver| fun_kind.resolved_in(solver).is_data())
             && dependent.is_none()
             && matches!(domain, Type::UIntRange(_) | Type::DataSource(_)));
         let dom = if shown_domain {
@@ -576,7 +601,7 @@ impl Printer {
         } else {
             String::new()
         };
-        let is_data = fun_kind.resolved_in(&Solver::scratch()).is_data();
+        let is_data = self.read(|solver| fun_kind.resolved_in(solver).is_data());
         let binder = name.map(|n| (n, self.binder(n, if is_data { "k" } else { "x" })));
         self.binders.push(binder.as_ref().map(|(_, s)| s.clone()));
         if let Some((n, s)) = &binder {
@@ -632,12 +657,9 @@ impl Printer {
             let alternatives: Vec<String> = candidates
                 .iter()
                 .map(|candidate| {
-                    let values = crate::ccl::ty::instantiate_witness(
-                        &mut Solver::scratch(),
-                        codomain,
-                        w.id(),
-                        candidate,
-                    );
+                    let values = self.read(|solver| {
+                        crate::ccl::ty::instantiate_witness(solver, codomain, w.id(), candidate)
+                    });
                     let alternative = Type::Fun {
                         name: name.cloned(),
                         fun_kind: FunKind::Data(None),
@@ -1031,7 +1053,7 @@ impl Printer {
         };
         let target = self.expr(f, Prec::Postfix, env);
         let (_, arg) = argument.written();
-        let text = if fun_kind.resolved_in(&Solver::scratch()).is_data() {
+        let text = if self.read(|solver| fun_kind.resolved_in(solver).is_data()) {
             format!("{target}[{arg}]!")
         } else {
             format!("{target}({arg})")

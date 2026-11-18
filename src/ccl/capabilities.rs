@@ -6,6 +6,7 @@
 //! data function, and its type's capabilities are always [`Capabilities::none`].
 
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::ty::RenderCtx;
 use smol_str::SmolStr;
 use std::{
     cell::{Cell, RefCell},
@@ -1568,8 +1569,8 @@ pub fn pruned(
     reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
               and a trait hashes and orders by its module path and name"
 )]
-pub fn except_text(except: &BTreeSet<Capability>) -> String {
-    let taken: Vec<String> = except.iter().map(ToString::to_string).collect();
+pub fn except_text(solver: &mut Solver, except: &BTreeSet<Capability>) -> String {
+    let taken: Vec<String> = except.iter().map(|c| c.rendered(solver)).collect();
     match taken.as_slice() {
         [] => String::new(),
         [one] => format!(" except {one}"),
@@ -3060,9 +3061,10 @@ impl Capabilities {
     }
 }
 
-impl fmt::Display for Requirement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let solver = &mut Solver::scratch();
+impl Requirement {
+    /// This requirement as a clause writes it, reading the variables it holds through
+    /// `solver`.
+    pub(crate) fn rendered(&self, solver: &mut Solver) -> String {
         if let Some(r) = &self.1 {
             let mut set = r.capabilities.set_in(solver);
             set.requires.clear();
@@ -3070,34 +3072,49 @@ impl fmt::Display for Requirement {
             set.params.retain(|p| p.of_causes);
             set.tops.retain(|t| t.of_causes);
             let clause = clauses(solver, Vec::new(), &Capabilities::known(set));
-            return write!(
-                f,
-                "OrderableIfRequiredBy({}, {})",
-                r.positions,
+            let positions = r.positions.rendered_in(&RenderCtx::new(solver)).to_string();
+            return format!(
+                "OrderableIfRequiredBy({positions}, {})",
                 clause.strip_prefix(" causes ").unwrap_or("nothing")
             );
         }
-        write!(f, "{}", self.0.trait_)?;
+        let mut out = self.0.trait_.to_string();
         if !self.0.terms.is_empty() {
             let terms: Vec<String> = self.0.terms.iter().map(ToString::to_string).collect();
-            write!(f, "({})", terms.join(", "))?;
+            out.push_str(&format!("({})", terms.join(", ")));
         }
-        Ok(())
+        out
+    }
+}
+
+impl fmt::Display for Requirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.rendered(&mut Solver::scratch()))
+    }
+}
+
+impl Effect {
+    /// This effect as a clause writes it, reading the variables a raised type holds through
+    /// `solver`.
+    pub(crate) fn rendered(&self, solver: &mut Solver) -> String {
+        match self {
+            Effect::Write(x) => format!("Write({x})"),
+            Effect::WriteTxn(x) => format!("WriteTxn({x})"),
+            Effect::Append(x) => format!("Append({x})"),
+            Effect::RunTransaction => "RunTransaction".to_string(),
+            Effect::AffectWorld => "AffectWorld".to_string(),
+            Effect::Raise(raised) => format!(
+                "Raise({})",
+                crate::ccl::chl_print::Writer::default()
+                    .ty_with(&RenderCtx::new(solver), &raised.ty)
+            ),
+        }
     }
 }
 
 impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Effect::Write(x) => write!(f, "Write({x})"),
-            Effect::WriteTxn(x) => write!(f, "WriteTxn({x})"),
-            Effect::Append(x) => write!(f, "Append({x})"),
-            Effect::RunTransaction => f.write_str("RunTransaction"),
-            Effect::AffectWorld => f.write_str("AffectWorld"),
-            Effect::Raise(raised) => {
-                write!(f, "Raise({})", crate::ccl::chl_print::chl_type(&raised.ty))
-            }
-        }
+        f.write_str(&self.rendered(&mut Solver::scratch()))
     }
 }
 
@@ -3238,14 +3255,26 @@ impl Written {
     }
 }
 
+impl Capability {
+    /// This capability as a clause writes it, reading the variables it holds through
+    /// `solver`.
+    pub(crate) fn rendered(&self, solver: &mut Solver) -> String {
+        match self {
+            Capability::Requires(r) => r.rendered(solver),
+            Capability::Causes(e) => e.rendered(solver),
+            Capability::Param(p) => {
+                format!("{}{}", p.param.spelling, except_text(solver, &p.except))
+            }
+            Capability::Every(every) => {
+                format!("{}{}", every.head(), except_text(solver, &every.except))
+            }
+        }
+    }
+}
+
 impl fmt::Display for Capability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Capability::Requires(r) => r.fmt(f),
-            Capability::Causes(e) => e.fmt(f),
-            Capability::Param(p) => write!(f, "{}{}", p.param.spelling, except_text(&p.except)),
-            Capability::Every(every) => write!(f, "{}{}", every.head(), except_text(&every.except)),
-        }
+        f.write_str(&self.rendered(&mut Solver::scratch()))
     }
 }
 
@@ -3271,9 +3300,9 @@ pub fn clauses(
     capabilities: &Capabilities,
 ) -> String {
     let set = capabilities.set_in(solver).normalized(solver);
-    traits.extend(set.requires.iter().map(ToString::to_string));
+    traits.extend(set.requires.iter().map(|r| r.rendered(solver)));
     traits.extend(set.named_requires.iter().map(ToString::to_string));
-    let mut causes: Vec<String> = set.causes.iter().map(ToString::to_string).collect();
+    let mut causes: Vec<String> = set.causes.iter().map(|e| e.rendered(solver)).collect();
     causes.extend(set.named_causes.iter().map(ToString::to_string));
     // A clause's `except` takes from each of its variables and tops what lies within it, so it
     // ends the clause after the tops. One every variable takes away is the clause's, and a
@@ -3318,7 +3347,7 @@ pub fn clauses(
             clause.push(if p.except == shared {
                 p.param.spelling.to_string()
             } else {
-                format!("({}{})", p.param.spelling, except_text(&p.except))
+                format!("({}{})", p.param.spelling, except_text(solver, &p.except))
             });
         }
         clause.extend(unnamed);
@@ -3339,11 +3368,11 @@ pub fn clauses(
             } else if bare.less(solver, shared.iter().cloned()) == *top {
                 clause.push(name);
             } else {
-                clause.push(format!("({name}{})", except_text(&top.except)));
+                clause.push(format!("({name}{})", except_text(solver, &top.except)));
             }
         }
         if let Some(last) = clause.last_mut() {
-            last.push_str(&except_text(&except));
+            last.push_str(&except_text(solver, &except));
         }
     }
     let mut out = String::new();

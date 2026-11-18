@@ -3209,7 +3209,35 @@ fn show_binders() -> bool {
 /// reference as its bare index — see [`symbolic::PiBinderEnv`].
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_type(&mut Solver::scratch(), f, self, None)
+        fmt_type(&RenderCtx::new(&mut Solver::scratch()), f, self, None)
+    }
+}
+
+/// What a rendering reads a variable through: a run renders with its own solver, so a type
+/// shows what the run has recorded on its variables, and a type outside every run renders with
+/// a scratch one ([`Display`](fmt::Display)). Renderings nest, a predicate in a type rendering
+/// its own types, so each read borrows the solver for that read alone.
+pub struct RenderCtx<'s> {
+    solver: RefCell<&'s mut Solver>,
+}
+
+impl<'s> RenderCtx<'s> {
+    pub fn new(solver: &'s mut Solver) -> Self {
+        RenderCtx {
+            solver: RefCell::new(solver),
+        }
+    }
+
+    /// Read through the solver. `f` renders nothing through this context.
+    pub(crate) fn read<R>(&self, f: impl FnOnce(&mut Solver) -> R) -> R {
+        f(&mut self.solver.borrow_mut())
+    }
+}
+
+impl Type {
+    /// This type rendered with `ctx`'s solver.
+    pub fn rendered_in<'a, 'r>(&'a self, ctx: &'a RenderCtx<'r>) -> TypeUnder<'a, 'a, 'r> {
+        TypeUnder(self, None, ctx)
     }
 }
 
@@ -3218,14 +3246,15 @@ impl fmt::Display for Type {
 /// string. The symbolic printer takes this for the type slots it renders
 /// inside a refinement predicate, so a reference to an enclosing function
 /// prints as that function's binder name there too.
-pub(crate) struct TypeUnder<'a, 'b>(
+pub struct TypeUnder<'a, 'b, 'r>(
     pub(crate) &'a Type,
     pub(crate) Option<&'a symbolic::PiBinderEnv<'b>>,
+    pub(crate) &'a RenderCtx<'r>,
 );
 
-impl fmt::Display for TypeUnder<'_, '_> {
+impl fmt::Display for TypeUnder<'_, '_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_type(&mut Solver::scratch(), f, self.0, self.1)
+        fmt_type(self.2, f, self.0, self.1)
     }
 }
 
@@ -3235,7 +3264,7 @@ impl fmt::Display for TypeUnder<'_, '_> {
 /// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Display opens
 /// what it descended through").
 fn fmt_type(
-    solver: &mut Solver,
+    ctx: &RenderCtx<'_>,
     f: &mut fmt::Formatter<'_>,
     ty: &Type,
     binders: Option<&symbolic::PiBinderEnv<'_>>,
@@ -3243,15 +3272,16 @@ fn fmt_type(
     /// `ty` in the same environment, as something `write!` can take directly, so
     /// a single-child arm formats straight into `f`. The `Tuple`/`Record`/`Variant`
     /// arms still materialize a `String` per child, because they `join` them.
-    fn at<'a, 'b>(
+    fn at<'a, 'b, 'r>(
+        ctx: &'a RenderCtx<'r>,
         ty: &'a Type,
         binders: Option<&'a symbolic::PiBinderEnv<'b>>,
-    ) -> TypeUnder<'a, 'b> {
-        TypeUnder(ty, binders)
+    ) -> TypeUnder<'a, 'b, 'r> {
+        TypeUnder(ty, binders, ctx)
     }
     match ty {
         Type::Base(b) => write!(f, "{}", b.keyword()),
-        Type::BoundedHole(t) => write!(f, "<:{}", at(t, binders)),
+        Type::BoundedHole(t) => write!(f, "<:{}", at(ctx, t, binders)),
         // The mirror of `BoundedHole`'s `<:𝑇`. Rendered by identity like
         // `Infer`'s `?N`, never by reading `lowers`, which may be cyclic or
         // mutably borrowed.
@@ -3284,23 +3314,22 @@ fn fmt_type(
                 }
             }
             let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
-            let cod = at(codomain, Some(&inner));
-            let dom = at(domain, binders);
+            let cod = at(ctx, codomain, Some(&inner));
+            let dom = at(ctx, domain, binders);
+            let arrow = ctx.read(|solver| fun_kind.arrow(solver));
+            let capabilities = ctx
+                .read(|solver| crate::ccl::capabilities::clauses(solver, Vec::new(), capabilities));
             match name {
-                Some(x) => write!(
-                    f,
-                    "(({x}: {dom}) {} {cod}{capabilities})",
-                    fun_kind.arrow(solver)
-                ),
-                None => write!(f, "({dom} {} {cod}{capabilities})", fun_kind.arrow(solver)),
+                Some(x) => write!(f, "(({x}: {dom}) {arrow} {cod}{capabilities})"),
+                None => write!(f, "({dom} {arrow} {cod}{capabilities})"),
             }
         }
         Type::Tuple(ts) => {
-            let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
+            let parts: Vec<_> = ts.iter().map(|t| at(ctx, t, binders).to_string()).collect();
             write!(f, "({})", parts.join(", "))
         }
         Type::OpenTuple(ts) => {
-            let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
+            let parts: Vec<_> = ts.iter().map(|t| at(ctx, t, binders).to_string()).collect();
             write!(f, "({}, ..)", parts.join(", "))
         }
         // `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`: each component renders inside the
@@ -3309,6 +3338,7 @@ fn fmt_type(
         // from the flat telescope.
         Type::DepTuple(components) => {
             fn rest(
+                ctx: &RenderCtx<'_>,
                 f: &mut fmt::Formatter<'_>,
                 components: &[(Option<crate::ccl::Name>, Type)],
                 binders: Option<&symbolic::PiBinderEnv<'_>>,
@@ -3316,7 +3346,7 @@ fn fmt_type(
                 let Some(((name, ty), later)) = components.split_first() else {
                     return Ok(());
                 };
-                let shown = at(ty, binders);
+                let shown = at(ctx, ty, binders);
                 match (name, ty) {
                     (Some(x), _) => write!(f, "({x} : {shown})")?,
                     (None, Type::DepTuple(_)) => write!(f, "({shown})")?,
@@ -3327,14 +3357,14 @@ fn fmt_type(
                 }
                 write!(f, " × ")?;
                 let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
-                rest(f, later, Some(&inner))
+                rest(ctx, f, later, Some(&inner))
             }
-            rest(f, components, binders)
+            rest(ctx, f, components, binders)
         }
         Type::Record(fields) => {
             let parts: Vec<_> = fields
                 .iter()
-                .map(|(n, t)| format!("{n}: {}", at(t, binders)))
+                .map(|(n, t)| format!("{n}: {}", at(ctx, t, binders)))
                 .collect();
             write!(f, "{{{}}}", parts.join(", "))
         }
@@ -3357,7 +3387,7 @@ fn fmt_type(
             if let Some(payloads) = synthetic_payloads(tags) {
                 let parts: Vec<_> = payloads
                     .iter()
-                    .map(|t| at(t, binders).to_string())
+                    .map(|t| at(ctx, t, binders).to_string())
                     .collect();
                 write!(f, "{}{ellipsis}", parts.join(" | "))
             } else {
@@ -3368,7 +3398,7 @@ fn fmt_type(
                     tags.iter().map(|(n, t)| {
                         let payload = match t {
                             Type::Base(BaseType::Unit) => None,
-                            _ => Some(at(t, binders).to_string()),
+                            _ => Some(at(ctx, t, binders).to_string()),
                         };
                         (n.to_string(), payload)
                     }),
@@ -3390,14 +3420,19 @@ fn fmt_type(
         // Each refinement renders inside `binders`, so a reference to an enclosing
         // function prints as that function's binder name.
         Type::Refinement(t, refinements) => match singleton_value(ty) {
-            Some(lit) => write!(f, "{}@{}", at(t, binders), symbolic::symbolic(lit)),
+            Some(lit) => write!(
+                f,
+                "{}@{}",
+                at(ctx, t, binders),
+                symbolic::symbolic_in(ctx, lit)
+            ),
             None => {
                 let mut rendered: Vec<String> = refinements
                     .iter()
-                    .map(|r| symbolic::symbolic_under(&r.predicate, binders))
+                    .map(|r| symbolic::symbolic_under(&r.predicate, binders, ctx))
                     .collect();
                 rendered.sort();
-                write!(f, "{{{} | {}}}", at(t, binders), rendered.join(", "))
+                write!(f, "{{{} | {}}}", at(ctx, t, binders), rendered.join(", "))
             }
         },
         Type::Hole => write!(f, "_"),
@@ -3412,7 +3447,7 @@ fn fmt_type(
             let args: Vec<String> = app
                 .args
                 .iter()
-                .map(|a| symbolic::symbolic_under(&a.term, binders))
+                .map(|a| symbolic::symbolic_under(&a.term, binders, ctx))
                 .collect();
             write!(f, "{}({})", app.param.spelling, args.join(", "))
         }
@@ -3423,7 +3458,7 @@ fn fmt_type(
         } => {
             let mut shown = Vec::with_capacity(bound.len());
             for (name, domain) in bound {
-                let dom = at(domain, binders).to_string();
+                let dom = at(ctx, domain, binders).to_string();
                 match name {
                     Some(x) => shown.push(format!("{x}: {dom}")),
                     None => shown.push(format!("_: {dom}")),
@@ -3431,30 +3466,39 @@ fn fmt_type(
             }
             // Each crossing borrows the one before it, so the binders are entered by recursion.
             fn body_under(
+                ctx: &RenderCtx<'_>,
                 f: &mut fmt::Formatter<'_>,
                 names: &[(Option<crate::ccl::Name>, Type)],
                 body: &Type,
                 binders: Option<&symbolic::PiBinderEnv<'_>>,
             ) -> fmt::Result {
                 match names.split_first() {
-                    None => write!(f, "{}", at(body, binders)),
+                    None => write!(f, "{}", at(ctx, body, binders)),
                     Some(((name, _), rest)) => {
                         let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
-                        body_under(f, rest, body, Some(&inner))
+                        body_under(ctx, f, rest, body, Some(&inner))
                     }
                 }
             }
             write!(f, "\\{} -> ", shown.join(", "))?;
-            body_under(f, bound, body, binders)
+            body_under(ctx, f, bound, body, binders)
         }
         Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.spelled()),
         Type::Nominal(decl, args) => {
-            let args: Vec<String> = args.iter().map(|t| at(t, binders).to_string()).collect();
+            let args: Vec<String> = args
+                .iter()
+                .map(|t| at(ctx, t, binders).to_string())
+                .collect();
             write!(f, "{}({})", decl.spelled(), args.join(", "))
         }
         // No program writes one, so it has no CHL spelling; this names both sides.
         Type::Split { input, output } => {
-            write!(f, "in {} out {}", at(input, binders), at(output, binders))
+            write!(
+                f,
+                "in {} out {}",
+                at(ctx, input, binders),
+                at(ctx, output, binders)
+            )
         }
         // The spec's notation, `forall (T, U <: B) V`.
         Type::Poly(poly) => {
@@ -3473,8 +3517,11 @@ fn fmt_type(
                         TypeKind::Type => name,
                         TypeKind::SubtypesOf(bound) => format!(
                             "{name} <: {}{}",
-                            at(bound, binders),
-                            crate::ccl::capabilities::except_text(&p.param.clause_except)
+                            at(ctx, bound, binders),
+                            ctx.read(|solver| crate::ccl::capabilities::except_text(
+                                solver,
+                                &p.param.clause_except
+                            ))
                         ),
                         other => format!("{name}: {other}"),
                     }
@@ -3490,13 +3537,17 @@ fn fmt_type(
                 ),
                 body => (body.clone(), crate::ccl::capabilities::Capabilities::none()),
             };
-            let requires = poly.requires_text(|t| at(t, binders).to_string());
+            let requires = poly.requires_text(|t| at(ctx, t, binders).to_string());
             write!(
                 f,
                 "forall ({}) {}{}",
                 params.join(", "),
-                at(&body, binders),
-                crate::ccl::capabilities::clauses(solver, requires, &capabilities)
+                at(ctx, &body, binders),
+                ctx.read(|solver| crate::ccl::capabilities::clauses(
+                    solver,
+                    requires,
+                    &capabilities
+                ))
             )
         }
         Type::Txn => write!(f, "Txn"),
@@ -3515,7 +3566,7 @@ fn fmt_type(
             };
             // The value renders inside the function's binder, as a function's codomain does.
             let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
-            let (value, domain) = (at(codomain, Some(&inner)), at(domain, binders));
+            let (value, domain) = (at(ctx, codomain, Some(&inner)), at(ctx, domain, binders));
             match (history_kind, name) {
                 (HistoryKind::Overwrite, None) => write!(f, "Mut({value}, {domain})"),
                 (HistoryKind::Overwrite, Some(k)) => write!(f, "Mut({value}, {k}: {domain})"),
@@ -3546,7 +3597,7 @@ fn fmt_type(
             write!(
                 f,
                 "σ{subscript}({})",
-                symbolic::symbolic_under(&p.term, binders)
+                symbolic::symbolic_under(&p.term, binders, ctx)
             )
         }
     }
