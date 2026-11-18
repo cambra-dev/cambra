@@ -5,9 +5,7 @@
 //!
 //! `streaming_echo` and `fanout` also read a source, but each reads it once, so
 //! neither reaches the sharing this program is here for. The wire side is
-//! pinned by the `source_shared` snapshot fixture and by
-//! `a_source_read_twice_is_one_node_attributed_to_both_reads` in
-//! `tests/it/inspector_goldens.rs`.
+//! pinned by the `source_shared` case in `web/src/wireValidate.test.ts`.
 //!
 //! Tested through a subprocess for the same reason `streaming_echo` is: the
 //! in-process path would have to replace the real `StdinDataSource` and so

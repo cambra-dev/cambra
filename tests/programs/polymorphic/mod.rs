@@ -6,8 +6,7 @@
 //! *set* of tuple types (`Int` and `Bool`); that fan-out is what makes the
 //! inspector's `paneLinks` carry non-identity edges in both the
 //! `pre-inference → post-inference` and `post-inference → post-channelize`
-//! windows, pinned whole by the `polymorphic` snapshot fixture and asserted
-//! structurally by `tests/it/inspector_goldens.rs`.
+//! windows, asserted by `tests/it/inspector_wire.rs`.
 
 use super::common::expect_scalar;
 

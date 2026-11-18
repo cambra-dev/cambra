@@ -1,103 +1,36 @@
-//! Golden-corpus tests over the real `cambra --dump-snapshot` CLI.
+//! The inspector's wire payload, over fresh `cambra --dump-snapshot` dumps of the gallery
+//! programs (`tests/programs/`).
 //!
-//! The fixture corpus (`web/scripts/fixtures.manifest`, shared with
-//! `regen-fixtures.sh`) maps committed frontend fixtures to gallery programs
-//! under `tests/programs/`. These tests spawn the actual `cambra` binary **once
-//! per program, per dump** — a fresh process each time. That is not an
-//! incidental choice: `NodeId`s come from a process-global counter, so only a
-//! single-compile process reproduces a fixture's ids. An in-process compile
-//! inside this test (or any multi-program process) starts from a counter another
-//! compile already advanced and can never byte-match — which is also why
-//! `regen-fixtures.sh` invokes the CLI once per fixture.
+//! Each dump spawns the command line as a fresh process (`crate::it::cli::command`): `NodeId`s
+//! come from a process-global counter, so only a process that compiles one program numbers its
+//! payload as the inspector's own process does.
 //!
-//! Six ratchets, coarsest backstop of the provenance test stack (semantic unit
-//! tests state intent; the boundary invariants enforce error classes; these
-//! catch everything-composed drift):
-//! 1. every corpus dump is cross-process deterministic (two spawns,
-//!    byte-identical) — the property the goldens depend on;
-//! 2. every committed fixture equals a fresh dump of its program
-//!    (content-level; the ci.sh `ci_fixtures` gate does the byte-level file
-//!    diff through `regen-fixtures.sh`);
-//! 3. every committed fixture is a structurally-valid payload, not merely one
-//!    that equals a fresh dump of itself;
-//! 4. the corpus programs still trigger the passes they were chosen to pin;
-//! 5. **every** program in the gallery — not just the five with fixtures —
-//!    produces a payload the wire validator accepts, on the contract its
-//!    pinned compile outcome selects;
-//! 6. two compiles of one program in one process differ in id numbering and
-//!    nothing else.
+//! - Every gallery program produces a payload the wire validator accepts, on the contract its
+//!   pinned compile outcome selects.
+//! - A dump is the same bytes from two processes.
+//! - Two compiles of one program in one process differ in id numbering and nothing else.
+//! - The programs chosen for a wire shape still produce it: fan-out edges, the dense channelize
+//!   window, a store's edge shapes, the recurrence phases' tags, a source read's iteration.
 //!
-//! Ratchets 5 and 6 are what keeps the corpus bounded. Pinned bytes are the
-//! narrowest of the six ratchets and the only one that costs a re-bless, so a
-//! program added for backend coverage belongs in ratchet 5, which reads every
-//! gallery source and commits nothing.
-//!
-//! Four programs — `txn_multi_read`, `for_accumulator`, `source_accumulator`
-//! and `inner_join` — are in the corpus without a committed fixture. Their
-//! payloads run to five figures of lines each, which is a document nobody reads
-//! and a re-bless nobody can review, so what they are here for is asserted
-//! structurally over a fresh dump instead: the dense channelize window, the
-//! `Transact`/`Letrec` rewrite tags that reach the wire, and a store's trigger
-//! iterating a data source. Ratchet 5 validates all four like any other gallery
-//! program, naming the source it dumped when one fails.
+//! [`write_gallery_snapshots`] writes every gallery program's dump to a directory for the
+//! frontend's tests, which read real payloads rather than committed copies of them.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-/// One corpus row: the fixture basename and the example-program basename.
-struct CorpusEntry {
-    fixture: String,
-    example: String,
-}
-
-/// The `cambra/` repo root — the working directory `regen-fixtures.sh` runs
-/// from. Dumps spawn from here with repo-root-relative program paths so
-/// `source.name` in the payload matches the fixtures byte-for-byte.
+/// The repo root. Dumps spawn from here with repo-relative program paths, so a payload's
+/// `source.name` is a path a reader can open.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-/// A gallery program's source path, relative to the repo root — the path a
-/// fixture's `source.name` records.
+/// A gallery program's source path, relative to the repo root.
 fn program_path(example: &str) -> String {
     format!("tests/programs/{example}/program.cambra")
 }
 
-/// Parse `scripts/fixtures.manifest` — the corpus's single source of truth,
-/// shared with `regen-fixtures.sh`. A row is `<fixture> <example>`; `#`
-/// comments and blank lines are skipped. Two words and nothing else, so the
-/// shell parser and this one have no grammar to disagree about.
-fn corpus() -> Vec<CorpusEntry> {
-    let path = repo_root().join("web/scripts/fixtures.manifest");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    let entries: Vec<CorpusEntry> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let mut parts = l.split_whitespace();
-            let fixture = parts.next().expect("manifest line has a fixture name");
-            let example = parts
-                .next()
-                .unwrap_or_else(|| panic!("manifest line {l:?} lacks an example name"));
-            assert!(
-                parts.next().is_none(),
-                "manifest line {l:?} has more than a fixture and an example"
-            );
-            CorpusEntry {
-                fixture: fixture.to_string(),
-                example: example.to_string(),
-            }
-        })
-        .collect();
-    assert!(!entries.is_empty(), "the fixture corpus must be non-empty");
-    entries
-}
-
-/// Run `cambra <program> --dump-snapshot` as a fresh process and return its raw
-/// stdout — exactly what `regen-fixtures.sh` writes to a fixture.
+/// Run `cambra <program> --dump-snapshot` as a fresh process and return its raw stdout.
 fn dump(example: &str) -> Vec<u8> {
     let prog = program_path(example);
     let output = crate::it::cli::command()
@@ -113,29 +46,30 @@ fn dump(example: &str) -> Vec<u8> {
     output.stdout
 }
 
-/// The determinism self-check the golden fixtures depend on: dumping the same
-/// program from two **separate process invocations** yields byte-identical
-/// output, for every corpus program.
+/// A dump is the same bytes from two processes, for programs that cover the heaviest synthesis.
 ///
-/// If this fires, the committed fixtures cannot be trusted as goldens — the
-/// first suspects are hash-iteration-ordered node minting (Rust's default
-/// hasher is randomly seeded per process; candidates: mono's specialization
-/// iteration, channelize's channel maps, `transact_phase::collect_txn_stores`)
-/// or the dump process compiling more than one program.
+/// Rust's default hasher is seeded per process, so output that follows hash iteration order
+/// differs between two processes, where within one it can agree with itself
+/// ([`ids_are_the_only_difference_between_two_compiles`]). The first suspects are mono's
+/// specialization iteration, channelize's channel maps and
+/// `transact_phase::collect_txn_stores`; a hash join mints from keyed lookups besides.
 #[test]
 fn snapshot_dumps_are_cross_process_deterministic() {
-    for entry in corpus() {
-        assert_dumps_agree(&entry.example);
+    for example in [
+        "udf_closure",
+        "polymorphic",
+        "list_min",
+        "list_comp",
+        "type_error",
+        "defer_lift",
+        "source_shared",
+        "txn_multi_read",
+        "for_accumulator",
+        "source_accumulator",
+        "inner_join",
+    ] {
+        assert_dumps_agree(example);
     }
-    // The programs whose payloads are too large to commit (see
-    // `fixtures.manifest`) carry no fixture, so the manifest loop above does
-    // not reach them. They are the heaviest synthesis here, and a hash join
-    // mints from keyed lookups besides — both are where hash-iteration-ordered
-    // minting would show, which is what this test exists to catch.
-    assert_dumps_agree("txn_multi_read");
-    assert_dumps_agree("for_accumulator");
-    assert_dumps_agree("source_accumulator");
-    assert_dumps_agree("inner_join");
 }
 
 /// Two spawns of one program produce byte-identical dumps.
@@ -157,9 +91,8 @@ fn assert_dumps_agree(example: &str) {
         panic!(
             "--dump-snapshot for {example} is NOT cross-process deterministic \
              (first difference at byte {diff_at}; dumps preserved at {} and {}). \
-             Golden fixtures cannot be blessed until the nondeterminism source \
-             is fixed — see `snapshot_dumps_are_cross_process_deterministic` \
-             for the first suspects.",
+             See `snapshot_dumps_are_cross_process_deterministic` for the first \
+             suspects.",
             a.display(),
             b.display()
         );
@@ -218,59 +151,10 @@ fn first_json_difference(lhs: &Value, rhs: &Value, path: &str) -> Option<(String
     }
 }
 
-/// RT-1a — the golden ratchet: every committed fixture equals a fresh dump of
-/// its example program. Compared at the JSON-content level (both sides parsed)
-/// so the comparison is independent of the pretty-printer `regen-fixtures.sh`
-/// pipes through; the ci.sh `ci_fixtures` gate covers the literal file bytes by
-/// regenerating through the same script and diffing. On failure the message
-/// names the first drifted JSON path and the fix path is its one command.
-#[test]
-fn committed_fixtures_match_fresh_dumps() {
-    let fixtures_dir = repo_root().join("web/src/__fixtures__");
-    for entry in corpus() {
-        let fixture_path = fixtures_dir.join(format!("{}.snapshot.json", entry.fixture));
-        let committed = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
-            panic!(
-                "reading committed fixture {} for corpus entry `{}`: {e}. \
-                 Every manifest entry must have a committed fixture — run \
-                 web/scripts/regen-fixtures.sh and commit the result.",
-                fixture_path.display(),
-                entry.example
-            )
-        });
-        let committed: Value = serde_json::from_str(&committed)
-            .unwrap_or_else(|e| panic!("{} is valid JSON: {e}", fixture_path.display()));
-
-        let raw = dump(&entry.example);
-        let fresh: Value = serde_json::from_slice(&raw)
-            .unwrap_or_else(|e| panic!("dump for {} is valid JSON: {e}", entry.example));
-
-        if committed != fresh {
-            // Preserve the fresh dump for offline diffing before panicking.
-            let preserved =
-                std::env::temp_dir().join(format!("{}.fresh.snapshot.json", entry.fixture));
-            std::fs::write(&preserved, &raw).expect("writing fresh dump");
-            let (path, committed_at, fresh_at) = first_json_difference(&committed, &fresh, "$")
-                .expect("values are unequal, so a structural difference exists");
-            panic!(
-                "fixture drift: {}.snapshot.json differs from a fresh dump of \
-                 tests/programs/{}/program.cambra. First difference at {path}:\n  committed: {committed_at}\n  \
-                 fresh:     {fresh_at}\nFresh dump preserved at {}. If the wire change is \
-                 intended, re-bless via web/scripts/regen-fixtures.sh and \
-                 commit the diff.",
-                entry.fixture,
-                entry.example,
-                preserved.display()
-            );
-        }
-    }
-}
-
-/// The corpus programs still exercise what they were chosen for, at the wire
-/// level: `polymorphic`'s `post-inference -> post-channelize` paneLinks window
+/// The programs chosen for a wire shape still exercise it: `polymorphic`'s `post-inference -> post-channelize` paneLinks window
 /// carries a genuine non-identity (`u != d`) fan-out edge — not just the dense
-/// self-edges. Guards against the corpus rotting into programs that no longer
-/// trigger the pass they were chosen to pin.
+/// self-edges. Guards against the program rotting into one that no longer triggers
+/// the pass it was chosen to pin.
 #[test]
 fn polymorphic_corpus_program_produces_fanout_edges() {
     let raw = dump("polymorphic");
@@ -300,11 +184,9 @@ fn pane_node_ids(pane: &Value) -> std::collections::HashSet<u64> {
         .collect()
 }
 
-/// Dense-window sanity over a dump's `post-inference → post-channelize` window
-/// — the structural bug-catcher that stands in for a committed fixture on the
-/// two programs whose payloads are too large to commit (`txn_multi_read`,
-/// `for_accumulator`). Mirrors the `polymorphic` fan-out pattern, strengthened to
-/// what a pinned document would have guaranteed: (a) the window carries genuine
+/// Dense-window sanity over a dump's `post-inference → post-channelize` window, for the
+/// programs whose substitution copies make it dense (`txn_multi_read`, `for_accumulator`).
+/// Mirrors the `polymorphic` fan-out pattern, strengthened: (a) the window carries genuine
 /// non-identity edges, (b) some upstream node fans out to ≥2 downstream nodes
 /// (the substitution copies these programs were chosen to exercise), and (c)
 /// every edge endpoint is a live node in its pane.
@@ -359,15 +241,13 @@ fn assert_dense_window_sanity(example: &str) {
     );
 }
 
-/// `txn_multi_read` (no committed fixture) exercises the dense channelize-window
-/// fan-out structurally.
+/// `txn_multi_read` exercises the dense channelize-window fan-out.
 #[test]
 fn txn_multi_read_produces_dense_channelize_window() {
     assert_dense_window_sanity("txn_multi_read");
 }
 
-/// `for_accumulator` (no committed fixture) exercises the dense
-/// channelize-window fan-out structurally.
+/// `for_accumulator` exercises the dense channelize-window fan-out.
 #[test]
 fn for_accumulator_produces_dense_channelize_window() {
     assert_dense_window_sanity("for_accumulator");
@@ -376,15 +256,10 @@ fn for_accumulator_produces_dense_channelize_window() {
 /// The operator-pane edge shapes only a store produces, over a fresh dump.
 ///
 /// A store is the one construct that wires an input late, so a `deferred` edge
-/// exists nowhere else — and neither does a store-keyed edge role. Every
-/// committed fixture carries neither, so without this nothing checks that either
-/// reaches the wire at all. That the deferred edges are the cycle set is
-/// `every_operator_graph_cycle_runs_through_a_deferred_edge`'s claim, over the
-/// graph rather than the payload.
-///
-/// Structural rather than a fixture, matching the two window checks above: a
-/// transaction program's operator pane is large, and pinning its bytes would
-/// re-bless on every change to how a store is built.
+/// exists nowhere else — and neither does a store-keyed edge role, so without this nothing
+/// checks that either reaches the wire at all. That the deferred edges are the cycle set is
+/// `every_operator_graph_cycle_runs_through_a_deferred_edge`'s claim, over the graph rather
+/// than the payload.
 fn assert_store_edge_shapes(example: &str) {
     let raw = dump(example);
     let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
@@ -428,15 +303,13 @@ fn assert_store_edge_shapes(example: &str) {
     );
 }
 
-/// `txn_multi_read` (no committed fixture) exercises the store-only operator
-/// edge shapes.
+/// `txn_multi_read` exercises the store-only operator edge shapes.
 #[test]
 fn txn_multi_read_produces_store_edge_shapes() {
     assert_store_edge_shapes("txn_multi_read");
 }
 
-/// `for_accumulator` (no committed fixture) exercises the store-only operator
-/// edge shapes.
+/// `for_accumulator` exercises the store-only operator edge shapes.
 #[test]
 fn for_accumulator_produces_store_edge_shapes() {
     assert_store_edge_shapes("for_accumulator");
@@ -609,6 +482,35 @@ fn dump_vias(example: &str) -> std::collections::HashSet<String> {
     out
 }
 
+/// The labels of the rewrites that produced `example`'s nodes, over every pane.
+fn dump_rewrite_labels(example: &str) -> std::collections::HashSet<String> {
+    let raw = dump(example);
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let mut out = std::collections::HashSet::new();
+    for pane in v["panes"].as_array().expect("panes is an array") {
+        for node in pane["nodes"].as_array().expect("nodes is an array") {
+            if let Some(label) = node["rewritten"]["label"].as_str() {
+                out.insert(label.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `defer_lift` still exercises the two channelize rewrites it is in the gallery for: the lift
+/// that merges a call's defer scope into its caller's, and the fan-in of two feed sites into
+/// one channel.
+#[test]
+fn defer_lift_reaches_the_wire_through_both_channelize_rewrites() {
+    let labels = dump_rewrite_labels("defer_lift");
+    for label in ["channelize.defer_lift", "channelize.cluster"] {
+        assert!(
+            labels.contains(label),
+            "defer_lift's payload carries no node rewritten by `{label}`; got {labels:?}"
+        );
+    }
+}
+
 /// The two mutability-elimination phases reach the wire.
 ///
 /// Both validators pin a `rewritten.via` allowlist. An allowlist rejects a new
@@ -630,33 +532,8 @@ fn the_recurrence_phases_reach_the_wire() {
     );
 }
 
-/// RT-1b — every committed fixture is a structurally-valid payload.
-///
-/// The byte comparison above cannot see a *wrongly built* dump: a bad dump
-/// equals a fresh copy of itself, so committed == fresh holds and the fixture
-/// still reaches the frontend. This is the check that reads the document
-/// instead of comparing it, and it runs here rather than in the lib's own tests
-/// because these files are what the frontend actually loads.
-#[test]
-fn committed_fixtures_are_structurally_valid() {
-    let fixtures_dir = repo_root().join("web/src/__fixtures__");
-    for entry in corpus() {
-        let path = fixtures_dir.join(format!("{}.snapshot.json", entry.fixture));
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let v: Value = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{} is valid JSON: {e}", path.display()));
-        let at = path.display().to_string();
-        if v["meta"]["payloadKind"] == "failed" {
-            cambra::inspector_server::wire_check::assert_degraded_snapshot_shape_at(&v, &at);
-        } else {
-            cambra::inspector_server::wire_check::assert_snapshot_shape_at(&v, &at);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Ratchet 5: the whole gallery, validated
+// The whole gallery, validated
 // ---------------------------------------------------------------------------
 
 /// The gallery sources whose `--dump-snapshot` **panics**, so the sweep below
@@ -732,12 +609,12 @@ fn gallery_sources() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Dump `path` (repo-root-relative) as a fresh process, substituting the
+/// Dump `path` as a fresh process, spawned at its repo-relative path, substituting the
 /// `{PORT}` placeholder the HTTP programs carry so they reach the compiler as
 /// the program they describe rather than as a parse error.
 fn dump_source(path: &Path) -> Option<Vec<u8>> {
     let text = std::fs::read_to_string(path).expect("a gallery source is readable");
-    let mut spawn_path = path.to_path_buf();
+    let mut spawn_path = path.strip_prefix(repo_root()).unwrap_or(path).to_path_buf();
     let substituted;
     if text.contains("{PORT}") {
         // The file keeps its name, which is the root's module path, in a
@@ -763,14 +640,9 @@ fn dump_source(path: &Path) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
-/// Ratchet 5 — every gallery program produces a payload the wire validator
-/// accepts, on whichever of the two contracts its compile outcome selects.
-///
-/// This is the coverage the pinned fixtures cannot afford: six committed
-/// documents against every program in the repository, at no re-bless cost. A
-/// payload that violates the wire contract reaches the frontend unchallenged if
-/// only its own bytes are compared to themselves, which is what ratchets 2 and 3
-/// do for the six.
+/// Every gallery program produces a payload the wire validator accepts, on whichever of the
+/// two contracts its compile outcome selects. The frontend's tests run its own validator over
+/// the same dumps ([`write_gallery_snapshots`]).
 #[test]
 fn every_gallery_program_produces_a_valid_payload() {
     let mut panicked = Vec::new();
@@ -815,6 +687,47 @@ fn every_gallery_program_produces_a_valid_payload() {
     );
 }
 
+/// Writes every gallery program's dump to the directory `CAMBRA_SNAPSHOT_DIR` names, for the
+/// frontend's tests (`web/src/__fixtures__/dumps.ts`): `<program>.snapshot.json` for a
+/// directory's `program.cambra`, and `<program>.<file stem>.snapshot.json` for any other
+/// source. A dump already in the directory is removed first, so none outlives its program.
+///
+/// Ignored because it writes files: the frontend tests' setup runs it, with the profile the
+/// suite was built with.
+#[test]
+#[ignore = "writes the frontend tests' payloads; their setup runs it"]
+fn write_gallery_snapshots() {
+    let dir = PathBuf::from(
+        std::env::var_os("CAMBRA_SNAPSHOT_DIR")
+            .expect("CAMBRA_SNAPSHOT_DIR names the directory to write the dumps to"),
+    );
+    std::fs::create_dir_all(&dir).expect("creating the dump directory");
+    for entry in std::fs::read_dir(&dir).expect("the dump directory is readable") {
+        let path = entry.expect("a readable entry").path();
+        if path.to_string_lossy().ends_with(".snapshot.json") {
+            std::fs::remove_file(&path).expect("removing an earlier dump");
+        }
+    }
+    for (name, path) in gallery_sources() {
+        // The sweep above pins these; the frontend has no payload of theirs to read.
+        if DUMP_PANICS.contains(&name.as_str()) {
+            continue;
+        }
+        let raw = dump_source(&path)
+            .unwrap_or_else(|| panic!("--dump-snapshot failed for {}", path.display()));
+        let stem = path
+            .file_stem()
+            .expect("a source has a file name")
+            .to_string_lossy();
+        let file = if stem == "program" {
+            format!("{name}.snapshot.json")
+        } else {
+            format!("{name}.{stem}.snapshot.json")
+        };
+        std::fs::write(dir.join(file), raw).expect("writing a dump");
+    }
+}
+
 /// The observed program names, sorted and deduped for comparison against a
 /// pinned list. A program directory with several sources reports once, as the
 /// pinned lists name directories.
@@ -832,7 +745,7 @@ fn listed(names: &[&str]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Ratchet 6: ids are the only volatile field
+// Ids are the only volatile field
 // ---------------------------------------------------------------------------
 
 /// Renumber every node id in `v` by first appearance in a document-order walk,
@@ -850,9 +763,7 @@ fn listed(names: &[&str]) -> Vec<String> {
 ///
 /// A rendered `?N` is the second volatile number on the wire: `Display for
 /// Type` spells an unresolved `Infer` as its variable id, which comes from
-/// another process-global counter. So a fixture over a program whose payload
-/// carries one would churn on every change to how many variables inference
-/// allocates upstream. No committed fixture carries one today.
+/// another process-global counter.
 ///
 /// A `?N` on this wire is not itself a defect. `for_accumulator`'s post-inference
 /// pane ships `Mut(Int, ?N)` because an induction accumulator's domain is
@@ -932,20 +843,15 @@ fn canonicalize_ids(v: &mut Value) {
     }
 }
 
-/// Ratchet 6 — compiling one program twice in one process yields payloads that
-/// differ in id numbering and in nothing else.
+/// Compiling one program twice in one process yields payloads that differ in id numbering and
+/// in nothing else: anything else that differs is state carried from one compile to the next.
+/// Two numbers are volatile, not one — node ids and the `?N` of an unresolved type — and
+/// [`canonicalize_ids`] normalizes both.
 ///
-/// This is the premise the whole golden strategy rests on: a re-bless that
-/// renumbers ids carries no other information, and a re-bless that changes
-/// anything else is reporting a real wire change. Two numbers are volatile, not
-/// one — node ids and the `?N` of an unresolved type — and
-/// [`canonicalize_ids`] normalizes both. Nothing else in the suite
-/// states it — ratchet 1 compares two dumps that are each a first compile, so
-/// it cannot see what a *second* compile in the same process does.
-///
-/// It does **not** subsume ratchet 1. Both compiles here share one process's
-/// hash seeds, so a payload whose order depends on hash iteration agrees with
-/// itself and only a second process disagrees.
+/// [`snapshot_dumps_are_cross_process_deterministic`] compares two dumps that are each a first
+/// compile, so it cannot see what a *second* compile in one process does; and both compiles
+/// here share one process's hash seeds, so a payload whose order follows hash iteration agrees
+/// with itself here and only a second process disagrees.
 #[test]
 fn ids_are_the_only_difference_between_two_compiles() {
     use cambra::ccl::context::{GlobalContext, compile_program};

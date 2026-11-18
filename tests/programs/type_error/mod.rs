@@ -2,7 +2,8 @@
 //!
 //! The corpus's one failing program. It is what gives the inspector a degraded
 //! payload to serve — source and diagnostics with empty panes and
-//! `meta.payloadKind: "failed"` — pinned by the `failed` snapshot fixture.
+//! `meta.payloadKind: "failed"` — which the frontend's tests render and validate
+//! (`web/src/main.test.ts`, `web/src/wireValidate.test.ts`).
 
 use super::common::expect_compile_error;
 

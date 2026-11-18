@@ -1,3 +1,5 @@
+/// <reference types="vitest/config" />
+
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -47,5 +49,9 @@ export default defineConfig({
     assetsInlineLimit: 100_000_000,
     chunkSizeWarningLimit: 100_000_000,
     reportCompressedSize: false,
+  },
+  test: {
+    // Dumps every gallery program's payload for the tests to read.
+    globalSetup: ["./src/__fixtures__/dumps.ts"],
   },
 });
