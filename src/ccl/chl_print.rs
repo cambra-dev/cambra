@@ -70,6 +70,17 @@ impl Writer {
         .annotation(ty)
     }
 
+    /// `ty` written in CHL, reading its variables through `ctx`: a type a run renders while
+    /// it holds the run's variables.
+    pub fn ty_with(&self, ctx: &crate::ccl::ty::RenderCtx<'_>, ty: &Type) -> String {
+        Printer {
+            ctx: Some(ctx),
+            variables: Rc::clone(&self.variables),
+            ..Printer::for_type(ty)
+        }
+        .annotation(ty)
+    }
+
     /// An inferred polymorphic type written in CHL ([`chl_inferred_poly`]).
     pub fn inferred_poly(&self, inferred: &InferredPoly) -> String {
         self.inferred_poly_in(inferred, None)
@@ -137,7 +148,10 @@ pub fn chl_inferred_poly_in(inferred: &InferredPoly, home: Option<&[SmolStr]>) -
 }
 
 #[derive(Default)]
-struct Printer {
+struct Printer<'c, 'r> {
+    /// What the text reads a variable through: a run's solver, or a scratch one outside every
+    /// run ([`crate::ccl::ty::RenderCtx`]).
+    ctx: Option<&'c crate::ccl::ty::RenderCtx<'r>>,
     /// The functions the walk has descended into the codomain of, innermost last: the
     /// spelling of each one's binder, or `None` for one that names none. A reference
     /// `index` crossings out reads entry `len - 1 - index`, as
@@ -238,9 +252,18 @@ enum Prec {
 /// depth of the environment that expression is written in.
 type Env<'a> = Vec<(&'a Name, &'a Expr, usize)>;
 
-impl Printer {
+impl Printer<'_, '_> {
+    /// Ask the context's rendering questions, or a detached context's where there is none
+    /// ([`RenderCtx::detached`](crate::ccl::ty::RenderCtx::detached)).
+    fn with_ctx<R>(&self, f: impl FnOnce(&crate::ccl::ty::RenderCtx<'_>) -> R) -> R {
+        match self.ctx {
+            Some(ctx) => f(ctx),
+            None => f(&crate::ccl::ty::RenderCtx::detached()),
+        }
+    }
+
     /// A printer for `ty`, holding the spellings its names have.
-    fn for_type(ty: &Type) -> Printer {
+    fn for_type(ty: &Type) -> Self {
         let mut taken = HashSet::new();
         type_spellings(ty, &mut taken);
         Printer {
@@ -350,7 +373,7 @@ impl Printer {
                         "{} <: {}{}",
                         p.param.spelling,
                         self.component(bound),
-                        crate::ccl::capabilities::except_text(&p.param.clause_except)
+                        self.with_ctx(|ctx| ctx.except_text(&p.param.clause_except))
                     ),
                     None => p.param.spelling.to_string(),
                 },
@@ -386,7 +409,7 @@ impl Printer {
         format!(
             "forall ({}) {body}{}",
             params.join(", "),
-            crate::ccl::capabilities::clauses(&mut Solver::none(), requires, &capabilities)
+            self.with_ctx(|ctx| ctx.clauses(requires, &capabilities))
         )
     }
 
@@ -614,7 +637,7 @@ impl Printer {
         if !witnesses.is_empty() {
             return self.sum(binder.whole(), witnesses, domain, codomain);
         }
-        let is_data = fun_kind.resolved().is_data();
+        let is_data = self.with_ctx(|ctx| ctx.is_data(fun_kind));
         let arrow = if is_data { "|=>" } else { "=>" };
         // A function of a parameter list writes the list, naming each parameter the codomain
         // reads: `(a: A, B) => C(a)`.
@@ -716,12 +739,8 @@ impl Printer {
             let alternatives: Vec<String> = candidates
                 .iter()
                 .map(|candidate| {
-                    let values = crate::ccl::ty::instantiate_witness(
-                        &mut Solver::none(),
-                        codomain,
-                        w.id(),
-                        candidate,
-                    );
+                    let values =
+                        self.with_ctx(|ctx| ctx.instantiate_witness(codomain, w.id(), candidate));
                     let alternative = Type::Fun {
                         binder: name.cloned().into(),
                         fun_kind: FunKind::Data(None),
@@ -1170,7 +1189,7 @@ impl Printer {
         };
         let target = self.expr(f, Prec::Postfix, env);
         let (_, arg) = argument.written();
-        let text = if fun_kind.resolved_in(&Solver::none()).is_data() {
+        let text = if self.with_ctx(|ctx| ctx.is_data(fun_kind)) {
             format!("{target}[{arg}]!")
         } else {
             format!("{target}({arg})")

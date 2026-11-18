@@ -468,7 +468,10 @@ impl TraitMember {
             lines.push(format!(
                 "    {} <: {top}{}",
                 assoc.param.spelling,
-                crate::ccl::capabilities::except_text(&assoc.param.clause_except)
+                crate::ccl::capabilities::except_text(
+                    &mut Solver::none(),
+                    &assoc.param.clause_except
+                )
             ));
         }
         for function in &trait_.functions {
