@@ -38,11 +38,14 @@ use crate::interpreter::{
 pub(crate) mod loop_scope;
 mod plan;
 pub(crate) mod transaction_scope;
+mod workers;
 
 pub use plan::{
     Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
-    run_program_polling,
+    run_program_polling, run_program_with_workers,
 };
+#[cfg(test)]
+pub(crate) use plan::{default_workers, run_program_polling_with_workers};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -84,6 +87,9 @@ pub enum Next {
 /// The count of the dispatcher's changes that can make a claim succeed, as a claim observed it.
 #[cfg_attr(test, derive(Debug))]
 pub struct Generation(u64);
+
+/// A pipeline's follower hold, read before a publication pass ([`Dispatcher::followers_hold`]).
+pub(crate) struct FollowersHold(u64);
 
 /// Where a pipeline is in the run. It is `Finishing` from the claim, or the
 /// [`Dispatcher::begin_finish`], that moves it there until [`Dispatcher::finish`].
@@ -286,8 +292,10 @@ struct PipelineState {
     pushed: Mutex<Option<TileGuard>>,
     /// How many of the pipeline's packages have been acknowledged.
     acknowledged: AtomicUsize,
-    /// Whether this pipeline waits for its loop's round to settle before following its reads.
-    followers_held: AtomicBool,
+    /// Whether this pipeline waits for its loop's round to settle before following its reads, in
+    /// the low bit, and how many holds it has taken, in the bits above: a release that read the
+    /// count before a later hold fails ([`Dispatcher::release_followers_if`]).
+    followers_hold: AtomicU64,
 }
 
 impl PipelineState {
@@ -298,7 +306,7 @@ impl PipelineState {
             unfinished: AtomicUsize::new(reads),
             pushed: Mutex::new(None),
             acknowledged: AtomicUsize::new(0),
-            followers_held: AtomicBool::new(false),
+            followers_hold: AtomicU64::new(0),
         }
     }
 
@@ -325,6 +333,8 @@ pub struct Dispatcher {
     unfinished: AtomicUsize,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
     failed: AtomicBool,
+    /// Set by [`Dispatcher::stop_claims`]: every claim answers [`Next::Done`].
+    stopped: AtomicBool,
     /// Advances at every change that can make a claim succeed or end the run: an append, a close,
     /// an acknowledgement that frees an ordered pipeline's next package, completes a queue or
     /// returns credit to a limited source, a finish, and a failure.
@@ -424,6 +434,7 @@ impl Dispatcher {
             infos,
             states,
             failed: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             sleepers: AtomicUsize::new(0),
             sleep: Mutex::new(()),
@@ -626,16 +637,18 @@ impl Dispatcher {
 
     fn mark_arrivals(&mut self, pipeline: PipelineId) {
         let p = pipeline.0;
+        let state = &self.states[p];
+        // Composed scope graphs may already contain their initial queued inputs.
+        // This newly configured entry must itself have received nothing yet.
         assert!(
-            self.states.iter().all(|pipeline| {
-                pipeline.queue.reserved() == 0
-                    && !pipeline
-                        .queue
-                        .state
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .arrivals_closed
-            }),
+            state.queue.reserved() == 0
+                && !state
+                    .queue
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .arrivals_closed
+                && state.phase.load() == Phase::Running,
             "pipeline {p} takes arrivals before any notify or close"
         );
         let info = &mut self.infos[p];
@@ -691,12 +704,18 @@ impl Dispatcher {
     }
 
     /// Whether a claim may take `pipeline`'s packages: once every pipeline it follows
-    /// ([`follow`](Self::follow)) is quiescent ([`quiescent`](Self::quiescent)).
+    /// ([`follow`](Self::follow)) is quiescent ([`quiescent`](Self::quiescent)) and its followers
+    /// are not held.
+    ///
+    /// Quiescence is read before the hold. A worker holds a body's followers before it
+    /// acknowledges the body's package (`WorkerPool::consume`), so a quiescence that sees the
+    /// acknowledgement also sees the hold. Read the other way round, a hold taken between the two
+    /// reads goes unseen.
     fn takes_from(&self, pipeline: usize) -> bool {
         let follows = &self.infos[pipeline].follows;
         follows.is_empty()
-            || (!self.states[pipeline].followers_held.load(Ordering::SeqCst)
-                && self.quiescent(follows.iter().copied()))
+            || (self.quiescent(follows.iter().copied())
+                && self.states[pipeline].followers_hold.load(Ordering::SeqCst) & 1 == 0)
     }
 
     /// The serial coordinator changes these holds between claims, after settling held pushes.
@@ -713,11 +732,71 @@ impl Dispatcher {
         held: bool,
     ) {
         for pipeline in pipelines {
-            self.state(pipeline)
-                .followers_held
-                .store(held, Ordering::SeqCst);
+            let hold = &self.state(pipeline).followers_hold;
+            match held {
+                // Counted, so a release that read the hold before this one fails.
+                true => {
+                    let _ = hold.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |hold| {
+                        Some((((hold >> 1) + 1) << 1) | 1)
+                    });
+                }
+                false => {
+                    hold.fetch_and(!1, Ordering::SeqCst);
+                }
+            }
         }
         self.advance();
+    }
+
+    /// `pipeline`'s follower hold as it stands, for a later
+    /// [`release_followers_if`](Self::release_followers_if).
+    pub(crate) fn followers_hold(&self, pipeline: PipelineId) -> FollowersHold {
+        FollowersHold(self.state(pipeline).followers_hold.load(Ordering::SeqCst))
+    }
+
+    /// Release the followers `pipelines`, as [`hold_followers`](Self::hold_followers) with
+    /// `false`, where `gate`'s hold is still `read`: held, and held by no hold taken since. A worker
+    /// that consumes a package of a loop's or transaction writer's body holds the body's followers
+    /// again before it acknowledges the package, so a release decided before that consume
+    /// published fails, and the round's step waits for the next publication. Whether it released
+    /// `gate`.
+    ///
+    /// The other pipelines are released first and `gate` last, by its compare-and-swap alone: a
+    /// hold a worker takes after the gate's release stays, where a plain clear of the gate after it
+    /// would erase it. Where the compare-and-swap fails, the other pipelines are held again, since
+    /// the hold that made it fail may have landed on them before their release.
+    pub(crate) fn release_followers_if(
+        &self,
+        pipelines: impl IntoIterator<Item = PipelineId>,
+        gate: PipelineId,
+        read: FollowersHold,
+    ) -> bool {
+        if read.0 & 1 == 0 {
+            return false;
+        }
+        let others: Vec<PipelineId> = pipelines
+            .into_iter()
+            .filter(|pipeline| pipeline.0 != gate.0)
+            .collect();
+        for &pipeline in &others {
+            self.state(pipeline)
+                .followers_hold
+                .fetch_and(!1, Ordering::SeqCst);
+        }
+        let released = self
+            .state(gate)
+            .followers_hold
+            .compare_exchange(read.0, read.0 & !1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if !released {
+            for &pipeline in &others {
+                self.state(pipeline)
+                    .followers_hold
+                    .fetch_or(1, Ordering::SeqCst);
+            }
+        }
+        self.advance();
+        released
     }
 
     /// Record that `pipeline` consumes a breaker input of `input`'s tiling.
@@ -1050,21 +1129,40 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
+        self.try_claim_where(preferred, &|_| true, true)
+    }
+
+    /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
+    /// and to no finish where `finishes` is false: a claimant that runs only some breakers, as a
+    /// worker of the pool runs the admitted ones. After [`stop_claims`](Self::stop_claims) it
+    /// answers [`Next::Done`].
+    pub(crate) fn try_claim_where(
+        &self,
+        preferred: Option<PipelineId>,
+        takes: &dyn Fn(PipelineId) -> bool,
+        finishes: bool,
+    ) -> Next {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
         let generation = self.generation.load(Ordering::SeqCst);
         if self.failed.load(Ordering::SeqCst) {
             return Next::Failed;
         }
+        if self.stopped.load(Ordering::SeqCst) {
+            return Next::Done;
+        }
         let count = self.infos.len();
         if let Some(preferred) = preferred {
             self.state(preferred);
         }
-        let mut scan = preferred.map(|p| p.0).into_iter().chain(0..count);
-        if let Some(package) = scan.find_map(|p| self.claim_from(p)) {
+        let scan = preferred.map(|p| p.0).into_iter().chain(0..count);
+        if let Some(package) = scan
+            .filter(|&p| takes(PipelineId(p)))
+            .find_map(|p| self.claim_from(p))
+        {
             return Next::Package(package);
         }
-        for p in 0..count {
+        for p in (0..count).filter(|_| finishes) {
             let begun = self.try_begin_finish(p);
             if begun {
                 return Next::Finish {
@@ -1087,6 +1185,63 @@ impl Dispatcher {
                 next => return next,
             }
         }
+    }
+
+    /// [`try_claim_where`](Self::try_claim_where) with no finish, blocking while there is nothing
+    /// to claim, as [`claim`](Self::claim) does.
+    pub(crate) fn claim_where(
+        &self,
+        preferred: Option<PipelineId>,
+        takes: &dyn Fn(PipelineId) -> bool,
+    ) -> Next {
+        loop {
+            match self.try_claim_where(preferred, takes, false) {
+                Next::Wait(generation) => self.wait(generation),
+                next => return next,
+            }
+        }
+    }
+
+    /// Whether a package of a pipeline `takes` admits is in flight, or claimable now: a claimant
+    /// restricted to those pipelines may still change the run. Read before
+    /// [`changed_since`](Self::changed_since), it misses no package: one that becomes claimable
+    /// after it advances the generation.
+    pub(crate) fn may_claim_where(&self, takes: &dyn Fn(PipelineId) -> bool) -> bool {
+        (0..self.infos.len())
+            .filter(|&p| takes(PipelineId(p)))
+            .any(|p| {
+                let queue = self.states[p]
+                    .queue
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                // With nothing in flight, an ordered pipeline claims as any other does.
+                !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
+            })
+    }
+
+    /// Whether the generation has advanced past `generation`: something changed that can make a
+    /// claim succeed.
+    pub(crate) fn changed_since(&self, generation: &Generation) -> bool {
+        self.generation.load(Ordering::SeqCst) != generation.0
+    }
+
+    /// Wake every thread asleep in [`wait`](Self::wait), as a change that can make a claim succeed
+    /// does: a claimant that waited for a package in flight learns that it was acknowledged.
+    pub(crate) fn wake_claimants(&self) {
+        self.advance();
+    }
+
+    /// Whether the run has failed ([`fail`](Self::fail)).
+    pub(crate) fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+
+    /// End the run's claims at a drained boundary: every claim from now answers [`Next::Done`],
+    /// and every waiter wakes, so a worker of the pool stops before the run returns.
+    pub(crate) fn stop_claims(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.advance();
     }
 
     /// Block until the generation has advanced past `generation`, or the run has failed. A change
@@ -2042,7 +2197,6 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
 /// `input`'s universal guard cut as [`seed_within`] cuts a region: every `rows` keys where the
 /// input's tiling states a finite range of positions for its outermost keys, and one morsel
 /// otherwise.
-#[cfg(test)]
 fn seed(input: &Tiling, rows: usize) -> Vec<TileGuard> {
     seed_within(input, &input.universal_guard(), rows)
 }
@@ -2236,21 +2390,21 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
         return work();
     }
     struct Command<F, R> {
-        work: Option<F>,
-        result: Option<R>,
+        work: std::cell::RefCell<Option<F>>,
+        result: std::cell::RefCell<Option<R>>,
     }
     impl<F: FnOnce() -> R, R> Breaker for Command<F, R> {
         fn as_producer(&self) -> Option<&dyn BreakingProducer> {
             None
         }
-        fn consume_impl(&mut self, _: InputId, _: TileGuard) {
-            self.result = Some(self.work.take().expect("one command")());
+        fn consume_impl(&self, _: InputId, _: TileGuard) {
+            *self.result.borrow_mut() = Some(self.work.borrow_mut().take().expect("one command")());
         }
         fn input_tiling(&self, _: InputId) -> Tiling {
             Tiling::Scalar(Extent::Base(crate::interpreter::BaseType::Unit))
         }
         fn input_released(&self, _: InputId) -> TileGuard {
-            TileGuard::Scalar(if self.work.is_none() {
+            TileGuard::Scalar(if self.work.borrow().is_none() {
                 Predicate::True
             } else {
                 Predicate::False
@@ -2258,8 +2412,8 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
         }
     }
     let mut command = Command {
-        work: Some(work),
-        result: None,
+        work: std::cell::RefCell::new(Some(work)),
+        result: std::cell::RefCell::new(None),
     };
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     in_a_run(|| {
@@ -2267,7 +2421,10 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
             call(&mut command, InputId::ONLY)
         })
     });
-    command.result.expect("the dispatcher consumes the command")
+    command
+        .result
+        .into_inner()
+        .expect("the dispatcher consumes the command")
 }
 
 /// Evaluate a component query inside one dispatched unit command, for protocol fixtures.
@@ -2482,6 +2639,29 @@ mod tests {
         );
     }
 
+    /// A release decided against the hold read before a publication pass fails where a hold was
+    /// taken since, as a worker's after a claim of the body, and leaves every pipeline it names
+    /// held. It succeeds against the hold as it stands; a released hold is not released twice.
+    #[test]
+    fn a_release_fails_after_a_hold_taken_since_it_read_the_hold() {
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        let (body, step) = (PipelineId(0), PipelineId(1));
+        let held = |pipeline| dispatcher.followers_hold(pipeline).0 & 1 == 1;
+        dispatcher.hold_followers([body, step], true);
+        let read = dispatcher.followers_hold(step);
+        dispatcher.hold_followers([body, step], true);
+        assert!(!dispatcher.release_followers_if([body, step], step, read));
+        assert!(
+            held(body) && held(step),
+            "a failed release releases nothing"
+        );
+        let read = dispatcher.followers_hold(step);
+        assert!(dispatcher.release_followers_if([body, step], step, read));
+        assert!(!held(body) && !held(step));
+        let read = dispatcher.followers_hold(step);
+        assert!(!dispatcher.release_followers_if([body, step], step, read));
+    }
+
     /// The placements a planning pass sets are cleared when a probe in the pass unwinds.
     #[test]
     fn placements_a_pass_sets_are_cleared_when_it_unwinds() {
@@ -2567,7 +2747,7 @@ mod tests {
                 self.tiling().empty_tile()
             }
 
-            fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+            fn release_impl(&self, _obsolete_guard: TileGuard) {}
         }
 
         fn two_inputs(walk: Walk) -> TwoInputs {
