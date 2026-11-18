@@ -7,7 +7,7 @@ use super::{SourceRegistry, value_probe::ProbeSlot};
 /// as it lives, and lends it to every `TileOperator::subscribe` of its compilations.
 #[derive(Default)]
 pub struct SubscribeContext {
-    probes: ProbeSlot,
+    pub(crate) probes: ProbeSlot,
     /// The source producers registered under each subscription still in progress, innermost last
     /// ([`begin_source_producers`](Self::begin_source_producers)).
     producer_frames: Vec<Vec<String>>,
