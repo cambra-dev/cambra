@@ -575,10 +575,7 @@ fn writes_what_the_body_touches(definiens: &Expr, body: &Expr) -> bool {
 /// and no capability states. A copy of `e` does it once more, so `x = with begin(): …` read at
 /// two elements of `[x, x]` would commit twice.
 fn does_something(e: &Expr) -> bool {
-    fn declares_a_channel(e: &Expr) -> bool {
-        matches!(e.node, TypedExprNode::Defer) || e.any_child(declares_a_channel)
-    }
-    !e.capabilities.set().causes_nothing() || declares_a_channel(e)
+    !e.capabilities.set().causes_nothing() || crate::ccl::channelize::holds_defer(e)
 }
 
 /// Move every `Let`-bound definiens read in a list element into that element,
