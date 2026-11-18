@@ -272,12 +272,7 @@ impl MapResultProducer {
         let i_tiling = self.input.tiling().clone();
         // A scalar input is a key looked up in the function, and the keys the projection names
         // are the function's own: the input has none, so it is read whole and the answer cut.
-        let input_guard = match i_tiling.is_data_function() {
-            true => projection.guard(&i_tiling),
-            false => i_tiling.universal_guard(),
-        };
-
-        let mut input_tile = self.input.get(input_guard);
+        let mut input_tile = self.input.get(projection.input_guard(&i_tiling));
         // Drop logically-deleted rows before mapping. Release marks rows deleted
         // rather than removing them (`Tile::remove_guarded`), and the paths below
         // carry the input's `domain` through to the output while building the
@@ -912,11 +907,7 @@ impl MapResultToConstProducer {
         );
         let i_tiling = self.input.tiling().clone();
         // A scalar input has no keys to project, so it is read whole and the answer cut.
-        let input_guard = match i_tiling.is_data_function() {
-            true => projection.guard(&i_tiling),
-            false => i_tiling.universal_guard(),
-        };
-        let input_tile = self.input.get(input_guard);
+        let input_tile = self.input.get(projection.input_guard(&i_tiling));
         // **Laziness — do not evaluate an off-path arm.** In the scalar value-`Case`
         // C-form a false first-match gate empties this arm's `Units(1)` driver — the
         // `Restrict` marks the driver row *deleted* rather than dropping it. When

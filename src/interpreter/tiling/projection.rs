@@ -86,6 +86,17 @@ impl Projection {
         }
     }
 
+    /// The guard an operator answering this projection pulls an input with `tiling` at.
+    ///
+    /// A collection input is pulled at this projection's guard. An input with no keys to project
+    /// is read whole, and the operator cuts its answer after.
+    pub fn input_guard(&self, tiling: &Tiling) -> TileGuard {
+        match tiling.is_data_function() {
+            true => self.guard(tiling),
+            false => tiling.universal_guard(),
+        }
+    }
+
     /// The keys above `level` that this projection names, for an operator whose input lacks
     /// `level`: itself where it names keys above `level`, and otherwise the keys of the level just
     /// above that its paths run through, or everything where `level` is the outermost.

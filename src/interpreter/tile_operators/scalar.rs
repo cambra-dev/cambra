@@ -618,16 +618,6 @@ struct VariantProjectProducer {
     empty_level: Option<Tile>,
 }
 
-/// The guard a pull at `projection` reads a `match`'s scrutinee at: the projection for a union
-/// stream, whose keys are the answer's, and the whole of a bare `Scalar(Union)`, which has no keys
-/// of its own and whose positions the reader cuts after.
-fn scrutinee_guard(scrutinee: &dyn TileProducer, projection: &Projection) -> TileGuard {
-    match scrutinee.tiling().is_data_function() {
-        true => projection.guard(scrutinee.tiling()),
-        false => scrutinee.tiling().universal_guard(),
-    }
-}
-
 /// Release a bare `Scalar(Union)` scrutinee, which an operator reads whole and supplies the
 /// positions of. It has no keys to take a partial release, and the operator's own obsolete guard,
 /// `released`, cuts the released positions from its answer. The scrutinee is released whole on the
@@ -642,7 +632,7 @@ fn release_bare_scrutinee(scrutinee: &mut dyn TileProducer, released: &TileGuard
 impl VariantProjectProducer {
     /// The payloads of the scrutinee's rows carrying the tag.
     fn project(&mut self, projection: &Projection) -> Tile {
-        let tile = self.input.get(scrutinee_guard(&*self.input, projection));
+        let tile = self.input.get(projection.input_guard(self.input.tiling()));
         // Under standing levels the projection runs one enclosing row at a time: its keys
         // are the rows it keeps, and which rows those are is a fact about one group.
         if let (Some(level), Some(empty)) = (self.level, self.empty_level.as_ref())
@@ -924,7 +914,7 @@ impl TileProducer for VariantIsProducer {
             Some(level) if self.input.restates().refuses(level) => Projection::Everything,
             _ => projection.clone(),
         };
-        let mut tile = self.input.get(scrutinee_guard(&*self.input, &pulled));
+        let mut tile = self.input.get(pulled.input_guard(self.input.tiling()));
         let values = tile.deepest_values_mut();
         let Tile::Scalar(ColumnValue::Union(arms)) = &*values else {
             panic!("VariantIs expects a union input, got {values:?}")
