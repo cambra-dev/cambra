@@ -378,12 +378,15 @@ impl TileProducer for VariantWrapProducer {
             false => self.input.tiling().universal_guard(),
         };
         let mut tile = self.input.get(input_guard);
-        // **A collection payload is a value only once it is whole.** The arm holds it as one
-        // materialized cell, which cannot grow, so a row's cell is emitted once that row's
-        // collection is complete and not before. At the outermost level the payload is one
-        // row, the whole input, and once it is released there is nothing left to wrap: a
-        // released collection reads as an empty one, which is not the value it was.
-        if self.input.tiling().values_at(self.level).holds_a_level() {
+        // A materialized payload cannot grow. A collection payload must be complete before it
+        // becomes one cell, and an outermost record payload must have every field before it
+        // becomes one column. At the outermost level the payload is one row, the whole input,
+        // and once it is released there is nothing left to wrap: a released collection reads
+        // as an empty one, which is not the value it was.
+        let payload_tiling = self.input.tiling().values_at(self.level);
+        if payload_tiling.holds_a_level()
+            || (self.level.enclosing().is_none() && matches!(payload_tiling, Tiling::Record(_)))
+        {
             match self.level.enclosing() {
                 None if !tile.is_terminal() || self.obsolete_guard().is_universal() => {
                     return self.tiling().empty_tile();

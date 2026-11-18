@@ -686,3 +686,57 @@ fn a_per_element_record_holding_a_list_literal() {
 fn a_per_element_record_holding_a_computed_list_is_refused() {
     run_pipeline("xs = [1, 2]; ys = [(a=x, b=[x, x]) for x in xs]; ys");
 }
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_collection_field("[sum([1 for h in req.headers]) for req in requests()]", vec![2])]
+#[case::a_projected_collection(
+    "[sum([1 for h in hs]) for hs in [req.headers for req in requests()]]", vec![2]
+)]
+#[case::beneath_two_levels(
+    "[sum([1 for h in req.headers]) for outer in [0, 1] for req in requests()]", vec![2, 2]
+)]
+fn a_source_opens_collection_fields(#[case] code: &str, #[case] expected: Vec<i64>) {
+    use cambra::interpreter::FuncBinding;
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "requests",
+        Type::Record(vec![(
+            "headers".into(),
+            Type::list_of(Type::Base(BaseType::String)),
+        )]),
+        Extent::Record(HashMap::from([(
+            "headers".into(),
+            Extent::Function {
+                domain: Box::new(Extent::Base(BaseType::UInt)),
+                codomain: Box::new(Extent::Base(BaseType::String)),
+            },
+        )])),
+    )));
+    let headers = Value::Function(
+        (0..2)
+            .map(|n| FuncBinding {
+                input: Value::UInt(n),
+                output: Value::String("header".into()),
+            })
+            .collect(),
+    );
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(source.clone());
+    let loaded = LoadedProgram::test(code);
+    let mut compiled =
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    ctx.scheduler().check_for_notifications();
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let _ = producer.get(producer.tiling().universal_guard());
+    source.borrow_mut().add_data(&[(
+        Value::UInt(0),
+        Value::Record(HashMap::from([("headers".into(), headers)])),
+    )]);
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    let tile = producer.get(producer.tiling().universal_guard());
+    let Tile::DataFunction { codomain, .. } = tile else {
+        panic!("expected request-keyed output")
+    };
+    assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(expected)));
+}

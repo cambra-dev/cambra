@@ -489,8 +489,9 @@ and key fit in one column, but an element containing a collection requires a `Ti
 whose `_0` field retains its levels. `Uncurry` combines two key levels into one pair-keyed level
 without materializing their values.
 
-Variant payloads and store writes require materialized values. `VariantWrap` waits for a
-collection payload to complete, then emits it as one cell at the level named by the payload's
+Variant payloads and store writes require materialized values. `VariantWrap` waits for every
+field of a scalar record and for a collection payload to complete, then emits one cell at the level
+named by the payload's
 type, not necessarily the input's innermost level. `VariantProject` opens it back into levels.
 For a feed leaving a nested loop, this round trip carries the inner tap collection through the
 enclosing decision's variant payload; the channel then flattens the two collection levels.
@@ -1074,13 +1075,26 @@ pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
 nodes include a label, tiling, and input edges; boundary nodes have no tiling. Walk roots are
 derived from the edges on both sides of the wire rather than serialized separately.
 
+### Materialized source values
+
+`MapResultWithSource` opens each complete `ColumnValue` returned by a source into
+`Tiling::from_extent(output_extent)`. Record fields and collection-valued fields use the same
+`column_value_to_tile` and `open_collections` adapters as other materialized values. Newly opened
+collection completion predicates are qualified by the input rows fetched in that pull. An empty
+pull therefore closes no collection beneath a request that has not arrived.
+
+A release can cover individual output fields or collection cells. `through_shared_levels`
+projects the accumulated obsolete guard back to the source key tiling. The source receives a
+key release only when the complete value at that key is released. Partial output releases remain
+recorded by the producer and do not discard fields another consumer still needs.
+
 ### Operator catalog
 
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
 | `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::from_bindings`, any tiling from `Constant::collection` | Produces a fixed tile. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
 | `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
-| `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
+| `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Tiling::from_extent(output))` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. A row stands where every arm holds it, and a level beneath the pair is complete only beneath the rows the pair holds or calls complete: an arm may call its own collection under a row complete before another arm reaches that row ([qualified predicates](#qualified-predicates)). |
 | `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. Construction asserts that the function's domain extent includes the data's value extent, with one exception: a `UInt` or range value extent at a `0..𝑛` domain, the erasure of a refined `UInt` or range that inference proved inside the range. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. Keys beneath more than one level of the data are looked up the same way: each key's group stands in its place beneath the data's levels, an unanswered key is withheld (`Tile::withhold`, so no level calls a prefix of its path complete), a key the function settled without holding is dropped, and each group is complete beneath a complete path. A one-level function drops such a row too, beneath any level of the data: the function is read with its deleted keys removed, which are the keys a gated leg's `Restrict` rejected. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |

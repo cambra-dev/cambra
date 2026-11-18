@@ -581,12 +581,17 @@ The std root ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)) 
 embedded in the binary. Each file has a `FileId` and a path, such as `<std>/http.cambra`, so
 errors inside it render against its source.
 
-`run std::http(…) as server` exposes `server::requests` and `server::respond(values)`. The embedded
-module uses an internal `http_serve` declaration primitive that directly binds a request source
-and private response Feed. User code cannot call that primitive. `respond` consumes collection
-values. A module exports a Feed read with an ordinary public value binding.
-Address arguments are constants. Linking checks route uniqueness as each run is created
-([Runs](#runs)).
+`import std::http` provides shared nominal `Header`, `Request`, and `Response` types and pure
+response helpers. `run std::http::serve(…) as server` exposes `server::Reqs`, `server::requests`,
+and `server::respond(values: server::Reqs |=> http::Response)`. The embedded run module declares
+its key type, request source and private response Feed with `@Builtin`, and the compiler supplies
+each from the run's address. `respond` defines the complete response function once; no writable
+place is exported.
+
+Address arguments are constants. Linking substitutes them in route source names, including
+source-domain types in exported aliases and annotations. Nested forwarding modules preserve
+this substitution. Checking a module uses unopened sources, while each concrete root run opens
+its route and checks route uniqueness ([Runs](#runs)).
 
 ### Registries keyed by spelling
 
@@ -899,9 +904,9 @@ payload, with a diagnostic saying the inspector shows one file.
 
 ## Worked example: two storefronts and an audit log
 
-The example uses private Feed declarations, exported collection reads, and an input function that
-writes a transactional variable. Structured HTTP requests, indexed responses and structured
-response serialization remain **[Open]** extensions
+The example uses private Feed declarations, exported collection reads, an input function that
+writes a transactional variable, and complete HTTP response comprehensions. The deployment supplies
+its order-body decoder as a function parameter; HTTP transport supplies UTF-8 Strings
 ([chl-spec.md, "7.3 Sources"](chl-spec.md#73-sources)).
 
 `catalog.cambra`, a library:
@@ -923,6 +928,7 @@ pub Event = {app: String, event: String}
 `audit.cambra`, a runnable module that keeps the events it receives:
 
 ```python
+import std::http
 import audit_api use Event
 
 log: Mut(List(Event), Txn) := []
@@ -932,23 +938,26 @@ pub def receive(events):
         with begin():
             log := log ++ [e]
 
-run std::http(port="9000", method="GET", path="/events") as endpoint
-replies: Feed(String)
-for req in endpoint::requests:
+run std::http::serve(port="9000", method="GET", path="/events") as endpoint
+
+def show(req: http::Request) => http::Response:
     entries = with begin():
         [e.audit_api::app + ": " + e.audit_api::event for e in log]
-    replies << str(entries)
-endpoint::respond(replies)
+    http::ok_text(str(entries))
+
+endpoint::respond([show(req) for req in endpoint::requests])
 ```
 
 `storefront.cambra`, a runnable module with parameters that exports its events:
 
 ```python
+import std::http
 import catalog
 import audit_api use Event
 
 const param port: String
 param region: String
+param decode_order: String => {sku: String, qty: Int}
 
 items: Map(String, catalog::Item) = [
     "tee" -> (catalog::price=25, catalog::cost=11),
@@ -958,11 +967,10 @@ stock: Mut(Map(String, Int), Txn) := ["tee" -> 500, "mug" -> 200]
 _events: Feed(Event)
 pub events = _events
 
-run std::http(port=port, method="POST", path="/order") as orders
-replies: Feed(String)
+run std::http::serve(port=port, method="POST", path="/order") as orders
 
-for req in orders::requests:
-    order = req.body
+def handle(req: http::Request) => http::Response:
+    order = decode_order(req.body())
     result = with begin():
         if order.sku in items and order.sku in stock:
             s = stock[order.sku]!
@@ -974,16 +982,18 @@ for req in orders::requests:
                 "out of stock"
         else:
             "unknown item"
-    replies << result
-orders::respond(replies)
+    http::ok_text(result)
+
+orders::respond([handle(req) for req in orders::requests])
 ```
 
 `deploy.cambra`, the root:
 
 ```python
+param decode_order: String => {sku: String, qty: Int}
 run audit
-run storefront(port="8080", region="eu") as eu
-run storefront(port="8081", region="us") as us
+run storefront(port="8080", region="eu", decode_order=decode_order) as eu
+run storefront(port="8081", region="us", decode_order=decode_order) as us
 audit::receive(eu::events ++ us::events)
 ```
 
@@ -1004,14 +1014,11 @@ What each rule contributes:
   transaction. A handler reading the whole of `events` instead would wait for the feed to be
   complete, which a live store never is.
 - Labels from another module are qualified: `catalog::price`, `audit_api::app`.
-  The request body's `sku` and `qty` are written unqualified, which assumes the **[Open]** rule for
-  data from outside the program gives them to the handler's module ([chl-spec.md, "9.12 Field
-  labels and tags belong to a module"](chl-spec.md#912-field-labels-and-tags-belong-to-a-module)).
 - The routes are `8080 POST /order`, `8081 POST /order`, and `9000 GET /events`, distinct after
   linking binds each run's `port`.
-- A reload adding `run storefront(port="8082", region="ap") as ap` starts a third store with its
-  initial stock, and the root passes `ap::events` to `audit::receive` as well. Removing `us` needs
-  `@Discard run storefront as us`.
+- A reload adding `run storefront(port="8082", region="ap", decode_order=decode_order) as ap`
+  starts a third store with its initial stock, and the root passes `ap::events` to
+  `audit::receive` as well. Removing `us` needs `@Discard run storefront as us`.
 
 ---
 
@@ -1027,8 +1034,9 @@ The work that remains, one PR per item, each updating the spec and design docs i
    wrote, which needs a named wrapper type that every comparison looks through, and a diagnostic
    eliding the qualifier on its own module's members, which needs a diagnostic's text formatted once
    the error has a location ([Names carry their home](#names-carry-their-home)).
-4. **The std root.** `std::http` exposes request and response members through a run. Its internal
-   `http_serve` declaration primitive remains private to the embedded module.
+4. **The std root.** `std::http` exports shared nominal values through an import;
+   `std::http::serve` exports a route's request domain and response connection through a run.
+   Its `@Builtin` request source and response Feed stay private to the embedded run module.
 5. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
 6. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps

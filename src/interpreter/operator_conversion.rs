@@ -4440,7 +4440,7 @@ fn source_start(domain: &Type, ctx: &OpConversionContext) -> Option<Position> {
     // A stream buffer names the next index it offers, so what a drive over it
     // resumes after is the one below. A collection offers every position it has, so
     // a drive over one resumes after nothing.
-    let next = ctx.sources.get(name).map_or(0, |source| {
+    let next = ctx.sources.get(name.as_str()).map_or(0, |source| {
         source.borrow().first_position_for_a_new_producer()
     });
     next.checked_sub(1).map(|p| Position::new(Value::UInt(p)))

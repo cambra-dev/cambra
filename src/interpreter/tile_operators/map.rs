@@ -1174,7 +1174,7 @@ impl MapResultWithSource {
         let output_extent = projected_extent(&fields, source.borrow().output_value_extent());
         let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
             assert_eq!(source_domain_extent, *codomain_extent);
-            Tiling::Scalar(output_extent)
+            Tiling::from_extent(&output_extent)
         });
         Self {
             base: OperatorBase::new(tiling),
@@ -1454,13 +1454,31 @@ impl TileProducer for MapResultWithSourceProducer {
         }
         let source = self.source.borrow();
         let fields = &self.fields;
-
-        process_tile_result(self.tiling(), input_tile, move |codomain| {
+        let values_at = CurryLevel::values_of(self.input.tiling());
+        let rows = values_at.enclosing().map(|level| {
+            input_tile
+                .paths_at(level)
+                .iter()
+                .fold(Predicate::False, |rows, path| {
+                    rows.union(&Predicate::exactly(path))
+                })
+        });
+        let mut tile = process_tile_result(self.tiling(), input_tile, move |codomain| {
             source.get_fields(codomain, fields)
-        })
+        });
+        if let Some(rows) = rows {
+            tile.values_at_mut(values_at)
+                .map_level_predicates(&mut |depth, pred| pred.qualified_by(&rows, depth));
+        }
+        tile
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        let obsolete_guard = crate::interpreter::tiling::through_shared_levels(
+            self.obsolete_guard().clone(),
+            self.input.tiling().levels(),
+            self.input.tiling(),
+        );
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source

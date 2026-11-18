@@ -28,7 +28,7 @@ use cambra::{
 // ---------------------------------------------------------------------------
 
 /// Compile `source` for a sink program and return the surrounding
-/// [`GlobalContext`].  Sink programs (e.g. `http_serve`) have no `main`
+/// [`GlobalContext`].  Sink programs (e.g. an HTTP route) have no `main`
 /// output; their sinks bind their resources during `compile_program` and
 /// then await scheduler ticks to dispatch values.
 ///

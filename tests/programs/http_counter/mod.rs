@@ -40,20 +40,21 @@ fn http_computed_live_read() {
     let port = reserve_test_port();
     let source = indoc::formatdoc!(
         r#"
-            run std::http(port="{port}", method="POST", path="/set") as setter
-            setter_replies: Feed(String)
-            set_reqs = setter::requests
-            run std::http(port="{port}", method="GET", path="/get") as getter
-            getter_replies: Feed(String)
-            get_reqs = getter::requests
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="POST", path="/set") as setter
+            setter_replies: Feed(http_api::Response)
+            set_reqs = [request.body() for request in setter::requests]
+            run std::http::serve(port="{port}", method="GET", path="/get") as getter
+            getter_replies: Feed(http_api::Response)
+            get_reqs = [request.body() for request in getter::requests]
             latest: Mut(String, Txn) := "(none)"
             for msg in set_reqs:
                 with begin():
                     latest := msg
-                setter_replies << "ok\n"
+                setter_replies << http_api::ok_text("ok\n")
             for req in get_reqs:
                 with begin():
-                    getter_replies << latest + "!"
+                    getter_replies << http_api::ok_text(latest + "!")
             setter::respond(setter_replies)
             getter::respond(getter_replies)
             "#
@@ -79,22 +80,23 @@ fn http_multi_mut_var_live_read() {
     let port = reserve_test_port();
     let source = indoc::formatdoc!(
         r#"
-            run std::http(port="{port}", method="POST", path="/set") as setter
-            setter_replies: Feed(String)
-            set_reqs = setter::requests
-            run std::http(port="{port}", method="GET", path="/get") as getter
-            getter_replies: Feed(String)
-            get_reqs = getter::requests
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="POST", path="/set") as setter
+            setter_replies: Feed(http_api::Response)
+            set_reqs = [request.body() for request in setter::requests]
+            run std::http::serve(port="{port}", method="GET", path="/get") as getter
+            getter_replies: Feed(http_api::Response)
+            get_reqs = [request.body() for request in getter::requests]
             a: Mut(String, Txn) := "a0"
             b: Mut(String, Txn) := "b0"
             for msg in set_reqs:
                 with begin():
                     a := msg
                     b := msg
-                setter_replies << "ok\n"
+                setter_replies << http_api::ok_text("ok\n")
             for req in get_reqs:
                 with begin():
-                    getter_replies << a + b
+                    getter_replies << http_api::ok_text(a + b)
             setter::respond(setter_replies)
             getter::respond(getter_replies)
             "#

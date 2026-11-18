@@ -2,13 +2,14 @@
 //!
 //! [`SharedHttpServer`] owns the single `tiny_http::Server` for a given port and
 //! routes incoming requests to the matching `(method, path)` subscriber channel.
-//! Multiple `http_serve` calls on the same port share one server via
+//! Multiple HTTP routes on the same port share one server via
 //! [`SharedHttpServer::register`].
 //!
 //! [`HttpServerDataSource`] accepts incoming HTTP requests on a background thread
 //! and exposes them as a streaming [`DataSourceDomainExtentImpl`] with a `UInt`
-//! domain and `String` codomain (the request body).  Each request is assigned a
-//! monotonically-increasing uint index.
+//! domain and complete tuple values containing method, target, headers, and UTF-8
+//! body. The embedded run module constructs nominal Request values from these
+//! tuples. Each admitted request receives a monotonically increasing uint index.
 
 use std::{
     collections::HashMap,
@@ -21,15 +22,135 @@ use std::{
 };
 
 use log::debug;
-use smol_str::SmolStr;
 use tiny_http::{Header, Response, Server};
 
 use crate::ccl::Type;
 use crate::interpreter::{
-    BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent,
+    BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent, FuncBinding, Value,
     stream_buffer::UIntStreamBuffer,
     tiling::{Predicate, Tile},
+    tuple_field,
 };
+
+fn http_tuple<const N: usize>(values: [Value; N]) -> Value {
+    Value::Record(
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(n, v)| (tuple_field(n), v))
+            .collect(),
+    )
+}
+
+fn request_type() -> Type {
+    let string = || Type::Base(BaseType::String);
+    Type::Tuple(vec![
+        string(),
+        string(),
+        Type::list_of(Type::Tuple(vec![string(), string()])),
+        string(),
+    ])
+}
+
+fn request_extent() -> Extent {
+    let string = || Extent::Base(BaseType::String);
+    let header = Extent::Record(HashMap::from([
+        (tuple_field(0), string()),
+        (tuple_field(1), string()),
+    ]));
+    Extent::Record(HashMap::from([
+        (tuple_field(0), string()),
+        (tuple_field(1), string()),
+        (
+            tuple_field(2),
+            Extent::Function {
+                domain: Box::new(Extent::Base(BaseType::UInt)),
+                codomain: Box::new(header),
+            },
+        ),
+        (tuple_field(3), string()),
+    ]))
+}
+
+fn nominal_payload(value: &Value) -> &Value {
+    let Value::Union { inner, .. } = value else {
+        panic!("a nominal HTTP value carries its constructor, got {value:?}")
+    };
+    inner
+}
+
+fn tuple_part(value: &Value, n: usize) -> &Value {
+    let Value::Record(fields) = value else {
+        panic!("an HTTP constructor's arguments are a tuple, got {value:?}")
+    };
+    fields
+        .get(&tuple_field(n))
+        .expect("the HTTP constructor has every argument")
+}
+
+fn response_header(name: &str, value: &str) -> Result<Header, String> {
+    // tiny_http checks ASCII encoding but permits CR/LF and caller-supplied framing lengths.
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if name.is_empty() || !name.bytes().all(token) {
+        return Err("invalid response header name".into());
+    }
+    if !value
+        .bytes()
+        .all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+        || value.trim_matches([' ', '\t']) != value
+    {
+        return Err("invalid response header value".into());
+    }
+    if [
+        "Content-Length",
+        "Transfer-Encoding",
+        "Connection",
+        "Trailer",
+        "Upgrade",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err("response framing headers are managed by the HTTP transport".into());
+    }
+    Header::from_bytes(name.as_bytes(), value.as_bytes())
+        .map_err(|_| "invalid response header".into())
+}
+
+fn decode_response(value: &Value) -> Result<(u16, Vec<Header>, String), String> {
+    let payload = nominal_payload(value);
+    let status = tuple_part(payload, 0).as_int();
+    let status = u16::try_from(status)
+        .ok()
+        .filter(|s| (200..=599).contains(s))
+        .ok_or("invalid final response status")?;
+    let Value::Function(headers) = tuple_part(payload, 1) else {
+        panic!("response headers are a list")
+    };
+    let headers = headers
+        .iter()
+        .map(|h| {
+            let h = nominal_payload(&h.output);
+            response_header(
+                tuple_part(h, 0).as_string().as_str(),
+                tuple_part(h, 1).as_string().as_str(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if headers
+        .iter()
+        .filter(|h| h.field.equiv("Content-Type"))
+        .count()
+        > 1
+    {
+        return Err("a response has at most one Content-Type header".into());
+    }
+    Ok((
+        status,
+        headers,
+        tuple_part(payload, 2).as_string().to_string(),
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Per-port shared server
@@ -38,7 +159,7 @@ use crate::interpreter::{
 /// What the dispatcher thread sends a route.
 pub enum RouteMessage {
     /// A request for the route, with its body read off.
-    Request(SmolStr, tiny_http::Request),
+    Request(Value, Box<tiny_http::Request>),
     /// The dispatcher stopped for a reason other than the program releasing the port, so no
     /// request reaches the route again. Two causes stop it. tiny_http's accept thread exits on
     /// its first `accept` error and closes the listener. A panic on the dispatcher thread ends
@@ -64,7 +185,7 @@ struct RouteTable {
     failure: Option<String>,
 }
 
-/// A single `tiny_http::Server` shared by all `http_serve` calls on the same port.
+/// A single `tiny_http::Server` shared by all HTTP routes on the same port.
 ///
 /// Each `(method, path)` pair is registered as a route via [`register`](Self::register),
 /// which returns a `Receiver` delivering matching requests.  Requests that do not match
@@ -122,20 +243,63 @@ impl SharedHttpServer {
                         let req_method = request.method().to_string();
                         let req_url = request.url().to_string();
 
+                        // A target whose path is no URI path matches no route.
+                        let Ok(path) = request_path(&req_url) else {
+                            let _ = request.respond(
+                                Response::from_string("invalid request target")
+                                    .with_status_code(400),
+                            );
+                            continue;
+                        };
                         // Look up the route while holding the lock briefly.
                         let sender = routes_bg
                             .lock()
                             .unwrap()
                             .senders
-                            .get(&(req_method.clone(), req_url.clone()))
+                            .get(&(req_method.clone(), path))
                             .cloned();
 
                         match sender {
                             Some(tx) => {
                                 let mut body_bytes = Vec::new();
-                                let _ = request.as_reader().read_to_end(&mut body_bytes);
-                                let body = SmolStr::new(String::from_utf8_lossy(&body_bytes));
-                                if tx.send(RouteMessage::Request(body, request)).is_err() {
+                                if request.as_reader().read_to_end(&mut body_bytes).is_err() {
+                                    let _ = request.respond(
+                                        Response::from_string("invalid request body")
+                                            .with_status_code(400),
+                                    );
+                                    continue;
+                                }
+                                let Ok(body) = String::from_utf8(body_bytes) else {
+                                    let _ = request.respond(
+                                        Response::from_string("request body must be UTF-8")
+                                            .with_status_code(400),
+                                    );
+                                    continue;
+                                };
+                                let headers = Value::Function(
+                                    request
+                                        .headers()
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(n, h)| FuncBinding {
+                                            input: Value::UInt(n as u64),
+                                            output: http_tuple([
+                                                Value::String(h.field.to_string().into()),
+                                                Value::String(h.value.as_str().into()),
+                                            ]),
+                                        })
+                                        .collect(),
+                                );
+                                let value = http_tuple([
+                                    Value::String(req_method.as_str().into()),
+                                    Value::String(req_url.clone().into()),
+                                    headers,
+                                    Value::String(body.into()),
+                                ]);
+                                if tx
+                                    .send(RouteMessage::Request(value, Box::new(request)))
+                                    .is_err()
+                                {
                                     debug!("HTTP route {req_method} {req_url}: receiver dropped");
                                 }
                             }
@@ -171,6 +335,11 @@ impl SharedHttpServer {
     /// [`RouteMessage::Request`]. A route registered after the dispatcher failed receives that
     /// failure at once.
     pub fn register(&self, method: String, path: String) -> Receiver<RouteMessage> {
+        debug_assert_eq!(
+            route_path(&path).as_deref(),
+            Ok(path.as_str()),
+            "a route registers its normalized path",
+        );
         let (tx, rx) = mpsc::channel();
         let mut table = self.routes.lock().unwrap();
         if let Some(reason) = &table.failure {
@@ -211,7 +380,7 @@ impl SharedHttpServer {
     }
 }
 
-/// An `http_serve` route a compilation named but did not open.
+/// An HTTP route a compilation named but did not open.
 ///
 /// Lowering declares one for a route that a compilation names and does not open:
 ///
@@ -252,11 +421,11 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
     }
 
     fn output_value_extent(&self) -> Extent {
-        Extent::Base(BaseType::String)
+        request_extent()
     }
 
     fn output_type(&self) -> Type {
-        Type::Base(BaseType::String)
+        request_type()
     }
 
     fn check_for_new_data(&mut self) -> bool {
@@ -353,7 +522,7 @@ impl Drop for ReportPanic {
 // Test port reservation
 // ---------------------------------------------------------------------------
 
-/// Reserve a port for a test program's `http_serve`, held against every other
+/// Reserve a port for a test program's HTTP route, held against every other
 /// concurrent test — thread or process — for the rest of this process's life.
 ///
 /// **Test-only.** Built under `cfg(test)`, which the suite builds under.
@@ -365,7 +534,7 @@ impl Drop for ReportPanic {
 /// until then `bind(:0)` in a *concurrently running test binary* is free to hand
 /// the very same port out again.  Both compiles then race to bind it and the
 /// loser fails with `EADDRINUSE`, surfacing as a lowering error from
-/// `http_serve`.  Under `cargo test`, where the http test binaries run alongside
+/// HTTP route.  Under `cargo test`, where the http test binaries run alongside
 /// each other, that is the whole of the observed flakiness (measured: 13
 /// failures in 7200 allocations at 24-way concurrency, every one of them a port
 /// two processes had been handed at once).
@@ -488,6 +657,102 @@ impl HttpServerSharedState {
     }
 }
 
+/// Why `method` cannot be an HTTP method, or `Ok` if it can: a method is a token
+/// (RFC 9110, "5.6.2. Tokens"), and it is case-sensitive (RFC 9110, "9.1. Overview"), so
+/// `GET` and `get` are two methods.
+pub fn check_method(method: &str) -> Result<(), String> {
+    let tchar = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if method.is_empty() || !method.chars().all(tchar) {
+        return Err(format!(
+            "an HTTP method is a non-empty token of letters, digits and `!#$%&'*+-.^_`|~`, got \
+             {method:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// `path` in the normal form two equivalent paths share (RFC 3986, "6.2.2. Syntax-Based
+/// Normalization"), or why it is no absolute URI path. A percent-encoded unreserved character
+/// is decoded, every other percent-encoding takes uppercase hex digits, and `.` and `..`
+/// segments are removed: `/a%62`, `/ab` and `/x/../ab` are one path. A trailing `/` is kept,
+/// so `/ping` and `/ping/` are two paths.
+pub fn route_path(path: &str) -> Result<String, String> {
+    if !path.starts_with('/') {
+        return Err(format!("an HTTP path begins with `/`, got {path:?}"));
+    }
+    let unreserved = |b: u8| b.is_ascii_alphanumeric() || b"-._~".contains(&b);
+    let allowed = |b: u8| unreserved(b) || b"!$&'()*+,;=:@/".contains(&b);
+    let bytes = path.as_bytes();
+    let mut encoded = String::with_capacity(path.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let b = bytes[at];
+        if b == b'%' {
+            let hex = bytes
+                .get(at + 1..at + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| format!("`%` in an HTTP path begins two hex digits, in {path:?}"))?;
+            if unreserved(hex) {
+                encoded.push(char::from(hex));
+            } else {
+                encoded.push_str(&format!("%{hex:02X}"));
+            }
+            at += 3;
+        } else if allowed(b) {
+            encoded.push(char::from(b));
+            at += 1;
+        } else {
+            return Err(format!(
+                "an HTTP path holds letters, digits, `-._~!$&'()*+,;=:@/` and percent-encodings, \
+                 and {path:?} holds {:?}",
+                path[at..]
+                    .chars()
+                    .next()
+                    .expect("a character at a byte boundary")
+            ));
+        }
+    }
+    Ok(remove_dot_segments(&encoded))
+}
+
+/// `path`, an absolute path, with its `.` and `..` segments resolved (RFC 3986, "5.2.4. Remove
+/// Dot Segments"). A `..` above the root stays at the root.
+fn remove_dot_segments(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut parts = path[1..].split('/').peekable();
+    while let Some(segment) = parts.next() {
+        let last = parts.peek().is_none();
+        match segment {
+            "." | ".." => {
+                if segment == ".." {
+                    segments.pop();
+                }
+                // A dot segment at the end names its directory, so the path keeps the `/`.
+                if last {
+                    segments.push("");
+                }
+            }
+            _ => segments.push(segment),
+        }
+    }
+    format!("/{}", segments.join("/"))
+}
+
+/// The normalized path of a request's target ([`route_path`]): the target before its query,
+/// with the scheme and authority of an absolute-form target dropped (RFC 9112, "3.2.2.
+/// absolute-form").
+fn request_path(target: &str) -> Result<String, String> {
+    let before_query = target.split('?').next().unwrap_or_default();
+    let origin = match before_query.split_once("://") {
+        Some((scheme, rest)) if !scheme.contains('/') => {
+            rest.find('/').map_or("/", |slash| &rest[slash..])
+        }
+        _ => before_query,
+    };
+    route_path(origin)
+}
+
 /// The one answer a request gets when no version will compute a reply for it.
 ///
 /// Shared by the dispatcher's no-such-route path and by retirement, so a client
@@ -501,9 +766,9 @@ fn respond_not_found(request: tiny_http::Request) {
 }
 
 impl DataSink for HttpServerSharedState {
-    /// Dispatch HTTP responses for all live `(UInt index, String body)` entries in `tile`.
+    /// Dispatch complete nominal responses at the live request keys in `tile`.
     ///
-    /// Collects `(request, body)` pairs from the pending map while holding the
+    /// Collects request/response pairs from the pending map while holding the
     /// lock, then releases the lock and sends each response outside of it so that
     /// HTTP I/O does not block other threads waiting on the pending map.
     fn process(&self, tile: &Tile) {
@@ -521,36 +786,47 @@ impl DataSink for HttpServerSharedState {
             debug!("HttpServerSharedState::process: expected UInt keys, got {domain:?}");
             return;
         };
-        let Tile::Scalar(ColumnValue::Strings(responses)) = codomain.as_ref() else {
-            debug!(
-                "HttpServerSharedState::process: expected Scalar(Strings) codomain, got {codomain:?}"
-            );
-            return;
+        let Tile::Scalar(responses) = codomain.as_ref() else {
+            panic!("a nominal HTTP response is a complete value column, got {codomain:?}");
         };
-
-        // Collect (request, body) while the lock is held.
+        assert_eq!(
+            indices.len(),
+            responses.len(),
+            "one response value per request key"
+        );
         let to_send: Vec<_> = {
             let mut pending = self.pending.lock().unwrap();
             indices
                 .iter()
-                .zip(responses.iter())
                 .enumerate()
-                .filter_map(|(j, (idx, body))| {
-                    if deleted.contains(j) {
+                .filter_map(|(row, idx)| {
+                    if deleted.contains(row) {
                         return None;
                     }
-                    pending.remove(idx).map(|req| (req, body.clone()))
+                    pending
+                        .remove(idx)
+                        .map(|req| (req, decode_response(&responses.index_at(row))))
                 })
                 .collect()
         };
-
-        let content_type: Header = "Content-Type: text/html; charset=utf-8"
-            .parse()
-            .expect("static header is valid");
-        for (request, body) in to_send {
-            let response = Response::from_string(body.as_str()).with_header(content_type.clone());
-            if let Err(e) = request.respond(response) {
-                debug!("HTTP respond error: {e}");
+        for (request, response) in to_send {
+            match response {
+                Ok((status, headers, body)) => {
+                    let mut response =
+                        Response::from_data(body.into_bytes()).with_status_code(status);
+                    for header in headers {
+                        response.add_header(header);
+                    }
+                    if let Err(e) = request.respond(response) {
+                        debug!("HTTP respond error: {e}");
+                    }
+                }
+                Err(reason) => {
+                    log::error!("invalid HTTP response: {reason}");
+                    let _ = request.respond(
+                        Response::from_string("invalid HTTP response").with_status_code(500),
+                    );
+                }
             }
         }
     }
@@ -566,11 +842,11 @@ impl DataSink for HttpServerSharedState {
 /// that match `method` and `path` have their body read and are forwarded via an
 /// `mpsc` channel; non-matching requests receive an immediate 404.
 ///
-/// The domain is `UInt` (request indices 0, 1, 2, …) and the output value type
-/// is `String` (the request body).
+/// The domain is `UInt` (request indices 0, 1, 2, …). Each output is a complete
+/// `(method, target, headers, body)` tuple.
 pub struct HttpServerDataSource {
     /// Shared buffer, indexing, and predicate bookkeeping.
-    buf: UIntStreamBuffer,
+    buf: UIntStreamBuffer<Value>,
 
     /// Requests, with their `tiny_http::Request` handles, from the dispatcher thread, or the
     /// dispatcher's failure.
@@ -605,8 +881,8 @@ impl HttpServerDataSource {
         self.shared.clone()
     }
 
-    /// Accept a new request: store its body in the buffer and its handle in shared state.
-    fn add(&mut self, body: SmolStr, request: tiny_http::Request) {
+    /// Accept a new request: buffer its complete value and retain its handle for response dispatch.
+    fn add(&mut self, body: Value, request: tiny_http::Request) {
         let idx = self.buf.ready_size;
         self.shared.insert(idx, request);
         self.buf.push(body);
@@ -624,7 +900,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     /// request happened to be at does not decide what its client sees.
     fn answer_in_flight(&mut self) {
         while let Ok(RouteMessage::Request(_, request)) = self.receiver.try_recv() {
-            respond_not_found(request);
+            respond_not_found(*request);
         }
         self.shared.answer_not_found();
     }
@@ -639,7 +915,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         loop {
             match self.receiver.try_recv() {
                 Ok(RouteMessage::Request(body, request)) => {
-                    self.add(body, request);
+                    self.add(body, *request);
                     got_data = true;
                 }
                 Ok(RouteMessage::Failed(reason)) => {
@@ -672,9 +948,10 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn get(&self, key: ColumnValue) -> ColumnValue {
         match key {
-            ColumnValue::UInts(v) => {
-                ColumnValue::Strings(v.iter().map(|i| self.buf.get(*i)).cloned().collect())
-            }
+            ColumnValue::UInts(v) => ColumnValue::from_values(
+                v.iter().map(|i| self.buf.get(*i)).cloned().collect(),
+                &request_extent(),
+            ),
             other => panic!("HttpServerDataSource::get expected UInt key, got {other:?}"),
         }
     }
@@ -686,11 +963,11 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     }
 
     fn output_value_extent(&self) -> Extent {
-        Extent::Base(BaseType::String)
+        request_extent()
     }
 
     fn output_type(&self) -> Type {
-        Type::Base(BaseType::String)
+        request_type()
     }
 
     fn release(&mut self, producer: &str, obsolete: Predicate) {
@@ -720,6 +997,93 @@ mod tests {
     };
 
     use super::*;
+
+    /// Equivalent spellings of a path share one normal form, and distinct paths keep distinct
+    /// ones (RFC 3986, "6.2.2. Syntax-Based Normalization").
+    #[test]
+    fn a_path_takes_its_normal_form() {
+        for (path, normal) in [
+            ("/", "/"),
+            ("/ping", "/ping"),
+            ("/ping/", "/ping/"),
+            ("/a%62", "/ab"),
+            ("/a%7e%2f", "/a~%2F"),
+            ("/a/./b", "/a/b"),
+            ("/a/b/..", "/a/"),
+            ("/../a", "/a"),
+            ("/x/../ab/.", "/ab/"),
+            ("/a//b", "/a//b"),
+            ("/a%2E%2E/b", "/a../b"),
+        ] {
+            assert_eq!(route_path(path).as_deref(), Ok(normal), "{path}");
+        }
+        for path in [
+            "",
+            "ping",
+            "/a b",
+            "/caf\u{e9}",
+            "/a%2",
+            "/a%zz",
+            "/a?q",
+            "/a#f",
+        ] {
+            assert!(route_path(path).is_err(), "{path:?} is no path");
+        }
+    }
+
+    /// A method is a case-sensitive token (RFC 9110, "9.1. Overview").
+    #[test]
+    fn a_method_is_a_token() {
+        for method in ["GET", "get", "PATCH", "X-Custom.1"] {
+            assert_eq!(check_method(method), Ok(()), "{method}");
+        }
+        for method in ["", "G ET", "GET\r\n", "GÉT", "(GET)"] {
+            assert!(check_method(method).is_err(), "{method:?}");
+        }
+    }
+
+    /// A request's target reaches its route by the path before its query, in normal form, and
+    /// an absolute-form target by its path alone.
+    #[test]
+    fn a_request_target_names_its_path() {
+        for (target, path) in [
+            ("/a%62?x=%41", "/ab"),
+            ("http://example.com/a/./b?q", "/a/b"),
+            ("http://example.com", "/"),
+        ] {
+            assert_eq!(request_path(target).as_deref(), Ok(path), "{target}");
+        }
+        assert!(request_path("*").is_err());
+    }
+
+    #[test]
+    fn response_headers_validate_wire_syntax_and_transport_ownership() {
+        for (name, value) in [
+            ("", "value"),
+            ("X Bad", "value"),
+            ("X:Bad", "value"),
+            ("X-Test", "a\r\nX-Injected: yes"),
+            ("X-Test", "a\0b"),
+            ("X-Test", "a\x7fb"),
+            ("X-Test", "λ"),
+            ("X-Test", " leading"),
+            ("X-Test", "trailing\t"),
+            ("content-length", "0"),
+            ("Transfer-Encoding", "chunked"),
+            ("Connection", "close"),
+            ("Trailer", "X-Later"),
+            ("Upgrade", "websocket"),
+        ] {
+            assert!(response_header(name, value).is_err(), "{name:?}: {value:?}");
+        }
+        for (name, value) in [
+            ("X-Test", ""),
+            ("Set-Cookie", "a=b; Path=/"),
+            ("X-Test", "a\tb"),
+        ] {
+            assert!(response_header(name, value).is_ok(), "{name:?}: {value:?}");
+        }
+    }
 
     /// A source named `route` reading the channel `messages` were sent on, with no listener.
     fn source_reading(messages: Vec<RouteMessage>) -> HttpServerDataSource {

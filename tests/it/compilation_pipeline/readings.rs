@@ -138,23 +138,34 @@ fn a_reading_in_a_refinement_under_a_loop_is_refused(#[case] root: &str) {
     );
 }
 
-/// Only a std module declares a `@Builtin` function, and only one whose path the compiler
-/// supplies a body for (`docs/chl-spec.md`, "9.16 The std root"), with clauses or without.
+/// Only a std module declares a `@Builtin`, and only one whose path the compiler supplies
+/// (`docs/chl-spec.md`, "9.16 The std root"): a function, with clauses or without, a type, or
+/// a value.
 #[rstest]
-#[case::with_a_clause(indoc! {"
+#[case::a_function_with_a_clause(indoc! {"
     @Builtin
     def next() => Int requires ObserveWorld
     next()
 "})]
-#[case::with_no_clause(indoc! {"
+#[case::a_function_with_no_clause(indoc! {"
     @Builtin
     def f() => Int
     1
 "})]
-fn a_builtin_function_outside_std_is_refused(#[case] code: &str) {
+#[case::a_type(indoc! {"
+    @Builtin
+    type Keys
+    1
+"})]
+#[case::a_value(indoc! {"
+    @Builtin
+    requests: Int
+    requests
+"})]
+fn a_builtin_outside_std_is_refused(#[case] code: &str) {
     super::helpers::check_compile_error(
         code,
-        "a `@Builtin` function is declared at a std module's top level",
+        "a `@Builtin` declaration stands only at a std module's top level",
     );
 }
 
@@ -185,6 +196,43 @@ fn a_builtin_function_the_compiler_does_not_supply_is_refused() {
         errors.contains("the compiler supplies no function `std::extra::tick`"),
         "{errors}"
     );
+}
+
+/// A std module's `@Builtin` type or value is one the compiler supplies by its path.
+#[rstest]
+#[case::a_type(
+    indoc! {"
+        @Builtin
+        pub type Ticks
+        pub one = 1
+    "},
+    "the compiler supplies no type `std::extra::Ticks`"
+)]
+#[case::a_value(
+    indoc! {"
+        @Builtin
+        ticks: Int
+        pub one = ticks
+    "},
+    "the compiler supplies no value `std::extra::ticks`"
+)]
+fn a_builtin_declaration_the_compiler_does_not_supply_is_refused(
+    #[case] module: &str,
+    #[case] expected: &str,
+) {
+    let root = RootFile {
+        path: "main.cambra".to_owned(),
+        module: None,
+        text: indoc! {"
+            import std::extra
+            extra::one
+        "}
+        .to_owned(),
+    };
+    let program =
+        LoadedProgram::load_with_std(root, &mut InMemory::default(), &[("std::extra", module)]);
+    let errors = super::modules::compile_errors(&program);
+    assert!(errors.contains(expected), "{errors}");
 }
 
 /// A reading requires `ObserveWorld`, which only the run supplies: a module whose top level takes

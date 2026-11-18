@@ -1,7 +1,7 @@
-//! Shared buffer for uint-indexed string stream sources.
+//! Shared buffer for uint-indexed stream sources.
 //!
 //! [`UIntStreamBuffer`] captures the buffer and the sliding-window indexing
-//! common to every streaming `UInt → String` data source (stdin, HTTP server,
+//! common to streaming `UInt → T` data sources (stdin, HTTP server,
 //! etc.). Which producer has released what is
 //! [`ProducerReleases`](crate::interpreter::producer_releases::ProducerReleases),
 //! which every source keeps rather than only these.
@@ -17,15 +17,15 @@ use crate::interpreter::{
     ColumnValue, Value, producer_releases::ProducerReleases, row_index, tiling::Predicate,
 };
 
-/// Buffer and predicate bookkeeping for a uint-indexed string stream.
+/// Buffer and predicate bookkeeping for a uint-indexed stream.
 ///
-/// Maintains a sliding window of [`SmolStr`] values indexed by monotonically
+/// Maintains a sliding window of values indexed by monotonically
 /// increasing `u64` keys, which are CCL `UInt` values and outlive the live window.
 /// Released indices are drained from the front of `buffer`; `start_idx` records the
 /// logical offset so that external keys remain stable across drains.
-pub(crate) struct UIntStreamBuffer {
+pub(crate) struct UIntStreamBuffer<T = SmolStr> {
     /// Buffered values.  `buffer[j]` corresponds to logical index `start_idx + j`.
-    pub(crate) buffer: Vec<SmolStr>,
+    pub(crate) buffer: Vec<T>,
 
     /// Logical index of `buffer[0]`.  Indices below this have been released.
     pub(crate) start_idx: u64,
@@ -44,7 +44,7 @@ pub(crate) struct UIntStreamBuffer {
     pub(crate) releases: ProducerReleases,
 }
 
-impl UIntStreamBuffer {
+impl<T> UIntStreamBuffer<T> {
     pub(crate) fn new() -> Self {
         Self {
             buffer: Vec::new(),
@@ -57,7 +57,7 @@ impl UIntStreamBuffer {
     }
 
     /// Append `value` to the buffer and increment `ready_size`.
-    pub(crate) fn push(&mut self, value: SmolStr) {
+    pub(crate) fn push(&mut self, value: T) {
         if self.closed {
             // A closed buffer's universal release covers this index too, so
             // holding the value would re-accumulate what `close` just freed.
@@ -68,7 +68,7 @@ impl UIntStreamBuffer {
         self.ready_size += 1;
     }
 
-    pub(crate) fn get_opt(&self, i: u64) -> Option<&SmolStr> {
+    pub(crate) fn get_opt(&self, i: u64) -> Option<&T> {
         if self.closed || self.start_idx > i || i >= self.ready_size {
             None
         } else {
@@ -76,7 +76,7 @@ impl UIntStreamBuffer {
         }
     }
 
-    pub(crate) fn get(&self, i: u64) -> &SmolStr {
+    pub(crate) fn get(&self, i: u64) -> &T {
         self.get_opt(i)
             .unwrap_or_else(|| panic!("Invalid UIntStreamBuffer::get({i})"))
     }
@@ -282,7 +282,7 @@ mod tests {
     use super::*;
 
     fn buffer_with(n: usize) -> UIntStreamBuffer {
-        let mut buf = UIntStreamBuffer::new();
+        let mut buf = UIntStreamBuffer::<SmolStr>::new();
         for i in 0..n {
             buf.push(SmolStr::new(format!("e{i}")));
         }
@@ -316,7 +316,7 @@ mod tests {
     /// Memory is bounded across a long run, not just on the first release.
     #[test]
     fn a_long_run_does_not_accumulate() {
-        let mut buf = UIntStreamBuffer::new();
+        let mut buf = UIntStreamBuffer::<SmolStr>::new();
         for i in 0..200 {
             buf.push(SmolStr::new(format!("e{i}")));
             buf.release("p", covering(0, i));

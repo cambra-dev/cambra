@@ -313,6 +313,7 @@ pub(crate) fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
                     .collect(),
             )
         }
+        Tiling::DataFunction { .. } => open_collections(&cv, &tiling.extent()),
         other => panic!("column_value_to_tile: unsupported tiling {other:?}"),
     }
 }

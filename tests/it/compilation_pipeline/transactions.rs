@@ -2590,20 +2590,21 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
 #[test]
 fn computed_live_cross_endpoint_read_compiles() {
     let code = indoc! {r#"
-        run std::http(port="0", method="POST", path="/s") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="0", method="GET", path="/g") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="0", method="POST", path="/s") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="0", method="GET", path="/g") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
         latest: Mut(String, Txn) := ""
         for msg in set_reqs:
             with begin():
                 latest := msg
-            http_set_resps_replies << "ok"
+            http_set_resps_replies << http_api::ok_text("ok")
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << latest + "!"
+                http_get_resps_replies << http_api::ok_text(latest + "!")
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
 
@@ -2621,20 +2622,21 @@ fn computed_live_cross_endpoint_read_compiles() {
 #[test]
 fn live_read_combining_request_and_store_compiles() {
     let code = indoc! {r#"
-        run std::http(port="0", method="POST", path="/set") as http_set_resps
-        http_set_resps_replies: Feed(String)
-        set_reqs = http_set_resps::requests
-        run std::http(port="0", method="GET", path="/get") as http_get_resps
-        http_get_resps_replies: Feed(String)
-        get_reqs = http_get_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="0", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(http_api::Response)
+        set_reqs = [request.body() for request in http_set_resps::requests]
+        run std::http::serve(port="0", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(http_api::Response)
+        get_reqs = [request.body() for request in http_get_resps::requests]
         a: Mut(String, Txn) := "a0"
         for msg in set_reqs:
             with begin():
                 a := msg
-            http_set_resps_replies << "ok\n"
+            http_set_resps_replies << http_api::ok_text("ok\n")
         for req in get_reqs:
             with begin():
-                http_get_resps_replies << a + req
+                http_get_resps_replies << http_api::ok_text(a + req)
         http_set_resps::respond(http_set_resps_replies)
         http_get_resps::respond(http_get_resps_replies)
 

@@ -68,7 +68,7 @@
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
 //! - [`sinks`] — recognizing a sink-declaring statement, and refusing one outside the
 //!   top-level block.
-//! - [`http`] — `http_serve` recognition and lowering.
+//! - [`http`] — the `@Builtin` declarations of `std::http::serve`, and route registration.
 //! - [`nominal`] — lowering `type` declarations and binding their constructors.
 //! - [`modules`] — lowering a program of several modules, each lowered once and each
 //!   run of it created from that lowering.
@@ -141,6 +141,7 @@ use exprs::*;
 use functions::*;
 use http::*;
 use loops::*;
+#[cfg(test)]
 use sinks::*;
 use stmts::*;
 #[cfg(test)]
@@ -406,7 +407,7 @@ impl LoweringResult {
 // Lowering context
 // ---------------------------------------------------------------------------
 
-/// What a pass may do with an `http_serve` route the source/sink registry does not
+/// What a pass may do with an HTTP route the source/sink registry does not
 /// already hold.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Endpoints {
@@ -434,7 +435,7 @@ pub enum Endpoints {
     Inherited,
 }
 
-/// One `http_serve` route as lowering knows it: its reply sink and the address
+/// One HTTP route as lowering knows it: its reply sink and the address
 /// it serves.
 #[derive(Clone)]
 pub struct LoweredRoute {
@@ -483,11 +484,11 @@ pub struct LoweringContext {
     /// Names each feed's and each call's place ([`crate::ccl::site`]).
     pub(crate) places: crate::ccl::site::Naming,
     /// All sources for this compilation: pre-registered (e.g. stdin, test sources)
-    /// plus any discovered during lowering (e.g. from `http_serve`).  Drained by
+    /// plus any discovered during lowering (e.g. an HTTP route's).  Drained by
     /// [`take_sources`](Self::take_sources) after `lower_stmts` returns so every
     /// source is registered with inference and operator-conversion in one pass.
     ///
-    /// `pub(super)` so the statement (`http_serve` wiring) and expression
+    /// `pub(super)` so the statement (HTTP route wiring) and expression
     /// (registered-source recognition) submodules can read and mutate the map
     /// directly; external callers go through the `register_source` /
     /// `take_sources` methods.
@@ -504,6 +505,10 @@ pub struct LoweringContext {
     /// `pub(super)` so the statement submodule can inspect it when deciding
     /// whether to wrap the program tail in the sink-binding `Record`.
     pub(super) sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+    /// Each HTTP sink's required input domain, by its output label, with the route as a
+    /// diagnostic names it. Checked, and drained, after channelization resolves deferred Feed
+    /// domains ([`Self::check_sink_domains`]).
+    sink_domains: HashMap<Label, (Type, String)>,
 
     /// Test sinks registered before compiling, by binding name.
     ///
@@ -513,16 +518,16 @@ pub struct LoweringContext {
     #[cfg(test)]
     pub(super) test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 
-    /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
-    /// that use the same port.  Created lazily on the first `http_serve` for a port
+    /// One [`SharedHttpServer`] per TCP port, shared across all HTTP routes
+    /// that use the same port.  Created lazily on the first route on a port
     /// and reused for all subsequent ones, so only a single `tiny_http::Server`
     /// binds each port.
     ///
-    /// `pub(super)` so the statement submodule's `http_serve` wiring can create
+    /// `pub(super)` so the statement submodule's HTTP route wiring can create
     /// and reuse the per-port server.
     pub(super) shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
 
-    /// Every `http_serve` route this context knows: those seeded from the
+    /// Every HTTP route this context knows: those seeded from the
     /// registry and those this pass opened, by the route's source name.
     ///
     /// Keyed by *route* rather than by binding name, unlike
@@ -535,13 +540,13 @@ pub struct LoweringContext {
     /// and path to unregister.
     pub(super) http_routes: HashMap<String, LoweredRoute>,
 
-    /// Every `http_serve` route lowered *in this pass*, by source name.
+    /// Every HTTP route lowered *in this pass*, by source name.
     ///
     /// Separate from [`sources`](Self::sources) because that map is seeded with
     /// the endpoints a previous version of the program opened
     /// ([`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry)), so a name
     /// being present there means "already open", not "already lowered". Two
-    /// `http_serve` calls on one route within a single program remain an error;
+    /// declarations of one route within a single program remain an error;
     /// re-lowering the same route in a later version is the reuse path.
     pub(super) http_routes_this_pass: HashSet<String>,
     /// The fixed routes declared unopened for a module checked on its own, whose requests'
@@ -549,16 +554,16 @@ pub struct LoweringContext {
     pub(super) checked_routes: HashSet<String>,
 
     /// Where each route in [`http_routes_this_pass`](Self::http_routes_this_pass)
-    /// was lowered: its `http_serve` arguments, and the run whose module served
+    /// was lowered: its declaration, and the run whose module served
     /// it, if a run's did. A route two runs serve is an error at the second run's
     /// statement (`docs/chl-spec.md`, "9.9 Running").
     pub(super) http_route_sites: HashMap<String, (Span, Option<(RunPath, Span)>)>,
 
     /// How a diagnostic names each deferred collection lowering binds under a name it
-    /// mints, by that name: `the response channel of `http_serve("8080", "POST", "/e")``.
+    /// mints, by that name: `the feed `out` declared by `test_sink()``.
     pub(super) minted_channels: HashMap<String, String>,
 
-    /// What this pass may do with an `http_serve` naming a route the registry does
+    /// What this pass may do with a route the registry does
     /// not already hold.
     pub(super) endpoints: Endpoints,
 
@@ -800,13 +805,12 @@ pub struct LoweringContext {
 /// module registers it ([`LoweringContext::register_sinks`]).
 #[derive(Debug, Clone)]
 enum DeclaredSink {
-    /// `requests, responses = http_serve(…)` at `span`, its arguments at
-    /// `args_span`: its route, and the binding its responses are read through.
+    /// `std::http::serve`'s `@Builtin` response Feed declared at `span`: its route, and the
+    /// binding its responses are read through.
     Http {
         route: Box<HttpRoute>,
         responses: String,
         span: Span,
-        args_span: Span,
     },
     /// `name = test_sink()` at `span`.
     #[cfg(test)]
@@ -837,23 +841,16 @@ impl DeclaredSink {
 
 /// `sinks`, a module's, as the run whose `const` parameters take `consts` declares them:
 /// each route at the address the run gives it ([`http::HttpRoute::at`]), its requests'
-/// source renamed in `chain`, the run's copy of the module. A route whose address has no
-/// value here is an error at `statement`, the run's.
+/// source renamed in `chain`, the copy of the module the run `run` makes, or the root's
+/// with `None`. A route whose address has no value here is an error at `statement`, the run's.
 fn sinks_at(
     sinks: &[DeclaredSink],
     consts: &HashMap<crate::ccl::TypeParamId, crate::ccl::constant::ConstTerm>,
     chain: &mut Expr,
+    run: Option<&str>,
     statement: Span,
     errors: &mut Vec<LoweringError>,
 ) -> Vec<DeclaredSink> {
-    fn rename(expr: &mut Expr, from: &str, to: &str) {
-        if let TypedExprNode::Source(name, _) = &mut expr.node
-            && name == from
-        {
-            *name = to.to_string();
-        }
-        expr.walk_children_mut(|child| rename(child, from, to));
-    }
     let mut out = Vec::new();
     for sink in sinks {
         match sink {
@@ -861,16 +858,20 @@ fn sinks_at(
                 route,
                 responses,
                 span,
-                args_span,
             } => match route.at(consts) {
                 None => out.push(sink.clone()),
                 Some(Ok((at, from))) => {
-                    rename(chain, &from, at.source_name());
+                    rename_source_expr(
+                        chain,
+                        &SourceRenames {
+                            names: HashMap::from([(from, at.source_name().to_string())]),
+                            run,
+                        },
+                    );
                     out.push(DeclaredSink::Http {
                         route: Box::new(at),
                         responses: responses.clone(),
                         span: *span,
-                        args_span: *args_span,
                     });
                 }
                 // Missing or refused constant arguments already have a diagnostic at the run.
@@ -880,7 +881,7 @@ fn sinks_at(
                         statement,
                         format!("the route declared here has no address in this run: {why}"),
                     )
-                    .with_related(*args_span, "the route's address"),
+                    .with_related(*span, "the route's address"),
                 ),
             },
             #[cfg(test)]
@@ -978,7 +979,7 @@ impl LoweringContext {
             .filter(|(name, _)| !self.module_route_sources.contains(*name))
     }
 
-    /// Every `http_serve` route this context knows, by source name.
+    /// Every HTTP route this context knows, by source name.
     pub fn registered_routes(&self) -> impl Iterator<Item = (&str, &LoweredRoute)> {
         self.http_routes.iter().map(|(n, r)| (n.as_str(), r))
     }
@@ -1039,7 +1040,7 @@ impl LoweringContext {
     /// Drain all sources accumulated for this compilation.
     ///
     /// Returns every source that was either pre-registered (e.g. stdin, test
-    /// stubs) or discovered during lowering (e.g. from `http_serve`).  Call
+    /// stubs) or discovered during lowering (e.g. an HTTP route's).  Call
     /// after `lower_stmts` returns and pass each entry to
     /// [`GlobalContext`](crate::ccl::context::GlobalContext) for uniform
     /// registration with inference and operator-conversion.
@@ -1049,7 +1050,7 @@ impl LoweringContext {
 
     /// Register a sink for the CCL binding named `name`.
     ///
-    /// Called during `http_serve` and `test_sink` lowering: the binding is assigned a
+    /// Called during HTTP route and `test_sink` lowering: the binding is assigned a
     /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
     /// binding name so that the scheduler can subscribe a consumer to it after
     /// operator conversion.
@@ -1100,12 +1101,11 @@ impl LoweringContext {
                     route,
                     responses,
                     span,
-                    args_span,
                 } => (
                     responses,
                     responses,
                     *span,
-                    self.register_route(route, *args_span, run),
+                    self.register_route(route, *span, run),
                 ),
                 #[cfg(test)]
                 DeclaredSink::Test {
@@ -1128,14 +1128,30 @@ impl LoweringContext {
                 }
             };
             match bound.and_then(|sink| self.register_sink_binding(key(name), sink, span)) {
-                Ok(()) => registered.push(SinkOutput {
-                    key: key(name),
-                    binding: binding.clone(),
-                    label: match run {
-                        Some((path, _)) => Label::in_run(path.clone(), name.as_str()),
-                        None => Label::new(name.as_str()),
-                    },
-                }),
+                Ok(()) => {
+                    let output = SinkOutput {
+                        key: key(name),
+                        binding: binding.clone(),
+                        label: match run {
+                            Some((path, _)) => Label::in_run(path.clone(), name.as_str()),
+                            None => Label::new(name.as_str()),
+                        },
+                    };
+                    match sink {
+                        DeclaredSink::Http { route, .. } => {
+                            self.sink_domains.insert(
+                                output.label.clone(),
+                                (
+                                    Type::DataSource(route.source_name().into()),
+                                    route.describe(),
+                                ),
+                            );
+                        }
+                        #[cfg(test)]
+                        DeclaredSink::Test { .. } => {}
+                    }
+                    registered.push(output);
+                }
                 Err(error) => errors.push(error),
             }
         }
@@ -1145,7 +1161,7 @@ impl LoweringContext {
     /// Drain all sink bindings accumulated for this compilation.
     ///
     /// Returns every `(binding_name, DataSink)` pair discovered during lowering
-    /// (e.g. from `http_serve`).  Call after `lower_stmts` returns and pass
+    /// (e.g. an HTTP route's).  Call after `lower_stmts` returns and pass
     /// each entry to [`GlobalContext`](crate::ccl::context::GlobalContext) so
     /// it can extract the corresponding expressions and subscribe them.
     pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
@@ -1506,7 +1522,7 @@ impl LoweringContext {
 pub(crate) const EXPRESSION_STATEMENT: RewriteLabel = "lower.expression_statement";
 
 /// The rewrite label of the `Defer` a sink binding lowers to, `out = test_sink()` or the
-/// responses `http_serve` binds, which causes `AffectWorld` (`docs/chl-spec.md`, "Output outside
+/// response Feed `std::http::serve` declares, which causes `AffectWorld` (`docs/chl-spec.md`, "Output outside
 /// the program"). Lowering registers the sink by name beside the tree, and every copy of the
 /// binding keeps its label, so inference finds each run's sinks by it ([`marked_nodes`]).
 pub(crate) const SINK_BINDING: RewriteLabel = "lower.sink_binding";
@@ -1546,7 +1562,7 @@ impl LoweringContext {
 }
 
 /// Return the canonical data-source name for the requests side of
-/// `http_serve(port, method, path)`. A route is keyed by this name, and the listener by the port
+/// the route at `port`, `method` and `path`. A route is keyed by this name, and the listener by the port
 /// as a number, so the name takes the number: `"8080"` and `"08080"` name one route.
 pub fn http_requests_source_name(port: u16, method: &str, path: &str) -> String {
     format!(
@@ -1555,7 +1571,7 @@ pub fn http_requests_source_name(port: u16, method: &str, path: &str) -> String 
     )
 }
 
-/// The part of a name minted for `http_serve(port, method, path)` from its arguments as
+/// The part of a name minted for the route at `port`, `method` and `path` from its address as
 /// strings, one identifier for each triple of strings and a different one for every other: each
 /// argument keeps its ASCII letters and digits and writes every other character as its code
 /// point in hex between two `_`, `_` included, and `_s_`, which no code point spells,
@@ -1909,7 +1925,7 @@ fn lower_expr_inner(
 /// The last statement must be a bare expression ([`ChlStmt::Expr`])
 /// or an `if`/`else` block.
 ///
-/// When sink bindings are registered during lowering (e.g. from `http_serve`),
+/// When sink bindings are registered during lowering (e.g. an HTTP route's),
 /// the final expression is wrapped so the program ends in
 /// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The record is the
 /// sink-binding contract; each field is the name that

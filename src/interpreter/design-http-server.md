@@ -1,124 +1,137 @@
 # HTTP Server Design
 
-Runtime architecture for `http_serve` — the built-in that exposes an HTTP endpoint to a CCL program.
-
----
+`std::http::serve` runs one HTTP route and connects its exact request domain to nominal response
+values. `std::http` is an importable module containing shared nominal types and pure helpers.
 
 ## CHL surface
 
 ```python
-requests, responses = http_serve("8080", "GET", "/path")
-for req in requests:
-    responses << "Received " + req
+import std::http
+run std::http::serve(port="8080", method="POST", path="/echo") as server
+server::respond([http::ok_text(req.body()) for req in server::requests])
 ```
 
-`http_serve(port, method, path)` is a **compiler special form**, not a runtime function call.  All three arguments must be string literals known at compile time.  The compiler expands the two-binding assignment into a `Source`/`Defer` pair and registers the response `DataSink` out-of-band; nothing about `http_serve` appears in the operator graph at runtime.
+Each run exports `Reqs`, the route's source-domain type, `requests: Reqs |=> http::Request`, and
+`respond(values: Reqs |=> http::Response)`. The response definition covers exactly that domain.
+A filtered domain, contribution-site-tagged domain, or another route's domain is rejected.
+The module defines its private response Feed once with `<<=`. No writable place is exported.
 
-Limitations (current):
-- Only plain string request/response bodies; no headers, status codes, or streaming.
-- `Content-Type` is always `text/html; charset=utf-8`.
-- No TLS/HTTPS.
-- `http_serve` is refused in every block other than the top-level one.
+Request and response bodies are UTF-8 Strings. Invalid UTF-8 request bodies receive 400 before
+source admission. Header lists preserve order and repeated names. Response status codes range
+from 200 through 599. Binary bodies, streaming, informational responses, protocol upgrades, and
+TLS are not implemented.
 
----
+Response header names are HTTP tokens. Values contain visible ASCII, spaces, and internal tabs;
+leading or trailing whitespace and control characters are rejected. The transport owns
+Content-Length, Transfer-Encoding, Connection, Trailer, and Upgrade; a response that supplies
+those fields receives 500. Repeated Content-Type fields are rejected. Other repeated headers,
+such as Set-Cookie, retain their order. Field syntax follows
+[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-field-values).
+
 
 ## How runtime configuration reaches the operators
 
-Lowering extracts the literal `(port, method, path)` at compile time and constructs the runtime objects immediately:
+The embedded `std::http::serve` module declares its route with three `@Builtin` declarations:
+the key type `Reqs`, the request source `_requests`, and the response Feed `_responses`. The
+compiler supplies an alias of the route's source-domain type, a `Source`, and a response `Defer`,
+and reads the address off the module's String constant parameters `port`, `method` and `path`.
+The response sink registration is stored outside the pure CCL tree. A diagnostic prints the key
+type as the run reaches it, `server::Reqs`.
 
-1. A `SharedHttpServer` is created (or reused) for the port and binds the TCP socket synchronously — a bind failure becomes a `LoweringError` before any operator graph is built.
-2. An `HttpServerDataSource` is registered as the `requests` source.
-3. The `DataSink` (`HttpServerSharedState`) is stored in `LoweringContext::sink_bindings` keyed by the name the response channel is bound under, which lowering mints from the route (`http_responses_sink_name`), whatever the program's pattern calls it.
+A module interface retains its route templates. Linking substitutes run arguments into source
+names in expressions, exported aliases, annotations, and quoted predicates. A nested run may
+retain a symbolic address over its enclosing module's constant parameters. A concrete root run
+resolves it to the route's canonical source name. Checking a module uses unopened sources and
+opens no sockets.
 
-The CCL AST carries **no representation of the configuration** — the rendezvous between the source/sink objects and the compiled operator graph is entirely through these registries.  This is why lowering must special-case `http_serve`: it needs the literal arguments at compile time to create the objects.
+A concrete route registration creates or reuses a `SharedHttpServer` for the port. Binding is
+synchronous, so an unavailable port is a lowering error. `HttpServerDataSource` is registered
+under the route's source name; its `HttpServerSharedState` sink is registered separately.
+Duplicate `(port, method, path)` registrations are lowering errors.
 
-After the full CCL pipeline runs, `compile_program` calls `convert_outputs_to_operators` on the
-join-planned `Let* Record{…}` tree. This walks the `Let*` chain in a single pass, wrapping each
-binding once in `Memo`/`FanOut` and entering a shared scope, then compiles each output's expression
-in that shared scope to produce one operator per sink. Every sink subgraph branches off the same
-memoised upstream operators, so no shared computation is duplicated across sinks. The main program
-output becomes `Lit(Unit)`.
-
----
+After the CCL pipeline, `convert_outputs_to_operators` compiles the sink expressions in a shared
+scope. `compile_program` subscribes one `SinkConsumer` per sink. Shared upstream operators use
+`Memo` and `FanOut`; sink dispatch is never an expression node.
 
 ## Component map
 
-```
-lower.rs            HttpServerDataSource (source) + HttpServerSharedState (sink)
-                    registered in LoweringContext before type inference
-
-ccl/context.rs      compile_program extracts sink expressions post-pipeline,
-                    subscribes SinkConsumer to each, returns SinksHandle
-
-interpreter/
-  http_server.rs    SharedHttpServer  — one tiny_http::Server per TCP port
-                    HttpServerDataSource  — streams request bodies as UInt-indexed Strings
-                    HttpServerSharedState — DataSink, holds open requests, sends responses
-
-  sinks.rs          DoneNotifier  — atomic counter + channel, fires when all sinks finish
-                    SinkConsumer  — Consumer impl, pulls tiles, calls DataSink::process
-```
-
----
+| Component | Responsibility |
+|---|---|
+| `ccl/lower/http.rs` | Declares and instantiates route source-domain types, sources, and sinks |
+| `stdlib/src/std/http.cambra` | Shared nominal Header, Request, Response, and pure helpers |
+| `stdlib/src/std/http/serve.cambra` | Converts raw source tuples to nominal requests and defines the response connection |
+| `SharedHttpServer` | Owns one listener per port and dispatches requests by method and path |
+| `HttpServerDataSource` | Buffers complete request values at monotonically increasing UInt keys |
+| `HttpServerSharedState` | Matches response keys to pending HTTP requests and sends responses |
+| `SinkConsumer` | Pulls response tiles and calls the boundary sink |
 
 ## Per-port server sharing
 
-One `tiny_http::Server` is bound per TCP port, shared by all `http_serve` routes on that port.
-`SharedHttpServer::register(method, path)` adds a route and returns the `mpsc::Receiver` of the
-route's channel. The dispatcher thread reads each incoming request and looks up the route in the
-routing table (`RouteTable`). It sends a request for a registered route to that route's channel as
-`RouteMessage::Request`, and answers any other request 404.
+One `tiny_http::Server` is bound per TCP port. `SharedHttpServer::register(method, path)` adds a
+route and returns its receiver. The dispatcher matches the method exactly, since methods are
+case-sensitive ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-overview)). It matches
+the path before the query string in the normal form `route_path` gives
+([RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html#section-6.2.2)): a percent-encoded
+unreserved character is decoded, other percent-encodings take uppercase hex digits, and `.` and
+`..` segments are removed. A trailing `/` is kept, so `/ping` and `/ping/` are two routes. An
+absolute-form target matches by its path. A target whose path is no URI path receives 400, and
+an unmatched request receives 404. The complete target, including its query string, remains
+available through `Request.target()`.
 
-Duplicate `(port, method, path)` registrations are rejected with a `LoweringError` at compile time.
+A route's declared method must be a token, and its declared path an absolute URI path; linking
+refuses any other. The route is keyed by its normalized path, so two runs that spell one path
+differently serve one route, which is refused as a duplicate.
 
-The TCP socket is bound synchronously in `SharedHttpServer::new` (not inside the spawned thread) so that a port-in-use or permission error surfaces immediately as a compile-time error rather than a silent hang.
-
----
+For a matched request, the dispatcher reads and validates the UTF-8 body before enqueueing it.
+Its raw value is `(method, target, headers, body)`, where headers are a materialized list of
+String pairs. The embedded module uses ordinary CHL constructors to build nominal Header and
+Request values. Sources continue to return `ColumnValue`; collection-valued fields open through
+[Materialized source values](design-operators.md#materialized-source-values).
 
 ## Request/response matching
 
-Each request is assigned a monotonically-increasing integer index by `UIntStreamBuffer`.  The CCL program iterates over that index domain.  `SinkConsumer` pulls tiles from the responses producer and calls `HttpServerSharedState::process`, which matches `(index, response-body)` pairs against the `pending` map and sends each HTTP response outside the lock.
+`UIntStreamBuffer<Value>` assigns each admitted request a monotonically increasing key.
+`HttpServerSharedState` retains the corresponding open HTTP request in its pending map.
+The response function preserves those keys. A nominal Response constructor materializes its
+complete payload, including the header list, before emitting the scalar nominal value.
+`SinkConsumer` therefore passes complete response values through the existing `DataSink` protocol.
 
-`UIntStreamBuffer` drops a request body once every registered producer has released its index, which
-bounds a long-lived server's memory to the requests still in flight. Bodies are dropped from the
-front, so a release frees memory only over an unbroken run from the lowest index still held. A
-release covering a later region is recorded and withheld from that producer; its memory is reclaimed
-when the front is released.
+The sink decodes the status, repeated headers, and body and removes the pending request before
+sending it. An invalid response header receives 500. Compile-time domain coverage establishes
+one response value per admitted key; it does not guarantee eventual availability of arbitrary
+data dependencies used to compute that value.
 
----
+The source retains each request value until all readers release its key. The shared stream buffer
+reclaims only an unbroken released prefix. Later released regions remain recorded until the
+prefix reaches them. Partial record or collection-field releases do not release the whole source
+value; the source adapter projects accumulated releases through shared levels.
 
 ## Multi-endpoint programs
 
-Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `LoweringContext::sink_bindings`, under the channel name each route mints, so the names the program binds the call's tuple to are ordinary bindings: a later statement may rebind them. Two calls serving one route are refused.
-
----
+Each run has a separate request source-domain type and response definition. Runs on one port
+share its listener. The nominal Request and Response types belong to the shared imported module,
+so the same typed handler can serve several runs while each response connection retains its own
+domain contract.
 
 ## Shutdown and completion
 
-`SinkConsumer` detects terminal tiles via `Tile::is_terminal()` and fires `DoneNotifier::signal()`.
-`SinksHandle::done` fires once all consumers have signalled. An `HttpServerDataSource` never reaches
-the end of its stream, so for a program that serves HTTP `done` never fires, and the scheduler loop
-in `main.rs` runs until the process is killed.
+`SinkConsumer` signals `DoneNotifier` when its tile is terminal. An HTTP request source remains
+open, so an HTTP-serving program does not complete while its routes remain active.
 
-Dropping a `SharedHttpServer` releases its port. `Drop` sets `releasing` and unblocks the dispatcher
-thread, which returns without sending its routes anything, and the listener closes with it. The
-registry drops the handle only once no route remains on the port (`release_unrouted_ports`, see
-[A route a version stops serving is retired](../ccl/design/program-evolution.md#a-route-a-version-stops-serving-is-retired))
-or with its whole context, so no source reads the channels.
+Dropping a `SharedHttpServer` sets `releasing` and unblocks its dispatcher. The dispatcher exits
+without reporting a listener failure, and the listener closes. The registry releases the handle
+when no route remains on that port or the entire context is dropped. Route retirement is described
+in [A route a version stops serving is retired](../ccl/design/program-evolution.md#a-route-a-version-stops-serving-is-retired).
 
-A poll that reads either of two states from a route's channel panics, because no request reaches the
-route again:
+A poll panics if it receives `RouteMessage::Failed` or finds a channel with no sender. The former
+means the listener or dispatcher failed. The latter means the scheduler retained a source after
+its route was unregistered. `ReportPanic` reports dispatcher panics to every route, and the route
+table records failures for routes registered later.
 
-- `RouteMessage::Failed`. The dispatcher sends it when `recv` returns an error without `releasing`
-  set, which is tiny_http's accept thread exiting on its first `accept` error and closing the
-  listener. `ReportPanic` sends it when the dispatcher thread panics. The routing table records the
-  failure, and `register` sends it to a route registered afterwards.
-- A channel with no sender. The routing table holds the sender until the route is unregistered, and
-  retirement forgets the route's source in the step that unregisters it, so a poll that finds none
-  is polling a source the scheduler should no longer hold.
+An outstanding runtime limitation is listener recovery: tiny_http 0.12 ends its accept thread on
+an accept error. A reported failure ends the process, including other routes and the control port.
+Recovery requires rebinding or an accept loop that retries transient errors.
 
-> **Open: one `accept` error ends the process.** tiny_http 0.12 treats every `accept` error as
-> fatal, and the poll that reads the failure panics, which takes every port, every branch and the
-> control port with it. Running out of file descriptors (EMFILE, ENFILE) under connection load is
-> the confirmed trigger. Keeping the port would take rebinding after a failure, or an accept loop
-> that retries the errors `accept(2)` documents as transient; tiny_http 0.12 exposes neither.
+The compiler checks [sink domain contracts](../ccl/design/lowering.md#sink-domain-contracts) after
+Feed assembly, when every deferred channel domain is concrete. A partial Feed therefore receives
+a compilation error before operator conversion.

@@ -1,5 +1,3 @@
-run std::http(port="8080", method="POST", path="/echo") as server
-server_replies: Feed(String)
-for request in server::requests:
-    server_replies << request
-server::respond(server_replies)
+import std::http
+run std::http::serve(port="8080", method="POST", path="/echo") as server
+server::respond([http::ok_text(request.body()) for request in server::requests])

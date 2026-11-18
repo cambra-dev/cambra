@@ -199,7 +199,9 @@ impl Walk {
                 self.target(target);
                 self.expr(value);
             }
-            Stmt::Declare { target, annotation } => {
+            Stmt::Declare {
+                target, annotation, ..
+            } => {
                 self.target(target);
                 self.annotation(annotation);
             }
@@ -253,6 +255,7 @@ impl Walk {
                     }
                 });
             }
+            Stmt::BuiltinType { .. } => {}
             Stmt::TypeDecl(decl) => match &decl.body {
                 TypeDeclBody::Constructors(ctors) => ctors
                     .iter()
