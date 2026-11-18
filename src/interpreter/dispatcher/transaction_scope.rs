@@ -3,16 +3,35 @@
 //! As for loop rounds, request and step handlers control the recurrence boundary. The
 //! driver, body breakers and proposal writer are ordinary pipelines between those handlers.
 
-use super::loop_scope::Body;
+use super::loop_scope::{Body, RoundWork};
 use super::*;
 use crate::interpreter::commit_operator::CommitProducer;
-use crate::interpreter::tile_operators::StoreCell;
+use crate::interpreter::tile_operators::{StoreBorrow, StoreCell};
+
+/// A seed claim owns the store through its breaker call. The borrow ends before the
+/// resulting pushes land, since a reader can reach the same store.
+pub(super) struct ReservedSeed<'a> {
+    pub(super) store: StoreBorrow<'a>,
+    pub(super) input: InputId,
+}
+
+impl ReservedSeed<'_> {
+    pub(super) fn reach(mut self, call: &mut Call<'_>) {
+        call(
+            self.store
+                .as_breaking_mut()
+                .expect("a transaction seed breaker"),
+            self.input,
+        );
+    }
+}
 
 #[cfg(test)]
 thread_local! {
     /// The requests on this thread that ended with positions waiting for inputs
     /// ([`CommitProducer::finish_request`]'s stall), for a test that has to see that path taken.
-    /// A run's scopes step on the thread that runs it.
+    /// A run's worker threads add their counts to the thread that runs it once they join
+    /// (`WorkerPool::hand_over_counters`).
     pub(crate) static STALLS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -23,6 +42,15 @@ pub(crate) struct TransactionRun {
 }
 
 impl TransactionRun {
+    /// The planned driver is stable for the run even while another worker is pulling its fan-out.
+    pub(crate) fn writer_driver(&self, writer: usize) -> &BreakerHandle {
+        let body = &self.writers[writer].body;
+        let loop_scope::Member::Chain(driver) = &body.members[body.driver.0] else {
+            unreachable!("a transaction driver is a chain")
+        };
+        driver
+    }
+
     /// Wake parked peers on progress. An incomplete request may park once it has tried the
     /// current epoch. Overlapping attempts that read an older epoch get another turn.
     pub(super) fn settle(&mut self, writer: usize, queued_at: u64, progressed: bool) -> bool {
@@ -69,7 +97,8 @@ impl WriterPhase {
         dispatcher: &Dispatcher,
         package: WorkPackage,
     ) {
-        transaction(store).begin_request(self, dispatcher, writer, package);
+        let work = transaction(store).begin_request(self, dispatcher, writer, package);
+        work.queue(dispatcher);
     }
 
     /// End the attempt whose step claimed `package`: queue a retry, or complete the request.
@@ -80,8 +109,24 @@ impl WriterPhase {
         dispatcher: &Dispatcher,
         package: WorkPackage,
     ) {
+        #[cfg(test)]
+        let pipeline = package.pipeline;
         dispatcher.acknowledge(package);
-        let done = transaction(store).finish_request(self, dispatcher, writer);
+        let (done, work) = {
+            let mut store = transaction(store);
+            #[cfg(test)]
+            if let Some(probe) = &dispatcher.scope_step_probe {
+                probe(pipeline);
+            }
+            store.finish_request(self, dispatcher, writer)
+        };
+        work.queue(dispatcher);
+        if self.open() {
+            transaction(store)
+                .writer_run(writer)
+                .body
+                .hold_followers(dispatcher);
+        }
         scope::complete_request(dispatcher, done, |pushes| {
             transaction(store).push_store(pushes)
         });
@@ -116,7 +161,8 @@ impl WriterRun {
         Self { body }
     }
 
-    /// Queue an attempt over `guard`, at the store's progress epoch `queued_at`.
+    /// Activate the body for an attempt queued at the store's progress epoch `queued_at`, and
+    /// answer the attempt's work, which is queued once the store is released.
     fn queue(
         &mut self,
         phase: &mut WriterPhase,
@@ -124,24 +170,29 @@ impl WriterRun {
         request: Option<WorkPackage>,
         guard: TileGuard,
         queued_at: u64,
-    ) {
+    ) -> RoundWork {
+        let mut work = RoundWork::default();
         self.body.activate(dispatcher);
         self.body.hold_followers(dispatcher);
+        // The request establishes readiness of the external source. Materialize any
+        // source pipelines inside this writer before advancing its driver; the
+        // driver may read a breaker carrying another transaction's reply.
         for local in 0..self.body.members.len() {
             let pipeline = self.body.global(PipelineId(local));
             if local != self.body.driver.0 && dispatcher.is_source(pipeline) {
                 self.body.reach(PipelineId(local), &mut |breaker, input| {
-                    dispatcher.queue_for(pipeline, &breaker.input_tiling(input).universal_guard());
+                    work.queue_round(pipeline, &breaker.input_tiling(input).universal_guard());
                 });
             }
         }
-        self.body.queue_grown(dispatcher);
-        dispatcher.queue_for(self.body.global(self.body.driver), &guard);
+        self.body.queue_grown(&mut work);
+        work.queue_round(self.body.global(self.body.driver), &guard);
         *phase = WriterPhase::Attempt {
             request,
             guard,
             queued_at,
         };
+        work
     }
 
     pub(super) fn drain(&mut self, phase: &mut WriterPhase, dispatcher: &Dispatcher) {
@@ -164,7 +215,7 @@ impl WriterRun {
     }
 }
 
-pub(super) struct TransactionBorrow<'a>(crate::interpreter::tile_operators::StoreBorrow<'a>);
+pub(super) struct TransactionBorrow<'a>(StoreBorrow<'a>);
 impl std::ops::Deref for TransactionBorrow<'_> {
     type Target = CommitProducer;
     fn deref(&self) -> &Self::Target {
@@ -210,7 +261,7 @@ impl CommitProducer {
         if !self.writer_run(writer).body.has_offers(dispatcher) {
             return false;
         }
-        let open = self.open_store();
+        let open = self.open_if_ready();
         self.writer_run_mut(writer)
             .body
             .queue_offered(dispatcher, open)
@@ -222,28 +273,28 @@ impl CommitProducer {
         dispatcher: &Dispatcher,
         writer: usize,
         package: WorkPackage,
-    ) {
+    ) -> RoundWork {
         let input = self.writer_input(writer);
         assert!(
             matches!(phase, WriterPhase::Idle),
             "a writer completes its request before another starts"
         );
         self.begin_delivery(input);
-        self.publish_commits();
+        self.begin_attempt();
         let mark = self.progress_epoch();
         let run = self.writer_run_mut(writer);
         let guard = match run.body.take_waited() {
             Some(waiting) => package.guard.union(&waiting),
             None => package.guard.clone(),
         };
-        run.queue(phase, dispatcher, Some(package), guard, mark);
+        run.queue(phase, dispatcher, Some(package), guard, mark)
     }
     pub(super) fn finish_request(
         &mut self,
         phase: &mut WriterPhase,
         dispatcher: &Dispatcher,
         writer: usize,
-    ) -> Option<WorkPackage> {
+    ) -> (Option<WorkPackage>, RoundWork) {
         let progressed = self.complete_attempt(writer);
         let transaction = self.run.as_mut().expect("a transaction run is planned");
         let WriterPhase::Attempt {
@@ -262,14 +313,16 @@ impl CommitProducer {
                     !caught_up,
                     "writer {writer}'s final retry made no progress on its stale item"
                 );
-                self.publish_commits();
+                self.begin_attempt();
                 let mark = self.progress_epoch();
-                self.writer_run_mut(writer)
-                    .queue(phase, dispatcher, None, guard, mark);
-                return None;
+                return (
+                    None,
+                    self.writer_run_mut(writer)
+                        .queue(phase, dispatcher, None, guard, mark),
+                );
             }
             self.writer_run_mut(writer).drain(phase, dispatcher);
-            return None;
+            return (None, RoundWork::default());
         };
         if self.request_complete(self.writer_input(writer), &guard) {
             debug_assert!(
@@ -279,7 +332,7 @@ impl CommitProducer {
             );
             let run = self.writer_run_mut(writer);
             run.body.set_waiting(None, None);
-            return Some(package);
+            return (Some(package), RoundWork::default());
         }
         // The writer tried the current store and its body settled. The next relevant push,
         // or progress by a peer, reoffers its undecided positions.
@@ -297,20 +350,22 @@ impl CommitProducer {
             let entry = self.writer_placements[writer].clone();
             let run = self.writer_run_mut(writer);
             run.body.set_waiting(Some(waiting), Some(&entry));
-            return Some(package);
+            return (Some(package), RoundWork::default());
         }
-        self.publish_commits();
+        self.begin_attempt();
         let mark = self.progress_epoch();
-        self.writer_run_mut(writer)
-            .queue(phase, dispatcher, Some(package), guard, mark);
-        None
+        (
+            None,
+            self.writer_run_mut(writer)
+                .queue(phase, dispatcher, Some(package), guard, mark),
+        )
     }
     pub(super) fn begin_transaction_finish(
         &mut self,
         phase: &mut WriterPhase,
         dispatcher: &Dispatcher,
         writer: usize,
-    ) {
+    ) -> RoundWork {
         assert!(
             matches!(phase, WriterPhase::Idle),
             "a writer finishes after its requests settle"
@@ -318,9 +373,9 @@ impl CommitProducer {
         let whole = self
             .input_tiling(self.writer_input(writer))
             .universal_guard();
-        self.publish_commits();
+        self.begin_attempt();
         let mark = self.progress_epoch();
         let run = self.writer_run_mut(writer);
-        run.queue(phase, dispatcher, None, whole, mark);
+        run.queue(phase, dispatcher, None, whole, mark)
     }
 }
