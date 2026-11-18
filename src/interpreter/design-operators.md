@@ -750,6 +750,11 @@ whose own group's statement calls every key complete, and a statement about the 
 enclosing key the tile does not hold. The guard names all three exactly, the third by path. A memo
 answers every pull from its cache and reads its input only in `consume_impl` ([Memo](#memo)).
 
+At a nested level, the statement supplies completed members and known absences. Held-key guard
+construction excludes members already covered by that row's statement before qualifying the
+remainder. The union names the same exact region while avoiding one qualified held-key predicate
+per group where a shared statement already covers those members.
+
 ### What a producer holds
 
 `TileProducer::state_info` reports values retained by that producer between pulls, excluding
