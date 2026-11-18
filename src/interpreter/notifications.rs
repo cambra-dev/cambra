@@ -1,16 +1,64 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::sync::PoisonError;
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing};
 
+// The shared consumers this thread is notifying, by address, which `notify_shared` checks a
+// notification against to find re-entry.
+//
+// shared-state-ok: a per-thread record of the consumers a notification is passing through. What
+// crosses it is a consumer's address, never a tile.
+thread_local! {
+    static NOTIFYING: std::cell::RefCell<std::collections::HashSet<usize>> = Default::default();
+}
+
+/// Marks a shared consumer as being notified on this thread until it is dropped.
+struct Notifying(usize);
+
+impl Notifying {
+    /// The mark for `shared`, or `None` where this thread is already notifying it.
+    fn enter<C: ?Sized>(shared: &Arc<C>) -> Option<Self> {
+        let identity = Arc::as_ptr(shared) as *const () as usize;
+        NOTIFYING
+            .with(|notifying| notifying.borrow_mut().insert(identity))
+            .then_some(Notifying(identity))
+    }
+}
+
+impl Drop for Notifying {
+    fn drop(&mut self) {
+        NOTIFYING.with(|notifying| {
+            notifying.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+/// Notify `shared` of `region`. A notification that reaches a shared consumer this thread is
+/// already notifying calls [`Landing::reentered`] instead.
+///
+/// It takes no lock: a consumer guards its own state and releases it before it forwards a
+/// notification. Two threads can notify one consumer at once.
+pub(crate) fn notify_shared<C: Consumer + ?Sized>(
+    shared: &Arc<C>,
+    region: &Projection,
+    landing: &mut Landing<'_>,
+) {
+    match Notifying::enter(shared) {
+        Some(_notifying) => C::notify(shared, region, landing),
+        None => landing.reentered(),
+    }
+}
+
 /// A consumer handle shared by notification forwarders.
 /// It carries notifications, not tile data.
-pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
+pub type SharedConsumer = Arc<dyn Consumer>;
 
 /// Share a consumer between its input paths. Pipeline entries end notification propagation.
 pub fn shared_consumer(consumer: Box<dyn Consumer>) -> SharedConsumer {
-    Rc::new(RefCell::new(consumer))
+    Arc::from(consumer)
 }
 
 /// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
@@ -71,7 +119,7 @@ struct ThroughValues {
 }
 
 impl Consumer for ThroughValues {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let already_whole = *region == Projection::Everything;
         let region = if landing.is_complete() {
             let guard = crate::interpreter::tiling::through_shared_levels(
@@ -97,7 +145,7 @@ impl Consumer for Widening {
     /// A change widens to every key. A complete region passes as every key where its source is
     /// wholly complete, and not at all otherwise: each output key depends on every input key, so
     /// the path completes only part of what a row depends on.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         landing.completing_part(|landing| match region {
             Projection::Everything => self.0.notify(region, landing),
             _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
@@ -123,7 +171,7 @@ pub fn widening_restating_complete(
 struct WideningRestatingComplete(fn(&Projection) -> Projection, Box<dyn Consumer>);
 
 impl Consumer for WideningRestatingComplete {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
             Projection::Everything => self.1.notify(region, landing),
             _ if landing.is_complete() => self.1.notify(&(self.0)(region), landing),
@@ -136,7 +184,7 @@ impl Consumer for WideningRestatingComplete {
 /// key and also their input's value, so the complete region it passes names only part of what
 /// those rows depend on ([`Landing::completing_part`]).
 pub fn restating_lookup(
-    restate: Box<dyn Fn(&Projection) -> Projection>,
+    restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     Box::new(RestatingLookup(Restating(restate, consumer)))
@@ -145,7 +193,7 @@ pub fn restating_lookup(
 struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         landing.completing_part(|landing| self.0.notify(region, landing));
     }
 }
@@ -154,16 +202,19 @@ impl Consumer for RestatingLookup {
 /// complete region: an operator that keeps its input's keys under another spelling, as `Uncurry`
 /// beneath a standing level names an outer and an inner key as one pair, restates both exactly.
 pub fn restating(
-    restate: Box<dyn Fn(&Projection) -> Projection>,
+    restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     Box::new(Restating(restate, consumer))
 }
 
-struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
+struct Restating(
+    Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
+    Box<dyn Consumer>,
+);
 
 impl Consumer for Restating {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&(self.0)(region), landing);
     }
 }
@@ -178,7 +229,7 @@ pub fn tagging(tag: FieldKey, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> 
 struct Tagging(FieldKey, Box<dyn Consumer>);
 
 impl Consumer for Tagging {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.notify(&region.tagged(&self.0), landing);
     }
 }
@@ -193,11 +244,8 @@ struct Forwarding {
 impl Consumer for Forwarding {
     /// A push is passed on at once. A push climbs from one breaker to the next, so
     /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        match self.shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(region, landing),
-            Err(_) => landing.reentered(),
-        }
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        notify_shared(&self.shared, region, landing);
     }
 }
 
@@ -230,7 +278,7 @@ impl OneLevelIn {
     }
 
     /// [`notify`](Consumer::notify) inside the path's completes-part mark.
-    fn pass_on(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn pass_on(&self, region: &Projection, landing: &mut Landing<'_>) {
         if landing.is_complete() {
             match region {
                 Projection::Keys { level, .. } if *level >= self.at => {
@@ -256,7 +304,7 @@ impl Consumer for OneLevelIn {
     /// level `at` passes as every key where its source is wholly complete, and not at all
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries, so the path completes only part of what a row depends on.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         landing.completing_part(|landing| self.pass_on(region, landing));
     }
 }
@@ -264,22 +312,26 @@ impl Consumer for OneLevelIn {
 /// Source handles registered by subscriptions, for source-window inspection and route retirement.
 #[derive(Default)]
 pub struct SourceRegistry {
-    source_handles: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    source_handles: HashMap<String, Arc<RwLock<dyn DataSourceDomainExtentImpl>>>,
 }
 
 impl SourceRegistry {
     pub fn sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> + '_ {
+    ) -> impl Iterator<Item = (&str, &Arc<RwLock<dyn DataSourceDomainExtentImpl>>)> + '_ {
         self.source_handles
             .iter()
             .map(|(name, source)| (name.as_str(), source))
     }
-    pub fn add_source_handle(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
-        let id = source.borrow().get_id().to_string();
+    pub fn add_source_handle(&mut self, source: Arc<RwLock<dyn DataSourceDomainExtentImpl>>) {
+        let id = source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_id()
+            .to_string();
         if let Some(existing) = self.source_handles.get(&id) {
             assert!(
-                Rc::ptr_eq(existing, &source),
+                Arc::ptr_eq(existing, &source),
                 "two sources are registered as `{id}`"
             );
         } else {
@@ -302,7 +354,7 @@ mod tests {
         use crate::interpreter::{BaseType, Extent, Tiling};
         struct Entry;
         impl Consumer for Entry {
-            fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
+            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
                 landing.queue(
                     PipelineId(0),
                     &crate::interpreter::TileGuard::Scalar(crate::interpreter::Predicate::True),
@@ -310,7 +362,7 @@ mod tests {
             }
         }
         let output = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let mut consumer = through_values(CurryLevel::OUTERMOST, &output, Box::new(Entry));
+        let consumer = through_values(CurryLevel::OUTERMOST, &output, Box::new(Entry));
         let mut landing = Landing::route();
         consumer.notify(
             &Projection::admitting(crate::interpreter::Predicate::point(
@@ -333,7 +385,7 @@ mod tests {
         use crate::interpreter::{BaseType, Extent, Predicate, TileGuard, Tiling, Value};
         struct Entry;
         impl Consumer for Entry {
-            fn notify(&mut self, _: &Projection, landing: &mut Landing<'_>) {
+            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
                 landing.queue(PipelineId(0), &TileGuard::Scalar(Predicate::True));
             }
         }
@@ -342,37 +394,40 @@ mod tests {
             uint(),
             Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
         );
-        let mut consumer = through_values(CurryLevel::new(1), &output, Box::new(Entry));
-        let keeps = |region: Projection, consumer: &mut Box<dyn Consumer>| {
+        let consumer = through_values(CurryLevel::new(1), &output, Box::new(Entry));
+        let keeps = |region: Projection| {
             let mut landing = Landing::route();
             consumer.notify(&region, &mut landing);
             let routes = landing.routes();
             assert_eq!(routes.len(), 1, "{region:?}");
             routes[0].keeps_keys
         };
-        assert!(keeps(Projection::of_path(&[Value::UInt(0)]), &mut consumer));
-        assert!(!keeps(
-            Projection::keys_at(CurryLevel::new(1), Predicate::point(Value::UInt(0))),
-            &mut consumer
-        ));
+        assert!(keeps(Projection::of_path(&[Value::UInt(0)])));
+        assert!(!keeps(Projection::keys_at(
+            CurryLevel::new(1),
+            Predicate::point(Value::UInt(0))
+        )));
     }
 
     #[test]
     fn replaced_values_pass_changes_but_only_whole_value_completion() {
         use crate::interpreter::dispatcher::PipelineId;
         use crate::interpreter::{BaseType, Extent, Predicate, Tiling, Value};
-        struct Received(Rc<RefCell<Vec<Projection>>>);
+        struct Received(Arc<RwLock<Vec<Projection>>>);
         impl Consumer for Received {
-            fn notify(&mut self, region: &Projection, _: &mut Landing<'_>) {
-                self.0.borrow_mut().push(region.clone());
+            fn notify(&self, region: &Projection, _: &mut Landing<'_>) {
+                self.0
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(region.clone());
             }
         }
-        let received = Rc::new(RefCell::new(Vec::new()));
+        let received = Arc::new(RwLock::new(Vec::new()));
         let tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let mut consumer = through_values(
+        let consumer = through_values(
             CurryLevel::new(1),
             &tiling,
             Box::new(Received(received.clone())),
@@ -391,7 +446,7 @@ mod tests {
         consumer.notify(&whole, &mut Landing::probe_complete(PipelineId(0)));
         let outer = Projection::admitting(row);
         assert_eq!(
-            *received.borrow(),
+            *received.read().unwrap_or_else(PoisonError::into_inner),
             vec![outer.clone(), Projection::Nothing, outer]
         );
     }
@@ -402,10 +457,13 @@ mod tests {
         let shared = shared_consumer(Box::new(log));
         let keys = Projection::of(&keys_between(2, 4)).unwrap();
         crate::interpreter::dispatcher::notify_for_test(
-            &mut *forwarding_consumer_keeping_keys(&shared),
+            &*forwarding_consumer_keeping_keys(&shared),
             &keys,
         );
-        crate::interpreter::dispatcher::notify_for_test(&mut *forwarding_consumer(&shared), &keys);
-        assert_eq!(*received.borrow(), [keys, Projection::Everything]);
+        crate::interpreter::dispatcher::notify_for_test(&*forwarding_consumer(&shared), &keys);
+        assert_eq!(
+            *received.read().unwrap_or_else(PoisonError::into_inner),
+            [keys, Projection::Everything]
+        );
     }
 }

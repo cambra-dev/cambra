@@ -417,6 +417,8 @@ in-flight claims. A claim moves the oldest ready package to the in-flight map; a
 removes its entry, even when an earlier package is still running. Package indices increase for the
 run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
 pipelines permit at most one package in flight. No queue lock is held while an operator executes.
+A delivery takes no lock beyond what each consumer's own state needs
+([The notification contract](design-operators.md#the-notification-contract)).
 
 Queue entries retain only ready and in-flight guards. Collection capacity can retain its peak
 allocation; it does not grow with the number of acknowledged packages. The accumulated region
@@ -431,7 +433,8 @@ waiting therefore cannot be lost. A worker failure wakes waiters and stops furth
 does a panic in a thread that publishes (`notify`, `start_source`, `close`, `land`, `finish`,
 queueing a reader), worker or not.
 
-These guarantees concern scheduling. Breakers use `Rc<RefCell<_>>`, and the production driver runs
-them serially. Several pipelines can share one breaker, whose consumes, offers and finishes would
-need additional coordination before parallel execution. Atomic-ordering proofs and queue storage
-mechanics are documented beside their implementation in `dispatcher.rs`.
+These guarantees concern scheduling. Breakers are `Send + Sync`, each behind an `Arc<RwLock<_>>`
+(`BreakerHandle`), and the production driver runs them serially. Several pipelines can share one
+breaker, whose consumes, offers and finishes would need additional coordination before parallel
+execution. Atomic-ordering proofs and queue storage mechanics are documented beside their
+implementation in `dispatcher.rs`.
