@@ -385,10 +385,17 @@ two cases, which differ in whether the access goes through a `Ref`:
   `.`.** `*r.f` is `*(r.f)`, the content of the cell named by the `Ref` in field `f`. `r->f` is
   `(*r).f`. A chain through `Ref`s needs no parentheses: with `s: Ref(Session)`, whose `cart`
   field holds a `Ref(Cart)`, the cart's items are `s->cart->items`, as in [Example](#example).
-- **A pair is written `k ↦ v`.** `->` was the pair arrow, and `a -> b` is the two-tuple `(a, b)`
-  ([spec 2.4](../../../docs/chl-spec.md#24-atoms)), so `(k, v)` is the spelling of a pair without
-  `↦`. A lambda keeps `\x -> body`. The parse is unambiguous, because a lambda's binders are names
-  and type annotations, and no type uses `->`.
+- **`.` never dereferences.** A `Ref` is opaque and has no fields, so `r.f` with `r: Ref(𝑉)` is a
+  type error. Field projection keeps one meaning whatever type inference assigns its receiver.
+- **A map entry is written `k: v` inside brackets.** A map literal is `[k: v, …]` and a map
+  comprehension is `[k: v for …]`. Each entry is the two-tuple `(k, v)`. `:` separates a key from
+  its value only as an element of `[ … ]`, so a pair anywhere else is written `(k, v)`. A loop
+  binds an entry's halves with a tuple target, `for k, v in m`. The key is an expression without a
+  one-line `match`, and a `forall … requires` type inside brackets is parenthesized, because both
+  forms contain their own `:`.
+- **`->` is the field access through a `Ref` and the lambda's separator.** It is no longer the pair
+  arrow ([spec 2.4](../../../docs/chl-spec.md#24-atoms)). A lambda keeps `\x -> body`. The parse is
+  unambiguous, because a lambda's binders are names and type annotations, and no type uses `->`.
 
 `to_mut` is a projection, not an ordinary function. Rule 2 of [The rules](#the-rules) forbids a
 function from returning a `Mut`; a projection yields a `Mut` place that lasts as long as the
@@ -505,7 +512,7 @@ at which it commits nothing, and the exception propagates to a `try`
 ([Exceptions](../../../docs/chl-spec.md#exceptions)). This design adds a deadline:
 
 ```python
-for k ↦ req in srv::reqs:
+for k, req in srv::reqs:
     try:
         v = with begin(deadline=time::millis(50)):
             reserve(req.body.sku, req.body.qty)
@@ -736,8 +743,8 @@ An index is an in-transaction materialized view. With the running example from
 ```python
 @materialize
 def carts_by_item() => FullMap(ItemKey, Set(CartKey)) requires Transaction:
-    refs = [i ↦ c for c ↦ cart in carts for i in cart.lines]
-    return map([i ↦ set([r.1 for r in g]) for i ↦ g in groupby(refs, \r -> r.0)])
+    refs = [i: c for c, cart in carts for i in cart.lines]
+    return map([i: set([r.1 for r in g]) for i, g in groupby(refs, \r -> r.0)])
 
 with begin():
     if k not in carts_by_item().keys():
@@ -790,7 +797,7 @@ instance std::txn::Realm(Analytics)
 
 @materialize(realm=Analytics, delay=time::minutes(5))
 def revenue_by_sku() => Map(Sku, Int) requires Transaction:
-    return map([sku ↦ sum(o.qty * o.price for o in orders.values() if o.sku == sku) for sku in skus])
+    return map([sku: sum(o.qty * o.price for o in orders.values() if o.sku == sku) for sku in skus])
 
 for req in dashboard_reqs:
     report = with begin(Analytics):
@@ -884,7 +891,7 @@ partial, and it does not count toward totality. The program defines the entry ou
 from the block's value:
 
 ```python
-for k ↦ req in srv::reqs:
+for k, req in srv::reqs:
     v = with begin():
         reserve(req.body.sku, req.body.qty)
     resps[k] = to_response(v)             # defined on every path through the block
@@ -1022,7 +1029,7 @@ the sink's collection:
 ```python
 run http::serve("8080", "POST", "/order") as srv
 resps: OnceMap(srv::Reqs, srv::Response)
-for k ↦ req in srv::reqs:
+for k, req in srv::reqs:
     v = with begin():
         reserve(req.body.sku, req.body.qty)
     resps[k] = to_response(v)
@@ -1309,7 +1316,7 @@ ways. Each is written by the program or proved, and an obligation none discharge
   new instance with no quantified reasoning:
   ```python
   with begin():
-      carts := map([c ↦ Cart::new(lines=[i for i in cart.lines if i != k]) for c ↦ cart in carts])
+      carts := map([c: Cart::new(lines=[i for i in cart.lines if i != k]) for c, cart in carts])
       items.remove(k)
   ```
 - **A guard.** A key-position dependent needs one lookup: `if k not in carts.keys():`. A
@@ -1529,8 +1536,8 @@ that land with it. Work not listed here is in [Future work](#future-work).
    `ReadCell(𝑝)` and `WriteCell(𝑝)` ([Footprints and elision](#footprints-and-elision)). Spec 8.2
    changes.
 4. **`Ref`, with reference counting.** `Ref::new`, `ref(x)`, `*` and `->` reach cells allocated at
-   run time, and `Pin` hands them outside the program ([Operations](#operations)). The pair arrow
-   becomes `↦` first, which frees `->` (spec 2.4). The collector counts the `Ref`s stored in cells
+   run time, and `Pin` hands them outside the program ([Operations](#operations)). Map entries
+   become `k: v` first, which frees `->` (spec 2.4). The collector counts the `Ref`s stored in cells
    and scans the roots, and a cycle in the type graph of cells is a compile error ([Garbage
    collection](#garbage-collection)). Footprints name allocation sites, and a transaction that
    reads a `Ref` from a cell needs a reconnaissance step ([References read from
@@ -1552,7 +1559,7 @@ that land with it. Work not listed here is in [Future work](#future-work).
 | Transactional variables only at a module's top level | Root cells at the top level, and cells allocated with `Ref::new` anywhere a transaction is supplied |
 | A `Mut` argument written like a copy, with the call shape taken from the callee's type ([spec 9.6](../../../docs/chl-spec.md#96-qualified-references)) | `&x` at the call; an unmarked argument is always a copy |
 | `to_mut` inserted wherever a `Mut` is expected and a cell or a `Ref` is given | Inserted for a root cell named directly; a `Ref` is dereferenced with `*` or `->`, never implicitly |
-| `k -> v`, the pair arrow | `k ↦ v`, or the tuple `(k, v)`; `->` is the field access through a `Ref` |
+| `k -> v`, the pair arrow | `[k: v]` in a map literal or comprehension, `for k, v in m` in a loop, and the tuple `(k, v)` elsewhere; `->` is the field access through a `Ref` |
 | `Mut(_, Txn)` parameters | `Ref(𝑉, 𝑅)` parameters, effects on captured cells, or a cell passed to a `Mut(𝑉)` parameter through `to_mut` |
 | `requires ReadTxn(x)`, `causes WriteTxn(x)` per variable | `requires ReadCell(𝑝)`, `causes WriteCell(𝑝)` per path, resolved to sites by the compiler |
 | `causes Append(x)` on a feed, from any module | `causes Append(x)` only from the feed's declaring scope ([Which contributions participate](#which-contributions-participate)) |
@@ -1583,7 +1590,9 @@ Proposals for the owners of each part.
   that takes `self: Mut(Self)` is called on a marked receiver, `&xs.push(v)`, where `&` binds
   tighter than `.` and `[ ]`. Prefix `&` leaves infix `&` (logical and) unchanged.
 - **[Spec 2.4](../../../docs/chl-spec.md#24-atoms) and the precedence table.** The pair arrow
-  becomes `↦`. `->` becomes a postfix operator beside `.`, the field access through a `Ref`, and
+  is removed. A map literal is `[k: v, …]`, a map comprehension is `[k: v for …]`, and a loop over
+  entries binds `for k, v in m`. The note in spec 2.4 that records `[k: v, …]` as superseded is
+  reversed. `->` becomes a postfix operator beside `.`, the field access through a `Ref`, and
   prefix `*` is the dereference, binding looser than the postfix operators. A lambda keeps
   `\x -> body`.
 - **[Spec 8.4](../../../docs/chl-spec.md#84-feeds-are-the-second-form-of-mutability).** "Feeds are
