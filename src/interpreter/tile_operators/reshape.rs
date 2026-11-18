@@ -143,7 +143,7 @@ impl TileProducer for PermuteRecordDomainProducer {
 
     /// The keys are renamed fieldwise, so the input is read whole and the answer is cut to the
     /// projection over the permuted keys.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -612,7 +612,7 @@ impl TileProducer for FlattenTupleDomainProducer {
 
     /// The keys are restated flat, so the input is read whole and the answer is cut to the
     /// projection over the flat keys.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1428,7 +1428,7 @@ mod tests {
             fn add_inspect_children(&self, node: InspectNode, _: &VizOptions) -> InspectNode {
                 node
             }
-            fn get_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
             fn release_impl(&mut self, guard: TileGuard) {

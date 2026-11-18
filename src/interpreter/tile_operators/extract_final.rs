@@ -125,7 +125,7 @@ struct ExtractFinalProducer {
     final_tile: Option<Tile>,
     /// Completion survives reclamation of the extracted value.
     complete: bool,
-    /// The source rows [`Breaker::consume_impl`] merged, kept to the row at the
+    /// The source rows [`Breaker::consume`] merged, kept to the row at the
     /// greatest key where the values are a column, and empty before the first consume.
     merged: Tile,
 }
@@ -261,7 +261,7 @@ impl TileProducer for ExtractFinalProducer {
     /// The final position of a stream is one value, or one collection that a release takes
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if projection_of_one_value(&self.name(), "extracts one final value", &projection_guard)
             == Projection::Nothing
         {
@@ -352,7 +352,7 @@ impl Breaker for ExtractFinalProducer {
     /// the order they arrive, so the last row is not the final one: the key says which is. Once
     /// the source has been released whole the value is extracted, or the default read when the
     /// source held nothing.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, _: InputId, guard: TileGuard) {
         debug_assert!(
             guard.check_from(self.source.tiling()),
             "{} consumes a guard of its source's tiling: {guard:?}",
@@ -400,7 +400,7 @@ impl Breaker for ExtractFinalProducer {
     ///
     /// When the output is unreleased and no value has been extracted: the source has not been
     /// released whole, or the default it fell back to has not converged. A dispatcher issues no
-    /// `consume_impl` after the finish, so nothing would read that default again, and pushing
+    /// `consume` after the finish, so nothing would read that default again, and pushing
     /// nothing would leave the reader with no value.
     fn finish(&mut self, _input: InputId, pushes: &mut Pushes<'_>) {
         assert!(
@@ -419,7 +419,7 @@ impl Breaker for ExtractFinalProducer {
 
 impl BreakingProducer for ExtractFinalProducer {
     /// The extracted value, once there is one: none while the source has not drained, or while a
-    /// default it fell back to has not converged. The next `consume_impl` reads the default again.
+    /// default it fell back to has not converged. The next `consume` reads the default again.
     fn complete(&self) -> TileGuard {
         match self.complete {
             true => self.tiling().universal_guard(),
@@ -520,7 +520,7 @@ mod tests {
 
     impl TileProducer for PartialSourceProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
@@ -576,7 +576,7 @@ mod tests {
 
     impl TileProducer for TerminalSourceProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 self.domain.clone(),
                 Box::new(Tile::Scalar(self.codomain_tile.clone())),
@@ -631,7 +631,7 @@ mod tests {
 
     impl TileProducer for DelayedDefaultProducer {
         impl_producer_base!();
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             if self.ready.get() {
                 Tile::Scalar(ColumnValue::Ints(vec![42]))
             } else {
@@ -1167,7 +1167,7 @@ mod consuming_tests {
     }
 
     /// A default that has not converged by the `finish` is never read again: the dispatcher
-    /// issues no later `consume_impl`.
+    /// issues no later `consume`.
     #[test]
     #[should_panic(expected = "finishes after it extracted its value")]
     fn finish_with_an_unconverged_default_panics() {

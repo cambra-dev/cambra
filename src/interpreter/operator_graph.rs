@@ -149,7 +149,7 @@ pub enum GraphNode {
 /// sink follows the traversal of its input.
 #[derive(Clone, Debug, Default)]
 pub struct OperatorGraph {
-    nodes: Vec<GraphNode>,
+    nodes: std::sync::Arc<[GraphNode]>,
 }
 
 impl OperatorGraph {
@@ -357,7 +357,9 @@ impl BoundarySession {
                 },
             });
         }
-        OperatorGraph { nodes }
+        OperatorGraph {
+            nodes: nodes.into(),
+        }
     }
 }
 

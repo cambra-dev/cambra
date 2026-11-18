@@ -4,9 +4,10 @@
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::{PoisonError, RwLock};
+use std::sync::RwLock;
 
 use super::loop_scope::{self, Member, induction};
+use super::workers::{Target as WorkerTarget, WorkerPool};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -64,6 +65,36 @@ pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<
     run_program_polling(program, morsel_rows, &mut sleep_when_idle)
 }
 
+/// Run the production dispatcher with an explicit local degree of parallelism.
+pub fn run_program_with_workers(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    workers: usize,
+) -> Result<Run, Refused> {
+    let collected = Arc::new(Collected::default());
+    let planned = run_program_into_with_workers(
+        program,
+        morsel_rows,
+        collected.clone(),
+        &mut sleep_when_idle,
+        workers,
+    )?;
+    Ok(Run {
+        planned,
+        main: collected.take(),
+    })
+}
+
+fn configured_workers() -> usize {
+    std::env::var("CAMBRA_PARALLEL_WORKERS").map_or(1, |value| {
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|workers| *workers > 0)
+            .expect("CAMBRA_PARALLEL_WORKERS is a positive integer")
+    })
+}
+
 /// [`run_program`] with `on_idle` called each time nothing is claimable and a live source has
 /// yielded no new region since the last poll, before the next poll: [`run_program`] sleeps, and
 /// a test feeds the source there. `on_idle` runs inside the run, so it notifies no consumer
@@ -114,6 +145,19 @@ pub fn run_program_into(
     main: Arc<dyn DataSink>,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Vec<Planned>, Refused> {
+    run_program_into_with_workers(program, morsel_rows, main, on_idle, configured_workers())
+}
+
+fn run_program_into_with_workers(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    main: Arc<dyn DataSink>,
+    on_idle: &mut dyn FnMut(),
+    workers: usize,
+) -> Result<Vec<Planned>, Refused> {
+    if workers == 0 {
+        return Err(Refused("a run has at least one worker".into()));
+    }
     // A `main` output's producer is the driver's to pull; the run takes it into a slot, as a
     // sink's sits in one, and hands it back after. A program has at most one.
     let mut taken = None;
@@ -137,7 +181,14 @@ pub fn run_program_into(
             targets.push((slot, main.clone(), TargetEntry::Main(placement)));
         }
     }
-    let result = run_targets(&targets, morsel_rows, &mut Idle(on_idle)).map(|ended| match ended {
+    let result = run_targets_with_workers(
+        &targets,
+        std::slice::from_ref(&program.operator_graph),
+        morsel_rows,
+        &mut Idle(on_idle),
+        workers,
+    )
+    .map(|ended| match ended {
         Ended::Done(planned) => planned,
         Ended::Paused(_) => unreachable!("an observer that never breaks pauses no run"),
     });
@@ -206,15 +257,19 @@ pub enum Ended {
 
 /// The roots of a run over one compiled program's outputs, which `program` keeps.
 #[derive(Default)]
-pub struct Targets(Vec<RunTarget>);
+pub struct Targets {
+    roots: Vec<RunTarget>,
+    graphs: Vec<crate::interpreter::operator_graph::OperatorGraph>,
+}
 
 impl Targets {
     /// Every sink output of `program`.
     pub fn add_sinks(&mut self, program: &CompiledProgram) {
+        self.graphs.push(program.operator_graph.clone());
         for output in &program.outputs {
             if let Some(consumer) = &output.sink_consumer {
                 let consumer_ref = consumer.read().unwrap_or_else(PoisonError::into_inner);
-                self.0.push((
+                self.roots.push((
                     consumer_ref.producer_slot().clone(),
                     consumer_ref.sink(),
                     TargetEntry::Sink(consumer.clone()),
@@ -235,11 +290,12 @@ impl Targets {
         slot: ProducerSlot,
         sink: Arc<dyn DataSink>,
     ) {
+        self.graphs.push(program.operator_graph.clone());
         let placement = program
             .main()
             .and_then(|output| output.main_entry.clone())
             .expect("a `main` output keeps the placement of the entry before its consumer");
-        self.0.push((slot, sink, TargetEntry::Main(placement)));
+        self.roots.push((slot, sink, TargetEntry::Main(placement)));
     }
 
     /// Run the pipelines under every root until `observer` breaks or every live source yields
@@ -253,9 +309,9 @@ impl Targets {
         morsel_rows: usize,
         observer: &mut dyn RunObserver,
     ) -> Result<Ended, Refused> {
-        let ended = run_targets(&self.0, morsel_rows, observer)?;
+        let ended = run_targets(&self.roots, &self.graphs, morsel_rows, observer)?;
         if let Ended::Done(_) = ended {
-            complete_sinks(&self.0);
+            complete_sinks(&self.roots);
         }
         Ok(ended)
     }
@@ -307,8 +363,19 @@ impl DataSink for Collected {
 /// the output's pipeline.
 fn run_targets(
     targets: &[RunTarget],
+    graphs: &[crate::interpreter::operator_graph::OperatorGraph],
     morsel_rows: usize,
     observer: &mut dyn RunObserver,
+) -> Result<Ended, Refused> {
+    run_targets_with_workers(targets, graphs, morsel_rows, observer, configured_workers())
+}
+
+fn run_targets_with_workers(
+    targets: &[RunTarget],
+    graphs: &[crate::interpreter::operator_graph::OperatorGraph],
+    morsel_rows: usize,
+    observer: &mut dyn RunObserver,
+    workers: usize,
 ) -> Result<Ended, Refused> {
     let mut runs = InductionRuns::new();
     let mut planner = Planner::default();
@@ -330,7 +397,7 @@ fn run_targets(
         };
         let pipeline = planner.add(Located::Sink(at), format!("SinkBreaker#{at}"), None, under);
         sink_pipelines.push(pipeline);
-        sink_breakers.push(RwLock::new(breaker));
+        sink_breakers.push(Arc::new(RwLock::new(breaker)));
     }
     planner.check_direct();
     if let Some(refused) = planner.refused.take() {
@@ -723,6 +790,90 @@ fn run_targets(
         reach(PipelineId(pipeline), &mut |breaker, _| breaker.begin_run());
     }
     let execution = Execution::new(&scopes, &mut dispatcher);
+    let mut bindings = HashMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for located in &members.located {
+        if let Located::Chain(handle) = located
+            && let Some(id) = handle
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .base()
+                .definition
+                .as_ref()
+                .and_then(|op| op.operator_id())
+            && let Some(previous) = bindings.insert(id, handle.clone())
+            && !Arc::ptr_eq(&previous, handle)
+        {
+            ambiguous.insert(id);
+        }
+    }
+    bindings.retain(|id, _| !ambiguous.contains(id));
+    // Checked sums depend on fold order. Keep the producing dependency paths
+    // ordered as well, including the root dependencies of ordered loop scopes.
+    let mut ordered = std::collections::HashSet::new();
+    let mut pending = members
+        .located
+        .iter()
+        .enumerate()
+        .filter_map(|(p, located)| {
+            let requires_order = match located {
+                Located::Chain(handle) => handle
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .requires_ordered_input(),
+                Located::Scope { .. } | Located::Store { .. } => true,
+                _ => false,
+            };
+            requires_order.then_some(p)
+        })
+        .collect::<Vec<_>>();
+    while let Some(p) = pending.pop() {
+        if ordered.insert(p) {
+            pending.extend(members.reads[p].iter().copied());
+        }
+    }
+    for p in 0..members.located.len() {
+        if reads_a_scope(&members.located, &members.reads, p)
+            || reads_a_store(&members.located, &members.reads, p)
+        {
+            ordered.insert(p);
+        }
+    }
+    // External delivery observes queue order. Preserve that order through every
+    // producing stage, while still allowing different ordered stages to overlap.
+    let mut external = targets
+        .iter()
+        .zip(&sink_pipelines)
+        .filter_map(|((_, _, entry), p)| {
+            (matches!(entry, TargetEntry::Sink(_)) || !live.is_empty()).then_some(planner.local[*p])
+        })
+        .collect::<Vec<_>>();
+    let mut seen_external = std::collections::HashSet::new();
+    while let Some(p) = external.pop() {
+        if seen_external.insert(p) {
+            dispatcher.order(PipelineId(p));
+            external.extend(members.reads[p].iter().copied());
+        }
+    }
+    let worker_targets = members
+        .located
+        .iter()
+        .enumerate()
+        .map(|(p, located)| match located {
+            _ if ordered.contains(&p) => None,
+            Located::Chain(handle) => Some(WorkerTarget::Chain(handle.clone())),
+            Located::Sink(at) => Some(WorkerTarget::Sink(sink_breakers[*at].clone())),
+            _ => None,
+        })
+        .collect();
+    let mut workers = WorkerPool::new(
+        workers,
+        worker_targets,
+        bindings.into_keys().collect(),
+        graphs,
+    );
+    workers.configure(&mut dispatcher);
+
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
@@ -740,10 +891,17 @@ fn run_targets(
         }
         match live.is_empty() {
             true => {
-                execution.drive(&dispatcher, &mut reach);
+                execution.drive(&dispatcher, &mut reach, &mut workers);
                 true
             }
-            false => drive_live(&dispatcher, &mut reach, &execution, &mut live, observer),
+            false => drive_live(
+                &dispatcher,
+                &mut reach,
+                &execution,
+                &mut live,
+                observer,
+                &mut workers,
+            ),
         }
     });
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
@@ -793,6 +951,7 @@ fn run_targets(
             }
         }
     }
+    workers.report(&mut planned);
     for (plan, scope) in planned.iter_mut().zip(&scopes) {
         if let Some(scope) = scope {
             plan.rounds = std::mem::take(
@@ -1055,7 +1214,7 @@ impl Execution {
         push_held(dispatcher, reach, pipelines);
     }
 
-    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, workers: &mut WorkerPool) {
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
                 let mut input = None;
@@ -1063,15 +1222,26 @@ impl Execution {
                     input = Some(breaker.input_tiling(at))
                 });
                 let input = input.expect("a planned source has a breaker input");
-                dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
+                workers.start_source(
+                    dispatcher,
+                    PipelineId(pipeline),
+                    &input,
+                    &input.empty_guard(),
+                );
             }
         }
         loop {
-            match dispatcher.try_claim(None) {
-                Next::Package(package) => self.consume(dispatcher, reach, package),
+            match workers.next(dispatcher, reach) {
+                Next::Package(package) => {
+                    if let Err(package) = workers.submit(dispatcher, reach, package) {
+                        self.consume(dispatcher, reach, package);
+                    }
+                }
                 Next::Finish { pipeline, consumed } => {
+                    workers.finishing(pipeline, reach);
                     self.finish(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(_) if workers.wait(dispatcher, reach) => {}
                 Next::Wait(_) if self.resume(dispatcher, reach) => {}
                 Next::Wait(_) => {
                     panic!("an acyclic run with no pending loop has a pipeline that may finish")
@@ -1092,6 +1262,22 @@ fn reads_a_scope(located: &[&Located], reads: &[Vec<usize>], pipeline: usize) ->
             continue;
         }
         if matches!(located[at], Located::Scope { .. }) {
+            return true;
+        }
+        stack.extend(reads[at].iter().copied());
+    }
+    false
+}
+
+/// Transaction-dependent state retains its canonical execution history.
+fn reads_a_store(located: &[&Located], reads: &[Vec<usize>], pipeline: usize) -> bool {
+    let mut seen = vec![false; reads.len()];
+    let mut stack = vec![pipeline];
+    while let Some(at) = stack.pop() {
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        if matches!(located[at], Located::Store { .. }) {
             return true;
         }
         stack.extend(reads[at].iter().copied());
@@ -1204,6 +1390,11 @@ pub(super) fn plan_edges(
             rounds: Vec::new(),
             live: false,
             held: false,
+            worker_claims: 0,
+            workers_used: 0,
+            worker_instances: 0,
+            delta_flushes: 0,
+            incremental_claims: 0,
         })
         .collect();
     let mut starts = Vec::new();
@@ -1378,6 +1569,13 @@ enum TargetEntry {
 /// What [`run_program`] planned for one pipeline.
 #[cfg_attr(test, derive(Debug))]
 pub struct Planned {
+    /// Work executed by reusable worker subscriptions during this run.
+    pub worker_claims: usize,
+    pub workers_used: usize,
+    pub worker_instances: usize,
+    pub delta_flushes: usize,
+    /// Claims begun before an upstream pipeline finished.
+    pub incremental_claims: usize,
     /// Its breaker's name.
     pub name: String,
     /// Whether it reads its input whole: once every pipeline it reads has finished, or, over a live
@@ -2705,6 +2903,7 @@ fn drive_live(
     execution: &Execution,
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
+    workers: &mut WorkerPool,
 ) -> bool {
     for (pipeline, info) in dispatcher.infos.iter().take(execution.roots).enumerate() {
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
@@ -2713,7 +2912,7 @@ fn drive_live(
                 input = Some((breaker.input_tiling(at), breaker.input_released(at)));
             });
             let (input, released) = input.expect("a reach calls the breaker it reaches");
-            dispatcher.start_source(PipelineId(pipeline), &input, &released);
+            workers.start_source(dispatcher, PipelineId(pipeline), &input, &released);
         }
     }
     // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
@@ -2740,11 +2939,17 @@ fn drive_live(
             changed |= at.poll(dispatcher, reach);
         }
         loop {
-            match dispatcher.try_claim(None) {
-                Next::Package(package) => execution.consume(dispatcher, reach, package),
+            match workers.next(dispatcher, reach) {
+                Next::Package(package) => {
+                    if let Err(package) = workers.submit(dispatcher, reach, package) {
+                        execution.consume(dispatcher, reach, package);
+                    }
+                }
                 Next::Finish { pipeline, consumed } => {
+                    workers.finishing(pipeline, reach);
                     execution.finish(dispatcher, reach, pipeline, consumed)
                 }
+                Next::Wait(_) if workers.wait(dispatcher, reach) => {}
                 Next::Wait(_) if execution.resume(dispatcher, reach) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
@@ -3090,7 +3295,7 @@ mod tests {
             Some(CurryLevel::new(level.index() + 1))
         }
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 
@@ -3139,7 +3344,7 @@ mod tests {
             None
         }
 
-        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
             self.tiling().empty_tile()
         }
 

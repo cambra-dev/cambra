@@ -65,6 +65,13 @@ impl Converse {
 }
 
 impl TileOperator for Converse {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::new(self.level.index() + 1)
+    }
+    fn partition_input_level(&self, level: CurryLevel) -> CurryLevel {
+        CurryLevel::new(level.index() - 1)
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -128,12 +135,11 @@ struct ConverseProducer {
     /// row is released once the path it stands at is, which takes its value to read. A pull reads
     /// only the rows a region names, so the rows of earlier pulls are kept: a release of a group
     /// names rows no later pull may read again.
-    held: Vec<HeldRow>,
+    state: Mutex<ConverseState>,
     /// At the outermost level, the input keys the answers read state complete, together, and the
     /// values those answers held. A group is the rows whose value is its key, so once every input
     /// key is complete a value never seen has no group: it is stated absent.
-    read: Predicate,
-    seen: Predicate,
+
     /// The inverted level to answer with where no enclosing row has been reached.
     empty_level: Tile,
 }
@@ -141,6 +147,11 @@ struct ConverseProducer {
 /// An input row as [`ConverseProducer::held`] records it: the output path it stands at, then
 /// its input path.
 type HeldRow = (Vec<Value>, Vec<Value>);
+struct ConverseState {
+    held: Vec<HeldRow>,
+    read: Predicate,
+    seen: Predicate,
+}
 
 impl ConverseProducer {
     #[cfg(test)]
@@ -160,10 +171,12 @@ impl ConverseProducer {
     ) -> Self {
         Self {
             base,
-            input,
-            held: Vec::new(),
-            read: Predicate::False,
-            seen: Predicate::False,
+            input: pipeline_worker::shared_operand(input),
+            state: Mutex::new(ConverseState {
+                held: Vec::new(),
+                read: Predicate::False,
+                seen: Predicate::False,
+            }),
             operator,
             empty_level,
         }
@@ -243,25 +256,31 @@ impl ConverseProducer {
 
     /// Keep `read`, the rows a pull read, in place of what the same input rows held before: a
     /// row read again stands at the path its value now gives.
-    fn remember(&mut self, read: Vec<HeldRow>) {
+    fn remember(state: &mut ConverseState, read: Vec<HeldRow>) {
         let again: std::collections::HashSet<&Vec<Value>> =
             read.iter().map(|(_, input)| input).collect();
-        self.held.retain(|(_, input)| !again.contains(input));
-        self.held.extend(read);
+        state.held.retain(|(_, input)| !again.contains(input));
+        state.held.extend(read);
     }
 
     /// Release at the input the held rows `released`, a region the consumer let go of, covers.
     /// A row that arrives after its group was released is freed here, on the read that first
     /// holds it.
-    fn release_late_rows(&mut self, released: &TileGuard) {
-        let late = Self::held_rows_covered(&self.held, released);
+    fn release_late_rows(
+        &self,
+        cx: &mut ExecutionContext,
+        state: &mut ConverseState,
+        released: &TileGuard,
+    ) {
+        let late = Self::held_rows_covered(&state.held, released);
         if late.is_empty() {
             return;
         }
         let rows = self.input_rows(late);
-        self.held
+        state
+            .held
             .retain(|(output, _)| !released.covers_path(output));
-        self.input.release(rows);
+        cx.release(&*self.input, rows);
     }
 }
 
@@ -431,7 +450,14 @@ fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
 
 impl TileProducer for ConverseProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(2 * self.held.len())
+        ProducerStateInfo::holding(
+            2 * self
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held
+                .len(),
+        )
     }
 
     impl_producer_base!();
@@ -469,7 +495,10 @@ impl TileProducer for ConverseProducer {
     /// names ([`Projection::above`]), and at the outermost level it is read whole. Either way the
     /// groups are cut to the projection, and the rows a cut group does not name stay unreleased
     /// at the input, so a later pull reads them again.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -490,7 +519,8 @@ impl TileProducer for ConverseProducer {
                 .above(self.operator.level)
                 .guard(self.input.tiling()),
         };
-        let input_tile = self.input.get(input_guard);
+        let input_tile = cx.get(&*self.input, input_guard);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if self.operator.level == CurryLevel::OUTERMOST
             && let Tile::DataFunction {
                 codomain,
@@ -499,29 +529,29 @@ impl TileProducer for ConverseProducer {
             } = &input_tile
             && let Tile::Scalar(values) = &**codomain
         {
-            self.read = self.read.union(domain_predicate);
-            self.seen = self.seen.union(&Predicate::from_column_value(values));
+            state.read = state.read.union(domain_predicate);
+            state.seen = state.seen.union(&Predicate::from_column_value(values));
         }
         let (mut out, read) = self.invert(input_tile);
-        self.remember(read);
+        Self::remember(&mut state, read);
         // `release_impl` frees the rows held, the standing keys named, and the input keys
         // named under every group, so a group can be released while the input still grows. A
         // row arriving later with a released value would put the group back into a region the
         // consumer has let go; it is released upstream on the pull that first holds it, since
         // the release reached `release_impl` before the row arrived.
-        if !self.base.obsolete_guard.is_empty() {
-            let released = self.base.obsolete_guard.clone();
-            self.release_late_rows(&released);
+        if !cx.obsolete(self).is_empty() {
+            let released = cx.obsolete(self);
+            self.release_late_rows(cx, &mut state, &released);
             out.remove_guarded(released);
         }
         out.restrict_to(&projection, self.tiling());
         // A value never seen once every input key is complete has no group anywhere: it is
         // absent in every region, so it is recorded apart from the statement, which the cut
         // and every later cut keep to the region pulled.
-        if self.read.is_true()
+        if state.read.is_true()
             && let Tile::DataFunction { absent_keys, .. } = &mut out
         {
-            *absent_keys = Predicate::True.minus(&self.seen);
+            *absent_keys = Predicate::True.minus(&state.seen);
         }
         out
     }
@@ -531,8 +561,9 @@ impl TileProducer for ConverseProducer {
     /// where the output path it stands at is: the rows held now, and a row arriving later
     /// through the late-row release in `get_impl`, once its value says which group it joins.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if obsolete_guard.is_universal() {
-            self.held.clear();
+            state.held.clear();
             return self.input.release(self.input.tiling().universal_guard());
         }
         // A member `[𝑠…, value, key]` is the smallest region an input row stands at, so a guard
@@ -585,10 +616,11 @@ impl TileProducer for ConverseProducer {
             },
         );
         let held = self.input_rows(ConverseProducer::held_rows_covered(
-            &self.held,
+            &state.held,
             &obsolete_guard,
         ));
-        self.held
+        state
+            .held
             .retain(|(output, _)| !obsolete_guard.covers_path(output));
         self.input
             .release(TileGuard::flatten_or(vec![standing, held]));
@@ -639,6 +671,10 @@ impl MapDomain {
 }
 
 impl TileOperator for MapDomain {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        self.level >= level
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -660,10 +696,11 @@ impl TileOperator for MapDomain {
                 self.clone(),
                 cx,
             ),
-            input: self
-                .input
-                .clone()
-                .subscribe(self.tiling().universal_guard(), consumer, cx),
+            input: pipeline_worker::shared_operand(self.input.clone().subscribe(
+                self.tiling().universal_guard(),
+                consumer,
+                cx,
+            )),
         })
     }
 
@@ -692,12 +729,15 @@ impl TileProducer for MapDomainProducer {
     }
 
     /// Every level's keys stand, so the input is pulled at the projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let mut tile = self.input.get(projection.guard(self.input.tiling()));
+        let mut tile = cx.get(&*self.input, projection.guard(self.input.tiling()));
         // The keys stand, so only the values at the level are replaced, in place.
         let Tile::DataFunction {
             domain, codomain, ..
@@ -929,7 +969,7 @@ impl TileProducer for UncurryProducer {
 
     /// Projections above the paired level keep their keys. At and beneath that level,
     /// each pair is restated as its outer key and inner key on successive input levels.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1187,6 +1227,10 @@ impl Filter {
 }
 
 impl TileOperator for Filter {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::OUTERMOST
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -1218,8 +1262,8 @@ impl TileOperator for Filter {
         Box::new(FilterProducer {
             operator: self.clone(),
             base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), self.clone(), cx),
-            input: input_producer,
-            predicate: predicate_producer,
+            input: pipeline_worker::shared_operand(input_producer),
+            predicate: pipeline_worker::shared_operand(predicate_producer),
         })
     }
 
@@ -1278,13 +1322,16 @@ impl TileProducer for FilterProducer {
 
     /// The input, and a predicate that is a collection, share the keys of the level the mask
     /// names, so both are pulled at the projection; a function predicate is read whole.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
 
-        self.filtered(&projection)
+        self.filtered(cx, &projection)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1302,15 +1349,15 @@ impl TileProducer for FilterProducer {
 
 impl FilterProducer {
     /// The input's rows the predicate keeps, for the keys `projection` names.
-    fn filtered(&mut self, projection: &Projection) -> Tile {
+    fn filtered(&self, cx: &mut ExecutionContext, projection: &Projection) -> Tile {
         let guard_for = |tiling: &Tiling| match tiling.is_data_function() {
             true => projection.guard(tiling),
             false => tiling.universal_guard(),
         };
         let pred_guard = guard_for(self.predicate.tiling());
         let i_guard = guard_for(self.input.tiling());
-        let predicate_result = self.predicate.get(pred_guard);
-        let input_result = self.input.get(i_guard);
+        let predicate_result = cx.get(&*self.predicate, pred_guard);
+        let input_result = cx.get(&*self.input, i_guard);
 
         match (predicate_result, input_result) {
             // Scalar predicate applied element-wise to a collection's keys.
@@ -1571,7 +1618,7 @@ impl TileProducer for RestrictProducer {
 
     /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
     /// projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -2000,7 +2047,7 @@ impl TileProducer for ProductProducer {
 
     /// The two sides are aligned row for row, so a projection of the rows is a projection of
     /// each side.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -2352,8 +2399,11 @@ mod tests {
         let mut filter = FilterProducer {
             operator: Filter::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
-            input: Box::new(TestTileProducer::new(input, tiling.clone())),
-            predicate: Box::new(predicate),
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                input,
+                tiling.clone(),
+            ))),
+            predicate: pipeline_worker::shared_operand(Box::new(predicate)),
         };
         filter.read_in_pipeline(filter.tiling().universal_guard())
     }
@@ -3059,7 +3109,7 @@ mod tests {
         MapDomainProducer {
             operator: MapDomain::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &tiling),
-            input: Box::new(TestTileProducer::new(tile, tiling)),
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(tile, tiling))),
         }
     }
 
@@ -3881,8 +3931,8 @@ mod filter_projection_tests {
             FilterProducer {
                 operator: Filter::state_definition(CurryLevel::OUTERMOST),
                 base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
-                input: Box::new(input),
-                predicate: Box::new(predicate),
+                input: pipeline_worker::shared_operand(Box::new(input)),
+                predicate: pipeline_worker::shared_operand(Box::new(predicate)),
             },
             input_pulled,
             predicate_pulled,
@@ -4028,8 +4078,8 @@ mod filter_projection_tests {
         let mut filter = FilterProducer {
             operator: Filter::state_definition(CurryLevel::OUTERMOST),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
-            input: Box::new(input),
-            predicate: Box::new(predicate),
+            input: pipeline_worker::shared_operand(Box::new(input)),
+            predicate: pipeline_worker::shared_operand(Box::new(predicate)),
         };
 
         let first = filter.read_in_pipeline(keys_between(0, ROWS - 1));
@@ -4123,8 +4173,8 @@ mod filter_projection_tests {
         FilterProducer {
             operator: Filter::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
-            input: Box::new(input),
-            predicate: Box::new(predicate),
+            input: pipeline_worker::shared_operand(Box::new(input)),
+            predicate: pipeline_worker::shared_operand(Box::new(predicate)),
         }
     }
 
@@ -4173,8 +4223,8 @@ mod filter_projection_tests {
             Box::new(FilterProducer {
                 operator: Filter::state_definition(CurryLevel::new(2)),
                 base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
-                input: Box::new(input),
-                predicate: Box::new(predicate),
+                input: pipeline_worker::shared_operand(Box::new(input)),
+                predicate: pipeline_worker::shared_operand(Box::new(predicate)),
             }) as Box<dyn TileProducer>
         };
         let point = |k: u64| Predicate::point(Value::UInt(k));
@@ -4204,8 +4254,8 @@ mod filter_projection_tests {
         let by_function = FilterProducer {
             operator: Filter::state_definition(CurryLevel::OUTERMOST),
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
-            input: Box::new(input),
-            predicate: Box::new(predicate),
+            input: pipeline_worker::shared_operand(Box::new(input)),
+            predicate: pipeline_worker::shared_operand(Box::new(predicate)),
         };
         assert!(matches!(by_function.restates(), Restates::Every));
         assert_eq!(
@@ -4339,7 +4389,7 @@ mod map_domain_projection_tests {
             MapDomainProducer {
                 operator: MapDomain::state_definition(CurryLevel::OUTERMOST),
                 base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
-                input: Box::new(input),
+                input: pipeline_worker::shared_operand(Box::new(input)),
             },
             pulled,
         )
@@ -4394,7 +4444,7 @@ mod map_domain_projection_tests {
             MapDomainProducer {
                 operator: MapDomain::state_definition(CurryLevel::new(1)),
                 base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
-                input: Box::new(input),
+                input: pipeline_worker::shared_operand(Box::new(input)),
             },
             pulled,
         )
@@ -4706,7 +4756,7 @@ mod uncurry_projection_tests {
     impl TileProducer for OutermostSpy {
         impl_producer_base!();
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
             self.pulled
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)

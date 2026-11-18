@@ -417,7 +417,7 @@ impl TileProducer for ReadingsProducer {
         }
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let Some(input) = &mut self.input else {
             if self.base.obsolete_guard.is_universal() {
                 return self.tiling().empty_tile();

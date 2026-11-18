@@ -35,10 +35,11 @@ use crate::interpreter::{
 
 pub(crate) mod loop_scope;
 mod plan;
+mod workers;
 
 pub use plan::{
     Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
-    run_program_polling,
+    run_program_polling, run_program_with_workers,
 };
 
 /// A pipeline, by its index in the [`Dispatcher`].
@@ -2842,7 +2843,7 @@ pub(crate) fn in_pipeline_for_test<R>(work: impl FnOnce() -> R) -> R {
         fn as_producer(&self) -> Option<&dyn BreakingProducer> {
             None
         }
-        fn consume_impl(&mut self, _: InputId, _: TileGuard) {
+        fn consume(&mut self, _: InputId, _: TileGuard) {
             self.result = Some(self.work.take().expect("one command")());
         }
         fn input_tiling(&self, _: InputId) -> Tiling {
@@ -2978,7 +2979,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
-        breaker.consume_impl(input, package.guard.clone());
+        breaker.consume(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
         {

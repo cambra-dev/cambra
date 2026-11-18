@@ -371,7 +371,7 @@ impl InductionStoreProducer {
         let drive = self.drive();
         self.reach_local(drive, &mut |breaker, input| {
             let none = breaker.input_tiling(input).empty_guard();
-            breaker.consume_impl(input, none);
+            breaker.consume(input, none);
         });
     }
 
@@ -440,7 +440,7 @@ impl InductionStoreProducer {
             // a round. Each emitted position must run the body before the next store step.
             self.read_source();
             let none = self.input_tiling(InputId::ONLY).empty_guard();
-            self.consume_impl(InputId::ONLY, none);
+            self.consume(InputId::ONLY, none);
             self.run_mut().opened = true;
         }
         let rows = !matches!(self.tiling(), Tiling::Store { .. });
@@ -566,7 +566,7 @@ impl InductionStoreProducer {
 
     /// Step the store after the round's body and held pushes have settled.
     fn step_round(&mut self, guard: &TileGuard) {
-        self.consume_impl(InputId::ONLY, guard.clone());
+        self.consume(InputId::ONLY, guard.clone());
         assert!(
             self.final_guard().is_universal()
                 || guard_minus(guard, &self.input_released(InputId::ONLY)).is_empty(),

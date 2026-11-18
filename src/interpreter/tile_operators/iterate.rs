@@ -49,6 +49,10 @@ impl IterateExtent {
 }
 
 impl TileOperator for IterateExtent {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::OUTERMOST && !self.extent.reads_a_source()
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -326,7 +330,7 @@ impl TileProducer for IterateExtentProducer {
         sources
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
             let obsolete = self.obsolete_guard().clone();
@@ -335,6 +339,13 @@ impl TileProducer for IterateExtentProducer {
             };
             return cartesian.get(projection_guard, &tiling, &obsolete);
         }
+        self.get_impl(&mut ExecutionContext::default(), projection_guard)
+    }
+    fn shared_execution(&self) -> bool {
+        !self.base.tiling.extent().reads_a_source()
+            && matches!(self.iteration, Iteration::Direct(_))
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let Iteration::Direct(direct) = &self.iteration else {
             unreachable!()
         };
@@ -365,7 +376,10 @@ impl TileProducer for IterateExtentProducer {
         // Values may also be removed from underlying sources for efficiency, but
         // this filter here is ultimately responsible for not returning released data.
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
-            direct.released.clone(),
+            match cx.obsolete(self) {
+                TileGuard::Function(FunctionGuard::Domain(keys)) => keys,
+                _ => direct.released.clone(),
+            },
         )));
         tile
     }

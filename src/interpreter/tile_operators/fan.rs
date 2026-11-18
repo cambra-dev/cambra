@@ -177,6 +177,10 @@ impl RecordWrap {
 }
 
 impl TileOperator for RecordWrap {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::OUTERMOST
+    }
+
     impl_operator_base!();
 
     fn inspect_annotation(&self) -> Option<String> {
@@ -236,12 +240,15 @@ impl TileProducer for RecordWrapProducer {
     }
 
     /// Wrapping keeps the input's keys, so the input is pulled at the projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let mut tile = self.input.get(projection.guard(self.input.tiling()));
+        let mut tile = cx.get(&*self.input, projection.guard(self.input.tiling()));
         assert!(
             tile.is_data_function(),
             "RecordWrap: the input must be a function tile, got {tile:?}"
@@ -271,6 +278,10 @@ impl TileProducer for RecordWrapProducer {
 }
 
 impl TileOperator for Zip {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::OUTERMOST
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -292,14 +303,17 @@ impl TileOperator for Zip {
             operator: self.clone(),
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), self.clone(), cx),
 
-            held: vec![HashSet::new(); self.inputs.len()],
-            emitted: Predicate::False,
-            inputs: self
+            held: Mutex::new(vec![HashSet::new(); self.inputs.len()]),
+            emitted: Mutex::new(Predicate::False),
+            inputs: (self
                 .inputs
                 .iter()
                 // Every arm is pulled at the projection: the arms share the pair's keys.
                 .map(|i| subscribe_forwarding_keeping_keys(i, &shared, cx))
-                .collect(),
+                .collect::<Vec<_>>())
+            .into_iter()
+            .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+            .collect(),
         })
     }
 }
@@ -330,10 +344,10 @@ struct ZipProducer {
     inputs: Vec<Box<dyn TileProducer>>,
     /// The paths of the rows each arm has held at the pair's enclosing level, on any pull: an
     /// arm gives back only a row it held.
-    held: Vec<HashSet<Vec<Value>>>,
+    held: Mutex<Vec<HashSet<Vec<Value>>>>,
     /// The keys of the pairs a flat zip has emitted, whose cells a consumer may give back
     /// field by field ([`ZipProducer::release_impl`]).
-    emitted: Predicate,
+    emitted: Mutex<Predicate>,
 }
 
 impl TileProducer for ZipProducer {
@@ -357,7 +371,10 @@ impl TileProducer for ZipProducer {
     }
 
     /// The arms share the pair's keys, so each arm is pulled at the projection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -371,9 +388,9 @@ impl TileProducer for ZipProducer {
         // arrive there, so it is not.
         let (mut tiles, dropped): (Vec<Tile>, Vec<Option<TileGuard>>) = self
             .inputs
-            .iter_mut()
+            .iter()
             .map(|i| {
-                let mut tile = i.get(projection.guard(i.tiling()));
+                let mut tile = cx.get(&**i, projection.guard(i.tiling()));
                 let dropped = tile.deleted_keys_guard();
                 // Presence is read off the key columns, so a key an arm has dropped is gone
                 // from them first.
@@ -399,7 +416,7 @@ impl TileProducer for ZipProducer {
                     .holds_a_level())
                 .then(|| {
                     TileGuard::flatten_or(vec![crate::interpreter::tiling::onto_record_field(
-                        self.obsolete_guard().clone(),
+                        cx.obsolete(self),
                         self.operator.level.index(),
                         name,
                         input.tiling(),
@@ -409,7 +426,9 @@ impl TileProducer for ZipProducer {
             .collect();
         // A release covering a row the arm never held, one its input never had, gives
         // nothing back: the row is absent from that arm, and so from the pair.
-        let mut held = std::mem::take(&mut self.held);
+        let mut held_state = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emitted = self.emitted.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = std::mem::take(&mut *held_state);
         if let Some(rows_level) = self.operator.level.enclosing() {
             for (arm, tile) in tiles.iter().enumerate() {
                 if tile.is_data_function() {
@@ -449,7 +468,7 @@ impl TileProducer for ZipProducer {
                     let level = CurryLevel::new(depth);
                     let held: Vec<HashSet<Vec<Value>>> = tiles
                         .iter()
-                        .map(|tile| tile.paths_at(level).into_iter().collect())
+                        .map(|tile| tile.paths_at(level).into_iter().collect::<HashSet<_>>())
                         .collect();
                     held.iter()
                         .flatten()
@@ -675,10 +694,10 @@ impl TileProducer for ZipProducer {
                 };
                 // A row an arm deleted reaches no consumer, so no consumer releases it: the arm
                 // gives it back here and stops tracking it.
-                for (arm, (input, dropped)) in self.inputs.iter_mut().zip(dropped).enumerate() {
+                for (arm, (input, dropped)) in self.inputs.iter().zip(dropped).enumerate() {
                     if let Some(dropped) = dropped {
                         held[arm].retain(|path| !dropped.covers_path(path));
-                        input.release(dropped);
+                        cx.release(&**input, dropped);
                     }
                 }
                 let mut out = skeleton;
@@ -737,15 +756,15 @@ impl TileProducer for ZipProducer {
                     let vouched = held.union(domain_predicate);
                     qualify_beneath(out.values_at_mut(self.operator.level), &vouched);
                 }
-                self.held = held;
+                *held_state = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
-                if !self.base.obsolete_guard.is_empty() {
-                    out.remove_guarded(self.base.obsolete_guard.clone());
+                if !cx.obsolete(self).is_empty() {
+                    out.remove_guarded(cx.obsolete(self));
                 }
                 if let (1, Tile::DataFunction { domain, .. }) = (self.operator.level.index(), &out)
                 {
-                    self.emitted = self.emitted.union(&Predicate::from_column_value(domain));
+                    *emitted = emitted.union(&Predicate::from_column_value(domain));
                 }
                 // The completeness intersected above is each arm's, which an arm restating fewer
                 // levels than the projection's states over the region it was pulled at, so it is
@@ -758,6 +777,8 @@ impl TileProducer for ZipProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let mut held_state = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emitted = self.emitted.lock().unwrap_or_else(PoisonError::into_inner);
         let level = self.operator.level.index();
         let pair = self
             .base
@@ -771,9 +792,8 @@ impl TileProducer for ZipProducer {
         // The released fields of the rest are taken out of the pair instead. Beneath standing
         // levels only whole pairs are passed on.
         let delivered = match level {
-            1 => obsolete_guard.intersect(&TileGuard::Function(FunctionGuard::Domain(
-                self.emitted.clone(),
-            ))),
+            1 => obsolete_guard
+                .intersect(&TileGuard::Function(FunctionGuard::Domain(emitted.clone()))),
             _ => self.base.tiling.empty_guard(),
         };
         let whole = TileGuard::flatten_or(vec![whole_pair_rows(
@@ -799,13 +819,13 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
-        for paths in &mut self.held {
+        for paths in &mut *held_state {
             paths.retain(|path| !whole.covers_path(path));
         }
         if whole.is_universal() {
-            self.emitted = Predicate::False;
+            *emitted = Predicate::False;
         } else if let TileGuard::Function(FunctionGuard::Domain(keys)) = &whole {
-            self.emitted = self.emitted.minus(keys);
+            *emitted = emitted.minus(keys);
         }
     }
 }
@@ -922,6 +942,10 @@ impl MakeRecord {
 }
 
 impl TileOperator for MakeRecord {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::OUTERMOST
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -946,11 +970,14 @@ impl TileOperator for MakeRecord {
                 cx,
             ),
 
-            inputs: self
+            inputs: (self
                 .inputs
                 .iter()
                 .map(|i| subscribe_forwarding(i, &shared, cx))
-                .collect(),
+                .collect::<Vec<_>>())
+            .into_iter()
+            .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+            .collect(),
         })
     }
 }
@@ -980,7 +1007,10 @@ impl TileProducer for MakeRecordProducer {
 
     /// A record of values has no keys to project: the projection is the whole record or
     /// nothing, and a guard naming keys is a consumer's bug.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         match projection_guard.projection(&self.name()) {
             Projection::Everything => {}
             Projection::Nothing => return self.tiling().empty_tile(),
@@ -996,9 +1026,9 @@ impl TileProducer for MakeRecordProducer {
             .operator
             .names
             .iter()
-            .zip(self.inputs.iter_mut())
+            .zip(self.inputs.iter())
             .map(|(name, input)| {
-                let tile = input.get(input.tiling().universal_guard());
+                let tile = cx.get(&**input, input.tiling().universal_guard());
                 (name.clone(), tile)
             })
             .collect();
@@ -1134,6 +1164,10 @@ impl SelectField {
 }
 
 impl TileOperator for SelectField {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        level == CurryLevel::OUTERMOST
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -1164,7 +1198,7 @@ impl TileOperator for SelectField {
                 self.clone(),
                 cx,
             ),
-            input: input_producer,
+            input: pipeline_worker::shared_operand(input_producer),
 
             input_tiling,
         })
@@ -1226,7 +1260,10 @@ impl TileProducer for SelectFieldProducer {
     /// A stream of records keeps its keys under the field, so the input is pulled at the
     /// projection. A product of collections has no projection guard of its own: it is pulled
     /// whole, and the field cut after.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1235,7 +1272,7 @@ impl TileProducer for SelectFieldProducer {
             true => projection.guard(self.input.tiling()),
             false => self.input.tiling().universal_guard(),
         };
-        let mut tile = self.input.get(input_guard);
+        let mut tile = cx.get(&*self.input, input_guard);
         // A row holding no cell of this field gave that cell back to this reader's release
         // (`Tile::Record`'s `absent`), and the field is the whole value here, so the row
         // leaves with it. The record gathers its other fields' cells along.
@@ -1270,11 +1307,11 @@ impl TileProducer for SelectFieldProducer {
         // ([`guard_at_field`]), so it can still hold what this consumer released. The
         // field's own deleted rows are dropped too and reach no consumer, so they are released.
         let dropped = tile.deleted_keys_guard();
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(cx.obsolete(self));
         tile.compact();
         if let Some(dropped) = dropped {
             let at_field = self.at_field(dropped);
-            self.input.release(at_field);
+            cx.release(&*self.input, at_field);
         }
         tile.restrict_to(&projection, self.tiling());
         tile
@@ -1344,7 +1381,7 @@ mod tests {
             operator: RecordWrap::state_definition(SmolStr::new(name), level),
             base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out_tiling),
 
-            input: Box::new(spy),
+            input: pipeline_worker::shared_operand(Box::new(spy)),
         };
         (producer, log)
     }
@@ -1457,9 +1494,13 @@ mod tests {
             logs.push(log);
             inputs.push(Box::new(spy));
         }
-        let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
+        let out_tiling = Tiling::Record(
+            (0..2)
+                .map(|i| (tuple_field(i), tiling.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
         let mut producer = MakeRecordProducer {
-            operator: MakeRecord::state_definition((0..2).map(tuple_field).collect()),
+            operator: MakeRecord::state_definition((0..2).map(tuple_field).collect::<Vec<_>>()),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
 
             inputs,
@@ -1480,12 +1521,19 @@ mod tests {
     fn make_record_does_not_forward_an_empty_release() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
-        let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
+        let out_tiling = Tiling::Record(
+            [(tuple_field(0), tiling.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
         let mut producer = MakeRecordProducer {
             operator: MakeRecord::state_definition(vec![tuple_field(0)]),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![Box::new(spy)],
+            inputs: (vec![Box::new(spy)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
         };
 
         producer.release(out_tiling.empty_guard());
@@ -1518,8 +1566,12 @@ mod tests {
             inputs.push(Box::new(spy));
         }
         let names: Vec<SmolStr> = (0..2).map(tuple_field).collect();
-        let out_tiling =
-            Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
+        let out_tiling = Tiling::Record(
+            names
+                .iter()
+                .map(|n| (n.clone(), tiling.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
         let mut producer = MakeRecordProducer {
             operator: MakeRecord::state_definition(names.clone()),
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
@@ -1631,7 +1683,7 @@ mod tests {
         let mut producer = SelectFieldProducer {
             operator: SelectField::state_definition("a".into()),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
-            input: Box::new(spy),
+            input: pipeline_worker::shared_operand(Box::new(spy)),
 
             input_tiling,
         };
@@ -1733,7 +1785,7 @@ mod tests {
         let mut producer = SelectFieldProducer {
             operator: SelectField::state_definition("xs".into()),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
-            input: Box::new(spy),
+            input: pipeline_worker::shared_operand(Box::new(spy)),
 
             input_tiling,
         };
@@ -1789,7 +1841,10 @@ mod tests {
         let mut producer = SelectFieldProducer {
             operator: SelectField::state_definition("a".into()),
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
-            input: Box::new(TestTileProducer::new(input, input_tiling.clone())),
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                input,
+                input_tiling.clone(),
+            ))),
 
             input_tiling,
         };
@@ -1824,11 +1879,14 @@ mod tests {
         let mut zip = ZipProducer {
             operator: Zip::state_definition(vec!["a".into(), "b".into()], CurryLevel::new(1)),
 
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: Mutex::new(vec![HashSet::new(); 2]),
+            emitted: Mutex::new(Predicate::False),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
 
-            inputs: vec![Box::new(spy_a), Box::new(spy_b)],
+            inputs: (vec![Box::new(spy_a), Box::new(spy_b)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
         };
         zip.read_in_pipeline(zip.tiling().universal_guard());
         for log in [log_a, log_b] {
@@ -1878,14 +1936,17 @@ mod tests {
         let mut zip = ZipProducer {
             operator: Zip::state_definition(vec!["a".into(), "b".into()], CurryLevel::new(1)),
 
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: Mutex::new(vec![HashSet::new(); 2]),
+            emitted: Mutex::new(Predicate::False),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
 
-            inputs: vec![
+            inputs: (vec![
                 Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
                 Box::new(TestTileProducer::new(tile_b, input_tiling)),
-            ],
+            ])
+            .into_iter()
+            .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+            .collect(),
         };
 
         let result = zip.read_in_pipeline(zip.tiling().universal_guard());
@@ -1933,7 +1994,7 @@ mod tests {
         let arm_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
         let arm = |values: Vec<i64>, absent: Predicate| {
             let mut tile = Tile::data_function(
-                ColumnValue::from_uints((0..values.len() as u64).collect()),
+                ColumnValue::from_uints((0..values.len() as u64).collect::<Vec<_>>()),
                 Box::new(Tile::Scalar(ColumnValue::Ints(values))),
                 Predicate::False,
                 BitSet::new(),
@@ -1963,10 +2024,13 @@ mod tests {
             ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            inputs: (vec![Box::new(spy0), Box::new(spy1)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
 
-            emitted: Predicate::False,
-            held: vec![HashSet::new(); 2],
+            emitted: Mutex::new(Predicate::False),
+            held: Mutex::new(vec![HashSet::new(); 2]),
         };
         let Tile::DataFunction { absent_keys, .. } =
             zip.read_in_pipeline(out_tiling.universal_guard())
@@ -2023,10 +2087,13 @@ mod tests {
             ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            inputs: (vec![Box::new(spy0), Box::new(spy1)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
 
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: Mutex::new(vec![HashSet::new(); 2]),
+            emitted: Mutex::new(Predicate::False),
         };
         let out = zip.read_in_pipeline(out_tiling.universal_guard());
         let guard = out.to_guard();
@@ -2123,10 +2190,13 @@ mod tests {
             ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            inputs: (vec![Box::new(spy0), Box::new(spy1)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
 
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: Mutex::new(vec![HashSet::new(); 2]),
+            emitted: Mutex::new(Predicate::False),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
         // A consumer done with field `_0` at every row.
@@ -2164,21 +2234,23 @@ mod tests {
         zip.release(other_field.intersect(&first_row));
         assert!(
             zip.held
+                .lock()
+                .unwrap()
                 .iter()
                 .all(|paths| !paths.contains(&vec![Value::UInt(0)])),
             "a released pair must leave the row-tracking state"
         );
         assert!(
-            zip.held[0].contains(&vec![Value::UInt(1)]),
+            zip.held.lock().unwrap()[0].contains(&vec![Value::UInt(1)]),
             "an unpaired row stays held until released"
         );
         assert!(
-            !zip.emitted.contains(&Value::UInt(0)),
+            !zip.emitted.lock().unwrap().contains(&Value::UInt(0)),
             "a released pair must leave the emitted-key predicate"
         );
         zip.release(out_tiling.universal_guard());
-        assert!(zip.held.iter().all(HashSet::is_empty));
-        assert_eq!(zip.emitted, Predicate::False);
+        assert!(zip.held.lock().unwrap().iter().all(HashSet::is_empty));
+        assert_eq!(*zip.emitted.lock().unwrap(), Predicate::False);
     }
 
     /// An arm whose tile a test sets between pulls, returned as it stands, deleted rows
@@ -2195,7 +2267,7 @@ mod tests {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             self.tile
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2244,13 +2316,16 @@ mod tests {
             ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![scripted(&arm0), scripted(&arm1)],
+            inputs: (vec![scripted(&arm0), scripted(&arm1)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
 
-            held: vec![HashSet::new(); 2],
-            emitted: Predicate::False,
+            held: Mutex::new(vec![HashSet::new(); 2]),
+            emitted: Mutex::new(Predicate::False),
         };
         zip.read_in_pipeline(out_tiling.universal_guard());
-        assert!(zip.held[0].contains(&vec![Value::UInt(1)]));
+        assert!(zip.held.lock().unwrap()[0].contains(&vec![Value::UInt(1)]));
         // Arm 0 deletes row 1, and the consumer releases row 0, the pair it saw.
         *arm0.write().unwrap_or_else(PoisonError::into_inner) =
             rows(vec![0, 1], BitSet::from_iter([1]));
@@ -2259,9 +2334,9 @@ mod tests {
             Predicate::exactly(&[Value::UInt(0)]),
         )));
         assert!(
-            zip.held.iter().all(HashSet::is_empty),
+            zip.held.lock().unwrap().iter().all(HashSet::is_empty),
             "a deleted row stays tracked: {:?}",
-            zip.held
+            zip.held.lock().unwrap()
         );
     }
 
@@ -2318,18 +2393,21 @@ mod tests {
             ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            inputs: (vec![Box::new(spy0), Box::new(spy1)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
 
-            emitted: Predicate::False,
+            emitted: Mutex::new(Predicate::False),
             // Arm `_0` held both rows before the consumer released its field, so it gives them
             // back rather than lacking them.
-            held: vec![
+            held: Mutex::new(vec![
                 HashSet::from([
                     vec![Value::UInt(0), Value::UInt(7)],
                     vec![Value::UInt(1), Value::UInt(7)],
                 ]),
                 HashSet::new(),
-            ],
+            ]),
         };
         // The consumer reads field `_1` only, so it releases field `_0` at every path.
         let every_path = |field: TileGuard| {
@@ -2443,10 +2521,13 @@ mod tests {
             ),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
 
-            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            inputs: (vec![Box::new(spy0), Box::new(spy1)])
+                .into_iter()
+                .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                .collect(),
 
-            emitted: Predicate::False,
-            held: vec![HashSet::new(); 2],
+            emitted: Mutex::new(Predicate::False),
+            held: Mutex::new(vec![HashSet::new(); 2]),
         };
         let Tile::DataFunction { domain, .. } = zip.read_in_pipeline(out_tiling.universal_guard())
         else {
@@ -2505,7 +2586,7 @@ mod projection_tests {
                 operator: RecordWrap::state_definition(SmolStr::new("a"), CurryLevel::new(1)),
                 base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out),
 
-                input: Box::new(input),
+                input: pipeline_worker::shared_operand(Box::new(input)),
             },
             pulled,
         )
@@ -2535,7 +2616,7 @@ mod projection_tests {
     /// `[r.amount for r in rows]`: a field read out of a stream of records.
     fn amounts_of_records() -> (SelectFieldProducer, GuardLog) {
         let rows = Tile::data_function(
-            ColumnValue::UInts((0..ROWS).collect()),
+            ColumnValue::UInts((0..ROWS).collect::<Vec<_>>()),
             Box::new(Tile::record(HashMap::from([
                 (
                     SmolStr::new("amount"),
@@ -2545,7 +2626,7 @@ mod projection_tests {
                 ),
                 (
                     SmolStr::new("qty"),
-                    Tile::Scalar(ColumnValue::Ints((0..ROWS as i64).collect())),
+                    Tile::Scalar(ColumnValue::Ints((0..ROWS as i64).collect::<Vec<_>>())),
                 ),
             ]))),
             Predicate::True,
@@ -2570,7 +2651,7 @@ mod projection_tests {
             SelectFieldProducer {
                 operator: SelectField::state_definition(SmolStr::new("amount")),
                 base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
-                input: Box::new(input),
+                input: pipeline_worker::shared_operand(Box::new(input)),
 
                 input_tiling: in_tiling,
             },
@@ -2622,7 +2703,7 @@ mod projection_tests {
                 SelectFieldProducer {
                     operator: SelectField::state_definition(SmolStr::new("a")),
                     base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
-                    input: Box::new(input),
+                    input: pipeline_worker::shared_operand(Box::new(input)),
 
                     input_tiling: product_tiling.clone(),
                 },
@@ -2663,10 +2744,13 @@ mod projection_tests {
                 ),
                 base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
 
-                inputs: vec![Box::new(a), Box::new(b)],
+                inputs: (vec![Box::new(a), Box::new(b)])
+                    .into_iter()
+                    .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                    .collect(),
 
-                emitted: Predicate::False,
-                held: vec![HashSet::new(); 2],
+                emitted: Mutex::new(Predicate::False),
+                held: Mutex::new(vec![HashSet::new(); 2]),
             },
             a_pulled,
             b_pulled,
@@ -2766,7 +2850,10 @@ mod projection_tests {
                 operator: MakeRecord::state_definition(vec![SmolStr::new("a"), SmolStr::new("b")]),
                 base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out),
 
-                inputs: vec![Box::new(a), Box::new(b)],
+                inputs: (vec![Box::new(a), Box::new(b)])
+                    .into_iter()
+                    .map(|input| pipeline_worker::shared_operand(input as Box<dyn TileProducer>))
+                    .collect(),
             },
             a_pulled,
             b_pulled,

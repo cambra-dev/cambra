@@ -2191,14 +2191,49 @@ transitive indices (t1→t3 directly) vs. recompute on demand.
 None of the above algorithms guarantee termination in the presence of cycles in the dataflow
 graph. Detecting convergence (rather than truncating iteration) is an open problem.
 
-## Shared native operator definitions
+## Shared native definitions and worker state
 
-Operator definitions use `Arc` and immutable subscription methods. Producers retain mutable
-execution state and implement `get_impl` and `release_impl` directly. Shared definitions provide
-immutable configuration.
-Runtime source, consumer and breaker handles use standard-library locks. Compiler source types
-remain in `SourceDefinition`, separate from the runtime source trait.
+The [unified dispatcher](design-parallel-dispatcher.md#unified-native-execution) uses the canonical
+operator and producer instances for both coordinator and concurrent execution. `subscribe` constructs
+that graph once. A pipeline retains its existing input chain in a shared cell; its workers create
+only input cursors over that cell. They neither subscribe nor construct another operator chain.
+Stateless native producers read their existing operands through `get_impl(&self, context, guard)`.
+Temporary tiles remain on the stack. Converse retention and zip presence bookkeeping have mutexes
+on their canonical instances; fan-out aliases keep their existing shared cache and subscriptions.
 
-Construction and notifications share a mutex with per-thread nesting and cycle identities.
-Poisoned guards are recovered to preserve the existing unwind behavior. Store guards retain the
-whole producer slot and settle pending releases when the operation ends.
+`ExecutionContext` holds each cursor's releases and validation snapshots, keyed by the existing
+producer's identity. Releases issued inside a native read are recorded there. A worker reports those
+node releases along with its cumulative input guard only after native consumption and any local
+aggregation flush have integrated output. The coordinator applies them to the canonical chain before
+publication and acknowledgement. Canonical native reads call the same `get_impl` and apply their
+recorded releases after the read. Producers requiring exclusive access retain `get_exclusive_impl`;
+worker admission rejects chains containing those nodes, except shared breaker boundaries.
+
+`ConsumeState` borrows a worker's input cursor and retained aggregation buffers for a batch. Workers
+call `consume_impl(&self, state, input, guard)` on the canonical breaker under a shared runtime guard.
+Concurrent claims may share that guard; canonical mutation and release wait until those calls
+finish. Native coordinator consumption borrows the canonical input under its input mutex and calls
+the same `consume_impl`. Coordinator-only control breakers retain the exclusive `consume` callback.
+Local aggregation buffers are initialized by the native consumer and retained across batches.
+
+Runtime cells use standard-library `RwLock` and `Mutex`. Lock acquisition recovers poisoned guards,
+preserving the existing nonpoisoning execution contract. Store guards own the entire boxed-producer
+slot and settle deferred releases when the operation ends. Induction views retain that store guard
+while accessing its concrete producer. Construction and notifications share one mutex; per-thread
+nesting retains it until every control guard drops, and active-consumer identities detect recursive
+delivery.
+
+Native memo caches, scalar accumulators and sink delivery state have their own shared locks.
+Output releases and cache updates use the same lock, so late work cannot restore reclaimed data.
+Input computation and upstream release happen outside these output locks. Grouped aggregates retain
+worker-local maps and drain new contributions into the shared native state at each bounded batch's
+end, preserving local allocation. Group release and merging use the same state lock.
+
+A worker reports only completed claims and cumulative input releases after `consume_impl` and any
+local flush have published their output. The coordinator then advances the canonical input release,
+publishes output and acknowledges claims. The canonical subscription accumulates releases across
+workers while native fan-out intersections retain data for other logical readers. Whole operands
+stay held until their reader finishes. Scalar terminality follows canonical input completion, rather
+than any one worker's private input progress. Finalization waits for every queued and active claim.
+DOP one uses this same path. Operators requiring exclusive state continue on the coordinator within
+the same plan.

@@ -768,7 +768,7 @@ impl TileProducer for UnionProducer {
     /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
     /// projection reaches each arm as what it names under that arm's tag, as a release does, and
     /// an arm it names nothing of is not pulled.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // Closed first, so a pull of every arm reads as the pull of everything it is.
         let projection_guard = projection_guard.closed_over(self.tiling());
         let projection = projection_guard.projection_for(self);
@@ -943,7 +943,7 @@ mod tests {
         impl TileProducer for OuterOnly {
             impl_producer_base!();
 
-            fn get_impl(&mut self, guard: TileGuard) -> Tile {
+            fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
                 self.input.get(guard)
             }
 
@@ -1586,7 +1586,7 @@ mod tests {
             fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
                 node
             }
-            fn get_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
                 self.tile.clone()
             }
             fn release_impl(&mut self, obsolete_guard: TileGuard) {

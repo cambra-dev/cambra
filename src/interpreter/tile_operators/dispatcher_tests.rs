@@ -137,7 +137,7 @@ impl Scripted {
 impl TileProducer for Scripted {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -145,7 +145,7 @@ impl TileProducer for Scripted {
 }
 
 impl Breaker for Scripted {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, _: InputId, guard: TileGuard) {
         self.input.get(guard);
         if let Some(released) = &self.releases {
             self.input.release(released.clone());
@@ -262,7 +262,7 @@ fn a_partly_released_breaker_pushes_only_what_is_left() {
         .begin_run();
     memo.write()
         .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, ints().universal_guard());
+        .consume(InputId::ONLY, ints().universal_guard());
     memo.write()
         .unwrap_or_else(PoisonError::into_inner)
         .release(keys_between(2, 3));
@@ -518,7 +518,7 @@ fn finish_with_a_package_queued_panics() {
     breakers[0]
         .write()
         .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, ints().universal_guard());
+        .consume(InputId::ONLY, ints().universal_guard());
     dispatcher.close(PipelineId(0));
     finish_pipeline(&dispatcher, &breakers, PipelineId(0));
     finish_pipeline(&dispatcher, &breakers, PipelineId(1));
@@ -570,7 +570,7 @@ fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
         .begin_run();
     memo.write()
         .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, keys_between(0, 3));
+        .consume(InputId::ONLY, keys_between(0, 3));
     dispatcher.acknowledge(package);
     finish_pipeline(&dispatcher, &[handle], PipelineId(0));
 }
@@ -598,7 +598,7 @@ impl Positions {
 impl TileProducer for Positions {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -950,7 +950,7 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
 fn a_memos_morsels_partition_its_final_guard_and_leave_out_released_keys() {
     let mut memo = MemoProducer::over(Box::new(Input::over(&source(SPARSE))), &ints());
     memo.begin_run();
-    memo.consume_impl(InputId::ONLY, ints().universal_guard());
+    memo.consume(InputId::ONLY, ints().universal_guard());
     memo.release(keys_between(3, 3));
     memo.release(keys_between(8, 8));
     let guard = memo.final_guard();
@@ -984,7 +984,7 @@ fn a_partly_released_source_pushes_morsels_over_what_is_left() {
         .begin_run();
     memo.write()
         .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, ints().universal_guard());
+        .consume(InputId::ONLY, ints().universal_guard());
     memo.write()
         .unwrap_or_else(PoisonError::into_inner)
         .release(keys_between(2, 3));
@@ -1015,7 +1015,7 @@ fn a_breaker_of_one_value_pushes_one_morsel() {
         .begin_run();
     sum.write()
         .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, ints().universal_guard());
+        .consume(InputId::ONLY, ints().universal_guard());
     push_to(
         &mut *sum.write().unwrap_or_else(PoisonError::into_inner),
         &[1],
@@ -1052,7 +1052,7 @@ fn random_morsel_sizes_partition_and_answer_the_same() {
 
         let mut memo = MemoProducer::over(Box::new(Input::over(&source_rows(&keys))), &ints());
         memo.begin_run();
-        memo.consume_impl(InputId::ONLY, ints().universal_guard());
+        memo.consume(InputId::ONLY, ints().universal_guard());
         for key in &released {
             memo.release(keys_between(*key, *key));
         }
@@ -1162,7 +1162,7 @@ fn a_final_guard_pushed_twice_is_pushed_once() {
 fn a_guard_naming_part_of_what_is_held_is_cut_at_the_keys_it_names() {
     let mut memo = MemoProducer::over(Box::new(Input::over(&source(0..8))), &ints());
     memo.begin_run();
-    memo.consume_impl(InputId::ONLY, ints().universal_guard());
+    memo.consume(InputId::ONLY, ints().universal_guard());
     let guard = keys_between(3, 6);
     let morsels = memo.morsels(&guard, 2);
     assert_eq!(partition_gap(&guard, &morsels), None);

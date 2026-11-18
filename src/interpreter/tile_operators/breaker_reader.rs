@@ -12,9 +12,17 @@ pub(crate) fn share_breaker(producer: impl BreakingProducer + 'static) -> Box<dy
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
         .breaker_handle = Some(Arc::downgrade(&handle));
+    let mut base = ProducerBase::unowned(BreakerReader::alloc_id(), &tiling);
+    base.definition = handle
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .base()
+        .definition
+        .clone();
     Box::new(BreakerReader {
-        base: ProducerBase::unowned(BreakerReader::alloc_id(), &tiling),
+        base,
         handle,
+        releases: true,
     })
 }
 
@@ -23,9 +31,14 @@ struct BreakerReader {
     base: ProducerBase,
     // shared-state-ok: the producer subscription itself, with all values read through get.
     handle: BreakerHandle,
+    releases: bool,
 }
 
 impl TileProducer for BreakerReader {
+    fn worker_breaker(&self) -> Option<BreakerHandle> {
+        Some(self.handle.clone())
+    }
+
     impl_producer_base!();
 
     fn get(&mut self, guard: TileGuard) -> Tile {
@@ -36,17 +49,22 @@ impl TileProducer for BreakerReader {
             .unwrap_or_else(PoisonError::into_inner)
             .get(guard)
     }
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, _cx: &mut ExecutionContext, guard: TileGuard) -> Tile {
         self.handle
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .get(guard)
     }
     fn release_impl(&mut self, guard: TileGuard) {
-        self.handle
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .release(guard);
+        if self.releases {
+            self.handle
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .release(guard);
+        }
     }
     fn restates(&self) -> Restates {
         self.handle
@@ -95,7 +113,7 @@ mod tests {
             fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
                 visit("input", &*self.input);
             }
-            fn get_impl(&mut self, _: TileGuard) -> Tile {
+            fn get_exclusive_impl(&mut self, _: TileGuard) -> Tile {
                 self.input
                     .get(
                         CurryLevel::new(1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(

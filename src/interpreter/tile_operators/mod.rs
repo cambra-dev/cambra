@@ -49,7 +49,9 @@ use crate::{
 
 mod aggregate;
 mod breaker_reader;
+pub(crate) mod pipeline_worker;
 pub(crate) use breaker_reader::share_breaker;
+pub use pipeline_worker::{ConsumeState, ExecutionContext, InputReleases, WorkerPlan};
 mod combinators;
 mod cycle_slot;
 #[cfg(test)]
@@ -143,6 +145,22 @@ pub trait TileOperator: Send + Sync {
         short_type_name::<Self>()
     }
 
+    /// Whether this operator preserves independently executable regions at `level`.
+    /// The planner checks every operator between shared breaker boundaries.
+    fn partitions_at(&self, _level: CurryLevel) -> bool {
+        false
+    }
+
+    /// Translate the partition coordinate through this operator's input edges.
+    fn partition_input_level(&self, level: CurryLevel) -> CurryLevel {
+        level
+    }
+
+    /// Constructs one producer for `consumer` over the requested `intent_guard` region.
+    /// Its [`ProducerBase`] names this operator and holds `cx`'s probe slot.
+    /// An input's producer comes from the input's own `subscribe`, which attributes it
+    /// to that operator.
+    /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn subscribe(
         self: Arc<Self>,
         intent_guard: TileGuard,
@@ -832,6 +850,9 @@ pub struct ProducerBase {
     /// The operator that built this producer. `None` for an unprobed forwarding reader
     /// or a protocol test double built with `ProducerBase::unowned`.
     pub node_id: Option<NodeId>,
+    pub(crate) definition: Option<Arc<dyn TileOperator>>,
+    worker_pins: usize,
+    worker_release: Option<TileGuard>,
     /// The probe slot of the subscribe context this producer was subscribed under,
     /// written on every [`TileProducer::get`] while it holds a table.
     pub(crate) probes: ProbeSlot,
@@ -861,6 +882,19 @@ impl ProducerBase {
             && self.placement.as_ref().is_none_or(|at| at.get().is_none())
     }
 
+    /// Output releases may reclaim local state immediately, but their forwarding
+    /// must wait until this pipeline can no longer read shared operands.
+    fn defer_worker_release(&mut self, guard: &TileGuard) -> bool {
+        if self.worker_pins == 0 {
+            return false;
+        }
+        self.worker_release = Some(match self.worker_release.take() {
+            Some(before) => before.union(guard),
+            None => guard.clone(),
+        });
+        true
+    }
+
     /// Initialize a producer for `owner`'s operator.
     pub(crate) fn new(
         id: usize,
@@ -868,11 +902,18 @@ impl ProducerBase {
         owner: Arc<dyn TileOperator>,
         cx: &SubscribeContext,
     ) -> Self {
+        Self::owned(id, tiling, owner, cx.probes().clone())
+    }
+
+    fn owned(id: usize, tiling: &Tiling, owner: Arc<dyn TileOperator>, probes: ProbeSlot) -> Self {
         Self {
             id,
             breaker_handle: None,
+            worker_pins: 0,
+            worker_release: None,
             node_id: owner.operator_id(),
-            probes: cx.probes().clone(),
+            definition: Some(owner.clone()),
+            probes,
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
 
@@ -915,7 +956,10 @@ impl ProducerBase {
         Self {
             id,
             breaker_handle: None,
+            worker_pins: 0,
+            worker_release: None,
             node_id: None,
+            definition: None,
             probes: ProbeSlot::default(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
@@ -1319,6 +1363,99 @@ pub(crate) fn cut_at_keys(
     cut_before(region, &cuts, &domain)
 }
 
+pub(crate) fn order_positions(tile: &mut Tile, tiling: &Tiling) {
+    fn positional(extent: &Extent) -> bool {
+        match extent {
+            Extent::UIntRange(_) | Extent::Base(crate::interpreter::BaseType::Unit) => true,
+            Extent::Record(fields) => fields.values().all(positional),
+            Extent::Union(arms) => arms.iter().all(|(_, extent)| positional(extent)),
+            Extent::Restricted { base, .. } => positional(base),
+            _ => false,
+        }
+    }
+    match (tile, tiling) {
+        (
+            Tile::DataFunction {
+                row_starts,
+                domain: ColumnValue::UInts(keys),
+                codomain,
+                deleted,
+                ..
+            },
+            Tiling::DataFunction {
+                domain: Extent::UIntRange(_),
+                codomain: inner,
+            },
+        ) => {
+            let mut order = Vec::with_capacity(keys.len());
+            for (row, &first) in row_starts.iter().enumerate() {
+                let last = row_starts.get(row + 1).copied().unwrap_or(keys.len());
+                let mut run: Vec<_> = (first..last).collect();
+                run.sort_by_key(|i| keys[*i]);
+                order.extend(run);
+            }
+            if order.iter().enumerate().any(|(i, j)| i != *j) {
+                **codomain = codomain.select_rows(&order);
+                *keys = order.iter().map(|i| keys[*i]).collect();
+                *deleted = order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(new, old)| deleted.contains(*old).then_some(new))
+                    .collect();
+            }
+            order_positions(codomain, inner);
+        }
+        (
+            Tile::DataFunction {
+                row_starts,
+                domain,
+                codomain,
+                deleted,
+                ..
+            },
+            Tiling::DataFunction {
+                domain: extent,
+                codomain: inner,
+            },
+        ) => {
+            // Products and concatenations retain compound positions. Their payload and deletion
+            // mask must follow the same permutation as those keys, within each enclosing row.
+            if positional(extent) {
+                let keys: Vec<_> = (0..domain.len()).map(|i| domain.index_at(i)).collect();
+                let mut order = Vec::with_capacity(keys.len());
+                for (row, &first) in row_starts.iter().enumerate() {
+                    let last = row_starts.get(row + 1).copied().unwrap_or(keys.len());
+                    let mut run: Vec<_> = (first..last).collect();
+                    run.sort_by(|a, b| keys[*a].partial_cmp(&keys[*b]).expect("positions compare"));
+                    order.extend(run);
+                }
+                if order.iter().enumerate().any(|(i, j)| i != *j) {
+                    *domain = domain.select_indices(order.iter().copied(), order.len());
+                    **codomain = codomain.select_rows(&order);
+                    *deleted = order
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(new, old)| deleted.contains(*old).then_some(new))
+                        .collect();
+                }
+            }
+            order_positions(codomain, inner);
+        }
+        (Tile::Record { fields, .. }, Tiling::Record(shapes)) => {
+            for (name, field) in fields {
+                order_positions(field, &shapes[name]);
+            }
+        }
+        (
+            Tile::Aggregation { accumulator, .. },
+            Tiling::Aggregation {
+                accumulator: shape, ..
+            },
+        ) => order_positions(accumulator, shape),
+        _ => {}
+    }
+}
+
 /// Whether `key` has an order among the keys of its type: every value but a function, as
 /// `Value`'s `partial_cmp` orders them.
 fn has_order(key: &Value) -> bool {
@@ -1406,15 +1543,50 @@ impl InputId {
 }
 
 /// The end of a pipeline, as the dispatcher drives it: it consumes the pipeline's work packages.
-/// [`consume_impl`] pulls the breaker's input at a guard, merges the answer, and releases the
+/// [`consume`] pulls the breaker's input at a guard, merges the answer, and releases the
 /// input at what the answer stated once it has taken delivery of it, so the driver handles no
 /// tile. A breaker that also answers pulls from that state is a [`BreakingProducer`], which pushes
 /// what it decided. When a pipeline may finish is the dispatcher's to decide
 /// (`crate::interpreter::dispatcher`). See `src/interpreter/design-operators.md`, "Pipeline
 /// breakers".
 ///
-/// [`consume_impl`]: Self::consume_impl
+/// [`consume`]: Self::consume
 pub trait Breaker {
+    /// A reusable private input chain whose results can be integrated into this breaker.
+    #[doc(hidden)]
+    fn worker_plan(
+        &self,
+        _graphs: &[crate::interpreter::operator_graph::OperatorGraph],
+    ) -> Option<WorkerPlan> {
+        None
+    }
+
+    /// Checked folds retain their producing dependencies' execution order too.
+    fn requires_ordered_input(&self) -> bool {
+        false
+    }
+
+    /// Close the canonical input after all claimed work has been integrated.
+    #[doc(hidden)]
+    fn finish_worker_input(&mut self) {}
+
+    /// Consume through this shared breaker using the caller's private input and local buffers.
+    /// Coordinator-only control breakers use `consume` with exclusive access instead.
+    #[doc(hidden)]
+    fn consume_impl(&self, _state: &mut ConsumeState<'_>, _input: InputId, _guard: TileGuard) {
+        unreachable!("only admitted breakers consume with caller-owned state")
+    }
+
+    /// Publish local accumulation before reporting input safe to reclaim.
+    #[doc(hidden)]
+    fn flush_worker(&self, _state: &mut ConsumeState<'_>) {}
+
+    /// Advance canonical input accounting after a worker has published its output.
+    #[doc(hidden)]
+    fn release_worker_input(&mut self, _releases: InputReleases) {
+        unreachable!("only admitted breakers receive worker releases")
+    }
+
     /// Pull input `input` at `guard`, a guard of the tiling that input answers, merge the answer into
     /// this breaker's state, and release the input at the guard the answer states once the
     /// answer is taken.
@@ -1422,12 +1594,12 @@ pub trait Breaker {
     /// # Panics
     ///
     /// When the breaker cannot consume its input's shape.
-    fn consume_impl(&mut self, input: InputId, guard: TileGuard);
+    fn consume(&mut self, input: InputId, guard: TileGuard);
 
     /// Initialize per-run publication and loop control before the first package executes.
     fn begin_run(&mut self) {}
 
-    /// The tiling of input `input`, which `consume_impl` pulls: what a package's guard is a guard of, and
+    /// The tiling of input `input`, which `consume` pulls: what a package's guard is a guard of, and
     /// what a source pipeline's first packages cut.
     fn input_tiling(&self, input: InputId) -> Tiling;
 
@@ -1559,6 +1731,36 @@ pub trait BreakingProducer: TileProducer + Breaker {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer: Send + Sync {
+    /// The existing shared breaker at this pipeline boundary.
+    #[doc(hidden)]
+    fn worker_breaker(&self) -> Option<crate::interpreter::dispatcher::BreakerHandle> {
+        self.base()
+            .breaker_handle
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Slots of one inline fan-out share one worker-local input state.
+    #[doc(hidden)]
+
+    /// Protect canonical shared operands across active and still queued claims.
+    #[doc(hidden)]
+    fn pin_worker_inputs(&mut self) {
+        self.base_mut().worker_pins += 1;
+    }
+
+    #[doc(hidden)]
+    fn unpin_worker_inputs(&mut self) {
+        let base = self.base_mut();
+        assert!(base.worker_pins > 0);
+        base.worker_pins -= 1;
+        if base.worker_pins == 0
+            && let Some(guard) = base.worker_release.take()
+        {
+            self.release_impl(guard);
+        }
+    }
+
     /// The entry before `input`, where an enclosing breaker's planner can receive that input's
     /// pushes in its own keys. Unplaced inputs remain read by pull.
     fn input_entry(&self, _input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
@@ -1663,7 +1865,7 @@ pub trait TileProducer: Send + Sync {
                 self.restates()
             );
         }
-        let mut result = self.get_impl(projection_guard);
+        let mut result = self.get_exclusive_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
         if let Some(cells) = self.obsolete_guard().released_cells() {
@@ -1757,13 +1959,36 @@ pub trait TileProducer: Send + Sync {
             &result,
             &base.obsolete_guard,
         );
-
         result
     }
 
     /// Produce the tile for `projection_guard`, honoring accumulated releases and completeness.
     /// The [`get`](Self::get) wrapper supplies validation, not general projection or reclamation.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile;
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let mut cx = ExecutionContext::default();
+        let result = self.get_impl(&mut cx, projection_guard);
+        cx.apply(self);
+        result
+    }
+
+    /// Read this existing instance with execution-local progress and deferred releases.
+    #[doc(hidden)]
+    fn get_impl(&self, _cx: &mut ExecutionContext, _guard: TileGuard) -> Tile {
+        unreachable!("this producer requires exclusive execution")
+    }
+    #[doc(hidden)]
+    fn shared_execution(&self) -> bool {
+        false
+    }
+    #[doc(hidden)]
+    fn shared_input(&self) -> Option<pipeline_worker::SharedInputHandle> {
+        None
+    }
+    #[doc(hidden)]
+    fn apply_input_releases(&mut self, releases: &InputReleases) {
+        pipeline_worker::apply_releases(self, &releases.nodes);
+        self.release(releases.guard.clone());
+    }
 
     /// The collection levels whose keys this producer restates. A producer that declares more
     /// than the outermost keys reads its projection with [`TileGuard::projection_for`]
@@ -2033,9 +2258,7 @@ pub(crate) mod test_helpers {
             {
                 placement.set(Some(crate::interpreter::dispatcher::PipelineId(0)));
             }
-            crate::interpreter::dispatcher::in_pipeline_for_test(|| {
-                self.consume_impl(input, guard)
-            });
+            crate::interpreter::dispatcher::in_pipeline_for_test(|| self.consume(input, guard));
         }
     }
     impl<P: super::Breaker + ?Sized> ConsumeInPipeline for P {}
@@ -2318,7 +2541,7 @@ pub(crate) mod test_helpers {
             crate::interpreter::Restates::Every
         }
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
             self.pulled
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2451,7 +2674,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
             let mut tile = self
                 .tile
                 .read()
@@ -2817,7 +3040,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
 
@@ -2836,7 +3059,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             self.tile.clone()
         }
 
@@ -2881,7 +3104,7 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
@@ -2927,7 +3150,7 @@ mod tests {
             visit("input", &*self.input);
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             use super::FunctionGuard;
             use crate::interpreter::{Predicate, Value};
             self.input
@@ -2991,7 +3214,7 @@ mod tests {
     impl TileProducer for OneRow {
         impl_producer_base!();
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        fn get_exclusive_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             Tile::Scalar(ColumnValue::Ints(vec![7]))
         }
 

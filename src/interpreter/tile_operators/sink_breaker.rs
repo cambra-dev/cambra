@@ -23,7 +23,7 @@ use crate::interpreter::sinks::ProducerSlot;
 pub(crate) struct SinkBreaker {
     producer: ProducerSlot,
     sink: Arc<dyn DataSink>,
-    hands: Hands,
+    hands: Mutex<Hands>,
 }
 
 /// When a [`SinkBreaker`] hands its sink what it pulled.
@@ -51,8 +51,18 @@ enum Hands {
 }
 
 impl SinkBreaker {
-    fn deliver(&mut self, tile: Tile) {
-        match &mut self.hands {
+    pub(crate) fn may_reorder(&self) -> bool {
+        matches!(
+            *self.hands.lock().unwrap_or_else(PoisonError::into_inner),
+            Hands::Main {
+                each_package: false,
+                loop_beneath: false,
+                ..
+            }
+        )
+    }
+    fn deliver(&self, tile: Tile) {
+        match &mut *self.hands.lock().unwrap_or_else(PoisonError::into_inner) {
             Hands::EachPackage => self.sink.process(&tile),
             Hands::Main {
                 each_package,
@@ -78,25 +88,37 @@ impl SinkBreaker {
     /// The breaker of the sink that hands what it pulls of `producer`, which `subscribe` has
     /// filled, to `sink`, one answer per package.
     pub(crate) fn new(producer: ProducerSlot, sink: Arc<dyn DataSink>) -> Self {
+        {
+            let mut slot = Self::input(&producer);
+            if let Some(input) = slot.take() {
+                *slot = Some(pipeline_worker::share_input(input));
+            }
+        }
         Self {
             producer,
             sink,
-            hands: Hands::EachPackage,
+            hands: Mutex::new(Hands::EachPackage),
         }
     }
 
     /// The breaker of a `main` output, which hands what it pulls of `producer` to `sink` once, at
     /// its finish ([`Hands::Main`]).
     pub(crate) fn main(producer: ProducerSlot, sink: Arc<dyn DataSink>) -> Self {
+        {
+            let mut slot = Self::input(&producer);
+            if let Some(input) = slot.take() {
+                *slot = Some(pipeline_worker::share_input(input));
+            }
+        }
         Self {
             producer,
             sink,
-            hands: Hands::Main {
+            hands: Mutex::new(Hands::Main {
                 each_package: false,
                 answer: None,
                 handed_terminal: false,
                 loop_beneath: false,
-            },
+            }),
         }
     }
 
@@ -104,7 +126,9 @@ impl SinkBreaker {
     /// answer that states it complete: a run over a live source finishes it only once every
     /// source yields everything.
     pub(crate) fn hand_each_package(&mut self) {
-        if let Hands::Main { each_package, .. } = &mut self.hands {
+        if let Hands::Main { each_package, .. } =
+            &mut *self.hands.lock().unwrap_or_else(PoisonError::into_inner)
+        {
             *each_package = true;
         }
     }
@@ -113,7 +137,9 @@ impl SinkBreaker {
     /// that scope's store, rows the loop's rounds have written. Each is final as it
     /// is written, and the producer states it complete.
     pub(crate) fn reads_a_loop(&mut self) {
-        if let Hands::Main { loop_beneath, .. } = &mut self.hands {
+        if let Hands::Main { loop_beneath, .. } =
+            &mut *self.hands.lock().unwrap_or_else(PoisonError::into_inner)
+        {
             *loop_beneath = true;
         }
     }
@@ -132,24 +158,64 @@ impl SinkBreaker {
 }
 
 impl Breaker for SinkBreaker {
+    fn finish_worker_input(&mut self) {
+        let mut slot = Self::input(&self.producer);
+        let input = slot.as_mut().expect("a sink has subscribed its producer");
+        let whole = input.tiling().universal_guard();
+        input.release(whole);
+    }
+    fn worker_plan(
+        &self,
+        graphs: &[crate::interpreter::operator_graph::OperatorGraph],
+    ) -> Option<WorkerPlan> {
+        if !self.may_reorder() {
+            return None;
+        }
+        let mut slot = Self::input(&self.producer);
+        let input = slot.take().expect("a sink has subscribed its producer");
+        *slot = Some(pipeline_worker::share_input(input));
+        WorkerPlan::new(
+            &**slot.as_ref().expect("a sink has subscribed its producer"),
+            graphs,
+        )
+    }
+    fn release_worker_input(&mut self, releases: InputReleases) {
+        Self::input(&self.producer)
+            .as_mut()
+            .expect("a sink has subscribed its producer")
+            .apply_input_releases(&releases);
+    }
+
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, input: InputId, guard: TileGuard) {
         let mut slot = Self::input(&self.producer);
         let producer = slot.as_mut().expect("a sink has subscribed its producer");
-        let tile = producer.get(guard);
-        producer.release(tile.to_guard());
-        drop(slot);
+        let mut local = None;
+        self.consume_impl(
+            &mut ConsumeState {
+                input: &mut **producer,
+                local: &mut local,
+                worker: false,
+            },
+            input,
+            guard,
+        );
+    }
+    fn consume_impl(&self, state: &mut ConsumeState<'_>, _: InputId, guard: TileGuard) {
+        let tile = state.input.get(guard);
+        state.input.release(tile.to_guard());
         self.deliver(tile);
     }
 
     fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {
+        let mut hands = self.hands.lock().unwrap_or_else(PoisonError::into_inner);
         let Hands::Main {
             each_package,
             answer,
             handed_terminal,
             loop_beneath,
-        } = &mut self.hands
+        } = &mut *hands
         else {
             return;
         };
@@ -184,7 +250,8 @@ impl Breaker for SinkBreaker {
             }
             return;
         }
-        let answer = merged.unwrap_or(rest);
+        let mut answer = merged.unwrap_or(rest);
+        order_positions(&mut answer, &tiling);
         debug_assert!(
             answer.is_terminal(),
             "a `main` output is handed a terminal answer at its finish"

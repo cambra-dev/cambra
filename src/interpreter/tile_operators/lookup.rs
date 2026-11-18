@@ -460,7 +460,7 @@ impl TileProducer for CheckedLookupProducer {
     /// `(collection, key)` rows, is pulled at the projection while the collection is read whole:
     /// every key is answered against all of it. One answer for one key is a scalar and has no
     /// keys to project.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -805,7 +805,7 @@ impl TileProducer for LookupProducer {
     }
 
     /// Read only the requested rows, each carrying its own key and collection.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();

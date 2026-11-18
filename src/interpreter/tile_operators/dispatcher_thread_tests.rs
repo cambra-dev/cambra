@@ -411,7 +411,7 @@ struct ScriptBreaker {
 impl TileProducer for ScriptBreaker {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -419,7 +419,7 @@ impl TileProducer for ScriptBreaker {
 }
 
 impl Breaker for ScriptBreaker {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, _: InputId, guard: TileGuard) {
         self.consumed |= mask_of(&guard);
     }
 
@@ -1483,7 +1483,7 @@ impl SharedHeld {
 impl TileProducer for SharedHeld {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, _guard: TileGuard) -> Tile {
         self.tiling().empty_tile()
     }
 
@@ -1491,7 +1491,7 @@ impl TileProducer for SharedHeld {
 }
 
 impl Breaker for SharedHeld {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, _: InputId, guard: TileGuard) {
         self.consumed.fetch_or(mask_of(&guard), SeqCst);
     }
 
@@ -1561,7 +1561,7 @@ fn pushed_from_several_threads(seed: u64, threads: usize) {
                 loop {
                     match dispatcher.claim(None) {
                         Next::Package(package) if package.pipeline == PipelineId(0) => {
-                            breaker.consume_impl(InputId::ONLY, package.guard.clone());
+                            breaker.consume(InputId::ONLY, package.guard.clone());
                             jitter(&mut rng);
                             let mut pushes = dispatcher.pushes(package.pipeline);
                             pushes.push_final(&breaker);

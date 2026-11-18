@@ -218,6 +218,10 @@ fn input_values_are_keys(input: &dyn TileOperator) -> bool {
 }
 
 impl TileOperator for MapResult {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        self.level > level
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -304,8 +308,8 @@ impl TileOperator for MapResult {
                 self.clone(),
                 cx,
             ),
-            input: input_producer,
-            function: function_producer,
+            input: pipeline_worker::shared_operand(input_producer),
+            function: pipeline_worker::shared_operand(function_producer),
             values_are_keys,
         })
     }
@@ -372,17 +376,20 @@ impl TileProducer for MapResultProducer {
         }
     }
 
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let mut out = self.apply(&projection);
+        let mut out = self.apply(cx, &projection);
         // Part of an output value released names no part of the input, so the input keeps
         // the row and the value is recomputed on the next pull (`release_impl`); what the
         // consumer let go is taken back out here.
-        if !self.base.obsolete_guard.is_empty() {
-            out.remove_guarded(self.base.obsolete_guard.clone());
+        if !cx.obsolete(self).is_empty() {
+            out.remove_guarded(cx.obsolete(self));
         }
         // Mapping keeps the input's keys, so the input already answered the projection; the
         // cut states it for an input that answered more.
@@ -435,7 +442,7 @@ impl MapResultProducer {
     }
 
     /// The function applied at every argument the input holds, for the keys `projection` names.
-    fn apply(&mut self, projection: &Projection) -> Tile {
+    fn apply(&self, cx: &mut ExecutionContext, projection: &Projection) -> Tile {
         let f_tiling = self.function.tiling().clone();
         assert!(
             f_tiling.has_domain(),
@@ -451,7 +458,7 @@ impl MapResultProducer {
             false => i_tiling.universal_guard(),
         };
 
-        let mut input_tile = self.input.get(input_guard);
+        let mut input_tile = cx.get(&*self.input, input_guard);
         // Drop logically-deleted rows before mapping. Release marks rows deleted
         // rather than removing them (`Tile::remove_guarded`), and the paths below
         // carry the input's `domain` through to the output while building the
@@ -463,7 +470,7 @@ impl MapResultProducer {
         let dropped = input_tile.deleted_keys_guard();
         input_tile.compact();
         if let Some(dropped) = dropped {
-            self.input.release(dropped);
+            cx.release(&*self.input, dropped);
         }
         let function_guard = match projection {
             Projection::Keys { .. } if self.projection_reaches_function() => {
@@ -480,7 +487,7 @@ impl MapResultProducer {
             }
             _ => f_tiling.universal_guard(),
         };
-        let function_tile = self.function.get(function_guard);
+        let function_tile = cx.get(&*self.function, function_guard);
 
         // A function whose values are themselves a collection needs special-case handling:
         // the application adds a level, so it rebuilds the tile around it rather than
@@ -846,6 +853,10 @@ impl MapResultToConst {
 }
 
 impl TileOperator for MapResultToConst {
+    fn partitions_at(&self, level: CurryLevel) -> bool {
+        self.level > level
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -881,8 +892,8 @@ impl TileOperator for MapResultToConst {
                 self.clone(),
                 cx,
             ),
-            input: input_producer,
-            constant: constant_producer,
+            input: pipeline_worker::shared_operand(input_producer),
+            constant: pipeline_worker::shared_operand(constant_producer),
         })
     }
 }
@@ -984,13 +995,16 @@ impl TileProducer for MapResultToConstProducer {
     /// takes the input's place, and the projection names that collection's keys
     /// (`an_outermost_constant_answers_only_the_requested_keys`). The constant is read whole:
     /// every row reads all of it.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
 
-        let mut output = self.apply(&projection);
+        let mut output = self.apply(cx, &projection);
         output.restrict_to(&projection, self.tiling());
         output
     }
@@ -1019,7 +1033,7 @@ impl TileProducer for MapResultToConstProducer {
 
 impl MapResultToConstProducer {
     /// The output for the keys `projection` names.
-    fn apply(&mut self, projection: &Projection) -> Tile {
+    fn apply(&self, cx: &mut ExecutionContext, projection: &Projection) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
             !matches!(c_tiling, Tiling::Aggregation { .. } | Tiling::Store { .. }),
@@ -1034,7 +1048,7 @@ impl MapResultToConstProducer {
                 true => projection.guard(&i_tiling),
                 false => i_tiling.universal_guard(),
             };
-        let input_tile = self.input.get(input_guard);
+        let input_tile = cx.get(&*self.input, input_guard);
         // **Laziness — do not evaluate an off-path arm.** In the scalar value-`Case`
         // C-form a false first-match gate empties this arm's `Units(1)` driver — the
         // `Restrict` marks the driver row *deleted* rather than dropping it. When
@@ -1048,7 +1062,7 @@ impl MapResultToConstProducer {
             // The empty tile below drops the input's deleted rows, which no consumer then
             // sees, so this releases them.
             if let Some(dropped) = input_tile.deleted_keys_guard() {
-                self.input.release(dropped);
+                cx.release(&*self.input, dropped);
             }
 
             return self.empty_beneath_live_rows(&input_tile);
@@ -1056,7 +1070,7 @@ impl MapResultToConstProducer {
 
         let streams = c_tiling.is_data_function();
         let constant_guard = c_tiling.universal_guard();
-        let constant_tile = self.constant.get(constant_guard);
+        let constant_tile = cx.get(&*self.constant, constant_guard);
         // A **scalar** constant must be fully known before it is replicated across the
         // input's domain: `repeat` fabricates nothing, it copies a single present value. A
         // constant that is still absent (e.g. a scalar read from a sibling induction loop
@@ -1109,7 +1123,7 @@ impl MapResultToConstProducer {
         }
         // Each row is rebuilt from the input and the constant on every pull, so what a
         // consumer has released beneath a row still open comes back unless it is left out.
-        output.remove_guarded(self.obsolete_guard().clone());
+        output.remove_guarded(cx.obsolete(self));
         output
     }
 }
@@ -1467,7 +1481,7 @@ impl TileProducer for MapResultWithSourceProducer {
 
     /// The source is read at the keys the input answers, and the input is pulled at the
     /// projection, so a morsel reads only its own rows from the source.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1682,8 +1696,8 @@ mod tests {
         let producer = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &in_tiling),
-            input: Box::new(input),
-            function: Box::new(fn_spy),
+            input: pipeline_worker::shared_operand(Box::new(input)),
+            function: pipeline_worker::shared_operand(Box::new(fn_spy)),
             values_are_keys: false,
         };
         (producer, released, in_tiling)
@@ -1782,8 +1796,8 @@ mod tests {
         let mut map_result = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
-            input: Box::new(input_producer),
-            function: Box::new(function_producer),
+            input: pipeline_worker::shared_operand(Box::new(input_producer)),
+            function: pipeline_worker::shared_operand(Box::new(function_producer)),
             values_are_keys: false,
         };
 
@@ -1906,8 +1920,14 @@ mod tests {
         let mut map_result = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
-            function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                one_level_fn_tile,
+                input_tiling,
+            ))),
+            function: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                two_level_fn_tile,
+                function_tiling,
+            ))),
             values_are_keys: false,
         };
 
@@ -1979,8 +1999,13 @@ mod tests {
         let mut map_result = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
-            function: Box::new(ProjectionSpy::new(two_level_fn_tile, function_tiling).0),
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                one_level_fn_tile,
+                input_tiling,
+            ))),
+            function: pipeline_worker::shared_operand(Box::new(
+                ProjectionSpy::new(two_level_fn_tile, function_tiling).0,
+            )),
             values_are_keys: false,
         };
         let result = map_result.read_in_pipeline(map_result.tiling().universal_guard());
@@ -2049,8 +2074,8 @@ mod tests {
         let mut producer = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
-            input: Box::new(input),
-            function: Box::new(ProjectionSpy::new(f, fn_tiling).0),
+            input: pipeline_worker::shared_operand(Box::new(input)),
+            function: pipeline_worker::shared_operand(Box::new(ProjectionSpy::new(f, fn_tiling).0)),
             values_are_keys: false,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -2133,8 +2158,10 @@ mod tests {
         let mut producer = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(2)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
-            input: Box::new(TestTileProducer::new(input, in_tiling)),
-            function: Box::new(function),
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                input, in_tiling,
+            ))),
+            function: pipeline_worker::shared_operand(Box::new(function)),
             values_are_keys: false,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -2193,11 +2220,13 @@ mod tests {
                 CurryLevel::new(1),
             ),
             base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), operator.tiling()),
-            input: Box::new(TestTileProducer::new(groups, in_tiling)),
-            constant: Box::new(TestTileProducer::new(
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                groups, in_tiling,
+            ))),
+            constant: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
                 Tile::Scalar(ColumnValue::Ints(vec![7])),
                 Tiling::Scalar(int()),
-            )),
+            ))),
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(
@@ -2246,11 +2275,13 @@ mod tests {
         let mut producer = MapResultProducer {
             operator: MapResult::state_definition(CurryLevel::new(1)),
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), operator.tiling()),
-            input: Box::new(TestTileProducer::new(
+            input: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
                 in_tiling.empty_at_no_rows(),
                 in_tiling,
-            )),
-            function: Box::new(TestTileProducer::new(fn_tile, fn_tiling)),
+            ))),
+            function: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
+                fn_tile, fn_tiling,
+            ))),
             values_are_keys: false,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
@@ -2292,11 +2323,11 @@ mod tests {
                 CurryLevel::new(1),
             ),
             base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out_tiling),
-            input: Box::new(input),
-            constant: Box::new(TestTileProducer::new(
+            input: pipeline_worker::shared_operand(Box::new(input)),
+            constant: pipeline_worker::shared_operand(Box::new(TestTileProducer::new(
                 Tile::Scalar(ColumnValue::Ints(vec![])),
                 c_tiling,
-            )),
+            ))),
         };
         let first = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
@@ -2703,8 +2734,8 @@ mod projection_tests {
             MapResultProducer {
                 operator: MapResult::state_definition(level),
                 base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out),
-                input: Box::new(input),
-                function: Box::new(function),
+                input: pipeline_worker::shared_operand(Box::new(input)),
+                function: pipeline_worker::shared_operand(Box::new(function)),
                 values_are_keys,
             },
             Logs {
@@ -3114,8 +3145,8 @@ mod const_projection_tests {
             MapResultToConstProducer {
                 operator: MapResultToConst::state_definition(mode, CurryLevel::new(1)),
                 base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out),
-                input: Box::new(input),
-                constant: Box::new(constant),
+                input: pipeline_worker::shared_operand(Box::new(input)),
+                constant: pipeline_worker::shared_operand(Box::new(constant)),
             },
             input_pulled,
             constant_pulled,

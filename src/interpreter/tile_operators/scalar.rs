@@ -108,6 +108,10 @@ impl Constant {
 }
 
 impl TileOperator for Constant {
+    fn partitions_at(&self, _level: CurryLevel) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn inspect_annotation(&self) -> Option<String> {
@@ -171,7 +175,10 @@ impl TileProducer for ConstantProducer {
     /// A collection constant answers the keys the projection admits, which is how a worker reads
     /// the table a list literal denotes one morsel at a time. A scalar constant has one position,
     /// so its projection is the whole value or nothing.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn shared_execution(&self) -> bool {
+        true
+    }
+    fn get_impl(&self, cx: &mut ExecutionContext, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -182,9 +189,9 @@ impl TileProducer for ConstantProducer {
         // post-condition forbids.
         let mut tile = if self.tiling().is_data_function() {
             let mut tile = self.operator.tile.clone();
-            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.remove_guarded(cx.obsolete(self));
             tile
-        } else if self.obsolete_guard().is_universal() {
+        } else if cx.obsolete(self).is_universal() {
             self.tiling().empty_tile()
         } else {
             self.operator.tile.clone()
@@ -390,7 +397,7 @@ impl TileProducer for VariantWrapProducer {
 
     /// A payload stream keeps its keys, so the input is pulled at the projection. A payload
     /// that is itself a collection becomes one union column with no keys, so it is read whole.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -708,7 +715,7 @@ impl TileProducer for VariantProjectProducer {
     /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
     /// the projection. A bare union has implicit positions for keys, so it is read whole and
     /// the positions cut after.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -963,7 +970,7 @@ impl TileProducer for VariantIsProducer {
     /// Every key in is a key out, so the scrutinee is pulled at the projection, or whole where
     /// the scrutinee does not restate the projection's level, and the answer is cut to the
     /// projection after.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // A test answers every position, so the scrutinee's levels, keys, groupings and
         // deletions stand as they are, and only its values change: each union value becomes
         // whether it carries the tag.

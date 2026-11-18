@@ -171,7 +171,7 @@ impl TileProducer for RekeySortedProducer {
         Some(self)
     }
 
-    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+    fn get_exclusive_impl(&mut self, guard: TileGuard) -> Tile {
         if self.base.reads_input() {
             let mut tile = self.read_input(self.input.tiling().universal_guard());
             tile.restrict_to(&guard.projection_for(self), self.tiling());
@@ -351,7 +351,7 @@ impl RekeySortedProducer {
 }
 
 impl Breaker for RekeySortedProducer {
-    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+    fn consume(&mut self, _: InputId, guard: TileGuard) {
         let tile = self.read_input(guard.clone());
         self.output.merge(tile);
         let prefix = self.consumed_prefix();
