@@ -458,6 +458,6 @@ module's member. `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the
 every block and every expression, and reports one `LoweringError::Unsupported` per construct, and
 the module lowers nothing when it reports. A path with a capitalized qualifier segment,
 `Price::discounted`, is refused as a method reference rather than as module syntax
-([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]"). A module that
+([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods"). A module that
 uses refused syntax therefore reports only those refusals, and none of the lowering errors its
 other statements would raise.

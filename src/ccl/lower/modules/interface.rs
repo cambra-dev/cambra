@@ -334,7 +334,7 @@ pub struct NominalMember {
 impl NominalMember {
     /// The declaration as `cambra check` prints it: written as its module writes it, with
     /// the variance of each type parameter, which is part of the type's interface
-    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]"), and the type
+    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods"), and the type
     /// parameters of its module whose arguments tell its instances apart
     /// (`docs/chl-spec.md`, "Nominal type identity").
     fn written(&self) -> String {
