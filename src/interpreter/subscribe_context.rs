@@ -1,6 +1,6 @@
 //! What a `TileOperator::subscribe` records about the producers it builds.
 
-use super::{Scheduler, value_probe::ProbeSlot};
+use super::{SourceRegistry, value_probe::ProbeSlot};
 
 /// What a `subscribe` records about the producers it builds: the probe slot each takes, and the
 /// source producers each compilation and fan-out registered. A `GlobalContext` owns one as long
@@ -11,8 +11,8 @@ pub struct SubscribeContext {
     /// The source producers registered under each subscription still in progress, innermost last
     /// ([`begin_source_producers`](Self::begin_source_producers)).
     producer_frames: Vec<Vec<String>>,
-    /// Pull mode's half: source polling, wakeups and sink pulls.
-    pull: Scheduler,
+    /// Source lifetimes and notification registrations.
+    sources: SourceRegistry,
 }
 
 impl SubscribeContext {
@@ -63,8 +63,8 @@ impl SubscribeContext {
         }
     }
 
-    /// Pull mode's scheduler, which a dispatched run uses none of.
-    pub fn scheduler(&mut self) -> &mut Scheduler {
-        &mut self.pull
+    /// The sources and notification registrations owned by this context.
+    pub fn source_registry(&mut self) -> &mut SourceRegistry {
+        &mut self.sources
     }
 }
