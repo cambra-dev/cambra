@@ -2531,7 +2531,7 @@ fn resolve_binder_slot(
         }
     }
     coalesce_type_predicates(solver, slot, level, ctx);
-    decide_memberships(solver, pending, level, ctx, &label);
+    decide_memberships(solver, pending, level, ctx, &|_| label.clone());
 }
 
 /// Decide the memberships a materialization collected, now that the types they read are types
@@ -2541,7 +2541,7 @@ fn decide_memberships(
     pending: Vec<crate::ccl::infer::solver::coalesce::PendingMembership>,
     level: Level,
     ctx: &mut CoalesceCtx,
-    label: &str,
+    label: &dyn Fn(&mut Solver) -> String,
 ) {
     for mut m in pending {
         coalesce_type_predicates(solver, &mut m.found, level, ctx);
@@ -2561,7 +2561,8 @@ fn decide_memberships(
                 .entry(ctx.current_node)
                 .or_default()
                 .extend(reachable_vars(solver, &m.found));
-            ctx.push_position_error(solver, Some(m.position), map_coalesce_err(err, label));
+            let label = label(solver);
+            ctx.push_position_error(solver, Some(m.position), map_coalesce_err(err, &label));
         }
     }
 }
@@ -3124,7 +3125,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             if let Ok(ty) = resolved {
                 *row = ty;
                 coalesce_type_predicates(solver, row, level, ctx);
-                decide_memberships(solver, pending, level, ctx, "a feed's row");
+                decide_memberships(solver, pending, level, ctx, &|_| "a feed's row".to_string());
             }
         }
         TypedExprNode::Define { value, .. } => {
@@ -3253,7 +3254,14 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     {
         return;
     }
-    let label = crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), expr);
+    // The node rendered for a message, only where one is written: an error, or a debug read
+    // record. Rendering spells the node's whole subtree, so rendering every node would cost
+    // time quadratic in the tree's depth. The read record and the resolution error below
+    // render the node before the arms after them change it; a failed membership renders it
+    // as coalescing leaves it.
+    let label = |solver: &mut Solver, expr: &Expr| {
+        crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), expr)
+    };
     let (resolved, pending) =
         crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
             resolve_var_type(solver, &expr.ty)
@@ -3274,7 +3282,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             // may overwrite `expr.ty` afterwards via *structural* recovery
             // — `specialize_projection_domain`, let-closing — which is not a
             // graph read and so is not what this guards.)
-            ctx.record_read(&expr.ty, &ty, || label.clone());
+            ctx.record_read(&expr.ty, &ty, || label(solver, expr));
             expr.ty = ty;
             // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
             // type-inference.md`, "4.9 Capabilities").
@@ -3288,6 +3296,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         }
         Err(err) => {
             let ty = expr.ty.clone();
+            let label = label(solver, expr);
             ctx.push_type_error(solver, &ty, map_coalesce_err(err, &label))
         }
     }
@@ -3403,7 +3412,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             coalesce_type_predicates(solver, target, level, ctx);
         }
     }
-    decide_memberships(solver, pending, level, ctx, &label);
+    decide_memberships(solver, pending, level, ctx, &|solver| label(solver, expr));
 
     // A compiler instance builds its function at the type the call resolved to, so it is
     // chosen once that type is.
