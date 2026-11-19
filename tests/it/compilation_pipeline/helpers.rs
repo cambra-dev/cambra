@@ -35,6 +35,7 @@ use bit_set::BitSet;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
 use cambra::ccl::{Expr, FieldKey, Label, TagMap};
+use cambra::interpreter::KeysFollow;
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     ColumnValue, Consumer, Predicate, Tile, Value, sort_function_by_domain, tuple_field,
@@ -235,10 +236,13 @@ pub(crate) fn check_tile(code: &str, expected: Tile) {
 /// table's binding order before comparing, since [`Value::Function`] compares
 /// positionally and a collection's order is unspecified.
 pub(crate) fn check_collection_tile(code: &str, expected: Tile) {
-    assert_eq!(
+    let (actual, expected) = (
         sort_tile_collections(run_pipeline(code)),
         sort_tile_collections(expected),
-        "pipeline path"
+    );
+    assert!(
+        same_tile(&actual, &expected),
+        "pipeline path: {actual:?}\n  is not\n{expected:?}"
     );
 }
 
@@ -329,7 +333,9 @@ pub(crate) fn sort_collection_bindings(value: Value) -> Value {
 
 /// Whether `actual` and `expected` are one tile, with each collection's domain predicate compared
 /// by the region it admits rather than by its spelling: `True` and `Record({_0: True, _1: True})`
-/// name the same region of a record domain.
+/// name the same region of a record domain. Each level's `keys_follow_beneath` is compared by
+/// whether it follows, the only state `Tile::level_statement` reads: `KeysFollow::DoesNot` and
+/// `KeysFollow::Unstated` state the same keys complete.
 pub(crate) fn same_tile(actual: &Tile, expected: &Tile) -> bool {
     fn same_regions(actual: &mut Tile, expected: &mut Tile) -> bool {
         match (actual, expected) {
@@ -337,20 +343,25 @@ pub(crate) fn same_tile(actual: &Tile, expected: &Tile) -> bool {
                 Tile::DataFunction {
                     domain_predicate: actual_region,
                     codomain: actual_codomain,
+                    keys_follow_beneath: actual_follow,
                     ..
                 },
                 Tile::DataFunction {
                     domain_predicate: expected_region,
                     codomain: expected_codomain,
+                    keys_follow_beneath: expected_follow,
                     ..
                 },
             ) => {
                 if !(actual_region.subsumes(expected_region)
                     && expected_region.subsumes(actual_region))
+                    || (*actual_follow == KeysFollow::Follows)
+                        != (*expected_follow == KeysFollow::Follows)
                 {
                     return false;
                 }
                 *expected_region = actual_region.clone();
+                *expected_follow = *actual_follow;
                 same_regions(actual_codomain, expected_codomain)
             }
             (
@@ -440,14 +451,14 @@ pub(crate) fn sort_tile_collections(tile: Tile) -> Tile {
             codomain,
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         } => Tile::DataFunction {
             row_starts,
             domain,
             codomain: Box::new(sort_tile_collections(*codomain)),
             domain_predicate,
             deleted,
-            absent_keys,
+            keys_follow_beneath,
         },
         other => other,
     }
