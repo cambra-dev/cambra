@@ -1098,7 +1098,7 @@ impl InferCtx {
                 let error = match &raising_variable {
                     Some(variable) => InferError::ExceptAroundEveryRaise {
                         clause: crate::ccl::chl_print::chl_type(catches),
-                        top: variable.item.to_string(),
+                        top: variable.item.rendered(&mut self.solver),
                         variable: true,
                     },
                     None => InferError::ExceptCatchesNothing {
@@ -1297,11 +1297,14 @@ impl InferCtx {
     /// function to a variable bound outside that variable's scope: the function would outlive
     /// the variable (`docs/chl-spec.md`, "Discharging requirements and effects").
     pub(super) fn escaping_results(&mut self) -> Vec<LocatedInferError> {
+        // The capability, and its spelling, read through the run's solver.
         let mut beyond = |ty: &Type, depth, binds: Declared| {
-            type_capabilities(&mut self.solver, ty).into_iter().find(|l| {
+            let capability = type_capabilities(&mut self.solver, ty).into_iter().find(|l| {
                 matches!(l.bound, CapabilityBound::At(at) if at >= depth)
                     || matches!(&l.item, Capability::Every(every) if binds.named_by(&mut self.solver, every))
-            })
+            })?;
+            let item = capability.item.rendered(&mut self.solver);
+            Some((capability, item))
         };
         let located = |error, node_id| LocatedInferError {
             error,
@@ -1314,10 +1317,10 @@ impl InferCtx {
             .results
             .iter()
             .filter_map(|r| {
-                let capability = beyond(&r.ty, r.depth, r.binds)?;
+                let (capability, item) = beyond(&r.ty, r.depth, r.binds)?;
                 let mut error = located(
                     InferError::EscapesItsVariable {
-                        item: capability.item.to_string(),
+                        item,
                         every: matches!(capability.item, Capability::Every(_)),
                     },
                     r.returned,
@@ -1335,10 +1338,10 @@ impl InferCtx {
             .handed_out
             .iter()
             .filter_map(|h| {
-                let capability = beyond(&h.ty, h.depth, h.binds)?;
+                let (capability, item) = beyond(&h.ty, h.depth, h.binds)?;
                 Some(located(
                     InferError::HandsOutItsVariable {
-                        item: capability.item.to_string(),
+                        item,
                         every: matches!(capability.item, Capability::Every(_)),
                         target: h.target.to_string(),
                         appends: h.appends,
@@ -1383,9 +1386,11 @@ impl InferCtx {
                 });
                 found
             }
-            find(&mut self.solver, &inferred.poly.body, id).map(|r| r.to_string())
+            let found = find(&mut self.solver, &inferred.poly.body, id)?;
+            Some(found.rendered(&mut self.solver))
         };
-        named().unwrap_or_else(|| item.to_string())
+        let named = named();
+        named.unwrap_or_else(|| item.rendered(&mut self.solver))
     }
 
     /// An error at each `def` whose bounded `requires` clause a trait requirement inference
@@ -1494,7 +1499,7 @@ impl InferCtx {
                 ),
                 None => "an exception may escape its body".to_string(),
             },
-            item => format!("its body causes `{item}`"),
+            item => format!("its body causes `{}`", item.rendered(&mut self.solver)),
         };
         Some(LocatedInferError::new(
             InferError::UnorderedLoop {
@@ -1548,8 +1553,11 @@ impl InferCtx {
                 continue;
             }
             let set = order.capabilities.set_in(&mut self.solver);
-            let capability = set.items().find(|x| x.orders_a_loop(&mut self.solver));
-            let why = |capability: &Capability| match order.at_use {
+            let capability = set
+                .items()
+                .find(|x| x.orders_a_loop(&mut self.solver))
+                .map(|x| x.rendered(&mut self.solver));
+            let why = |capability: &str| match order.at_use {
                 true => format!("the loop's body causes `{capability}`"),
                 false => format!("its body causes `{capability}`"),
             };

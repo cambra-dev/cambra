@@ -301,7 +301,7 @@ impl CoalesceCtx {
     /// release). `unresolved` must be the var-laden type *as resolved* —
     /// its shared `Rc<InferVar>`s are what let the end-of-pass check
     /// re-resolve it against the final graph.
-    fn record_read(&mut self, unresolved: &Type, resolved: &Type, label: impl Fn() -> String) {
+    fn record_read(&mut self, unresolved: &Type, resolved: &Type, label: impl FnOnce() -> String) {
         self.record_read_for(ReadPurpose::Stamp, unresolved, resolved, label);
     }
 
@@ -312,7 +312,7 @@ impl CoalesceCtx {
         &mut self,
         unresolved: &Type,
         resolved: &Type,
-        label: impl Fn() -> String,
+        label: impl FnOnce() -> String,
     ) {
         self.record_read_for(ReadPurpose::Instantiation, unresolved, resolved, label);
     }
@@ -322,7 +322,7 @@ impl CoalesceCtx {
         purpose: ReadPurpose,
         unresolved: &Type,
         resolved: &Type,
-        label: impl Fn() -> String,
+        label: impl FnOnce() -> String,
     ) {
         #[cfg(debug_assertions)]
         self.reads.push(ReadRecord {
@@ -2853,7 +2853,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     {
         return;
     }
-    let label = symbolic(expr);
+    let label = crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), expr);
     let (resolved, pending) = crate::ccl::infer::solver::coalesce::collecting_memberships(|| {
         resolve_var_type(solver, &expr.ty)
     });
@@ -3697,7 +3697,10 @@ pub(super) fn specialize_use(
     let resolved = match resolve_var_type(solver, &use_expr.ty) {
         Ok(t) => t,
         Err(err) => {
-            let label = symbolic(use_expr);
+            let label = crate::ccl::symbolic::symbolic_in(
+                &crate::ccl::ty::RenderCtx::new(solver),
+                use_expr,
+            );
             let error = map_coalesce_err(err, &label);
             let carried = reachable_vars(solver, &use_expr.ty);
             let node = ctx.current_node;
@@ -3717,7 +3720,9 @@ pub(super) fn specialize_use(
     // because the pin that immediately follows is itself what moves them, and
     // this resolution's consumers are refinement-insensitive (see
     // `ReadPurpose::Instantiation`).
-    ctx.record_read_instantiation(&use_expr.ty, &resolved, || symbolic(use_expr));
+    ctx.record_read_instantiation(&use_expr.ty, &resolved, || {
+        crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), use_expr)
+    });
     // The specialization key: what decides whether this use may share an
     // existing clone. Read off the live graph *before* the pin, exactly as every
     // other use's is, so both sides of the comparison below are one procedure at
