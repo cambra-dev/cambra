@@ -18,6 +18,7 @@
 use crate::ccl::Occurrence;
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
 };
@@ -60,7 +61,7 @@ pub(crate) fn contribution_lambda(
     let ty = Type::fun_over(param.name.clone(), param.ty.clone(), codomain, fun_kind);
     Expr::lambda(
         &param.name,
-        param.occurrence.clone(),
+        param.occurrence.duplicate(),
         param.ty.clone(),
         body,
     )
@@ -243,7 +244,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
             .with_ty(domains[depth].clone());
             read_level(
                 position,
-                generators[depth].source().clone(),
+                generators[depth].source().duplicate(),
                 param,
                 inner,
                 was.as_ref(),
@@ -411,10 +412,10 @@ fn generator_nest(
         TypedExprNode::Lambda { .. } => {
             let parts = crate::ccl::ccl_utils::loop_parts(nest)?;
             let (param, body) = (parts.element, parts.body);
-            let iterated = parts.source.clone();
+            let iterated = parts.source.duplicate();
             let generator = Generator {
                 iterated,
-                param: param.clone(),
+                param: param.duplicate(),
             };
             let reads = |names: &[Name], e: &Expr| names.iter().any(|n| count_free(n, e) > 0);
             let independent = !reads(&scope.binders, &generator.iterated)
@@ -432,12 +433,12 @@ fn generator_nest(
             };
             let iterated = match prefix {
                 [] => return None,
-                [one] => one.clone(),
-                _ => compose_typed_or_hole(prefix.to_vec()),
+                [one] => one.duplicate(),
+                _ => compose_typed_or_hole(prefix.iter().map(Duplicate::duplicate).collect()),
             };
             let generator = Generator {
                 iterated,
-                param: param.clone(),
+                param: param.duplicate(),
             };
             // Neither the source nor its filter may read an enclosing binder or a name bound
             // between the loops: the loop's keys would then depend on the enclosing position,

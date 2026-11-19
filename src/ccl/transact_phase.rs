@@ -67,6 +67,7 @@ use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
+use crate::ccl::Duplicate;
 use crate::ccl::{
     BaseType, BinOpKind, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, FieldKey,
     HistoryKind, Lit, LogicKind, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
@@ -1549,7 +1550,7 @@ impl PathBound {
     /// A copy of the bound value for `binding`, minted under the caller's recording.
     fn term(&self, binding: &TypedBinding) -> Expr {
         match self {
-            PathBound::Value(value) => value.clone(),
+            PathBound::Value(value) => value.duplicate(),
             PathBound::Payload { scrutinee, tag } => payload_of(scrutinee, tag, &binding.ty),
             PathBound::BlockValue { .. } => {
                 unreachable!("a block's value is carried by the source, not copied")
@@ -1594,10 +1595,10 @@ impl ArmTest {
                 payload,
                 guard,
             } => ArmTest::Tag {
-                scrutinee: Box::new(scrutinee.clone_preserving_ids()),
+                scrutinee: Box::new(scrutinee.as_ref().clone_preserving_ids()),
                 tag: tag.clone(),
-                payload: payload.clone(),
-                guard: Box::new(guard.clone_preserving_ids()),
+                payload: payload.duplicate(),
+                guard: Box::new(guard.as_ref().clone_preserving_ids()),
             },
         }
     }
@@ -1605,7 +1606,7 @@ impl ArmTest {
     /// The test as a `Bool` term, minted under the caller's recording.
     fn term(&self) -> Expr {
         match self {
-            ArmTest::Guard(guard) => guard.clone(),
+            ArmTest::Guard(guard) => guard.duplicate(),
             ArmTest::Tag {
                 scrutinee,
                 tag,
@@ -1618,7 +1619,7 @@ impl ArmTest {
                 }
                 let bool_ty = Type::Base(BaseType::Bool);
                 let value = payload_of(scrutinee, tag, &payload.ty);
-                let guard = Expr::let_in(payload.clone(), value, (**guard).clone())
+                let guard = Expr::let_in(payload.duplicate(), value, (**guard).duplicate())
                     .with_ty(bool_ty.clone());
                 Expr::binop(test, BinOpKind::BoolLogic(LogicKind::And), guard).with_ty(bool_ty)
             }
@@ -1630,7 +1631,7 @@ impl ArmTest {
 fn payload_of(scrutinee: &Expr, tag: &Label, ty: &Type) -> Expr {
     let project = Expr::builtin(Builtin::VariantProject(FieldKey::Name(tag.clone())))
         .with_ty(Type::fun(scrutinee.ty.clone(), ty.clone()));
-    Expr::apply(scrutinee.clone(), project).with_ty(ty.clone())
+    Expr::apply(scrutinee.duplicate(), project).with_ty(ty.clone())
 }
 
 /// `term` under fresh copies of the bindings of `path` it reads, directly or through another,
@@ -1659,7 +1660,7 @@ fn under_path_lets(path: &Path, term: Expr) -> (Expr, Vec<(TypedBinding, Name)>)
     let mut term = rename(term);
     let mut carried = Vec::new();
     for ((binding, bound), (_, to)) in kept.into_iter().zip(&renames).rev() {
-        let mut binding = binding.clone();
+        let mut binding = binding.duplicate();
         binding.name = to.clone();
         if let PathBound::BlockValue { values } = bound {
             carried.push((binding, values.clone()));
@@ -1726,7 +1727,7 @@ fn restrict_to_path(
     let (domain, item_ty) = fun_parts(&source.ty);
     let (site_target, mut source, bind_item) = if carried.is_empty() {
         let bind_item: BindItem = Box::new(|term, _| term);
-        (target.clone(), source, bind_item)
+        (target.duplicate(), source, bind_item)
     } else {
         let views: Vec<(Name, Expr, Type)> = carried
             .iter()
@@ -1737,7 +1738,7 @@ fn restrict_to_path(
             .collect();
         let (zipped, tuple_ty) = build_zip_source(&source, &item_ty, &views, false);
         let item = binding(Name::fresh("__item"), tuple_ty.clone());
-        let (item_name, target, carried) = (item.name.clone(), target.clone(), carried.clone());
+        let (item_name, target, carried) = (item.name.clone(), target.duplicate(), carried.clone());
         let bind_item: BindItem = Box::new(move |term, values| {
             let at = tvar(&item_name, tuple_ty.clone());
             let mut term = term;
@@ -1752,7 +1753,7 @@ fn restrict_to_path(
             }
             let own = proj_item(&at, &tuple_ty, 0, &item_ty);
             let ty = term.ty.clone();
-            Expr::let_in(target.clone(), own, term).with_ty(ty)
+            Expr::let_in(target.duplicate(), own, term).with_ty(ty)
         });
         (item, zipped, bind_item)
     };
@@ -1821,7 +1822,7 @@ fn strip(
                 provenance::Nature::Expansion,
             );
             path.lets
-                .push((binding.clone(), PathBound::BlockValue { values }));
+                .push((binding.duplicate(), PathBound::BlockValue { values }));
             (binding, read)
         });
         let rest = strip(rest, txn_mut_vars, enclosing, path, out);
@@ -1986,7 +1987,7 @@ fn strip(
                 lets: path
                     .lets
                     .iter()
-                    .map(|(binding, bound)| (binding.clone(), bound.copy()))
+                    .map(|(binding, bound)| (binding.duplicate(), bound.copy()))
                     .collect(),
                 conditions: path
                     .conditions
@@ -2001,7 +2002,7 @@ fn strip(
                 "transact.loop_source",
                 provenance::Nature::Expansion,
             );
-            let (source, carried) = under_path_lets(path, source.clone());
+            let (source, carried) = under_path_lets(path, source.duplicate());
             assert!(
                 carried.is_empty(),
                 "a loop's source is evaluated outside every loop, where no block's value is \
@@ -2056,7 +2057,7 @@ fn strip(
             // The path holds the binding, the node's own copied.
             let _copy = provenance::copy_frame("transact.path_let");
             path.lets.push((
-                binding.clone(),
+                binding.duplicate(),
                 PathBound::Value(bound_expr.clone_preserving_ids()),
             ));
         }
@@ -2114,16 +2115,16 @@ fn strip(
                         // pattern's own copied.
                         let _copy = provenance::copy_frame("transact.arm_payload");
                         path.lets.push((
-                            pattern.binding.clone(),
+                            pattern.binding.duplicate(),
                             PathBound::Payload {
-                                scrutinee: scrutinee.clone_preserving_ids(),
+                                scrutinee: scrutinee.as_ref().clone_preserving_ids(),
                                 tag: pattern.tag(),
                             },
                         ));
                         ArmTest::Tag {
-                            scrutinee: Box::new(scrutinee.clone_preserving_ids()),
+                            scrutinee: Box::new(scrutinee.as_ref().clone_preserving_ids()),
                             tag: pattern.tag(),
-                            payload: pattern.binding.clone(),
+                            payload: pattern.binding.duplicate(),
                             guard: Box::new(guard.clone_preserving_ids()),
                         }
                     }
@@ -2713,8 +2714,8 @@ fn site_source(
     match enclosing {
         Some((position, target, source, writes)) => (
             position.clone(),
-            target.clone(),
-            source.clone(),
+            target.duplicate(),
+            source.duplicate(),
             writes.clone(),
         ),
         None => {
@@ -2910,7 +2911,11 @@ fn partition_spine(
     match node {
         TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_mut_vars.contains(name)) =>
         {
-            lifted.push(Subst::discharge_env_in_place(*effect, env));
+            lifted.push(Subst::discharge_env_in_place(
+                *effect,
+                env,
+                crate::ccl::Ids::Fresh,
+            ));
             partition_spine(*body, txn_mut_vars, lifted, env)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
@@ -2938,7 +2943,11 @@ fn partition_spine(
             // transactional remainder to read.
             env.insert(
                 binding.name.clone(),
-                Subst::discharge_env_in_place(bound_expr.as_ref().clone(), env),
+                Subst::discharge_env_in_place(
+                    bound_expr.as_ref().duplicate(),
+                    env,
+                    crate::ccl::Ids::Fresh,
+                ),
             );
             let body = partition_spine(*body, txn_mut_vars, lifted, env);
             // A binding the remainder does not name is one the lift took the last
@@ -3508,7 +3517,7 @@ fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
                 "transact.await_final_seed",
                 provenance::Nature::Expansion,
             );
-            *e = seed.init.clone();
+            *e = seed.init.duplicate();
             return;
         }
         e.walk_children_mut(|c| rewrite(c, seeds));
@@ -3691,7 +3700,7 @@ fn build_writer(
             continue;
         }
         if site.enclosing_writes.contains(n) {
-            site_accs.push((n.clone(), info.view.clone(), info.value_ty.clone()));
+            site_accs.push((n.clone(), info.view.duplicate(), info.value_ty.clone()));
         } else {
             broadcasts.push((n.clone(), info.final_var.clone(), info.value_ty.clone()));
         }
@@ -3703,7 +3712,7 @@ fn build_writer(
     // accumulators.
     let reads_position = block_reads_var(&site.block, &site.position);
     let (mut source, item_ty) = if site_accs.is_empty() && !reads_position {
-        (site.source.clone(), orig_item_ty.clone())
+        (site.source.duplicate(), orig_item_ty.clone())
     } else {
         build_zip_source(&site.source, &orig_item_ty, &site_accs, reads_position)
     };
@@ -3722,14 +3731,14 @@ fn build_writer(
         let item = binding(Name::fresh("__gated"), item_ty.clone());
         let at = tvar(&item.name, item_ty.clone());
         let bool_ty = Type::Base(BaseType::Bool);
-        let mut condition = gate.clone();
+        let mut condition = gate.duplicate();
         for (i, (acc, _, vty)) in site_accs.iter().enumerate().rev() {
             let value = proj_item(&at, &item_ty, i + 1, vty);
             condition = Expr::let_in(binding(acc.clone(), vty.clone()), value, condition)
                 .with_ty(bool_ty.clone());
         }
         let own = proj_item(&at, &item_ty, 0, &orig_item_ty);
-        condition = Expr::let_in(site.target.clone(), own, condition).with_ty(bool_ty);
+        condition = Expr::let_in(site.target.duplicate(), own, condition).with_ty(bool_ty);
         source = gated_source(source, &item, condition);
     }
 
@@ -3829,7 +3838,7 @@ fn block_reads_var(block: &Expr, name: &Name) -> bool {
 fn proj_item(item: &Expr, item_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     let mut proj = Expr::proj_index(i);
     proj.ty = Type::fun(item_ty.clone(), elt_ty.clone());
-    let mut app = Expr::apply(item.clone(), proj);
+    let mut app = Expr::apply(item.duplicate(), proj);
     app.ty = elt_ty.clone();
     app
 }
@@ -3860,11 +3869,15 @@ fn build_zip_source(
     let x = Name::fresh("__zx");
     let mut elts = vec![apply_ty(
         tvar(&x, dom.clone()),
-        source.clone(),
+        source.duplicate(),
         item_ty.clone(),
     )];
     for (_, view, vty) in accs {
-        elts.push(apply_ty(tvar(&x, dom.clone()), view.clone(), vty.clone()));
+        elts.push(apply_ty(
+            tvar(&x, dom.clone()),
+            view.duplicate(),
+            vty.clone(),
+        ));
     }
     if position {
         elts.push(tvar(&x, dom.clone()));
@@ -3933,7 +3946,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
             MutVarDecl {
                 decl: expr.node_id(),
                 occurrence: binding.occurrence.id(),
-                init: (**init).clone(),
+                init: (**init).duplicate(),
                 value_ty: mut_var_value_ty(&binding.ty),
                 site: binding.site.clone(),
             },
@@ -4333,7 +4346,7 @@ fn plan_store(
         // The init's one placement in the output, as this `get_prev_txn`
         // default. The `let` that held the original is dropped by `walk_spine`,
         // so this copy stands in for it and rows on the same parent.
-        let init = key_init.get(k).expect("key init present").init.clone();
+        let init = key_init.get(k).expect("key init present").init.duplicate();
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
         // ("multiple writer sites for one variable merge their commit
@@ -4599,7 +4612,7 @@ fn splice_stores(
     // Statements carried into each store's body, in source order. Index `i` holds the
     // statements that ride inside `stores[i]`; level 0 keeps its place and is never
     // collected here.
-    let mut carried: Vec<Vec<Expr>> = vec![Vec::new(); stores.len()];
+    let mut carried: Vec<Vec<Expr>> = (0..stores.len()).map(|_| Vec::new()).collect();
     let placed = walk_spine(expr, stores, key_init, cross, &mut carried);
     debug_assert!(
         carried.iter().all(Vec::is_empty),
@@ -4965,7 +4978,7 @@ mod tests {
             parent: unit.node_id(),
             target: binding(Name::fresh("__r"), Type::Base(BaseType::Unit)),
             position: Name::fresh("__pos"),
-            source: unit.clone(),
+            source: unit.duplicate(),
             block: unit,
             read_keys: read_keys.iter().map(|n| (*n).clone()).collect(),
             write_keys: write_keys.iter().map(|n| (*n).clone()).collect(),
@@ -5153,7 +5166,7 @@ mod tests {
             return;
         }
         if let TypedExprNode::LetRec { bindings, .. } = &expr.node {
-            *out = Some(bindings.clone());
+            *out = Some(bindings.duplicate());
             return;
         }
         expr.walk_children(|c| find_letrec(c, out));

@@ -32,6 +32,7 @@
 //! of which receives it), and a constant or a literal (which ignore it). Any other head may
 //! read the record whole, and the source is left as it is.
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{apply_primitive, is_builtin};
 use crate::ccl::lambda_elim::id;
 use crate::ccl::planning::{replace_constant_domain_type, set_domain_ty};
@@ -254,7 +255,7 @@ fn retarget(e: &mut Expr, plan: &Plan) {
             let mut output = e.ty.clone();
             set_domain_ty(&mut output, value);
             retarget(argument, plan);
-            *e = apply_primitive(argument.as_ref().clone(), Builtin::Zip, output);
+            *e = apply_primitive(argument.as_ref().duplicate(), Builtin::Zip, output);
         }
         TypedExprNode::Tuple(elts) => {
             if let Type::Tuple(tys) = &mut e.ty {
@@ -559,7 +560,7 @@ mod tests {
         let TypedExprNode::Compose(elts) = &chain.node else {
             panic!("a chain")
         };
-        elts[0].clone()
+        elts[0].duplicate()
     }
 
     /// No path lies inside another: where the head reads `.1` whole and `.1 ≫ .0`, the source
@@ -607,13 +608,13 @@ mod tests {
     fn a_source_is_left_alone_where_pruning_does_not_apply() {
         let f = || Expr::var("f").with_ty(fun_ty(record_ty(), int_ty()));
         let whole = compose(vec![source(vec![], record_ty()), f()]);
-        assert_eq!(pruned(whole.clone()), whole);
+        assert_eq!(pruned(whole.duplicate()), whole);
 
         let already = compose(vec![
             source(vec![vec![0], vec![1]], pair_ty()),
             zip(project(0, pair_ty()), project(1, pair_ty())),
         ]);
-        assert_eq!(pruned(already.clone()), already);
+        assert_eq!(pruned(already.duplicate()), already);
     }
 
     /// A chain that reads every field still names them, in sorted order, and the zip of the

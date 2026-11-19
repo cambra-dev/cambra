@@ -13,6 +13,7 @@ use crate::ccl::provenance;
 
 use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
 use super::*;
+use crate::ccl::Duplicate;
 
 /// Walks `expr` and materializes every iteration site, choosing the best
 /// available implementation strategy at each one.
@@ -784,7 +785,7 @@ fn membership_keys(
     present: &Type,
     ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
-    let image = predicates::eliminate_lifted(collection.clone())
+    let image = predicates::eliminate_lifted(collection.duplicate())
         .map_err(|e| format!("eliminating a membership's collection: {e:?}"))?;
     let indices = image
         .ty
@@ -804,7 +805,7 @@ fn keys_of(term: &Expr, ctx: &mut PlanningCtx) -> Result<Expr, String> {
         .ok_or_else(|| format!("a projected value has a sum type, got {}", term.ty))?;
     let (copy, quoted) = {
         let _frame = provenance::copy_frame("planning.projected_keys");
-        (term.clone(), Rc::new(term.clone()))
+        (term.duplicate(), Rc::new(term.duplicate()))
     };
     // The copy is a term lifted out of a type into the tree, so it is planned as every such
     // term is (`src/ccl/design/optimization.md`, "Planning a lifted term"): a conditional it
@@ -1386,7 +1387,7 @@ mod tests {
         //   (iterate(true) ▷ some_pred ▷ restrict) ≫ [1, 2, 3].
         let int = int_ty();
         let pred = var("some_pred").with_ty(fun_ty(Type::UIntRange(3), bool_ty()));
-        let refined_domain = refined_ty(Type::UIntRange(3), pred.clone());
+        let refined_domain = refined_ty(Type::UIntRange(3), pred.duplicate());
 
         let mut expr = list_123().with_ty(data_fun_ty(refined_domain, int));
         wrap_with_iterate(&mut expr, &mut Default::default(), &PredMemo::new(), "test").unwrap();
@@ -1624,10 +1625,11 @@ mod tests {
             Type::Tuple(vec![int.clone(), int.clone()]),
             int.clone(),
         ));
-        let tuple_arg = Expr::tuple(vec![proj0.clone(), proj0.clone()]).with_ty(Type::Tuple(vec![
-            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
-            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
-        ]));
+        let tuple_arg =
+            Expr::tuple(vec![proj0.duplicate(), proj0.duplicate()]).with_ty(Type::Tuple(vec![
+                fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+                fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+            ]));
         let mut expr = apply_builtin(
             tuple_arg,
             Builtin::Zip,

@@ -177,6 +177,7 @@
 
 use std::collections::HashMap;
 
+use crate::ccl::Duplicate;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
 use crate::ccl::{
@@ -222,8 +223,8 @@ pub fn run(expr: Expr) -> Expr {
 /// [`read_respelling`](crate::ccl::mut_read::read_respelling) spells as its variable. Like
 /// `read_respelling`, this is for diagnostics only. It is applied before `read_respelling`,
 /// because a temp's definition can name a read's binder.
-pub fn temp_respelling(expr: &Expr) -> Subst {
-    fn go(expr: &Expr, env: &mut HashMap<Name, Expr>) {
+pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
+    fn go(expr: &Expr, env: &mut HashMap<Name, Expr>, ids: crate::ccl::Ids) {
         if let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -232,7 +233,8 @@ pub fn temp_respelling(expr: &Expr) -> Subst {
             && binding.name.is_anf_temp()
             && binding.transparency == BindingTransparency::Transparent
         {
-            let mut definition = Subst::discharge_env_in_place((**bound_expr).clone(), env);
+            let mut definition =
+                Subst::discharge_env_in_place((**bound_expr).copied(ids), env, ids);
             // A loop source's `elements` call over a structural collection is the collection,
             // as coalescing reads it.
             if let Some(collection) =
@@ -247,11 +249,11 @@ pub fn temp_respelling(expr: &Expr) -> Subst {
             }
             env.insert(binding.name.clone(), definition);
         }
-        expr.walk_children(|child| go(child, env));
+        expr.walk_children(|child| go(child, env, ids));
     }
     let mut env = HashMap::new();
-    go(expr, &mut env);
-    Subst::discharging(&env)
+    go(expr, &mut env, ids);
+    Subst::discharging(&env, ids)
 }
 
 /// `e` with each temp that names a collection read an enclosing temp already names replaced by
@@ -1501,7 +1503,7 @@ mod tests {
     #[test]
     fn both_atoms_needs_no_binding() {
         let e = Expr::binop(var("a"), ADD, var("b"));
-        let out = run(e.clone());
+        let out = run(e.duplicate());
         assert_eq!(out, e);
     }
 
@@ -1550,7 +1552,7 @@ mod tests {
             Type::Hole,
             var("x"),
         );
-        let e = Expr::apply(lam.clone(), var("map"));
+        let e = Expr::apply(lam.duplicate(), var("map"));
         let out = run(e);
         // The lambda argument needs no naming; it stays inline.
         let TypedExprNode::Apply { argument, .. } = out.node else {
@@ -1654,7 +1656,7 @@ mod tests {
             body: lit(1),
         };
         let case = Expr::new(TypedExprNode::Case {
-            scrutinee: Some(Box::new(scrutinee.clone())),
+            scrutinee: Some(Box::new(scrutinee.duplicate())),
             branches: vec![branch],
         });
         let out = run(case);

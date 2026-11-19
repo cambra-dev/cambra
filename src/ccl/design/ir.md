@@ -547,8 +547,8 @@ the binder's resolved `ty` is the type at which references are bound. See
 [the binder slot](type-inference.md#the-binder-slot-and-why-annotations-do-not-outlive-inference).
 
 `NodeId` tracks provenance, not expression equality: `TypedExpr` comparison ignores it.
-`Clone` freshens node identities, while `clone_preserving_ids` and `preserve` are explicit paths
-for carrying an existing identity through a rebuild. A substitution's in-place replacement keeps
+`duplicate` freshens node identities, while `clone_preserving_ids` and `preserve` carry an existing
+identity through a rebuild (`Duplicate`, `src/ccl/expr.rs`). A substitution's in-place replacement keeps
 the occurrence root and freshens copied interiors. Passes that rebuild nodes must decide which
 identities survive so the lowering projection can still attribute diagnostics; see
 [provenance](provenance.md).

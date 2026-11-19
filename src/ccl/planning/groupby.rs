@@ -20,6 +20,7 @@
 //! recognizer stops matching bucketizes none.
 
 use super::*;
+use crate::ccl::Duplicate;
 use crate::ccl::ty::FunKind;
 
 /// Recognize group-by sites and rewrite them to the bucketize chain.
@@ -315,7 +316,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
     if !matches!(&elem.node, TypedExprNode::Var(n) if n.is_elem()) {
         return None;
     }
-    let path_pf = predicates::eliminate_lifted((**path_of).clone()).ok()?;
+    let path_pf = predicates::eliminate_lifted((**path_of).duplicate()).ok()?;
     if !crate::ccl::eq_term_modulo_ty_slots(&path_pf, collection) {
         return None;
     }
@@ -323,7 +324,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
     Some(PointfulSite {
         collection: collection.clone_preserving_ids(),
         key_binder: key_binder.clone(),
-        key_fn: partition.key_fn.clone(),
+        key_fn: partition.key_fn.duplicate(),
         key_ty: ccl_utils::strip_refinements(key_ty),
         key_dom: (**key_ty).clone(),
         value_idx_ty: Type::refined(
@@ -356,7 +357,7 @@ fn convert_groupby_pointful(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option
                 return Ok(None);
             };
             let mut new_elts = vec![grouped];
-            new_elts.extend(elts.iter().skip(1).cloned());
+            new_elts.extend(elts.iter().skip(1).map(Duplicate::duplicate));
             Ok(Some(typed_compose(new_elts).with_ty(expr.ty.clone())))
         }
         // **Not** consumed in place — a `let`-bound grouping, whose uses are per-key
@@ -391,7 +392,7 @@ fn rewrite_groupby_source(head: &Expr, ctx: &mut PlanningCtx) -> Result<Option<E
     // keeps every refinement except the consumed grouping equation — dropping them here
     // would silently discard a filter.
     let keys = ccl_utils::chain_typed(
-        vec![site.collection.clone(), key_pf],
+        vec![site.collection.duplicate(), key_pf],
         Type::fun_like(
             &site.collection.ty,
             site.value_idx_ty.clone(),
@@ -400,7 +401,7 @@ fn rewrite_groupby_source(head: &Expr, ctx: &mut PlanningCtx) -> Result<Option<E
     );
     Ok(Some(emit_groupby(
         keys,
-        site.collection.clone(),
+        site.collection.duplicate(),
         site.group_idx_ty,
         site.key_binder,
         site.key_dom,
@@ -452,8 +453,8 @@ mod tests {
 
         // pred = (__elem ▷ c ▷ key) == k
         let elem = Expr::var(Name::elem()).with_ty(idx.clone());
-        let elem_c = Expr::apply(elem, c.clone()).with_ty(int.clone());
-        let extract = Expr::apply(elem_c, key.clone()).with_ty(int.clone());
+        let elem_c = Expr::apply(elem, c.duplicate()).with_ty(int.clone());
+        let extract = Expr::apply(elem_c, key.duplicate()).with_ty(int.clone());
         let pred = Expr::binop(
             extract,
             BinOpKind::Compare(CompareKind::Equals),
@@ -464,12 +465,12 @@ mod tests {
         let head_ty = fun_ty(int.clone(), fun_ty(refined_ty(idx, pred), int.clone()));
         let pairs = Expr::compose(vec![
             Expr::new(TypedExprNode::Proj(ProjKey::Index(1))).with_ty(Type::Hole),
-            c.clone(),
+            c.duplicate(),
         ])
         .with_ty(Type::Hole);
         let head = apply_builtin(pairs, Builtin::Curry, Type::Hole, head_ty.clone());
         // The tail stands in for the live main-tree occurrence of the shared key.
-        Expr::compose(vec![head, key.clone()]).with_ty(head_ty)
+        Expr::compose(vec![head, key.duplicate()]).with_ty(head_ty)
     }
 
     /// Recognition lifts the key extraction out of a *type* and into the term

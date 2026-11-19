@@ -24,6 +24,7 @@ use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
 use super::{product, variant_type};
+use crate::ccl::Duplicate;
 use crate::ccl::infer::solver::traits::{
     Assoc, MethodRow, MethodTarget, Signature, Trait, function_over, replace_params,
 };
@@ -672,11 +673,12 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                     let mut opened = crate::ccl::subst::open_pi_binder(
                         &crate::ccl::subst::Mapping::Rename(b.clone()),
                         c,
+                        crate::ccl::Ids::Fresh,
                     );
                     ctx.scoped(b, &bound, |ctx| {
                         emit_annotation_predicates(&mut opened, ctx)
                     })?;
-                    **c = crate::ccl::subst::close_pi_binder(b, &opened);
+                    **c = crate::ccl::subst::close_pi_binder(b, &opened, crate::ccl::Ids::Fresh);
                     Ok(())
                 }
                 _ => emit_annotation_predicates(c, ctx),
@@ -702,8 +704,9 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 .iter()
                 .map(|(_, t)| ctx.normalize(&ctx.refinement_domain(t)))
                 .collect();
-            let mut opened = crate::ccl::subst::opened_family_body(binders, body)
-                .unwrap_or_else(|| (**body).clone());
+            let mut opened =
+                crate::ccl::subst::opened_family_body(binders, body, crate::ccl::Ids::Fresh)
+                    .unwrap_or_else(|| (**body).clone());
             fn under<C: Typing>(
                 scope: &[(Name, Type)],
                 body: &mut Type,
@@ -719,7 +722,8 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             let scope: Vec<(Name, Type)> = names.iter().cloned().zip(bounds).collect();
             under(&scope, &mut opened, ctx)?;
             let enclosing: Vec<Option<Name>> = names.into_iter().map(Some).collect();
-            **body = crate::ccl::subst::close_pi_binders(&enclosing, &opened);
+            **body =
+                crate::ccl::subst::close_pi_binders(&enclosing, &opened, crate::ccl::Ids::Fresh);
             Ok(())
         }
         // A family's arguments are terms the declaration writes, typed where they stand.
@@ -1176,7 +1180,7 @@ pub(super) fn emit_cast<C: Typing>(
     // the preserved binder close here. Idempotent when `v` came out of a
     // closed function (its references are already indices).
     let v = match &name {
-        Some(k) => crate::ccl::subst::close_pi_binder(k, &v),
+        Some(k) => crate::ccl::subst::close_pi_binder(k, &v, crate::ccl::Ids::Fresh),
         None => v,
     };
     // The re-viewed value does what the value does, settled by the target's kind: a
@@ -1679,7 +1683,8 @@ fn refine_result(
         "infer.refine_result",
         crate::ccl::provenance::Nature::Machinery,
     );
-    let operands: Vec<crate::ccl::TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+    let operands: Vec<crate::ccl::TypedExpr> =
+        operand_exprs.iter().map(|e| (*e).duplicate()).collect();
     refinement.refine(result, &operands)
 }
 
@@ -2223,6 +2228,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
                 crate::ccl::subst::open_pi_binder(
                     &crate::ccl::subst::Mapping::Rename(b.clone()),
                     &cod,
+                    crate::ccl::Ids::Fresh,
                 )
             }
             _ => cod,
@@ -4507,14 +4513,14 @@ pub(super) fn writer_tap_histories(
             let position = Name::fresh("__pos");
             let at = var(&position, domain);
             let item = match enclosing {
-                None => applied(at.clone(), source.clone_preserving_ids(), item_ty),
+                None => applied(at.duplicate(), source.clone_preserving_ids(), item_ty),
                 Some((e, e_ty)) => {
                     let family = source
                         .ty
                         .codomain()
                         .expect("a nested writer's source is a family of collections");
                     let row = applied(var(e, e_ty), source.clone_preserving_ids(), family);
-                    applied(at.clone(), row, item_ty)
+                    applied(at.duplicate(), row, item_ty)
                 }
             };
             // Each slot before the item is the value a variable held entering the position.
@@ -4598,10 +4604,13 @@ fn emit_transact_writer<C: Typing>(
         let ty = match (i, p.peel_refinements()) {
             (0, _) => enclosing_component(p),
             (_, Type::DepTuple(parts)) => {
-                let first = std::rc::Rc::new(projected(whole.clone(), 0, enclosing_component(p)));
-                crate::ccl::subst::open_tuple_components(parts, |_, _| {
-                    crate::ccl::subst::Mapping::Discharge(std::rc::Rc::clone(&first))
-                })
+                let first =
+                    std::rc::Rc::new(projected(whole.duplicate(), 0, enclosing_component(p)));
+                crate::ccl::subst::open_tuple_components(
+                    parts,
+                    |_, _| crate::ccl::subst::Mapping::Discharge(std::rc::Rc::clone(&first)),
+                    crate::ccl::Ids::Fresh,
+                )
                 .pop()
                 .unwrap_or_else(|| unreachable!("the pair has two components"))
             }
@@ -4808,9 +4817,11 @@ fn nested_parameter_parts(parameter: &Type) -> (Option<Name>, Type) {
                 .0
                 .clone()
                 .unwrap_or_else(|| Name::fresh("__enclosing"));
-            let position = crate::ccl::subst::open_tuple_components(parts, |_, _| {
-                crate::ccl::subst::Mapping::Rename(enclosing.clone())
-            })
+            let position = crate::ccl::subst::open_tuple_components(
+                parts,
+                |_, _| crate::ccl::subst::Mapping::Rename(enclosing.clone()),
+                crate::ccl::Ids::Fresh,
+            )
             .pop()
             .unwrap_or_else(|| unreachable!("the pair has two components"));
             (Some(enclosing), position)
