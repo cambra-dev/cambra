@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ccl::capabilities::{CapabilityRun, CapabilityState, CapabilityVar};
+use crate::ccl::capabilities::{
+    CapabilityRun, CapabilityState, CapabilityVar, OrderableIfRequiredBy, OrderingState,
+};
 use crate::ccl::infer_var::{
     BarrierState, BarrierVar, InferState, InferVar, InferVarId, SuspendedMemberships,
 };
@@ -47,6 +49,7 @@ pub(crate) struct Revisions {
     funkind: u64,
     funkind_names: u64,
     capability: u64,
+    ordering: u64,
     capability_run: u64,
 }
 
@@ -89,6 +92,7 @@ impl<R: PartialEq, T: Clone> Stamped<R, T> {
 pub(crate) struct CapabilityRevision {
     infer: u64,
     capability: u64,
+    ordering: u64,
     funkind: u64,
     capability_run: u64,
 }
@@ -181,6 +185,8 @@ pub struct Solver {
     barriers: Table<BarrierVar, BarrierState>,
     /// What is recorded on each capability variable.
     capabilities: Table<CapabilityVar, CapabilityState>,
+    /// What is recorded on each ordering requirement the run made.
+    orderings: Table<OrderableIfRequiredBy, OrderingState>,
     /// What the run records about capabilities beyond each variable's state.
     capability_run: CapabilityRun,
     /// How many facts the run has recorded, by what holds them ([`Revisions`]).
@@ -240,6 +246,7 @@ impl Solver {
             funkinds: Table::default(),
             barriers: Table::default(),
             capabilities: Table::default(),
+            orderings: Table::default(),
             capability_run: CapabilityRun::default(),
             revisions: Revisions::default(),
             suspended_memberships: SuspendedMemberships::default(),
@@ -274,12 +281,14 @@ impl Solver {
     /// capability variables; on funkind variables, since an edge's filter can hold only while
     /// a kind is data ([`crate::ccl::capabilities::Filter`]); on inference variables, since a
     /// bound compares the types of the exceptions it takes away and of an ordering
-    /// requirement's positions; and on the run's record of capabilities, whether its
-    /// exceptions' types are settled say ([`crate::ccl::capabilities::exceptions_settled`]).
+    /// requirement's positions; on ordering requirements, since a bound admits a requirement
+    /// that is satisfied; and on the run's record of capabilities, whether its exceptions'
+    /// types are settled say ([`crate::ccl::capabilities::exceptions_settled`]).
     pub(crate) fn capability_revision(&self) -> CapabilityRevision {
         CapabilityRevision {
             infer: self.revisions.infer,
             capability: self.revisions.capability,
+            ordering: self.revisions.ordering,
             funkind: self.revisions.funkind,
             capability_run: self.revisions.capability_run,
         }
@@ -424,6 +433,46 @@ impl Solver {
         self.capabilities.get_mut(self.id, var)
     }
 
+    /// The home the ordering requirement this solver makes next gets.
+    pub(crate) fn next_ordering_home(&self) -> Home {
+        self.reach(format_args!("a fresh ordering requirement"));
+        self.orderings.next_home(self.id)
+    }
+
+    /// Take ownership of a requirement made at [`Self::next_ordering_home`].
+    pub(crate) fn adopt_ordering(&mut self, order: &Rc<OrderableIfRequiredBy>) {
+        self.orderings
+            .adopt(self.id, order, OrderingState::default());
+    }
+
+    /// What has been recorded on the ordering requirement `order`. A run's requirement leaves
+    /// it only closed, carrying its answer, so another run's is read here only if lowering
+    /// wrote it, and then as unrecorded.
+    pub(crate) fn ordering_state(&self, order: &OrderableIfRequiredBy) -> &OrderingState {
+        self.own_ordering(order);
+        self.orderings.get(self.id, order)
+    }
+
+    /// What has been recorded on the ordering requirement `order`, for recording more
+    /// ([`Revisions`]).
+    pub(crate) fn ordering_state_mut(
+        &mut self,
+        order: &OrderableIfRequiredBy,
+    ) -> &mut OrderingState {
+        self.own_ordering(order);
+        self.revisions.ordering += 1;
+        self.orderings.get_mut(self.id, order)
+    }
+
+    fn own_ordering(&self, order: &OrderableIfRequiredBy) {
+        if let Some(home) = order.home {
+            assert_eq!(
+                home.solver, self.id,
+                "an ordering requirement is read open outside the run that made it"
+            );
+        }
+    }
+
     fn own_capability(&self, var: &CapabilityVar) {
         assert_eq!(
             var.home().solver,
@@ -493,6 +542,15 @@ impl Handle for InferVar {
     }
     fn home(&self) -> Option<Home> {
         InferVar::home(self)
+    }
+}
+
+impl Handle for OrderableIfRequiredBy {
+    fn key(&self) -> u32 {
+        self.id
+    }
+    fn home(&self) -> Option<Home> {
+        self.home
     }
 }
 
