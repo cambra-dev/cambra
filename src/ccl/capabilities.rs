@@ -2344,6 +2344,11 @@ pub struct Exceeded {
     pub blame: Blame,
 }
 
+/// Whether every one of `written` admits `capability` ([`CapabilityVar::written_uppers`]).
+fn admitted(solver: &mut Solver, written: &[Upper], capability: &LocatedCapability) -> bool {
+    written.iter().all(|u| u.admits(solver, &capability.item))
+}
+
 /// Each upper bound of the run that its variable's capabilities exceed, in the order the
 /// bounds were recorded.
 #[expect(
@@ -2355,7 +2360,7 @@ pub(crate) fn exceeded_uppers(solver: &mut Solver) -> Vec<Exceeded> {
     let vars = solver.capability_run.bounded.clone();
     let mut out = Vec::new();
     for var in vars {
-        let capabilities = var.resolved(solver);
+        let capabilities = var.resolved_unstopped(solver);
         for upper in var.uppers(solver).iter() {
             if let Some(capability) = capabilities.iter().find(|l| !upper.admits(solver, &l.item)) {
                 out.push(Exceeded {
@@ -2396,7 +2401,13 @@ impl CapabilityVar {
     }
 
     pub(crate) fn set_open_input(&self, solver: &mut Solver, open: bool) {
-        self.state_mut(solver).open_input = open;
+        if self.state(solver).open_input != open {
+            self.state_mut(solver).open_input = open;
+            // Whether an ordering requirement over this variable is satisfied reads it
+            // (`has_open_ordering_input`), so a union of children that read the requirement as
+            // satisfied before ([`Children`]) is no longer the answer.
+            solver.capability_run.facts += 1;
+        }
     }
 
     fn has_open_ordering_input(&self, solver: &mut Solver) -> bool {
@@ -2542,6 +2553,9 @@ impl CapabilityVar {
             solver.capability_run.bounded.push(Rc::clone(self));
         }
         self.state_mut(solver).uppers.push(upper);
+        // A written bound stops what this variable passes on, so a resolution read before it is
+        // no longer the answer.
+        solver.capability_run.facts += 1;
     }
 
     /// The sets bounding this variable.
@@ -2635,7 +2649,7 @@ impl CapabilityVar {
                   and a trait hashes and orders by its module path and name"
     )]
     pub fn resolved(&self, solver: &mut Solver) -> BTreeSet<LocatedCapability> {
-        self.resolve(solver, None)
+        self.resolve(solver, None, true)
             .into_iter()
             .filter(|c| !matches!(&c.item, Capability::Requires(r) if r.is_satisfied(solver)))
             .collect()
@@ -2646,7 +2660,7 @@ impl CapabilityVar {
         reason = "requirements hash conditional operands by stable identity"
     )]
     pub(crate) fn resolved_causes(&self, solver: &mut Solver) -> BTreeSet<LocatedCapability> {
-        self.resolve(solver, Some(true))
+        self.resolve(solver, Some(true), true)
     }
 
     /// The set [`Self::resolved`] states.
@@ -2670,11 +2684,24 @@ impl CapabilityVar {
         set_of(solver, &causes)
     }
 
+    /// The capabilities recorded on this variable and on every variable flowing into it, each
+    /// through the filters of the path it takes, of one direction where `direction` names one:
+    /// the effects for `Some(true)`, the requirements for `Some(false)`.
+    ///
+    /// With `stop`, the answer is what this variable's written bounds admit
+    /// ([`Self::written_uppers`]); without it, everything that flows in, which the check of
+    /// those bounds reads ([`exceeded_uppers`]). Every edge out of a variable carries its stopped
+    /// value, so the variables downstream of a written type read what the type states.
     #[expect(
         clippy::mutable_key_type,
         reason = "requirements hash conditional operands by stable identity"
     )]
-    fn resolve(&self, solver: &mut Solver, direction: Option<bool>) -> BTreeSet<LocatedCapability> {
+    fn resolve(
+        &self,
+        solver: &mut Solver,
+        direction: Option<bool>,
+        stop: bool,
+    ) -> BTreeSet<LocatedCapability> {
         let allows = |filter: &Filter| {
             direction.is_none() || filter.of_causes.is_none() || direction == filter.of_causes
         };
@@ -2689,6 +2716,7 @@ impl CapabilityVar {
         let now = solver.capability_run.facts;
         if let Some((at, capabilities)) = &self.state(solver).resolved_at
             && direction.is_none()
+            && stop
             && *at == now
         {
             return capabilities.clone();
@@ -2735,22 +2763,12 @@ impl CapabilityVar {
                     if !allows(&filter) || !filter.holds(solver) {
                         continue;
                     }
-                    // A variable a written function type bounds passes on only what the type
-                    // states: a capability beyond it is reported where it meets the type, and
-                    // stops there rather than reaching every variable downstream as a second
-                    // error. A `def`'s `only` clause passes on what its body does, which a
-                    // caller's constructs, a `try` say, still read.
-                    let written: Vec<Upper> = src
-                        .state(solver)
-                        .uppers
-                        .iter()
-                        .filter(|u| matches!(u.blame, Blame::Written(_)))
-                        .cloned()
-                        .collect();
+                    // What `src` passes on is its stopped value.
+                    let written = src.written_uppers(solver);
                     let flowing: Vec<LocatedCapability> = sets[&src.uid]
                         .iter()
                         .filter_map(|l| {
-                            if written.iter().all(|u| u.admits(solver, &l.item)) {
+                            if admitted(solver, &written, l) {
                                 filter.pass(solver, l)
                             } else {
                                 None
@@ -2772,11 +2790,53 @@ impl CapabilityVar {
                 break;
             }
         }
-        let out = sets.remove(&self.uid).expect("the variable's own set");
-        if direction.is_none() {
-            self.state_mut(solver).resolved_at = Some((now, out.clone()));
+        let mut out = sets.remove(&self.uid).expect("the variable's own set");
+        if stop {
+            let written = self.written_uppers(solver);
+            out.retain(|l| admitted(solver, &written, l));
+            if direction.is_none() {
+                self.state_mut(solver).resolved_at = Some((now, out.clone()));
+            }
         }
         out
+    }
+
+    /// The bounds a written function type puts on this variable, the only bounds that stop
+    /// what exceeds them.
+    ///
+    /// A written function type defines the type at the position it is written. What meets it
+    /// is a separate value, an argument say, which keeps its own capabilities and is what an
+    /// error beyond the type reports ([`exceeded_uppers`]); past the position, this variable
+    /// and every variable downstream of it read as the type states rather than reporting the
+    /// capability again.
+    ///
+    /// Every other bound asserts something of a type that is still inferred, and only checks
+    /// it. A `def`'s `only` clause and a trait's signature bound the definition's own type,
+    /// which an error beyond them spells (`InferCtx::item_beyond_clause` finds the item there)
+    /// and a caller's constructs, a `try` say, read: stopping would rewrite the definition's
+    /// type to agree with the clause it breaks. A clause variable's bound and a block's
+    /// transaction bound check what each use or body brings.
+    fn written_uppers(&self, solver: &Solver) -> Vec<Upper> {
+        self.state(solver)
+            .uppers
+            .iter()
+            .filter(|u| matches!(u.blame, Blame::Written(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// Everything that flows into this variable, beyond its written bounds too: what the
+    /// check of its bounds reads ([`exceeded_uppers`]).
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
+    fn resolved_unstopped(&self, solver: &mut Solver) -> BTreeSet<LocatedCapability> {
+        self.resolve(solver, None, false)
+            .into_iter()
+            .filter(|c| !matches!(&c.item, Capability::Requires(r) if r.is_satisfied(solver)))
+            .collect()
     }
 
     /// This variable and every variable flowing into it, through edges whose filters hold
@@ -3634,6 +3694,71 @@ mod tests {
             .into_iter()
             .map(|item| LocatedCapability { item, at: None })
             .collect()
+    }
+
+    /// A written bound is part of the bounded variable's value: the variable reads as the bound
+    /// states, so does every variable downstream of it, a resolution read before the bound was
+    /// recorded is not served after it, and only the check of the bound sees what exceeds it.
+    #[test]
+    fn a_written_bound_stops_what_its_variable_holds() {
+        let solver = &mut Solver::new();
+        // Both stand in the scope of `x`, the place the recorded write names.
+        let scope = Telescope::empty().extended(Name::from("x"));
+        let bounded = CapabilityVar::fresh(solver, 0, &scope);
+        let downstream = CapabilityVar::fresh(solver, 0, &scope);
+        downstream.flows_from(solver, &bounded, Filter::default());
+        let appended = LocatedCapability {
+            item: write("x"),
+            at: None,
+        };
+        bounded.record(solver, appended.clone());
+        assert!(downstream.resolved(solver).contains(&appended));
+
+        bounded.bound_above(
+            solver,
+            Upper {
+                set: CapabilitySet::default(),
+                of_requires: true,
+                of_causes: true,
+                forbidden: BTreeSet::new(),
+                blame: Blame::Written(chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0)),
+            },
+        );
+        assert!(bounded.resolved(solver).is_empty());
+        assert!(downstream.resolved(solver).is_empty());
+        let exceeded = exceeded_uppers(solver);
+        assert_eq!(exceeded.len(), 1);
+        assert_eq!(exceeded[0].capability, appended);
+    }
+
+    /// Opening a variable's input unsettles an ordering requirement over it, so a union of a
+    /// node's children that dropped the requirement as satisfied is read again after.
+    #[test]
+    fn opening_an_input_unsettles_a_union_read_before() {
+        let solver = &mut Solver::new();
+        let input = CapabilityVar::fresh(solver, 0, &Telescope::empty());
+        let holder = CapabilityVar::fresh(solver, 0, &Telescope::empty());
+        let order = Requirement::orderable_if_required_by(
+            crate::ccl::Type::Hole,
+            Capabilities::var(Rc::clone(&input)),
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+            None,
+            Vec::new(),
+        );
+        holder.record(
+            solver,
+            LocatedCapability {
+                item: Capability::Requires(order.clone()),
+                at: None,
+            },
+        );
+        let union = of_parts_in(solver, &[&Capabilities::var(holder)]);
+        assert!(matches!(union.repr(), Repr::Children(_)));
+        assert!(!union.set_in(solver).requires.contains(&order));
+
+        input.set_open_input(solver, true);
+        assert!(union.set_in(solver).requires.contains(&order));
     }
 
     /// `Effect` and `Context` hold every capability of their direction, a family's top every
