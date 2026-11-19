@@ -198,7 +198,35 @@ pub enum Predicate {
     },
 }
 
+/// A region of an ordered domain that is a prefix of it ([`Predicate::as_prefix_in`]).
+pub enum Prefix {
+    /// No position.
+    Nothing,
+    /// Every position at or below this one.
+    Through(Position),
+    /// Every position.
+    All,
+}
+
 impl Predicate {
+    /// This region as a prefix of the domain `extent`, or `None` where it is not one: where a
+    /// position it does not hold lies below one it holds.
+    ///
+    /// Exact: a region is `Through(𝑣)` only where it equals `at_or_below_in(𝑣, extent)`, so a
+    /// release of the positions `{0, 2}` is no prefix. A prefix cursor seeded from a region
+    /// asserts it through this rather than widening it to the region's upper bound.
+    pub fn as_prefix_in(&self, extent: Option<&Extent>) -> Option<Prefix> {
+        match self {
+            Predicate::False => Some(Prefix::Nothing),
+            Predicate::True => Some(Prefix::All),
+            _ => {
+                let last = self.max_released_position()?;
+                let prefix = Predicate::up_to(last.value().clone(), true, extent, None);
+                (prefix.subsumes(self) && self.subsumes(&prefix)).then_some(Prefix::Through(last))
+            }
+        }
+    }
+
     /// The largest position this predicate covers, for a prefix-style release of a
     /// monotone domain — a commit clock or an iteration's positions.
     ///
@@ -1731,6 +1759,35 @@ mod tests {
         BaseType, ColumnValue, Extent, Value,
         tiling::tests::{bool_ext, int, range},
     };
+
+    /// A region is a prefix exactly where it equals every position through its last: `{0, 2}`
+    /// is not one, and neither is a point above an empty start.
+    #[test]
+    fn a_region_is_a_prefix_only_where_it_holds_every_position_through_its_last() {
+        let extent = Extent::Base(crate::interpreter::BaseType::UInt);
+        let uint = |n: u64| Value::UInt(n);
+        let through = |pred: Predicate| match pred.as_prefix_in(Some(&extent)) {
+            Some(Prefix::Through(last)) => Some(last.into_value()),
+            _ => None,
+        };
+        assert!(matches!(
+            Predicate::False.as_prefix_in(Some(&extent)),
+            Some(Prefix::Nothing)
+        ));
+        assert!(matches!(
+            Predicate::True.as_prefix_in(Some(&extent)),
+            Some(Prefix::All)
+        ));
+        assert_eq!(through(Predicate::at_or_below(uint(4))), Some(uint(4)));
+        let holes = Predicate::point(uint(0)).union(&Predicate::point(uint(2)));
+        assert!(holes.as_prefix_in(Some(&extent)).is_none());
+        assert!(
+            Predicate::point(uint(2))
+                .as_prefix_in(Some(&extent))
+                .is_none()
+        );
+        assert_eq!(through(Predicate::point(uint(0))), Some(uint(0)));
+    }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 

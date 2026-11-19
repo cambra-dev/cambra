@@ -187,34 +187,46 @@ impl TileProducer for RekeySortedProducer {
         if self.consuming {
             return;
         }
-        // The accumulated guard, not the increment: a release that closes a gap releases the
-        // rows above it that an earlier release named.
         let released = self.obsolete_guard().clone();
         if released.is_universal() {
             return self.input.release(self.input.tiling().universal_guard());
         }
-        let through = self
-            .held
-            .iter()
-            .take_while(|(key, _)| released.covers_path(std::slice::from_ref(key)))
-            .last()
-            .cloned();
-        let Some((key, through)) = through else {
+        // Each row whose key is released is this read's no longer, so its position goes
+        // upstream exactly, above a gap as well: the input's slot then holds what this read
+        // has finished with, which is where a read that replaces it across a reload starts.
+        let (done, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|(key, _)| released.covers_path(std::slice::from_ref(key)));
+        self.held = held;
+        if done.is_empty() {
             return;
-        };
-        if matches!(self.complete, Complete::Through(_)) {
-            self.released_through = Some(key);
         }
-        self.held.retain(|(_, at)| at > &through);
+        if matches!(self.complete, Complete::Through(_)) {
+            let greatest = done
+                .iter()
+                .map(|(key, _)| key)
+                .max_by(|a, b| a.partial_cmp(b).expect("the keys of one domain compare"));
+            if let Some(greatest) = greatest
+                && self
+                    .released_through
+                    .as_ref()
+                    .is_none_or(|through| greatest > through)
+            {
+                self.released_through = Some(greatest.clone());
+            }
+        }
+        let positions = Predicate::union_all(
+            done.into_iter()
+                .map(|(_, at)| Predicate::point(at))
+                .collect(),
+        );
         self.input
-            .release(TileGuard::Function(FunctionGuard::Domain(
-                Predicate::at_or_below(through),
-            )));
+            .release(TileGuard::Function(FunctionGuard::Domain(positions)));
     }
 }
 
 impl RekeySortedProducer {
-    /// Only the continuous consumed prefix can advance a prefix-releasing input.
+    /// The continuous consumed prefix, whose keys rising keys make complete.
     fn consumed_prefix(&self) -> Predicate {
         match &self.consumed {
             Predicate::True => Predicate::True,
@@ -384,9 +396,14 @@ impl Breaker for RekeySortedProducer {
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         let tile = self.read_input(guard.clone());
         self.output.merge(tile);
-        let prefix = self.consumed_prefix();
+        // What is consumed goes upstream exactly, above a gap as well, so the input's slot holds
+        // what this read has finished with. The rows above a gap stay held: their keys become
+        // complete only once the gap closes.
         self.input
-            .release(TileGuard::Function(FunctionGuard::Domain(prefix.clone())));
+            .release(TileGuard::Function(FunctionGuard::Domain(
+                self.consumed.clone(),
+            )));
+        let prefix = self.consumed_prefix();
         self.held.retain(|(_, position)| !prefix.contains(position));
     }
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -527,7 +544,9 @@ mod tests {
     /// A producer over rising keys that reads `input` whole, pulled once, and the guards it
     /// forwards upstream: the path a breaker takes outside consuming mode.
     fn read_whole(input: Tile) -> (RekeySortedProducer, Tile, Rc<RefCell<Vec<TileGuard>>>) {
-        let (spy, released) = ReleaseSpy::new(input, pair_tiling());
+        // An input that answers nothing it released, as every producer does.
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+        let (spy, _, released) = ProjectionSpy::new(input, pair_tiling());
         let tiling = rekeyed_tiling(&pair_tiling());
         let mut producer = RekeySortedProducer {
             base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
@@ -551,9 +570,10 @@ mod tests {
         Value::UInt(n)
     }
 
-    /// A later morsel cannot release an unread earlier tick or rule its output key absent.
+    /// A later morsel releases its own tick and no unread earlier one, and does not rule the
+    /// earlier tick's output key absent.
     #[test]
-    fn reverse_morsels_release_only_the_consumed_prefix() {
+    fn reverse_morsels_release_only_what_they_consumed() {
         use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
         let input_tiling = pair_tiling();
         let (spy, _, releases) = ProjectionSpy::new(
@@ -573,7 +593,10 @@ mod tests {
         };
         producer.enter_consuming_mode();
         producer.consume_impl(InputId::ONLY, keys(Predicate::point(uint(1))));
-        assert!(producer.input.obsolete_guard().is_empty());
+        assert_eq!(
+            producer.input.obsolete_guard(),
+            &keys(Predicate::point(uint(1)))
+        );
         let Tile::DataFunction {
             domain_predicate, ..
         } = &producer.output
@@ -594,11 +617,14 @@ mod tests {
             producer.input.obsolete_guard(),
             &keys(Predicate::at_or_below(uint(1)))
         );
+        // Every release names consumed ticks only.
         assert!(
             releases
                 .borrow()
                 .iter()
-                .all(|guard| guard.is_empty() || *guard == keys(Predicate::at_or_below(uint(1))))
+                .all(|guard| keys(Predicate::at_or_below(uint(1))).subsumes(guard)),
+            "{:?}",
+            releases.borrow()
         );
     }
 
@@ -626,10 +652,9 @@ mod tests {
         assert_eq!(domain_predicate, Predicate::at_or_below(uint(1)));
     }
 
-    /// On the read-whole path, a prefix of keys is released as the prefix of positions that
-    /// carries them.
+    /// On the read-whole path, released keys release exactly the positions that carry them.
     #[test]
-    fn a_key_prefix_releases_a_position_prefix() {
+    fn released_keys_release_the_positions_that_carry_them() {
         let (mut producer, _, released) = read_whole(pairs(
             &[3, 7, 9],
             &[0, 1, 2],
@@ -639,14 +664,16 @@ mod tests {
         producer.release(keys(Predicate::at_or_below(uint(1))));
         assert_eq!(
             *released.borrow(),
-            vec![keys(Predicate::at_or_below(uint(7)))]
+            vec![keys(
+                Predicate::point(uint(3)).union(&Predicate::point(uint(7)))
+            )]
         );
     }
 
-    /// On the read-whole path, a release with a gap below it forwards nothing until the gap is
-    /// released, and the key above the gap leaves the output meanwhile.
+    /// On the read-whole path, a key released above a gap releases its position at once, and
+    /// the key leaves the output; the gap's position is released when its key is.
     #[test]
-    fn a_gap_holds_the_rows_above_it() {
+    fn a_key_released_above_a_gap_releases_its_position() {
         let (mut producer, _, released) = read_whole(pairs(
             &[3, 7, 9],
             &[0, 1, 2],
@@ -654,8 +681,10 @@ mod tests {
             Predicate::True,
         ));
         producer.release(keys(Predicate::point(uint(1))));
-        assert!(released.borrow().is_empty(), "{:?}", released.borrow());
-        let out = producer.get(producer.tiling().universal_guard());
+        assert_eq!(*released.borrow(), vec![keys(Predicate::point(uint(7)))]);
+        let out = crate::interpreter::dispatcher::in_a_run(|| {
+            producer.get(producer.tiling().universal_guard())
+        });
         assert_eq!(
             out.live_keys()
                 .map(|k| k.map(|(_, key)| key).collect::<Vec<_>>()),
@@ -664,7 +693,10 @@ mod tests {
         producer.release(keys(Predicate::point(uint(0))));
         assert_eq!(
             *released.borrow(),
-            vec![keys(Predicate::at_or_below(uint(7)))]
+            vec![
+                keys(Predicate::point(uint(7))),
+                keys(Predicate::point(uint(3)))
+            ]
         );
     }
 
