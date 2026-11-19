@@ -4031,10 +4031,15 @@ refinement: a group-by under a loop whose key reads the loop's binder has keys
 `{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
 always was.
 
-A function of several parameters takes a dependent tuple when a later parameter's type reads an
-earlier one. Written dependent tuples, `{(𝑎: 𝐴), (𝑏: 𝐷(𝑎))}`, are planned
-(`docs/chl-spec.md`, "Named components"). Inference also introduces a dependent tuple through
-`uncurry(𝑛)`, which
+A program writes a dependent tuple as a product naming its components,
+`{(𝑎: 𝐴), (𝑏: 𝐷(𝑎))}` (`docs/chl-spec.md`, "Named components"), and a function of several
+parameters takes one. A lambda's domain names its parameters whether or not a later one's type
+reads an earlier one yet, as `uncurry`'s scheme below does, so a written dependent domain meeting
+it has names to align to. A written product keeps its names where a hole follows a named
+component, since what the hole is inferred to may read it (`lower::named_product`), and an
+annotation's hole in component `𝑘` is a variable standing under the components before it.
+Inference also introduces one
+through `uncurry(𝑛)`, which
 flattens a comprehension over several generators ([ir.md, "Several
 generators"](ir.md#several-generators)). Its scheme keys the flattened collection by
 `(𝑘₁ : 𝛼₁) × … × 𝛼ₙ`, each `𝛼ᵢ` a variable standing under `𝑘₁ … 𝑘ᵢ₋₁`, so a generator whose source
@@ -4086,8 +4091,11 @@ tuple. Code that only recurses through a tuple treats `DepTuple` as it treats `T
 Opening the outermost binder changes no distance to a binder inside it, and the binders around the
 tuple are already open wherever the tuple is held, so no index shifts. In
 `λ 𝑝 : (𝑎 : Int) × {Int | __elem ∈ keys(𝑎)} → …`, the term `𝑝.1` has type
-`{Int | __elem ∈ keys(𝑝.0)}`. Check mode's projection rule (`emit_proj`) requires a projection's
-codomain to be that type, read with the projection's own binder as `𝑝`.
+`{Int | __elem ∈ keys(𝑝.0)}`. The projection rule (`emit_proj`) requires a projection's
+codomain to be that type, read with the projection's own binder as `𝑝`. Check mode reads the
+binder off the recorded type; emission, which applies `.𝑘` to an argument already typed, seeds the
+projection's type as a function of that dependent tuple (`emit_apply`), since an open tuple's
+positions stand outside the components a later one reads.
 
 `Type::projection_type` constructs the function whose result reads earlier components of its own
 input. `Expr::projection_of` applies that function to the projected value and discharges its binder.
@@ -4124,8 +4132,9 @@ Materializing a plain tuple removes the unnamed crossings with `subst::tuple_of_
 A plain tuple meets a dependent one with its components unnamed, so the dependent side opens at
 its names, and each later component is judged with the earlier names bound at the plain tuple's
 component types (`ComponentScope`): `{Int | __elem == 1} × {Int | __elem == 5}` is below
-`(𝑎 : Int) × {Int | __elem >= 𝑎}` since `5 >= 𝑎` given `𝑎 == 1`. A dependent tuple meets an open
-tuple position by position, each
+`(𝑎 : Int) × {Int | __elem >= 𝑎}` since `5 >= 𝑎` given `𝑎 == 1`. A tuple built in place meets a
+written dependent annotation with the earlier components read at its parts instead
+(`emit::dep_tuple_at`). A dependent tuple meets an open tuple position by position, each
 component joined over the earlier ones (`Mapping::Join`), and compaction meets an open tuple into
 a dependent one when the open prefix fits its closed width. Materialization builds the tuple
 with `Type::dep_tuple`, which collapses it to

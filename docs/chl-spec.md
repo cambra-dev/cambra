@@ -3055,9 +3055,17 @@ component's value by that name. `{(lo: Int), (x: {Int where _ >= lo})}` is the p
 second component is at least the first. A component without the parentheses is unnamed, and
 `{a: T}` is a record type.
 
-**[Planned]** A written type whose component reads an earlier one, as `x`'s does above. A `def`'s
-parameters may read the earlier ones (§4.1), and a message writes the type of such a function and
-of such a tuple in this form.
+A tuple value has such a type when each component has its type with the earlier components in
+place: `p: {(lo: Int), (x: {Int where _ >= lo})} = (1, 5)` holds since `5 >= 1`, and `(5, 1)` does
+not. A projection reads the earlier components of the tuple it projects, so `p.1` is a
+`{Int where _ >= p.0}`. A tuple whose type lists only some of the components, `{Int, ..}`, holds
+a value of a dependent tuple type, and a component it lists reads none of the others.
+
+A collection keyed by several positions, such as a comprehension over several generators, is a
+collection over a tuple of its keys, and an inner key may depend on an outer one:
+`[x for xs in rows for x in xs]` is a `{(i: K), (j: D(i))} |=> V` where each row `xs` has its own
+keys `D(i)`. A hole in a component after a named one may be inferred to read it, so
+`{(i: _), (j: _)} |=> Int` annotates that comprehension. A message writes such types in this form.
 
 A name is a spelling, not part of the type: `{(a: Int), (b: Int)}` is the type `{Int, Int}`,
 since no component reads `a`. A one-component tuple keeps its comma, `{(a: T),}`.
