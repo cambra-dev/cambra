@@ -1110,12 +1110,7 @@ fn yields_a_prefix(path: &[SmolStr], yielded: &Predicate) -> bool {
             ),
         };
     }
-    at.is_true()
-        || at.is_false()
-        || at.max_released_position().is_some_and(|last| {
-            let prefix = Predicate::at_or_below(last.into_value());
-            prefix.subsumes(at) && at.subsumes(&prefix)
-        })
+    at.as_prefix_in(None).is_some()
 }
 
 /// A live source, as a range over its domain reads it.
