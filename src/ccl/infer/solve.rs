@@ -1721,7 +1721,9 @@ pub(super) fn coalesce_pass(
 ///
 /// The terms a type quotes are nodes too, each with capabilities of its own: a refinement's
 /// predicate, a projection's sum, a family's arguments. Each is settled where it stands, as
-/// predicate rewrites are ([`crate::ccl::ccl_utils::walk_quoted_terms_mut`]).
+/// predicate rewrites are ([`crate::ccl::ccl_utils::walk_quoted_terms_mut`]). Each type in a
+/// slot is closed ([`close_type`]), and so is each ordering requirement a node's capabilities
+/// hold ([`close_requirements`]).
 ///
 /// A run that fails before coalesce settles here too ([`super::run_once`]): the passes after a
 /// failed inference still read the tree.
@@ -1733,36 +1735,66 @@ pub(super) fn settle_capabilities(solver: &mut Solver, expr: &mut Expr) {
     assert_capabilities_settled(expr);
 }
 
-/// Panic on a node whose capabilities still read a variable once inference has settled them, a
-/// node of a term a type quotes included ([`settle_capabilities`]): a pass after inference
-/// would resolve that variable when it reads it.
+/// Panic on anything of the run's left in `expr` once inference has closed it: a node's
+/// capabilities, or a function type's, that still read a variable, or an ordering requirement
+/// the run has not closed ([`settle_capabilities`]), a node of a term a type quotes included.
+/// A pass after inference would read the variable when it reads it.
 #[cfg(debug_assertions)]
-fn assert_capabilities_settled(expr: &Expr) {
-    fn go(e: &Expr, seen: &mut std::collections::HashSet<*const Expr>) {
-        let unsettled = [&e.capabilities, &e.own_capabilities]
-            .iter()
-            .any(|c| c.is_pending());
-        assert!(
-            !unsettled,
-            "a node's capabilities still read a variable once inference has settled them: `{}`",
-            symbolic(e)
-        );
-        e.walk_type_slots(|ty| {
-            ty.walk_quoted_terms(&mut |term| {
-                if seen.insert(Rc::as_ptr(term)) {
-                    go(term, seen);
-                }
-            })
-        });
-        e.walk_children(|child| go(child, seen));
+pub(super) fn assert_capabilities_settled(expr: &Expr) {
+    let mut seen = std::collections::HashSet::new();
+    assert_expr_closed(expr, &mut seen);
+}
+
+/// [`assert_capabilities_settled`] of one node and what is below it.
+#[cfg(debug_assertions)]
+fn assert_expr_closed(e: &Expr, seen: &mut std::collections::HashSet<*const Expr>) {
+    for c in [&e.capabilities, &e.own_capabilities] {
+        assert_capabilities_closed(c, &|| format!("the node `{}`", symbolic(e)));
     }
-    go(expr, &mut std::collections::HashSet::new());
+    e.walk_type_slots(|ty| assert_type_closed(ty, seen));
+    e.walk_children(|child| assert_expr_closed(child, seen));
+}
+
+/// Panic on a function type in `ty`, or a node of a term it quotes, still holding anything of
+/// the run's ([`assert_capabilities_settled`]).
+#[cfg(debug_assertions)]
+pub(super) fn assert_type_closed(ty: &Type, seen: &mut std::collections::HashSet<*const Expr>) {
+    if let Type::Fun { capabilities, .. } = ty {
+        assert_capabilities_closed(capabilities, &|| format!("a function type in `{ty}`"));
+    }
+    ty.walk_quoted_terms(&mut |term| {
+        if seen.insert(Rc::as_ptr(term)) {
+            assert_expr_closed(term, seen);
+        }
+    });
+    ty.walk_children(|child| assert_type_closed(child, seen));
+}
+
+#[cfg(debug_assertions)]
+fn assert_capabilities_closed(c: &crate::ccl::capabilities::Capabilities, at: &dyn Fn() -> String) {
+    assert!(
+        !c.is_pending(),
+        "the capabilities of {} still read a variable once inference has closed them",
+        at()
+    );
+    if let Some(set) = c.known_set() {
+        for r in &set.requires {
+            if let Some(order) = r.ordering() {
+                assert!(
+                    order.decided.is_some(),
+                    "an ordering requirement in the capabilities of {} is not closed once \
+                     inference has closed them",
+                    at()
+                );
+            }
+        }
+    }
 }
 
 /// [`settle_capabilities`] sharing `memo` across the quoted terms it rewrites. Whether any slot
 /// changed.
 fn settle_capabilities_in(solver: &mut Solver, expr: &mut Expr, memo: &PredMemo) -> bool {
-    settle_capabilities_reading(solver, expr, memo, &mut HashMap::new())
+    settle_capabilities_reading(solver, expr, memo, &mut ReadSets::default())
 }
 
 /// [`settle_capabilities_in`], children first: a node's union of its children's capabilities
@@ -1771,26 +1803,189 @@ fn settle_capabilities_reading(
     solver: &mut Solver,
     expr: &mut Expr,
     memo: &PredMemo,
-    read: &mut crate::ccl::capabilities::ReadValues,
+    read: &mut ReadSets,
 ) -> bool {
     let mut changed = false;
     expr.walk_children_mut(|child| {
         changed |= settle_capabilities_reading(solver, child, memo, read)
     });
-    expr.walk_type_slots_mut(|ty| {
-        changed |=
-            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
-                settle_capabilities_reading(solver, term, memo, read)
-            });
-    });
+    expr.walk_type_slots_mut(|ty| changed |= close_type(solver, ty, memo, read));
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-        let set = slot.set_reading(solver, read);
-        let settled =
-            crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved(solver));
-        changed |= *slot != settled;
+        let set = slot
+            .set_reading(solver, &mut read.read)
+            .with_raises_resolved(solver);
+        let (set, closed) = close_requirements(solver, set, memo, read);
+        let settled = crate::ccl::capabilities::Capabilities::known(set);
+        changed |= closed || *slot != settled;
         *slot = settled;
     }
     changed
+}
+
+/// Close what a run hands back besides its tree, as [`settle_capabilities`] closes the tree:
+/// each type an error holds, each scheme the run records, and each ordering requirement the
+/// run's top level holds. Nothing the run recorded is left in them to be read once it ends.
+pub(super) fn close_outputs(
+    solver: &mut Solver,
+    errors: &mut [LocatedInferError],
+    schemes: &mut [(Name, crate::ccl::infer::solver::display::InferredPoly)],
+    top_level: &mut [crate::ccl::capabilities::ScopedCapability],
+) {
+    let memo = PredMemo::replacing();
+    let read = &mut ReadSets::default();
+    for e in errors {
+        e.error.map_types(&mut |ty| {
+            let mut ty = ty.clone();
+            close_type(solver, &mut ty, &memo, read);
+            ty
+        });
+    }
+    for (_, scheme) in schemes {
+        for ty in scheme.poly.types_mut() {
+            close_type(solver, ty, &memo, read);
+        }
+        for join in &mut scheme.joins {
+            for ty in &mut join.operands {
+                close_type(solver, ty, &memo, read);
+            }
+        }
+    }
+    for capability in top_level {
+        if let crate::ccl::capabilities::Capability::Requires(r) = &capability.item
+            && r.ordering().is_some()
+        {
+            let set = crate::ccl::capabilities::CapabilitySet {
+                requires: [r.clone()].into(),
+                ..Default::default()
+            };
+            let (set, _) = close_requirements(solver, set, &memo, read);
+            let closed = set
+                .requires
+                .into_iter()
+                .next()
+                .expect("the requirement closed");
+            capability.item = crate::ccl::capabilities::Capability::Requires(closed);
+        }
+    }
+}
+
+/// What a closing pass remembers: each pending value it has read, by allocation
+/// ([`crate::ccl::capabilities::Capabilities::set_reading`]), and each ordering requirement it
+/// has closed or is closing, by identity. A requirement's capabilities can hold the
+/// requirement itself, a loop's body requiring what the loop does, so one met while it is
+/// being closed is closed with the answer decided for it and no capabilities: rendering a
+/// requirement writes only the effects it reads, and its answer is decided.
+#[derive(Default)]
+pub(super) struct ReadSets {
+    read: crate::ccl::capabilities::ReadValues,
+    closed: HashMap<u32, crate::ccl::capabilities::Requirement>,
+    closing: HashMap<u32, bool>,
+}
+
+/// Close `ty` as its run ends: each function type's capabilities become the set they resolve
+/// to, its ordering requirements closed ([`close_requirements`]), and the terms it quotes are
+/// settled ([`settle_capabilities_reading`]). Whether anything changed.
+fn close_type(solver: &mut Solver, ty: &mut Type, memo: &PredMemo, read: &mut ReadSets) -> bool {
+    let mut changed = close_function_capabilities(solver, ty, memo, read);
+    changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
+        settle_capabilities_reading(solver, term, memo, read)
+    });
+    changed
+}
+
+/// The capabilities of each function type in `ty`, closed.
+fn close_function_capabilities(
+    solver: &mut Solver,
+    ty: &mut Type,
+    memo: &PredMemo,
+    read: &mut ReadSets,
+) -> bool {
+    use crate::ccl::capabilities::{Capabilities, Repr};
+    let mut changed = false;
+    if let Type::Fun { capabilities, .. } = ty {
+        let closed = match capabilities.repr() {
+            Repr::Written(_) => None,
+            Repr::Known(set) => {
+                let (set, closed) = close_requirements(solver, set.clone(), memo, read);
+                closed.then(|| Capabilities::known(set))
+            }
+            Repr::Var(_) | Repr::Children(_) => {
+                let set = capabilities
+                    .set_reading(solver, &mut read.read)
+                    .with_raises_resolved(solver);
+                Some(Capabilities::known(
+                    close_requirements(solver, set, memo, read).0,
+                ))
+            }
+        };
+        if let Some(closed) = closed {
+            *capabilities = closed;
+            changed = true;
+        }
+    }
+    ty.walk_children_mut(|child| {
+        changed |= close_function_capabilities(solver, child, memo, read);
+    });
+    changed
+}
+
+/// `set` with each ordering requirement the run has not closed closed
+/// ([`crate::ccl::capabilities::Requirement::closed`]): its capabilities and positions hold
+/// nothing of the run's, and whether it is satisfied is what the run decides now, while its
+/// capabilities can still say whether an effect input is open. Whether one was closed.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Requirement` reaches a `Type` only through its trait declaration, and a trait \
+              hashes and orders by its module path and name"
+)]
+fn close_requirements(
+    solver: &mut Solver,
+    set: crate::ccl::capabilities::CapabilitySet,
+    memo: &PredMemo,
+    read: &mut ReadSets,
+) -> (crate::ccl::capabilities::CapabilitySet, bool) {
+    let mut closed = false;
+    let requires = set
+        .requires
+        .iter()
+        .map(|r| match r.ordering() {
+            Some(order) if order.decided.is_none() => {
+                closed = true;
+                if let Some(done) = read.closed.get(&order.id) {
+                    return done.clone();
+                }
+                if let Some(&satisfied) = read.closing.get(&order.id) {
+                    return r.closed(
+                        order.positions.clone(),
+                        crate::ccl::capabilities::Capabilities::none(),
+                        satisfied,
+                    );
+                }
+                let satisfied = r.is_satisfied(solver);
+                read.closing.insert(order.id, satisfied);
+                let capabilities = order
+                    .capabilities
+                    .set_reading(solver, &mut read.read)
+                    .with_raises_resolved(solver);
+                let (capabilities, _) = close_requirements(solver, capabilities, memo, read);
+                let mut positions = order.positions.clone();
+                close_type(solver, &mut positions, memo, read);
+                let done = r.closed(
+                    positions,
+                    crate::ccl::capabilities::Capabilities::known(capabilities),
+                    satisfied,
+                );
+                read.closing.remove(&order.id);
+                read.closed.insert(order.id, done.clone());
+                done
+            }
+            _ => r.clone(),
+        })
+        .collect();
+    (
+        crate::ccl::capabilities::CapabilitySet { requires, ..set },
+        closed,
+    )
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
