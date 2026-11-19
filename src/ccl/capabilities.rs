@@ -10,7 +10,7 @@ use crate::ccl::infer::solver::state::Home as SolverHome;
 use crate::ccl::ty::RenderCtx;
 use smol_str::SmolStr;
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
@@ -40,13 +40,19 @@ pub struct Requirement(TraitRequirement, Option<Rc<OrderableIfRequiredBy>>);
 #[derive(Debug, Clone)]
 pub struct OrderableIfRequiredBy {
     pub(crate) id: u32,
+    /// The solver of the run that made the requirement, which holds its proof state
+    /// ([`OrderingState`]). `None` for one lowering wrote, which a run makes its own copy of
+    /// before reading it.
+    pub(crate) home: Option<SolverHome>,
     pub positions: crate::ccl::Type,
     pub capabilities: Capabilities,
-    pub(crate) satisfied: Rc<Cell<bool>>,
     pub(crate) node: NodeId,
     pub(crate) source: NodeId,
     pub(crate) iter: Option<crate::ccl::Type>,
-    pub(crate) assumptions: RefCell<Vec<Rc<TraitRequirement>>>,
+    /// The assumptions in scope where the requirement was made. A run records more as uses
+    /// copy it ([`OrderableIfRequiredBy::assume_more`]); closing the requirement writes them
+    /// here ([`Requirement::closed`]).
+    pub(crate) assumptions: Vec<Rc<TraitRequirement>>,
     /// Whether this is a use's copy, located at the use rather than at the loop
     /// ([`Requirement::at_use`]).
     pub(crate) at_use: bool,
@@ -56,7 +62,50 @@ pub struct OrderableIfRequiredBy {
     pub(crate) decided: Option<bool>,
 }
 
+/// What a run has recorded on an ordering requirement it made: its decision, once it makes one,
+/// and the assumptions of the uses that copied it. The run's solver holds it
+/// ([`crate::ccl::infer::solver::Solver::ordering_state`]); the requirement carries only what
+/// is fixed when it is made, and, once closed, the run's decision ([`Requirement::closed`]).
+#[derive(Debug, Default)]
+pub(crate) struct OrderingState {
+    decision: Option<bool>,
+    assumed: Vec<Rc<TraitRequirement>>,
+}
+
 impl OrderableIfRequiredBy {
+    /// Whether the requirement is satisfied, where that is decided: the decision a closed
+    /// requirement carries, or the one its run has made ([`Self::decide`]). `None` while it is
+    /// not, when [`Requirement::is_satisfied`] answers from what its capabilities say so far.
+    pub(crate) fn decision(&self, solver: &Solver) -> Option<bool> {
+        self.decided
+            .or_else(|| solver.ordering_state(self).decision)
+    }
+
+    /// Decide whether the requirement is satisfied: `InferCtx::check_loop_orders`, once
+    /// emission is done, or a loop that is ordered as it is emitted.
+    pub(crate) fn decide(&self, solver: &mut Solver, satisfied: bool) {
+        solver.ordering_state_mut(self).decision = Some(satisfied);
+    }
+
+    /// The assumptions the requirement is checked under: those where it was made and those its
+    /// run has recorded since.
+    pub(crate) fn assumptions(&self, solver: &Solver) -> Vec<Rc<TraitRequirement>> {
+        let mut out = self.assumptions.clone();
+        if self.decided.is_none() {
+            out.extend(solver.ordering_state(self).assumed.iter().cloned());
+        }
+        out
+    }
+
+    /// Record `more` assumptions, a use's that copied the requirement.
+    pub(crate) fn assume_more(
+        &self,
+        solver: &mut Solver,
+        more: impl IntoIterator<Item = Rc<TraitRequirement>>,
+    ) {
+        solver.ordering_state_mut(self).assumed.extend(more);
+    }
+
     pub(crate) fn position_type(&self, solver: &mut Solver) -> crate::ccl::Type {
         use crate::ccl::{Type, ty::TypeKind};
         let resolve = |solver: &mut Solver, t: &Type| {
@@ -143,7 +192,49 @@ impl Requirement {
         )
     }
 
+    /// A run's ordering requirement: `solver` holds its proof state ([`OrderingState`]).
     pub(crate) fn orderable_if_required_by(
+        solver: &mut Solver,
+        positions: crate::ccl::Type,
+        capabilities: Capabilities,
+        node: NodeId,
+        source: NodeId,
+        iter: Option<crate::ccl::Type>,
+        assumptions: Vec<Rc<TraitRequirement>>,
+    ) -> Requirement {
+        let home = solver.next_ordering_home();
+        let r = Self::new_ordering(
+            Some(home),
+            positions,
+            capabilities,
+            node,
+            source,
+            iter,
+            assumptions,
+        );
+        solver.adopt_ordering(r.ordering().expect("an ordering requirement"));
+        r
+    }
+
+    /// The ordering requirement a clause writes, which no run holds yet: inference makes a
+    /// run's own of it before reading it (`InferCtx::stated_capability`).
+    pub(crate) fn written_orderable_if_required_by(
+        positions: crate::ccl::Type,
+        capabilities: Capabilities,
+    ) -> Requirement {
+        Self::new_ordering(
+            None,
+            positions,
+            capabilities,
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+            None,
+            Vec::new(),
+        )
+    }
+
+    fn new_ordering(
+        home: Option<SolverHome>,
         positions: crate::ccl::Type,
         capabilities: Capabilities,
         node: NodeId,
@@ -164,27 +255,25 @@ impl Requirement {
             },
             Some(Rc::new(OrderableIfRequiredBy {
                 id: NEXT.fetch_add(1, Ordering::Relaxed),
+                home,
                 positions,
                 capabilities,
-                satisfied: Rc::new(Cell::new(false)),
                 node,
                 source,
                 iter,
-                assumptions: RefCell::new(assumptions),
+                assumptions,
                 at_use: false,
                 decided: None,
             })),
         )
     }
 
-    /// This ordering requirement as a use's copy, which a refusal reports at the use: the
-    /// requirement was made just now and is held nowhere else.
-    pub(crate) fn at_use(mut self) -> Requirement {
-        let order = self.1.as_mut().expect("an ordering requirement");
-        Rc::get_mut(order)
-            .expect("a copy made just now has one owner")
-            .at_use = true;
-        self
+    /// This ordering requirement as a use's copy, which a refusal reports at the use. The same
+    /// requirement, with the same proof state: only where it is reported differs.
+    pub(crate) fn at_use(self) -> Requirement {
+        let mut order = (**self.ordering().expect("an ordering requirement")).clone();
+        order.at_use = true;
+        Self(self.0, Some(Rc::new(order)))
     }
 
     pub(crate) fn record(&self, solver: &mut Solver) {
@@ -222,14 +311,17 @@ impl Requirement {
     }
 
     /// This ordering requirement as its run leaves it: `positions` and `capabilities` closed,
-    /// with nothing of the run's left in them, and whether it is satisfied decided by the run.
+    /// with nothing of the run's left in them, whether it is satisfied decided by the run, and
+    /// the assumptions the run recorded on it written into it.
     pub(crate) fn closed(
         &self,
+        solver: &Solver,
         positions: crate::ccl::Type,
         capabilities: Capabilities,
         satisfied: bool,
     ) -> Self {
         let mut order = (**self.ordering().expect("an ordering requirement")).clone();
+        order.assumptions = order.assumptions(solver);
         order.positions = positions;
         order.capabilities = capabilities;
         order.decided = Some(satisfied);
@@ -253,11 +345,8 @@ impl Requirement {
     )]
     pub fn is_satisfied(&self, solver: &mut Solver) -> bool {
         let Some(r) = &self.1 else { return false };
-        if r.satisfied.get() {
-            return true;
-        }
-        if let Some(decided) = r.decided {
-            return decided;
+        if let Some(decision) = r.decision(solver) {
+            return decision;
         }
         if !matches!(r.capabilities.repr(), Repr::Var(_)) {
             let set = r.capabilities.set_in(solver);
@@ -3704,6 +3793,7 @@ mod tests {
         let input = CapabilityVar::fresh(solver, 0);
         let holder = CapabilityVar::fresh(solver, 0);
         let order = Requirement::orderable_if_required_by(
+            solver,
             crate::ccl::Type::Hole,
             Capabilities::var(Rc::clone(&input)),
             NodeId::PLACEHOLDER,
@@ -3753,6 +3843,75 @@ mod tests {
 
         kind.stamp_data(solver);
         assert!(downstream.resolved(solver).contains(&appended));
+    }
+
+    /// An ordering requirement made in a run, its proof state in that run's solver.
+    fn run_ordering(solver: &mut Solver) -> Requirement {
+        let input = CapabilityVar::fresh(solver, 0);
+        Requirement::orderable_if_required_by(
+            solver,
+            crate::ccl::Type::Hole,
+            Capabilities::var(input),
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// A renamed or relocated view of an ordering requirement shares its proof state: settling
+    /// one settles them all.
+    #[test]
+    fn views_of_an_ordering_requirement_share_its_proof_state() {
+        let solver = &mut Solver::new();
+        let r = run_ordering(solver);
+        let order = r.ordering().unwrap();
+        let renamed = r.with_ordering(order.positions.clone(), order.capabilities.clone());
+        let at_use = r.clone().at_use();
+        assert_eq!(renamed.ordering().unwrap().decision(solver), None);
+        order.decide(solver, true);
+        assert_eq!(renamed.ordering().unwrap().decision(solver), Some(true));
+        assert_eq!(at_use.ordering().unwrap().decision(solver), Some(true));
+    }
+
+    /// Closing an ordering requirement writes the assumptions its run recorded into it, and its
+    /// answer, so another run reads both from the requirement alone.
+    #[test]
+    fn a_closed_ordering_requirement_carries_what_its_run_recorded() {
+        let solver = &mut Solver::new();
+        let r = run_ordering(solver);
+        let order = r.ordering().unwrap();
+        let assumed = Rc::new(Requirement::transaction().0);
+        order.assume_more(solver, [Rc::clone(&assumed)]);
+        let closed = r.closed(solver, order.positions.clone(), Capabilities::none(), true);
+
+        let other = &mut Solver::new();
+        let closed = closed.ordering().unwrap();
+        assert_eq!(closed.decision(other), Some(true));
+        assert_eq!(closed.assumptions(other), vec![assumed]);
+    }
+
+    /// A decided ordering requirement answers its decision, a refusal included, where what its
+    /// capabilities say would answer otherwise.
+    #[test]
+    fn a_decided_ordering_requirement_answers_its_decision() {
+        let solver = &mut Solver::new();
+        let r = run_ordering(solver);
+        assert!(
+            r.is_satisfied(solver),
+            "an input that causes nothing orders nothing"
+        );
+        r.ordering().unwrap().decide(solver, false);
+        assert!(!r.is_satisfied(solver));
+    }
+
+    /// An open ordering requirement is read only by the run that made it.
+    #[test]
+    #[should_panic(expected = "outside the run that made it")]
+    fn an_open_ordering_requirement_is_read_only_by_its_run() {
+        let solver = &mut Solver::new();
+        let r = run_ordering(solver);
+        r.ordering().unwrap().decision(&Solver::new());
     }
 
     /// `Effect` and `Context` hold every capability of their direction, a family's top every

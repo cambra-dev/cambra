@@ -1551,10 +1551,7 @@ impl InferCtx {
                     && let Some(order) = r.ordering()
                 {
                     r.record(&mut self.solver);
-                    order
-                        .assumptions
-                        .borrow_mut()
-                        .extend(self.assumptions.iter().cloned());
+                    order.assume_more(&mut self.solver, self.assumptions.iter().cloned());
                 }
             }
         }
@@ -1571,7 +1568,7 @@ impl InferCtx {
                 continue;
             };
             if requirement.is_satisfied(&mut self.solver) {
-                order.satisfied.set(true);
+                order.decide(&mut self.solver, true);
                 continue;
             }
             let set = order.capabilities.set_in(&mut self.solver);
@@ -1595,6 +1592,7 @@ impl InferCtx {
                         },
                         order.source,
                     ));
+                    order.decide(&mut self.solver, false);
                 }
                 continue;
             }
@@ -1618,7 +1616,8 @@ impl InferCtx {
             if let Type::Infer(v) = order.positions.peel_refinements() {
                 self.telescope = v.telescope.clone();
             }
-            let result = self.with_assumptions(&order.assumptions.borrow(), |ctx| {
+            let assumptions = order.assumptions(&self.solver);
+            let result = self.with_assumptions(&assumptions, |ctx| {
                 ctx.require_trait(
                     Trait::orderable(),
                     order.node,
@@ -1630,7 +1629,7 @@ impl InferCtx {
             self.level = saved_level;
             self.telescope = saved_telescope;
             match result {
-                Ok(_) => order.satisfied.set(true),
+                Ok(_) => order.decide(&mut self.solver, true),
                 Err(_) => {
                     if let Some(capability) = capability {
                         errors.push(LocatedInferError::new(
@@ -1641,6 +1640,7 @@ impl InferCtx {
                             },
                             order.source,
                         ));
+                        order.decide(&mut self.solver, false);
                     }
                 }
             }
@@ -1732,9 +1732,12 @@ impl InferCtx {
             Capability::Requires(r) if r.ordering().is_some() => {
                 let order = r.ordering().unwrap();
                 if matches!(order.capabilities.repr(), Repr::Written(_)) {
+                    let positions = self.normalize_annotation(&order.positions);
+                    let capabilities = self.normalize_capabilities(&order.capabilities);
                     let r = Requirement::orderable_if_required_by(
-                        self.normalize_annotation(&order.positions),
-                        self.normalize_capabilities(&order.capabilities),
+                        &mut self.solver,
+                        positions,
+                        capabilities,
                         self.current_node_id,
                         self.current_node_id,
                         order.iter.clone(),
@@ -4471,6 +4474,7 @@ impl Typing for InferCtx {
             return;
         };
         let requirement = Requirement::orderable_if_required_by(
+            &mut self.solver,
             (**domain).clone(),
             capabilities.clone(),
             node,
@@ -4501,6 +4505,7 @@ impl Typing for InferCtx {
             },
         );
         let requirement = Requirement::orderable_if_required_by(
+            &mut self.solver,
             positions.clone(),
             Capabilities::var(guard),
             node,
@@ -4510,7 +4515,10 @@ impl Typing for InferCtx {
         );
         let ordered = body.ordered;
         if ordered {
-            requirement.ordering().unwrap().satisfied.set(true);
+            requirement
+                .ordering()
+                .unwrap()
+                .decide(&mut self.solver, true);
         }
         self.record_capability(Capability::Requires(requirement));
         if !ordered {

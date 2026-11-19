@@ -1973,6 +1973,7 @@ fn close_requirements(
                 }
                 if let Some(&satisfied) = read.closing.get(&order.id) {
                     return r.closed(
+                        solver,
                         order.positions.clone(),
                         crate::ccl::capabilities::Capabilities::none(),
                         satisfied,
@@ -1988,6 +1989,7 @@ fn close_requirements(
                 let mut positions = order.positions.clone();
                 close_type(solver, &mut positions, memo, read);
                 let done = r.closed(
+                    solver,
                     positions,
                     crate::ccl::capabilities::Capabilities::known(capabilities),
                     satisfied,

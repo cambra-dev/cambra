@@ -626,14 +626,12 @@ fn context_requirement(
         let mut written = lower_clauses(&Clause::default(), effects, Site::Type, item.span, ctx)?
             .expect("a written requirement has an effect clause");
         written.open_requires = true;
-        return Ok(Lowered::Capability(Requirement::orderable_if_required_by(
-            positions,
-            crate::ccl::capabilities::Capabilities::written(written),
-            NodeId::PLACEHOLDER,
-            NodeId::PLACEHOLDER,
-            None,
-            Vec::new(),
-        )));
+        return Ok(Lowered::Capability(
+            Requirement::written_orderable_if_required_by(
+                positions,
+                crate::ccl::capabilities::Capabilities::written(written),
+            ),
+        ));
     }
     let ChlRequirement::Trait { binder, ty } = &item.node else {
         unreachable!("a bound is no context requirement");
