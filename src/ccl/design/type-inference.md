@@ -1701,12 +1701,12 @@ reused only while they stand. A funkind variable's resolution reads funkind stat
 (`Solver::funkind_revision`), and not its binder names, which only its binder positions and a
 component's names read (`Solver::funkind_names_revision`). A capability variable's reads capability
 state, funkind state, since an edge's filter can hold only while a kind is data, inference state,
-since a bound compares exception and position types, and the run's record of capabilities, among
-them whether the exceptions' types a `try` reads are settled (`Solver::capability_revision`). A
-write to state an answer does not read leaves it standing: a funkind variable's resolution survives
-every capability write. Caches live apart from the facts (`state::Stamped`), in cells read through
-`&Solver`, since storing an answer records nothing, and each is stored at the counts taken before it
-was computed.
+since a bound compares exception and position types, ordering requirements' proof state, since a
+bound admits one that is satisfied, and the run's record of capabilities, among them whether the
+exceptions' types a `try` reads are settled (`Solver::capability_revision`). A write to state an
+answer does not read leaves it standing: a funkind variable's resolution survives every capability
+write. Caches live apart from the facts (`state::Stamped`), in cells read through `&Solver`, since
+storing an answer records nothing, and each is stored at the counts taken before it was computed.
 
 Bounds and watches form cycles. A bound names another variable, and a variable watches an obligation
 whose output type names a variable. Each cycle runs through the solver's tables rather than through
@@ -1770,6 +1770,18 @@ builds, the trait-narrowing audit trail and the requirement sweep's window. Noth
 kept on its thread. No capability variable leaves its run ([Capabilities on every
 expression](#capabilities-on-every-expression)), so a solver panics on reading one it did not mint
 rather than reading it as unrecorded.
+
+An ordering requirement (`OrderableIfRequiredBy`) is an unknown of the run too: whether it is
+satisfied. It has one answer at a time (`OrderableIfRequiredBy::decision`): until the run decides
+it, what its capabilities say so far, and once decided, the decision, a refusal included. The run
+decides it once emission ends (`InferCtx::check_loop_orders`), or as a loop that is ordered is
+emitted. The requirement is a handle with a home like a variable's, and the solver holds its proof
+state (`OrderingState`): the decision, and the assumptions of the uses that copied it. A renamed or
+relocated view of the requirement keeps its identity, so it shares that state. A requirement leaves
+its run closed (`Requirement::closed`), carrying the run's answer and the assumptions the run
+recorded, which a later run reads from the requirement alone. One a clause writes has no home until
+inference makes the run's own of it, and a solver panics on reading an open requirement another run
+made.
 
 #### One solver variable
 
