@@ -447,11 +447,15 @@ fn zip_of(arms: Vec<Expr>, fun_kind: &FunKind) -> Expr {
         .iter()
         .map(|a| match a.ty.peel_refinements() {
             Type::Fun {
-                name,
+                binder,
                 domain,
                 codomain,
                 ..
-            } => Some((name.clone(), (**domain).clone(), (**codomain).clone())),
+            } => Some((
+                binder.whole().cloned(),
+                (**domain).clone(),
+                (**codomain).clone(),
+            )),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
@@ -462,7 +466,7 @@ fn zip_of(arms: Vec<Expr>, fun_kind: &FunKind) -> Expr {
             Some(match name {
                 Some(n) => Type::pi_kinded(n, domain, codomain, fun_kind.clone()),
                 None => Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
@@ -812,7 +816,7 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
                     (
                         Some(domain),
                         Type::Fun {
-                            name: Some(input),
+                            binder: crate::ccl::FunBinder::Whole(input),
                             codomain,
                             ..
                         },
@@ -1162,7 +1166,7 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
             // `try_pairwise_in_compose` for which kind that makes it).
             let new_const_ty = match (left.ty.domain(), right.ty.codomain()) {
                 (Some(dom), Some(cod)) => Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: mint_kind.clone(),
                     domain: Box::new(dom),
                     codomain: Box::new(cod),
@@ -1211,7 +1215,7 @@ fn product_beta_rebinding(expr: &Expr) -> Option<(usize, Rebinding)> {
         .position(|w| is_product_beta_window(&w[0], &w[1]))?;
     match elts[i + 1].ty.peel_refinements() {
         Type::Fun {
-            name: Some(x),
+            binder: crate::ccl::FunBinder::Whole(x),
             codomain,
             ..
         } if crate::ccl::subst::codomain_depends_on(x, codomain) => {
@@ -1497,7 +1501,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             let id_ty =
                 g.ty.domain()
                     .map(|a| Type::Fun {
-                        name: None,
+                        binder: crate::ccl::FunBinder::None,
                         fun_kind: mint_kind.clone(),
                         domain: Box::new(a.clone()),
                         codomain: Box::new(a),
@@ -1570,7 +1574,7 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
             let option_ty = lookup_ty.codomain().unwrap_or(Type::Hole);
             let key_ty = keys.ty.codomain().unwrap_or(Type::Hole);
             let at_key = Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: mint_kind.clone(),
                 domain: Box::new(key_ty),
                 codomain: Box::new(option_ty),
@@ -2045,7 +2049,7 @@ enum Restated {
 /// (`src/ccl/design/type-parameters.md`, "Generalized types").
 fn restate_behind(f: &mut Expr, curry_ty: &Type) -> Restated {
     let Type::Fun {
-        name: Some(x),
+        binder: crate::ccl::FunBinder::Whole(x),
         codomain,
         ..
     } = curry_ty.peel_refinements()
@@ -2054,10 +2058,13 @@ fn restate_behind(f: &mut Expr, curry_ty: &Type) -> Restated {
     };
     let result = crate::ccl::subst::open_codomain(curry_ty, codomain);
     // 𝑓's codomain reads its binder by index, so renaming the slot is an α-conversion.
-    let Type::Fun { name, fun_kind, .. } = &mut f.ty else {
+    let Type::Fun {
+        binder, fun_kind, ..
+    } = &mut f.ty
+    else {
         return Restated::Unnamed;
     };
-    let previous = name.replace(x.clone());
+    let previous = std::mem::replace(binder, crate::ccl::FunBinder::Whole(x.clone()));
     let fun_kind = fun_kind.clone();
     let Some(f_codomain) = f.ty.codomain() else {
         return Restated::Unnamed;
@@ -2100,8 +2107,8 @@ fn restate_behind(f: &mut Expr, curry_ty: &Type) -> Restated {
     // determines it, as a collection's domain that `map` keeps does
     // (`crate::ccl::generalize::generalizes`).
     if !crate::ccl::generalize::generalizes(&map_ty, &|n| n == x) {
-        if let Type::Fun { name, .. } = &mut f.ty {
-            *name = previous;
+        if let Type::Fun { binder, .. } = &mut f.ty {
+            *binder = previous;
         }
         return Restated::Unspellable;
     }
@@ -2184,7 +2191,7 @@ mod tests {
 
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
@@ -2207,7 +2214,7 @@ mod tests {
             }
         }
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: fun_tys.first().unwrap().0.clone(),
             codomain: fun_tys.last().unwrap().1.clone(),
@@ -3058,7 +3065,7 @@ mod tests {
         };
         // `(k: A) ⤇ (B ⤇ Bool)` — a named, data-kinded curry type.
         let curry_ty = |domain: Type| Type::Fun {
-            name: Some(Name::from("k")),
+            binder: crate::ccl::FunBinder::Whole(Name::from("k")),
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(Type::data_fun(b_ty.clone(), c2_ty.clone())),

@@ -333,6 +333,22 @@ impl BinderScope {
         self.facts.truncate(depth);
     }
 
+    /// `f` under a lambda's `params`, each bound at its type.
+    pub fn under_params<R>(
+        &mut self,
+        params: &[crate::ccl::TypedBinding],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        for p in params {
+            self.push(&p.name, p.ty.clone());
+        }
+        let out = f(self);
+        for _ in params {
+            self.pop();
+        }
+        out
+    }
+
     /// `f` under a `let`'s binder ([`Self::push_let`]).
     pub fn under_let<R>(
         &mut self,
@@ -2150,7 +2166,7 @@ mod tests {
         let lhs = [elem_cmp(CompareKind::Equals, add(var("f"), lit(1)))];
         let rhs = [elem_cmp(CompareKind::Greater, var("f"))];
         let opaque = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(int()),
             codomain: Box::new(int()),

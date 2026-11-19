@@ -945,7 +945,7 @@ equality or order. A nominal type compares as its declaration states
 and equality requirements ([Trait requirements](#trait-requirements)):
 
 ```
-_ in _ : forall (C, E) {e: E, c: C} => Bool requires r: Iterable(C), r::Elements <: _ |=> E, Equatable(E, E)
+_ in _ : forall (C, E) (e: E, c: C) => Bool requires r: Iterable(C), r::Elements <: _ |=> E, Equatable(E, E)
 ```
 
 - **`in` tests what iteration binds** ([4.6 `for` — iteration](#46-for--iteration)): the key of a
@@ -1150,7 +1150,7 @@ follows where a handle goes, such as an effect system or affine or linear types 
 f(arg₀, arg₁, …, argₙ₋₁)
 ```
 
-The call denotes `f` applied to the tuple `(arg₀, …, argₙ₋₁)`: the
+The call passes each argument to the parameter of `f` in its position: the
 result is the function's return value on those arguments. The order
 in which `f` and the arguments are themselves evaluated is
 unspecified (§3 — *Evaluation order*).
@@ -1174,27 +1174,35 @@ else dbl` followed by `g(x)`.
 **No default values**, **no `*args`/`**kwargs`**, **no positional-only /
 keyword-only markers**. A call's arguments are a parenthesised,
 comma-separated list of expressions, or of `name=value` fields, which
-build the record argument below: `f(x=1, y=2)` is `f((x=1, y=2))`. A
+build one record argument: `f(x=1, y=2)` is `f((x=1, y=2))`. A
 field's name may carry the module its label belongs to, `shop::amount=3`
 ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
 A call that mixes expressions and fields is an error.
 
-> **Direction [Decided].** Every function takes exactly **one**
-> argument, and the argument's product structure is what "arity" is: a
-> higher-arity function is a function on a *tuple*, and a
-> keyword-argument function is a function on a *record* with named
-> fields. Under the term-level delimiter direction (§2.4) the call
-> parentheses simply *are* the product constructor — `f(a, b)` applies
-> `f` to the tuple `(a, b)`, and `f(x=1, y=2)` applies `f` to the
-> record `(x=1, y=2)`. "Keyword arguments" and "a record argument" are
-> the same thing, which dissolves the record-vs-call ambiguity flagged
-> in §2.4. Whether one call can mix positional and named components (a
-> product with both anonymous and named fields) is **[Open]**.
-> Recorded here only (2026-07-07, no brainstorm writeup yet).
+#### Parameter lists
 
-A function may declare no parameters, and a call of it passes no arguments: `f()` applies `f` to
-the unit, the product of no components. `def zero() => Int:`, `\ -> 3`, an associated function
-`def Price::zero() => Price:` and a trait's `def one() => S` each take the unit. A call with no
+A function takes a **parameter list**, the parameters its `def` or lambda declares, in order. Its
+type writes the list in parentheses, `(Int, Int) => Int`, naming each parameter its result reads,
+`(lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo}`. A function of one parameter is
+written without them, `Int => Int`, or `(x: T) => U` where its result reads the parameter, and a
+function of none as `() => U`.
+
+A call passes exactly as many arguments as its function has parameters: `f(a, b)` for a
+function of two.
+
+**A parameter list is not a tuple.** A function of two parameters, `(Int, Int) => Int`, is not a
+function of one pair, `{Int, Int} => Int`, and neither type is below the other. A function of a
+pair is called with the pair, `g(p)` or `g((1, 2))`, and `f(p)` passes a function of two
+parameters one argument, which is an error. A function of two parameters given where a function
+of pairs is expected is an error too; a lambda adapts it, `\p -> f(p.0, p.1)`. A parameter may
+take a mutable variable or a feed written at the call (§4.1), which no tuple holds.
+
+A collection is keyed by one value, a tuple where it has several positions: `{K₁, K₂} |=> V`,
+read as `m[i, j]` (§3.9).
+
+A function may declare no parameters, and a call of it passes no arguments: `f()` passes the empty
+list. `def zero() => Int:`, `\ -> 3`, an associated function `def Price::zero() => Price:` and
+a trait's `def one() => S` each take it. A call with no
 arguments also opens a registered **data source**, `stdin()` (§7.3), and builds the empty map,
 `empty_map()` (§3.11), and `begin()` is the context of `with begin():` (§8.2).
 
@@ -1238,7 +1246,7 @@ define an absent-key runtime result. `!` can be used generally as a postfix oper
 postfix `!` takes an `Option` refined to exclude `none`:
 
 ```
-_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m.keys())}
+_[_] : (m: Map(K, V), k: K) => {Option(V) where _.is_none() == (k not in m.keys())}
 _!   : (o: {Option(T) where not _.is_none()}) => {T where _ == o.value()}
 ```
 
@@ -1318,9 +1326,9 @@ the current rule: a lookup decides absence only once the collection's domain is 
 
 `\` introduces the binders and `->` separates them from the body — e.g.
 `groupby(sales, \r -> r.region)`. A lambda denotes an anonymous function
-value; applying it to a tuple of argument values gives the value of `body`
-in an environment where each parameter is bound to its corresponding
-argument positionally.
+value; calling it gives the value of `body` in an environment where each
+parameter is bound to its corresponding argument positionally
+([Parameter lists](#parameter-lists)).
 
 Like `def`-defined functions (§4.1), lambdas are uncurried: an n-arg
 lambda consumes all n arguments at once and is invoked through an
@@ -1651,7 +1659,10 @@ def f(x: Int, y):
 ```
 
 Annotation types are arbitrary expressions evaluated in the
-surrounding scope. `p: T` fixes the parameter's type at `T`; `p <: T`
+surrounding scope, with the parameters before them in scope: a later parameter's type may read
+an earlier one, `def above(lo: Int, x: {Int where _ >= lo})`. A parameter's annotation
+reads neither the parameter itself, which is `_` in a refinement, nor a parameter after it.
+`p: T` fixes the parameter's type at `T`; `p <: T`
 leaves it inferred and bounded above by `T` (see [Two annotation
 forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
 The two forms may be mixed across a parameter list. A capitalized
@@ -2350,7 +2361,7 @@ CHL is lexically scoped. Each binding is visible only within its scope:
 | Scope | Bindings and visibility |
 | --- | --- |
 | Top-level block | Value bindings are visible after their introduction. |
-| Function or lambda | Parameters are visible in the body; free names refer to the enclosing scope. |
+| Function or lambda | Parameters are visible in the body and in the annotations of the parameters after them; free names refer to the enclosing scope. |
 | Comprehension | Each generator binder is visible to subsequent clauses, guards and the element expression. |
 | `for` body | The loop binder is visible only inside the body. |
 | Match arm | Tag-payload and constructor-pattern binders are visible only in that arm. |
@@ -2435,12 +2446,14 @@ marked one carries its status per "How to read this document".)
   the call.
 - `Time` — a position in the commit order (**[Tentative]**). A transaction's time is one, which
   `txn::now()` answers for a transaction named `txn` (**[Decided]**, §8.7).
-- `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
-  argument (§3.8): an n-parameter function's domain is the
-  corresponding tuple type, and a keyword-argument function's domain
-  is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
-  function. A `def` or a lambda has a function type, and a comprehension or a literal is a
-  collection: the construct decides, and an annotation states it.
+- `{(i: T₀), (j: T₁(i)), …}` — a tuple whose later components read the earlier ones by name
+  ([Named components](#named-components)).
+- `(T₀, T₁, …) => U` — function type over a parameter list ([Parameter lists](#parameter-lists)):
+  `T => U` for one parameter, `() => U` for none. A result that reads the parameters names them,
+  `(a: T₀, b: T₁) => U`, or `(x: T) => U` for one. A function of a tuple, `{T₀, T₁} => U`, takes
+  one argument, and a keyword-argument function's domain is a record type, `{x: T, y: U} => V`.
+  A `def` or a lambda has a function type, and a comprehension or a literal is a collection: the
+  construct decides, and an annotation states it.
 - `D |=> V` — data-function type: a collection over the domain `D` (§6.3).
 - `Module{name: T, Name <: U, …}` — the type of a module's public members,
   through which one module is passed to another (**[Decided]**,
@@ -3033,6 +3046,35 @@ A diagnostic printing an inferred polymorphic type
 ([Polymorphic type annotations](#polymorphic-type-annotations)) writes an open tuple as a type
 parameter's bound: `def first(t): t.0` prints as `forall (A, B <: {A, ..}) B => A`.
 
+### Named components
+
+A component of a tuple type may be named, `(name: T)`, and a component after it reads the
+component's value by that name. `{(lo: Int), (x: {Int where _ >= lo})}` is the pairs whose
+second component is at least the first. A component without the parentheses is unnamed, and
+`{a: T}` is a record type.
+
+**[Planned]** A written type whose component reads an earlier one, as `x`'s does above. A `def`'s
+parameters may read the earlier ones (§4.1), and a message writes the type of such a function and
+of such a tuple in this form.
+
+A name is a spelling, not part of the type: `{(a: Int), (b: Int)}` is the type `{Int, Int}`,
+since no component reads `a`. A one-component tuple keeps its comma, `{(a: T),}`.
+
+A function of a tuple names the tuple's components the same way, and its result reads them as
+the later components do: `{(lo: Int), (x: {Int where _ >= lo})} => {Int where _ >= lo}` takes
+one argument, a pair. A `def`'s parameters are a parameter list, not a tuple
+([Parameter lists](#parameter-lists)), named the same way inside parentheses, so
+
+```python
+def above(lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo}:
+    x
+```
+
+has type `(lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo}`, and a message about `above`
+writes it in that form. A function whose result reads no parameter is written
+`(Int, Int) => Int` however its parameters are named. A function of one parameter names it
+`(x: T) => U`, the form a family's domain takes ([Family parameters](#family-parameters)).
+
 ### 6.7 Type-alias statements
 
 A **type alias** binds a capitalized name to a type expression with plain `=`,
@@ -3147,7 +3189,7 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   other block is an error, and so is a second binding of its name in the module, public or private,
   with both sites named.
 - **Each constructor line declares a function that builds the type's values.** `Shape::rect` has type
-  `{Int, Int} => Shape`, and `Option::some` has type `forall (T) T => Option(T)`. A constructor that
+  `(Int, Int) => Shape`, and `Option::some` has type `forall (T) T => Option(T)`. A constructor that
   declares no parameters is a value: `Option::none` has type `forall (T) Option(T)`, its `T`
   determined by the use ([Type parameters](#type-parameters)). The constructor set is closed.
 - **A constructor's parameter names are not record labels.** `radius` names the parameter for
@@ -3481,7 +3523,7 @@ A method is reached two ways:
 | --- | --- |
 | `p.discounted(10)` | the method call: `discounted` of `p`'s type, with `p` as `self` |
 | `Price::discounted(p, 10)` | the same call, naming the type, with `self` passed first |
-| `Price::discounted` | the method as a function value, of type `{Price, Int} => Price` |
+| `Price::discounted` | the method as a function value, of type `(Price, Int) => Price` |
 
 `Price::discounted` names the method without an instance. It is how a call states which type's
 method it means, and the method as an unapplied value has no other spelling.
@@ -3731,7 +3773,7 @@ is an error, as an `except` item that takes nothing away is.
 - **A hole that a `def`'s body leaves open is a variable.** In
   `def apply_all(f: (Int => Int causes _), xs): [f(x) for x in xs]` nothing fixes the hole, so
   `apply_all` has type
-  `forall (E <: Effect) {(Int => Int causes E), List(Int)} => List(Int) causes E`, as a type that a
+  `forall (E <: Effect) (Int => Int causes E, List(Int)) => List(Int) causes E`, as a type that a
   body leaves open makes a `def` polymorphic ([6.10 Polymorphic types](#610-polymorphic-types)). A
   variable is written where an upper bound relates two positions:
   `def apply_all(E <: Effect, f: (Int => Int causes E), xs) causes only E`.
@@ -3739,7 +3781,7 @@ is an error, as an `except` item that takes nothing away is.
   capabilities the `def`'s bounded clause receives admits what that clause does, besides what
   the body discharges on the way: in
   `def p(f: (Int => Int causes _), x: Int) => Int causes nothing: f(x)`, `f`'s clause is
-  `causes nothing`, so `p` has type `{Int => Int, Int} => Int`, and a use passing a function
+  `causes nothing`, so `p` has type `(Int => Int, Int) => Int`, and a use passing a function
   that appends is refused at the call.
 - **A function type that requires and causes less is a subtype.** `A => B requires R₁ causes E₁`
   is a subtype of `A => B requires R₂ causes E₂` when every item of `R₁` is an item of `R₂`, and
@@ -4719,10 +4761,10 @@ poly_type       ::= "forall" "(" type_param ( "," type_param )* ")" expression [
 In a type position, `forall (T, U <: B) V requires …` is the type of a polymorphic value: for
 every `T` and `U` that meet the kinds and requirements, a value of type `V`. A polymorphic `def` has
 this type, with its type parameters moved into the `forall`. `first` above has type
-`forall (T) {T, T} => T`.
+`forall (T) (T, T) => T`.
 
 ```python
-pick: forall (T) {T, T} => T = first
+pick: forall (T) (T, T) => T = first
 ```
 
 - **It annotates a polymorphic binding.** A monomorphic binding with a polymorphic annotation is an
@@ -4737,13 +4779,13 @@ pick: forall (T) {T, T} => T = first
 - **It is written only as a whole annotation.** Inside another type, as in
   `{forall (T) T => T} => Int`, it would type a function that takes a polymorphic argument. That is
   **[Open]** and an error.
-- **An alias may name it.** `Pick = forall (T) {T, T} => T` declares an alias of a polymorphic type,
+- **An alias may name it.** `Pick = forall (T) (T, T) => T` declares an alias of a polymorphic type,
   and `pick: Pick = first` uses it as a whole annotation
   ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
   the nested case above.
 - **A polymorphic function type has one `requires` clause,** after its codomain, holding the trait
   requirements on the types it quantifies and the context requirements of a call:
-  `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes AffectWorld`
+  `forall (T) (T, T) => T requires Orderable(T, T), Transaction causes AffectWorld`
   ([Writing requirements and effects](#writing-requirements-and-effects)). The `causes` clause
   after it is the function type's, so a body that is not a function type takes none.
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
@@ -4754,7 +4796,7 @@ pick: forall (T) {T, T} => T = first
   parameter, `A`, `B`, … in order of first appearance, and each trait it requires of them as a
   requirement, named where it has an associated type. The associated type is written where the
   type is that associated type alone, and otherwise bounded in the clause by what it is.
-  `def add(a, b): a + b` prints as `forall (A, B) {A, B} => r::Output requires r: Addable(A, B)`.
+  `def add(a, b): a + b` prints as `forall (A, B) (A, B) => r::Output requires r: Addable(A, B)`.
   A part of the type the notation cannot write, such as a parameter joined with another type, is
   marked in the printed type (`A ∨ Int`), not dropped.
 

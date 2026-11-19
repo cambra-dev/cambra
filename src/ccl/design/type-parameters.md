@@ -74,7 +74,7 @@ every variable's bounds, which breaks that cycle as it breaks the cycles among v
 
 The parser gives `Stmt::FunctionDef` a `type_params` field beside `params`, and a `requires` field.
 Type parameters stay out of `params` because the parameter count is the arity: it sizes the argument
-tuple and fixes how many lambdas a `Mut`-parameter function's chain has (`uncurry_params`).
+tuple (`lower_params`).
 
 `declare_type_params` declares each parameter in order as an alias of a declared `Type::Param`,
 after lowering its kind with the parameters before it in scope, and records it in the `Poly`. It
@@ -132,7 +132,7 @@ lambda's type. The parameters are aliases over the whole definition, including p
 result annotations, so the alias scope opens around `lower_function_body`.
 `LoweringContext::type_params_in_scope` lets `pre_declare_type_aliases` refuse a body alias that
 would hide a parameter. A parameter that no value parameter's annotation determines is refused
-after lowering, by walking the binders of the lambda chain that `uncurry_params` builds.
+after lowering, by walking the parameters of the definition's lambda (`lower_params`).
 
 A `requires` clause on a `def` or a `Poly` lowers into the `Poly`'s `requires`, as
 [Lowering requirements](#lowering-requirements) describes.

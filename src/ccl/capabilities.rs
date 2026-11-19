@@ -74,7 +74,7 @@ impl OrderableIfRequiredBy {
             Type::Infer(v) => v.witness_scope_kinds().iter().find_map(|k| {
                 let index = k.binder_position(id)?;
                 let carrier = Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: crate::ccl::ty::FunKind::Var(Rc::clone(k)),
                     domain: Box::new(self.positions.clone()),
                     codomain: Box::new(Type::Base(crate::ccl::BaseType::Unit)),

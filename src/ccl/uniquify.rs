@@ -79,8 +79,7 @@
 //! makes the pass idempotent. A uid may legitimately occur at several binding
 //! sites — a predicate shared by `Rc` is rebuilt once, and a later copy
 //! preserves uids — so the checked invariant is "every binding site is
-//! minted", not global binder uniqueness. `uncurry_params` in `lower/functions.rs` also
-//! pre-mints tuple binders to carry the parameter spellings diagnostics need.
+//! minted", not global binder uniqueness.
 
 use std::collections::HashMap;
 
@@ -346,7 +345,7 @@ impl Uniquifier {
                 self.expr(value);
             }
 
-            TypedExprNode::Lambda { param, body } => {
+            TypedExprNode::Lambda { params, body } => {
                 // The domain half is the param's declared type, so it resolves against the
                 // enclosing scope, alongside `binding_tys`. The codomain half is the body's
                 // type and resolves under the binder. Walking the whole function type before the
@@ -354,16 +353,24 @@ impl Uniquifier {
                 // rebuilt **once**, with every occurrence re-pointed at that rebuild, so a
                 // decision made here is the one the copies visited later under the binder
                 // get too.
+                //
+                // A later parameter's type reads the earlier ones, so each parameter's types
+                // resolve with the parameters before it bound.
                 if let Type::Fun { domain, .. } = &mut e_ty {
                     self.ty(domain);
                 }
-                self.binding_tys(param);
-                let base = self.bind(param);
+                let bases: Vec<_> = params
+                    .iter_mut()
+                    .map(|param| {
+                        self.binding_tys(param);
+                        self.bind(param)
+                    })
+                    .collect();
                 if let Type::Fun { codomain, .. } = &mut e_ty {
                     self.ty(codomain);
                 }
                 self.expr(body);
-                self.unbind(base);
+                bases.into_iter().rev().for_each(|base| self.unbind(base));
             }
 
             // The loop's position and target bind only in the body; the source
@@ -1161,13 +1168,13 @@ mod tests {
             panic!("expected a var");
         };
         assert_eq!(*free, member);
-        let TypedExprNode::Lambda { param, body } = &items[1].node else {
+        let TypedExprNode::Lambda { params, body } = &items[1].node else {
             panic!("expected a lambda");
         };
         let TypedExprNode::Var(bound) = &body.node else {
             panic!("expected a var");
         };
-        assert_eq!(bound, &param.name);
+        assert_eq!(bound, &params[0].name);
         assert_ne!(*bound, member);
     }
 

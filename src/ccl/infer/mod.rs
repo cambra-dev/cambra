@@ -1041,14 +1041,18 @@ fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
     }
     fn declared_reads(expr: &Expr) -> Option<std::collections::BTreeSet<Name>> {
         match &expr.node {
-            crate::ccl::TypedExprNode::Lambda { param, body } => {
-                let annotation = param.annotation_ty().unwrap_or(&param.ty);
-                if !complete(annotation) {
-                    return None;
-                }
+            crate::ccl::TypedExprNode::Lambda { params, body } => {
                 let mut reads = declared_reads(body)?;
-                reads.extend(crate::ccl::subst::type_free_vars(annotation));
-                reads.remove(&param.name);
+                for param in params {
+                    let annotation = param.annotation_ty().unwrap_or(&param.ty);
+                    if !complete(annotation) {
+                        return None;
+                    }
+                    reads.extend(crate::ccl::subst::type_free_vars(annotation));
+                }
+                for param in params {
+                    reads.remove(&param.name);
+                }
                 Some(reads)
             }
             _ => match crate::ccl::opaque_output::annotated_result(expr).map(|e| &e.node) {
@@ -1914,9 +1918,9 @@ pub(crate) mod test_helpers {
                         ..
                     }
                 )
-                && let TypedExprNode::Lambda { param, .. } = &bound_expr.node
+                && let TypedExprNode::Lambda { params, .. } = &bound_expr.node
             {
-                out.push(param.ty.clone());
+                out.extend(params.iter().map(|p| p.ty.clone()));
             }
             e.walk_children(|c| go(c, out));
         }
@@ -1957,15 +1961,14 @@ mod tests {
     fn smoke_lambda_identity_inferred_int() {
         // λx. x applied to 42 → Int
         let lam = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
         let app = TypedExpr::new(TypedExprNode::Apply {
@@ -2011,7 +2014,6 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
             },
             bound_expr: Box::new(lit_int(42)),
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),

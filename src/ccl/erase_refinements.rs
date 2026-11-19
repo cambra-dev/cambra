@@ -22,13 +22,13 @@ pub fn run(mut expr: Expr) -> Expr {
 /// the parameter's and asserts the two agree.
 fn erase_refinements(expr: &mut Expr) {
     expr.walk_type_slots_mut(erase_in_type);
-    if let TypedExprNode::Lambda { param, .. } = &mut expr.node
+    if let TypedExprNode::Lambda { params, .. } = &mut expr.node
         && let Type::Fun {
             fun_kind, domain, ..
         } = expr.ty.peel_refinements()
         && fun_kind.resolved().is_data()
     {
-        param.ty = (**domain).clone();
+        crate::ccl::one_param_mut(params).ty = (**domain).clone();
     }
     expr.walk_children_mut(erase_refinements);
 }

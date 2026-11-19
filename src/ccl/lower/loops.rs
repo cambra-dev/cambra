@@ -1240,12 +1240,12 @@ fn nested_feed_only_gap(
         match &expr.node {
             TypedExprNode::Compose(elts) => match elts.split_last() {
                 Some((last, sources)) => match &last.node {
-                    TypedExprNode::Lambda { param, body } => {
+                    TypedExprNode::Lambda { params, body } => {
                         if sources.iter().any(|s| (checks.source)(s, &lets.own, loops)) {
                             return Some(SOURCE_GAP);
                         }
                         let mut loops = loops.clone();
-                        loops.insert(param.name.clone());
+                        loops.extend(params.iter().map(|p| p.name.clone()));
                         walk(body, &mut lets.clone(), &loops, checks)
                     }
                     _ => children(expr, lets, loops, checks),
@@ -1444,7 +1444,6 @@ fn lower_nested_loop(
                 transparency: BindingTransparency::Transparent,
                 // The loop's place, which names the stores of the variables it writes.
                 site: Some(ctx.places.site(target.span)),
-                role: Default::default(),
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -1544,7 +1543,6 @@ pub(super) fn lower_direct_mirror_loop(
                 transparency: BindingTransparency::Transparent,
                 // The loop's place, which names the stores of the variables it writes.
                 site: Some(ctx.places.site(target.span)),
-                role: Default::default(),
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -2041,8 +2039,7 @@ mod tests {
             in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x * 2)); __result_0
             in doubles"#}
     )]
-    // Multi-param generator: captures outer parameter. Uncurried params
-    // appear as projections of the synthetic `__arg_tuple_0`.
+    // Multi-param generator: captures outer parameter, which the body reads by name.
     #[case(
         indoc::indoc! {r#"
             def add_to(xs, n):
@@ -2050,8 +2047,8 @@ mod tests {
                     yield x + n
             add_to"#},
         indoc::indoc! {r#"
-            let add_to : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
+            let add_to : ((_, _) ⇒ _) = λ (xs, n) → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x + n)); __result_0
             in add_to"#}
     )]
     // Generator with if-guard: guard becomes a Case in the For body.
@@ -2076,8 +2073,8 @@ mod tests {
                         yield x + y
             cross"#},
         indoc::indoc! {r#"
-            let cross : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, x + y))); __result_0
+            let cross : ((_, _) ⇒ _) = λ (xs, ys) → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → ys ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, x + y))); __result_0
             in cross"#}
     )]
     // Three-level nested for.
@@ -2090,8 +2087,8 @@ mod tests {
                             yield x + y + z
             triple"#},
         indoc::indoc! {r#"
-            let triple : ((_, _, _) ⇒ _) = λ __arg_tuple_1 : (_, _, _) → let __result_0 = defer
-            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → __arg_tuple_1.2 ▷ Iterable::elements ▷ unbox ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
+            let triple : ((_, _, _) ⇒ _) = λ (xs, ys, zs) → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → ys ▷ Iterable::elements ▷ unbox ≫ (λ y → zs ▷ Iterable::elements ▷ unbox ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
             in triple"#}
     )]
     // Guard before inner for: Case wraps the nested For node.
@@ -2104,8 +2101,8 @@ mod tests {
                             yield y
             cross_filtered"#},
         indoc::indoc! {r#"
-            let cross_filtered : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
+            let cross_filtered : ((_, _) ⇒ _) = λ (xs, ys) → let __result_0 = defer
+            in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → ys ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
             in cross_filtered"#}
     )]
     // Let-binding in generator body: y is a fresh local per iteration.

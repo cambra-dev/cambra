@@ -1,8 +1,7 @@
 //! Lambda / `def` / parameter lowering.
 //!
-//! Multi-arg lambdas and functions are uncurried to a single tupled-parameter
-//! lambda whose body substitutes each named argument with a projection of the
-//! synthetic tuple — keeping the tree free of curried `Lambda` chains.
+//! A lambda or a function lowers to one [`Expr::Lambda`] over its parameters, each a named
+//! binder ([`lower_params`]).
 
 use crate::ccl::Annotation;
 use crate::ccl::Occurrence;
@@ -78,29 +77,6 @@ fn history_param_type(
     }
 }
 
-/// Whether `body` feeds or defines `name` where `name` is free.
-fn feeds_name(body: &Expr, name: &Name) -> bool {
-    match &body.node {
-        TypedExprNode::Feed {
-            name: target,
-            value,
-            ..
-        }
-        | TypedExprNode::Define {
-            name: target,
-            value,
-            ..
-        } => target == name || feeds_name(value, name),
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => feeds_name(bound_expr, name) || (&binding.name != name && feeds_name(body, name)),
-        TypedExprNode::Lambda { param, body, .. } => &param.name != name && feeds_name(body, name),
-        _ => body.any_child(|c| feeds_name(c, name)),
-    }
-}
-
 /// If `param` is annotated `Feed(T)` (a pass-by-reference deferred output),
 /// return its history type `Feed(T)`.
 ///
@@ -160,261 +136,73 @@ pub(super) fn feed_annotation_type(
     Some(lower_type_expr(value, ctx).map(|t| Type::feed(Type::Hole, t)))
 }
 
-/// Wrap `body_expr` in a single uncurried lambda over `args`.
+/// Wrap `body_expr` in one lambda over `params`, each a named binder: `(x, y): body` →
+/// `λ (x, y) → body`.
 ///
-/// Single-arg `(x): body` → `λ x → body`.
-///
-/// Multi-arg `(x, y, ...): body` becomes a single lambda whose parameter is
-/// a synthetic tuple `__arg_tuple_<N>`, with each named argument substituted
-/// in the body by its projection of that tuple:
-///
-/// ```text
-/// (x, y): body  ⟹  λ __arg_tuple_N → body[x := __arg_tuple_N.0,
-///                                          y := __arg_tuple_N.1]
-/// ```
-///
-/// Each multi-arg call mints a fresh `N` via
-/// [`LoweringContext::fresh_tuple_arg`] so that nested multi-arg
-/// lambdas/defs cannot capture each other's tuple parameter; without the
-/// unique suffix, an outer substitution inserting `Var("__arg_tuple")` into
-/// an inner lambda's body would be captured by the inner binder of the same
-/// name.
-///
-/// In-place substitution (rather than wrapping the body in `let`-bindings)
-/// avoids introducing function-typed `Let` nodes; when `lambda_elim`
-/// rewrites a `Let` under a lambda, the bound variable's type is lifted to
-/// `ParamTy ⇒ T`, producing `zip(.0, .1)`-shaped morphisms that downstream
-/// passes would then need to simplify back to `id` before operator
-/// conversion can compile them (simplify has no such rule today).
-/// Substitution sidesteps that whole rewrite chain.
-///
-/// Shared between [`lower_lambda`] and [`lower_function_body`] so that both
-/// `\x, y -> …` and `def f(x, y): …` pair with [`lower_call`]'s
-/// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
-/// `lambda_elim` would fold into an unsupported `curry(body)` — the one
-/// exception being a pass-by-reference `Mut` parameter, which stays a *named*
-/// curried binder (see the `Mut`-param arm below); such functions are always
-/// inlined, so their curried chain never reaches `lambda_elim`.
-pub(super) fn uncurry_params(
+/// The lambda's argument is the product of the parameters' types, so a call with several
+/// arguments applies it to the tuple of them ([`super::exprs`]'s `apply_to_args`) and a call
+/// with none to the unit. Each parameter stays a binder through inlining, which substitutes
+/// the argument's components for them: a `Mut(…)` parameter's writes and a `Feed(…)`
+/// parameter's feeds then land on the variable and the channel the caller passed. A later
+/// parameter's annotation may read the earlier parameters, as a dependent tuple's component
+/// reads the components before it.
+pub(super) fn lower_params(
     params: &[Param],
     body_expr: Expr,
-    fn_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let mut function = uncurry_params_inner(params, body_expr, fn_span, ctx)?;
-    let TypedExprNode::Lambda { param, .. } = &mut function.node else {
-        unreachable!("a source function lowers to a lambda")
-    };
-    param.role = crate::ccl::BindingRole::FunctionParameter;
-    Ok(function)
-}
-
-fn uncurry_params_inner(
-    params: &[Param],
-    body_expr: Expr,
-    fn_span: Span,
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    if params.len() == 1 {
-        // A `Mut(…)`-annotated single parameter is a pass-by-reference mutable variable:
-        // bind it at `Mut(V, D)` so body references carry `Mut` (reads deref, writes lower
-        // to `MutWrite`) and inference fills an induction domain from each call's argument;
-        // `Mut(V)` given a transactional variable is refused there. A `Feed(…)` parameter is
-        // bound at its feed type the same way. Every other parameter stays `Hole` (inferred).
-        let history_ty = history_param_type(&params[0], ctx).transpose()?;
-        let param_ty = history_ty.clone().unwrap_or(Type::Hole);
-        let occurrence = ctx.occurrence_at(params[0].name_span);
-        let mut lam = Expr::lambda(params[0].name.as_str(), occurrence, param_ty, body_expr);
-        if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
-            if let Some(history_ty) = history_ty {
-                // The carrier is both the binder type and its declaration, as for a
-                // curried parameter below: the declaration keeps the domain as written,
-                // which inference fills in the binder type.
-                let occurrence = params[0]
-                    .annotation
-                    .as_ref()
-                    .map_or_else(Occurrence::mint, |ann| ctx.occurrence_at(ann.ty.span));
-                param.declare(Annotation::new(history_ty, occurrence));
-            } else if let Some(ann) = &params[0].annotation {
-                // Any *other* annotation (`int`, `List[T]`, …) is a
-                // **checking-mode** declaration: attach it so `emit_lambda` binds
-                // the param at its declared type and an ill-typed argument is
-                // rejected at the call site. Without this the annotation was
-                // silently dropped and the param inferred purely from its body (so
-                // `def g(a: int)` with an identity body accepted any argument).
-                param.declare(Annotation::new(
-                    lower_type_annotation(ann, ctx)?,
-                    ctx.occurrence_at(ann.ty.span),
-                ));
-            }
+    let mut bindings = Vec::with_capacity(params.len());
+    for param in params {
+        let mut binding = crate::ccl::TypedBinding::new_unannotated(
+            param.name.as_str(),
+            ctx.occurrence_at(param.name_span),
+        );
+        // A `Mut(…)` parameter is a pass-by-reference mutable variable: bound at `Mut(V, D)`
+        // so body references carry `Mut` (reads deref, writes lower to `MutWrite`), and
+        // inference fills an induction domain from each call's argument; `Mut(V)` given a
+        // transactional variable is refused there. A `Feed(…)` parameter is bound at its
+        // feed type the same way. A `Mut(…)`/`Feed(…)` annotation names a history carrier
+        // rather than an ordinary type, so it lowers here and not through
+        // `lower_type_annotation`.
+        if let Some(history_ty) = history_param_type(param, ctx).transpose()? {
+            // The carrier is both the binder type and its declaration: the declaration keeps
+            // the domain as written, which inference fills in the binder type.
+            let occurrence = param
+                .annotation
+                .as_ref()
+                .map_or_else(Occurrence::mint, |ann| ctx.occurrence_at(ann.ty.span));
+            binding.ty = history_ty.clone();
+            binding.declare(Annotation::new(history_ty, occurrence));
+        } else if let Some(ann) = &param.annotation {
+            // Any *other* annotation (`int`, `List[T]`, …) is a **checking-mode**
+            // declaration: attach it so `emit_lambda` binds the param at its declared type
+            // and an ill-typed argument is rejected at the call site.
+            binding.declare(Annotation::new(
+                lower_type_annotation(ann, ctx)?,
+                ctx.occurrence_at(ann.ty.span),
+            ));
         }
-        return Ok(lam);
+        bindings.push(binding);
     }
-    // A function with a pass-by-reference `Mut` parameter is curried into a
-    // chain of *named* lambdas rather than tupled: a `Mut` parameter must stay a
-    // named binder so inlining renames the callee's `MutWrite` target to the
-    // caller's mutable variable (a tuple projection cannot be a write target — the
-    // cross-function transactional writer `def transfer(src, dst, amt)`). Such
-    // functions are always inlined (a `Mut`-param function must reach its call
-    // sites), so the curried chain never survives to `lambda_elim`. Call sites
-    // apply curried to match (see `lower_call`, keyed on `history_param_fns`). A `Feed`
-    // parameter is the same case: a feed's target is a name, so the channel the caller
-    // passes reaches the body's feeds only through a named binder.
-    if is_curried(params, ctx) {
-        return params.iter().rev().try_fold(body_expr, |acc, param| {
-            // A `Mut(…)`/`Feed(…)` annotation names a history carrier rather than
-            // an ordinary type, so it lowers here and not through
-            // `lower_type_annotation`. A malformed `Mut(…)` already returned from
-            // `lower_function_body`; a malformed `Feed(…)` surfaces here.
-            let history_ty = history_param_type(param, ctx).transpose()?;
-            let param_ty = history_ty.clone().unwrap_or(Type::Hole);
-            let occurrence = ctx.occurrence_at(param.name_span);
-            let mut lam = Expr::lambda(param.name.as_str(), occurrence, param_ty.clone(), acc);
-            if let TypedExprNode::Lambda { param: p, .. } = &mut lam.node {
-                p.role = crate::ccl::BindingRole::Temporary;
-                match (history_ty, &param.annotation) {
-                    // The carrier is both the binder type and its declaration.
-                    (Some(_), Some(ann)) => {
-                        p.declare(Annotation::new(param_ty, ctx.occurrence_at(ann.ty.span)))
-                    }
-                    (Some(_), None) => p.declare(Annotation::new(param_ty, Occurrence::mint())),
-                    // Every other annotation is a checking-mode declaration, as in
-                    // the single-parameter arm: attach it so `emit_lambda` binds the
-                    // parameter at its declared type and an ill-typed argument is
-                    // rejected at the call site.
-                    (None, Some(ann)) => p.declare(Annotation::new(
-                        lower_type_annotation(ann, ctx)?,
-                        ctx.occurrence_at(ann.ty.span),
-                    )),
-                    (None, None) => {}
-                }
-            }
-            // Each curried lambda images one written parameter; the outermost
-            // is re-tagged identically by the `def`/lambda caller.
-            Ok(ctx.tag_image(lam, fn_span))
-        });
-    }
-
-    // Mint the tuple binder here so it carries the parameters' spellings for diagnostics.
-    // Its unique id separates nested tuple binders; the counter in the reserved
-    // `__arg_tuple_` spelling only keeps their printed base names distinct.
-    let tuple_name = Name::fresh_tuple(
-        ctx.fresh_tuple_arg(),
-        params
-            .iter()
-            .map(|p| SmolStr::from(p.name.as_str()))
-            .collect(),
-    );
-    let up = "lower.param_proj";
-    let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
-        // The projection plumbing is manufactured per *occurrence*: the
-        // substitution deep-freshens this template's INTERIOR into every
-        // occurrence of the parameter while each occurrence keeps its own
-        // id/attribution (see `substitute_param_in_body`), so tag the template's
-        // three nodes as machinery leaves.
-        //
-        // The template itself never enters the tree. Its two interior ids reach
-        // the tree as the freshened copies the recording below captures, so they are
-        // origins of live nodes; its ROOT does not — each occurrence's own id
-        // replaces it — so that one id is tagged and then carried by nothing.
-        // Harmless in the product (the projection is filtered to the output tree,
-        // so the entry drops out), and the reason there is no produced-side leak
-        // class: see `design/provenance.md`, "The fold".
-        //
-        // Tagged with the **parameter's declaration**, not the function's span.
-        // `__arg_tuple_N ▷ .i` is what became of `arg`, so its source position is
-        // where `arg` was written. Every occurrence inherits that tag on the
-        // freshened interior while keeping its own span on the root, which is the
-        // pair a consumer needs: the root says which occurrence, the interior says
-        // which declaration. A substituted parameter binds nothing, so this is the
-        // only channel that can name its site — see `src/ccl/design/ir.md`,
-        // "Source locations on substituted parameter projections".
-        let site = arg.name_span;
-        let var = ctx.tag_machinery(Expr::var(tuple_name.clone()), site, up);
-        let idx = ctx.tag_machinery(Expr::proj_index(i), site, up);
-        let proj = ctx.tag_machinery(Expr::apply(var, idx), site, up);
-        let name = Name::raw(arg.name.as_str());
-        // A feed's target is a name, which a projection of the tuple cannot stand in for, so
-        // a parameter the body feeds is bound to its projection rather than replaced by it.
-        // Inlining a call then makes it an alias of the channel the caller passed, which
-        // channelization follows (`src/ccl/design/lowering.md`, "Feed declarations and
-        // operators — `x: Feed(V)` / `<<` / `<<=`").
-        if feeds_name(&acc, &name) {
-            let occurrence = ctx.occurrence_at(site);
-            return ctx.tag_machinery(Expr::let_bind(name, occurrence, proj, acc), site, up);
-        }
-        substitute_param_in_body(acc, &name, &proj, up)
-    });
-    // Attach the *tuple* of per-parameter annotations (checking mode), mirroring the
-    // single-parameter case: each annotated position is enforced at the call site,
-    // unannotated positions ride `Hole` (inferred). Skip if no parameter is
-    // annotated. (This arm has no `Mut` params — those are curried above.)
-    let mut elem_anns: Vec<Type> = Vec::with_capacity(params.len());
-    for p in params {
-        elem_anns.push(match &p.annotation {
-            Some(ann) => lower_type_annotation(ann, ctx)?,
-            None => Type::Hole,
-        });
-    }
-    // The tuple has one position per parameter, and no parameter makes it the unit, the one
-    // empty product a call with no arguments applies. The body only projects it, which fixes
-    // no width (`docs/chl-spec.md`, "Tuple width"), so the binder states it. The tuple binder is
-    // lowering's own: no one place in the source writes it, so it records where the function
-    // is tagged.
-    let arity = Type::tuple(vec![Type::Hole; params.len()]);
-    let mut lam = Expr::lambda(tuple_name, Occurrence::mint(), arity, body_with_subs);
-    if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
-        && let TypedExprNode::Lambda { param, .. } = &mut lam.node
-    {
-        param.declare(Annotation::new(Type::tuple(elem_anns), Occurrence::mint()));
-    }
-    Ok(lam)
+    Ok(Expr::lambda_of(bindings, body_expr))
 }
 
-/// Whether [`uncurry_params`] curries `params` into one lambda each
-/// ([`is_curried`](crate::ccl::infer::solver::traits::is_curried)).
-fn is_curried(params: &[Param], ctx: &mut LoweringContext) -> bool {
-    let by_reference: Vec<bool> = params
-        .iter()
-        .map(|p| history_param_type(p, ctx).is_some())
-        .collect();
-    crate::ccl::infer::solver::traits::is_curried(&by_reference)
-}
-
-/// Stamp the lambda whose body is a `def`'s body, the innermost of the chain
-/// [`uncurry_params`] built over `params`, with the `def`'s clauses: inference reads them
-/// off the function type the stamp states (`src/ccl/design/type-inference.md`, "Written
-/// clauses").
-fn stamp_clauses(
-    func: &mut Expr,
-    params: &[Param],
-    written: crate::ccl::capabilities::Written,
-    ctx: &mut LoweringContext,
-) {
-    let lambdas = if is_curried(params, ctx) {
-        params.len()
-    } else {
-        1
-    };
-    let mut lambda = func;
-    for _ in 1..lambdas {
-        let TypedExprNode::Lambda { body, .. } = &mut lambda.node else {
-            unreachable!("`uncurry_params` curries one lambda per parameter");
-        };
-        lambda = body;
-    }
+/// Stamp `func`, the lambda whose body is a `def`'s body, with the `def`'s clauses:
+/// inference reads them off the function type the stamp states
+/// (`src/ccl/design/type-inference.md`, "Written clauses").
+fn stamp_clauses(func: &mut Expr, written: crate::ccl::capabilities::Written) {
     debug_assert!(
-        matches!(lambda.node, TypedExprNode::Lambda { .. }) && lambda.user_annotation.is_none(),
-        "a `def`'s innermost lambda carries no annotation before its clauses"
+        matches!(func.node, TypedExprNode::Lambda { .. }) && func.user_annotation.is_none(),
+        "a `def`'s lambda carries no annotation before its clauses"
     );
-    lambda.user_annotation = Some(
+    func.user_annotation = Some(
         Type::fun(Type::Hole, Type::Hole)
             .with_capabilities(crate::ccl::capabilities::Capabilities::written(written)),
     );
 }
 
 /// Lower a CHL lambda expression to an [`Expr::Lambda`] via
-/// [`uncurry_params`].
+/// [`lower_params`].
 ///
 /// Explicitly nested lambdas can produce the internal `curry` combinator when
 /// they survive inlining. Operator conversion does not compile arbitrary
@@ -426,7 +214,7 @@ pub(super) fn lower_lambda(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // Mutability of a `Mut(…)`-annotated parameter is its *type* (stamped by
-    // `uncurry_params`), checked post-inference — there is no induction registry
+    // `lower_params`), checked post-inference — there is no induction registry
     // to mask here. But a plain parameter spelled like an outer transactional
     // mutable variable is a genuine local, so SHADOW every parameter over the body
     // (popped on exit) to skip the out-of-block read gate for it — mirroring how
@@ -434,34 +222,32 @@ pub(super) fn lower_lambda(
     // meaning. The shadow set is keyed by pre-uniquify base name.
     let param_names: Vec<String> = params.iter().map(|p| p.name.as_str().to_string()).collect();
     let body_expr = ctx.with_shadowed(param_names, |ctx| lower_expr(body, ctx));
-    uncurry_params(params, body_expr?, lambda_span, ctx)
+    let lambda = lower_params(params, body_expr?, ctx)?;
+    Ok(ctx.tag_image(lambda, lambda_span))
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
 /// respecting binder shadowing introduced by inner `Lambda` and `Let` nodes.
 ///
-/// Used during multi-arg lambda lowering to rewrite named CHL parameters as
-/// projections of a synthetic tuple variable. A thin wrapper over the uniform
-/// engine's in-place mode ([`crate::ccl::subst::Subst::rewrite_expr`]), which
-/// traverses type slots too: a comprehension filter that references an
-/// enclosing multi-arg lambda's parameter — e.g.
-/// `\lo, hi -> sum([x for x in data if x >= lo])` — lowers the filter
-/// into the comprehension's `Cast::target` predicate with `lo` free in it,
-/// and the engine rewrites it there along with the term spine.
+/// Used to rewrite the names a pattern binds as projections of the value it takes apart. A thin
+/// wrapper over the uniform engine's in-place mode
+/// ([`crate::ccl::subst::Subst::rewrite_expr`]), which traverses type slots too: a
+/// comprehension filter in the pattern's scope lowers into the comprehension's `Cast::target`
+/// predicate with the name free in it, and the engine rewrites it there along with the term
+/// spine.
 ///
 /// **Root-carry** — the substitution engine's identity rule for a compound
 /// replacement: it carries each *occurrence*'s own id onto the replacement root
 /// (a preserve, so the root inherits the occurrence's own `Source` attribution)
 /// and deep-freshens only the replacement's *interior* into fresh nodes. That is
-/// what buys occurrence fidelity here: every `x` in `def f(x, y)`'s body becomes
-/// its own `__arg_tuple.0` whose root still points at that `x`'s span, rather
-/// than every projection mirroring the one shared `def` span. The interior
+/// what buys occurrence fidelity here: every `w` in `case Shape::rect(w, h)`'s arm becomes its
+/// own projection whose root still points at that `w`'s span, rather than every projection
+/// mirroring the one shared pattern span. The interior
 /// freshens land as ambient `Copy`s in the open lowering copy sink below,
 /// mirroring the template's machinery attribution — so every substituted node
 /// stays covered by the lowering fold.
 ///
-/// The replacement names a tuple binder minted by `uncurry_params`. Its unique id keeps
-/// it distinct from every binder in the body before `uniquify` runs.
+/// The replacement names a binder lowering minted, which no binder in the body can capture.
 ///
 /// `label` names the lowering rule the copies are recorded under.
 pub(super) fn substitute_param_in_body(
@@ -736,12 +522,10 @@ fn imply_declaration_requirements(
         }
     }
     let mut found = Vec::new();
-    let mut node = func;
-    while let TypedExprNode::Lambda { param, body } = &node.node {
+    for param in lambda_params(func) {
         if let Some(annotation) = &param.user_annotation {
             applications(&annotation.ty, &mut found);
         }
-        node = body;
     }
     for application in found {
         let Type::Nominal(decl, args) = &application else {
@@ -861,19 +645,22 @@ pub(super) fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypePa
     ty.walk_children(|child| collect_params(child, out));
 }
 
-/// The type parameters the annotations on `func`'s parameters name: the binders of
-/// the lambda chain `uncurry_params` builds, one lambda for an uncurried definition
-/// and one per parameter for a `Mut`-parameter one.
+/// The parameters of `func`, the lambda [`lower_params`] builds for a definition.
+fn lambda_params(func: &Expr) -> &[crate::ccl::TypedBinding] {
+    let TypedExprNode::Lambda { params, .. } = &func.node else {
+        unreachable!("a definition lowers to a lambda")
+    };
+    params
+}
+
+/// The type parameters the annotations on `func`'s parameters name.
 fn parameter_annotation_params(func: &Expr) -> HashSet<crate::ccl::ty::TypeParamId> {
-    let collect = collect_params;
     let mut out = HashSet::new();
-    let mut node = func;
-    while let TypedExprNode::Lambda { param, body } = &node.node {
-        collect(&param.ty, &mut out);
+    for param in lambda_params(func) {
+        collect_params(&param.ty, &mut out);
         if let Some(annotation) = param.annotation_ty() {
-            collect(annotation, &mut out);
+            collect_params(annotation, &mut out);
         }
-        node = body;
     }
     out
 }
@@ -904,7 +691,7 @@ pub(super) fn lower_function_body(
     //    begin():` block is classified as a commit (the cross-function writer
     //    `def transfer(src, dst: Mut(_, Txn), …)`), and a bare read of it is gated.
     //  - An induction `Mut(V)` parameter needs no registry — its mutability is
-    //    its `Type::History` (stamped by `uncurry_params`), checked post-inference. It
+    //    its `Type::History` (stamped by `lower_params`), checked post-inference. It
     //    is recorded here only so it is *not* shadowed below: a mutable variable keeps its
     //    gate, a plain local does not. A malformed `Mut(…)` annotation surfaces
     //    its error eagerly (before the body lowers).
@@ -955,9 +742,7 @@ pub(super) fn lower_function_body(
     // A `=> T` output annotation checks the body's result against `T`. Wrap the
     // body in an annotated let *inside* the lambda, so the annotation's predicate
     // sees the parameters in scope — a refinement `{Int where _ >= a}` refers to
-    // parameter `a`. In the multi-arg case `uncurry_params` rewrites those
-    // parameter references (in the term *and* in this annotation's type slot) to
-    // tuple projections along with the rest of the body.
+    // parameter `a`.
     let mut body_expr = body_result?;
     if let Some(output) = output {
         let output_ty = Annotation::new(
@@ -971,12 +756,10 @@ pub(super) fn lower_function_body(
         );
     }
 
-    // Tag the function's lambda wrapper with the `def` span. (The synthetic
-    // tuple-arg lambda for the multi-param case is the user's function node,
-    // so the def span is the right blame here.)
-    let mut func = uncurry_params(params, body_expr, fn_span, ctx)?;
+    // Tag the function's lambda with the `def` span.
+    let mut func = lower_params(params, body_expr, ctx)?;
     if let Some(written) = clauses {
-        stamp_clauses(&mut func, params, written, ctx);
+        stamp_clauses(&mut func, written);
     }
     Ok(ctx.tag_image(func, fn_span))
 }
@@ -1046,14 +829,14 @@ mod tests {
             let inc : (_ ⇒ _) = λ x → x + 1
             in inc"#}
     )]
-    // Multi-param function: uncurried to a single tupled-parameter lambda.
+    // Multi-param function: one lambda over the parameter list, of the tuple of them.
     #[case(
         indoc::indoc! {r#"
             def add(x, y):
                 x + y
             add"#},
         indoc::indoc! {r#"
-            let add : ((_, _) ⇒ _) = λ __arg_tuple_0 : (_, _) → __arg_tuple_0.0 + __arg_tuple_0.1
+            let add : ((_, _) ⇒ _) = λ (x, y) → x + y
             in add"#}
     )]
     fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {
@@ -1062,105 +845,5 @@ mod tests {
             .into_result()
             .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
-    }
-
-    /// A substituted parameter's two spans, which together answer
-    /// goto-definition for it: the projection **root** carries the occurrence's
-    /// own span (its id is the occurrence's), and the projection **interior**
-    /// carries the parameter's **declaration** (the template's tag, inherited by
-    /// every freshened copy).
-    ///
-    /// A substituted parameter binds nothing, so no `TypedBinding::name_span` can
-    /// name it and this pair is the only channel that does. The corpus otherwise
-    /// has no multi-param `def`, so pin both halves here.
-    #[test]
-    fn a_substituted_parameter_carries_occurrence_and_declaration_spans() {
-        use crate::ccl::TypedExprNode;
-        use crate::ccl::provenance::NodeId;
-        use crate::ccl::provenance::{LoweringSession, Nature, SourceProjection, fold_lowering};
-        use crate::chl_parser::ast::Span;
-        use std::collections::HashSet;
-
-        // `def add(a, b):` newline `    a + a + b` newline `add(1, 2)` newline.
-        // The two `a` occurrences sit at distinct source spans; `b` at a third.
-        let src = indoc::indoc! {r#"
-            def add(a, b):
-                a + a + b
-            add(1, 2)
-            "#};
-        let module = parse_module(src);
-        let a1 = Span::new(module.file, 19, 20);
-        let a2 = Span::new(module.file, 23, 24);
-        let b = Span::new(module.file, 27, 28);
-        // The declarations, in `def add(a, b)`.
-        let decl_a = Span::new(module.file, 8, 9);
-        let decl_b = Span::new(module.file, 11, 12);
-
-        let mut ctx = LoweringContext::default();
-        let session = LoweringSession::install();
-        let ccl = lower_stmts(&module, &mut ctx)
-            .into_result()
-            .expect("lowering failed");
-        let log = session.into_log();
-
-        let mut ids: HashSet<NodeId> = HashSet::new();
-        fn all_ids(e: &Expr, acc: &mut HashSet<NodeId>) {
-            acc.insert(e.node_id());
-            e.walk_children(|c| all_ids(c, acc));
-        }
-        all_ids(&ccl, &mut ids);
-        let (projection, leaks) = fold_lowering(&log, &ids);
-        assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
-
-        // Collect the source span each uncurry-projection ROOT carries. A
-        // projection node is `Apply { function: Proj(Index(_)) }` — its argument
-        // is the synthetic tuple var. Its own id is the occurrence's, so its
-        // projection entry is that occurrence's `Source` image.
-        fn projection_spans(e: &Expr, proj: &SourceProjection, out: &mut Vec<Span>) {
-            if let TypedExprNode::Apply { function, .. } = &e.node
-                && matches!(function.node, TypedExprNode::Proj(_))
-                && let Some(attr) = proj.get(&e.node_id())
-            {
-                assert_eq!(
-                    attr.rewritten.nature,
-                    Nature::Source,
-                    "a root-carried projection preserves the occurrence's Source image"
-                );
-                out.extend(attr.spans.iter().copied());
-            }
-            e.walk_children(|c| projection_spans(c, proj, out));
-        }
-        let mut spans = Vec::new();
-        projection_spans(&ccl, &projection, &mut spans);
-        spans.sort_by_key(|s| (s.start, s.end));
-
-        assert_eq!(
-            spans,
-            vec![a1, a2, b],
-            "each projection root carries its OWN occurrence's span — the two `a` \
-             uses at distinct spans, plus `b`, not the shared `def` span"
-        );
-
-        // The interior: the `Proj(Index(i))` under each projection root carries
-        // the declaration of the parameter that projection stands for. `a` is
-        // used twice, so its declaration appears twice.
-        fn interior_spans(e: &Expr, proj: &SourceProjection, out: &mut Vec<Span>) {
-            if let TypedExprNode::Apply { function, .. } = &e.node
-                && matches!(function.node, TypedExprNode::Proj(_))
-                && let Some(attr) = proj.get(&function.node_id())
-            {
-                out.extend(attr.spans.iter().copied());
-            }
-            e.walk_children(|c| interior_spans(c, proj, out));
-        }
-        let mut interiors = Vec::new();
-        interior_spans(&ccl, &projection, &mut interiors);
-        interiors.sort_by_key(|s| (s.start, s.end));
-        assert_eq!(
-            interiors,
-            vec![decl_a, decl_a, decl_b],
-            "each projection's interior names the parameter's declaration, so a \
-             consumer at an occurrence can reach the site the parameter was written at"
-        );
     }
 }

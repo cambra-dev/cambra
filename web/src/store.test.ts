@@ -104,7 +104,7 @@ describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
     // Resolves to the literal's singleton type, which prints as `Int@10`.
     expect(store.resolvedTypesFor("pre-inference", lit.nodeId)).toEqual(["Int@10"]);
 
-    const lambda = theNode(pre, "Lambda(__arg_tuple_0)");
+    const lambda = theNode(pre, "Lambda(p, q)");
     expect(lambda.type).toBe("((_, _) ⇒ _)"); // a function of two parameters, types still holes
     expect(store.resolvedTypesFor("pre-inference", lambda.nodeId)).toEqual([
       "((Int@1, Int@2) ⇒ Int)",

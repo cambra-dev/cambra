@@ -1563,7 +1563,7 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
                 .iter()
                 .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__family_k")))
                 .collect();
-            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
+            let opened = crate::ccl::subst::open_family_body(binders, body, |j| {
                 crate::ccl::subst::Mapping::Rename(names[j].clone())
             });
             let terms: Vec<Rc<crate::ccl::TypedExpr>> =

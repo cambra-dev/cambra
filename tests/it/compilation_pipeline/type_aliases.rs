@@ -35,7 +35,7 @@ fn alias_annotates_def_params_and_output() {
             def add(a: Cents, b: Cents) => Cents:
                 a + b
 
-            add((4, -1))
+            add(4, -1)
         "#},
         Value::Int(3),
     );

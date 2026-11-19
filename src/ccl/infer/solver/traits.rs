@@ -482,7 +482,7 @@ impl CompilerTraits {
                 assoc_bounds: vec![(
                     Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
                     Type::Fun {
-                        name: None,
+                        binder: crate::ccl::FunBinder::None,
                         fun_kind: crate::ccl::ty::FunKind::data_hole(),
                         domain: Box::new(Type::Hole),
                         codomain: Box::new(Type::Hole),
@@ -1242,8 +1242,7 @@ pub enum InstanceBody {
 
 impl InstanceBody {
     /// The function as a term of `ty`, the type its call resolved to: `𝐴 ⇒ 𝑂` for one
-    /// parameter, `{𝐴, 𝐵} ⇒ 𝑂` for two. The parameters are taken out of the tuple by name,
-    /// so each operand the primitive reads is atomic.
+    /// parameter, `(𝐴, 𝐵) ⇒ 𝑂` for two, the primitive reading its parameters by name.
     pub fn build(&self, ty: &Type) -> TypedExpr {
         let Type::Fun {
             domain, codomain, ..
@@ -1251,42 +1250,44 @@ impl InstanceBody {
         else {
             panic!("a trait function resolves to a function type, got {ty}");
         };
-        let param = Name::fresh("__op");
         let domain = (**domain).clone();
         let codomain = (**codomain).clone();
         let read = |name: &Name, ty: &Type| TypedExpr::var(name.clone()).with_ty(ty.clone());
-        let body = match (self, crate::ccl::ccl_utils::strip_refinements(&domain)) {
+        match (self, crate::ccl::ccl_utils::strip_refinements(&domain)) {
             (InstanceBody::Binary(op), Type::Tuple(parts)) => {
                 let [left, right]: [Type; 2] = parts
                     .try_into()
                     .unwrap_or_else(|_| panic!("`{op:?}` is over two operands"));
-                let names = [Name::anf_temp(), Name::anf_temp()];
-                let mut body = TypedExpr::new(TypedExprNode::BinOp {
+                let names = [Name::fresh("__op"), Name::fresh("__op")];
+                let body = TypedExpr::new(TypedExprNode::BinOp {
                     left: Box::new(read(&names[0], &left)),
                     op: *op,
                     right: Box::new(read(&names[1], &right)),
                 })
-                .with_ty(codomain.clone());
-                for (i, (name, part)) in names.iter().zip([left, right]).enumerate().rev() {
-                    let projection = TypedExpr::apply(
-                        read(&param, &domain),
-                        TypedExpr::proj_index(i).with_ty(super::fun(domain.clone(), part.clone())),
-                    )
-                    .with_ty(part);
-                    body = TypedExpr::let_bind(name.clone(), Occurrence::mint(), projection, body)
-                        .with_ty(codomain.clone());
-                }
-                body
+                .with_ty(codomain);
+                let params = names
+                    .into_iter()
+                    .zip([left, right])
+                    .map(|(name, part)| {
+                        let mut param =
+                            crate::ccl::TypedBinding::new_unannotated(name, Occurrence::mint());
+                        param.ty = part;
+                        param
+                    })
+                    .collect();
+                TypedExpr::lambda_of(params, body).with_ty(ty.clone())
             }
             (InstanceBody::Unary(op), _) => {
-                TypedExpr::new(TypedExprNode::UnaryOp(*op, Box::new(read(&param, &domain))))
-                    .with_ty(codomain)
+                let param = Name::fresh("__op");
+                let body =
+                    TypedExpr::new(TypedExprNode::UnaryOp(*op, Box::new(read(&param, &domain))))
+                        .with_ty(codomain);
+                TypedExpr::lambda(param, Occurrence::mint(), domain, body).with_ty(ty.clone())
             }
             (InstanceBody::Binary(op), other) => {
                 panic!("`{op:?}` is over a pair of operands, got {other}")
             }
-        };
-        TypedExpr::lambda(param, Occurrence::mint(), domain, body).with_ty(ty.clone())
+        }
     }
 }
 
@@ -1534,28 +1535,38 @@ impl Default for InstanceTable {
     }
 }
 
-/// Whether a function whose parameters are passed by reference where `by_reference` says so
-/// takes them one at a time: several, one of them a `Mut` or `Feed` parameter, whose argument
-/// reaches the body only through a named binder (`lower::functions`). A `def`, a trait's
-/// signature and the type of either decide it here.
-pub fn is_curried(by_reference: &[bool]) -> bool {
-    by_reference.len() > 1 && by_reference.iter().any(|b| *b)
-}
-
-/// The type of a function over `inputs`, as a `def` over them lowers: over the one input, over
-/// the tuple of several, which for none is the unit, or one at a time where [`is_curried`].
+/// The type of a function over `inputs`, as a `def` over them lowers: a function of the one
+/// input, or of the parameter list of any other number, its domain the tuple of several or the
+/// unit for none ([`Type::fun_of_params`]).
 pub fn function_over(inputs: &[Type], output: Type) -> Type {
-    let by_reference: Vec<bool> = inputs.iter().map(|t| t.history_parts().is_some()).collect();
-    if is_curried(&by_reference) {
-        return inputs.iter().rev().fold(output, |acc, input| {
-            crate::ccl::infer::solver::fun(input.clone(), acc)
-        });
-    }
-    let domain = match inputs {
-        [one] => one.clone(),
-        several => Type::tuple(several.to_vec()),
+    let (binder, domain) = match inputs {
+        [one] => (crate::ccl::FunBinder::None, one.clone()),
+        [] => (
+            crate::ccl::FunBinder::Parameters(Vec::new()),
+            Type::Base(BaseType::Unit),
+        ),
+        several => (
+            crate::ccl::FunBinder::Parameters(vec![None; several.len()]),
+            Type::tuple(several.to_vec()),
+        ),
     };
-    crate::ccl::infer::solver::fun(domain, output)
+    let Type::Fun {
+        fun_kind,
+        domain,
+        codomain,
+        capabilities,
+        ..
+    } = crate::ccl::infer::solver::fun(domain, output)
+    else {
+        unreachable!("`fun` builds a function")
+    };
+    Type::Fun {
+        binder,
+        fun_kind,
+        domain,
+        codomain,
+        capabilities,
+    }
 }
 
 impl InstanceTable {

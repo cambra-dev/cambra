@@ -558,13 +558,14 @@ the witness decisions, kept only if the join is. Realization records which witne
 once for the whole program (`Witnesses`), because a lifted term names the witnesses of the tree it
 came from.
 
-Every lift point-frees its term through `eliminate_lifted`, which states which of the passes
-between inference and planning skip a predicate and runs those on the term. Channelize is the one
-a predicate can need: the predicate shape rule keeps the mutable-variable forms out of a predicate
-(`debug_assert_predicate_shape`), but a generator called in a filter or a key leaves its `defer`
-block there. For a term holding a `defer`, `eliminate_lifted` runs channelize, which turns the
-block into the loop feeding its channel, then lambda elimination, then letrec recognition
-(`plan_loops`), which reads that loop as the collection it builds. Until a predicate is lifted, its
+Every lift point-frees its term through `eliminate_lifted`, which runs the passes between inference
+and planning that skip a predicate. Refinement erasure removes the lifted term's value facts before
+lambda elimination and retains the data-domain refinements that planning executes. The predicate
+shape rule keeps mutable-variable forms out of a predicate (`debug_assert_predicate_shape`), but a
+generator called in a filter or a key leaves its `defer` block there. For a term holding a `defer`,
+`eliminate_lifted` first runs channelize, which turns the block into the loop feeding its channel.
+After refinement erasure and lambda elimination, letrec recognition (`plan_loops`) reads that loop
+as the collection it builds. Until a predicate is lifted, its
 `defer` block is source form: channelize reports an error in it (`check_predicate_defers`) without
 rewriting it, its residue check skips it, and the typecheck before planning checks it at
 `Strictness::PreChannelize`. Planning compiles every predicate, so the check of planning's output,

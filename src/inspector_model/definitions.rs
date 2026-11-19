@@ -33,9 +33,9 @@
 //! - A `Var` names the binder sharing its uid. A qualified one, `Shape::rect` or
 //!   `m::f`, is resolved at its last segment; the qualifier is a row of lowering's.
 //! - A `Feed`, `Define` or `MutWrite` names its binder through its applied occurrence.
-//! - A substituted parameter, a multi-argument function's or a constructor pattern's
-//!   field, binds nothing — lowering replaces each use with `__arg_tuple_N ▷ .i` — so
-//!   it resolves through the projection's two spans: the `Apply` carries the use and
+//! - A constructor pattern's field binds nothing — lowering replaces each use with a
+//!   projection of the value the pattern takes apart — so it resolves through the
+//!   projection's two spans: the `Apply` carries the use and
 //!   its `Proj` child carries the declaration (`src/ccl/design/ir.md`, "Source
 //!   locations on substituted parameter projections"). The name is read back from
 //!   the source at that declaration.
@@ -91,8 +91,7 @@ pub(super) fn definitions(
     out
 }
 
-/// The label `uncurry_params` and `bind_parameters` tag a substituted parameter's
-/// projection with. Matching on it is exact: an author-written `t.0` images its own
+/// The label `bind_parameters` tags a substituted constructor field's projection with. Matching on it is exact: an author-written `t.0` images its own
 /// source and carries the lowering image label instead.
 const PARAM_PROJ: &str = "lower.param_proj";
 

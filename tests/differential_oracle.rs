@@ -95,7 +95,7 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
                 }
             }
             let fun = |n: Option<&str>, k: FunKind, d: Type, c: Type| Type::Fun {
-                name: n.map(Name::raw),
+                binder: n.map(Name::raw).into(),
                 fun_kind: k,
                 domain: Box::new(d),
                 codomain: Box::new(c),
@@ -262,7 +262,11 @@ fn pred_json(e: &TypedExpr, scope: &mut Vec<Name>) -> Option<String> {
                 refs.join(",")
             ))
         }
-        TypedExprNode::Lambda { param, body } => {
+        // The model's lambda binds one parameter.
+        TypedExprNode::Lambda { params, body } => {
+            let [param] = params.as_slice() else {
+                return None;
+            };
             scope.push(param.name.clone());
             let body = pred_json(body, scope);
             scope.pop();
@@ -332,7 +336,7 @@ fn close_all(ty: &Type) -> Type {
     use cambra::ccl::subst::close_pi_binder;
     match ty {
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
@@ -340,12 +344,12 @@ fn close_all(ty: &Type) -> Type {
         } => {
             let domain = close_all(domain);
             let codomain = close_all(codomain);
-            let codomain = match name {
+            let codomain = match binder.whole() {
                 Some(b) => close_pi_binder(b, &codomain),
                 None => codomain,
             };
             Type::Fun {
-                name: name.clone(),
+                binder: binder.clone(),
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
@@ -377,16 +381,17 @@ fn ty_json(t: &Type) -> Option<String> {
         Type::DataSource(s) => format!(r#"{{"k":"dataSource","name":"{s}"}}"#),
         Type::Txn => r#"{"k":"txn"}"#.to_string(),
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
             capabilities: _,
         } => {
-            let binder = match name {
-                None => "null".to_string(),
-                Some(Name::Raw(s)) => format!(r#""{s}""#),
-                Some(_) => return None,
+            // The model has no components binder.
+            let binder = match binder {
+                cambra::ccl::FunBinder::None => "null".to_string(),
+                cambra::ccl::FunBinder::Whole(Name::Raw(s)) => format!(r#""{s}""#),
+                _ => return None,
             };
             let kind = match fun_kind {
                 FunKind::Compute => "compute",
@@ -653,13 +658,13 @@ fn open_some_tuples(rng: &mut Rng, ty: Type) -> Type {
             }
         }
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
             capabilities,
         } => Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain: Box::new(open_some_tuples(rng, *domain)),
             codomain: Box::new(open_some_tuples(rng, *codomain)),
@@ -688,13 +693,13 @@ fn open_some_tuples(rng: &mut Rng, ty: Type) -> Type {
 fn strip_binders(t: &Type) -> Type {
     match t {
         Type::Fun {
-            name: _,
+            binder: _,
             fun_kind,
             domain,
             codomain,
             capabilities: _,
         } => Type::Fun {
-            name: None,
+            binder: cambra::ccl::FunBinder::None,
             fun_kind: fun_kind.clone(),
             domain: Box::new(strip_binders(domain)),
             codomain: Box::new(strip_binders(codomain)),

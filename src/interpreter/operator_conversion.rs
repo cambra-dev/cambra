@@ -6682,7 +6682,6 @@ mod variant_ctor_tests {
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
         }
     }
 
@@ -6819,7 +6818,7 @@ mod variant_ctor_tests {
         );
         let matcher = typed(
             TypedExprNode::Lambda {
-                param: binding("__c", rec_ty.clone()),
+                params: vec![binding("__c", rec_ty.clone())],
                 body: Box::new(case),
             },
             Type::fun(rec_ty.clone(), out_rec_ty.clone()),
@@ -6966,7 +6965,7 @@ mod variant_ctor_tests {
         );
         let matcher = typed(
             TypedExprNode::Lambda {
-                param: binding("p", int_ty.clone()),
+                params: vec![binding("p", int_ty.clone())],
                 body: Box::new(case),
             },
             Type::fun(int_ty.clone(), variant_ty),

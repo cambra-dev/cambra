@@ -14,7 +14,8 @@
 //!
 //! # The rules
 //!
-//! - [`Lambda`](TypedExprNode::Lambda) — `param` scopes over `body`.
+//! - [`Lambda`](TypedExprNode::Lambda) — its params scope over `body`, and each over the
+//!   later params' types.
 //! - [`Let`](TypedExprNode::Let) — `binding` scopes over `body` **only**;
 //!   `bound_expr` sits outside it (CCL's `let` is non-recursive).
 //! - [`MutDecl`](TypedExprNode::MutDecl) — `binding` scopes over `body`; `init`
@@ -108,9 +109,12 @@ use super::{Generator, Label, Name, Type, TypedBinding, TypedExpr, TypedExprNode
 pub enum Binders<'a> {
     /// No binder: the child sits in the node's own scope.
     Ambient,
-    /// A single binder — a [`Lambda`](TypedExprNode::Lambda) param, a
-    /// [`Let`](TypedExprNode::Let) binding, a [`Case`](TypedExprNode::Case) branch's payload.
+    /// A single binder — a [`Let`](TypedExprNode::Let) binding, a
+    /// [`Case`](TypedExprNode::Case) branch's payload.
     One(&'a TypedBinding),
+    /// A prefix of a [`Lambda`](TypedExprNode::Lambda)'s parameters: all of them over the
+    /// body, and the ones before it over a later parameter's type.
+    Params(&'a [TypedBinding]),
     /// A [`For`](TypedExprNode::For)'s position and target, the position outer: what its body
     /// sits under.
     Loop(&'a Name, &'a TypedBinding),
@@ -140,6 +144,7 @@ impl<'a> Binders<'a> {
         match self {
             Binders::Ambient => false,
             Binders::One(b) => &b.name == name,
+            Binders::Params(ps) => ps.iter().any(|b| &b.name == name),
             Binders::Loop(p, b) => p == name || &b.name == name,
             Binders::Position(p) => p == name,
             Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
@@ -154,18 +159,21 @@ impl<'a> Binders<'a> {
         const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
         const NO_GENERATORS: &[Generator] = &[];
         const NO_FED: &[(TypedBinding, Label)] = &[];
-        let (position, one, group, generators, fed) = match self {
-            Binders::Ambient => (None, None, EMPTY, NO_GENERATORS, NO_FED),
-            Binders::One(b) => (None, Some(b), EMPTY, NO_GENERATORS, NO_FED),
-            Binders::Loop(p, b) => (Some(p), Some(b), EMPTY, NO_GENERATORS, NO_FED),
-            Binders::Position(p) => (Some(p), None, EMPTY, NO_GENERATORS, NO_FED),
-            Binders::Group(g) => (None, None, g, NO_GENERATORS, NO_FED),
-            Binders::Generators(gs) => (None, None, EMPTY, gs, NO_FED),
-            Binders::Fed(fed) => (None, None, EMPTY, NO_GENERATORS, fed),
+        const NO_PARAMS: &[TypedBinding] = &[];
+        let (position, one, params, group, generators, fed) = match self {
+            Binders::Ambient => (None, None, NO_PARAMS, EMPTY, NO_GENERATORS, NO_FED),
+            Binders::One(b) => (None, Some(b), NO_PARAMS, EMPTY, NO_GENERATORS, NO_FED),
+            Binders::Params(ps) => (None, None, ps, EMPTY, NO_GENERATORS, NO_FED),
+            Binders::Loop(p, b) => (Some(p), Some(b), NO_PARAMS, EMPTY, NO_GENERATORS, NO_FED),
+            Binders::Position(p) => (Some(p), None, NO_PARAMS, EMPTY, NO_GENERATORS, NO_FED),
+            Binders::Group(g) => (None, None, NO_PARAMS, g, NO_GENERATORS, NO_FED),
+            Binders::Generators(gs) => (None, None, NO_PARAMS, EMPTY, gs, NO_FED),
+            Binders::Fed(fed) => (None, None, NO_PARAMS, EMPTY, NO_GENERATORS, fed),
         };
         position
             .into_iter()
             .chain(one.map(|b| &b.name))
+            .chain(params.iter().map(|b| &b.name))
             .chain(group.iter().map(|(b, _)| &b.name))
             .chain(generators.iter().map(|g| &g.target.name))
             .chain(fed.iter().map(|(b, _)| &b.name))
@@ -181,6 +189,7 @@ impl<'a> Binders<'a> {
         match self {
             Binders::Ambient => true,
             Binders::One(_) | Binders::Loop(..) | Binders::Position(_) => false,
+            Binders::Params(ps) => ps.is_empty(),
             Binders::Group(g) => g.is_empty(),
             Binders::Generators(gs) => gs.is_empty(),
             Binders::Fed(fed) => fed.is_empty(),
@@ -199,6 +208,9 @@ impl<'a> Binders<'a> {
         match (self, other) {
             (Binders::Ambient, Binders::Ambient) => true,
             (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),
+            (Binders::Params(a), Binders::Params(b)) => {
+                a.as_ptr() == b.as_ptr() && a.len() == b.len()
+            }
             (Binders::Loop(a0, a1), Binders::Loop(b0, b1)) => {
                 std::ptr::eq(a0, b0) && std::ptr::eq(a1, b1)
             }
@@ -353,6 +365,7 @@ where
         }
         N::List(elts)
         | N::Tuple(elts)
+        | N::Arguments(elts)
         | N::Compose(elts)
         | N::Copair(elts)
         | N::DisjointJoin(elts)
@@ -420,7 +433,19 @@ where
         }
 
         // ---- Binding nodes --------------------------------------------------
-        N::Lambda { param, body } => under(f, body, Binders::One(param)),
+        // A later parameter's type reads the parameters before it, and the body reads them
+        // all.
+        N::Lambda { params, body } => {
+            for (i, param) in params.iter().enumerate().skip(1) {
+                for ty in std::iter::once(&param.ty).chain(param.annotation_ty()) {
+                    f(ScopedItem::TypeSlot {
+                        ty,
+                        binders: Binders::Params(&params[..i]),
+                    });
+                }
+            }
+            under(f, body, Binders::Params(params));
+        }
 
         // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
         // `body`. A `MutDecl`'s seed cannot reference the variable it seeds.
@@ -685,6 +710,7 @@ where
         | N::Method { .. }
         | N::List(_)
         | N::Tuple(_)
+        | N::Arguments(_)
         | N::Record(_)
         | N::Compose(_)
         | N::Copair(_)
@@ -823,6 +849,7 @@ mod tests {
                 body: Box::new(var("t")),
             }),
             TypedExpr::tuple(vec![var("t0"), var("t1")]),
+            TypedExpr::arguments(vec![var("a0"), var("a1")]),
             node(N::Record(vec![
                 RecordEntry::new("a", Occurrence::mint(), var("ra")),
                 RecordEntry::new("b", Occurrence::mint(), var("rb")),
@@ -986,6 +1013,7 @@ mod tests {
         N::DefGroup { .. } => "DefGroup",
         N::For { .. } => "For",
         N::Tuple(_) => "Tuple",
+        N::Arguments(_) => "Arguments",
         N::Record(_) => "Record",
         N::Compose(_) => "Compose",
         N::Copair(_) => "Copair",

@@ -356,11 +356,13 @@ pub(super) trait Typing {
     /// no refinement answers it in place of a proof.
     fn refutes(&mut self, facts: Vec<Expr>, recorded: bool) -> bool;
 
-    /// Enter one source parameter. Currying preserves the common signature scope
-    /// for write contracts; ordinary lexical binders use `scoped` directly.
+    /// Enter one parameter of the lambda whose parameters `group` names, the first of them:
+    /// a contribution through any parameter crosses the whole signature. Ordinary lexical
+    /// binders use `scoped` directly.
     fn scoped_parameter<R>(
         &mut self,
         parameter: &TypedBinding,
+        _group: &Name,
         ty: &Type,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R
@@ -720,6 +722,15 @@ pub(super) trait Typing {
     /// query learns about that name.
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type;
 
+    /// State the parameters the components of `tuple`, a call's argument tuple, pass to, one
+    /// per component, which `tuple`'s rule takes ([`Self::take_arguments`]): a component a
+    /// parameter takes by reference passes the handle it names rather than its value.
+    fn pass_arguments(&mut self, tuple: NodeId, params: Vec<Type>);
+
+    /// Take the parameters [`Self::pass_arguments`] stated for `tuple`, if it is a call's
+    /// argument tuple.
+    fn take_arguments(&mut self, tuple: NodeId) -> Option<Vec<Type>>;
+
     /// Lift a `Case` arm's type `body_ty` past the arm's pattern binder `binder`, after
     /// [`Self::scoped`] has restored the enclosing scope.
     ///
@@ -875,6 +886,12 @@ pub(super) trait Typing {
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError>;
 
+    /// Whether a call's argument list is in hand to check against its function's parameter
+    /// list: emission reads it off the call, and a check runs over the tree inference left,
+    /// whose lists are tuples by then (`TypedExpr::erase_argument_lists`), against types whose
+    /// lists already met their calls.
+    fn reads_argument_lists(&self) -> bool;
+
     /// Type an application `function(argument)`.
     ///
     /// The result is the function's codomain with its Pi binder *discharged* to
@@ -896,12 +913,19 @@ pub(super) trait Typing {
     /// that never meet: a collection reaching both mints its own index at each
     /// ([`crate::ccl::ty::FunKindVar::binder_ids`]), every arm renames onto both, and the
     /// two names arrive at one position with nothing relating them.
+    ///
+    /// `list` is the length of the call's argument list ([`TypedExprNode::Arguments`]), or
+    /// `None` for a call passing one argument: the function applied takes a parameter list
+    /// exactly that long, or one parameter ([`crate::ccl::ty::FunBinder::Parameters`]).
+    ///
+    /// [`TypedExprNode::Arguments`]: crate::ccl::TypedExprNode::Arguments
     fn apply(
         &mut self,
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
         kind: Option<&crate::ccl::ty::FunKind>,
+        list: Option<usize>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
 

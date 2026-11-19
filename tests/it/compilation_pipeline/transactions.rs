@@ -4595,13 +4595,16 @@ fn a_counter_over_an_induction_map_at_an_absent_key() {
 }
 
 /// A keyed write whose key is a mutable variable, `log[n] := 5` after `n := n + 1` in the same
-/// block, does not compile: the post-transact type check rejects the block's snapshot tuple,
-/// expecting `Mut(Int, Txn)` and finding `Int`. A `Map(Int, String)` panics the same way, and a
-/// key that is the loop item compiles (`a_keyed_write_commits_a_computed_value_at_a_computed_key`).
-/// Each transaction writes the key it has just counted to, so every commit order gives the same
-/// map.
+/// block, does not compile: the transact phase leaves `insert`'s key typed `Mut(Int, Txn)` where
+/// it passes the value `n`, so the post-transact type check refuses the key as an argument to a
+/// `Mut` parameter. A `Map(Int, String)` panics the same way, and a key that is the loop item
+/// compiles (`a_keyed_write_commits_a_computed_value_at_a_computed_key`). Each transaction writes
+/// the key it has just counted to, so every commit order gives the same map.
 #[test]
-#[should_panic(expected = "post-transact produced an invalid tree: [Type mismatch")]
+#[should_panic(
+    expected = "post-transact produced an invalid tree: [argument to a `Mut` parameter must be a \
+                mutable variable"
+)]
 fn a_keyed_write_at_a_mutable_variable_key() {
     let value = final_mut_var_value(indoc! {r#"
         n: Mut(Int, Txn) := 0

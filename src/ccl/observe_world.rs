@@ -67,7 +67,7 @@ fn bind(e: &mut Expr, positions: &mut Vec<(Name, Type)>, applied: bool) {
                 }
             };
             let fn_ty = Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: FunKind::Compute,
                 domain: Box::new(operand.ty.clone()),
                 codomain: Box::new(e.ty.clone()),
@@ -79,7 +79,8 @@ fn bind(e: &mut Expr, positions: &mut Vec<(Name, Type)>, applied: bool) {
         }
         // A loop, `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ step`: its source is evaluated outside it, and its step at
         // each of its positions.
-        TypedExprNode::Lambda { param, body } if e.ty.is_collection() => {
+        TypedExprNode::Lambda { params, body } if e.ty.is_collection() => {
+            let param = crate::ccl::one_param(params);
             if let TypedExprNode::Apply {
                 argument: read,
                 function: step,

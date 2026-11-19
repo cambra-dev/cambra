@@ -77,7 +77,7 @@ use crate::ccl::RefinementSet;
 fn term_mentions_pair_binder(e: &Expr, referenced: &HashSet<Name>) -> bool {
     let here = match &e.node {
         TypedExprNode::Var(n) => n.is_synthetic_pair() && !referenced.contains(n),
-        TypedExprNode::Lambda { param, .. } => param.name.is_synthetic_pair(),
+        TypedExprNode::Lambda { params, .. } => params.iter().any(|p| p.name.is_synthetic_pair()),
         TypedExprNode::Let { binding, .. } => binding.name.is_synthetic_pair(),
         TypedExprNode::LetRec { bindings, .. } => {
             bindings.iter().any(|(b, _)| b.name.is_synthetic_pair())
@@ -262,6 +262,8 @@ pub(crate) fn fn_of_bare_predicate(
 /// - `channelize` skips a predicate holding a `defer` block, which a generator called in a
 ///   filter or a key leaves there. This runs it on such a term, then letrec recognition
 ///   (`plan_loops`), which reads the loop channelize builds as the collection it feeds.
+/// - `erase_refinements` skips predicates. This erases the lifted term's value facts before
+///   `lambda_elim`, retaining the data-domain refinements that planning executes.
 /// - `lambda_elim` skips predicates, and this runs it.
 ///
 /// Debug builds assert that the result holds none of these passes' source forms.
@@ -271,9 +273,11 @@ pub(crate) fn eliminate_lifted(term: Expr) -> Result<Expr, lambda_elim::LambdaEl
         // (`channelize::check_predicate_defers`), so this one channelizes.
         let channelized = crate::ccl::channelize::run(term)
             .unwrap_or_else(|e| panic!("channelizing a term lifted out of a predicate: {e:?}"));
-        plan_loops(lambda_elim::run(channelized)?)
+        plan_loops(lambda_elim::run(crate::ccl::erase_refinements::run(
+            channelized,
+        ))?)
     } else {
-        lambda_elim::run(term)?
+        lambda_elim::run(crate::ccl::erase_refinements::run(term))?
     };
     #[cfg(debug_assertions)]
     if let Some(form) = pre_planning_source_form(&eliminated) {
@@ -352,18 +356,15 @@ fn compile_predicates_in_type(
         // whose type reads the binder, and compiled closed, that index is carried under the
         // crossings the compiled morphisms add, where it names another function.
         Type::Fun {
-            name,
+            binder,
             domain,
             codomain,
             ..
         } => {
             compile_predicates_in_type(domain, memo, slot);
-            match name {
-                Some(b) => crate::ccl::subst::map_opened_codomain(b, codomain, |opened| {
-                    compile_predicates_in_type(opened, memo, slot)
-                }),
-                None => compile_predicates_in_type(codomain, memo, slot),
-            }
+            crate::ccl::subst::map_opened_codomain(binder, domain, codomain, |opened| {
+                compile_predicates_in_type(opened, memo, slot)
+            });
         }
         Type::DepTuple(components) => {
             let names = crate::ccl::subst::tuple_component_names(components);
