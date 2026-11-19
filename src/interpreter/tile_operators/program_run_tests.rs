@@ -4567,6 +4567,40 @@ fn small_morsels_refresh_transaction_sources(
     assert_eq!(dispatched(source, rows).0, expected);
 }
 
+/// A selector of a plain field states each row it holds complete, though the record's other field
+/// still grows: over a list of two rows, the sink holds the final value from the first delivery.
+/// Over rows of an outer live source the selected collection stays open until that source's rows
+/// are complete, since the selector states only the rows it holds.
+#[rstest_log::rstest]
+#[case::rows_of_a_list(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.0 for p in xs]",
+    "[u0 -> 1, u1 -> 2]",
+    true
+)]
+#[case::rows_of_a_live_source(
+    "xs = [(x, [y * x for y in [1, 2]]) for x in source1()]\nout << [p.0 for p in xs]",
+    "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]",
+    false
+)]
+fn a_plain_field_of_rows_whose_other_field_grows_is_complete_once_held(
+    #[case] body: &str,
+    #[case] expected: &str,
+    #[case] complete_at_the_first_delivery: bool,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = format!("out = test_sink()\n{body}\n");
+    let mut complete_at_idle = Vec::new();
+    let (value, _) = dispatched_live_observed(&source, rows, three_batches(), |sink, _| {
+        complete_at_idle.push(sink.value().is_ok());
+    });
+    assert_eq!(canonical(&single_value(&value)), expected, "{body}");
+    assert_eq!(
+        complete_at_idle,
+        vec![complete_at_the_first_delivery; 2],
+        "{body}: whether the sink holds its final value before the source ends"
+    );
+}
+
 /// `value` with every collection's rows sorted, so two values compare equal whatever order their
 /// rows arrived in.
 fn canonical(value: &Value) -> String {
@@ -4636,10 +4670,6 @@ fn canonical(value: &Value) -> String {
         "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
           u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
     ],
-)]
-#[case::a_field_of_a_bound_tuple_row(
-    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.0 for p in xs]",
-    &["[u0 -> 1, u1 -> 2]", "[u0 -> 1, u1 -> 2]", "[u0 -> 1, u1 -> 2]"],
 )]
 #[case::a_bound_tuple_row(
     "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
