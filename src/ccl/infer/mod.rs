@@ -121,7 +121,7 @@ pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
 }
 
 /// The first node whose type names a variable of a failing operand place.
-/// Equivalent requirement copies are grouped before this walk, so an arena-only copy
+/// Equivalent requirement copies are grouped before this walk, so a copy only the solver holds
 /// contributes the live variables of the same conflict. An attribution miss reports at
 /// the root and leaves no statement out of recovery, since the root may be unrelated.
 fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> Option<NodeId> {
@@ -793,7 +793,6 @@ pub(crate) fn case_result_ty<'a>(
 /// the public [`crate::ccl::infer::TypeInferenceContext`] and are
 /// normalized (holes → fresh vars) up front.
 pub(crate) fn run(
-    arena: &mut InferArena,
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
@@ -801,7 +800,6 @@ pub(crate) fn run(
     marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
 ) -> Result<(Type, Vec<LocatedInferError>), Vec<LocatedInferError>> {
     let outcome = run_with_params(
-        arena,
         expr,
         sources,
         instances,
@@ -916,7 +914,7 @@ pub(crate) struct RunOutcome {
 /// nothing.
 ///
 /// A run whose emission recovered from a statement stops after emission, and inference
-/// starts over in `arena`, restarted, on a copy of `expr` as it was, with the expression of
+/// starts over, with a solver of its own, on a copy of `expr` as it was, with the expression of
 /// each statement recovered from replaced by the [`Error`](crate::ccl::TypedExprNode::Error)
 /// stand-in. A run the barrier check or the requirement sweep stops starts over the same
 /// way, without the statements enclosing their failures ([`context::InferCtx::failure`]). The
@@ -935,7 +933,6 @@ pub(crate) struct RunOutcome {
     reason = "the module check's inputs, each read by every run, and the recovery switch"
 )]
 pub(crate) fn run_with_params(
-    arena: &mut InferArena,
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
@@ -995,7 +992,6 @@ pub(crate) fn run_with_params(
         if !changed {
             break;
         }
-        arena.restart();
         let mut rest = pristine.clone_preserving_ids();
         stand_in_for_recovered(&mut rest, &stood_in, recover_all);
         if recover_all {
@@ -1724,7 +1720,7 @@ fn attempt_run(
     // legitimately so. What must not happen is a later pass narrowing a definition's
     // obligation, which would leave the sweep's verdict stale.
     #[cfg(debug_assertions)]
-    solver::traits::seal_emission();
+    solver::traits::seal_emission(&mut sub_ctx.solver);
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding

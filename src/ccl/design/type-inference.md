@@ -334,7 +334,7 @@ After any emission error, the run stops before the operand-requirement sweep and
 holds the constraints a failed statement recorded before its rule failed, and lacks the rest, so
 neither pass can read it: an obligation a failed constraint emptied is no requirement the program
 states, and a variable only the failed statement would have bound is no gap in it. Inference instead
-starts over (`run_with_params`), with a solver of its own and a restarted arena, on a copy of the
+starts over (`run_with_params`), with a solver of its own, on a copy of the
 tree as it was before emission (`clone_preserving_ids`), in which the expression of each statement
 recovered from is the `Error` stand-in: a `let`'s right-hand side, an expression statement's
 expression, a `:=`'s initializer, a `def` group member's definition. A statement rule types a
@@ -1505,7 +1505,7 @@ types that read it (`Subst::force_refinement`). One predicate read under such a 
 coalesce as several copies, one per substitution, and each copy coalesces apart.
 
 Each inference run records what every predicate copy and every coalesce rebuild was derived from
-(`ccl_utils::record_derivation`, held by `InferArena`). Coalesce follows a coalesced predicate to
+(`ccl_utils::record_derivation`, held by the run's solver). Coalesce follows a coalesced predicate to
 its origin and points it at a predicate already coalesced from the same origin that equals it and
 reads the same names and witnesses (`share_with_its_origin` in `infer/solve.rs`). Term equality
 compares a refinement nested in a type slot type-blind, and two copies made under different
@@ -1604,14 +1604,15 @@ Each inference run owns a `Solver` (`infer/solver/state.rs`), which holds what t
 its variables. `run_once` creates the run's solver. A typing run of its own creates another:
 `case_result_ty`, and each check in `infer/check.rs`.
 
-An inference, funkind or barrier variable is a handle: `InferVar`, `FunKindVar`, `BarrierVar`. The
-handle holds what is fixed when the variable is minted: its identity, an inference variable's
-telescope and kind, and its home, which is the solver that minted it and the variable's slot in that
-solver's tables. What the run learns is the state at that slot: an inference variable's bounds,
-trait watches and suspensions, a funkind variable's facts, and a barrier variable's bounds. A
-function that records takes `&mut Solver`, and so does one that resolves a type, which records as it
-compacts: a suspension, a funkind variable's binder ids, a memoized answer. A read that records
-nothing takes `&Solver`.
+An inference, funkind, barrier or capability variable is a handle: `InferVar`, `FunKindVar`,
+`BarrierVar`, `CapabilityVar`. The handle holds what is fixed when the variable is minted: its
+identity, an inference variable's telescope and kind, and its home, which is the solver that minted
+it and the variable's slot in that solver's tables. What the run learns is the state at that slot:
+an inference variable's bounds, trait watches and suspensions, a funkind variable's facts, a barrier
+variable's bounds, and a capability variable's capabilities, the edges into it and its upper bounds.
+A function that records takes `&mut Solver`, and so does one that resolves a type or a capability
+variable, which records as it reads: a suspension, a funkind variable's binder ids, a memoized
+answer. A read that records nothing takes `&Solver`.
 
 Bounds and watches form cycles. A bound names another variable, and a variable watches an obligation
 whose output type names a variable. Each cycle runs through the solver's tables rather than through
@@ -1639,12 +1640,14 @@ recorded id, compaction materializing a position say, finds the variable without
 In debug builds, dropping a run's solver checks that no substitution entry `Subst::acting_on`
 dropped acts on its variable (`subst::check_dropped_entries`).
 
-Capability variables keep their state on their handles. `InferArena` in `infer/api.rs` scopes the
-state of a run that its solver does not hold: the capability variables given an upper bound, the
-edges out of `try` bodies, the ordering requirements, the predicate derivations coalesce reads
-(`ccl_utils::record_derivation`), and the debug audits of trait narrowing. At most one arena is
-active on a thread, which debug builds check.
----
+The solver holds what the run records beyond its variables too: the capability variables given an
+upper bound, the edges out of `try` bodies and the ordering requirements (`CapabilityRun` in
+`capabilities.rs`), the predicate derivations coalesce reads (`ccl_utils::record_derivation`), the
+memberships each materialization collects (`coalesce::collecting_memberships`), and, in debug
+builds, the trait-narrowing audit trail and the requirement sweep's window. Nothing a run records is
+kept on its thread. No capability variable leaves its run ([Capabilities on every
+expression](#capabilities-on-every-expression)), so a solver panics on reading one it did not mint
+rather than reading it as unrecorded.
 
 ## 4. Information Flow and Type Mapping
 
@@ -5332,8 +5335,7 @@ These definitions summarize the linked contracts rather than restating their alg
 | `ccl::Type` | The AST's type representation, also used by the solver; it can contain inference unknowns during solving. |
 | Refinement | A base type restricted by predicate terms. See [Refinements on the lattice](#refinements-on-the-lattice). |
 | Let binding resolution | Resolve a binding and its uses, specializing generalized uses independently. See [Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation). |
-| `Solver` | Owns what one run records on its inference, funkind and barrier variables, released when it drops. See [Variable lifetime](#32-the-solver-who-owns-inference-variables). |
-| `InferArena` | Scopes a run's capability lists, predicate derivations and debug audits, which the solver does not hold. See [Variable lifetime](#32-the-solver-who-owns-inference-variables). |
+| `Solver` | Owns what one run records on its variables and beyond them, released when it drops. See [Variable lifetime](#32-the-solver-who-owns-inference-variables). |
 | Pi type | A function type binding a term name in its codomain. See [Dependent refinements](#45-dependent-refinements-via-pi-types). |
 | Dependent tuple | A tuple whose components read the ones before it. See [Dependent tuples](#48-dependent-tuples). |
 | Telescope | The term binders an inference variable may name, in the order entered; also a dependent tuple, whose components bind in order. See [The invariant](#the-invariant). |

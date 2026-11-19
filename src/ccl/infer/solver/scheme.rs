@@ -445,45 +445,52 @@ fn freshen_capability_var(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<CapabilityVar> {
-    if v.level() <= lim {
+    if v.level(solver) <= lim {
         return Rc::clone(v);
     }
     if let Some(f) = cache.capability_vars.get(&v.uid) {
         return Rc::clone(f);
     }
-    let f = CapabilityVar::fresh(target.level_of(v.level()));
-    f.open_input.set(v.open_input.get());
+    let f = CapabilityVar::fresh(solver, target.level_of(v.level(solver)));
+    let open = v.open_input(solver);
+    f.set_open_input(solver, open);
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.capability_vars.insert(v.uid, Rc::clone(&f));
     // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
     // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
     // bring instead.
-    for capability in v.own() {
+    for capability in v.own(solver) {
         match &capability.item {
             Capability::Param(_) => {}
             // A use raises the exception at its own instance of the definition's types, and as
             // an exception of its own: two uses at two types are two exceptions.
             Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
                 let ty = freshen_above(solver, lim, &raised.ty, target, cache);
-                f.record(crate::ccl::capabilities::ScopedCapability {
-                    item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
-                        raised.instantiated(ty),
-                    )),
-                    ..capability.clone()
-                });
+                f.record(
+                    solver,
+                    crate::ccl::capabilities::ScopedCapability {
+                        item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
+                            raised.instantiated(ty),
+                        )),
+                        ..capability.clone()
+                    },
+                );
             }
             Capability::Requires(r) if r.ordering().is_some_and(|o| o.satisfied.get()) => {}
             Capability::Requires(r) if r.ordering().is_some() => {
                 let requirement = freshen_requirement(solver, lim, r, target, cache);
-                f.record(crate::ccl::capabilities::ScopedCapability {
-                    item: Capability::Requires(requirement),
-                    ..capability
-                });
+                f.record(
+                    solver,
+                    crate::ccl::capabilities::ScopedCapability {
+                        item: Capability::Requires(requirement),
+                        ..capability
+                    },
+                );
             }
-            _ => f.record(capability),
+            _ => f.record(solver, capability),
         }
     }
-    for (source, mut filter) in v.incoming() {
+    for (source, mut filter) in v.incoming(solver) {
         let source = freshen_capability_var(solver, lim, &source, target, cache);
         // A use's `try` catches the use's instances of the types its clauses name, as its
         // exceptions are the use's instances of the types they are raised at.
@@ -505,13 +512,13 @@ fn freshen_capability_var(
                 item => item,
             })
             .collect();
-        f.flows_from(&source, filter);
+        f.flows_from(solver, &source, filter);
     }
     // Each use answers the bounds the definition states: a use's arguments can add capabilities
     // its copy holds and the definition's variable never does. A part a parameter stands in
     // admits whatever the use passes there, and the definition was checked against it, less what
     // the clause takes from the parameter: the top of its direction less that.
-    for mut upper in v.uppers() {
+    for mut upper in v.uppers(solver) {
         // The copy is noted by the use that makes it ([`CapabilityVar::note_use`]).
         if let crate::ccl::capabilities::Blame::NestedTransaction { used_at, .. } = &mut upper.blame
         {
@@ -535,7 +542,7 @@ fn freshen_capability_var(
             }
         }
         if upper.of_requires || upper.of_causes || !upper.forbidden.is_empty() {
-            f.bound_above(upper);
+            f.bound_above(solver, upper);
         }
     }
     f
@@ -690,7 +697,7 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
         // A capability variable is copied like any variable above the cutoff, so a type whose
         // only quantified content is a function's capabilities is not returned verbatim: each use
         // would add its arguments' capabilities to the definition's own variable.
-        Type::Fun { capabilities, .. } => capabilities.level(),
+        Type::Fun { capabilities, .. } => capabilities.level(solver),
         _ => 0,
     };
     for r in ty.refinements() {
