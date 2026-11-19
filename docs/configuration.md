@@ -25,8 +25,11 @@ no owner in that model. A source has one: the version that declares it.
   values of one declared type. Each element is a new version of the configuration.
 - **Configuration value**: one element of a configuration source.
 - **Secret configuration source**: a configuration source whose elements are `Secret(T)` values,
-  which only a `SecretReader` scope extracts ([Secret configuration](#secret-configuration)).
-- **`SecretReader` scope**: a scope the program writes that supplies `SecretReader` to its body.
+  which no program unwraps ([Secret configuration](#secret-configuration)).
+- **Secret combinator**: `flat_map`, or a function written over it such as `map` or `map2`, which
+  applies a function to the values inside secrets and returns its result as a `Secret`.
+- **Verifier**: a function that compares a secret in constant time and returns a plain `Bool`
+  ([Verifying a secret](#verifying-a-secret)).
 - **Configuration payload**: the map from configuration-source name to an encoded value that a
   create or reload request carries beside the program.
 - **Configuration API**: the engine endpoint that decodes a configuration payload and delivers each
@@ -34,8 +37,9 @@ no owner in that model. A source has one: the version that declares it.
 
 ## Configuration is a source
 
-A configuration source is an ordinary source at the CHL layer: opening one requires `Ext`, its
-elements are values, and every rule of [chl-spec.md, "7.3 Sources"](chl-spec.md#73-sources) holds.
+A configuration source is an ordinary source at the CHL layer: opening one requires
+`ObserveWorld`, its elements are values, and every rule of [chl-spec.md, "7.3
+Sources"](chl-spec.md#73-sources) holds.
 `std::config` declares it, in the std root ([chl-spec.md, "9.16 The std
 root"](chl-spec.md#916-the-std-root)). The spelling below is a sketch:
 
@@ -46,7 +50,7 @@ type Payments = {base_url: String, timeout_ms: Int}
 type PaymentsKey = {api_key: String}
 
 payments: Source(Payments) = config::source("payments")
-payments_key: Source(Secret(PaymentsKey)) = config::secret("payments_key")
+payments_key: Source(Secret(PaymentsKey)) = config::secret_source("payments_key")
 ```
 
 The string is the source's **name**. The type comes from the annotation, since a call does not pass
@@ -74,14 +78,22 @@ Every name is a placeholder ([Open questions](#open-questions)).
 | Member | Type | Does |
 | --- | --- | --- |
 | `source(name)` | `String => Source(T)` | Declares the configuration source `name`, whose elements are `T` |
-| `secret(name)` | `String => Source(Secret(T))` | Declares the secret configuration source `name` |
+| `secret_source(name)` | `String => Source(Secret(T))` | Declares the secret configuration source `name` |
 | `source_or(name, default)` | `{String, T} => Source(T)` | Declares `name` with `default` as its value until one is supplied |
 | `first(s)` | `Source(T) => T` | The value `s` holds when the version starts, which a mutable variable's declaration takes as its initial value |
-| `Secret(T)` | nominal type | `Secret::new(v)` constructs one; `s.extract()` and the pattern `Secret::new(v)` read one, and require `SecretReader` |
-| `secrets()` | scope marker | `with secrets():` supplies `SecretReader` to its body |
+| `Secret(T)` | nominal builtin | Holds a value no program unwraps |
+| `secret(v)` | `@Builtin`, `T => Secret(T)` | Wraps `v` as a `Secret` |
+| `s.flat_map(f)` | `@Builtin`, `{Secret(T), (T => Secret(U) requires Context)} => Secret(U)` | Applies `f` to the value `s` holds |
+| `s.map(f)` | `{Secret(T), (T => U requires Context)} => Secret(U)` | `s.flat_map(lambda x: secret(f(x)))` |
+| `s.map2(t, f)` | `{Secret(T), Secret(U), ({T, U} => V requires Context)} => Secret(V)` | `s.flat_map(lambda x: t.map(lambda y: f(x, y)))` |
+| `sequence(xs)` | `List(Secret(T)) => Secret(List(T))` | A fold of `xs` over `map2` |
+| `hmac_verify(key, msg, sig)` | `@Builtin`, `{Secret(String), String, String} => Bool` | Whether `sig` is the HMAC-SHA256 of `msg` under `key`, compared in constant time |
+| `secret_eq(s, guess)` | `@Builtin`, `{Secret(String), String} => Bool` | Whether `s` holds `guess`, compared in constant time |
 
-Opening a source requires `Ext`, so `source`, `secret`, `source_or` and `first` are called at a
-module's top level. `T` is a type parameter inferred from the annotation or from `default`.
+Opening a source requires `ObserveWorld`. The engine knows every configuration source before the
+version runs, so `source`, `secret_source` and `source_or` are called only as the whole right-hand
+side of a top-level `=`, as `http_serve` is ([chl-spec.md, "7.3 Sources"](chl-spec.md#73-sources)).
+`T` is a type parameter inferred from the annotation or from `default`.
 
 ### Reading the latest value
 
@@ -122,117 +134,113 @@ A branch shares a configuration source with its parent when both read the same s
 any source ([program-evolution.md, "Every branch reads every
 element"](../src/ccl/design/program-evolution.md#every-branch-reads-every-element)). A branch that
 wants its own configuration declares another configuration source,
-`config::secret("payments_key_staging")`, and the Configuration API delivers to it by that name.
+`config::secret_source("payments_key_staging")`, and the Configuration API delivers to it by that
+name.
 
 ## Secret configuration
 
-A secret configuration source's elements have type **`Secret(T)`**, a nominal type of the
-single-constructor form ([chl-spec.md, "6.8 Nominal types and methods
-[Decided]"](chl-spec.md#68-nominal-types-and-methods-decided)): `Secret::new(v)` constructs one and
-`s.extract()` reads it. A `Secret(T)` is a value like any other until it is extracted: a program
-stores it, passes it, and folds it into a mutable variable. Extracting it, by `extract` or by the
-pattern `Secret::new(v)`, requires **`SecretReader`**, as reading a transactional mutable variable
-requires `Transaction` ([chl-spec.md, "8.3 Reads"](chl-spec.md#83-reads)). A scope the program
-writes supplies `SecretReader` to its body, as `with begin():` supplies `Transaction`, and nothing
-else supplies it, the run included. Inside the scope an extracted value is printed and composed as
-any value is. The spelling below is a placeholder:
+A secret configuration source's elements have type **`Secret(T)`**, a nominal builtin as `Set` and
+`Map` are ([chl-spec.md, "Collection operations"](chl-spec.md#collection-operations)). A builtin
+has no constructors and no `extract`, so no program unwraps a `Secret`. `secret(v)` builds one. A
+program stores a `Secret`, passes it, and folds it into a mutable variable. It computes on the
+value inside through the **secret combinators**, whose results are `Secret` values again.
+`flat_map` is the one `@Builtin` combinator, and `map`, `map2` and `sequence` are ordinary
+polymorphic functions that `std::config` writes over it ([The `std::config`
+interface](#the-stdconfig-interface)). A sink whose element type has a `Secret` field unwraps that
+field as it hands the element out. The spelling below is a placeholder:
 
 ```python
 key: Mut(Secret(PaymentsKey), Txn) := config::first(payments_key)
 for k in payments_key:
     with begin():
-        key := k                               # storing a Secret extracts nothing
+        key := k
 
 for req in charges:
     with begin():
-        with secrets():                        # supplies SecretReader to its body
-            auth = "Bearer " + key.extract().api_key
-            payments_api << (auth: auth, body: req)
+        auth = key.map(lambda k: "Bearer " + k.api_key)    # Secret(String)
+        payments_api << (auth=auth, body=req)
 ```
 
-Reading `key` requires `Transaction`, because the fold stores it in a transactional mutable
-variable, and extracting it requires `SecretReader`. A loop over the source itself extracts each
-element with `SecretReader` alone. `payments_api` is a sink for outbound requests, which is not
-designed yet. A sink or source that receives an extracted value manages it, its error text included.
+`payments_api` is a sink for outbound requests, which is not designed yet. Its element type is
+`{auth: Secret(String), body: Charge}`, so the inspector shows each request's `body` and redacts
+its `auth`. A sink that unwraps a value manages it, its error text included.
 
-### Extracting confines the value to its scope
+`map2` combines two secrets into one, as a key and its certificate combine into one TLS identity:
+`cert.map2(pkey, lambda c, k: (cert=c, key=k))`. `sequence` combines a list of secrets. A program
+combines more secrets by nesting `flat_map` once per secret, since CHL has no type over tuples of
+every length to give an N-ary combinator. `flat_map` also chooses a secret by the value of another
+secret, which no fixed-arity combinator does.
 
-**No value computed from an extracted secret leaves the scope that extracted it,** except into a
-sink. A write to a mutable variable or a feed bound outside the scope, a function value that
-outlives it, and the scope's own value are each a compile error at the line that writes it. A value
-leaves a scope as a secret when the scope constructs one, `Secret::new(v)`, which requires nothing.
-The effects stack has a rule of the same form: nothing that outlives a scope names a variable whose
-history the scope ends.
+### Confinement is typing
 
-The rule exists for this program, which `SecretReader` alone accepts:
+No value computed from a secret leaves a `Secret` except through a sink or a verifier ([Verifying a
+secret](#verifying-a-secret)). Existing type rules check this, and none of them is particular to
+secrets:
+
+- **A `Secret(T)` is not a `T`.** Subtyping relates a nominal type only to itself and its
+  refinements ([chl-spec.md, "A nominal type is opaque"](chl-spec.md#a-nominal-type-is-opaque)), so
+  a `Secret(String)` passed where a `String` is expected is a type error.
+- **The function a combinator applies causes nothing.** `flat_map`'s parameter type,
+  `(T => Secret(U) requires Context)`, has no `causes` clause, and a written type's clauses are
+  exact ([chl-spec.md, "Writing requirements and
+  effects"](chl-spec.md#writing-requirements-and-effects)). A function that appends to a feed,
+  writes a variable or raises is refused at the call. Its result is its one output, and that result
+  is a `Secret`. The function may require anything, since a requirement is an input. `map`, `map2`
+  and `sequence` call their functions inside a function they pass to `flat_map`, and their written
+  parameter types state the same bound.
+- **`Secret` has no `Equatable` or `Orderable` instance.** `==` on a `Secret`, and a `Secret` as
+  the key of a `Set`, a `Map` or a `groupby`, are type errors ([chl-spec.md, "Equality and
+  order"](chl-spec.md#equality-and-order)).
+- **A condition on a secret is decided inside a combinator, so a selection is a `Secret` too.**
+  `allowed.map(lambda ids: [u for u in users if u.id in ids])` is a `Secret(List(User))`. A
+  transactional mutable variable that holds it has a `Secret` type, so a selection that one
+  transaction stores and another reads stays secret.
+
+Both appends below are compile errors:
 
 ```python
 leaked: Feed(String)
 for req in charges:
     with begin():
-        with secrets():
-            leaked << key.extract().api_key   # extracting requires SecretReader
-for s in leaked:
-    log << s                                  # s is a String; nothing here requires SecretReader
+        leaked << key.map(lambda k: k.api_key)    # a Secret(String) is not a String
+        key.map(lambda k: leaked << k.api_key)    # the function causes Append(leaked)
 ```
 
-A requirement gates the operation that needs it, not the value that operation returns. Under
-[chl-spec.md, "6.9 Effects in function types
-[Tentative]"](chl-spec.md#69-effects-in-function-types-tentative), as the effects stack under review
-revises it, "opening a source requires `Ext`. The source's elements are values, so a function that
-reads a captured source requires nothing further":
+### Redaction
 
-```python
-reqs, resps = http_serve("8080", "POST", "/echo")    # opening the source requires Ext
-
-def shout(s): s + "!"                                 # requires nothing
-for r in reqs:
-    resps << shout(r)                                 # r is a String; nothing here requires Ext
-```
-
-A transactional read has the same shape. The read requires `Transaction`, and the value it returns
-leaves the block through a feed:
-
-```python
-balance: Mut(Int, Txn) := 0
-audit: Feed(Int)
-for r in reqs:
-    with begin():
-        audit << balance           # the read requires Transaction
-for b in audit:
-    log << b                       # b is an Int; nothing here requires Transaction
-```
-
-The confinement makes the requirement sufficient for redaction. Every term that sees an extracted
-value requires `SecretReader`, and inference records each term's requirements, so the inspector, the
-control port's replies, errors and the engine's logs redact every term that requires `SecretReader`
-and every `Secret`-typed value. Redaction is decided from types, never by matching a value's text,
+The inspector, the control port's replies, errors and the engine's logs redact every
+`Secret`-typed value. They also redact every term evaluated inside a function that `flat_map`
+applies, including the terms of each function it calls, so the functions `map` and `map2` apply
+are covered. Every call is resolved when the
+program is compiled ([chl-spec.md, "Inputs from outside the
+program"](chl-spec.md#inputs-from-outside-the-program)), so the redacted terms are fixed before the
+program runs. Redaction is decided from types and call paths, never by matching a value's text,
 which GitHub Actions does and which misses an encoded or reformatted copy ([Security
 hardening](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions)).
 The inspector shows a redacted value as a marker.
 
-### Confinement follows data
+### Verifying a secret
 
-A value a condition on a secret selects leaves the scope. Confinement covers what an extracted value
-flows into, not what it decides, and keeping a selection private is the program's choice of where
-its scopes end:
+A **verifier** is a `std::config` function that compares a secret in constant time and returns a
+plain `Bool`. It is the one way a program decides on a secret outside a `Secret`.
+`hmac_verify(key, msg, sig)` checks that `sig` is the HMAC-SHA256 of `msg` under `key`, and
+`secret_eq(s, guess)` checks that `s` holds `guess`. A webhook checks its signature before it acts
+on a request:
 
 ```python
-allowed: Mut(Secret(Set(Int)), Txn) := config::first(admin_ids)   # folded as above
+hook_key: Mut(Secret(String), Txn) := config::first(hook_secret)   # folded as above
 
-with begin():
-    with secrets():
-        admins = [u for u in users if u.id in allowed.extract()]
-notify << admins                   # leaves the scope: its elements are users, not the secret
+for r in hooks:
+    with begin():
+        if config::hmac_verify(hook_key, r.body, r.sig):
+            events << parse(r.body)
 ```
 
-Every element of `admins` is a user, and none is secret. Which users it holds is the intersection of
-`users` and the secret set, so `admins`, its size and the time it arrives show that much of the
-secret, in the inspector as anywhere else. A conditional expression is the same case: `"yes" if
-guess == pin.extract() else "no"` leaves the scope and tells whoever reads it whether the guess was
-right. A program that must keep a selection private uses it inside the scope, or leaves with
-`Secret::new(admins)`. Confining selections too would mean tracking every value a secret condition
-decides, downstream of every branch and filter.
+`hooks` stands for a source whose elements carry a body and a signature. Each call reveals the
+result of one comparison. A verifier bounds what one call reveals, not what many calls reveal: a
+low-entropy secret, such as a PIN, is recovered through `secret_eq` by trying every candidate, and
+limiting attempts is the program's job. Whether a program may unwrap a secret any other way is open
+([Open questions](#open-questions)).
 
 ## Where configuration comes from
 
@@ -293,9 +301,11 @@ works"](../src/ccl/design/program-evolution.md#how-a-reload-works)). This is a r
 ### Remote keystores
 
 A remote keystore is a (sink, source) pair, as `http_serve` is a (source, sink) pair: the program
-feeds requests to the sink and reads the keystore's replies from the source. A request that carries
-a secret, such as a Vault token, is fed inside a `SecretReader` scope, and a reply that holds one
-arrives as a `Secret`. Nothing else about a keystore is particular to configuration.
+feeds requests to the sink and reads the keystore's replies from the source. A request carries a
+secret, such as a Vault token, in a `Secret` field. A reply types each secret field `Secret`, as in
+`{token: Secret(String), expires_at: time::Instant}`, so a program schedules its next refresh from
+`expires_at` without unwrapping the token. Nothing else about a keystore is particular to
+configuration.
 
 Vault is one instance. A credential with a short lease is refreshed on a timer, `time::alarms()`:
 each alarm feeds a request carrying the token, and each reply is folded into a transactional mutable
@@ -403,22 +413,42 @@ key, is the application's to detect.
 - **Where secret values live at rest** ([Secret values at rest
   [Open]](#secret-values-at-rest-open)).
 - **Local files** ([Local files [Open]](#local-files-open)).
+- **Revealing a secret.** Whether a program may unwrap a `Secret(T)` into a `T` other than through
+  a verifier is undecided. A general reveal would let a program unwrap any secret whole and send it
+  anywhere. If one exists, which programs may call it belongs to the security design ([Out of
+  scope](#out-of-scope)).
+- **Combining secrets without nesting.** Combining N secrets nests `flat_map` N deep. A second
+  `@Builtin` combinator, `using(f)`, would combine any number at one depth. It calls `f` once,
+  passing it a function that unwraps any secret, and returns `f`'s result as a `Secret`:
+  `using(lambda unwrap: unwrap(a) + unwrap(b) + unwrap(c))` is a `Secret`. `using` computes nothing
+  that nested `flat_map` does not: inside the innermost function of
+  `a.flat_map(lambda x: b.flat_map(lambda y: …))`, `x` and `y` are plain values, as `unwrap(a)` and
+  `unwrap(b)` are. It removes the nesting and nothing else. The unwrapping function
+  exists only as `f`'s argument. `f` causes nothing, so it cannot store the function, and the
+  function leaves `f` only inside the `Secret` that `using` returns. `using`'s type is
+  `((forall (T) Secret(T) => T) => U requires Context) => Secret(U)`: its argument is a function
+  that takes a polymorphic argument, which is **[Open]** and an error ([chl-spec.md, "Polymorphic
+  type annotations"](chl-spec.md#polymorphic-type-annotations)). `using` waits on that rule.
+- **Computing on a secret without a lambda.** Every computation on a secret is a function passed to
+  a combinator. A type that names a scope, `In(s, T)` for a value computed under
+  `with secrets() as s:`, would let ordinary operators apply to a secret, with the compiler lifting
+  each one as `map` does. The cost is inference that is polymorphic over scope labels, and tracking
+  of implicit flows: a branch on a labeled value labels every effect inside the branch.
 - **Names.** Every name in this document's examples is a placeholder until the design settles:
-  `std::config` and its functions, `Secret`, `SecretReader`, the scope that supplies it, and the
-  CLI's commands. `Secret::new` and `extract` are the names every single-constructor nominal type
-  has.
+  `std::config` and its functions, `Secret`, `secret`, the combinators, the verifiers, and the CLI's
+  commands.
 
 ## Out of scope
 
 These belong to a security design that comes later:
 
-- **Who may reload a program, create a branch, set a secret, or add a scope that extracts one.**
-  Whoever can reload a program can ship one that sends every secret it extracts to a sink, as anyone
+- **Who may reload a program, create a branch, set a secret, or send a secret to a sink.**
+  Whoever can reload a program can ship one that sends every secret it holds to a sink, as anyone
   who can create a Kubernetes Pod can read the Secrets it mounts ([Secrets good
   practices](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)). Role-based
   access and policy controls, such as a policy naming the sinks a secret may reach, answer it.
-- **Authenticating to the control port.** It has none today and binds every interface
-  (`src/control_port.rs`).
+- **Authenticating to the control port.** It has none today. It binds loopback
+  (`src/control_port.rs`), so every process on the engine's host reaches it.
 - **Idempotent control port requests.** A create or reload request sent twice appends its
   configuration values twice. An idempotency key on each request is a requirement on the control
   API's design, which has no document yet; the verbs it covers are [program-evolution.md, "The
@@ -428,9 +458,9 @@ These belong to a security design that comes later:
 
 ## Dependencies
 
-- The effects design, for `SecretReader` and the `Ext` that opening a source requires.
-- A way for `std::config` to state that `Secret`'s `extract` and its pattern require `SecretReader`.
-  The single-constructor form declares `extract` with no `requires` clause.
+- `Secret` as a nominal builtin, and `secret`, `flat_map` and the verifiers as `@Builtin` functions
+  of `std::config` ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)).
+- A sink whose element type has `Secret` fields, which unwraps them as it hands an element out.
 - The std root ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)), which holds
   `std::config`.
 - An outbound (sink, source) pair, for remote keystores.
