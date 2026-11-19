@@ -7,6 +7,7 @@
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::infer::solver::component_walk::{ComponentWalk, Exit};
 use crate::ccl::nominal::{DeclMap, NominalDecl, Variance};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -3099,24 +3100,21 @@ const CYCLE_CLOSURE_ROUNDS: usize = 64;
 /// the walk is at the position, and whether the position is invariant.
 type MemoKey = (InferVarId, bool, Vec<Option<Name>>, bool, bool);
 
-/// A revisit [`compact_go`] cut: the variable and polarity, how many variables were being
-/// expanded when it was entered, and whether the cut was a spurious cycle, along one bound
-/// chain, rather than a recursive one.
-#[derive(Clone, Copy)]
-struct Cut {
-    key: (InferVarId, bool),
-    entered: usize,
-    spurious: bool,
-}
+/// A [`CompactState::components`] key: the variable, the polarity, and whether the walk is at
+/// the position ([`fallback_allowed`]).
+type ComponentKey = (InferVarId, bool, bool);
 
-/// A memoized [`compact_go`] result, and the variables it cut as spurious cycles, which
-/// the path reusing it must hold on its bound chain. A reuse where the walk would cut more
-/// returns what that cut would have dropped as well; the dropped part is already on the
-/// path, and merging it again changes nothing.
+/// How many rounds [`compact_go`] walks one cyclic component of the bound graph before it
+/// panics. A round merges each member's value into the members its bounds reach, and merging
+/// a value again changes nothing, so a component settles once every value has gone round it.
+pub(super) const COMPONENT_ROUNDS: usize = 64;
+
+/// A memoized [`compact_go`] result, with the index its key was entered at, which says whether
+/// the result is final or pending in an open component ([`ComponentWalk::reuse`]).
 #[derive(Clone)]
 struct Memoized {
     ty: CompactType,
-    cuts: Vec<(InferVarId, bool)>,
+    index: usize,
 }
 
 /// [`CompactState::consulted`]'s key: the variable, the polarity, whether the walk is at the
@@ -3132,21 +3130,21 @@ struct CompactState {
     expanded: usize,
     #[cfg(test)]
     consulted_expanded: usize,
-    /// Variables whose bounds are currently being walked, per polarity, each with how
-    /// many were being walked when it was entered.
-    in_process: HashMap<(InferVarId, bool), usize>,
+    /// The variables being expanded and the cyclic components of the bound graph not yet
+    /// finished ([`ComponentWalk`]). A back edge along a bound chain reads the variable's value
+    /// in its component's last round.
+    components: ComponentWalk<ComponentKey, CompactType>,
     /// What each variable compacted to, for one reached again under a substitution that acts
-    /// on none of the names below it ([`consulted_below`]). Without it a variable is walked once per path that reaches it, and a
-    /// bound graph shares variables freely: constraining `?a <: ?b` copies `?a`'s lower
-    /// bounds onto `?b`, so `?b` reaches `?a`'s bounds twice, and each level of a nested
-    /// type doubles the walk.
+    /// on none of the names below it ([`consulted_below`]). Without it a variable is walked
+    /// once per path that reaches it, and a bound graph shares variables freely: constraining
+    /// `?a <: ?b` copies `?a`'s lower bounds onto `?b`, so `?b` reaches `?a`'s bounds twice,
+    /// and each level of a nested type doubles the walk.
     ///
     /// The result depends on the variable, the polarity, the binders the refinement
     /// closing runs against, and two facts about the position: whether the walk is at it
-    /// ([`fallback_allowed`]) and whether it is invariant. It does not otherwise depend on
-    /// the path, except through the cycles it cut back to variables entered before it:
-    /// a result is reused only where each of those is again on the bound chain, so the
-    /// walk would cut it again ([`Memoized::cuts`]). `spec_key`'s walk keeps the same memo.
+    /// ([`fallback_allowed`]) and whether it is invariant. Round a cycle it depends on the
+    /// values of the cycle's other variables, which a back edge reads from the component's
+    /// last round, so it does not depend on the path either.
     memo: HashMap<MemoKey, Memoized>,
     /// [`CompactState::memo`] for a walk under a substitution that acts below the variable:
     /// each result with the substitution, restricted to the names the walk below reads
@@ -3155,8 +3153,6 @@ struct CompactState {
     memo_under: HashMap<MemoKey, Vec<(Subst, Memoized)>>,
     /// Complete dependency summaries for each variable and position in this walk.
     consulted: HashMap<MemoKeyAt, Option<Rc<ConsultedReads>>>,
-    /// The revisits the walk has cut, since the variables being expanded were entered.
-    cuts: Vec<Cut>,
     /// Placeholder ids minted for genuinely recursive revisits.
     recursive: HashMap<(InferVarId, bool), InferVarId>,
     /// Barrier variables whose lower bounds are currently being joined. Keyed on the
@@ -3241,10 +3237,9 @@ impl CompactState {
             expanded: 0,
             #[cfg(test)]
             consulted_expanded: 0,
-            in_process: HashMap::new(),
+            components: ComponentWalk::new(COMPONENT_ROUNDS),
             memo: HashMap::new(),
             memo_under: HashMap::new(),
-            cuts: Vec::new(),
             consulted: HashMap::new(),
             recursive: HashMap::new(),
             barriers_in_process: HashSet::new(),
@@ -3772,7 +3767,7 @@ fn compact_go(
 
 /// Whether `ty` is a variable, refined or not: what it contributes is its bounds', whose births
 /// they record ([`ContributionOrigins`]).
-fn stands_for_a_variable(ty: &Type) -> bool {
+pub(super) fn stands_for_a_variable(ty: &Type) -> bool {
     match ty {
         Type::Infer(_) => true,
         Type::Refinement(base, _) => stands_for_a_variable(base),
@@ -4284,7 +4279,6 @@ fn compact_go_inner(
         Type::BarrierVar(barrier) => join_barrier_lowers(solver, barrier, subst_acc, st).0,
         Type::Infer(state) => {
             let uid = state.uid;
-            let key = (uid, pol);
             let memo_key: MemoKey = (
                 uid,
                 pol,
@@ -4335,411 +4329,425 @@ fn compact_go_inner(
                 None
             };
             if let Some(done) = memoized
-                && done.cuts.iter().all(|cut| {
-                    st.in_process.contains_key(cut)
-                        && pos.parents.is_some_and(|p| p.contains(cut.0))
-                })
+                && st.components.reuse(done.index)
             {
-                let done = done.clone();
-                st.cuts.extend(done.cuts.iter().map(|cut| Cut {
-                    key: *cut,
-                    entered: st.in_process[cut],
-                    spurious: true,
-                }));
-                return done.ty;
+                return done.ty.clone();
             }
-            if let Some(&entered) = st.in_process.get(&key) {
-                let spurious = pos.parents.is_some_and(|p| p.contains(uid));
-                st.cuts.push(Cut {
-                    key,
-                    entered,
-                    spurious,
-                });
-                if spurious {
-                    // Spurious cycle (a <: b and b <: a with no
-                    // structural intermediary). Drop the bound.
-                    return CompactType::empty();
-                }
+            // A chain that returns to the position it started from meets the variable as one
+            // read along a chain, which the position's opposite-side reading is not part of:
+            // a key of its own, expanded below the position.
+            let key = (uid, pol, memo_key.3);
+            let spurious = pos.parents.is_some_and(|p| p.contains(uid));
+            if spurious && st.components.expanding(&key) {
+                // A cycle along one bound chain, with no structural intermediary, reads the
+                // variable's value in its component's last round ([`ComponentWalk`]).
+                return st
+                    .components
+                    .back_edge(&key)
+                    .unwrap_or_else(CompactType::empty);
+            }
+            if !spurious
+                && let Some(on_path) = [key, (uid, pol, !memo_key.3)]
+                    .into_iter()
+                    .find(|k| st.components.expanding(k))
+            {
+                st.components.recursive_edge(&on_path);
                 // Real recursive cycle: mint a fresh UID to mark this slot.
                 // We need only the identifier here — the cycle is surfaced
                 // by `coalesce_compact` as a `RecursiveType` error before
                 // any level-sensitive code observes it — so we don't
                 // allocate a full `InferVar` (no bounds, no level value
                 // to defend).
-                let placeholder = *st.recursive.entry(key).or_insert_with(fresh_infer_var_id);
+                let placeholder = *st
+                    .recursive
+                    .entry((uid, pol))
+                    .or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
-            let depth = st.in_process.len();
-            st.in_process.insert(key, depth);
-            #[cfg(test)]
-            {
-                st.expanded += 1;
-            }
-            let cuts_before = st.cuts.len();
-            // **A variable states a binder correspondence too**, and it is the only thing
-            // that states the one a join needs: two conditional arms are two sums recorded
-            // below one variable's kind, each spelled in its own binder, and the kind is what
-            // puts those binders in correspondence with the position's. Applied on the way
-            // in, exactly as a function's own kind is, so every bound below arrives spelled
-            // in the position's binders.
-            let mut owned_acc = fun_kind_correspondence(
-                solver,
-                &crate::ccl::ty::FunKind::Var(Rc::clone(&state.fun_kind)),
-                subst_acc,
-            );
-            // **A part reads its function's binders too.** A variable that is a part of a
-            // function over a funkind variable names that function's witnesses, spelled in
-            // whichever related sum's binder reached it; the function's correspondence puts
-            // them in its own binders, as entering the function does. A part reached along a
-            // bound chain is never entered through the function, so it is applied here.
-            for k in state.witness_scope_kinds(solver) {
-                owned_acc = part_correspondence(solver, &k, &owned_acc);
-            }
-            let subst_acc = &owned_acc;
-            // The opposite-polarity fallback below is monomorphization's
-            // coalesce-time *read* for a contravariant position. A function
-            // domain is negative, so an argument flowing in (`arg <: domain`) is
-            // recorded as a *lower* bound of the domain var — but negative
-            // coalesce reads *upper* bounds. The fallback recovers the concrete
-            // type from the lower side. Choosing a concrete type for a
-            // negative-position var that only ever receives `arg` *is*
-            // monomorphizing it; the answer is the concrete `arg`.
-            //
-            // Algebraic subtyping's "principal" answer for such a var is
-            // `∀α ⊇ arg. …`, which would need a `Type::ForAll`. Cambra uses
-            // implicit, level-based polymorphism and lowers it to concrete code,
-            // so the desired output here is the concrete `arg`, not a quantifier
-            // — this is a pragmatic fit, not a ban on ever representing `∀`.
-            //
-            // The read is sound because every variable reaching coalesce is
-            // *monomorphically determined* — pinned to one type by its uses, or
-            // its bounds collide into `IncompatibleBounds` (never a silent
-            // mis-type). This invariant is the structural-collision check; it
-            // predates let-polymorphism. A generalized binding's definition is
-            // never coalesced in place (the inference engine keeps it aside and
-            // coalesces per-use *clones* pinned to one resolved use type);
-            // only those clones and the per-use instantiations reach here,
-            // each fixed by a single use site.
-            let s = state.bounds(solver);
-            // `Rc::clone`, not a copy: taking the list out of the `RefCell` is a
-            // refcount bump, and this is the walk's hot read.
-            let primary_bounds = Rc::clone(if pol { s.lower() } else { s.upper() });
-            // When the polarity-correct list is empty we fall back to the
-            // opposite-polarity bounds (see the rationale above). Track which
-            // polarity the bounds came from so we walk + merge them at THAT
-            // polarity — record merge is asymmetric (union at negative,
-            // intersection at positive), and using the wrong polarity collapses
-            // disjoint-field records to the empty record at coalesce time. Fix
-            // for the multi-gen iter-record case: lambda param `__iter_record`
-            // accumulates upper bounds (open records `{.0}` and `{.1}`) from
-            // projections; we want their negative-polarity union (both fields)
-            // when the Var is coalesced at positive polarity, not the
-            // positive-polarity intersection (empty).
-            //
-            // This fallback handles a *bare* under-determined domain var: it
-            // materializes the type locally at coalesce from the lower-bound
-            // side. The other half of the contravariant-domain story — a
-            // *structured* domain whose untouched positions are variables no
-            // edge ever reaches, which is a `Proj`'s dense-prefix requirement
-            // and nothing else — is recovered separately by `coalesce_node`'s
-            // `specialize_projection_domain`. Both Apply edges are one-way (no
-            // emit-time reverse whose eager cross-component propagation would
-            // cover these halves); see `design/type-inference.md` ("Apply is
-            // one-way" and "Closing the single-sided blind spots (no separate
-            // pass)").
-            let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
-            let type_kinds = s.type_kinds.clone();
-            // **A bound under a discharge states a fact about an instance.** `𝐿 <: 𝑉‹[𝑘 ↦ 𝑎]›` is a
-            // fact about `𝑉[𝑘 ↦ 𝑎]`, already checked at the edge that recorded it, and it is a
-            // fact about `𝑉` exactly where the discharge leaves `𝑉`'s content unchanged: where
-            // the binder is outside `𝑉`'s scope, or `𝑉`'s own content does not name it
-            // ([`content_mentions`]). Elsewhere it stays out of `𝑉`'s answer; the variable that
-            // stands for the instance reads it.
-            let holder = solver.lookup(&uid);
-            let own_content = Rc::clone(&st.own_content);
-            let renders_as_own = |solver: &mut Solver, b: &crate::ccl::Bound| -> bool {
-                if b.self_subst.invert().is_some() {
-                    return true;
+            let (bound, index, complete) = loop {
+                st.components.enter(key);
+                let bound = expand_variable(solver, state, pol, subst_acc, pos, st);
+                // A value read by key is the merge of its bounds' values, each carried
+                // unchanged; one read under a substitution is not ([`ComponentWalk::exit`]).
+                match st.components.exit(&bound, memoizable) {
+                    Exit::Done { index, memoizable } => break (bound, index, memoizable),
+                    Exit::Rerun => {}
+                    Exit::Unsettled => panic!(
+                        "compaction's values round a cycle of bounds did not settle in \
+                         {COMPONENT_ROUNDS} rounds"
+                    ),
                 }
-                let Some(v) = holder.as_ref() else {
-                    return true;
-                };
-                let (_, discharged) = b.self_subst.split_renames();
-                let acting = discharged.acting_on(solver, v);
-                if acting.is_id() {
-                    return true;
-                }
-                // An elimination acts on `𝑉` exactly where `𝑉` is a sum, which its kind says once
-                // the graph is closed: on a plain collection it eliminates nothing.
-                if acting.eliminates_top()
-                    && !matches!(v.fun_kind.resolved_in(solver), KindPin::Plain)
-                {
-                    return false;
-                }
-                !content_mentions(solver, v, &acting, &mut own_content.borrow_mut())
             };
-            // Walk bounds, transitively expanding, seeded from the variable's own
-            // identity: `from_var` is not a value, so it imposes nothing at any
-            // slot and the fold's first step is the identity but for carrying the
-            // uid ([`CompactType::refinements`] for why the refinement slot needs the
-            // same `None` the shape slots have).
-            //
-            // Whether this variable is the *position* being materialized, which is
-            // the only place the opposite-polarity collapse below may happen
-            // ([`fallback_allowed`]).
-            let allow_fallback = fallback_allowed(pos, st);
-            let new_parents = ParentPath {
-                uid,
-                prev: pos.parents,
-            };
-            let mut bound = CompactType::from_var(uid);
-            let primary_own = st.own_bound_flags(solver, uid, pol, &primary_bounds, renders_as_own);
-            for (index, b) in primary_bounds.iter().enumerate() {
-                if !primary_own[index] {
-                    continue;
-                }
-                // Compose this edge's morphisms onto the accumulator before
-                // descending: a bound reached transitively through `v → w → …`
-                // arrives with every edge's morphism composed (design §3.6).
-                // Identity edges leave `subst_acc` unchanged (the common case).
-                let inner_acc = {
-                    let rendered = b.render_subst(solver);
-                    Subst::then(solver, &rendered, subst_acc)
-                };
-                let mut bc =
-                    compact_bound(solver, &b.ty, pol, &inner_acc, pos.under(&new_parents), st);
-                if !stands_for_a_variable(&b.ty) {
-                    bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
-                }
-                bound = CompactType::merge(solver, pol, bound, bc);
-            }
-            // **An edge between two variables is a fact about both.** Inference holds
-            // `𝑢 <: 𝑣` on one end, whichever the levels pick, so a rendering, which names a
-            // parameter by the variables standing together, reads the edges the other end
-            // holds too: the variables below this one at a positive position, above it at a
-            // negative one. A data function's domain is invariant, one type at either
-            // polarity, so there it reads every variable on either side.
-            if let Some(held) = st.held_elsewhere.clone() {
-                let mut partners: Vec<Rc<crate::ccl::InferVar>> = Vec::new();
-                if let Some((below, above)) = held.get(&uid) {
-                    partners.extend(if pol { below } else { above }.iter().cloned());
-                    if pos.invariant {
-                        partners.extend(if pol { above } else { below }.iter().cloned());
-                    }
-                }
-                if pos.invariant {
-                    let s = state.bounds(solver);
-                    partners.extend(
-                        if pol { s.upper() } else { s.lower() }
-                            .iter()
-                            .filter(|b| b.self_subst.is_id() && b.ty_subst.is_id())
-                            .filter_map(|b| match &b.ty {
-                                Type::Infer(v) => Some(Rc::clone(v)),
-                                _ => None,
-                            }),
-                    );
-                }
-                for u in partners {
-                    let bc = compact_go(
-                        solver,
-                        &Type::Infer(u),
-                        pol,
-                        subst_acc,
-                        pos.under(&new_parents),
-                        st,
-                    );
-                    bound = CompactType::merge(solver, pol, bound, bc);
-                }
-            }
-            // Whether the *shape* collapse fires: the primary walk produced no
-            // concrete (atom / shape) contribution. Without it a variable whose only
-            // concrete information lives on the opposite polarity coalesces to
-            // `Type::Infer(?N)` instead of its real type — most commonly a fresh
-            // lambda param whose Apply-site bound flows in at the opposite polarity
-            // from where the lambda is coalesced. This is the coalesce-time read of
-            // monomorphization; it is sound because every var reaching coalesce is
-            // monomorphically determined (one type or an `IncompatibleBounds`
-            // error). See the rationale above, and [`fallback_allowed`] for why it
-            // happens only at a position.
-            let no_concrete = {
-                let CompactType {
-                    atoms,
-                    rec,
-                    width: _,
-                    fun,
-                    history_slot,
-                    dep_tuple,
-                    family,
-                    nominal,
-                    var,
-                    // A sum is a shape: it is what the position *is*, and it
-                    // determines the position as much as an atom does.
-                    // Not shape. These are carried across the fallback explicitly
-                    // below, rather than deciding whether it fires.
-                    vars: _,
-                    refinements: _,
-                    kinds: _,
-                    nominal_conflict: _,
-                    met_refinements: _,
-                    origins: _,
-                } = &bound;
-                // A variant shape counts as concrete only at a **positive**
-                // position, where it is the value's own tags — read off the lower
-                // bounds, it is what the thing *is*, and the fallback firing past
-                // it would overwrite the value with its own upper bound (a bounded
-                // annotation reading back as the binder's type).
-                //
-                // At a negative position it is not a determination at all: an arm
-                // binder's upper bounds are the arms the body can *handle*, so
-                // stopping here would make a domain the sum of everything the
-                // `match` accepts rather than the argument it was given. That
-                // direction still needs the argument the fallback finds.
-                //
-                // **Inside an invariant position** both readings are one: a data domain's
-                // variant — the positional union `++` builds — is the domain itself, not the
-                // arms anything handles, so it determines the position at either polarity.
-                let var_is_shape = (pol || pos.invariant) && var.is_some();
-                atoms.is_empty()
-                    && rec.is_none()
-                    && fun.is_none()
-                    && history_slot.is_none()
-                    && dep_tuple.is_none()
-                    && family.is_none()
-                    && nominal.is_empty()
-                    && !var_is_shape
-            };
-            // The two rules that read the opposite side, and they are not the same rule.
-            //
-            // The **shape collapse** is a choice, so it fires only at the position the
-            // walk entered, and only where the polarity-correct walk found no shape for
-            // it to overwrite.
-            //
-            // The **merge** is a narrowing: both sides narrow a negative position — the
-            // requirement side records what the uses demand, the value side what
-            // actually arrives — so it fires there whether or not the shape needed
-            // recovering (`src/ccl/design/type-inference.md`, "The collapse happens at
-            // the position"). Inside an invariant position it fires however the walk
-            // arrived, where elsewhere it fires only at a position: a data domain
-            // reached along a bound chain is the same domain as one entered
-            // structurally, and invariance leaves no variance to tell the two readings
-            // apart, so gating this one on `allow_fallback` gives one variable two
-            // answers at one polarity and the invariance check rejects the position
-            // against itself (`src/ccl/design/type-inference.md`, "An invariant position
-            // reads both sides however the walk reached it").
-            //
-            // Both stay under `st.collapse`, which suppresses the opposite side
-            // walk-wide for [`compact_type_polarity_only`] — a caller whose question is
-            // what reached the position, for which a demand is not an answer.
-            let collapse = allow_fallback && no_concrete;
-            let merge = !pol && (allow_fallback || (st.collapse && pos.invariant));
-            let read_opposite = collapse || merge;
-            let mut recovered: Option<CompactType> = None;
-            if read_opposite {
-                let opposite_own =
-                    st.own_bound_flags(solver, uid, !pol, &opposite_bounds, renders_as_own);
-                for (index, b) in opposite_bounds.iter().enumerate() {
-                    if !opposite_own[index] {
-                        continue;
-                    }
-                    let rendered = b.render_subst(solver);
-                    let inner_acc = Subst::then(solver, &rendered, subst_acc);
-                    let mut bc =
-                        compact_bound(solver, &b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
-                    if !stands_for_a_variable(&b.ty) {
-                        bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
-                    }
-                    recovered = Some(match recovered {
-                        None => bc,
-                        Some(acc) => CompactType::merge(solver, !pol, acc, bc),
-                    });
-                }
-            }
-            match (recovered, no_concrete) {
-                (Some(mut recovered), true) => {
-                    // Carry what the polarity-correct walk *did* find — variable
-                    // identities and refinement demands — across without letting
-                    // it into the structural fold.
-                    //
-                    // Replacing rather than meeting is what an *undetermined*
-                    // position needs, and the difference is that the collapse here is
-                    // a choice rather than a narrowing: there is no settled structure
-                    // for the two sides to narrow jointly. A negative position reaches
-                    // this arm holding at most a variant shape, and that shape is the
-                    // arms the body can handle rather than anything that flowed in, so
-                    // meeting would intersect those tags into the domain. (At a
-                    // positive position `no_concrete` implies there is no shape at all
-                    // to lose.) A variant the walk reaches *under* a settled shape is a
-                    // different position and does meet — the arm below.
-                    //
-                    // Refinements union instead of intersecting: a demanded
-                    // predicate is checked against the value the fallback found,
-                    // so both hold of it.
-                    recovered.vars.extend(std::mem::take(&mut bound.vars));
-                    if let Some(demanded) = bound.refinements.take() {
-                        recovered
-                            .refinements
-                            .get_or_insert_with(RefinementSet::default)
-                            .extend(demanded);
-                    }
-                    bound = recovered;
-                }
-                // Both sides are narrowings of a structure the primary walk already
-                // settled, so the reading is their meet — which is what merging at the
-                // position's own polarity computes. One rule covers every slot: a
-                // refinement set narrows a position exactly as a record's fields do,
-                // and the negative merge unions both.
-                //
-                // A variant in a child slot meets here too, and that is the one caller
-                // reaching [`CompactVariant::meet_openness`]'s one-side-open case: the
-                // value side of a `case _:` demand is a producer and so closed, and the
-                // meet both closes the marker and intersects away a tag the demand does
-                // not name (`a_settled_negative_position_closes_an_open_child_demand`).
-                (Some(recovered), false) => {
-                    bound = CompactType::merge(solver, pol, bound, recovered);
-                }
-                (None, _) => {}
-            }
-            // The variable's kinding constraints join its identity: they are facts
-            // about what this position resolves to, and coalesce reads them there.
-            for k in type_kinds {
-                if !bound.kinds.contains(&k) {
-                    bound.kinds.push(k);
-                }
-            }
-            st.in_process.remove(&key);
-            // The cuts back to variables entered before this one are what the result
-            // assumes of the path; the others are its own business.
-            let mut assumed: Vec<Cut> = Vec::new();
-            for cut in st.cuts.drain(cuts_before..) {
-                if cut.entered < depth && !assumed.iter().any(|a| a.key == cut.key) {
-                    assumed.push(cut);
-                }
-            }
-            st.cuts.extend(assumed.iter().copied());
             // Recursive types: store the bound under the placeholder
             // variable and emit a reference.
-            if let Some(rec_uid) = st.recursive.get(&key) {
+            if let Some(rec_uid) = st.recursive.get(&(uid, pol)) {
                 let rec_uid = *rec_uid;
                 st.rec_vars.insert(rec_uid, bound);
                 return CompactType::from_var(rec_uid);
             }
-            if (memoizable || memoizable_under) && assumed.iter().all(|cut| cut.spurious) {
+            if complete && (memoizable || memoizable_under) {
                 let done = Memoized {
                     ty: bound.clone(),
-                    cuts: assumed.iter().map(|cut| cut.key).collect(),
+                    index,
                 };
                 if memoizable {
                     st.memo.insert(memo_key, done);
                 } else {
-                    st.memo_under
-                        .entry(memo_key)
-                        .or_default()
-                        .push((subst_acc.clone(), done));
+                    let entries = st.memo_under.entry(memo_key).or_default();
+                    match entries.iter_mut().find(|(s, _)| s == subst_acc) {
+                        Some((_, stale)) => *stale = done,
+                        None => entries.push((subst_acc.clone(), done)),
+                    }
                 }
             }
             bound
         }
     }
+}
+
+/// A variable's value at polarity `pol`: its bounds, walked under `subst_acc`, merged with what
+/// it reads of the opposite side and its kinding constraints. The body of [`compact_go`]'s
+/// `Infer` arm, which decides where the value comes from.
+fn expand_variable(
+    solver: &mut Solver,
+    state: &Rc<crate::ccl::InferVar>,
+    pol: bool,
+    subst_acc: &Subst,
+    pos: Position<'_>,
+    st: &mut CompactState,
+) -> CompactType {
+    let uid = state.uid;
+    #[cfg(test)]
+    {
+        st.expanded += 1;
+    }
+    // **A variable states a binder correspondence too**, and it is the only thing
+    // that states the one a join needs: two conditional arms are two sums recorded
+    // below one variable's kind, each spelled in its own binder, and the kind is what
+    // puts those binders in correspondence with the position's. Applied on the way
+    // in, exactly as a function's own kind is, so every bound below arrives spelled
+    // in the position's binders.
+    let mut owned_acc = fun_kind_correspondence(
+        solver,
+        &crate::ccl::ty::FunKind::Var(Rc::clone(&state.fun_kind)),
+        subst_acc,
+    );
+    // **A part reads its function's binders too.** A variable that is a part of a
+    // function over a funkind variable names that function's witnesses, spelled in
+    // whichever related sum's binder reached it; the function's correspondence puts
+    // them in its own binders, as entering the function does. A part reached along a
+    // bound chain is never entered through the function, so it is applied here.
+    for k in state.witness_scope_kinds(solver) {
+        owned_acc = part_correspondence(solver, &k, &owned_acc);
+    }
+    let subst_acc = &owned_acc;
+    // The opposite-polarity fallback below is monomorphization's
+    // coalesce-time *read* for a contravariant position. A function
+    // domain is negative, so an argument flowing in (`arg <: domain`) is
+    // recorded as a *lower* bound of the domain var — but negative
+    // coalesce reads *upper* bounds. The fallback recovers the concrete
+    // type from the lower side. Choosing a concrete type for a
+    // negative-position var that only ever receives `arg` *is*
+    // monomorphizing it; the answer is the concrete `arg`.
+    //
+    // Algebraic subtyping's "principal" answer for such a var is
+    // `∀α ⊇ arg. …`, which would need a `Type::ForAll`. Cambra uses
+    // implicit, level-based polymorphism and lowers it to concrete code,
+    // so the desired output here is the concrete `arg`, not a quantifier
+    // — this is a pragmatic fit, not a ban on ever representing `∀`.
+    //
+    // The read is sound because every variable reaching coalesce is
+    // *monomorphically determined* — pinned to one type by its uses, or
+    // its bounds collide into `IncompatibleBounds` (never a silent
+    // mis-type). This invariant is the structural-collision check; it
+    // predates let-polymorphism. A generalized binding's definition is
+    // never coalesced in place (the inference engine keeps it aside and
+    // coalesces per-use *clones* pinned to one resolved use type);
+    // only those clones and the per-use instantiations reach here,
+    // each fixed by a single use site.
+    let s = state.bounds(solver);
+    // `Rc::clone`, not a copy: taking the list out of the `RefCell` is a
+    // refcount bump, and this is the walk's hot read.
+    let primary_bounds = Rc::clone(if pol { s.lower() } else { s.upper() });
+    // When the polarity-correct list is empty we fall back to the
+    // opposite-polarity bounds (see the rationale above). Track which
+    // polarity the bounds came from so we walk + merge them at THAT
+    // polarity — record merge is asymmetric (union at negative,
+    // intersection at positive), and using the wrong polarity collapses
+    // disjoint-field records to the empty record at coalesce time. Fix
+    // for the multi-gen iter-record case: lambda param `__iter_record`
+    // accumulates upper bounds (open records `{.0}` and `{.1}`) from
+    // projections; we want their negative-polarity union (both fields)
+    // when the Var is coalesced at positive polarity, not the
+    // positive-polarity intersection (empty).
+    //
+    // This fallback handles a *bare* under-determined domain var: it
+    // materializes the type locally at coalesce from the lower-bound
+    // side. The other half of the contravariant-domain story — a
+    // *structured* domain whose untouched positions are variables no
+    // edge ever reaches, which is a `Proj`'s dense-prefix requirement
+    // and nothing else — is recovered separately by `coalesce_node`'s
+    // `specialize_projection_domain`. Both Apply edges are one-way (no
+    // emit-time reverse whose eager cross-component propagation would
+    // cover these halves); see `design/type-inference.md` ("Apply is
+    // one-way" and "Closing the single-sided blind spots (no separate
+    // pass)").
+    let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
+    let type_kinds = s.type_kinds.clone();
+    // **A bound under a discharge states a fact about an instance.** `𝐿 <: 𝑉‹[𝑘 ↦ 𝑎]›` is a
+    // fact about `𝑉[𝑘 ↦ 𝑎]`, already checked at the edge that recorded it, and it is a
+    // fact about `𝑉` exactly where the discharge leaves `𝑉`'s content unchanged: where
+    // the binder is outside `𝑉`'s scope, or `𝑉`'s own content does not name it
+    // ([`content_mentions`]). Elsewhere it stays out of `𝑉`'s answer; the variable that
+    // stands for the instance reads it.
+    let holder = solver.lookup(&uid);
+    let own_content = Rc::clone(&st.own_content);
+    let renders_as_own = |solver: &mut Solver, b: &crate::ccl::Bound| -> bool {
+        if b.self_subst.invert().is_some() {
+            return true;
+        }
+        let Some(v) = holder.as_ref() else {
+            return true;
+        };
+        let (_, discharged) = b.self_subst.split_renames();
+        let acting = discharged.acting_on(solver, v);
+        if acting.is_id() {
+            return true;
+        }
+        // An elimination acts on `𝑉` exactly where `𝑉` is a sum, which its kind says once
+        // the graph is closed: on a plain collection it eliminates nothing.
+        if acting.eliminates_top() && !matches!(v.fun_kind.resolved_in(solver), KindPin::Plain) {
+            return false;
+        }
+        !content_mentions(solver, v, &acting, &mut own_content.borrow_mut())
+    };
+    // Walk bounds, transitively expanding, seeded from the variable's own
+    // identity: `from_var` is not a value, so it imposes nothing at any
+    // slot and the fold's first step is the identity but for carrying the
+    // uid ([`CompactType::refinements`] for why the refinement slot needs the
+    // same `None` the shape slots have).
+    //
+    // Whether this variable is the *position* being materialized, which is
+    // the only place the opposite-polarity collapse below may happen
+    // ([`fallback_allowed`]).
+    let allow_fallback = fallback_allowed(pos, st);
+    let new_parents = ParentPath {
+        uid,
+        prev: pos.parents,
+    };
+    let mut bound = CompactType::from_var(uid);
+    let primary_own = st.own_bound_flags(solver, uid, pol, &primary_bounds, renders_as_own);
+    for (index, b) in primary_bounds.iter().enumerate() {
+        if !primary_own[index] {
+            continue;
+        }
+        // Compose this edge's morphisms onto the accumulator before
+        // descending: a bound reached transitively through `v → w → …`
+        // arrives with every edge's morphism composed (design §3.6).
+        // Identity edges leave `subst_acc` unchanged (the common case).
+        let inner_acc = {
+            let rendered = b.render_subst(solver);
+            Subst::then(solver, &rendered, subst_acc)
+        };
+        let mut bc = compact_bound(solver, &b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+        if !stands_for_a_variable(&b.ty) {
+            bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
+        }
+        bound = CompactType::merge(solver, pol, bound, bc);
+    }
+    // **An edge between two variables is a fact about both.** Inference holds
+    // `𝑢 <: 𝑣` on one end, whichever the levels pick, so a rendering, which names a
+    // parameter by the variables standing together, reads the edges the other end
+    // holds too: the variables below this one at a positive position, above it at a
+    // negative one. A data function's domain is invariant, one type at either
+    // polarity, so there it reads every variable on either side.
+    if let Some(held) = st.held_elsewhere.clone() {
+        let mut partners: Vec<Rc<crate::ccl::InferVar>> = Vec::new();
+        if let Some((below, above)) = held.get(&uid) {
+            partners.extend(if pol { below } else { above }.iter().cloned());
+            if pos.invariant {
+                partners.extend(if pol { above } else { below }.iter().cloned());
+            }
+        }
+        if pos.invariant {
+            let s = state.bounds(solver);
+            partners.extend(
+                if pol { s.upper() } else { s.lower() }
+                    .iter()
+                    .filter(|b| b.self_subst.is_id() && b.ty_subst.is_id())
+                    .filter_map(|b| match &b.ty {
+                        Type::Infer(v) => Some(Rc::clone(v)),
+                        _ => None,
+                    }),
+            );
+        }
+        for u in partners {
+            let bc = compact_go(
+                solver,
+                &Type::Infer(u),
+                pol,
+                subst_acc,
+                pos.under(&new_parents),
+                st,
+            );
+            bound = CompactType::merge(solver, pol, bound, bc);
+        }
+    }
+    // Whether the *shape* collapse fires: the primary walk produced no
+    // concrete (atom / shape) contribution. Without it a variable whose only
+    // concrete information lives on the opposite polarity coalesces to
+    // `Type::Infer(?N)` instead of its real type — most commonly a fresh
+    // lambda param whose Apply-site bound flows in at the opposite polarity
+    // from where the lambda is coalesced. This is the coalesce-time read of
+    // monomorphization; it is sound because every var reaching coalesce is
+    // monomorphically determined (one type or an `IncompatibleBounds`
+    // error). See the rationale above, and [`fallback_allowed`] for why it
+    // happens only at a position.
+    let no_concrete = {
+        let CompactType {
+            atoms,
+            rec,
+            width: _,
+            fun,
+            history_slot,
+            dep_tuple,
+            family,
+            nominal,
+            var,
+            // A sum is a shape: it is what the position *is*, and it
+            // determines the position as much as an atom does.
+            // Not shape. These are carried across the fallback explicitly
+            // below, rather than deciding whether it fires.
+            vars: _,
+            refinements: _,
+            kinds: _,
+            nominal_conflict: _,
+            met_refinements: _,
+            origins: _,
+        } = &bound;
+        // A variant shape counts as concrete only at a **positive**
+        // position, where it is the value's own tags — read off the lower
+        // bounds, it is what the thing *is*, and the fallback firing past
+        // it would overwrite the value with its own upper bound (a bounded
+        // annotation reading back as the binder's type).
+        //
+        // At a negative position it is not a determination at all: an arm
+        // binder's upper bounds are the arms the body can *handle*, so
+        // stopping here would make a domain the sum of everything the
+        // `match` accepts rather than the argument it was given. That
+        // direction still needs the argument the fallback finds.
+        //
+        // **Inside an invariant position** both readings are one: a data domain's
+        // variant — the positional union `++` builds — is the domain itself, not the
+        // arms anything handles, so it determines the position at either polarity.
+        let var_is_shape = (pol || pos.invariant) && var.is_some();
+        atoms.is_empty()
+            && rec.is_none()
+            && fun.is_none()
+            && history_slot.is_none()
+            && dep_tuple.is_none()
+            && family.is_none()
+            && nominal.is_empty()
+            && !var_is_shape
+    };
+    // The two rules that read the opposite side, and they are not the same rule.
+    //
+    // The **shape collapse** is a choice, so it fires only at the position the
+    // walk entered, and only where the polarity-correct walk found no shape for
+    // it to overwrite.
+    //
+    // The **merge** is a narrowing: both sides narrow a negative position — the
+    // requirement side records what the uses demand, the value side what
+    // actually arrives — so it fires there whether or not the shape needed
+    // recovering (`src/ccl/design/type-inference.md`, "The collapse happens at
+    // the position"). Inside an invariant position it fires however the walk
+    // arrived, where elsewhere it fires only at a position: a data domain
+    // reached along a bound chain is the same domain as one entered
+    // structurally, and invariance leaves no variance to tell the two readings
+    // apart, so gating this one on `allow_fallback` gives one variable two
+    // answers at one polarity and the invariance check rejects the position
+    // against itself (`src/ccl/design/type-inference.md`, "An invariant position
+    // reads both sides however the walk reached it").
+    //
+    // Both stay under `st.collapse`, which suppresses the opposite side
+    // walk-wide for [`compact_type_polarity_only`] — a caller whose question is
+    // what reached the position, for which a demand is not an answer.
+    let collapse = allow_fallback && no_concrete;
+    let merge = !pol && (allow_fallback || (st.collapse && pos.invariant));
+    let read_opposite = collapse || merge;
+    let mut recovered: Option<CompactType> = None;
+    if read_opposite {
+        let opposite_own = st.own_bound_flags(solver, uid, !pol, &opposite_bounds, renders_as_own);
+        for (index, b) in opposite_bounds.iter().enumerate() {
+            if !opposite_own[index] {
+                continue;
+            }
+            let rendered = b.render_subst(solver);
+            let inner_acc = Subst::then(solver, &rendered, subst_acc);
+            let mut bc =
+                compact_bound(solver, &b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+            if !stands_for_a_variable(&b.ty) {
+                bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
+            }
+            recovered = Some(match recovered {
+                None => bc,
+                Some(acc) => CompactType::merge(solver, !pol, acc, bc),
+            });
+        }
+    }
+    match (recovered, no_concrete) {
+        (Some(mut recovered), true) => {
+            // Carry what the polarity-correct walk *did* find — variable
+            // identities and refinement demands — across without letting
+            // it into the structural fold.
+            //
+            // Replacing rather than meeting is what an *undetermined*
+            // position needs, and the difference is that the collapse here is
+            // a choice rather than a narrowing: there is no settled structure
+            // for the two sides to narrow jointly. A negative position reaches
+            // this arm holding at most a variant shape, and that shape is the
+            // arms the body can handle rather than anything that flowed in, so
+            // meeting would intersect those tags into the domain. (At a
+            // positive position `no_concrete` implies there is no shape at all
+            // to lose.) A variant the walk reaches *under* a settled shape is a
+            // different position and does meet — the arm below.
+            //
+            // Refinements union instead of intersecting: a demanded
+            // predicate is checked against the value the fallback found,
+            // so both hold of it.
+            recovered.vars.extend(std::mem::take(&mut bound.vars));
+            if let Some(demanded) = bound.refinements.take() {
+                recovered
+                    .refinements
+                    .get_or_insert_with(RefinementSet::default)
+                    .extend(demanded);
+            }
+            bound = recovered;
+        }
+        // Both sides are narrowings of a structure the primary walk already
+        // settled, so the reading is their meet — which is what merging at the
+        // position's own polarity computes. One rule covers every slot: a
+        // refinement set narrows a position exactly as a record's fields do,
+        // and the negative merge unions both.
+        //
+        // A variant in a child slot meets here too, and that is the one caller
+        // reaching [`CompactVariant::meet_openness`]'s one-side-open case: the
+        // value side of a `case _:` demand is a producer and so closed, and the
+        // meet both closes the marker and intersects away a tag the demand does
+        // not name (`a_settled_negative_position_closes_an_open_child_demand`).
+        (Some(recovered), false) => {
+            bound = CompactType::merge(solver, pol, bound, recovered);
+        }
+        (None, _) => {}
+    }
+    // The variable's kinding constraints join its identity: they are facts
+    // about what this position resolves to, and coalesce reads them there.
+    for k in type_kinds {
+        if !bound.kinds.contains(&k) {
+            bound.kinds.push(k);
+        }
+    }
+    bound
 }
 
 /// Counts the substitution entries compaction's walk brings to each variable it reaches, and

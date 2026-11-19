@@ -44,6 +44,7 @@ use crate::ccl::{BaseType, InferVar, Level, Type};
 pub mod barrier;
 pub mod coalesce;
 pub mod compact;
+mod component_walk;
 pub mod constrain;
 pub(crate) mod containment;
 pub mod display;
