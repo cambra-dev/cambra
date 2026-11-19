@@ -4116,6 +4116,9 @@ impl Typing for InferCtx {
                     Repr::Written(_) => unreachable!(
                         "a part's written clauses are normalized before its composition is typed"
                     ),
+                    Repr::Children(_) => {
+                        unreachable!("a union of a node's children's capabilities is in no type")
+                    }
                 }
             }
         }

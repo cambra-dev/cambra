@@ -1733,7 +1733,7 @@ pub(super) fn settle_capabilities(solver: &mut Solver, expr: &mut Expr) {
     assert_capabilities_settled(expr);
 }
 
-/// Panic on a node whose capabilities are still a variable once inference has settled them, a
+/// Panic on a node whose capabilities still read a variable once inference has settled them, a
 /// node of a term a type quotes included ([`settle_capabilities`]): a pass after inference
 /// would resolve that variable when it reads it.
 #[cfg(debug_assertions)]
@@ -1741,10 +1741,10 @@ fn assert_capabilities_settled(expr: &Expr) {
     fn go(e: &Expr, seen: &mut std::collections::HashSet<*const Expr>) {
         let unsettled = [&e.capabilities, &e.own_capabilities]
             .iter()
-            .any(|c| matches!(c.repr(), crate::ccl::capabilities::Repr::Var(_)));
+            .any(|c| c.is_pending());
         assert!(
             !unsettled,
-            "a node's capabilities are still a variable once inference has settled them: `{}`",
+            "a node's capabilities still read a variable once inference has settled them: `{}`",
             symbolic(e)
         );
         e.walk_type_slots(|ty| {
@@ -1762,24 +1762,34 @@ fn assert_capabilities_settled(expr: &Expr) {
 /// [`settle_capabilities`] sharing `memo` across the quoted terms it rewrites. Whether any slot
 /// changed.
 fn settle_capabilities_in(solver: &mut Solver, expr: &mut Expr, memo: &PredMemo) -> bool {
+    settle_capabilities_reading(solver, expr, memo, &mut HashMap::new())
+}
+
+/// [`settle_capabilities_in`], children first: a node's union of its children's capabilities
+/// reads the values they held before settling, each of which `read` holds by then.
+fn settle_capabilities_reading(
+    solver: &mut Solver,
+    expr: &mut Expr,
+    memo: &PredMemo,
+    read: &mut crate::ccl::capabilities::ReadValues,
+) -> bool {
     let mut changed = false;
+    expr.walk_children_mut(|child| {
+        changed |= settle_capabilities_reading(solver, child, memo, read)
+    });
+    expr.walk_type_slots_mut(|ty| {
+        changed |=
+            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
+                settle_capabilities_reading(solver, term, memo, read)
+            });
+    });
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-        let set = match slot.repr() {
-            crate::ccl::capabilities::Repr::Var(v) => v.resolved_set(solver),
-            _ => slot.set_in(solver),
-        };
+        let set = slot.set_reading(solver, read);
         let settled =
             crate::ccl::capabilities::Capabilities::known(set.with_raises_resolved(solver));
         changed |= *slot != settled;
         *slot = settled;
     }
-    expr.walk_type_slots_mut(|ty| {
-        changed |=
-            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
-                settle_capabilities_in(solver, term, memo)
-            });
-    });
-    expr.walk_children_mut(|child| changed |= settle_capabilities_in(solver, child, memo));
     changed
 }
 
@@ -2868,9 +2878,9 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
             // type-inference.md`, "4.9 Capabilities").
             for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-                if let crate::ccl::capabilities::Repr::Var(v) = slot.repr() {
+                if slot.is_pending() {
                     *slot = crate::ccl::capabilities::Capabilities::known(
-                        v.resolved_set(solver).with_raises_resolved(solver),
+                        slot.set_in(solver).with_raises_resolved(solver),
                     );
                 }
             }
