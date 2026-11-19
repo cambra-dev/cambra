@@ -11,7 +11,7 @@
 //! `src/ccl/design/type-inference.md`, "Key timing and precision limits".
 
 use crate::ccl::infer::solver::Solver;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
 
@@ -20,7 +20,8 @@ use crate::ccl::nominal::Variance;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
-use super::compact::{AtomKey, ConsultedNames};
+use super::compact::{AtomKey, COMPONENT_ROUNDS, ConsultedNames, stands_for_a_variable};
+use super::component_walk::{ComponentWalk, Exit};
 use crate::ccl::ty::KindPin;
 
 /// The identity of a use's instantiation, for deciding which uses may share one
@@ -423,36 +424,39 @@ impl fmt::Display for SpecKey {
 /// [`KeyCtx::memo`]'s key: the variable, the polarity and the enclosing binders.
 type KeyMemoKey = (InferVarId, bool, Vec<Option<Name>>);
 
-/// Walk-wide state: the cycle guard, the per-variable memo, and the truncation
-/// counter that decides what may be memoized.
+/// Walk-wide state: the variables being expanded, the per-variable memo, and where the bound
+/// chain being followed started.
 struct KeyCtx {
     /// Variables whose bounds are currently being walked, per polarity — the same
     /// key `compact_type`'s cycle guard uses, and for the same reason: a variable
-    /// legitimately appears at both polarities in one type.
+    /// legitimately appears at both polarities in one type — and the cyclic components of
+    /// the bound graph not yet finished ([`ComponentWalk`]).
     ///
     /// Deliberately coarser than `memo`'s key, which also carries the enclosing
-    /// binders. The two agree because reaching one variable twice in one descent
-    /// *at different enclosing binders* means the walk crossed a function between
-    /// the two arrivals, so the variable occurs under a function in its own bound
-    /// chain — a recursive type, which `coalesce_compact` rejects
-    /// (`CoalesceError::RecursiveType`). The cycles that do occur are var-to-var
-    /// (`?a <: ?b` with `?b <: ?a`), which cross no binder and so re-enter at the
-    /// scope they left. `visiting_scopes` checks that in debug builds.
+    /// binders. The two agree on a cycle along one bound chain (`?a <: ?b` with
+    /// `?b <: ?a`), which crosses no binder and so re-enters at the scope it left;
+    /// `visiting_scopes` checks that in debug builds. Reaching a variable again across a
+    /// structural boundary is a recursive type, which `coalesce_compact` rejects
+    /// (`CoalesceError::RecursiveType`).
     ///
     /// The guard cannot simply take `memo`'s key: it is what bounds the walk, and
     /// a cycle that grew the binder stack on each turn would never repeat a finer
     /// key.
-    visiting: HashSet<(InferVarId, bool)>,
-    /// The enclosing binders each in-flight visit was entered at, so a cut can
-    /// check it is cutting a same-scope re-entry rather than silently coarsening
-    /// the key — the invariant stated on `visiting`.
+    walk: ComponentWalk<(InferVarId, bool), KeyView>,
+    /// The index ([`ComponentWalk::next_index`]) the walk stood at when it last crossed a
+    /// structural boundary: a variable entered at a lower index is behind one, so reaching it
+    /// again is a recursive type rather than a cycle along a bound chain.
+    chain_from: usize,
+    /// The enclosing binders each in-flight visit was entered at, so a back edge can
+    /// check it re-enters at the scope it left — the invariant stated on `walk`.
     #[cfg(debug_assertions)]
     visiting_scopes: HashMap<(InferVarId, bool), Vec<Option<Name>>>,
     /// Barrier variables whose lower bounds are currently being walked, the guard
-    /// `compact_go`'s `BarrierVar` arm runs on the same key: a barrier's lowers are read
-    /// at positive polarity whatever the reference's. A lower reaching its own barrier
-    /// again is a recursive type, so the cut it makes is a truncation as `visiting`'s is.
-    visiting_barriers: HashSet<BarrierVarId>,
+    /// `compact_go`'s `BarrierVar` arm runs on the same key, each with the innermost variable
+    /// being expanded when it was entered: a barrier's lowers are read at positive polarity
+    /// whatever the reference's. A lower reaching its own barrier again is a recursive type:
+    /// the walk truncates it, and no variable from that innermost one up is memoized.
+    visiting_barriers: HashMap<BarrierVarId, Option<usize>>,
     /// Completed keys per `(variable, polarity, enclosing binders)`, each with the
     /// substitution it was reached under, restricted to the names that substitution could
     /// act on below the variable ([`ConsultedNames`]).
@@ -462,17 +466,12 @@ struct KeyCtx {
     /// substitution does to the predicates the walk materializes, which is what its
     /// restriction says. A substitution with a witness half bypasses the memo, as does a
     /// variable whose names are not known.
-    memo: HashMap<KeyMemoKey, Vec<(Subst, KeyView)>>,
+    memo: HashMap<KeyMemoKey, Vec<(Subst, KeyView, usize)>>,
     /// The names below each variable a substitution could act on.
     consulted: ConsultedNames,
     /// How many variables the walk has expanded, for the tests to bound.
     #[cfg(test)]
     visits: usize,
-    /// How many cycle back-edges the walk has dropped. A key computed while a
-    /// truncation occurred inside it is *incomplete* — it is missing whatever the
-    /// back-edge would have contributed — so it must not be memoized. Comparing
-    /// the counter before and after a variable's expansion is what detects that.
-    truncations: usize,
     /// The functions the walk is inside of, and the closing memo over them. The same
     /// type `compact_go` threads, so a key and a compacted type cannot close one
     /// refinement two ways. A refinement lands index-spelled, so two α-variant
@@ -488,13 +487,13 @@ struct KeyCtx {
 /// one point in the pin's lifecycle.
 pub fn spec_key(solver: &mut Solver, ty: &Type) -> SpecKey {
     let mut ctx = KeyCtx {
-        visiting: HashSet::new(),
+        walk: ComponentWalk::new(COMPONENT_ROUNDS),
         #[cfg(debug_assertions)]
         visiting_scopes: HashMap::new(),
-        visiting_barriers: HashSet::new(),
+        visiting_barriers: HashMap::new(),
         memo: HashMap::new(),
         consulted: ConsultedNames::new(),
-        truncations: 0,
+        chain_from: 0,
         scope: RefinementScope::default(),
         #[cfg(test)]
         visits: 0,
@@ -659,10 +658,16 @@ fn key_go(
         // instantiation wherever an opaque-binding function's type does, so two uses whose
         // barrier variables resolve differently clone differently.
         Type::BarrierVar(barrier) => {
-            if !ctx.visiting_barriers.insert(barrier.uid) {
-                ctx.truncations += 1;
+            if let Some(&entered_in) = ctx.visiting_barriers.get(&barrier.uid) {
+                if let Some(from) = entered_in {
+                    ctx.walk.taint_from(from);
+                }
                 return KeyView::default();
             }
+            ctx.visiting_barriers
+                .insert(barrier.uid, ctx.walk.innermost());
+            // The lowers are read as new positions, as `compact_go` reads them.
+            let chain_from = std::mem::replace(&mut ctx.chain_from, ctx.walk.next_index());
             let lowers = barrier.lowers(solver).to_vec();
             let mut acc = KeyView::default();
             for b in &lowers {
@@ -672,6 +677,7 @@ fn key_go(
                 };
                 acc.union(key_go(solver, &b.ty, true, &inner_acc, ctx));
             }
+            ctx.chain_from = chain_from;
             ctx.visiting_barriers.remove(&barrier.uid);
             acc.drop_covariant_refinements(Variance::Covariant);
             acc
@@ -923,30 +929,32 @@ fn key_go(
                     .filter(|reads| !subst_acc.has_witnesses() || !reads.witnesses)
                     .map(|reads| subst_acc.restricted_to(&reads.names))
             };
-            if let Some(under) = &under
-                && let Some((_, k)) = ctx
-                    .memo
-                    .get(&memo_key)
-                    .and_then(|done| done.iter().find(|(at, _)| at == under))
-            {
-                return k.clone();
-            }
-            if !ctx.visiting.insert(visit_key) {
-                // A cycle in the bound graph (`?a <: ?b` and `?b <: ?a` is
-                // ordinary). Drop the back-edge: whatever it would contribute is
-                // already on the path that reached it. Recorded so the partial
-                // result this produces is never cached.
+            if ctx.walk.expanding(&visit_key) {
+                if ctx.walk.entered_at(&visit_key) < ctx.chain_from {
+                    // Reached again across a structural boundary: a recursive type. Truncated,
+                    // and nothing above the variable is memoized.
+                    ctx.walk.recursive_edge(&visit_key);
+                    return KeyView::default();
+                }
+                // A cycle along one bound chain (`?a <: ?b` and `?b <: ?a` is ordinary)
+                // reads the variable's key in its component's last round.
                 #[cfg(debug_assertions)]
                 debug_assert_eq!(
                     ctx.visiting_scopes.get(&visit_key).map(Vec::as_slice),
                     Some(ctx.scope.enclosing()),
-                    "the cycle guard is cutting a re-entry at different enclosing binders, \
-                     so it is coarsening the key the memo distinguishes — that needs the \
-                     variable to occur under a function in its own bound chain, which \
-                     `coalesce_compact` rejects as a recursive type",
+                    "a cycle along one bound chain re-enters at different enclosing binders, \
+                     so the guard is coarsening the key the memo distinguishes",
                 );
-                ctx.truncations += 1;
-                return KeyView::default();
+                return ctx.walk.back_edge(&visit_key).unwrap_or_default();
+            }
+            if let Some(under) = &under
+                && let Some((_, k, index)) = ctx
+                    .memo
+                    .get(&memo_key)
+                    .and_then(|done| done.iter().find(|(at, _, _)| at == under))
+                && ctx.walk.reuse(*index)
+            {
+                return k.clone();
             }
             #[cfg(debug_assertions)]
             ctx.visiting_scopes
@@ -959,28 +967,48 @@ fn key_go(
                 let b = state.bounds(solver);
                 Rc::clone(if pol { b.lower() } else { b.upper() })
             };
-            let truncations_before = ctx.truncations;
-            let mut acc = KeyView::default();
-            for b in bounds.iter() {
-                // Compose the edge's morphism before descending, as `compact_go`
-                // does: a bound reached transitively arrives with every edge's
-                // substitution composed.
-                let inner_acc = {
-                    let rendered = b.render_subst(solver);
-                    Subst::then(solver, &rendered, subst_acc)
-                };
-                acc.union(key_go(solver, &b.ty, pol, &inner_acc, ctx));
-            }
-            ctx.visiting.remove(&visit_key);
+            // A value read under no substitution is the union of its bounds' values, each
+            // carried unchanged ([`ComponentWalk::exit`]).
+            let uniform = under.as_ref().is_some_and(Subst::is_id);
+            let (acc, index, complete) = loop {
+                ctx.walk.enter(visit_key);
+                let mut acc = KeyView::default();
+                for b in bounds.iter() {
+                    // Compose the edge's morphism before descending, as `compact_go`
+                    // does: a bound reached transitively arrives with every edge's
+                    // substitution composed.
+                    let inner_acc = {
+                        let rendered = b.render_subst(solver);
+                        Subst::then(solver, &rendered, subst_acc)
+                    };
+                    // A bound that is not a variable is a structural boundary, behind which
+                    // reaching a variable being expanded is a recursive type.
+                    let chain_from = ctx.chain_from;
+                    if !stands_for_a_variable(&b.ty) {
+                        ctx.chain_from = ctx.walk.next_index();
+                    }
+                    acc.union(key_go(solver, &b.ty, pol, &inner_acc, ctx));
+                    ctx.chain_from = chain_from;
+                }
+                match ctx.walk.exit(&acc, uniform) {
+                    Exit::Done { index, memoizable } => break (acc, index, memoizable),
+                    Exit::Rerun => {}
+                    Exit::Unsettled => panic!(
+                        "a specialization key's values round a cycle of bounds did not settle \
+                         in {COMPONENT_ROUNDS} rounds"
+                    ),
+                }
+            };
             #[cfg(debug_assertions)]
             ctx.visiting_scopes.remove(&visit_key);
             if let Some(under) = under
-                && ctx.truncations == truncations_before
+                && complete
             {
-                ctx.memo
-                    .entry(memo_key)
-                    .or_default()
-                    .push((under, acc.clone()));
+                let entries = ctx.memo.entry(memo_key).or_default();
+                match entries.iter_mut().find(|(at, _, _)| *at == under) {
+                    Some(stale) => *stale = (under, acc.clone(), index),
+                    None => entries.push((under, acc.clone(), index)),
+                }
             }
             acc
         }
@@ -1140,18 +1168,17 @@ mod tests {
         assert_eq!(k.positive, spec_key(solver, &singleton(7)).positive);
     }
 
-    /// A key computed while a cycle back-edge was dropped is **incomplete**, so it
-    /// must not enter the memo — otherwise a later position that reaches the same
-    /// variable from outside the cycle is served the truncated view.
+    /// A key computed inside a cycle is final only once its component settles, so a later
+    /// position that reaches the same variable from outside the cycle is served the
+    /// complete view.
     ///
     /// The shape: `?a` and `?b` are mutually constrained and each carries a
     /// refinement of its own, so each one's *complete* view is both refinements.
-    /// Reached from position 0, `?b` expands with `?a` already on the stack — the
-    /// back-edge is dropped and `?b` sees only its own `2`. Position 1 then asks for
-    /// `?b` directly, where nothing is on the stack and the answer is `{1, 2}`.
-    /// Without [`KeyCtx::truncations`] guarding the insert, the truncated `{2}` is
-    /// cached at position 0 and returned at position 1, and one type has two
-    /// different keys depending on where the walk met it.
+    /// Reached from position 0, `?b` expands with `?a` already on the stack, and in the
+    /// component's first round the back edge to `?a` reads nothing, so `?b` sees only its
+    /// own `2`. Position 1 then asks for `?b` directly, where the answer is `{1, 2}`.
+    /// Memoized from the first round, the `{2}` would be returned at position 1, and one
+    /// type would have two different keys depending on where the walk met it.
     ///
     /// The cycle is built by **writing the bound lists directly** rather than
     /// through [`constrain_subtype`], and that is the point: `constrain_go` keeps
@@ -1161,7 +1188,7 @@ mod tests {
     /// (`Bound::render_subst`), where the transitive copy and the direct one are not
     /// the same contribution.
     #[test]
-    fn a_truncated_expansion_is_not_memoized() {
+    fn a_key_inside_a_cycle_is_memoized_once_its_component_settles() {
         let solver = &mut Solver::new();
         fn push_lower(solver: &mut Solver, var: &Type, ty: Type) {
             let Type::Infer(v) = var else {
@@ -1261,6 +1288,50 @@ mod tests {
             ctx.visits <= nodes,
             "{} expansions for {nodes} variables",
             ctx.visits
+        );
+    }
+
+    /// A cycle of variables reached along many paths is expanded at most twice per variable,
+    /// once in each round of its component: two variables per level, each bounded below by both
+    /// variables of the level below and of the level above, reached along `2ⁿ` paths.
+    #[test]
+    fn a_cycle_reached_along_many_paths_is_expanded_at_most_twice_per_variable() {
+        let solver = &mut Solver::new();
+        let depth = 16;
+        let levels: Vec<[Type; 2]> = (0..depth)
+            .map(|_| [fresh_var(solver, 0), fresh_var(solver, 0)])
+            .collect();
+        let push_lower = |solver: &mut Solver, var: &Type, ty: &Type| {
+            let Type::Infer(v) = var else {
+                unreachable!("fresh_var yields Type::Infer");
+            };
+            v.bounds_mut(solver)
+                .lower_mut()
+                .push(Bound::conc(ty.clone()));
+        };
+        push_lower(solver, &levels[depth - 1][0], &singleton(1));
+        for pair in levels.windows(2) {
+            for above in &pair[0] {
+                for below in &pair[1] {
+                    push_lower(solver, above, below);
+                    push_lower(solver, below, above);
+                }
+            }
+        }
+        let mut ctx = fresh_ctx();
+        let one = key_go(solver, &singleton(1), true, &Subst::id(), &mut fresh_ctx());
+        assert_eq!(
+            key_go(solver, &levels[0][0], true, &Subst::id(), &mut ctx),
+            one
+        );
+        for var in levels.iter().flatten() {
+            assert_eq!(key_go(solver, var, true, &Subst::id(), &mut ctx), one);
+        }
+        assert!(
+            ctx.visits <= 4 * depth,
+            "{} variables expanded for a cycle of {}",
+            ctx.visits,
+            2 * depth
         );
     }
 
@@ -1402,13 +1473,13 @@ mod tests {
 
     fn fresh_ctx() -> KeyCtx {
         KeyCtx {
-            visiting: HashSet::new(),
+            walk: ComponentWalk::new(COMPONENT_ROUNDS),
             #[cfg(debug_assertions)]
             visiting_scopes: HashMap::new(),
-            visiting_barriers: HashSet::new(),
+            visiting_barriers: HashMap::new(),
             memo: HashMap::new(),
             consulted: ConsultedNames::new(),
-            truncations: 0,
+            chain_from: 0,
             scope: RefinementScope::default(),
             visits: 0,
         }
