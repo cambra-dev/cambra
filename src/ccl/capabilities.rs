@@ -117,7 +117,7 @@ impl Hash for OrderableIfRequiredBy {
 
 /// The ordering requirements the run has recorded ([`Requirement::record`]).
 pub(crate) fn order_requirements(solver: &Solver) -> Vec<Requirement> {
-    solver.capability_run.order_requirements.clone()
+    solver.capability_run().order_requirements.clone()
 }
 
 impl Requirement {
@@ -191,7 +191,7 @@ impl Requirement {
         if self.ordering().is_none() {
             return;
         }
-        let rs = &mut solver.capability_run.order_requirements;
+        let rs = &mut solver.capability_run_mut().order_requirements;
         if !rs.contains(self) {
             rs.push(self.clone());
         }
@@ -428,7 +428,7 @@ impl Raised {
     /// variable generalizes into a type parameter, so it is decided as one ([`covers`]).
     /// `None` while the type may still resolve.
     pub(crate) fn decided_type(&self, solver: &mut Solver) -> Option<crate::ccl::Type> {
-        if solver.capability_run.settled {
+        if solver.capability_run().settled {
             crate::ccl::infer::solve::resolve_var_type(solver, &self.ty).ok()
         } else {
             self.resolved(solver)
@@ -1661,16 +1661,15 @@ pub struct Children {
     parts: Vec<(Capabilities, Option<Rc<[crate::ccl::Type]>>)>,
     /// Whether the node is a `with begin():` block, which supplies `Transaction`.
     begin: bool,
-    /// The set the parts union, and the solver and its count of capability facts it was read
-    /// at: still the answer while that solver has written no fact since, as for
+    /// The set the parts union, at the solver and its revision it was read at, as for
     /// [`CapabilityVar::resolved`]. The node holding the union can be shared, and each solver
-    /// counts its own facts, so the count alone names no reading.
-    read_at: RefCell<
-        Option<(
+    /// counts its own facts, so the revision alone names no reading.
+    read_at: crate::ccl::infer::solver::state::Stamped<
+        (
             crate::ccl::infer::solver::state::SolverId,
-            u64,
-            CapabilitySet,
-        )>,
+            crate::ccl::infer::solver::state::CapabilityRevision,
+        ),
+        CapabilitySet,
     >,
 }
 
@@ -1733,20 +1732,18 @@ impl Children {
         Children {
             parts,
             begin,
-            read_at: RefCell::new(None),
+            read_at: Default::default(),
         }
     }
 
     /// The set the parts union, read through [`Capabilities::set`].
     fn set(&self, solver: &mut Solver) -> CapabilitySet {
-        let now = (solver.id(), solver.capability_run.facts);
-        if let Some((id, at, set)) = &*self.read_at.borrow()
-            && (*id, *at) == now
-        {
-            return set.clone();
+        let now = (solver.id(), solver.capability_revision());
+        if let Some(set) = self.read_at.at(&now) {
+            return set;
         }
         let set = self.union(solver, &mut |solver, part| part.set_in(solver));
-        *self.read_at.borrow_mut() = Some((solver.id(), solver.capability_run.facts, set.clone()));
+        self.read_at.store(now, set.clone());
         set
     }
 }
@@ -1961,8 +1958,7 @@ impl Eq for Catch {}
 /// Mark the exceptions' types resolved: a resolution of a capability variable computed before
 /// now may have let through an exception a [`Catch`] stops.
 pub fn exceptions_settled(solver: &mut Solver) {
-    solver.capability_run.settled = true;
-    solver.capability_run.facts += 1;
+    solver.capability_run_mut().settled = true;
 }
 
 impl Catch {
@@ -2056,15 +2052,12 @@ pub(crate) struct CapabilityRun {
     partly_reported: HashSet<(NodeId, String, String)>,
     /// Whether the exceptions' types are settled ([`exceptions_settled`]).
     settled: bool,
-    /// How many facts have been written to capability variables. A resolution computed at the
-    /// current count is still the answer.
-    facts: u64,
 }
 
 /// Each `try` clause of the run taking part of the type of an exception its body
 /// raises, not answered before. Read once the exceptions' types are settled.
 pub(crate) fn partly_caught(solver: &mut Solver) -> Vec<PartlyCaught> {
-    let edges = solver.capability_run.try_edges.clone();
+    let edges = solver.capability_run().try_edges.clone();
     let mut out = Vec::new();
     for (catch, body) in edges {
         for capability in body.resolved(solver) {
@@ -2079,7 +2072,7 @@ pub(crate) fn partly_caught(solver: &mut Solver) -> Vec<PartlyCaught> {
             };
             let clause = catch.clauses[i].clone();
             let key = (catch.node, clause.to_string(), ty.to_string());
-            if solver.capability_run.partly_reported.insert(key) {
+            if solver.capability_run_mut().partly_reported.insert(key) {
                 out.push(PartlyCaught {
                     node: catch.node,
                     clause,
@@ -2208,7 +2201,12 @@ pub(crate) struct CapabilityState {
     level: Level,
     own: BTreeSet<ScopedCapability>,
     incoming: Vec<(Rc<CapabilityVar>, Filter)>,
-    resolved_at: Option<(u64, BTreeSet<ScopedCapability>)>,
+    /// [`CapabilityVar::resolved`]'s answer, at the revision it was computed at
+    /// ([`Solver::capability_revision`]).
+    resolved_at: crate::ccl::infer::solver::state::Stamped<
+        crate::ccl::infer::solver::state::CapabilityRevision,
+        BTreeSet<ScopedCapability>,
+    >,
     /// The sets this variable may not exceed, checked once emission is complete
     /// ([`exceeded_uppers`]).
     uppers: Vec<Upper>,
@@ -2336,7 +2334,7 @@ fn admitted(solver: &mut Solver, written: &[Upper], capability: &ScopedCapabilit
               and a trait hashes and orders by its module path and name"
 )]
 pub(crate) fn exceeded_uppers(solver: &mut Solver) -> Vec<Exceeded> {
-    let vars = solver.capability_run.bounded.clone();
+    let vars = solver.capability_run().bounded.clone();
     let mut out = Vec::new();
     for var in vars {
         let capabilities = var.resolved_unstopped(solver);
@@ -2389,10 +2387,6 @@ impl CapabilityVar {
     pub(crate) fn set_open_input(&self, solver: &mut Solver, open: bool) {
         if self.state(solver).open_input != open {
             self.state_mut(solver).open_input = open;
-            // Whether an ordering requirement over this variable is satisfied reads it
-            // (`has_open_ordering_input`), so a union of children that read the requirement as
-            // satisfied before ([`Children`]) is no longer the answer.
-            solver.capability_run.facts += 1;
         }
     }
 
@@ -2543,12 +2537,9 @@ impl CapabilityVar {
         }
         let first = uppers.is_empty();
         if first {
-            solver.capability_run.bounded.push(Rc::clone(self));
+            solver.capability_run_mut().bounded.push(Rc::clone(self));
         }
         self.state_mut(solver).uppers.push(upper);
-        // A written bound stops what this variable passes on, so a resolution read before it is
-        // no longer the answer.
-        solver.capability_run.facts += 1;
     }
 
     /// The sets bounding this variable.
@@ -2585,9 +2576,7 @@ impl CapabilityVar {
 
     /// Record `capability` on this variable.
     pub fn record(&self, solver: &mut Solver, capability: ScopedCapability) {
-        if self.state_mut(solver).own.insert(capability) {
-            solver.capability_run.facts += 1;
-        }
+        self.state_mut(solver).own.insert(capability);
     }
 
     /// Record that what `source` holds, through `filter`, is held here too.
@@ -2603,14 +2592,13 @@ impl CapabilityVar {
         {
             if let Some(catch) = &filter.catches {
                 solver
-                    .capability_run
+                    .capability_run_mut()
                     .try_edges
                     .push((Rc::clone(catch), Rc::clone(source)));
             }
             self.state_mut(solver)
                 .incoming
                 .push((Rc::clone(source), filter));
-            solver.capability_run.facts += 1;
         }
     }
 
@@ -2683,13 +2671,12 @@ impl CapabilityVar {
                 .cloned()
                 .collect::<BTreeSet<_>>()
         };
-        let now = solver.capability_run.facts;
-        if let Some((at, capabilities)) = &self.state(solver).resolved_at
-            && direction.is_none()
+        let now = solver.capability_revision();
+        if direction.is_none()
             && stop
-            && *at == now
+            && let Some(capabilities) = self.state(solver).resolved_at.at(&now)
         {
-            return capabilities.clone();
+            return capabilities;
         }
         // The variables reaching this one, each with the edges into it. A worklist
         // fixpoint, since edges can form cycles and two paths can filter differently.
@@ -2760,7 +2747,7 @@ impl CapabilityVar {
             let written = self.written_uppers(solver);
             out.retain(|l| admitted(solver, &written, l));
             if direction.is_none() {
-                self.state_mut(solver).resolved_at = Some((now, out.clone()));
+                self.state(solver).resolved_at.store(now, out.clone());
             }
         }
         out
@@ -3738,6 +3725,34 @@ mod tests {
 
         input.set_open_input(solver, true);
         assert!(union.set_in(solver).requires.contains(&order));
+    }
+
+    /// A capability variable's resolution reads the funkind variable an edge's filter waits on,
+    /// so a resolution read before the kind is stamped data is not served after.
+    #[test]
+    fn stamping_a_kind_unsettles_a_resolution_read_before() {
+        let solver = &mut Solver::new();
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let source = CapabilityVar::fresh(solver, 0);
+        let downstream = CapabilityVar::fresh(solver, 0);
+        downstream.flows_from(
+            solver,
+            &source,
+            Filter {
+                when_data: Some(Rc::clone(&kind)),
+                ..Filter::default()
+            },
+        );
+        let appended = ScopedCapability {
+            item: write("x"),
+            bound: Bound::Escaping,
+            at: None,
+        };
+        source.record(solver, appended.clone());
+        assert!(!downstream.resolved(solver).contains(&appended));
+
+        kind.stamp_data(solver);
+        assert!(downstream.resolved(solver).contains(&appended));
     }
 
     /// `Effect` and `Context` hold every capability of their direction, a family's top every
