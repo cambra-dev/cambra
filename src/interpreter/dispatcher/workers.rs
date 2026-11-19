@@ -1,13 +1,15 @@
-//! Shared native breaker execution: worker threads that claim the packages of admitted pipelines
-//! from the run's dispatcher. See `src/interpreter/design-dispatcher.md`, "Shared native pipeline
-//! execution".
+//! Shared native breaker execution: worker threads that claim every package and every finish from
+//! the run's dispatcher, beside the coordinator. See `src/interpreter/design-dispatcher.md`,
+//! "Shared native pipeline execution".
+use super::plan::Execution;
 use super::*;
 use crate::interpreter::CurryLevel;
+use std::sync::MutexGuard;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::thread::{Scope, ScopedJoinHandle};
 
-/// An admitted pipeline's breaker and the level its claims partition.
+/// A partitioned pipeline's breaker and the level its claims partition.
 struct Spec {
     target: BreakerHandle,
     level: CurryLevel,
@@ -26,13 +28,30 @@ struct Stats {
     incremental: AtomicUsize,
 }
 
-/// The run's worker threads, and which pipelines they claim from.
+/// What a thread's claim did ([`WorkerPool::run_next`]).
+pub(super) enum Claimed {
+    /// It ran a package or a finish.
+    Ran,
+    /// Nothing was claimable since the generation.
+    Wait(Generation),
+    Done,
+    Failed,
+}
+
+/// The run's worker threads, and which pipelines several of them consume at once.
 pub(super) struct WorkerPool {
-    /// How many workers the run has; with one, the coordinator claims everything and no thread
-    /// starts.
+    /// How many threads the run has, the coordinator included: it starts one fewer worker thread.
+    /// With one, the coordinator claims everything and no thread starts.
     count: usize,
-    /// Per pipeline, its breaker and level where the pipeline is admitted.
+    /// Per pipeline, its breaker and level where several claims consume it at once.
     specs: Vec<Option<Spec>>,
+    /// Held by the thread that runs serial work: a package or a finish of a pipeline that is not
+    /// partitioned, a finish of one that is, and the coordinator's resume pass and live polling.
+    /// Serial work runs one claim at a time, in claim order, on any thread, as the coordinator
+    /// alone ran it before workers claimed it; only this lock's holder takes a store's blocking
+    /// `write`.
+    // shared-state-ok: a lock that orders serial work between the run's threads, holding no data.
+    serial: Mutex<()>,
     /// Set where the system refused every worker thread: the coordinator claims everything.
     unstarted: AtomicBool,
     #[cfg(test)]
@@ -72,28 +91,85 @@ impl WorkerPool {
             #[cfg(test)]
             stats: (0..specs.len()).map(|_| Stats::default()).collect(),
             specs,
+            serial: Mutex::new(()),
             unstarted: AtomicBool::new(false),
         }
     }
 
-    /// Whether the run starts worker threads: more than one worker, and a pipeline for them.
+    /// Whether the run starts worker threads: more than one worker, and a partitioned pipeline.
+    /// Without one, every claim is serial work, which another thread would only wait to run.
     fn threaded(&self) -> bool {
         self.count > 1 && self.specs.iter().any(Option::is_some)
     }
 
-    /// Whether `pipeline`'s packages are the workers' to claim.
-    fn admits(&self, pipeline: PipelineId) -> bool {
+    /// Whether several claims of `pipeline` consume it at once, outside the serial lock. With one
+    /// thread every package is serial work.
+    fn partitioned(&self, pipeline: PipelineId) -> bool {
         self.threaded()
             && !self.unstarted.load(Ordering::SeqCst)
             && self.specs.get(pipeline.0).is_some_and(Option::is_some)
     }
 
+    /// The serial lock: a panic while it is held fails the run, so a poisoned lock is taken as is.
+    pub(super) fn serial(&self) -> MutexGuard<'_, ()> {
+        self.serial.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Claim and run the next package or finish: a package of a partitioned pipeline without the
+    /// serial lock, then serial work under it. [`Claimed::Wait`] answers a generation taken before
+    /// either claim, so a wait on it misses nothing that became claimable since.
+    pub(super) fn run_next(
+        &self,
+        dispatcher: &Dispatcher,
+        execution: &Execution,
+        reach: &mut Reach<'_>,
+        preferred: &mut Option<PipelineId>,
+        #[cfg_attr(not(test), allow(unused_variables))] worker: usize,
+    ) -> Claimed {
+        let generation =
+            match dispatcher.try_claim_where(*preferred, &|p| self.partitioned(p), false) {
+                Next::Package(package) => {
+                    *preferred = Some(package.pipeline);
+                    #[cfg(test)]
+                    self.count_claim(dispatcher, &package, worker);
+                    self.consume(dispatcher, package);
+                    return Claimed::Ran;
+                }
+                Next::Wait(generation) => generation,
+                Next::Done => return Claimed::Done,
+                Next::Failed => return Claimed::Failed,
+                Next::Finish { .. } => unreachable!("a claim without finishes answers none"),
+            };
+        let _serial = self.serial();
+        match dispatcher.try_claim_where(None, &|p| !self.partitioned(p), true) {
+            Next::Package(package) => {
+                execution.consume(dispatcher, reach, package);
+                // The coordinator, waiting for the serial lock to decide whether the run is
+                // stalled, sees this claim's progress in the generation.
+                dispatcher.wake_claimants();
+                Claimed::Ran
+            }
+            Next::Finish { pipeline, consumed } => {
+                self.finishing(pipeline, reach);
+                execution.finish(dispatcher, reach, pipeline, consumed);
+                dispatcher.wake_claimants();
+                Claimed::Ran
+            }
+            Next::Wait(_) => Claimed::Wait(generation),
+            Next::Done => Claimed::Done,
+            Next::Failed => Claimed::Failed,
+        }
+    }
+
     /// Start the workers in `scope`. Each claims until the run is done, has failed, or its claims
-    /// are stopped. [`join`](Self::join) takes the handles.
+    /// are stopped, and reaches breakers through `root` as the coordinator does.
+    /// [`join`](Self::join) takes the handles.
     pub(super) fn spawn<'scope, 'env>(
         &'env self,
         scope: &'scope Scope<'scope, 'env>,
         dispatcher: &'env Dispatcher,
+        execution: &'env Execution,
+        root: &'env SharedReach<'env>,
     ) -> Vec<ScopedJoinHandle<'scope, ()>> {
         if !self.threaded() {
             return Vec::new();
@@ -101,9 +177,10 @@ impl WorkerPool {
         // A thread the system refuses leaves the run with the workers it has. Panicking instead
         // would leave the workers already started asleep, and the scope waiting for them.
         let mut handles = Vec::new();
-        for worker in 0..self.count {
-            match thread::Builder::new().spawn_scoped(scope, move || self.work(dispatcher, worker))
-            {
+        for worker in 0..self.count - 1 {
+            match thread::Builder::new().spawn_scoped(scope, move || {
+                self.work(dispatcher, execution, root, worker)
+            }) {
                 Ok(handle) => handles.push(handle),
                 Err(_) => break,
             }
@@ -114,26 +191,26 @@ impl WorkerPool {
         handles
     }
 
-    /// One worker's claims: consume, publish and acknowledge each package of an admitted pipeline.
-    fn work(&self, dispatcher: &Dispatcher, worker: usize) {
-        #[cfg(not(test))]
-        let _ = worker;
+    /// One worker's claims: every package and every finish, until the run ends.
+    fn work(
+        &self,
+        dispatcher: &Dispatcher,
+        execution: &Execution,
+        root: &SharedReach<'_>,
+        worker: usize,
+    ) {
         in_a_run(|| {
             // A panic fails the run, so no claimant waits for what this worker held.
             let _worker = dispatcher.worker();
+            let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
+                execution.reach(pipeline, root, call);
+            };
             let mut preferred = None;
             loop {
-                match dispatcher.claim_where(preferred, &|pipeline| self.admits(pipeline)) {
-                    Next::Package(package) => {
-                        preferred = Some(package.pipeline);
-                        #[cfg(test)]
-                        self.count_claim(dispatcher, &package, worker);
-                        self.consume(dispatcher, package);
-                    }
-                    Next::Done | Next::Failed => return,
-                    Next::Finish { .. } | Next::Wait(_) => {
-                        unreachable!("a worker's blocking claim takes packages and no finish")
-                    }
+                match self.run_next(dispatcher, execution, &mut reach, &mut preferred, worker) {
+                    Claimed::Ran => {}
+                    Claimed::Wait(generation) => dispatcher.wait(generation),
+                    Claimed::Done | Claimed::Failed => return,
                 }
             }
         });
@@ -145,7 +222,7 @@ impl WorkerPool {
         let pipeline = package.pipeline;
         let spec = self.specs[pipeline.0]
             .as_ref()
-            .expect("a worker claims only admitted pipelines");
+            .expect("a claim outside the serial lock is of a partitioned pipeline");
         let target = &spec.target;
         {
             let breaker = target.read().unwrap_or_else(PoisonError::into_inner);
@@ -161,7 +238,7 @@ impl WorkerPool {
         }
         // Exclusive, so the push sees no consume between the merge of its rows and the release of
         // its input, which the readers it wakes rely on. A breaker that publishes only at its
-        // finish or in the resume pass pushes nothing here, as on the coordinator
+        // finish or in the resume pass pushes nothing here, as in serial work
         // (`consume_with`).
         let pushes = {
             let breaker = target.write().unwrap_or_else(PoisonError::into_inner);
@@ -202,18 +279,20 @@ impl WorkerPool {
         }
     }
 
-    /// The coordinator's next claim: every package of a pipeline the workers do not claim, and
-    /// every finish.
-    pub(super) fn next(&self, dispatcher: &Dispatcher) -> Next {
-        dispatcher.try_claim_where(None, &|pipeline| !self.admits(pipeline), true)
+    /// The index [`run_next`](Self::run_next) counts the coordinator's claims under, after the
+    /// worker threads'.
+    pub(super) fn coordinator(&self) -> usize {
+        self.count - 1
     }
 
-    /// Whether a worker holds or can claim a package: the coordinator waits for the workers rather
-    /// than deciding the run is stalled.
+    /// Whether a package of a partitioned pipeline is in flight or claimable: the coordinator,
+    /// finding nothing to claim, waits for it rather than deciding the run is stalled. Asked
+    /// under the serial lock, where no serial claim is running, it misses no running claim; one
+    /// that ends wakes the claimants ([`consume`](Self::consume)).
     pub(super) fn may_progress(&self, dispatcher: &Dispatcher) -> bool {
         self.threaded()
             && !self.unstarted.load(Ordering::SeqCst)
-            && dispatcher.may_claim_where(&|pipeline| self.admits(pipeline))
+            && dispatcher.may_claim_where(&|pipeline| self.partitioned(pipeline))
     }
 
     pub(super) fn start_source(
@@ -252,7 +331,7 @@ impl WorkerPool {
         }
     }
 
-    /// Before the coordinator finishes an admitted pipeline, release its input whole.
+    /// Before a partitioned pipeline finishes, release its input whole.
     pub(super) fn finishing(&self, p: PipelineId, reach: &mut Reach<'_>) {
         if self.specs.get(p.0).is_some_and(Option::is_some) {
             reach(p, &mut |breaker, _| breaker.finish_parallel_input());
@@ -361,7 +440,7 @@ mod tests {
         );
     }
     /// A `:=` loop over a collection the workers build answers at more than one worker what it
-    /// answers at one: its body runs on the coordinator, and its source on the workers.
+    /// answers at one: its body runs as serial work, and its source's packages are partitioned.
     #[test]
     fn a_loop_answers_at_each_dop_what_it_answers_at_one() {
         let values = (0..512)

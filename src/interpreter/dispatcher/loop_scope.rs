@@ -929,11 +929,11 @@ mod tests {
         }
 
         fn tick(&self) -> Option<PipelineId> {
-            let mut root = |_: PipelineId, _: &mut Call<'_>| {
+            let root = |_: PipelineId, _: &mut Call<'_>| {
                 panic!("the test's pipelines all belong to its induction run");
             };
             let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-                self.execution.reach(pipeline, &mut root, call);
+                self.execution.reach(pipeline, &root, call);
             };
             match self.dispatcher.try_claim(None) {
                 Next::Package(package) => {

@@ -1563,10 +1563,10 @@ impl Dispatcher {
             .expect("a pipeline that reads its input again knows its input");
         let queue = &self.states[reader].queue;
         let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // The coordinator alone consumes a pipeline that is queued reads again and every pipeline
-        // it reads (the pool admits none of them), one package at a time, so a change reaches a
-        // reader while no read of that reader is consumed, and two reads of one open row never
-        // run at once.
+        // A pipeline that is queued reads again and every pipeline it reads run as serial work,
+        // which claims and runs one package at a time under one lock (`WorkerPool::run_next`), so
+        // a change reaches a reader while no read of that reader is consumed, and two reads of
+        // one open row never run at once.
         debug_assert!(
             !state
                 .in_flight
@@ -1976,8 +1976,8 @@ impl Dispatcher {
 
     /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
     /// and to no finish where `finishes` is false: a claimant that runs only some breakers, as a
-    /// worker of the pool runs the admitted ones. After [`stop_claims`](Self::stop_claims) it
-    /// answers [`Next::Done`].
+    /// thread of the pool claims partitioned packages apart from serial work. After
+    /// [`stop_claims`](Self::stop_claims) it answers [`Next::Done`].
     pub(crate) fn try_claim_where(
         &self,
         preferred: Option<PipelineId>,
@@ -2024,21 +2024,6 @@ impl Dispatcher {
     pub fn claim(&self, preferred: Option<PipelineId>) -> Next {
         loop {
             match self.try_claim(preferred) {
-                Next::Wait(generation) => self.wait(generation),
-                next => return next,
-            }
-        }
-    }
-
-    /// [`try_claim_where`](Self::try_claim_where) with no finish, blocking while there is nothing
-    /// to claim, as [`claim`](Self::claim) does.
-    pub(crate) fn claim_where(
-        &self,
-        preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-    ) -> Next {
-        loop {
-            match self.try_claim_where(preferred, takes, false) {
                 Next::Wait(generation) => self.wait(generation),
                 next => return next,
             }
@@ -3547,6 +3532,9 @@ pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &C, region: &Proje
 /// Each pipeline's breaker, reached for one call at a time: through a handle ([`handles`]), or by
 /// walking a compiled program's producer chains (`run_program`).
 type Reach<'r> = dyn FnMut(PipelineId, &mut Call<'_>) + 'r;
+
+/// A [`Reach`] every thread of a run shares: it borrows breakers through their own locks.
+type SharedReach<'r> = dyn Fn(PipelineId, &mut Call<'_>) + Sync + 'r;
 
 /// One call on a pipeline's breaker, which a [`Reach`] makes, with the input of the breaker the
 /// pipeline consumes.

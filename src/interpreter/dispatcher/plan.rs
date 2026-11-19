@@ -9,7 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
-use super::workers::WorkerPool;
+use super::workers::{Claimed, WorkerPool};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -878,9 +878,10 @@ fn run_targets(
     // `Dispatcher::take_arrivals` requires that no queue holds a package, and attaching a writer
     // calls it for the writer's step, so the start regions are queued after every writer attaches.
     queue_starts(&dispatcher, &start_regions);
-    let mut root_reach = reach;
+    let root_reach = reach;
+    let root_reach: &SharedReach<'_> = &root_reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-        execution.reach(pipeline, &mut root_reach, call);
+        execution.reach(pipeline, root_reach, call);
     };
     let worker_targets: Vec<Option<BreakerHandle>> = execution
         .handlers
@@ -896,15 +897,15 @@ fn run_targets(
         })
         .collect();
     let consuming: Vec<BreakerHandle> = worker_targets.iter().flatten().cloned().collect();
-    // The pool admits no pipeline that is queued reads again, and none such a pipeline reads,
-    // transitively (`src/interpreter/design-dispatcher.md`, "Reading a widened input again"). The
-    // coordinator consumes a read again one at a time and lands the change it pushes. A read again
-    // reads its input whole, and what it reads beneath it reaches it through the regions those
-    // pipelines push, which a worker's packages push keyed rather than widened. The pipelines
-    // queued reads again are the readers that read their input again at a widened push, and the
-    // live pipelines notified of their whole input whose breaker reads an open input
+    // No pipeline that is queued reads again is partitioned, and none such a pipeline reads,
+    // transitively (`src/interpreter/design-dispatcher.md`, "Reading a widened input again"): they
+    // run as serial work, one claim at a time, and a read again lands the change it pushes. A read
+    // again reads its input whole, and what it reads beneath it reaches it through the regions
+    // those pipelines push, which partitioned packages push keyed rather than widened. The
+    // pipelines queued reads again are the readers that read their input again at a widened push,
+    // and the live pipelines notified of their whole input whose breaker reads an open input
     // (`LivePipeline`).
-    let mut coordinator_only: Vec<bool> = (0..worker_targets.len())
+    let mut serial_only: Vec<bool> = (0..worker_targets.len())
         .map(|p| {
             // A body's pipelines come after the program's, which alone are planned live.
             dispatcher.infos[p].whole_input.is_some()
@@ -914,37 +915,37 @@ fn run_targets(
                     && reads_open_input(&mut reach, PipelineId(p)))
         })
         .collect();
-    let mut beneath: Vec<usize> = (0..coordinator_only.len())
-        .filter(|&p| coordinator_only[p])
-        .collect();
+    let mut beneath: Vec<usize> = (0..serial_only.len()).filter(|&p| serial_only[p]).collect();
     while let Some(p) = beneath.pop() {
         for &read in &dispatcher.infos[p].reads {
-            if !coordinator_only[read] {
-                coordinator_only[read] = true;
+            if !serial_only[read] {
+                serial_only[read] = true;
                 beneath.push(read);
             }
         }
     }
     let worker_targets = worker_targets
         .into_iter()
-        .zip(coordinator_only)
-        .map(|(target, coordinator_only)| {
-            target.filter(|handle| {
-                !coordinator_only && chain_restates_parallel_level(handle, &consuming)
-            })
+        .zip(serial_only)
+        .map(|(target, serial_only)| {
+            target
+                .filter(|handle| !serial_only && chain_restates_parallel_level(handle, &consuming))
         })
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
     let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
     let done = thread::scope(|scope| {
-        let threads = workers.spawn(scope, &dispatcher);
+        let threads = workers.spawn(scope, &dispatcher, &execution, root_reach);
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
         // coordinator can go on to panic over the state the worker left.
         let coordinator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // A panic here fails the run, so the workers stop rather than wait for the coordinator.
             let _coordinator = dispatcher.worker();
             in_a_run(|| {
-                // A range over a static extent has completed every key from the start.
+                // A range over a static extent has completed every key from the start. Its
+                // landing is the run's control, which runs under the serial lock: the workers
+                // already claim serial work.
+                let serial = workers.serial();
                 for (pipeline, ranges) in members.leaves.iter().enumerate() {
                     for (range, _) in ranges {
                         dispatcher.land_range_complete(
@@ -954,6 +955,7 @@ fn run_targets(
                         );
                     }
                 }
+                drop(serial);
                 match live.is_empty() {
                     true => {
                         execution.drive(&dispatcher, &mut reach, &workers);
@@ -1256,7 +1258,7 @@ impl Scope {
             return true;
         }
         // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
-        // The step's hold is read first: a worker's claim of the body after it holds the
+        // The step's hold is read first: a partitioned claim of the body after it holds the
         // followers again, so the release below fails rather than pass output this pass missed.
         let (pipelines, hold) = match self {
             Scope::Loop(store) => {
@@ -1400,7 +1402,7 @@ impl Execution {
         induction(store).decide_through_drive(pipeline);
     }
 
-    pub(super) fn reach(&self, pipeline: PipelineId, root: &mut Reach<'_>, call: &mut Call<'_>) {
+    pub(super) fn reach(&self, pipeline: PipelineId, root: &SharedReach<'_>, call: &mut Call<'_>) {
         match &self.handlers[pipeline.0] {
             Handler::Root => root(pipeline, call),
             Handler::Body(handle) => call(
@@ -1554,6 +1556,7 @@ impl Execution {
     }
 
     fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, workers: &WorkerPool) {
+        let serial = workers.serial();
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
                 let mut input = None;
@@ -1569,23 +1572,25 @@ impl Execution {
                 );
             }
         }
+        drop(serial);
+        let mut preferred = None;
+        let coordinator = workers.coordinator();
         loop {
-            match workers.next(dispatcher) {
-                Next::Package(package) => self.consume(dispatcher, reach, package),
-                Next::Finish { pipeline, consumed } => {
-                    workers.finishing(pipeline, reach);
-                    self.finish(dispatcher, reach, pipeline, consumed)
-                }
-                Next::Wait(generation) if workers.may_progress(dispatcher) => {
-                    dispatcher.wait(generation)
-                }
-                Next::Wait(_) if self.resume(dispatcher, reach) => {}
-                Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
-                Next::Wait(_) => {
-                    panic!("an acyclic run with no pending loop has a pipeline that may finish")
+            match workers.run_next(dispatcher, self, reach, &mut preferred, coordinator) {
+                Claimed::Ran => {}
+                Claimed::Wait(generation) => {
+                    let serial = workers.serial();
+                    if workers.may_progress(dispatcher) {
+                        drop(serial);
+                        dispatcher.wait(generation);
+                    } else if !self.resume(dispatcher, reach)
+                        && !dispatcher.changed_since(&generation)
+                    {
+                        panic!("an acyclic run with no pending loop has a pipeline that may finish")
+                    }
                 }
                 // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Done | Next::Failed => return,
+                Claimed::Done | Claimed::Failed => return,
             }
         }
     }
@@ -1956,10 +1961,11 @@ enum TargetEntry {
 /// What [`run_program`] planned for one pipeline.
 #[cfg_attr(test, derive(Debug))]
 pub struct Planned {
-    /// Claims the worker pool consumed, for the pool's tests.
+    /// Partitioned claims any thread consumed, for the pool's tests.
     #[cfg(test)]
     pub worker_claims: usize,
-    /// Pool threads that consumed at least one claim, for the pool's tests.
+    /// Threads, the coordinator included, that consumed at least one partitioned claim, for the
+    /// pool's tests.
     #[cfg(test)]
     pub workers_used: usize,
     /// Claims submitted before a producing dependency finished, for the pool's tests.
@@ -3321,7 +3327,7 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
 
 /// Whether every operator the chain under `breaker` pulls restates the keys of the breaker's
 /// [`Breaker::parallel_level`](crate::interpreter::tile_operators::Breaker::parallel_level). The
-/// worker pool seeds an admitted pipeline at that level (`WorkerPool::start_source`), and the
+/// worker pool seeds a partitioned pipeline at that level (`WorkerPool::start_source`), and the
 /// level answers for the breaker's immediate input only: an operator deeper in the chain can
 /// refuse the keys its consumer restates. `true` for a breaker with no parallel level.
 fn chain_restates_parallel_level(breaker: &BreakerHandle, consuming: &[BreakerHandle]) -> bool {
@@ -3707,6 +3713,7 @@ fn drive_live(
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
+    let serial = workers.serial();
     for (pipeline, info) in dispatcher.infos.iter().take(execution.roots).enumerate() {
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
             let mut input = None;
@@ -3720,7 +3727,11 @@ fn drive_live(
     // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
     // and the run has no finish before its sources close, so each pushes what it holds first.
     execution.push_held(dispatcher, reach);
+    drop(serial);
+    let mut preferred = None;
+    let coordinator = workers.coordinator();
     loop {
+        let serial = workers.serial();
         let mut sources: Vec<LiveSource> = Vec::new();
         for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
             leaf.extent.for_each_source(&mut |source| {
@@ -3740,19 +3751,21 @@ fn drive_live(
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, reach);
         }
+        drop(serial);
         loop {
-            match workers.next(dispatcher) {
-                Next::Package(package) => execution.consume(dispatcher, reach, package),
-                Next::Finish { pipeline, consumed } => {
-                    workers.finishing(pipeline, reach);
-                    execution.finish(dispatcher, reach, pipeline, consumed)
-                }
-                Next::Wait(generation) if workers.may_progress(dispatcher) => {
-                    dispatcher.wait(generation)
-                }
-                Next::Wait(_) if execution.resume(dispatcher, reach) => {}
-                Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
-                Next::Wait(_) => {
+            match workers.run_next(dispatcher, execution, reach, &mut preferred, coordinator) {
+                Claimed::Ran => {}
+                Claimed::Wait(generation) => {
+                    let serial = workers.serial();
+                    if workers.may_progress(dispatcher) {
+                        drop(serial);
+                        dispatcher.wait(generation);
+                        continue;
+                    }
+                    if execution.resume(dispatcher, reach) || dispatcher.changed_since(&generation)
+                    {
+                        continue;
+                    }
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
                     // once every source yields everything: it pushes what it completed here, and the
                     // pass runs on while that brings anything.
@@ -3767,9 +3780,9 @@ fn drive_live(
                     );
                     break;
                 }
-                Next::Done => return true,
+                Claimed::Done => return true,
                 // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Failed => return false,
+                Claimed::Failed => return false,
             }
         }
         #[cfg(debug_assertions)]
@@ -4075,11 +4088,11 @@ mod tests {
         for reader in [2, 3] {
             dispatcher.hold_pipeline(PipelineId(reader), true);
         }
-        let mut root = |_: PipelineId, _: &mut Call<'_>| {
+        let root = |_: PipelineId, _: &mut Call<'_>| {
             panic!("the test's ordinary readers stay held");
         };
         let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-            execution.reach(pipeline, &mut root, call);
+            execution.reach(pipeline, &root, call);
         };
         for _ in 0..2 {
             let Next::Package(package) = dispatcher.try_claim(None) else {

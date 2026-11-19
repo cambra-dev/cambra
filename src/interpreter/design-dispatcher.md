@@ -270,12 +270,12 @@ nothing as pushed. The operators on its way learn of it as of a delivery and mar
 dirty.
 
 No read again is queued while one of the same pipeline waits unclaimed, since that one reads
-whatever arrived before its claim. The coordinator consumes every pipeline that is queued reads
-again and every pipeline such a pipeline reads, transitively, one package at a time; the worker pool
-admits none of them ([Who claims what](#who-claims-what)). So no two reads of one open row run at
-once. The pipelines beneath stay off the pool too because a read again reads its input whole, and
-what lies beneath it reaches it through the regions those pipelines push, which a worker's packages
-push keyed rather than widened.
+whatever arrived before its claim. No pipeline that is queued reads again is partitioned, and no
+pipeline such a pipeline reads, transitively ([Who claims what](#who-claims-what)): they run as
+serial work, one claim at a time. So no two reads of one open row run at once. The pipelines
+beneath are serial too because a read again reads its input whole, and what lies beneath it reaches
+it through the regions those pipelines push, which partitioned packages push keyed rather than
+widened.
 
 Every widened pipeline also reads its input once every source yields everything, held until the
 inputs it waits for have completed it. That read carries the obligation the finish checks: it takes
@@ -437,7 +437,9 @@ queue storage mechanics are documented beside their implementation in `dispatche
 A run that names no number of workers takes `CAMBRA_LOCAL_DOP`, or one where it is unset
 (`default_workers`). `run_program_with_workers` names the number for one run, as a parameter.
 All runs use the same planner, dispatcher queues and native breakers. With one worker the run starts
-no thread and the coordinator claims every package and every finish itself.
+no thread and the coordinator claims every package and every finish itself. With more, every thread
+claims every pipeline's packages and finishes through the same handlers
+([Who claims what](#who-claims-what)).
 
 A pipeline owns its subscribed non-breaker producer chain. Its upstream breaker readers share
 canonical breaker handles. Workers retain those handles and call the existing breaker's immutable
@@ -452,7 +454,7 @@ and every pipeline it reads, transitively: a loop runs its positions in order an
 none of whose positions is next as one that only closes absent positions, so its input is published
 in position order, one package in flight per pipeline. The store's step reads the body and seeds no
 ordering, so the body is not ordered by this. Control scopes, sinks, and shapes without independent
-position projections keep their coordinator handlers.
+position projections run as serial work.
 
 A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
 `TestSink` merges them in arrival order and reads the merged value in key order
@@ -469,7 +471,18 @@ consumed input through the existing producer chain.
 
 ### Who claims what
 
-A pipeline is **admitted** when all of these hold:
+A run of 𝑛 workers has 𝑛 threads: the coordinator and 𝑛 − 1 worker threads it starts. With
+more than one, every thread claims every package and every finish (`WorkerPool::run_next`). A claim is one of two
+kinds:
+
+- A package of a **partitioned** pipeline runs without a lock, several at once
+  ([A partitioned claim](#a-partitioned-claim)).
+- Everything else is **serial work**, run under `WorkerPool`'s serial lock: a package of a pipeline
+  that is not partitioned, every finish, the loop and transaction scopes' requests and steps, and
+  sinks. A thread takes the lock, claims, and runs the claim before it releases the lock, so serial
+  work runs one claim at a time, in claim order, on any thread.
+
+A pipeline is partitioned when all of these hold:
 
 - It is a pipeline of the program over a chain or a pipeline of a loop's or transaction writer's
   body.
@@ -481,20 +494,15 @@ A pipeline is **admitted** when all of these hold:
   read their input again at a widened push, and the live pipelines notified of their whole input
   whose breaker reads an open input.
 
-With more than one worker, the run starts that many worker threads, and two kinds of claimant share
-the dispatcher:
+The coordinator also runs the run's control under the serial lock: the start of each source, the
+resume pass ([A loop in rounds](#a-loop-in-rounds)), the polling of live sources and the stall check
+([Waiting and stalls](#waiting-and-stalls)).
 
-- A worker claims packages of admitted pipelines only, and never a finish
-  (`Dispatcher::claim_where`). It sleeps in `Dispatcher::wait` while none is claimable.
-- The coordinator claims every other package and every finish (`Dispatcher::try_claim_where`). It
-  runs the loop and transaction scopes, sinks and breakers that are not admitted, every finish, the
-  resume pass ([A loop in rounds](#a-loop-in-rounds)) and the polling of live sources.
+### A partitioned claim
 
-### A worker's claim
+A thread consumes, publishes and acknowledges a partitioned claim, in that order:
 
-A worker consumes, publishes and acknowledges its own claim, in that order:
-
-1. It calls `consume_impl` under the breaker's handle held shared. Several workers consume one
+1. It calls `consume_impl` under the breaker's handle held shared. Several threads consume one
    pipeline at once; an ordered pipeline has at most one package in flight.
 2. Where the breaker answers `pushes_while_consuming`, as on the coordinator (`consume_with`), it
    computes the pipeline's pushes under the handle held exclusively (`Pushes::push_final`), so the
@@ -502,8 +510,8 @@ A worker consumes, publishes and acknowledges its own claim, in that order:
    its input. A breaker that publishes only at its finish or in the resume pass pushes nothing here.
 3. It lands the pushes with no handle held, then acknowledges the package.
 
-A finish of an admitted pipeline is the coordinator's: it is claimable only once every package is
-acknowledged, so no worker holds the pipeline. The coordinator releases the input whole
+A finish of a partitioned pipeline is serial work: it is claimable only once every package is
+acknowledged, so no thread holds the pipeline. The thread that claims it releases the input whole
 (`Breaker::finish_parallel_input`) and runs the finish.
 
 ### Bodies on workers
@@ -515,26 +523,30 @@ answered from the snapshot the store published after its last step (`consume_sto
 store's state until its next step. A reader of the round's first packages therefore finds the store
 free and pulls the round's state, not the snapshot from before the round.
 
-A round's step passes only output the resume pass has published. The coordinator re-holds a scope's
-followers after each of its own claims (`Execution::consume`). A worker re-holds the followers of
-the body it consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass
+A round's step passes only output the resume pass has published. Serial work re-holds every scope's
+followers after each claim (`Execution::consume`). A partitioned claim re-holds the followers of the
+body it consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass
 reads the step's follower hold before it publishes and releases the followers only where that hold
 is unchanged (`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release
-decided before a worker's consume published fails, and the step waits for the next pass.
+decided before a partitioned claim published fails, and the step waits for the next pass.
 
 ### Waiting and stalls
 
-A coordinator claim that answers `Next::Wait` goes on in this order:
+A worker that finds nothing to claim sleeps in `Dispatcher::wait`. A coordinator claim that finds
+nothing goes on under the serial lock, in this order:
 
-1. While a package of an admitted pipeline is in flight or claimable by a worker
-   (`WorkerPool::may_progress`, through `Dispatcher::may_claim_where`), the coordinator sleeps in
-   `Dispatcher::wait`.
+1. While a package of a partitioned pipeline is in flight or claimable
+   (`WorkerPool::may_progress`, through `Dispatcher::may_claim_where`), the coordinator releases the
+   lock and sleeps in `Dispatcher::wait`. Under the lock no serial claim is running, so a
+   partitioned claim is the only running one.
 2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress. A run
    with no live source panics. A live run has reached a drained boundary.
 
-A worker's publication can advance the generation during the resume pass, which then counts as
-progress. The coordinator claims again and reaches the same fixed point.
+Every claim a thread runs advances the generation when it ends (`Dispatcher::wake_claimants`), so
+serial work another thread ran while the coordinator waited for the lock counts as progress, and so
+does a partitioned claim's publication during the resume pass. The coordinator claims again and
+reaches the same fixed point.
 
 ### Lock order
 
@@ -548,11 +560,12 @@ No two threads wait on each other through these rules:
   consumer takes only the lock on its own state and releases it before it notifies another, so a
   landing holds at most one consumer's lock at a time. No consumer takes a breaker handle or a store
   while it is notified.
-- Only the coordinator takes a store's blocking `write`, in the scope handlers. While it holds one
-  it takes the scope's member handles, where `row_for` probes where a round's push lands; a worker
-  never waits on a store, since it reaches one only through `try_write`, so the coordinator's
-  store-first order meets no worker waiting the other way. The round's packages are queued after the
-  store is released ([Bodies on workers](#bodies-on-workers)).
+- Only the holder of the serial lock takes a store's blocking `write`, in serial work. While it
+  holds one it takes the scope's member handles, where `row_for` probes where a round's push lands;
+  a partitioned claim never waits on a store, since it reaches one only through `try_write`, and
+  never takes the serial lock, so the store-first order meets no thread waiting the other way. The
+  round's packages are queued after the store is released ([Bodies on workers](#bodies-on-workers)).
+- No thread waits in `Dispatcher::wait` while it holds the serial lock.
 
 A wait for a handle is therefore a wait on a thread that holds a handle further upstream and waits
 for nothing but handles further upstream still. The pipelines form a DAG, since a loop's cycle runs
@@ -569,11 +582,12 @@ place, and the coordinator's is resumed only where no worker panicked. A run tha
 failed.
 
 A worker thread the system refuses to start leaves the run with the workers already started; with
-none, the coordinator claims every package. The coordinator's guard exists only once the workers
-are started, so a refusal must not panic: the workers already started would never be stopped.
+none, the coordinator claims every package, and no pipeline is partitioned. The coordinator's guard
+exists only once the workers are started, so a refusal must not panic: the workers already started
+would never be stopped.
 
-A run that ends at a drained boundary, to pause or reload, has no claim in flight and none claimable
-by a worker. The coordinator ends the claims (`Dispatcher::stop_claims`), every worker's claim
+A run that ends at a drained boundary, to pause or reload, has no claim in flight and none
+claimable. The coordinator ends the claims (`Dispatcher::stop_claims`), every worker's claim
 answers `Next::Done`, and the coordinator joins them before the run returns its operators.
 
 Reads and releases lock the retained state they access, without an operator-wide operation

@@ -129,6 +129,9 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<(PipelineId, Tiling)>`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
+    # The worker pool's serial lock, which orders serial work between a run's threads; it guards
+    # no data.
+    ("src/interpreter/dispatcher/workers.rs", "cell of `()`"),
     # The placement an entry and its breaker share, which the planner writes before a run; what
     # crosses it is a pipeline's index. See `Placement`.
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<PipelineId>`"),
