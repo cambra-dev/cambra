@@ -959,6 +959,13 @@ impl Subst {
         if let Some((_, held)) = v.suspensions(solver).iter().find(|(s, _)| *s == stored) {
             return Type::Infer(Rc::clone(held));
         }
+        if let Some((_, held)) = solver
+            .read_suspensions
+            .get(&v.uid)
+            .and_then(|held| held.iter().find(|(s, _)| *s == stored))
+        {
+            return Type::Infer(Rc::clone(held));
+        }
         let reads: Vec<Name> = self
             .binders
             .values()
@@ -1000,8 +1007,18 @@ impl Subst {
                 matches!(m, WitnessMapping::Discharge(_)) && scope.may_bind(solver, w)
             })
         });
-        v.suspensions_mut(solver)
-            .push((stored.clone(), Rc::clone(&held)));
+        // A read keeps what it mints to itself (`Solver::read`); only a write records a
+        // suspension on `v`.
+        if solver.is_reading() {
+            solver
+                .read_suspensions
+                .entry(v.uid)
+                .or_default()
+                .push((stored.clone(), Rc::clone(&held)));
+        } else {
+            v.suspensions_mut(solver)
+                .push((stored.clone(), Rc::clone(&held)));
+        }
         let bound = crate::ccl::Bound::suspended_on(v, stored);
         crate::ccl::infer_var::enforce_bound_scope(solver, &held, "lower", &bound);
         crate::ccl::infer_var::enforce_bound_scope(solver, &held, "upper", &bound);
@@ -4928,6 +4945,33 @@ mod capture_assert_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read keeps the suspensions it mints to itself: applying a substitution to a variable
+    /// inside a read suspends on it for the rest of the read, and leaves nothing on the
+    /// variable after it; a write records the suspension on the variable.
+    #[test]
+    fn a_read_leaves_no_suspension_on_its_variable() {
+        let solver = &mut Solver::new();
+        let x = Name::raw("x");
+        let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let v = crate::ccl::infer_var::InferVar::fresh_over(solver, 0, &telescope, kind);
+        let sigma = Subst::rename(x, Name::raw("y"));
+        let ty = Type::Infer(Rc::clone(&v));
+
+        let (first, again) = solver.read(|solver| {
+            (
+                sigma.apply_type_in(solver, &ty),
+                sigma.apply_type_in(solver, &ty),
+            )
+        });
+        assert!(matches!(&first, Type::Infer(held) if !Rc::ptr_eq(held, &v)));
+        assert_eq!(first, again, "the read reuses the suspension it minted");
+        assert!(v.suspensions(solver).is_empty());
+
+        sigma.apply_type_in(solver, &ty);
+        assert_eq!(v.suspensions(solver).len(), 1);
+    }
     use crate::ccl::Occurrence;
     use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
 
