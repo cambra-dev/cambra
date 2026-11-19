@@ -4668,7 +4668,10 @@ variable. A capability also records the node where it entered its variable (`Sco
 which equality and ordering leave out. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the
 edge's filter, 𝑣 holds too. An edge standing for a node, a call, a statement or an argument, stamps
 that node on each capability crossing it (`Filter::at`). `CapabilityVar::resolved` is the fixpoint
-over the edges reaching a variable.
+over the edges reaching a variable. A resolution caches its answer for every variable it reached,
+each of which it computed whole, and a later one stops at a variable resolved since the last
+recorded fact, taking its cached answer as what it passes on; resolving each node of a long
+statement spine then walks the spine once.
 
 Emission keeps a stack of frames, one for the module's top level and one for each function body
 under emission (`InferCtx::capability_frames`), and gives each node its own capability variable

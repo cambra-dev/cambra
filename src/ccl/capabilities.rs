@@ -2763,7 +2763,13 @@ impl CapabilityVar {
         }
         // The variables reaching this one, each with the edges into it. A worklist
         // fixpoint, since edges can form cycles and two paths can filter differently.
+        //
+        // A variable whose resolution is cached at the current count is settled: its stopped
+        // value is what it passes on, so the walk takes it from the cache and does not descend
+        // into what flows into it. Resolving each node of a long spine would otherwise walk
+        // the whole spine below it.
         let mut nodes: HashMap<CapabilityVarId, Rc<CapabilityVar>> = HashMap::new();
+        let mut settled: HashSet<CapabilityVarId> = HashSet::new();
         let mut stack: Vec<Rc<CapabilityVar>> = Vec::new();
         let mut sets: HashMap<CapabilityVarId, BTreeSet<ScopedCapability>> = HashMap::new();
         sets.insert(self.uid, own(solver, self));
@@ -2774,6 +2780,14 @@ impl CapabilityVar {
         }
         while let Some(v) = stack.pop() {
             if v.uid == self.uid || nodes.contains_key(&v.uid) {
+                continue;
+            }
+            if direction.is_none()
+                && let Some(capabilities) = v.state(solver).resolved_at.at(&now)
+            {
+                sets.insert(v.uid, capabilities);
+                settled.insert(v.uid);
+                nodes.insert(v.uid, v);
                 continue;
             }
             sets.insert(v.uid, own(solver, &v));
@@ -2791,7 +2805,11 @@ impl CapabilityVar {
                 nodes[&uid].incoming(solver)
             }
         };
-        let ids: Vec<CapabilityVarId> = sets.keys().copied().collect();
+        let ids: Vec<CapabilityVarId> = sets
+            .keys()
+            .copied()
+            .filter(|id| !settled.contains(id))
+            .collect();
         loop {
             let mut changed = false;
             for &id in &ids {
@@ -2826,6 +2844,19 @@ impl CapabilityVar {
             }
         }
         let mut out = sets.remove(&self.uid).expect("the variable's own set");
+        // Every variable reached and not settled has its whole set now: every edge into it was
+        // followed. Its stopped value is its resolution, so it is cached as resolving it would.
+        if direction.is_none() {
+            for (id, v) in &nodes {
+                if settled.contains(id) {
+                    continue;
+                }
+                let mut resolved = sets.remove(id).expect("every reached variable has a set");
+                let written = v.written_uppers(solver);
+                resolved.retain(|l| admitted(solver, &written, l));
+                v.state(solver).resolved_at.store(now, resolved);
+            }
+        }
         if stop {
             let written = self.written_uppers(solver);
             out.retain(|l| admitted(solver, &written, l));
