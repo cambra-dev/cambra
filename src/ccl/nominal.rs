@@ -19,8 +19,8 @@ use smol_str::SmolStr;
 use crate::ccl::ccl_utils::{free_names, strip_refinements};
 use crate::ccl::constant::{ConstParam, ConstTerm, NoValue};
 use crate::ccl::{
-    BaseType, FieldKey, FunKind, Label, Name, Refinement, RefinementSet, Type, TypeKind, TypeParam,
-    TypeParamId, V_NONE, V_SOME,
+    BaseType, CtorRef, FieldKey, FunKind, Label, Name, Refinement, RefinementSet, Type, TypeKind,
+    TypeParam, TypeParamId, V_NONE, V_SOME,
 };
 
 /// The name the compiler-provided `Option` declaration binds.
@@ -190,79 +190,184 @@ fn runtime_order(order: &WrittenOrder) -> crate::interpreter::ValueOrder {
     }
 }
 
-/// `option ▷ option_is_none`: whether `option`, an `Option(payload)`, is `none`, as a
-/// refinement predicate states it ([`crate::ccl::Builtin::OptionIsNone`]).
-///
-/// The refinements the compiler states about `Option` values are built from this and
-/// [`option_value`], the two observers of an `Option` the refinement encoding reads
-/// (`src/ccl/infer/solver/smt.rs`, "Option").
-pub fn option_is_none(option: crate::ccl::TypedExpr, payload: &Type) -> crate::ccl::TypedExpr {
-    option_observer(
-        crate::ccl::Builtin::OptionIsNone,
-        option,
-        payload,
+/// `value ▷ ctor_is(N::c)`: whether `value`, an `N(args)`, was built by `ctor`
+/// ([`crate::ccl::Builtin::CtorIs`]).
+pub fn ctor_is(
+    value: crate::ccl::TypedExpr,
+    ctor: &CtorRef,
+    args: &[Type],
+) -> crate::ccl::TypedExpr {
+    observe(
+        crate::ccl::Builtin::CtorIs(ctor.clone()),
+        value,
+        args,
         Type::Base(BaseType::Bool),
     )
 }
 
-/// `option ▷ option_value`: the payload of `option`, an `Option(payload)`, as a refinement
-/// predicate states it ([`crate::ccl::Builtin::OptionValue`]). It says nothing of a `none`.
-pub fn option_value(option: crate::ccl::TypedExpr, payload: &Type) -> crate::ccl::TypedExpr {
-    option_observer(
-        crate::ccl::Builtin::OptionValue,
-        option,
+/// `value ▷ ctor_payload(N::c)`: the payload of `value`, an `N(args)` built by `ctor`
+/// ([`crate::ccl::Builtin::CtorPayload`]).
+pub fn ctor_payload(
+    value: crate::ccl::TypedExpr,
+    ctor: &CtorRef,
+    args: &[Type],
+) -> crate::ccl::TypedExpr {
+    let payload = ctor.payload_at(args);
+    observe(
+        crate::ccl::Builtin::CtorPayload(ctor.clone()),
+        value,
+        args,
         payload,
-        payload.clone(),
     )
 }
 
-fn option_observer(
+fn observe(
     observer: crate::ccl::Builtin,
-    option: crate::ccl::TypedExpr,
-    payload: &Type,
+    value: crate::ccl::TypedExpr,
+    args: &[Type],
     result: Type,
 ) -> crate::ccl::TypedExpr {
     use crate::ccl::TypedExpr;
-    let function = TypedExpr::builtin(observer)
-        .with_ty(Type::fun(Type::option_of(payload.clone()), result.clone()));
-    TypedExpr::apply(option, function).with_ty(result)
+    let decl = match &observer {
+        crate::ccl::Builtin::CtorIs(c) | crate::ccl::Builtin::CtorPayload(c) => Rc::clone(&c.decl),
+        _ => unreachable!("`observe` builds `ctor_is` and `ctor_payload` only"),
+    };
+    let function = TypedExpr::builtin(observer).with_ty(Type::fun(
+        Type::Nominal(decl, args.to_vec()),
+        result.clone(),
+    ));
+    TypedExpr::apply(value, function).with_ty(result)
 }
 
-/// The refinements an `Option(payload)` built by the constructor `ctor` carries: `none` is
-/// `__elem ▷ option_is_none`, and `some` is `not (__elem ▷ option_is_none)` and, where
-/// `argument` names its payload, `(__elem ▷ option_value) == argument`.
-pub fn option_ctor_refinements(
-    ctor: &str,
-    payload: &Type,
-    argument: Option<crate::ccl::TypedExpr>,
+/// The refinements of the `N(args)` that `ctor` builds from `argument`:
+/// `__elem ▷ ctor_is(N::c)`, and `(__elem ▷ ctor_payload(N::c)) == argument` for a constructor
+/// that takes an argument (`docs/chl-spec.md`, "Constructors state what they build").
+///
+/// The argument is stated whatever its form. What the refinement encoding cannot read of it,
+/// it drops, as it drops any assumption outside its fragment.
+pub fn ctor_refinements(
+    ctor: &CtorRef,
+    args: &[Type],
+    argument: crate::ccl::TypedExpr,
 ) -> RefinementSet {
-    use crate::ccl::{BinOpKind, CompareKind, TypedExpr, UnaryOpKind};
-    let bool_ty = Type::Base(BaseType::Bool);
-    let elem = || TypedExpr::var(Name::elem()).with_ty(Type::option_of(payload.clone()));
-    let is_none = option_is_none(elem(), payload);
+    use crate::ccl::{BinOpKind, CompareKind, TypedExpr};
+    let elem = || {
+        TypedExpr::var(Name::elem()).with_ty(Type::Nominal(Rc::clone(&ctor.decl), args.to_vec()))
+    };
     let born = |predicate: TypedExpr| Refinement::born(Rc::new(predicate));
-    if ctor == V_NONE.name() {
-        return born(is_none).into();
-    }
-    debug_assert_eq!(
-        ctor,
-        V_SOME.name(),
-        "`Option` declares `none` and `some` only"
-    );
-    let mut refinements = vec![born(
-        TypedExpr::unary(UnaryOpKind::Not, is_none).with_ty(bool_ty.clone()),
-    )];
-    if let Some(argument) = argument {
+    let mut refinements = vec![born(ctor_is(elem(), ctor, args))];
+    let takes_argument = ctor
+        .decl
+        .ctor(&ctor.ctor)
+        .is_some_and(|c| !c.params.is_empty());
+    if takes_argument {
         refinements.push(born(
             TypedExpr::binop(
-                option_value(elem(), payload),
+                ctor_payload(elem(), ctor, args),
                 BinOpKind::Compare(CompareKind::Equals),
                 argument,
             )
-            .with_ty(bool_ty),
+            .with_ty(Type::Base(BaseType::Bool)),
         ));
     }
     refinements.into_iter().collect()
+}
+
+/// Whether a value of `decl` states its constructor and payload in its type: whether
+/// `emit_nominal_ctor` refines what it builds ([`ctor_refinements`]), and whether a `match` over
+/// it derives its result's refinement from its arms (`src/ccl/design/nominal-types.md`,
+/// "A constructed value states its constructor and payload").
+///
+/// `Option` alone does. The encoding, the arm facts and the coverage proof are general; a
+/// refinement on every nominal value is not yet, since trait selection and the passes after
+/// inlining do not read a refined nominal type.
+pub fn states_constructors(decl: &NominalDecl) -> bool {
+    *decl == *option()
+}
+
+/// What an arm of a `match` over `scrutinee`, a value of `decl` at `args`, knows of the
+/// value it matched: that `ctor` built it, `scrutinee ▷ ctor_is(N::c)`, and that its payload is
+/// what the arm binds, `(scrutinee ▷ ctor_payload(N::c)) == 𝑣` for `payload`'s binder `𝑣`
+/// (`src/ccl/design/type-inference.md`, "Arm facts").
+///
+/// `None` when `scrutinee` is not a term ([`is_term`]): a fact restates the scrutinee, and only a
+/// term can be restated without copying a program into a type. The grammar is closed under
+/// substitution, so a scrutinee that a `let`'s discharge or an inlined call rewrites keeps its
+/// facts.
+///
+/// [`is_term`]: crate::ccl::infer::solver::smt::is_term
+pub fn arm_facts(
+    scrutinee: &crate::ccl::TypedExpr,
+    decl: &Rc<NominalDecl>,
+    args: &[Type],
+    ctor: &str,
+    payload: Option<&crate::ccl::TypedBinding>,
+) -> Option<Vec<crate::ccl::TypedExpr>> {
+    use crate::ccl::{BinOpKind, CompareKind, TypedExpr};
+    if !crate::ccl::infer::solver::smt::is_term(scrutinee) {
+        return None;
+    }
+    let ctor = CtorRef {
+        decl: Rc::clone(decl),
+        ctor: ctor.into(),
+    };
+    let read = || scrutinee.clone_preserving_ids();
+    let mut facts = vec![ctor_is(read(), &ctor, args)];
+    let takes_argument = decl.ctor(&ctor.ctor).is_some_and(|c| !c.params.is_empty());
+    if let Some(binding) = payload.filter(|_| takes_argument) {
+        let bound = TypedExpr::var(binding.name.clone()).with_ty(binding.ty.clone());
+        facts.push(
+            TypedExpr::binop(
+                ctor_payload(read(), &ctor, args),
+                BinOpKind::Compare(CompareKind::Equals),
+                bound,
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        );
+    }
+    Some(facts)
+}
+
+/// [`arm_facts`] for the arm of a typed `match` whose pattern is `pattern`, the declaration's
+/// arguments read off `scrutinee`'s type. Empty for an arm that names no constructor, and for a
+/// scrutinee whose type is no application of the declaration the pattern names.
+///
+/// For a pass walking a tree inference typed, so the facts' nodes are machinery of the
+/// scrutinee they read.
+pub fn typed_arm_facts(
+    scrutinee: &crate::ccl::TypedExpr,
+    pattern: &crate::ccl::Pattern,
+) -> Vec<crate::ccl::TypedExpr> {
+    let crate::ccl::PatternHead::Constructor { decl, ctor } = &pattern.head else {
+        return Vec::new();
+    };
+    let Type::Nominal(scrutinee_decl, args) = scrutinee.ty.peel_refinements() else {
+        return Vec::new();
+    };
+    if scrutinee_decl != decl {
+        return Vec::new();
+    }
+    let _g = crate::ccl::provenance::enter(
+        scrutinee.node_id(),
+        "arm_facts",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    arm_facts(scrutinee, decl, args, ctor, Some(&pattern.binding)).unwrap_or_default()
+}
+
+impl CtorRef {
+    /// The payload the constructor takes, at the declaration's arguments `args`, without its
+    /// refinements: the type a predicate's `ctor_payload` read is typed at. What the
+    /// refinements state, the refinement encoding reads off the declaration.
+    pub fn payload_at(&self, args: &[Type]) -> Type {
+        let ctor = self.decl.ctor(&self.ctor).unwrap_or_else(|| {
+            panic!(
+                "`{}` declares no constructor `{}`",
+                self.decl.name, self.ctor
+            )
+        });
+        strip_refinements(&self.decl.instantiate(&ctor.destructured(), args))
+    }
 }
 
 /// The compiler-provided declaration `name` names, if any.
@@ -1000,6 +1105,16 @@ impl NominalDecl {
     /// The constructor named `name`.
     pub fn ctor(&self, name: &str) -> Option<&NominalCtor> {
         self.body().ctors.iter().find(|c| c.name == name)
+    }
+
+    /// The position of the constructor named `name` in declaration order.
+    pub fn ctor_index(&self, name: &str) -> Option<usize> {
+        self.body().ctors.iter().position(|c| c.name == name)
+    }
+
+    /// The number of constructors the declaration declares.
+    pub fn ctor_count(&self) -> usize {
+        self.body().ctors.len()
     }
 
     /// `ty`, a type the declaration states at a positive position, with each type parameter

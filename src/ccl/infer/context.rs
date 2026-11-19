@@ -315,6 +315,11 @@ pub(super) struct InferCtx {
     /// never removed: a uniquified name denotes one binding, so the fact it
     /// records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The facts in scope at the current emission position ([`Typing::assuming`]).
+    facts: Vec<Expr>,
+    /// The names whose reads are narrowed at the current emission position, each with the
+    /// refinements a read adds ([`Typing::narrowing`]).
+    pub(super) narrowed: Vec<(Name, Vec<Refinement>)>,
     /// The generalized bindings bound at their exact annotation
     /// ([`LetScheme::Generalized`]), which the coalesce walk pins one way.
     pub(super) bound_at_annotation: HashSet<Name>,
@@ -792,6 +797,8 @@ pub(super) struct SolverScope<'a> {
     /// What each transparent binder is defined as, read while it is in scope
     /// ([`defined_as`](crate::ccl::infer::solver::smt::defined_as)).
     scope_exits: &'a HashMap<Name, Vec<ScopeExit>>,
+    /// The facts in scope at the query ([`Typing::assuming`]).
+    facts: &'a [Expr],
 }
 
 impl ScopeEnv for SolverScope<'_> {
@@ -808,8 +815,8 @@ impl ScopeEnv for SolverScope<'_> {
         }
         self.opaque_binders.get(name).and_then(value_type)
     }
-    fn resolve_slot(&self, slot: &Type) -> Option<Type> {
-        value_type(slot)
+    fn facts(&self) -> Vec<Expr> {
+        self.facts.iter().map(Expr::clone_preserving_ids).collect()
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -886,6 +893,8 @@ impl InferCtx {
             assumptions: Vec::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
+            facts: Vec::new(),
+            narrowed: Vec::new(),
             bound_at_annotation: HashSet::new(),
             definition_telescopes: HashMap::new(),
             scope_exits: HashMap::new(),
@@ -2916,6 +2925,7 @@ impl InferCtx {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
             scope_exits: &self.scope_exits,
+            facts: &self.facts,
         };
         self.cache.at(self.here(), self.here());
         let result = constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope);
@@ -3836,6 +3846,7 @@ impl Typing for InferCtx {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
             scope_exits: &self.scope_exits,
+            facts: &self.facts,
         };
         self.cache.at(
             self.value_at.or(self.here()),
@@ -3892,6 +3903,40 @@ impl Typing for InferCtx {
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scoped_exiting(name, ty, ScopeExit::Join, f)
+    }
+
+    fn assuming<R>(&mut self, facts: Vec<Expr>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let depth = self.facts.len();
+        self.facts.extend(facts);
+        let r = f(self);
+        self.facts.truncate(depth);
+        r
+    }
+
+    fn narrowing<R>(
+        &mut self,
+        name: &Name,
+        refinements: Vec<Refinement>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.narrowed.push((name.clone(), refinements));
+        let r = f(self);
+        self.narrowed.pop();
+        r
+    }
+
+    fn refutes(&mut self, facts: Vec<Expr>, _recorded: bool) -> bool {
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+            scope_exits: &self.scope_exits,
+            facts: &self.facts,
+        };
+        let scope = crate::ccl::infer::solver::smt::WithFacts {
+            inner: &scope,
+            facts: &facts,
+        };
+        crate::ccl::infer::solver::smt::refuted(&scope).unwrap_or(false)
     }
 
     fn function_body<R>(

@@ -467,6 +467,7 @@ where
         N::Case {
             scrutinee,
             branches,
+            ..
         } => {
             if let Some(s) = scrutinee {
                 open(f, s);
@@ -917,6 +918,7 @@ mod tests {
                     body: var("b1"),
                 },
             ],
+            refuted: Vec::new(),
         })
     }
 

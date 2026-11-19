@@ -623,6 +623,7 @@ fn is_filter_case_body(body: &Expr) -> bool {
     if let TypedExprNode::Case {
         scrutinee: None,
         branches,
+        ..
     } = &body.node
     {
         branches.len() == 2
@@ -2180,6 +2181,7 @@ fn elim_lambda_impl(
         TypedExprNode::Case {
             scrutinee: None,
             branches,
+            ..
         } if branches.iter().all(|b| b.pattern.is_none()) => {
             let mut prior_guards: Vec<Expr> = Vec::new();
             let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
@@ -2323,6 +2325,7 @@ fn elim_lambda_impl(
         TypedExprNode::Case {
             scrutinee: Some(scrut),
             branches,
+            refuted,
         } if branches.iter().all(|b| b.pattern.is_some()) => {
             let value_ty = body_ty.clone();
             let scrut = *scrut;
@@ -2457,12 +2460,21 @@ fn elim_lambda_impl(
             // scrutinee cannot carry are dead, project empty, and contribute
             // nothing — so a `match` written for a wider type than the scrutinee
             // was inferred to have is fine, and needs no arms pruned away.
+            //
+            // A `match` naming a nominal type's constructors may omit one that inference
+            // proved the scrutinee never carries, and it records that tag in `refuted`
+            // (`src/ccl/design/type-inference.md`, "Unreachable arms"). The arms then cover
+            // every tag the scrutinee carries.
             debug_assert!(
-                variants.iter().all(|(k, _)| seen_tags.contains(k)),
+                variants.iter().all(|(k, _)| {
+                    seen_tags.contains(k)
+                        || matches!(k, FieldKey::Name(tag) if refuted.contains(tag))
+                }),
                 "scrutinee-Case is non-exhaustive: scrutinee tags {:?} are not all \
-                 covered by arms {:?}",
+                 covered by arms {:?} or refuted by inference {:?}",
                 variants.iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                seen_tags
+                seen_tags,
+                refuted
             );
             match arms.len() {
                 0 => unreachable!("a scrutinee-Case has at least one branch"),
@@ -2495,6 +2507,7 @@ fn elim_lambda_impl(
         TypedExprNode::Case {
             scrutinee: Some(_),
             branches,
+            ..
         } if branches.iter().any(|b| b.pattern.is_none()) => Err(LambdaElimError::Unsupported(
             "a `match` with a `case _:` default arm inside a lambda body: the \
                  tag fan-out has no scalar collapse to carry the default"
@@ -2740,6 +2753,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         TypedExprNode::Case {
             scrutinee: None,
             branches,
+            refuted,
         } if branches.iter().all(|b| b.pattern.is_none()) => {
             // Names the `Case`: both builders' scaffolding — the C-form's gated
             // lifts and `final_or_default`, the fan-out's restricted arms — stands
@@ -2770,6 +2784,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 let mut expr = Expr::new(TypedExprNode::Case {
                     scrutinee: None,
                     branches,
+                    refuted,
                 })
                 .with_ty(ty);
                 expr.try_map_children(|child| elim_lambdas(ctx, child))?;
@@ -2786,6 +2801,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         TypedExprNode::Case {
             scrutinee: Some(scrut),
             branches,
+            ..
         } if branches
             .iter()
             .enumerate()
@@ -3591,6 +3607,7 @@ mod tests {
                 arm("fired", "w", int_ty(), w_plus_1),
                 arm("idle", "a", unit_ty(), lit(0).with_ty(int_ty())),
             ],
+            refuted: Vec::new(),
         })
         .with_ty(int_ty());
 
@@ -3645,6 +3662,7 @@ mod tests {
                         .with_ty(Type::Tuple(vec![int_ty(), int_ty()])),
                 ),
             ],
+            refuted: Vec::new(),
         })
         .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
 

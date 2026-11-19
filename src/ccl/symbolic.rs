@@ -379,6 +379,16 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("uncurry({n})"))
         }
 
+        TypedExprNode::Builtin(Builtin::CtorIs(c)) => (
+            Precedence::Atom,
+            format!("ctor_is({}::{})", c.decl.name, c.ctor),
+        ),
+
+        TypedExprNode::Builtin(Builtin::CtorPayload(c)) => (
+            Precedence::Atom,
+            format!("ctor_payload({}::{})", c.decl.name, c.ctor),
+        ),
+
         TypedExprNode::Builtin(Builtin::VariantIs(tag)) => {
             (Precedence::Atom, format!("variant_is(`{tag})"))
         }
@@ -524,6 +534,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             let arms: Vec<_> = branches
                 .iter()
@@ -1267,7 +1278,7 @@ mod tests {
         TypedExpr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: vec![Branch { pattern: None, guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) }],
-        }),
+         refuted: Vec::new(), }),
         "{ true → 0 }"
     )]
     // Case: two guards (if/else pattern)
@@ -1278,7 +1289,7 @@ mod tests {
                 Branch { pattern: None, guard: Expr::var("x"), body: Expr::lit(Lit::Int(1)) },
                 Branch { pattern: None, guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) },
             ],
-        }),
+         refuted: Vec::new(), }),
         "{ x → 1; true → 0 }"
     )]
     // Lambda whose parameter carries a domain refinement (refinements ride the

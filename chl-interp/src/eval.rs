@@ -1062,6 +1062,9 @@ enum BuiltinMethod {
     /// `Option::unwrap_or`, which the compiler provides with `Option` (`bind_unwrap_or` in
     /// `src/ccl/lower/nominal.rs`).
     UnwrapOr,
+    /// `Option::value`, which the compiler provides with `Option` and `x!` calls (`bind_value`
+    /// in `src/ccl/lower/nominal.rs`).
+    Value,
 }
 
 impl BuiltinMethod {
@@ -1071,27 +1074,32 @@ impl BuiltinMethod {
             BuiltinMethod::Extract => "extract",
             BuiltinMethod::IsNone => "is_none",
             BuiltinMethod::UnwrapOr => "unwrap_or",
+            BuiltinMethod::Value => "value",
         }
     }
 
     /// The number of arguments the method takes after its receiver.
     fn arity(self) -> usize {
         match self {
-            BuiltinMethod::Extract | BuiltinMethod::IsNone => 0,
+            BuiltinMethod::Extract | BuiltinMethod::IsNone | BuiltinMethod::Value => 0,
             BuiltinMethod::UnwrapOr => 1,
         }
     }
 
     /// The method applied to a value built by the constructor `ctor` from `payload`, and to
-    /// the arguments `args` after it.
-    fn apply(self, ctor: &str, payload: &Value, args: &[Value]) -> Value {
-        match (self, args) {
+    /// the arguments `args` after it, or `None` for `value` of a `none`. The compiler refuses a
+    /// program that calls `value` of an `Option` not proven `some`, so a `none` there is a
+    /// program the two disagree on.
+    fn apply(self, ctor: &str, payload: &Value, args: &[Value]) -> Option<Value> {
+        Some(match (self, args) {
             (BuiltinMethod::Extract, []) => payload.clone(),
             (BuiltinMethod::IsNone, []) => Value::Bool(ctor == "none"),
             (BuiltinMethod::UnwrapOr, [default]) if ctor == "none" => default.clone(),
             (BuiltinMethod::UnwrapOr, [_]) => payload.clone(),
+            (BuiltinMethod::Value, []) if ctor == "some" => payload.clone(),
+            (BuiltinMethod::Value, []) => return None,
             _ => unreachable!("the caller checks `{}`'s arity", self.name()),
-        }
+        })
     }
 }
 
@@ -1120,7 +1128,7 @@ impl TypeMembers {
 
 /// What `body` declares of each nominal type, by the type's name: each `type` declaration's
 /// members, the methods the associated functions of the type declare, and the
-/// compiler-provided `Option`'s constructors, `is_none` and `unwrap_or`.
+/// compiler-provided `Option`'s constructors, `is_none`, `value` and `unwrap_or`.
 fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
     let mut option = TypeMembers {
         members: BTreeMap::from([
@@ -1131,6 +1139,7 @@ fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
     };
     option.add_builtin(BuiltinMethod::IsNone);
     option.add_builtin(BuiltinMethod::UnwrapOr);
+    option.add_builtin(BuiltinMethod::Value);
     let mut out = BTreeMap::from([(OPTION.to_string(), option)]);
     let mut add_function = |ty: &str, name: &str, params: &[chl_parser::ast::Param]| {
         if params.first().is_some_and(|p| p.name == "self") {
@@ -2160,7 +2169,9 @@ impl Interp {
             if any_pending(values.iter()) {
                 return Ok(Value::Pending);
             }
-            return Ok(builtin.apply(&ctor, &payload, &values));
+            return builtin
+                .apply(&ctor, &payload, &values)
+                .map_or_else(|| err(format!("`.{method}()` takes an `Option::some`")), Ok);
         }
         let Some(Slot::Fn(function)) = self.slot(&bound) else {
             return err(format!("`{bound}` is not bound"));
@@ -2217,8 +2228,8 @@ impl Interp {
             }
         }
         // `N::extract(n)` is the payload of `n`'s one constructor `new`,
-        // `Option::is_none(o)` whether `o` is `none`, and `Option::unwrap_or(o, w)` the payload
-        // of `o` or `w`.
+        // `Option::is_none(o)` whether `o` is `none`, `Option::value(o)` the payload of a
+        // `some`, and `Option::unwrap_or(o, w)` the payload of `o` or `w`.
         if let Member::Builtin(method) = self.member(q)? {
             let name = method.name();
             let Some((arg, rest)) = args
@@ -2237,7 +2248,9 @@ impl Interp {
                 Value::Nominal { ty, ctor, payload }
                     if q.qualifier.last().is_some_and(|t| t.node == ty) =>
                 {
-                    Ok(method.apply(&ctor, &payload, &values))
+                    method
+                        .apply(&ctor, &payload, &values)
+                        .map_or_else(|| err(format!("`{name}` takes an `Option::some`")), Ok)
                 }
                 other => err(format!("`{name}` takes a nominal value, got {other}")),
             };

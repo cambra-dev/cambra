@@ -1140,11 +1140,14 @@ fn accepted_position_type(
 }
 
 /// Pin `var` to `chosen` in both directions, so every occurrence of the variable reads it.
+///
+/// `var` is a position no value reaches, so `chosen` is checked against its bounds but not
+/// against its guarded bounds ([`ConstrainCache::without_guarded_checks`]).
 fn pin_both_ways(
     chosen: &Type,
     var: &Type,
 ) -> Result<(), crate::ccl::infer::solver::ConstrainError> {
-    let mut cache = ConstrainCache::new();
+    let mut cache = ConstrainCache::new().without_guarded_checks();
     constrain_subtype(chosen, var, &mut cache)
         .and_then(|()| constrain_subtype(var, chosen, &mut cache))
 }
@@ -1992,18 +1995,6 @@ fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[L
 #[cfg(not(debug_assertions))]
 fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &[Label]) {}
 
-/// Whether `value`, the type a value gave a `match`'s scrutinee ([`value_type`]), can carry the
-/// arm tag `tag`. A value that is not a variant, such as a nominal type, names no tags here and
-/// is taken to carry none.
-fn value_carries_tag(value: &Type, tag: &Label) -> bool {
-    match crate::ccl::ccl_utils::strip_refinements(value) {
-        Type::Variant(tags, _) => tags
-            .iter()
-            .any(|(k, _)| *k == crate::ccl::FieldKey::Name(tag.clone())),
-        _ => false,
-    }
-}
-
 /// Whether a **value** has reached `ty` — as opposed to merely something
 /// determining what it must be.
 ///
@@ -2188,8 +2179,8 @@ impl crate::ccl::infer::solver::smt::ScopeEnv for ResolvingScope<'_> {
         let ty = self.0.binder_type(name)?;
         Some(resolve_var_type(&ty).unwrap_or(ty))
     }
-    fn resolve_slot(&self, slot: &Type) -> Option<Type> {
-        resolve_var_type(slot).ok()
+    fn facts(&self) -> Vec<Expr> {
+        self.0.facts()
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -2551,6 +2542,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             // Before any occurrence of an arm's payload variable is read: an arm
             // nothing reaches has no bound that determines its payload, and needs
@@ -2567,21 +2559,12 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // code — a scrutinee no value reaches stands for what the uses supply, so
             // an arm with no value at its payload is not unreachable: its payload is
             // a parameter of the definition, and pinning it would decide a type no
-            // use chose. The same holds for an arm whose tag the reaching value
-            // carries: a value of shape ``{`some{𝑇}}`` with `𝑇` a parameter reaches
-            // the scrutinee of `Option::unwrap`'s `match` through its stamped `id`.
-            let scrutinee_value = ctx
-                .discarding
-                .then(|| scrutinee.as_ref().and_then(|s| value_type(&s.ty)));
-            let pin = |p: &Pattern| match &scrutinee_value {
-                None => true,
-                Some(None) => false,
-                Some(Some(value)) => !value_carries_tag(value, &p.tag()),
-            };
+            // use chose.
+            let pin = !ctx.discarding || scrutinee.as_ref().is_some_and(|s| value_reaches(&s.ty));
             let pinned_tags: Vec<Label> = branches
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
-                .filter(|p| pin(p) && pin_unobservable_arm_payload(p, ctx))
+                .filter(|p| pin && pin_unobservable_arm_payload(p, ctx))
                 .map(|p| p.tag())
                 .collect();
             if let Some(s) = scrutinee {
@@ -2592,10 +2575,19 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // A pattern's payload binding scopes the branch's guard and
                 // body, shadowing an outer generalized binding of its name.
                 let pattern_name = b.pattern.as_ref().map(|p| p.binding.name.clone());
+                // An arm knows which constructor built the value it matched
+                // (`src/ccl/design/type-inference.md`, "Arm facts").
+                let facts = match (scrutinee.as_deref(), &b.pattern) {
+                    (Some(s), Some(p)) => crate::ccl::nominal::typed_arm_facts(s, p),
+                    _ => Vec::new(),
+                };
+                let depth = ctx.binders.facts_len();
+                ctx.binders.extend_facts(facts);
                 with_shadows(ctx, pattern_name.clone(), |ctx| {
                     coalesce_node(&mut b.guard, level, ctx);
                     coalesce_node(&mut b.body, level, ctx);
                 });
+                ctx.binders.truncate_facts(depth);
                 assert_none_placed(ctx, pattern_name.as_slice(), "pattern");
                 // Binder slot: resolve the pattern's payload-binding type.
                 // `emit_case` wrote the per-tag narrowed var into
@@ -5553,6 +5545,7 @@ mod tests {
             TypedExpr::new(TypedExprNode::Case {
                 scrutinee: Some(Box::new(TypedExpr::var("m"))),
                 branches: vec![arm("a", "v"), arm("b", "w")],
+                refuted: Vec::new(),
             }),
         );
         // The tail is what makes the widening observable, and *any* consumer that

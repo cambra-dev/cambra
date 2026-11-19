@@ -89,6 +89,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
     let TypedExprNode::Case {
         scrutinee,
         branches,
+        refuted,
     } = case.node
     else {
         unreachable!("caller guarantees a Case")
@@ -138,6 +139,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
     let mut rebuilt = Expr::new(TypedExprNode::Case {
         scrutinee: None,
         branches: out,
+        refuted,
     });
     rebuilt.ty = case_ty;
     rebuilt
@@ -298,6 +300,7 @@ pub(crate) fn tap_gated(fire: Expr, value: Expr, value_ty: Type) -> Expr {
                 body: tap_idle(value_ty),
             },
         ],
+        refuted: Vec::new(),
     });
     case.ty = ty;
     case
@@ -1063,6 +1066,7 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
         Expr::throwaway(TypedExprNode::Case {
             scrutinee: Some(Box::new(scrutinee?.clone_preserving_ids())),
             branches,
+            refuted: Vec::new(),
         })
         .with_ty(ty.clone()),
     )
@@ -1416,6 +1420,7 @@ fn read_fan_out(argument: &Expr, legs: &[Expr], ty: &Type, fuel: &mut usize) -> 
         Expr::throwaway(TypedExprNode::Case {
             scrutinee: None,
             branches,
+            refuted: Vec::new(),
         })
         .with_ty(ty.clone()),
     )
@@ -1765,7 +1770,7 @@ fn is_trailing_nested_case(b: &Branch) -> bool {
         && matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))
         && matches!(
             &b.body.node,
-            TypedExprNode::Case { scrutinee: None, branches }
+            TypedExprNode::Case { scrutinee: None, branches , refuted, }
                 if branches.iter().all(|ib| ib.pattern.is_none())
         )
 }
@@ -3898,6 +3903,7 @@ mod tests {
         Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: vec![branch(greater, 10), branch(Expr::lit(Lit::Bool(true)), 20)],
+            refuted: Vec::new(),
         })
     }
 

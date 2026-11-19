@@ -918,6 +918,7 @@ fn lower_for_body_stmt(
                 Expr::new(TypedExprNode::Case {
                     scrutinee: None,
                     branches: out_branches,
+                    refuted: Vec::new(),
                 }),
                 stmt.span,
             ))
@@ -1983,6 +1984,7 @@ fn build_loop_if_case(
         Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: out,
+            refuted: Vec::new(),
         }),
         stmt_span,
     ))

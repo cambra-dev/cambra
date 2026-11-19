@@ -1884,6 +1884,7 @@ fn lower_expr_inner(
                         body: false_arm,
                     },
                 ],
+                refuted: Vec::new(),
             }))
         }
         // `target << value` — feed into a deferred output.

@@ -5986,10 +5986,12 @@ fn eq_term_modulo_ty_slots_go(
             N::Case {
                 scrutinee: s1,
                 branches: br1,
+                refuted: r1,
             },
             N::Case {
                 scrutinee: s2,
                 branches: br2,
+                refuted: r2,
             },
         ) => {
             let scrutinee_eq = match (s1, s2) {
@@ -5998,6 +6000,7 @@ fn eq_term_modulo_ty_slots_go(
                 _ => false,
             };
             scrutinee_eq
+                && r1 == r2
                 && br1.len() == br2.len()
                 && br1
                     .iter()
@@ -6264,6 +6267,7 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             if let Some(s) = scrutinee {
                 hash_term_modulo_ty_slots(s, state, scope);

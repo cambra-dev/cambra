@@ -1242,6 +1242,8 @@ _[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m.keys(
 _!   : (o: {Option(T) where not _.is_none()}) => {T where _ == o.value()}
 ```
 
+`x!` calls the method `Option::value`.
+
 `Option` is a nominal type ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
 so presence is stated by a term predicate over it rather than by a subtype naming one constructor.
 `is_none` is a method of `Option` declared with it, and the predicate calls it because a nominal
@@ -1250,12 +1252,21 @@ type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A l
 `{Option(V) where not _.is_none()}` for every key. **[Open]** — the predicate a `List(T)` lookup
 states presence by. An index drawn from iterating `xs` is present.
 
-`value` is a method of `Option` that only a refinement predicate calls: `o.value()` is the payload
-of `o` when `o` is `Option::some`, and is unspecified when `o` is `Option::none`. The constructors
-state which one built a value. `Option::none` is `{Option(T) where _.is_none()}`. `Option::some(v)`
-is `{Option(T) where not _.is_none() and _.value() == v}` where `v` is built from integer and
-boolean literals, names, field reads and operators, and `{Option(T) where not _.is_none()}`
-otherwise. The method `o.unwrap_or(w)` is the payload of `o`, or `w` when `o` is `Option::none`:
+#### Constructors state what they build
+
+`o.value()` is the payload of `o`, an `Option::some`. Called outside a refinement predicate,
+`value` takes `{Option(T) where not _.is_none()}`. In a predicate, `o.value()` is the payload when
+`o` is `Option::some`, and is unspecified when `o` is `Option::none`.
+
+The constructors state which one built a value and what it took:
+
+```
+Option::none    : {Option(T) where _.is_none()}
+Option::some(v) : {Option(T) where not _.is_none() and _.value() == v}
+```
+
+What the solver uses of a constructor's type is up to the compiler. The method `o.unwrap_or(w)` is
+the payload of `o`, or `w` when `o` is `Option::none`:
 
 ```
 unwrap_or : (o: Option(T), w: T) => {T where (o.is_none() and _ == w) or (not o.is_none() and _ == o.value())}
@@ -1584,8 +1595,8 @@ expected type, a join — rather than at the constructor.
 **`Option` is a nominal type, not a variant.** `Option(T)` is a `type` declared in a std module,
 with constructors `Option::some(T)` and `Option::none`
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), the method
-`Option::is_none` that a lookup's refinement tests, and the methods `Option::unwrap_or` and, in a
-refinement predicate, `Option::value`
+`Option::is_none` that a lookup's refinement tests, and the methods `Option::value` and
+`Option::unwrap_or`
 ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). A structural
 variant with the same arms is a different type, so `` y: Option(Int) = `some(1) `` is a type
 error and `y: Option(Int) = Option::some(1)` is the spelling.
@@ -2250,6 +2261,13 @@ scrutinee; the scrutinee is still checked for name resolution and type correctne
 > `match` name constructors of one type, and that type is the scrutinee's type, so a constructor
 > pattern determines the scrutinee's type without an annotation. Tag arms and constructor arms do
 > not mix in one `match`.
+>
+> An arm knows which constructor built the value it matched. Inside `case Option::some(v):` of
+> `match o`, `o` is `{Option(T) where not _.is_none() and _.value() == v}`, so `o!` is accepted
+> there. A `match` may omit an arm for a constructor that the scrutinee's refinement rules out:
+> `match o: case Option::some(v): v` is complete for `o: {Option(T) where not _.is_none()}`. Which
+> facts the compiler uses to rule a constructor out is up to the compiler; a constructor it does
+> not rule out is a type error at the `match`.
 
 In a value position, including an assignment's right-hand side, every arm must produce a
 value. A statement-position match is also allowed in a loop or transaction body. An arm may

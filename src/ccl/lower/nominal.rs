@@ -876,6 +876,7 @@ pub(in crate::ccl::lower) fn predicate_term(
                         body: otherwise,
                     },
                 ],
+                refuted: Vec::new(),
             })
         }
         _ => unreachable!("a predicate holds `{term}`"),
@@ -1554,7 +1555,7 @@ pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
         acc = match decl.ctor(&name) {
             Some(ctor) => bind_constructor(&decl, ctor, acc, ctx),
             None if name == IS_NONE => bind_is_none(&decl, acc, ctx),
-            None if name == UNWRAP => bind_unwrap(&decl, acc, ctx),
+            None if name == VALUE => bind_value(&decl, acc, ctx),
             None if name == UNWRAP_OR => bind_unwrap_or(&decl, acc, ctx),
             None => unreachable!("`{}` provides no function `{name}`", decl.name),
         };
@@ -1703,20 +1704,14 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     )
 }
 
-/// The member of `Option` that `x!` calls. It is no method: `.unwrap()` names nothing, and `!`
-/// reaches the member only through [`lower_unwrap`].
-const UNWRAP: &str = "unwrap";
-
 /// The method `Option::unwrap_or` that the compiler provides with `Option`.
 const UNWRAP_OR: &str = "unwrap_or";
 
-/// The method `Option::value` that the compiler provides with `Option`, which only a refinement
-/// predicate calls ([`builtin_functions`]). It has no binding: the call lowers to
-/// `option_value` ([`predicate_observer`]).
+/// The method `Option::value` that the compiler provides with `Option`, and that `x!` calls.
 const VALUE: &str = "value";
 
 /// `x!`: the payload of `x`, an `Option` proven `some` (`docs/chl-spec.md`, "Subscript and
-/// unwrap syntax \[Decided\]"). It applies `Option::unwrap` ([`bind_unwrap`]), whose
+/// unwrap syntax \[Decided\]"). It applies `Option::value` ([`bind_value`]), whose
 /// parameter's refinement is the proof `x`'s type owes.
 pub(super) fn lower_unwrap(
     target: &Spanned<ChlExpr>,
@@ -1728,71 +1723,23 @@ pub(super) fn lower_unwrap(
         return Ok(target);
     }
     let option = crate::ccl::nominal::option();
-    let binding = member_reference(&option, UNWRAP, ctx);
+    let binding = member_reference(&option, VALUE, ctx);
     let function = ctx.tag_image(Expr::var(binding), span);
     Ok(Expr::apply(target, function))
 }
 
-/// The payload type `T` of the compiler-provided `Option(T)`.
-fn option_payload_param(decl: &NominalDecl) -> Type {
-    let [t] = decl.params.as_slice() else {
-        unreachable!("`Option` declares one type parameter")
-    };
-    Type::Param(Rc::clone(t))
+/// `Option`'s constructor `ctor`.
+fn option_ctor(decl: &Rc<NominalDecl>, ctor: Label) -> crate::ccl::CtorRef {
+    crate::ccl::CtorRef {
+        decl: Rc::clone(decl),
+        ctor: ctor.name().into(),
+    }
 }
 
-/// `value ▷ id`, with `id` stamped `𝑇 ⇒ {𝑇 | predicate}`: `value` at the type `predicate`
-/// refines, which inference takes as stated rather than deriving it.
-///
-/// A compiler-provided member of `Option` states what its result is in terms of
-/// `option_is_none` and `option_value`, which no typing rule derives from the `match` that
-/// computes it. `id` is the one node whose stamped type inference takes as given
-/// (`emit_node`'s rule for a `Builtin`), so the stamp is where the statement goes. At runtime it
-/// is the identity.
-fn asserting(
-    value: Expr,
-    refined: &Type,
-    span: Span,
-    label: crate::ccl::provenance::RewriteLabel,
-    ctx: &mut LoweringContext,
-) -> Expr {
-    let from = refined.peel_refinements().clone();
-    stamped_id(value, from, refined.clone(), span, label, ctx)
-}
-
-/// `value ▷ id`, with `id` stamped `from ⇒ to`, which inference takes as given ([`asserting`]).
-fn stamped_id(
-    value: Expr,
-    from: Type,
-    to: Type,
-    span: Span,
-    label: crate::ccl::provenance::RewriteLabel,
-    ctx: &mut LoweringContext,
-) -> Expr {
-    let id = Expr::builtin(crate::ccl::Builtin::Id).with_ty(Type::fun(from, to));
-    let id = ctx.tag_machinery(id, span, label);
-    ctx.tag_machinery(Expr::apply(value, id), span, label)
-}
-
-/// `payload` refined by `predicate`, with the predicate's nodes recorded.
-fn refined_by(
-    payload: &Type,
-    predicate: Expr,
-    span: Span,
-    label: crate::ccl::provenance::RewriteLabel,
-    ctx: &mut LoweringContext,
-) -> Type {
-    ctx.tag_predicate(&predicate, span, label);
-    Type::refined_one(
-        payload.clone(),
-        crate::ccl::Refinement::born(Rc::new(predicate)),
-    )
-}
-
-/// `match scrutinee { some(𝑣) → 𝑣; none → none }`, each arm's head `head(tag)`, or with no
-/// `none` arm when `none` is `None`.
+/// `match scrutinee { Option::some(𝑣) → 𝑣; Option::none → none }`, or with no `none` arm when
+/// `none` is `None`.
 fn match_option(
-    head: &dyn Fn(Label) -> PatternHead,
+    decl: &Rc<NominalDecl>,
     scrutinee: Expr,
     none: Option<Expr>,
     span: Span,
@@ -1820,7 +1767,10 @@ fn match_option(
         .into_iter()
         .map(|(tag, binding, empty_payload, body)| crate::ccl::Branch {
             pattern: Some(Pattern {
-                head: head(tag),
+                head: PatternHead::Constructor {
+                    decl: Rc::clone(decl),
+                    ctor: tag.name().into(),
+                },
                 head_occurrence: Occurrence::mint(),
                 binding,
                 empty_payload,
@@ -1832,63 +1782,50 @@ fn match_option(
     ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label)
 }
 
-/// `Option::unwrap`, the function `x!` applies:
-/// `λ 𝑜 : {Option(𝑇) | not (__elem ▷ option_is_none)} → match (𝑜 ▷ id) { `some(𝑣) → 𝑣 }`, its
-/// result asserted `{𝑇 | __elem == (𝑜 ▷ option_value)}` ([`asserting`]).
+/// `Option::value`, the method `x!` calls:
+/// `λ 𝑜 : {Option(𝑇) | not (__elem ▷ ctor_is(Option::none))} → match 𝑜 { Option::some(𝑣) → 𝑣 }`.
 ///
-/// The parameter's refinement excludes `none`, so the `match` has no arm for it. The `id` is
-/// stamped ``{Option(𝑇) | not (__elem ▷ option_is_none)} ⇒ {`some{𝑇}}``, the variant the
-/// refinement leaves, so the scrutinee's type carries no `none` tag for the one arm to miss:
-/// `lambda_elim` checks a `match`'s arms against its scrutinee's tags with the refinements
-/// stripped (the scrutinee-Case rule).
-fn bind_unwrap(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
-    use crate::ccl::nominal::{option_is_none, option_value};
-    use crate::ccl::{BinOpKind, CompareKind, UnaryOpKind};
-    let label = "lower.option_unwrap";
+/// The `match` has no arm for `none`: the parameter's refinement rules it out, which
+/// inference proves (`src/ccl/design/type-inference.md`, "Arm facts"). Its result is
+/// `{𝑇 | 𝑜 ▷ ctor_is(Option::some) and __elem == 𝑜 ▷ ctor_payload(Option::some)}`, which the
+/// `match` derives.
+fn bind_value(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
+    use crate::ccl::UnaryOpKind;
+    let label = "lower.option_value";
     let span = decl.span;
-    let arg = "__unwrap_arg";
-    let t = option_payload_param(decl);
+    let arg = "__value_arg";
     let option_ty = decl
         .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    let bool_ty = Type::Base(crate::ccl::BaseType::Bool);
-
+    let Type::Nominal(_, args) = &option_ty else {
+        unreachable!("a declaration applied to its parameters is a nominal type")
+    };
     let elem = Expr::var(Name::elem()).with_ty(option_ty.clone());
+    let is_none = crate::ccl::nominal::ctor_is(elem, &option_ctor(decl, V_NONE), args);
     let excludes_none =
-        Expr::unary(UnaryOpKind::Not, option_is_none(elem, &t)).with_ty(bool_ty.clone());
-    let param_ty = refined_by(&option_ty, excludes_none, span, label, ctx);
-
-    let read = Expr::var(arg).with_ty(option_ty);
-    let some_ty = Type::variant(vec![(FieldKey::Name(V_SOME), t.clone())]);
-    let predicate = Expr::binop(
-        Expr::var(Name::elem()).with_ty(t.clone()),
-        BinOpKind::Compare(CompareKind::Equals),
-        option_value(read, &t),
-    )
-    .with_ty(bool_ty);
-    let result_ty = refined_by(&t, predicate, span, label, ctx);
-
+        Expr::unary(UnaryOpKind::Not, is_none).with_ty(Type::Base(crate::ccl::BaseType::Bool));
+    ctx.tag_predicate(&excludes_none, span, label);
+    let param_ty = Type::refined_one(
+        option_ty.clone(),
+        crate::ccl::Refinement::born(Rc::new(excludes_none)),
+    );
     let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
-    let scrutinee = stamped_id(scrutinee, param_ty.clone(), some_ty, span, label, ctx);
-    let case = match_option(&PatternHead::Tag, scrutinee, None, span, label, ctx);
-    let value = asserting(case, &result_ty, span, label, ctx);
-    let name = member_binding(decl, UNWRAP);
+    let case = match_option(decl, scrutinee, None, span, label, ctx);
+    let name = member_binding(decl, VALUE);
     let binder = Occurrence::mint();
     bind_function(
-        decl, name, binder, arg, param_ty, value, acc, span, label, ctx,
+        decl, name, binder, arg, param_ty, case, acc, span, label, ctx,
     )
 }
 
 /// `Option::unwrap_or`, the function
 /// `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, polymorphic
-/// over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃`, its result asserted `{𝑇₃ | (𝑝.0 ▷ option_is_none and
-/// __elem == 𝑝.1) or (not (𝑝.0 ▷ option_is_none) and __elem == (𝑝.0 ▷ option_value))}`
-/// ([`asserting`]).
+/// over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃`.
 ///
 /// The option's payload and the default each have their own parameter, so a call does not
-/// equate their types. Only the result's parameter, `𝑇₃`, lies above both.
+/// equate their types. Only the result's parameter, `𝑇₃`, lies above both. The result's
+/// refinement is the one the `match` derives, `(𝑝.0 ▷ ctor_is(Option::some) and __elem ==
+/// 𝑝.0 ▷ ctor_payload(Option::some)) or (𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`.
 fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
-    use crate::ccl::nominal::{option_is_none, option_value};
-    use crate::ccl::{BinOpKind, CompareKind, LogicKind, UnaryOpKind};
     let label = "lower.option_unwrap_or";
     let span = decl.span;
     let arg = "__unwrap_or_arg";
@@ -1909,37 +1846,8 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
         below_result("T1"),
         below_result("T2"),
     ];
-    let [t3, t1, t2] =
-        [&params[0], &params[1], &params[2]].map(|p| Type::Param(Rc::clone(&p.param)));
-    let option_ty = Type::Nominal(Rc::clone(decl), vec![t1.clone()]);
-    let param_ty = Type::Tuple(vec![option_ty.clone(), t2.clone()]);
-    let bool_ty = Type::Base(crate::ccl::BaseType::Bool);
-
-    let read = |i: usize, ty: &Type| {
-        Expr::apply(
-            Expr::var(arg).with_ty(param_ty.clone()),
-            Expr::proj_index(i).with_ty(Type::fun(param_ty.clone(), ty.clone())),
-        )
-        .with_ty(ty.clone())
-    };
-    let option = || read(0, &option_ty);
-    let elem = || Expr::var(Name::elem()).with_ty(t3.clone());
-    let equals = |l: Expr, r: Expr| {
-        Expr::binop(l, BinOpKind::Compare(CompareKind::Equals), r).with_ty(bool_ty.clone())
-    };
-    let and = |l: Expr, r: Expr| {
-        Expr::binop(l, BinOpKind::BoolLogic(LogicKind::And), r).with_ty(bool_ty.clone())
-    };
-    let is_none = || option_is_none(option(), &t1);
-    let when_none = and(is_none(), equals(elem(), read(1, &t2)));
-    let when_some = and(
-        Expr::unary(UnaryOpKind::Not, is_none()).with_ty(bool_ty.clone()),
-        equals(elem(), option_value(option(), &t1)),
-    );
-    let predicate = Expr::binop(when_none, BinOpKind::BoolLogic(LogicKind::Or), when_some)
-        .with_ty(bool_ty.clone());
-    let result_ty = refined_by(&t3, predicate, span, label, ctx);
-
+    let [t1, t2] = [&params[1], &params[2]].map(|p| Type::Param(Rc::clone(&p.param)));
+    let param_ty = Type::Tuple(vec![Type::Nominal(Rc::clone(decl), vec![t1]), t2]);
     let component = |i: usize, ctx: &mut LoweringContext| {
         let read = Expr::apply(
             ctx.tag_machinery(Expr::var(arg), span, label),
@@ -1949,12 +1857,7 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
     };
     let scrutinee = component(0, ctx);
     let default = component(1, ctx);
-    let constructor = |tag: Label| PatternHead::Constructor {
-        decl: Rc::clone(decl),
-        ctor: tag.name().into(),
-    };
-    let case = match_option(&constructor, scrutinee, Some(default), span, label, ctx);
-    let value = asserting(case, &result_ty, span, label, ctx);
+    let case = match_option(decl, scrutinee, Some(default), span, label, ctx);
     let name = member_binding(decl, UNWRAP_OR);
     let binder = Occurrence::mint();
     bind_function_over(
@@ -1964,7 +1867,7 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
         binder,
         arg,
         param_ty,
-        value,
+        case,
         acc,
         span,
         label,
@@ -1985,9 +1888,8 @@ fn member_reference(decl: &Rc<NominalDecl>, name: &str, ctx: &mut LoweringContex
 }
 
 /// The associated functions the compiler provides with its declarations: `Option`'s methods
-/// `is_none` and `unwrap_or`, and inside a refinement predicate its method `value`, whose
-/// result for a `none` is unspecified.
-fn builtin_functions(ctx: &LoweringContext) -> Vec<AssociatedFunction> {
+/// `is_none`, `value` and `unwrap_or`.
+fn builtin_functions() -> [AssociatedFunction; 3] {
     let option = crate::ccl::nominal::option();
     let span = option.span;
     let method = |name: &'static str, arity: usize| AssociatedFunction {
@@ -1997,40 +1899,25 @@ fn builtin_functions(ctx: &LoweringContext) -> Vec<AssociatedFunction> {
         is_method: true,
         span,
     };
-    let mut functions = vec![method(IS_NONE, 1), method(UNWRAP_OR, 2)];
-    if ctx.in_refinement_predicate {
-        functions.push(method(VALUE, 1));
-    }
-    functions
+    [method(IS_NONE, 1), method(VALUE, 1), method(UNWRAP_OR, 2)]
 }
 
-/// The observer of `Option` that the method call `.method()` passing `args` arguments lowers
-/// to inside a refinement predicate: `option_is_none` for `.is_none()` and `option_value` for
-/// `.value()`, where `Option` is the only type declaring the method (`owners`).
+/// The reading a refinement predicate gives a call of `decl`'s method `method`, where the
+/// method is one of `Option`'s observers: `is_none` reads `ctor_is(Option::none)`, and `value`
+/// reads `ctor_payload(Option::some)`.
 ///
-/// The refinement encoding reads the builtin (`src/ccl/infer/solver/smt.rs`, [`Sort::Option`]).
-/// A call of the method's binding is a function it has no encoding for, and specialization
-/// renames that binding, so the predicate states nothing the solver can use.
-///
-/// [`Sort::Option`]: crate::ccl::infer::solver::smt::Sort::Option
-fn predicate_observer(
-    method: &str,
-    owners: &[(Rc<NominalDecl>, usize, Option<QualifiedNameOf>)],
-    args: usize,
-    ctx: &LoweringContext,
-) -> Option<crate::ccl::Builtin> {
-    if !ctx.in_refinement_predicate || args != 0 || ctx.reached_methods.contains(method) {
-        return None;
-    }
-    let [(decl, _, None)] = owners else {
-        return None;
-    };
+/// The method's function is what a call of it computes, and the refinement encoding reads
+/// neither function. The reading is what the encoding reads (`src/ccl/infer/solver/smt.rs`,
+/// "Nominal values"). It takes the candidate's place, so the call resolves by its receiver's
+/// type as any method call does. Unlike `value`, `ctor_payload` has no domain refinement: it
+/// states nothing of a `none`, and `_.value() == 3` is a predicate about any `Option`.
+fn predicate_reading(decl: &Rc<NominalDecl>, method: &str) -> Option<crate::ccl::Builtin> {
     if **decl != *crate::ccl::nominal::option() {
         return None;
     }
     match method {
-        IS_NONE => Some(crate::ccl::Builtin::OptionIsNone),
-        VALUE => Some(crate::ccl::Builtin::OptionValue),
+        IS_NONE => Some(crate::ccl::Builtin::CtorIs(option_ctor(decl, V_NONE))),
+        VALUE => Some(crate::ccl::Builtin::CtorPayload(option_ctor(decl, V_SOME))),
         _ => None,
     }
 }
@@ -2192,7 +2079,7 @@ fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Memb
     ctx.associated_functions
         .iter()
         .cloned()
-        .chain(builtin_functions(ctx))
+        .chain(builtin_functions())
         .find(|f| *f.decl == *decl && f.name == name)
         .map(|f| (Member::Associated { arity: f.arity }, f.span))
 }
@@ -2479,12 +2366,9 @@ pub(super) fn refuse_nested(span: Span, decl: &TypeDecl) -> LoweringError {
 
 /// The nominal type a `match`'s constructor arms name, once each arm is checked against
 /// it: every arm names a constructor of that one type and binds one name per declared
-/// parameter, and without a `case _:` every constructor has an arm
-/// (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
+/// parameter (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
 pub(super) fn constructor_arms_type(
-    match_span: Span,
     arms: &[MatchArm],
-    has_default: bool,
     ctx: &LoweringContext,
 ) -> Result<Rc<NominalDecl>, LoweringError> {
     let mut found: Option<Rc<NominalDecl>> = None;
@@ -2509,34 +2393,10 @@ pub(super) fn constructor_arms_type(
         }
         check_binders(&decl, pattern)?;
     }
+    // A constructor no arm names is checked by inference, which proves its arm unreachable
+    // from what the scrutinee's type states (`src/ccl/design/type-inference.md`, "Unreachable
+    // arms").
     let decl = found.expect("`constructor_arms_type` is called with a constructor arm");
-    if !has_default {
-        let named: HashSet<&str> = arms
-            .iter()
-            .filter_map(|a| match &a.pattern {
-                Some(ArmPattern::Constructor(p)) => Some(p.ctor.node.as_str()),
-                _ => None,
-            })
-            .collect();
-        let missing: Vec<String> = decl
-            .body()
-            .ctors
-            .iter()
-            .filter(|c| !named.contains(c.name.as_str()))
-            .map(|c| format!("`{}::{}`", decl.name, c.name))
-            .collect();
-        if !missing.is_empty() {
-            return Err(LoweringError::unsupported(
-                match_span,
-                format!(
-                    "`match` over `{}` has no arm for {}; each constructor is handled by an \
-                     arm, or `case _:` covers the rest",
-                    decl.name,
-                    missing.join(", ")
-                ),
-            ));
-        }
-    }
     Ok(decl)
 }
 
@@ -3175,7 +3035,7 @@ pub(super) fn lower_method_call(
         .associated_functions
         .iter()
         .cloned()
-        .chain(builtin_functions(ctx))
+        .chain(builtin_functions())
         .filter(|f| f.is_method && f.name == method.node)
         .map(|f| (Rc::clone(&f.decl), f.arity - 1, None))
         .collect();
@@ -3204,13 +3064,22 @@ pub(super) fn lower_method_call(
             ),
         ));
     }
-    if let Some(observer) = predicate_observer(&method.node, &owners, args.len(), ctx) {
-        let function = ctx.tag_image(Expr::builtin(observer), method.span);
-        return Ok(Expr::apply(receiver, function));
-    }
     let candidates = owners
         .into_iter()
         .map(|(decl, params, qualifier)| {
+            let reading = ctx
+                .in_refinement_predicate
+                .then(|| predicate_reading(&decl, &method.node))
+                .flatten();
+            if let Some(reading) = reading {
+                let function = ctx.tag_image(Expr::builtin(reading), method.span);
+                return MethodCandidate {
+                    decl,
+                    params,
+                    function,
+                    copy: false,
+                };
+            }
             let binding = match qualifier {
                 None => member_reference(&decl, &method.node, ctx),
                 Some(qualifier) => {

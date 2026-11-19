@@ -3201,14 +3201,6 @@ fn convert_impl_inner(
                             expr.ty
                         ))
                     })?;
-                    // A constructor whose result a refinement ties to an out-of-scope binder
-                    // (`Option::some(𝑖)`'s `option_value == 𝑖`) is generalized over its result,
-                    // which then ranges below the parameter's bound.
-                    let codomain = match codomain.generalized_param().and_then(|p| p.bound.clone())
-                    {
-                        Some(bound) => bound,
-                        None => codomain,
-                    };
                     let union_ty = codomain.peel_refinements().structure();
                     let Type::Variant(variants, _) = &*union_ty else {
                         return Err(ConversionError::TypeError(format!(
@@ -6820,6 +6812,7 @@ mod variant_ctor_tests {
                     guard: bool_true(),
                     body: arm_body,
                 }],
+                refuted: Vec::new(),
             },
             out_rec_ty.clone(),
         );
@@ -6966,6 +6959,7 @@ mod variant_ctor_tests {
                         body: abort_body,
                     },
                 ],
+                refuted: Vec::new(),
             },
             variant_ty.clone(),
         );

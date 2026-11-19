@@ -2532,31 +2532,48 @@ fn unwrap_of_an_annotated_option() {
     );
 }
 
-// The tests below assert the value each program computes, and `should_panic` pins the panic it
-// raises instead. Pinned on the failure rather than deferred: an `#[ignore]` reports the same
-// green whether the gap closed, regressed, or went away, and nothing runs ignored tests here.
-// Once the program computes its value, the `should_panic` comes off.
-
-/// `!` in a comprehension's element. The post-lambda-elimination check rejects the tree: a
-/// `Compose` stage expects the variant ``{`some{Int}}`` and finds the nominal `Option(Int)`.
-/// `Option::some(x).unwrap_or(0)` is the same program through `unwrap_or`.
-#[test]
-#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
-fn unwrap_in_a_comprehension() {
-    check_scalar(
-        indoc! {"
-            xs = [1, 2]
-            sum([Option::some(x)! for x in xs])
-        "},
-        Value::Int(3),
-    );
+/// `!` and `unwrap_or` in a comprehension's element.
+#[rstest]
+#[case::unwrap(indoc! {"
+    xs = [1, 2]
+    sum([Option::some(x)! for x in xs])
+"})]
+#[case::unwrap_or(indoc! {"
+    xs = [1, 2]
+    sum([Option::some(x).unwrap_or(0) for x in xs])
+"})]
+// The `match` `unwrap_or` is, written out. Its `none` arm reads only the outer binder, and its
+// leg keeps the gate that restricts it to the `none` positions.
+#[case::written_out(indoc! {"
+    def f(o, d):
+        match o:
+            case Option::some(v):
+                v
+            case Option::none:
+                d
+    xs = [1, 2]
+    sum([f(Option::some(x), 0) for x in xs])
+"})]
+fn unwrap_in_a_comprehension(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
 }
 
-/// `!` of a `String` payload. The post-inlining check rejects the type of `Option::some("a")`:
-/// the type it expects carries `_.value() == "a"`, and the type it finds carries only
-/// `not _.is_none()`.
+/// A constructor states its payload whatever the payload's type. The refinement encoding reads
+/// none of these payloads and drops what it states of them.
+#[rstest]
+#[case::string(indoc! {r#"
+    x = Option::some("a")
+    x.is_none()
+"#})]
+#[case::record("Option::some((a=1)).is_none()")]
+#[case::list("Option::some([1, 2]).is_none()")]
+#[case::tuple("Option::some((1, 2)).is_none()")]
+fn a_payload_outside_the_encoding(#[case] code: &str) {
+    check_scalar(code, Value::Bool(false));
+}
+
+/// `!` of a `String` payload.
 #[test]
-#[should_panic(expected = "post-inline produced an invalid tree")]
 fn unwrap_of_a_string_payload() {
     check_scalar(
         indoc! {r#"
@@ -2567,10 +2584,83 @@ fn unwrap_of_a_string_payload() {
     );
 }
 
+/// An arm knows which constructor built the value it matched, so `o!` holds in the `some` arm.
+#[test]
+fn unwrap_in_the_arm_that_matched_some() {
+    check_scalar(
+        indoc! {"
+            def f(o: Option(Int)) => Int:
+                match o:
+                    case Option::some(v):
+                        o!
+                    case Option::none:
+                        0
+            f(Option::some(4))
+        "},
+        Value::Int(4),
+    );
+}
+
+/// A `match` needs no arm for a constructor the scrutinee's refinement rules out.
+#[test]
+fn an_arm_the_refinement_rules_out_is_omitted() {
+    check_scalar(
+        indoc! {"
+            def f(o: {Option(Int) where not _.is_none()}) => Int:
+                match o:
+                    case Option::some(v):
+                        v
+            f(Option::some(4))
+        "},
+        Value::Int(4),
+    );
+}
+
+/// An arm nothing rules out is required.
+#[rstest]
+#[case::unrefined(indoc! {"
+    def f(o: Option(Int)) => Int:
+        match o:
+            case Option::some(v):
+                v
+    f(Option::some(4))
+"})]
+// What the payload's type states holds only of a value `some` built, so it does not rule `none`
+// out: `none` is the one value of this type.
+#[case::uninhabited_payload(indoc! {"
+    def f(o: Option({Int where False})) => Int:
+        match o:
+            case Option::some(v):
+                v
+    f(Option::none)
+"})]
+fn an_arm_nothing_rules_out_is_required(#[case] code: &str) {
+    check_compile_error(code, "has no arm for `Option::none`");
+}
+
+/// A predicate's `.is_none()` and `.value()` resolve by the receiver's type, so another type's
+/// method of the same name does not change what they mean.
+#[rstest]
+#[case::is_none(indoc! {"
+    type W = Int
+    def W::is_none(self) => Bool:
+        False
+    y: {Option(Int) where not _.is_none()} = Option::some(3)
+    y!
+"})]
+#[case::value(indoc! {"
+    type W = Int
+    def W::value(self) => Int:
+        0
+    y: {Option(Int) where _.value() == 3} = Option::some(3)
+    y.unwrap_or(0)
+"})]
+fn another_types_method_of_the_same_name(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
+}
+
 /// `f`'s parameter is inferred from both calls, so it admits `Option::none`, and `!`'s domain
-/// refinement `not _.is_none()` rejects it. Checked alone, `f`'s body reaches the `match` inside
-/// `Option::unwrap` with a scrutinee that carries `` `some `` but whose payload no value reaches;
-/// the payload is `f`'s parameter, not an unreachable arm to pin.
+/// refinement `not _.is_none()` rejects it.
 #[test]
 fn unwrapping_a_parameter_called_with_none_is_rejected() {
     check_compile_error(
@@ -2580,7 +2670,6 @@ def f(x):
     x1 == 1
 f(Option::some(1)) == f(Option::none)
         "#},
-        "Type mismatch for this call: expected {Option({Int where _ == 1}) where not _.is_none()}, \
-         found {Option(",
+        "Type mismatch for this call: expected {Option(Int) where not _.is_none()}, found {Option(",
     )
 }

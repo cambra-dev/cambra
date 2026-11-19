@@ -508,6 +508,7 @@ fn if_returns_variant() {
     let expr = TypedExpr::new(TypedExprNode::Case {
         scrutinee: None,
         branches: arms,
+        refuted: Vec::new(),
     });
     let ty = run(expr).expect("inference ok");
     // Each arm flows one-way into a shared result variable, so coalescing at
@@ -610,6 +611,7 @@ fn unobservable_arm_payload_resolves_everywhere() {
             arm("a", "v", None, var("v")),
             arm("b", "w", None, lit_int(0)),
         ],
+        refuted: Vec::new(),
     });
     let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
     let call = TypedExpr::apply(
@@ -640,6 +642,7 @@ fn ignored_arm_payload_still_takes_its_argument_type() {
             arm("a", "v", None, lit_int(0)),
             arm("b", "w", None, lit_int(0)),
         ],
+        refuted: Vec::new(),
     });
     let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
     let call = TypedExpr::apply(
@@ -677,6 +680,7 @@ fn read_arm_payload_is_pinned_to_where_it_flows() {
     let body = TypedExpr::new(TypedExprNode::Case {
         scrutinee: Some(Box::new(var("x"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
+        refuted: Vec::new(),
     });
     let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
     let call = TypedExpr::apply(
@@ -741,6 +745,7 @@ fn read_arm_payload_is_pinned_to_a_type_its_reads_accept(
     let body = TypedExpr::new(TypedExprNode::Case {
         scrutinee: Some(Box::new(var("x"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, read)],
+        refuted: Vec::new(),
     });
     let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
     let call = TypedExpr::apply(
@@ -821,6 +826,7 @@ fn an_upper_bound_alone_does_not_count_as_a_value_reaching_a_payload() {
     let body = TypedExpr::new(TypedExprNode::Case {
         scrutinee: Some(Box::new(var("m"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
+        refuted: Vec::new(),
     });
     let unwrap = TypedExpr::lambda("m", Occurrence::mint(), Type::Hole, body);
     let call = |n: i64| {

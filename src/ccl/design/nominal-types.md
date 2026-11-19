@@ -354,52 +354,60 @@ does. No `Method` node survives inference. A method no type declares is a loweri
 ### The compiler-provided `Option`
 
 `Option(T)` is a `NominalDecl` the compiler provides (`nominal::option`) at the path `std::Option`,
-with the constructors `none` and `some(T)`, the methods `is_none` and `unwrap_or`, and no source.
-Its constructor names are the tags the runtime builds when it answers a checked lookup (`V_NONE`,
-`V_SOME`), so a lookup's answer is a value of it. `LoweringContext::nominal_type` answers it for the
-name `Option` after the module's own declarations, and `Type::option_of` builds an application of
-it.
+with the constructors `none` and `some(T)`, the methods `is_none`, `value` and `unwrap_or`, and no
+source. Its constructor names are the tags the runtime builds when it answers a checked lookup
+(`V_NONE`, `V_SOME`), so a lookup's answer is a value of it. `LoweringContext::nominal_type`
+answers it for the name `Option` after the module's own declarations, and `Type::option_of` builds
+an application of it.
 
 A member of `Option` is bound only where the module names it: a reference records it
-(`member_reference`), and `bind_constructors` binds the recorded ones, `is_none` as `λ 𝑜 : Option(𝑇)
-→ match 𝑜 { Option::some(_) → false; Option::none → true }` (`bind_is_none`), `unwrap_or` as
-`bind_unwrap_or`, and `unwrap`, which only `x!` names (`lower_unwrap`), as `bind_unwrap`. A method
-call names every type that declares its method, because inference picks the candidate from the
-receiver's type, so any `.is_none()` call binds `Option::is_none`, even one whose receiver is a type
-declaring its own `is_none`. A module that names no member lowers as it would without the
-declaration. Its identity is its path, so every compilation, and every version of a reloaded
-program, names the same type. Its spans are empty, and lowering refuses the programs that would
-point a diagnostic at one: a declaration named `Option`, and an associated function of it.
+(`member_reference`), and `bind_constructors` binds the recorded ones. Each is an ordinary `match`:
 
-#### Refinements an `Option` carries
+- `is_none` is `λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }`
+  (`bind_is_none`).
+- `value`, which `x!` calls (`lower_unwrap`), is
+  `λ 𝑜 : {Option(𝑇) | not (__elem ▷ ctor_is(Option::none))} → match 𝑜 { Option::some(𝑣) → 𝑣 }`
+  (`bind_value`). The parameter's refinement rules out `none`, so the `match` has no arm for it
+  (`type-inference.md`, [Unreachable arms](type-inference.md#unreachable-arms)).
+- `unwrap_or` is `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`,
+  polymorphic over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃` (`bind_unwrap_or`). The payload and the default
+  each have their own parameter, so a call does not equate their types. Only the result's
+  parameter lies above both.
 
-Two builtins observe an `Option` in a refinement predicate: `option_is_none : Option(𝑇) ⇒ Bool`
-and `option_value : Option(𝑇) ⇒ 𝑇`. Neither is executed. The solver encodes `Option(𝑇)` as an
-uninterpreted sort with an uninterpreted `is_some` and `value` (`Sort::Option` in
-`src/ccl/infer/solver/smt.rs`), so `option_value` of a `none` is unconstrained.
+The refinements of `value`'s and `unwrap_or`'s results are the ones their `match` derives
+(`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). A method call names every type
+that declares its method, because inference picks the candidate from the receiver's type, so any
+`.is_none()` call binds `Option::is_none`, even one whose receiver is a type declaring its own
+`is_none`. A module that names no member lowers as it would without the declaration. Its identity
+is its path, so every compilation, and every version of a reloaded program, names the same type.
+Its spans are empty, and lowering refuses the programs that would point a diagnostic at one: a
+declaration named `Option`, and an associated function of it.
 
-- `emit_nominal_ctor` refines each `Option` it builds: `Option::none` by
-  `__elem ▷ option_is_none`, and `Option::some(𝑣)` by `not (__elem ▷ option_is_none)` and, where
-  `𝑣` is in the solver's term fragment (`in_term_fragment`), `(__elem ▷ option_value) == 𝑣`.
-  The fragment admits an operator in both spellings, `𝑙 + 𝑟` and the `(𝑙, 𝑟) ▷ add` that
-  `lambda_elim` rewrites it to in a predicate as in the tree. The check after `lambda_elim`
-  re-derives the type of an `Option::some` inside a predicate, and with one spelling admitted it
-  derives a type without the `option_value` conjunct inference recorded.
-- `bind_unwrap` and `bind_unwrap_or` state their results through `asserting`, which applies an
-  `id` stamped `𝑇 ⇒ {𝑇 | predicate}`. Inference takes the stamp as given, since no typing rule
-  derives the predicate from the `match` that computes the result.
-- `unwrap_or` is `(𝑝: (Option(𝑇₁), 𝑇₂)) ⇒ {𝑇₃ | predicate}`, polymorphic over `𝑇₃`, `𝑇₁ <: 𝑇₃`
-  and `𝑇₂ <: 𝑇₃` rather than over `Option`'s own parameter. The payload and the default each have
-  their own parameter, so a call does not equate their types. Only the result's parameter lies
-  above both. `unwrap`'s parameter is
-  `{Option(𝑇) | not (__elem ▷ option_is_none)}`, so its `match` has no `none` arm. Its scrutinee
-  is the parameter through an `id` stamped ``{Option(𝑇) | …} ⇒ {`some{𝑇}}``, and the arm names the
-  tag `` `some ``: `lambda_elim` checks a `match` against its scrutinee's tags with refinements
-  stripped, and `Option(𝑇)` stripped still carries `none`.
-- In a refinement predicate, `.is_none()` and `.value()` lower to `option_is_none` and
-  `option_value` (`predicate_observer`) where `Option` is the only type declaring the method.
-  A call of the method's binding has no encoding, and specialization renames the binding. The
-  method `value` exists only in a predicate (`builtin_functions`) and has no binding.
+### A constructed value states its constructor and payload
+
+Two builtins observe a value of any nominal type `N` in a refinement predicate:
+`ctor_is(N::c) : N(𝑃…) ⇒ Bool`, whether `c` built the value, and `ctor_payload(N::c) : N(𝑃…) ⇒ 𝑃ᶜ`,
+the argument `c` took. Neither is executed. The solver reads them as the value's constructor tag
+and as the path to its payload (`type-inference.md`,
+[A nominal value is reached through its tag and payloads](type-inference.md#a-nominal-value-is-reached-through-its-tag-and-payloads)).
+`ctor_payload` states nothing of a value another constructor built.
+
+`emit_nominal_ctor` refines each value it builds of a type that states its constructors
+(`nominal::states_constructors`) by `__elem ▷ ctor_is(N::c)` and, for a constructor that takes an
+argument, `(__elem ▷ ctor_payload(N::c)) == 𝑎` (`nominal::ctor_refinements`). `Option` alone
+states its constructors. The encoding, the arm facts and the coverage proof of a `match` hold for
+every nominal type (`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). Trait
+selection and the passes after inlining do not yet read a refined value of any other type. The
+argument `𝑎` is stated whatever its form. The solver drops what it cannot read of it, as it drops
+any antecedent outside its fragment, so a constructor's type does not depend on how its argument is
+written.
+
+In a refinement predicate, `Option`'s methods `is_none` and `value` read as `ctor_is(Option::none)`
+and `ctor_payload(Option::some)` (`predicate_reading`). The reading takes the place of the method's
+candidate in the call's `Method` node, so the call resolves by its receiver's type as any method
+call does, and another type's method of the same name changes nothing. `ctor_payload` has no domain
+refinement, so `_.value() == 3` is a predicate about any `Option`, where a call of `value` outside a
+predicate demands a `some`.
 
 ---
 

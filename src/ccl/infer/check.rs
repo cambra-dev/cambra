@@ -125,6 +125,8 @@ pub(super) struct CheckCtx {
     /// Entries accumulate and are never removed — a uniquified name denotes one
     /// binding, so the fact it records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The facts in scope at the current position ([`Typing::assuming`]).
+    facts: Vec<Expr>,
     /// The refinement predicates already typed by [`check_slot_predicates`], by address. A
     /// predicate shared across type slots is one term and is typed once.
     checked_predicates: std::collections::HashSet<crate::ccl::ty::PredicateId>,
@@ -177,6 +179,7 @@ impl CheckMode {
 struct CheckScope<'a> {
     scopes: &'a ScopeStack<Name, Type>,
     opaque_binders: &'a HashMap<Name, Type>,
+    facts: &'a [Expr],
 }
 
 impl ScopeEnv for CheckScope<'_> {
@@ -185,6 +188,9 @@ impl ScopeEnv for CheckScope<'_> {
             .lookup(name)
             .or_else(|| self.opaque_binders.get(name))
             .cloned()
+    }
+    fn facts(&self) -> Vec<Expr> {
+        self.facts.iter().map(Expr::clone_preserving_ids).collect()
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -208,6 +214,7 @@ impl CheckCtx {
             telescope: Telescope::empty(),
             scopes: ScopeStack::default(),
             opaque_binders: HashMap::new(),
+            facts: Vec::new(),
             checked_predicates: Default::default(),
             opened_types: Vec::new(),
             scratch_lambdas: Vec::new(),
@@ -222,6 +229,7 @@ impl CheckCtx {
         CheckScope {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
+            facts: &self.facts,
         }
     }
 
@@ -559,6 +567,28 @@ impl Typing for CheckCtx {
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
+    }
+
+    fn assuming<R>(&mut self, facts: Vec<Expr>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let depth = self.facts.len();
+        self.facts.extend(facts);
+        let r = f(self);
+        self.facts.truncate(depth);
+        r
+    }
+
+    fn refutes(&mut self, facts: Vec<Expr>, recorded: bool) -> bool {
+        // Refinement-blind checking decides no refinement, so it takes the proof inference
+        // recorded on the `Case`.
+        if matches!(self.mode, CheckMode::RefinementBlind) {
+            return recorded;
+        }
+        let scope = self.scope();
+        let scope = crate::ccl::infer::solver::smt::WithFacts {
+            inner: &scope,
+            facts: &facts,
+        };
+        crate::ccl::infer::solver::smt::refuted(&scope).unwrap_or(false)
     }
 
     fn instantiate_generalized(&mut self, ty: &Type, incoming: &Type) -> Type {
@@ -1094,7 +1124,8 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Case {
             scrutinee,
             branches,
-        } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
+            refuted,
+        } => emit_case(scrutinee.as_deref_mut(), branches, refuted, &label, ctx)?,
 
         TypedExprNode::VariantCtor {
             tag_occurrence: _,

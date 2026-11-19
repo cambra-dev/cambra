@@ -323,6 +323,9 @@ pub struct ConstrainCache {
     /// not: uses that differ only in what they cause share one clone, and relating their
     /// capabilities through it would give each the others' ([`Self::without_capabilities`]).
     relates_capabilities: bool,
+    /// Whether a lower bound arriving at a variable is checked against its guarded bounds. A
+    /// pin's is not ([`Self::without_guarded_checks`]).
+    checks_guarded: bool,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -376,6 +379,7 @@ impl ConstrainCache {
             unreported: Vec::new(),
             extruded: HashMap::new(),
             relates_capabilities: true,
+            checks_guarded: true,
         }
     }
 
@@ -383,6 +387,16 @@ impl ConstrainCache {
     /// instantiation, and a pin relates only what chooses its clone.
     pub fn without_capabilities(mut self) -> Self {
         self.relates_capabilities = false;
+        self
+    }
+
+    /// This cache, checking no lower bound against a guarded bound. A guarded bound restricts
+    /// the values that reach its holder, and a pin chooses the type of a position that no value
+    /// reaches, so no value arrives with the type it adds. The bound's base edge is ordinary
+    /// and still applies (`src/ccl/design/type-inference.md`, "A variable base takes a guarded
+    /// bound").
+    pub fn without_guarded_checks(mut self) -> Self {
+        self.checks_guarded = false;
         self
     }
 
@@ -2480,7 +2494,7 @@ fn constrain_go_impl(
                 })?;
             }
             let guarded = rv.bounds.borrow().guarded_upper.clone();
-            if !guarded.is_empty() {
+            if !guarded.is_empty() && cache.checks_guarded {
                 let low =
                     Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
                 for entry in &guarded {

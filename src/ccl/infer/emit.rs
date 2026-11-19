@@ -184,7 +184,19 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                             ctx.link_effect(copy, assoc, var);
                         }
                     }
-                    instance.ty
+                    // A read inside a `match` arm over this name knows what the arm matched
+                    // (`src/ccl/design/type-inference.md`, "Arm facts").
+                    let narrowing: Vec<Refinement> = ctx
+                        .narrowed
+                        .iter()
+                        .filter(|(narrowed, _)| narrowed == name)
+                        .flat_map(|(_, refinements)| refinements.iter().cloned())
+                        .collect();
+                    if narrowing.is_empty() {
+                        instance.ty
+                    } else {
+                        Type::refined(instance.ty, narrowing.into_iter().collect())
+                    }
                 }
             }
         }
@@ -234,16 +246,6 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     }
                     _ => instantiated,
                 }
-            } else if *b == crate::ccl::Builtin::Id {
-                // An `id` stamped by lowering asserts a refinement of the value it is applied
-                // to (`asserting` in `src/ccl/lower/nominal.rs`). Lowering types its predicate,
-                // in the declared parameters of the enclosing definition's `Poly`, which are
-                // opened here as the stamp's own types are. The predicate is not emitted: it
-                // is stated rather than checked, and emitting its `==` would demand
-                // `Equatable` of a parameter that declares nothing.
-                let mut stamp = expr.ty.clone();
-                open_stamped_predicates(&mut stamp, ctx);
-                ctx.normalize_annotation(&stamp)
             } else {
                 ctx.normalize_annotation(&expr.ty)
             }
@@ -311,7 +313,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Case {
             scrutinee,
             branches,
-        } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
+            refuted,
+        } => emit_case(scrutinee.as_deref_mut(), branches, refuted, &label, ctx)?,
 
         TypedExprNode::VariantCtor {
             tag_occurrence: _,
@@ -849,23 +852,6 @@ fn emit_bare_predicate<C: Typing>(
             });
     });
     typed
-}
-
-/// Replace each declared type parameter in the type slots of the predicates `ty` carries with
-/// the variable its open `Poly` minted ([`Typing::refinement_domain`]).
-fn open_stamped_predicates<C: Typing>(ty: &mut Type, ctx: &C) {
-    fn open_slots<C: Typing>(e: &mut Expr, ctx: &C) {
-        e.walk_type_slots_mut(|t| *t = ctx.refinement_domain(t));
-        e.walk_children_mut(|child| open_slots(child, ctx));
-    }
-    if let Type::Refinement(_, refinements) = ty {
-        refinements.rewrite_each(|_, r| {
-            let mut predicate = r.predicate.clone_preserving_ids();
-            open_slots(&mut predicate, ctx);
-            *r = Refinement::born(std::rc::Rc::new(predicate));
-        });
-    }
-    ty.walk_children_mut(|child| open_stamped_predicates(child, ctx));
 }
 
 /// Apply a binary scheme: instantiate, build the expected call shape,
@@ -3402,6 +3388,7 @@ pub(super) fn emit_list<C: Typing>(
 pub(super) fn emit_case<C: Typing>(
     mut scrutinee: Option<&mut Expr>,
     branches: &mut [Branch],
+    refuted: &mut Vec<Label>,
     label: &str,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
@@ -3435,8 +3422,16 @@ pub(super) fn emit_case<C: Typing>(
         "a `Case` names the constructors of one nominal type, or tags only (`lower_match` \
          refuses any other arms)"
     );
+    // A `match` over a nominal value whose scrutinee a fact can name: each arm knows which
+    // constructor built the value (`src/ccl/design/type-inference.md`, "Arm facts").
+    let mut matched: Option<(
+        Expr,
+        std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        Vec<Type>,
+    )> = None;
     if let (Some(scrut), Some(decl)) = (scrutinee.as_deref_mut(), nominal) {
-        emit_nominal_scrutinee(scrut, &decl, branches, ctx)?;
+        let args = emit_nominal_scrutinee(scrut, &decl, branches, refuted, ctx)?;
+        matched = Some((scrut.clone_preserving_ids(), decl, args));
     } else if let Some(scrut) = scrutinee {
         let scrut_ty = emit_value_read(scrut, ctx)?;
         let mut expected_tags: BTreeMap<FieldKey, Type> = BTreeMap::new();
@@ -3508,16 +3503,172 @@ pub(super) fn emit_case<C: Typing>(
             .pattern
             .as_ref()
             .map(|p| (p.binding.name.clone(), p.binding.ty.clone()));
-        let body_ty = match scope_info {
+        let facts = match (&matched, &b.pattern) {
+            (Some((scrut, decl, args)), Some(p)) => {
+                let PatternHead::Constructor { ctor, .. } = &p.head else {
+                    unreachable!("a `Case` names constructors of one nominal type or tags only")
+                };
+                let _g = arm_facts_recording(scrut);
+                crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, Some(&p.binding))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let narrowing = matched
+            .as_ref()
+            .and_then(|(scrut, ..)| narrowing_of(scrut, &facts));
+        let emit_arm = |ctx: &mut C| match scope_info {
             Some((name, ty)) => {
                 let body_ty = ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?;
-                ctx.close_pattern_type(&name, body_ty)
+                Ok(ctx.close_pattern_type(&name, body_ty))
             }
-            None => emit_case_branch(b, ctx)?,
+            None => emit_case_branch(b, ctx),
         };
+        let body_ty = ctx.assuming(facts, |ctx| match narrowing {
+            Some((root, refinements)) => ctx.narrowing(&root, refinements, emit_arm),
+            None => emit_arm(ctx),
+        })?;
         ctx.require_sub(&body_ty, &result_ty, &|| "this branch".to_string())?;
     }
-    Ok(result_ty)
+    let derived = matched
+        .as_ref()
+        .filter(|(_, decl, _)| crate::ccl::nominal::states_constructors(decl))
+        .and_then(|(scrut, decl, args)| {
+            let _g = arm_facts_recording(scrut);
+            derived_case_refinement(scrut, decl, args, branches, &result_ty)
+        });
+    Ok(match derived {
+        Some(refinement) => Type::refined_one(result_ty, refinement),
+        None => result_ty,
+    })
+}
+
+/// The narrowing an arm's `facts` about `scrut` give `scrut`, a name: the facts, each with the
+/// name read as `__elem`. `None` when `scrut` is no name, or no fact is stated.
+///
+/// A scrutinee read through a projection, `𝑝.0`, narrows nothing: a refinement of `𝑝`'s type
+/// would ride the projection's recorded domain, and a call inlined later replaces `𝑝` with a
+/// term whose type a check derives without it. The arm's facts still hold in `Γ`.
+fn narrowing_of(scrut: &Expr, facts: &[Expr]) -> Option<(Name, Vec<Refinement>)> {
+    let TypedExprNode::Var(root) = &scrut.node else {
+        return None;
+    };
+    let root = root.clone();
+    if facts.is_empty() {
+        return None;
+    }
+    let _g = arm_facts_recording(scrut);
+    let elem = Expr::var(Name::elem()).with_ty(scrut.ty.clone());
+    let refinements = facts
+        .iter()
+        .map(|fact| {
+            let about_elem =
+                crate::ccl::lambda_elim::substitute(fact.clone_preserving_ids(), &root, &elem);
+            Refinement::born(std::rc::Rc::new(about_elem))
+        })
+        .collect();
+    Some((root, refinements))
+}
+
+/// The recording the nodes of a `match`'s arm facts and its derived refinement are minted
+/// under: machinery of the scrutinee they read.
+fn arm_facts_recording(scrut: &Expr) -> crate::ccl::provenance::RecordingGuard {
+    crate::ccl::provenance::enter(
+        scrut.node_id(),
+        "infer.arm_facts",
+        crate::ccl::provenance::Nature::Machinery,
+    )
+}
+
+/// What a `match` over `scrut`, a value of the nominal type `decl`, states of its result: the
+/// disjunction over its arms of the arm's facts and `__elem == body`, the binder of the arm's
+/// pattern read as the payload it binds (`src/ccl/design/type-inference.md`, "Arm facts").
+/// For `unwrap_or`'s `match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }` it is
+/// `(𝑝.0 ▷ ctor_is(Option::some) and __elem == 𝑝.0 ▷ ctor_payload(Option::some)) or
+/// (𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`.
+///
+/// `None` when some arm's body is not a term ([`is_term`]): copying an arbitrary body into a
+/// type would copy a program into it, and an arm that writes or feeds is no term, which keeps
+/// the refinement off the `match`es the mutability phases rewrite into guards.
+///
+/// [`is_term`]: crate::ccl::infer::solver::smt::is_term `None` when the
+/// scrutinee is no path a fact names.
+fn derived_case_refinement(
+    scrut: &Expr,
+    decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    args: &[Type],
+    branches: &[Branch],
+    result_ty: &Type,
+) -> Option<Refinement> {
+    use crate::ccl::{BinOpKind, CompareKind, LogicKind, UnaryOpKind};
+    let bool_ty = Type::Base(BaseType::Bool);
+    let and = |l: Expr, r: Expr| {
+        Expr::binop(l, BinOpKind::BoolLogic(LogicKind::And), r).with_ty(bool_ty.clone())
+    };
+    let elem = || Expr::var(Name::elem()).with_ty(result_ty.clone());
+    let mut named = Vec::new();
+    let mut disjuncts = Vec::new();
+    for b in branches {
+        let (facts, body) = match &b.pattern {
+            Some(p) => {
+                let PatternHead::Constructor { ctor, .. } = &p.head else {
+                    unreachable!("a `Case` names constructors of one nominal type or tags only")
+                };
+                named.push(ctor.clone());
+                let mut facts = crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, None)?;
+                let payload =
+                    crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, Some(&p.binding))?
+                        .into_iter()
+                        .nth(1)
+                        .and_then(|fact| match fact.node {
+                            TypedExprNode::BinOp { left, .. } => Some(*left),
+                            _ => None,
+                        });
+                let body = match payload {
+                    Some(payload) => crate::ccl::lambda_elim::substitute(
+                        b.body.clone_preserving_ids(),
+                        &p.binding.name,
+                        &payload,
+                    ),
+                    None => b.body.clone_preserving_ids(),
+                };
+                (std::mem::take(&mut facts), body)
+            }
+            // A default arm: no named constructor built the value.
+            None => {
+                let facts = named
+                    .iter()
+                    .map(|ctor| {
+                        let is = crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, None)
+                            .expect("the scrutinee is a path, as the named arms found")
+                            .swap_remove(0);
+                        Expr::unary(UnaryOpKind::Not, is).with_ty(bool_ty.clone())
+                    })
+                    .collect();
+                (facts, b.body.clone_preserving_ids())
+            }
+        };
+        if !crate::ccl::infer::solver::smt::is_term(&body) {
+            return None;
+        }
+        let mut conjuncts = facts;
+        conjuncts.push(
+            Expr::binop(elem(), BinOpKind::Compare(CompareKind::Equals), body)
+                .with_ty(bool_ty.clone()),
+        );
+        let disjunct = conjuncts
+            .into_iter()
+            .reduce(&and)
+            .unwrap_or_else(|| Expr::lit(crate::ccl::Lit::Bool(true)).with_ty(bool_ty.clone()));
+        disjuncts.push(disjunct);
+    }
+    let predicate = disjuncts
+        .into_iter()
+        .reduce(|l, r| {
+            Expr::binop(l, BinOpKind::BoolLogic(LogicKind::Or), r).with_ty(bool_ty.clone())
+        })
+        .expect("a `Case` has at least one branch");
+    Some(Refinement::born(std::rc::Rc::new(predicate)))
 }
 
 /// The scrutinee of a `Case` whose patterns name constructors of the nominal type `decl`.
@@ -3531,12 +3682,48 @@ fn emit_nominal_scrutinee<C: Typing>(
     scrut: &mut Expr,
     decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
     branches: &mut [Branch],
+    refuted: &mut Vec<Label>,
     ctx: &mut C,
-) -> Result<(), LocatedInferError> {
+) -> Result<Vec<Type>, LocatedInferError> {
     let scrut_ty = emit_value_read(scrut, ctx)?;
     let args = fresh_nominal_args(decl, ctx);
     let expected = Type::Nominal(decl.clone(), args.clone());
     ctx.require_sub(&scrut_ty, &expected, &|| "the matched value".to_string())?;
+    // A constructor no arm names is one the scrutinee's refinement rules out: its arm is
+    // unreachable (`src/ccl/design/type-inference.md`, "Unreachable arms"). The `Case` records
+    // each one proved, which is what later passes read in place of the proof.
+    let recorded = std::mem::take(refuted);
+    if branches.iter().all(|b| b.pattern.is_some()) {
+        let named: Vec<&str> = branches
+            .iter()
+            .filter_map(|b| match &b.pattern.as_ref()?.head {
+                PatternHead::Constructor { ctor, .. } => Some(ctor.as_str()),
+                PatternHead::Tag(_) => None,
+            })
+            .collect();
+        let mut unhandled: Vec<String> = Vec::new();
+        for c in decl.body().ctors.iter() {
+            if named.contains(&c.name.as_str()) {
+                continue;
+            }
+            let tag = decl.tag(&c.name);
+            let facts = {
+                let _g = arm_facts_recording(scrut);
+                crate::ccl::nominal::arm_facts(scrut, decl, &args, &c.name, None)
+            };
+            if facts.is_some_and(|facts| ctx.refutes(facts, recorded.contains(&tag))) {
+                refuted.push(tag);
+            } else {
+                unhandled.push(format!("`{}::{}`", decl.name, c.name));
+            }
+        }
+        if !unhandled.is_empty() {
+            return Err(ctx.raise(InferError::UnhandledConstructors {
+                ty: decl.name.to_string(),
+                ctors: unhandled,
+            }));
+        }
+    }
     for b in branches.iter_mut() {
         let Some(p) = &mut b.pattern else {
             continue;
@@ -3565,7 +3752,7 @@ fn emit_nominal_scrutinee<C: Typing>(
             format!("the parameters of `{ty}::{ctor_name}`")
         })?;
     }
-    Ok(())
+    Ok(args)
 }
 
 /// Type a function of an instance by its trait's signature, at the operands the trait type
@@ -4176,24 +4363,22 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
     ctx.require_sub(&payload_ty, &expected, &|| {
         format!("the argument of constructor `{}::{ctor}`", decl.name)
     })?;
-    if **decl != *crate::ccl::nominal::option() {
+    if !crate::ccl::nominal::states_constructors(decl) {
         return Ok(Type::Nominal(decl.clone(), args));
     }
-    // An `Option` states which constructor built it, and what its payload is where the
-    // payload is a term the refinement encoding reads: the body of `Option::some`'s function,
-    // `λ __ctor_arg → Option::some(__ctor_arg)`, whose type then reads the argument, and the
-    // `Option::some(1)` inlining leaves of a call of it.
+    // A constructed value states which constructor built it and what its payload is
+    // (`docs/chl-spec.md`, "Constructors state what they build"), whatever the payload's form.
     let _g = crate::ccl::provenance::enter(
         payload.node_id(),
-        "infer.option_ctor",
+        "infer.ctor_refinements",
         crate::ccl::provenance::Nature::Machinery,
     );
-    let [arg] = args.as_slice() else {
-        unreachable!("`Option` declares one type parameter")
+    let ctor = crate::ccl::CtorRef {
+        decl: decl.clone(),
+        ctor: ctor.into(),
     };
-    let argument = crate::ccl::infer::solver::smt::in_term_fragment(payload)
-        .then(|| payload.clone_preserving_ids());
-    let refinements = crate::ccl::nominal::option_ctor_refinements(ctor, arg, argument);
+    let refinements =
+        crate::ccl::nominal::ctor_refinements(&ctor, &args, payload.clone_preserving_ids());
     Ok(Type::refined(
         Type::Nominal(decl.clone(), args),
         refinements,

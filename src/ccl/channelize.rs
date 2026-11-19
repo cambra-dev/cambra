@@ -273,10 +273,12 @@ impl DeferError {
 /// fresh id per node, so a clone would re-identify the whole residual once per defer.
 fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
     let TypedExpr {
-        node: TypedExprNode::Case {
-            scrutinee,
-            branches,
-        },
+        node:
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+                refuted,
+            },
         ty,
         user_annotation,
         capabilities,
@@ -302,6 +304,7 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
         node: TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         },
         ty,
         user_annotation,
@@ -356,6 +359,7 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
+        ..
     } = &converted.as_ref().unwrap_or(body).node
     else {
         return None;
@@ -440,6 +444,7 @@ fn case_contributions(case: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Expr)
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
+        ..
     } = &converted.as_ref().unwrap_or(case).node
     else {
         return None;
@@ -560,6 +565,7 @@ fn erase_spine_feeds(body: Expr, defer_name: &Name) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } => TypedExprNode::Case {
             scrutinee,
             branches: branches
@@ -569,6 +575,7 @@ fn erase_spine_feeds(body: Expr, defer_name: &Name) -> Expr {
                     ..b
                 })
                 .collect(),
+            refuted,
         },
         other => other,
     };
@@ -2706,6 +2713,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } => {
                 if let Some(s) = scrutinee {
                     rec(s, bound, out);
@@ -3703,6 +3711,7 @@ fn extract_for_defer_impl(
         TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } => {
             // Case branches: each branch is an inner scope.  When *some*
             // arm contains a feed for `defer_name`, we wrap each arm's
@@ -3871,6 +3880,7 @@ fn extract_for_defer_impl(
                         body,
                     })
                     .collect(),
+                refuted,
             }
         }
         // `Transact` is born by recognition, which runs *after* channelize

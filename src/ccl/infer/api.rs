@@ -584,6 +584,10 @@ pub enum InferError {
     ///
     /// Lowering never produces a 0-branch `Case`; this indicates a malformed
     /// AST constructed outside the normal lowering path.
+    /// A `match` over a value of a nominal type `ty` with no arm for the constructors `ctors`,
+    /// whose arms the value's refinement does not rule out (`src/ccl/design/type-inference.md`,
+    /// "Unreachable arms").
+    UnhandledConstructors { ty: String, ctors: Vec<String> },
     EmptyCase {
         /// The empty case expression written in CCL. Omitted from the message; retained
         /// excluded by [`Self::same_defect`].
@@ -1167,6 +1171,7 @@ impl InferError {
             | InferError::HandsOutItsVariable { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
+            | InferError::UnhandledConstructors { .. }
             | InferError::UnresolvedHole { .. }
             | InferError::UnresolvedBoundedHole { .. }
             | InferError::UnresolvedInfer { .. }
@@ -2157,6 +2162,13 @@ impl std::fmt::Debug for InferError {
             InferError::EmptyCase { .. } => {
                 write!(f, "A `match` must have at least one `case`")
             }
+            InferError::UnhandledConstructors { ty, ctors } => write!(
+                f,
+                "`match` over `{ty}` has no arm for {}, and nothing proves the matched value was \
+                 not built by it; each constructor is handled by an arm, or `case _:` covers the \
+                 rest",
+                ctors.join(", ")
+            ),
             InferError::UnresolvedHole { .. } => {
                 write!(f, "Nothing determines the type this `_` stands for")
             }
@@ -3205,6 +3217,7 @@ fn collect_expr_errors(
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             if let Some(s) = scrutinee {
                 collect_expr_errors(s, strictness, errors, seen_refinements);
@@ -5858,6 +5871,7 @@ mod tests {
                     ),
                 ),
             }],
+            refuted: Vec::new(),
         });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
@@ -5883,6 +5897,7 @@ mod tests {
                     ),
                 ),
             }],
+            refuted: Vec::new(),
         });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         // TODO: pinned on `^+`: the arm's type records the sum, with `x` discharged to its
@@ -5910,6 +5925,7 @@ mod tests {
                     body: Expr::lit(Lit::Int(2)),
                 },
             ],
+            refuted: Vec::new(),
         });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
@@ -5922,6 +5938,7 @@ mod tests {
         let mut expr = Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: vec![],
+            refuted: Vec::new(),
         });
         assert!(matches!(
             infer_bare(&mut expr, &mut ctx),

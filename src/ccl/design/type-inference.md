@@ -792,8 +792,12 @@ about to read it and nothing has determined it. What counts as determining it di
 the table below gives. At an output site, an arm payload or a list literal's element, a value
 reaching it does (`value_reaches`) and a demand alone does not. At a lambda parameter, a value or a
 demand does. A nominal constructor's type argument is an output site that a demand alone can
-resolve: it is then pinned to the type the demand gives, so a join it flows into, such as a call's
-type parameter, joins that type with the call's other arguments. The walk pins each unobservable
+resolve; the walk reads such an argument from the demand. It is then pinned to the type the demand
+gives, which records the reading as a value: a specialization that adds a bound to the argument
+after the walk read it would otherwise change what the walk read, and the walk's reads are final
+(`assert_reads_stable`). `y = Option::none` with `y.unwrap_or(2)` demanded `{Int where _ == 2}` is
+the case: `y`'s argument reads `Int` from the demand through `unwrap_or`'s `𝑇₁ <: 𝑇₃`, and the
+call's specialization later bounds `𝑇₁`. The walk pins each unobservable
 variable at a pin site to the type of its position, before any node reads it. The pin is recorded in
 both directions against the variable, so every occurrence reads the chosen type. Where the position
 determines nothing, each site applies its own fallback.
@@ -813,7 +817,7 @@ conditional's reading unchanged.
 | Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
 | Lambda parameter | `(\x -> 1) if c else (\y -> y + 2)` | `x : Int`, the join's domain | the parameter's type | neither a value nor a demand reaches it | the variable remains, and the post-inference check reports `UnresolvedInfer` |
 | Call no value returns from | `def g(x): raise x`; `try: g(3) except Int as e: e + 1` | the call's result `Int`, the `try`'s join | the call's type | no value reaches it and the call may raise | as an arm payload |
-| Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | the payload does not reach it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
+| Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument, or the type a demand resolves `T` to | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | the payload does not reach it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
 
 ##### The type of a position
 
@@ -1170,11 +1174,6 @@ In a walk whose types are dropped, a `match` on a scrutinee no value reaches doe
 payloads
 ([An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)):
 the scrutinee stands for what the uses supply, so its payloads are parameters of the definition.
-An arm whose tag the reaching value carries is not pinned either: the value's payload is then a
-parameter. `Option::unwrap`'s stamped `id` gives its scrutinee the value ``{`some{𝑇}}`` with `𝑇`
-unreached while `f`'s body is checked alone in `def f(x): x!`. An arm is pinned there only when
-a value reaches the scrutinee and that value, read as a variant, lacks the arm's tag
-(`value_carries_tag`, `src/ccl/infer/solve.rs`).
 
 Calls from discarded code are checked too. They can specialize an outer generalized binding to
 test the callee's demands against the arguments. Those specializations remain registered for memo
@@ -1858,6 +1857,34 @@ Within the root's own predicate, `__elem.b` is rerooted onto `x.b`; it does not 
 query-subject field. For `x = (a=10, b=2 + 1)`, a function body `t + x.b` can therefore satisfy
 the result refinement `__elem == t + 3`.
 
+##### A nominal value is reached through its tag and payloads
+
+A value `𝑜` of a nominal type `N` with `𝑛` constructors has no sort either. A predicate reaches it
+through two kinds of path key (`Key` in `src/ccl/infer/solver/smt.rs`):
+
+- `𝑜.#tag` is a constant at `0..𝑛`, the position of the constructor that built `𝑜`.
+  `𝑜 ▷ ctor_is(N::c)` encodes as `𝑜.#tag == 𝑖` for `c` at position `𝑖`. The range states that each
+  value has exactly one constructor.
+- `𝑜.c` is the payload that `c` took, at the declaration's payload type:
+  `𝑜 ▷ ctor_payload(N::c)`. A record payload, a nested nominal value or a `UInt` payload is then a
+  path like any other.
+
+What a payload's type states holds only of a value its constructor built. Each assumption along a
+path through `𝑜.c`, and the sort constraint of a constant on such a path, is assumed under
+`𝑜.#tag == 𝑖`. An unguarded assumption would make `Option::none` contradictory at
+`Option({Int where False})`.
+
+`𝑙 == 𝑟` for two paths to a product or a nominal value encodes structurally: a product's
+components pairwise, and a nominal value's tags and, under each tag, that constructor's payloads.
+Lowering refuses a declaration that reaches itself through its constructors, so the expansion ends.
+
+A path reads through a tuple or record literal: `(𝑎, 𝑏).0` is the path `𝑎`. Inlining writes an
+argument tuple where a function read its parameter, so a path in a type stays a path after the
+call is inlined. A constructor term reads the same way: `N::c(𝑎) ▷ ctor_payload(N::c)` is the path
+`𝑎`, and `N::c(𝑎) ▷ ctor_is(N::d)` is `true` exactly when `c` is `d`.
+
+A comparison whose operands encode at two SMT sorts, a `String` and an `Int`, has no encoding.
+
 ##### The scope a query runs in
 
 `ScopeEnv` looks up a free name's bound type. A supported path uses that type's sort and contributes
@@ -1884,15 +1911,24 @@ this prevents an unrelated contradictory binder from proving an otherwise unsupp
 | --- | --- |
 | Emission through `constrain_subtype_in` | `InferCtx` supplies lexical and recorded opaque binder types. `value_type` resolves their positive contributions with opposite-side compaction disabled, so a use's demand cannot prove itself. |
 | Post-inference checks | `CheckCtx` supplies lexical and opaque binder types from the tree through `constrain_subtype_in` and `constrain_subtype_under_in`. Recorded `Var` types are trusted; a missing scope entry contributes no assumption rather than a name-resolution error. |
-| Inlining's discharge check | `inline::Scope` supplies the `let` and lambda binders enclosing the call and the opaque binders met so far, as `CheckCtx` does. A loop target or pattern binder contributes no assumption. |
-| `NoScope` | Supplies no binder types. Used by a specialization's clone-below-use pin and probes without a program scope. The query can prove less than one with lexical assumptions. |
+| Inlining's discharge check | `BinderScope` supplies the `let` and lambda binders enclosing the call, the opaque binders met so far, and the facts of the `match` arms enclosing the call ([Arm facts](#arm-facts)). A loop target or pattern binder contributes no type. An argument that is a path is assumed equal to the parameter's value (`smt::equal_to`), which links the arm facts about the path to the query. |
+| Coalescing | `ResolvingScope` supplies the binders the walk has entered, resolved, and the facts of the `match` arms enclosing the position. A specialization decides both of its pin edges under it. |
+| `NoScope` | Supplies no binder types. Used by probes without a program scope. The query can prove less than one with lexical assumptions. |
 | `SkipSmtScope` | Suppresses the query. `constrain_subtype` uses this structural-only policy. |
 
+`ScopeEnv::facts` supplies the scope's facts: `Bool` terms over names the scope binds, each of
+which holds wherever the query runs. A `match` arm's facts are the case
+([Arm facts](#arm-facts)). Every query assumes them.
+
 Emission does not instantiate a generalized binder merely to create an SMT assumption. Unresolved
-or unsupported types provide no usable sort. Unsupported scope assumptions are dropped rather than
-treated as facts; omitted assumptions weaken the antecedent. This differs from an unencodable
-predicate on either side of the requested comparison, which makes that comparison undecidable by
-the encoder and falls back to structural rejection.
+or unsupported types provide no usable sort.
+
+An antecedent outside the fragment weakens the query rather than defeating it. Each atom of an lhs
+refinement, of a scope assumption or of a fact that has no encoding becomes a fresh `Bool` constant
+(`Encode::claim`). The constant is universally quantified like every other constant, so an
+entailment proven for every truth value of the atom holds for its actual one. The connectives
+around the atom are still encoded. An unencodable rhs predicate makes the comparison undecidable by
+the encoder, and the comparison falls back to structural rejection.
 
 ##### The set is the representation, not just the reading
 
@@ -3152,6 +3188,11 @@ Instantiation copies a variable's guarded bounds with its bounds, so each instan
 are checked under its own copy. Extrusion gives a proxy flowing into the variable its guarded
 bounds, as it gives it the upper bounds. Compaction does not read them: they restrict which values
 reach the variable, and say nothing of the type it stands for.
+
+A coalescing pin adds its chosen type to a variable without checking it against the variable's
+guarded bounds (`pin_both_ways`). The pinned position is one that no value reaches, and a guarded
+bound restricts only the values that reach its holder. The pin still meets the variable's ordinary
+bounds, including the base edge each guarded bound drew.
 
 Within two data domains the edge is one direction of an equation, and the variable base takes no
 guarded bound there. Whether two such domains are one is decided where they materialize, once
@@ -5065,6 +5106,66 @@ not propagate payload types from one into the other.
 
 Branch bodies are value reads. Selecting between mutable variables selects their values,
 not a write-through handle; this does not relax the restriction on writable argument nodes.
+
+#### Arm facts
+
+An arm of a `match` naming the constructors of a nominal type `N` knows which constructor built
+the value it matched. For a scrutinee `𝑠` that is a term (`smt::is_term`), the arm
+`case N::c(𝑣):` holds two **arm facts** (`nominal::arm_facts`): `𝑠 ▷ ctor_is(N::c)`, and
+`(𝑠 ▷ ctor_payload(N::c)) == 𝑣` when `c` takes an argument. A scrutinee that is no term cannot
+be restated without copying a program into a type, and its arms hold none. The term grammar is
+closed under substitution, so a scrutinee that a `let`'s discharge or an inlined call rewrites,
+`o` to `Option::some(r)`, keeps its facts.
+
+The facts hold in `Γ` while the arm is typed and checked. Emission and the post-inference checks
+add them through `Typing::assuming`, coalescing through `ResolvingScope`, and inlining through
+`BinderScope::assuming` ([The scope a query runs in](#the-scope-a-query-runs-in)).
+
+A scrutinee that is a name is also narrowed. Inside the arm, emission types each read of the name
+at its type refined by the arm facts, with the name read as `__elem` (`Typing::narrowing`). The
+narrowing links a query about the read's value to the facts. In
+`match o: case Option::some(v): o!`, the domain refinement of `Option::value`,
+`not (__elem ▷ ctor_is(Option::none))`, holds of the read of `o`. A scrutinee read through a
+projection, `𝑝.0`, narrows nothing. A refinement of `𝑝`'s type would ride the projection's recorded
+domain, and a call inlined later replaces `𝑝` with a term whose type a check derives without the
+refinement.
+
+A `match` over a term, of a type whose values state their constructor
+(`nominal::states_constructors`, `Option` alone), states what its arms compute. Its result is
+refined by the disjunction over
+its arms of each arm's facts and `__elem == body`, the pattern's binder read as the payload it
+binds (`derived_case_refinement`). `Option::unwrap_or` is
+`match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, and its result is refined by
+`(𝑝.0 ▷ ctor_is(Option::some) and __elem == 𝑝.0 ▷ ctor_payload(Option::some)) or
+(𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`. A default arm contributes the negation of each
+named arm's tag. A `match` with an arm whose body is not a term (`smt::is_term`) states nothing
+of its result: copying an arbitrary body into a type would copy a program into it. An arm that
+writes or feeds is no term, so the refinement stays off the `match`es the mutability phases rewrite
+into guards (`tag_case_to_guard_case`), whose re-derived type would lack it. The term grammar is
+closed under substituting a term for a name, so inlining does not change whether a `match` states
+its result.
+
+#### Unreachable arms
+
+A `match` naming the constructors of `N` may omit a constructor that the scrutinee's refinement
+rules out. Lowering checks only that the arms name constructors of one type. Inference checks
+coverage. With no default arm, each constructor `c` that no arm names must be refuted
+(`Typing::refutes`): `Γ`, with the fact `𝑠 ▷ ctor_is(N::c)` added, entails `false`. A constructor
+that is not refuted is `InferError::UnhandledConstructors`. A scrutinee that is no term refutes
+nothing, so its `match` names every constructor.
+
+`match o: case Option::some(v): v` is exhaustive for `o : {Option(T) where not _.is_none()}`. It
+is rejected for `o : Option({Int where False})`: the payload's refinement holds only under the
+`some` tag ([A nominal value is reached through its tag and payloads](#a-nominal-value-is-reached-through-its-tag-and-payloads)),
+so nothing rules `none` out.
+
+The omitted arm stays omitted. Lambda elimination's fan-out builds one leg per arm, and the
+scrutinee holds no value with the omitted tag, so the legs still cover every value it holds.
+
+Inference records the tag of each refuted constructor in the `Case`'s `refuted` set. Passes after
+inference read the set in place of the proof. A `RefinementBlind` check decides no refinement, so
+it accepts an omitted constructor only when the set records its tag. Lambda elimination's coverage
+assertion requires each tag of the scrutinee to have an arm or to be in the set.
 
 #### An unobservable arm payload is pinned to what its uses require
 

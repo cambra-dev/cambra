@@ -2098,6 +2098,7 @@ impl Subst {
             Case {
                 scrutinee,
                 branches,
+                refuted,
             } => {
                 let scrutinee = scrutinee.as_ref().map(|s| Box::new(self.apply_expr(s)));
                 let branches = branches
@@ -2117,6 +2118,7 @@ impl Subst {
                 Case {
                     scrutinee,
                     branches,
+                    refuted: refuted.clone(),
                 }
             }
 
@@ -5611,6 +5613,7 @@ mod rewrite_tests {
         let mut e = TypedExpr::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(var("x"))),
             branches: vec![branch("A", "pa"), branch("B", "pb")],
+            refuted: Vec::new(),
         });
         let subst = Subst::discharge("x", int(0));
 
