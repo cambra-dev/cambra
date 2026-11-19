@@ -1262,8 +1262,9 @@ pub(crate) struct BarrierState {
     /// it.
     pub(crate) watches: Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>,
     /// What `solver::barrier::solve_barrier_vars` last checked: `None` before the
-    /// first check.
-    pub(crate) checked: Option<BarrierCheck>,
+    /// first check. A record of the checking, which no cached answer reads, so a cell that
+    /// recording moves no count in ([`crate::ccl::infer::solver::state::Revisions`]).
+    checked: RefCell<Option<BarrierCheck>>,
 }
 
 /// An upper bound of a [`BarrierVar`], with the error a failed check of it reports.
@@ -1379,13 +1380,13 @@ impl BarrierVar {
     }
 
     /// What the last check found ([`BarrierState::checked`]).
-    pub fn checked<'s>(&self, solver: &'s Solver) -> &'s Option<BarrierCheck> {
-        &solver.barrier_state(self).checked
+    pub fn checked(&self, solver: &Solver) -> Option<BarrierCheck> {
+        solver.barrier_state(self).checked.borrow().clone()
     }
 
-    /// What the last check found, for recording a new check.
-    pub fn checked_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut Option<BarrierCheck> {
-        &mut solver.barrier_state_mut(self).checked
+    /// Record what a check found.
+    pub fn record_check(&self, solver: &Solver, check: BarrierCheck) {
+        *solver.barrier_state(self).checked.borrow_mut() = Some(check);
     }
 
     /// The scope level the variable belongs to, with the meaning of [`InferVar`]'s: a

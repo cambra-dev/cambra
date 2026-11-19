@@ -29,6 +29,70 @@ pub struct SolverId(u64);
 /// A wrapped counter would let a new solver read a finished run's handles as its own.
 static SOLVER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// How many facts a run has recorded, counted by what holds them: each kind of state some
+/// cached answer reads, and the run's own record of capabilities ([`CapabilityRun`]).
+///
+/// Every write to such state goes through an accessor on [`Solver`] that moves its count: a
+/// kind's `*_state_mut`, [`Solver::funkind_names_mut`] for the binder names a funkind variable
+/// settles on, which [`FunKindVar::resolved`] does not read, and [`Solver::capability_run_mut`].
+/// No cached answer reads a barrier
+/// variable's state, so it has no count; a cache that does would add one there. A cached answer
+/// records the counts of everything it reads ([`Solver::funkind_revision`],
+/// [`Solver::capability_revision`]) and is reused only while they stand, so no write it reads
+/// can outlive it, while a write to state it does not read leaves it standing. Caches live
+/// apart from the facts ([`Stamped`]), since storing an answer records nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Revisions {
+    infer: u64,
+    funkind: u64,
+    funkind_names: u64,
+    capability: u64,
+    capability_run: u64,
+}
+
+/// A cached answer, and the revision it was computed at ([`Revisions`]): the answer while the
+/// solver is still at that revision. A cell read through `&Solver`, since storing an answer
+/// records nothing. A caller takes the revision before it reads anything, and stores the
+/// answer at that revision, so an answer whose computation recorded a fact is not served.
+pub(crate) struct Stamped<R, T>(std::cell::RefCell<Option<(R, T)>>);
+
+/// A cache prints as nothing: what it holds is not part of the value that holds it.
+impl<R, T> std::fmt::Debug for Stamped<R, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Stamped")
+    }
+}
+
+impl<R, T> Default for Stamped<R, T> {
+    fn default() -> Self {
+        Stamped(std::cell::RefCell::new(None))
+    }
+}
+
+impl<R: PartialEq, T: Clone> Stamped<R, T> {
+    /// The answer cached at `at`, if it is still the one cached.
+    pub(crate) fn at(&self, at: &R) -> Option<T> {
+        match &*self.0.borrow() {
+            Some((r, answer)) if r == at => Some(answer.clone()),
+            _ => None,
+        }
+    }
+
+    /// Cache `answer`, computed at `at`.
+    pub(crate) fn store(&self, at: R, answer: T) {
+        *self.0.borrow_mut() = Some((at, answer));
+    }
+}
+
+/// The counts a capability variable's resolution reads at ([`Solver::capability_revision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapabilityRevision {
+    infer: u64,
+    capability: u64,
+    funkind: u64,
+    capability_run: u64,
+}
+
 /// Where a variable's state lives: the solver that minted it and its slot in that solver's
 /// table. `None` on a handle minted outside every solver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,15 +182,9 @@ pub struct Solver {
     /// What is recorded on each capability variable.
     capabilities: Table<CapabilityVar, CapabilityState>,
     /// What the run records about capabilities beyond each variable's state.
-    pub(crate) capability_run: CapabilityRun,
-    /// How many facts have been written to funkind variables: the bounds, stamps and sources
-    /// [`FunKindVar::resolved`] reads. Every write bumps it, so an answer cached at the current
-    /// count is still the answer.
-    pub(crate) funkind_facts: u64,
-    /// How many times a funkind variable has minted binder names
-    /// ([`Self::funkind_names_mut`]): a name is no fact [`FunKindVar::resolved`] reads, but the
-    /// binder positions and a component's names are answered from them.
-    pub(crate) funkind_names: u64,
+    capability_run: CapabilityRun,
+    /// How many facts the run has recorded, by what holds them ([`Revisions`]).
+    revisions: Revisions,
     /// The memberships recorded on suspensions ([`crate::ccl::infer_var::SuspendedMembership`]).
     pub(crate) suspended_memberships: SuspendedMemberships,
     /// The predicate each predicate the run derived was derived from
@@ -183,8 +241,7 @@ impl Solver {
             barriers: Table::default(),
             capabilities: Table::default(),
             capability_run: CapabilityRun::default(),
-            funkind_facts: 0,
-            funkind_names: 0,
+            revisions: Revisions::default(),
             suspended_memberships: SuspendedMemberships::default(),
             derivations: Default::default(),
             pending_memberships: Vec::new(),
@@ -199,6 +256,44 @@ impl Solver {
             #[cfg(debug_assertions)]
             fixed_compactions: None,
         }
+    }
+
+    /// The revision a funkind variable's resolution reads at: the facts recorded on funkind
+    /// variables, the only state it reads.
+    pub(crate) fn funkind_revision(&self) -> u64 {
+        self.revisions.funkind
+    }
+
+    /// The revision a funkind variable's binder positions read at: the facts recorded on funkind
+    /// variables, and the binder names they have settled on.
+    pub(crate) fn funkind_names_revision(&self) -> (u64, u64) {
+        (self.revisions.funkind, self.revisions.funkind_names)
+    }
+
+    /// The revision a capability variable's resolution reads at: the facts recorded on
+    /// capability variables; on funkind variables, since an edge's filter can hold only while
+    /// a kind is data ([`crate::ccl::capabilities::Filter`]); on inference variables, since a
+    /// bound compares the types of the exceptions it takes away and of an ordering
+    /// requirement's positions; and on the run's record of capabilities, whether its
+    /// exceptions' types are settled say ([`crate::ccl::capabilities::exceptions_settled`]).
+    pub(crate) fn capability_revision(&self) -> CapabilityRevision {
+        CapabilityRevision {
+            infer: self.revisions.infer,
+            capability: self.revisions.capability,
+            funkind: self.revisions.funkind,
+            capability_run: self.revisions.capability_run,
+        }
+    }
+
+    /// What the run has recorded about capabilities beyond each variable's state.
+    pub(crate) fn capability_run(&self) -> &CapabilityRun {
+        &self.capability_run
+    }
+
+    /// What the run has recorded about capabilities, for recording more ([`Revisions`]).
+    pub(crate) fn capability_run_mut(&mut self) -> &mut CapabilityRun {
+        self.revisions.capability_run += 1;
+        &mut self.capability_run
     }
 
     /// This solver's identity.
@@ -266,9 +361,10 @@ impl Solver {
         self.infer.get(self.id, var)
     }
 
-    /// What has been recorded on `var`, for recording more.
+    /// What has been recorded on `var`, for recording more ([`Revisions`]).
     pub(crate) fn infer_state_mut(&mut self, var: &InferVar) -> &mut InferState {
         self.reach(format_args!("?{}", var.uid));
+        self.revisions.infer += 1;
         self.infer.get_mut(self.id, var)
     }
 
@@ -294,7 +390,8 @@ impl Solver {
         self.barriers.get(self.id, var)
     }
 
-    /// What has been recorded on the barrier `var`, for recording more.
+    /// What has been recorded on the barrier `var`, for recording more. No cached answer reads
+    /// it, so no revision moves ([`Revisions`]).
     pub(crate) fn barrier_state_mut(&mut self, var: &BarrierVar) -> &mut BarrierState {
         self.reach(format_args!("{var:?}"));
         self.barriers.get_mut(self.id, var)
@@ -319,10 +416,11 @@ impl Solver {
         self.capabilities.get(self.id, var)
     }
 
-    /// What has been recorded on the capability `var`, for recording more.
+    /// What has been recorded on the capability `var`, for recording more ([`Revisions`]).
     pub(crate) fn capability_state_mut(&mut self, var: &CapabilityVar) -> &mut CapabilityState {
         self.reach(format_args!("{var:?}"));
         self.own_capability(var);
+        self.revisions.capability += 1;
         self.capabilities.get_mut(self.id, var)
     }
 
@@ -361,22 +459,21 @@ impl Solver {
         self.funkinds.get(self.id, var)
     }
 
-    /// The binder names the kind `var` has settled on, for settling more: a name is not a
-    /// fact any cached answer reads, so the fact count stays.
+    /// The binder names the kind `var` has settled on, for settling more: a name is no fact
+    /// [`FunKindVar::resolved`] reads, so only the names' count moves ([`Revisions`]).
     pub(crate) fn funkind_names_mut(
         &mut self,
         var: &FunKindVar,
     ) -> &mut Vec<crate::ccl::infer_var::WitnessBinderId> {
         self.reach(format_args!("{var:?}"));
-        self.funkind_names += 1;
+        self.revisions.funkind_names += 1;
         self.funkinds.get_mut(self.id, var).names_mut()
     }
 
-    /// What has been recorded on the kind `var`, for recording a fact: the fact count moves,
-    /// so every answer cached before it is stale.
+    /// What has been recorded on the kind `var`, for recording more ([`Revisions`]).
     pub(crate) fn funkind_state_mut(&mut self, var: &FunKindVar) -> &mut FunKindState {
         self.reach(format_args!("{var:?}"));
-        self.funkind_facts += 1;
+        self.revisions.funkind += 1;
         self.funkinds.get_mut(self.id, var)
     }
 }
@@ -426,5 +523,33 @@ impl Drop for Solver {
         if !self.graph_free && !std::thread::panicking() {
             crate::ccl::subst::check_dropped_entries(self);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write to the run's record of capabilities is counted by its accessor, so a
+    /// capability variable's resolution read before it is not served after.
+    #[test]
+    fn a_write_to_the_run_record_moves_the_capability_revision() {
+        let solver = &mut Solver::new();
+        let before = solver.capability_revision();
+        crate::ccl::capabilities::exceptions_settled(solver);
+        assert_ne!(solver.capability_revision(), before);
+        let read = solver.capability_revision();
+        let _ = solver.capability_run();
+        assert_eq!(solver.capability_revision(), read, "a read moves nothing");
+    }
+
+    /// A cached answer is served only at the revision it was stored at.
+    #[test]
+    fn a_stamped_answer_is_served_only_at_its_revision() {
+        let cache: Stamped<u64, &str> = Stamped::default();
+        assert_eq!(cache.at(&0), None);
+        cache.store(3, "answer");
+        assert_eq!(cache.at(&3), Some("answer"));
+        assert_eq!(cache.at(&4), None);
     }
 }
