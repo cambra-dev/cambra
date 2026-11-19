@@ -2360,6 +2360,18 @@ fn resolve_binder_slot(
     decide_memberships(solver, pending, level, ctx, &|_| label.clone());
 }
 
+/// Resolve a node's capabilities and its own where they are still pending, as coalesce resolves
+/// the node's type (`src/ccl/design/type-inference.md`, "Capabilities on every expression").
+fn settle_node_capabilities(solver: &mut Solver, expr: &mut Expr) {
+    for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
+        if slot.is_pending() {
+            *slot = crate::ccl::capabilities::Capabilities::known(
+                slot.set_in(solver).with_raises_resolved(solver),
+            );
+        }
+    }
+}
+
 /// Decide the memberships a materialization collected, now that the types they read are types
 /// with their predicates coalesced, under the binders in scope here.
 fn decide_memberships(
@@ -3058,44 +3070,57 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     let label = |solver: &mut Solver, expr: &Expr| {
         crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), expr)
     };
-    let (resolved, pending) =
-        crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
-            resolve_var_type(solver, &expr.ty)
-        });
-    match resolved {
-        // A node every path through which raises has no value, so nothing bounds its type
-        // from below: it stands at what its position expects of it. Its own variable resolves
-        // from its upper bounds alone, which may be wider than the join it stands in (the
-        // annotation above a `try`), so the join's type is read instead.
-        Ok(_) if never_has_value(expr) => {
-            expr.ty = stands_at(solver, &expr.ty);
-        }
-        Ok(ty) => {
-            // Log the graph read for the ordering-invariant check. The
-            // var-laden `expr.ty` shares the live `InferVar`s, so the
-            // end-of-pass re-resolution sees every bound a later
-            // specialization added — and must still yield `ty`. (Parent arms
-            // may overwrite `expr.ty` afterwards via *structural* recovery
-            // — `specialize_projection_domain`, let-closing — which is not a
-            // graph read and so is not what this guards.)
-            ctx.record_read(&expr.ty, &ty, || label(solver, expr));
-            expr.ty = ty;
-            // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
-            // type-inference.md`, "4.9 Capabilities").
-            for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-                if slot.is_pending() {
-                    *slot = crate::ccl::capabilities::Capabilities::known(
-                        slot.set_in(solver).with_raises_resolved(solver),
-                    );
-                }
+    // A spine node (a `let`, an effect statement, a mutable introduction) takes its body's
+    // coalesced type below (`let_closed`), so its own variable is not resolved: resolving it
+    // would compact the whole spine under it, quadratic in the spine's length, for a type the
+    // node then replaces. An effect statement's or a mutable introduction's type is its body's
+    // own. A `let`'s is a variable whose one lower bound is the body's type, through the
+    // binder's discharge (`Typing::close_let_type`), and an upper bound reaching it is passed to
+    // the body's variable when it is recorded. Either way a conflict on it is the body's, and is
+    // reported at the body. A node every path through which raises has no body type to take,
+    // and resolves.
+    let spine = matches!(
+        expr.node,
+        TypedExprNode::Let { .. } | TypedExprNode::ExprStmt { .. } | TypedExprNode::MutDecl { .. }
+    ) && !never_has_value(expr);
+    let pending = if spine {
+        settle_node_capabilities(solver, expr);
+        Vec::new()
+    } else {
+        let (resolved, pending) =
+            crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
+                resolve_var_type(solver, &expr.ty)
+            });
+        match resolved {
+            // A node every path through which raises has no value, so nothing bounds its type
+            // from below: it stands at what its position expects of it. Its own variable resolves
+            // from its upper bounds alone, which may be wider than the join it stands in (the
+            // annotation above a `try`), so the join's type is read instead.
+            Ok(_) if never_has_value(expr) => {
+                expr.ty = stands_at(solver, &expr.ty);
+            }
+            Ok(ty) => {
+                // Log the graph read for the ordering-invariant check. The
+                // var-laden `expr.ty` shares the live `InferVar`s, so the
+                // end-of-pass re-resolution sees every bound a later
+                // specialization added — and must still yield `ty`. (Parent arms
+                // may overwrite `expr.ty` afterwards via *structural* recovery
+                // — `specialize_projection_domain`, let-closing — which is not a
+                // graph read and so is not what this guards.)
+                ctx.record_read(&expr.ty, &ty, || label(solver, expr));
+                expr.ty = ty;
+                // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
+                // type-inference.md`, "4.9 Capabilities").
+                settle_node_capabilities(solver, expr);
+            }
+            Err(err) => {
+                let ty = expr.ty.clone();
+                let label = label(solver, expr);
+                ctx.push_type_error(solver, &ty, map_coalesce_err(err, &label))
             }
         }
-        Err(err) => {
-            let ty = expr.ty.clone();
-            let label = label(solver, expr);
-            ctx.push_type_error(solver, &ty, map_coalesce_err(err, &label))
-        }
-    }
+        pending
+    };
 
     // Codomain extraction (design §6.2 move site): a `let x = v in body` node's
     // type is the body's type, whose refinement predicates may close over `x`.
