@@ -879,8 +879,7 @@ fn projects_a_uint_range(solver: &mut Solver, p: &crate::ccl::ty::WitnessProject
     if !solver.reading_sums.insert(v.uid) {
         return false;
     }
-    // This query runs while `reading_sums` holds `v`, which answers a cycle through it, so its
-    // result must not enter a fixed-graph batch's memo ([`with_fixed_graph_compactions`]).
+    // This query runs while `reading_sums` holds `v`, which answers a cycle through it.
     let term = compact_type_with(solver, &p.term.ty, true, false, false).term;
     solver.reading_sums.remove(&v.uid);
     term.fun
@@ -2401,62 +2400,6 @@ pub enum JoinedPosition {
     Parameter,
 }
 
-/// A root and the immutable views its equality omits. The root keeps the allocations alive
-/// while their addresses distinguish held type slots, settled witness ranges and declarations.
-#[cfg(debug_assertions)]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CompactionInput {
-    ty: Type,
-    views: Vec<usize>,
-}
-
-#[cfg(debug_assertions)]
-impl CompactionInput {
-    fn new(ty: &Type) -> Self {
-        fn views(ty: &Type, out: &mut Vec<usize>) {
-            use crate::ccl::ty::FunKind;
-            match ty {
-                Type::Fun {
-                    fun_kind,
-                    capabilities,
-                    ..
-                } => {
-                    if let FunKind::Data(Some(binders)) = fun_kind {
-                        out.push(Rc::as_ptr(binders) as usize);
-                    }
-                    out.push(std::ptr::from_ref(capabilities.repr()) as usize);
-                }
-                Type::Param(param) => out.push(Rc::as_ptr(param) as usize),
-                Type::FamilyApp(app) => out.push(Rc::as_ptr(&app.param) as usize),
-                Type::Nominal(decl, _) => out.push(Rc::as_ptr(decl) as usize),
-                Type::WitnessProjection(_) => {
-                    ty.walk_children(|view| out.push(std::ptr::from_ref(view) as usize));
-                }
-                Type::Refinement(_, refinements) => {
-                    out.extend(
-                        refinements
-                            .iter()
-                            .map(|r| Rc::as_ptr(&r.predicate) as usize),
-                    );
-                }
-                _ => {}
-            }
-            out.extend(ty.held_terms().map(|term| Rc::as_ptr(term) as usize));
-            ty.walk_children(|child| views(child, out));
-        }
-        let mut read_views = Vec::new();
-        views(ty, &mut read_views);
-        Self {
-            ty: ty.clone(),
-            views: read_views,
-        }
-    }
-}
-
-/// The compactions a fixed-graph batch shares ([`with_fixed_graph_compactions`]).
-#[cfg(debug_assertions)]
-pub(crate) type FixedCompactions = HashMap<CompactionInput, CompactGraph>;
-
 /// `a ∪ b`, inserting the smaller set's elements into the larger. A variable's value carries every
 /// variable its bounds reach, so along a chain one side of a merge holds the chain so far and the
 /// other a few new arrivals; inserting the chain into the arrivals instead costs the chain's
@@ -2467,52 +2410,13 @@ fn union_into_larger<T: Ord>(a: BTreeSet<T>, b: BTreeSet<T>) -> BTreeSet<T> {
     larger
 }
 
-/// Share complete compactions while `f` reads a fixed inference graph. The caller must not
-/// add bounds or change scopes during the batch. Each nested batch starts empty, and its
-/// results are discarded on return or unwind. Specialization runs outside these batches.
-#[cfg(debug_assertions)]
-pub(crate) fn with_fixed_graph_compactions<R>(
-    solver: &mut Solver,
-    f: impl FnOnce(&mut Solver) -> R,
-) -> R {
-    struct Batch<'s> {
-        solver: &'s mut Solver,
-        previous: Option<FixedCompactions>,
-    }
-    impl Drop for Batch<'_> {
-        fn drop(&mut self) {
-            self.solver.fixed_compactions = self.previous.take();
-        }
-    }
-    let previous = solver.fixed_compactions.replace(HashMap::new());
-    let batch = Batch { solver, previous };
-    f(batch.solver)
-}
-
 /// Walk a `Type`, transitively expanding variable bounds at the
 /// appropriate polarity, and produce a CompactType.
 ///
 /// The walk's [`Position`] tracks the variables whose bounds it is currently
 /// following, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
-#[allow(clippy::mutable_key_type)] // A batch keeps each key's graph fixed while its entry is live.
 pub fn compact_type(solver: &mut Solver, ty: &Type) -> CompactGraph {
-    #[cfg(debug_assertions)]
-    if solver.fixed_compactions.is_some() {
-        let input = CompactionInput::new(ty);
-        if let Some(done) = solver
-            .fixed_compactions
-            .as_ref()
-            .and_then(|memo| memo.get(&input))
-        {
-            return done.clone();
-        }
-        let graph = compact_type_with(solver, ty, true, false, false);
-        if let Some(memo) = solver.fixed_compactions.as_mut() {
-            memo.insert(input, graph.clone());
-        }
-        return graph;
-    }
     compact_type_with(solver, ty, true, false, false)
 }
 
@@ -2556,6 +2460,37 @@ fn compact_type_with(
     solver.read(|solver| compact_type_reading(solver, ty, collapse, capability_vars, origins))
 }
 
+/// The walk state every [`compact_type`] in a [`reading_fixed_graph`] shares.
+///
+/// The graph is fixed while that read lasts: no variable it holds is recorded on, and a
+/// substitution reaching one suspends on it once for the whole read ([`Solver::read`]). So a
+/// variable's memoized value is a function of its key, and one compaction serves every later
+/// one that reaches the variable, as it serves the rest of its own walk. A value is shared only
+/// where it is all the walk below produced. A walk that met a recursive type, reported a join
+/// violation, widened a candidate or read a refinement naming a joined binder produced more, or
+/// read where it stands; such a value serves only its own compaction
+/// ([`CompactState::impure`]).
+pub(crate) struct FixedGraph(CompactState);
+
+/// Run `f` as one read of a graph it does not change, every [`compact_type`] in it sharing one
+/// walk state ([`FixedGraph`]): the stamp pass (`src/ccl/design/type-inference.md`,
+/// "Coalescing in two passes"). Debug builds check that `f` records on no variable minted
+/// before it began.
+pub(crate) fn reading_fixed_graph<R>(solver: &mut Solver, f: impl FnOnce(&mut Solver) -> R) -> R {
+    solver.read(|solver| {
+        assert!(
+            solver.fixed_graph.is_none(),
+            "a fixed graph is read by one pass at a time"
+        );
+        solver.fix_graph();
+        solver.fixed_graph = Some(Box::new(FixedGraph(CompactState::new(true))));
+        let out = f(solver);
+        solver.fixed_graph = None;
+        solver.unfix_graph();
+        out
+    })
+}
+
 /// [`compact_type_with`] inside its read ([`Solver::read`]).
 fn compact_type_reading(
     solver: &mut Solver,
@@ -2564,6 +2499,22 @@ fn compact_type_reading(
     capability_vars: bool,
     origins: bool,
 ) -> CompactGraph {
+    // A compaction that collects nothing beyond the type reads through the shared state. One
+    // run while another holds it walks on its own.
+    if collapse
+        && !capability_vars
+        && !origins
+        && let Some(mut fixed) = solver.fixed_graph.take()
+    {
+        let term = compact_walk(solver, ty, &mut fixed.0);
+        let (rec_vars, join_violations) = fixed.0.finish_walk();
+        solver.fixed_graph = Some(fixed);
+        return CompactGraph {
+            term,
+            rec_vars,
+            join_violations,
+        };
+    }
     let mut st = CompactState::new(collapse);
     st.capability_vars = capability_vars;
     st.origins = origins;
@@ -2572,21 +2523,27 @@ fn compact_type_reading(
             solver,
         )));
     }
+    let term = compact_walk(solver, ty, &mut st);
+    CompactGraph {
+        term,
+        rec_vars: st.rec_vars,
+        join_violations: st.join_violations,
+    }
+}
+
+/// One compaction's walk of `ty` from its root.
+fn compact_walk(solver: &mut Solver, ty: &Type, st: &mut CompactState) -> CompactType {
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
     let term = crate::ccl::subst::with_transport_memo(solver, |solver| {
-        compact_go(solver, ty, true, &Subst::id(), Position::default(), &mut st)
+        compact_go(solver, ty, true, &Subst::id(), Position::default(), st)
     });
     debug_assert!(
         refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
         "a position carrying content must carry a refinement slot: only a hole and a \
          bare variable leave it absent"
     );
-    CompactGraph {
-        term,
-        rec_vars: st.rec_vars,
-        join_violations: st.join_violations,
-    }
+    term
 }
 
 /// Whether every position in `ct` that carries content also carries a refinement
@@ -3172,6 +3129,8 @@ pub(super) const COMPONENT_ROUNDS: usize = 64;
 struct Memoized {
     ty: CompactType,
     index: usize,
+    /// Whether the value is all the walk below produced ([`CompactState::impure`]).
+    pure: bool,
 }
 
 /// [`CompactState::consulted`]'s key: the variable, the polarity, whether the walk is at the
@@ -3268,9 +3227,47 @@ struct CompactState {
     /// The graph is fixed during this walk, and eligibility is independent of the incoming
     /// substitution, so revisits reuse the decision without splitting its morphism again.
     own_bounds: HashMap<(InferVarId, bool), Rc<Vec<bool>>>,
+    /// How many times the walk has produced more than a value: a recursive placeholder or its
+    /// bound, a join violation, a widened candidate, a refinement naming a joined binder, or a
+    /// reuse of a value whose walk did. A memoized value whose walk left the count unchanged is
+    /// pure, a function of its key alone, and outlives its walk ([`FixedGraph`]).
+    impure: u64,
+    /// The memo entries this walk made that are not pure, which [`Self::finish_walk`] drops.
+    impure_entries: Vec<(MemoKey, Option<Subst>)>,
 }
 
 impl CompactState {
+    /// End one compaction's walk in a state a later one continues: take what it reported, and
+    /// drop the memoized values only it may read.
+    fn finish_walk(&mut self) -> (BTreeMap<InferVarId, CompactType>, Vec<JoinViolation>) {
+        debug_assert!(
+            self.barriers_in_process.is_empty()
+                && self.candidate_widened.is_none()
+                && self.data_domain_depth == 0
+                && self.join_entries.is_empty()
+                && self.scope.enclosing().is_empty(),
+            "a compaction's walk ends where it began"
+        );
+        for (key, under) in self.impure_entries.drain(..) {
+            match under {
+                None => {
+                    self.memo.remove(&key);
+                }
+                Some(subst) => {
+                    if let Some(entries) = self.memo_under.get_mut(&key) {
+                        entries.retain(|(s, _)| *s != subst);
+                    }
+                }
+            }
+        }
+        self.recursive.clear();
+        self.barrier_recursive.clear();
+        (
+            std::mem::take(&mut self.rec_vars),
+            std::mem::take(&mut self.join_violations),
+        )
+    }
+
     fn own_bound_flags(
         &mut self,
         solver: &mut Solver,
@@ -3317,6 +3314,8 @@ impl CompactState {
             join_violations: Vec::new(),
             own_content: Default::default(),
             own_bounds: HashMap::new(),
+            impure: 0,
+            impure_entries: Vec::new(),
         }
     }
 }
@@ -3364,6 +3363,7 @@ fn join_barrier_lowers(
     st: &mut CompactState,
 ) -> (CompactType, Vec<Name>) {
     if st.barriers_in_process.contains(&barrier.uid) {
+        st.impure += 1;
         let placeholder = *st
             .barrier_recursive
             .entry(barrier.uid)
@@ -3385,6 +3385,7 @@ fn join_barrier_lowers(
     joined.resolve_barrier_refinements(Variance::Covariant, barrier.opaque(), &mut escaped);
     st.barriers_in_process.remove(&barrier.uid);
     if let Some(rec_uid) = st.barrier_recursive.remove(&barrier.uid) {
+        st.impure += 1;
         st.rec_vars.insert(rec_uid, joined);
         return (CompactType::from_var(rec_uid), escaped);
     }
@@ -3994,6 +3995,9 @@ fn compact_go_inner(
                 // reported; a term at the key does not answer it, since a parameter is not
                 // the key. Data domains and polarity are counted from the bound whose values
                 // are joined ([`CompactState::join_entries`]).
+                if subst_acc.joins_refinement(r) {
+                    st.impure += 1;
+                }
                 let joined = subst_acc.joined_over_in(&r.predicate);
                 let entries = || {
                     joined
@@ -4402,6 +4406,9 @@ fn compact_go_inner(
             if let Some(done) = memoized
                 && st.components.reuse(done.index)
             {
+                if !done.pure {
+                    st.impure += 1;
+                }
                 return done.ty.clone();
             }
             // A chain that returns to the position it started from meets the variable as one
@@ -4423,6 +4430,7 @@ fn compact_go_inner(
                     .find(|k| st.components.expanding(k))
             {
                 st.components.recursive_edge(&on_path);
+                st.impure += 1;
                 // Real recursive cycle: mint a fresh UID to mark this slot.
                 // We need only the identifier here — the cycle is surfaced
                 // by `coalesce_compact` as a `RecursiveType` error before
@@ -4435,6 +4443,7 @@ fn compact_go_inner(
                     .or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
+            let impure_before = st.impure;
             let (bound, index, complete) = loop {
                 st.components.enter(key);
                 let bound = expand_variable(solver, state, pol, subst_acc, pos, st);
@@ -4457,14 +4466,23 @@ fn compact_go_inner(
             // variable and emit a reference.
             if let Some(rec_uid) = st.recursive.get(&(uid, pol)) {
                 let rec_uid = *rec_uid;
+                st.impure += 1;
                 st.rec_vars.insert(rec_uid, bound);
                 return CompactType::from_var(rec_uid);
             }
             if complete && (memoizable || memoizable_under) {
+                let pure = st.impure == impure_before;
                 let done = Memoized {
                     ty: bound.clone(),
                     index,
+                    pure,
                 };
+                if !pure {
+                    st.impure_entries.push((
+                        memo_key.clone(),
+                        memoizable_under.then(|| subst_acc.clone()),
+                    ));
+                }
                 if memoizable {
                     st.memo.insert(memo_key, done);
                 } else {
@@ -5223,215 +5241,6 @@ mod tests {
         let both = read(&Type::Tuple(vec![w1.clone(), w2.clone()]));
         assert_eq!(both, format!("({}, {})", read(&w1), read(&w2)));
         assert!(read(&w2).contains('y'), "{}", read(&w2));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn final_graph_compactions_are_isolated_between_batches_and_modes() {
-        let solver = &mut Solver::new();
-        let variable = fresh_var(solver, 0);
-        let Type::Infer(v) = &variable else {
-            unreachable!()
-        };
-        v.bounds_mut(solver)
-            .lower_mut()
-            .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        let mode_slot = fresh_var(solver, 0);
-        let Type::Infer(mode_var) = &mode_slot else {
-            unreachable!()
-        };
-        mode_var
-            .bounds_mut(solver)
-            .upper_mut()
-            .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        with_fixed_graph_compactions(solver, |solver| {
-            let mut first = compact_type(solver, &variable);
-            assert_eq!(
-                coalesce_compact(solver, &first).unwrap(),
-                Type::Base(BaseType::Int)
-            );
-            first.term.atoms.clear();
-            assert_eq!(
-                {
-                    let graph = compact_type(solver, &variable);
-                    coalesce_compact(solver, &graph)
-                }
-                .unwrap(),
-                Type::Base(BaseType::Int)
-            );
-            assert_eq!(
-                {
-                    let graph = compact_type(solver, &mode_slot);
-                    coalesce_compact(solver, &graph)
-                }
-                .unwrap(),
-                Type::Base(BaseType::Int)
-            );
-            assert_eq!(
-                {
-                    let graph = compact_type_polarity_only(solver, &mode_slot);
-                    coalesce_compact(solver, &graph)
-                }
-                .unwrap(),
-                mode_slot
-            );
-            with_fixed_graph_compactions(solver, |solver| {
-                assert_eq!(
-                    {
-                        let graph = compact_type(solver, &variable);
-                        coalesce_compact(solver, &graph)
-                    }
-                    .unwrap(),
-                    Type::Base(BaseType::Int)
-                );
-            });
-        });
-        v.bounds_mut(solver)
-            .lower_mut()
-            .push(crate::ccl::Bound::conc(Type::Base(BaseType::Bool)));
-        with_fixed_graph_compactions(solver, |solver| {
-            assert!(matches!(
-                {
-                    let graph = compact_type(solver, &variable);
-                    coalesce_compact(solver, &graph)
-                },
-                Err(CoalesceError::IncompatibleBounds { .. })
-            ));
-        });
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn final_graph_compactions_release_their_graph_on_unwind() {
-        let solver = &mut Solver::new();
-        let variable = fresh_var(solver, 0);
-        let Type::Infer(v) = &variable else {
-            unreachable!()
-        };
-        v.bounds_mut(solver)
-            .lower_mut()
-            .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_fixed_graph_compactions(solver, |solver| {
-                assert_eq!(
-                    {
-                        let graph = compact_type(solver, &variable);
-                        coalesce_compact(solver, &graph)
-                    }
-                    .unwrap(),
-                    Type::Base(BaseType::Int)
-                );
-                panic!("end the verification batch");
-            });
-        }));
-        assert!(failed.is_err());
-        v.bounds_mut(solver)
-            .lower_mut()
-            .push(crate::ccl::Bound::conc(Type::Base(BaseType::Bool)));
-        assert!(matches!(
-            {
-                let graph = compact_type(solver, &variable);
-                coalesce_compact(solver, &graph)
-            },
-            Err(CoalesceError::IncompatibleBounds { .. })
-        ));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn final_graph_compactions_preserve_each_held_term() {
-        let solver = &mut Solver::new();
-        let make = || Rc::new(TypedExpr::var("p").with_ty(Type::Base(BaseType::Bool)));
-        let first = make();
-        let second = make();
-        let refined = |predicate: &Rc<TypedExpr>| {
-            Type::refined_one(Type::Base(BaseType::Int), Refinement::sharing(predicate))
-        };
-        let (left, right) = (refined(&first), refined(&second));
-        assert_eq!(
-            left, right,
-            "predicate equality omits its typed view and origin"
-        );
-        with_fixed_graph_compactions(solver, |solver| {
-            for (ty, original) in [(&left, &first), (&right, &second)] {
-                let Type::Refinement(_, refinements) = {
-                    let graph = compact_type(solver, ty);
-                    coalesce_compact(solver, &graph)
-                }
-                .unwrap() else {
-                    panic!("the refinement survives")
-                };
-                assert!(Rc::ptr_eq(&refinements.sole().unwrap().predicate, original));
-            }
-        });
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn final_graph_compactions_preserve_settled_witness_ranges() {
-        use crate::ccl::ty::{FunKind, TypeKind, Witness};
-        let solver = &mut Solver::new();
-        let narrow = Type::sum_over(
-            TypeKind::Enumerated(vec![Type::UIntRange(2)]),
-            None,
-            Type::Base(BaseType::Int),
-        );
-        let binder = &narrow.sum().unwrap()[0];
-        let widened = Witness::bound_to(
-            binder.id().bound(),
-            TypeKind::Enumerated(vec![Type::UIntRange(4)]),
-        );
-        let mut wide = narrow.clone();
-        let Type::Fun { fun_kind, .. } = &mut wide else {
-            unreachable!()
-        };
-        *fun_kind = FunKind::Data(Some(Rc::new(vec![widened])));
-        assert_eq!(
-            narrow, wide,
-            "witness equality names the binder, not its range"
-        );
-        with_fixed_graph_compactions(solver, |solver| {
-            for (ty, extent) in [(&narrow, 2), (&wide, 4)] {
-                let resolved = {
-                    let graph = compact_type(solver, ty);
-                    coalesce_compact(solver, &graph)
-                }
-                .unwrap();
-                assert_eq!(
-                    resolved.sum().unwrap()[0].type_kind(),
-                    TypeKind::Enumerated(vec![Type::UIntRange(extent)])
-                );
-            }
-        });
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn final_graph_compactions_collect_memberships_on_every_read() {
-        let solver = &mut Solver::new();
-        let variable = fresh_var(solver, 0);
-        let Type::Infer(v) = &variable else {
-            unreachable!()
-        };
-        v.bounds_mut(solver)
-            .lower_mut()
-            .push(crate::ccl::Bound::conc(Type::Base(BaseType::Int)));
-        v.bounds_mut(solver)
-            .type_kinds
-            .push(crate::ccl::ty::TypeKind::Type);
-        with_fixed_graph_compactions(solver, |solver| {
-            for _ in 0..2 {
-                let (resolved, pending) =
-                    super::super::coalesce::collecting_memberships(solver, |solver| {
-                        let graph = compact_type(solver, &variable);
-                        coalesce_compact(solver, &graph)
-                    });
-                assert_eq!(resolved.unwrap(), Type::Base(BaseType::Int));
-                assert_eq!(pending.len(), 1);
-                assert_eq!(pending[0].found, Type::Base(BaseType::Int));
-                assert_eq!(pending[0].kind, crate::ccl::ty::TypeKind::Type);
-            }
-        });
     }
 
     #[test]
