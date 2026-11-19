@@ -2852,7 +2852,7 @@ pub(crate) fn is_in_a_run() -> bool {
 }
 
 impl Consumer for Entry {
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some(pipeline) = self.pipeline.get()
             && landing.accepts_entry(pipeline)
         {
@@ -2862,7 +2862,7 @@ impl Consumer for Entry {
             return;
         }
         if self.pipeline.get().is_none() && landing.is_delivery() && !landing.is_complete() {
-            if let Some(inline) = &mut self.inline {
+            if let Some(inline) = &self.inline {
                 inline.notify(region, landing);
             }
             return;
@@ -3175,7 +3175,7 @@ pub fn read_for_test<P: crate::interpreter::tile_operators::TileProducer + ?Size
 }
 
 #[cfg(test)]
-pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &mut C, region: &Projection) {
+pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &C, region: &Projection) {
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     let mut landing = Landing::new(
         Target::Queue {

@@ -420,7 +420,7 @@ struct RecordingConsumer {
 impl Consumer for RecordingConsumer {
     /// Delivered notifications record the region; planning probes leave it unchanged.
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -2250,7 +2250,7 @@ pub(crate) mod test_helpers {
     }
 
     pub(crate) trait Announce: super::Consumer {
-        fn announce(&mut self, region: &Projection) {
+        fn announce(&self, region: &Projection) {
             crate::interpreter::dispatcher::notify_for_test(self, region);
         }
     }
@@ -2276,9 +2276,7 @@ pub(crate) mod test_helpers {
             .collect();
         breaker
             .base_mut()
-            .pushing_to(std::sync::Arc::new(std::sync::RwLock::new(Readers(
-                entries,
-            ))));
+            .pushing_to(std::sync::Arc::new(Readers(entries)));
     }
 
     /// Point each breaker's pushes at the pipelines that read it in `reads`, whose breakers read
@@ -2305,11 +2303,11 @@ pub(crate) mod test_helpers {
 
     impl crate::interpreter::Consumer for Readers {
         fn notify(
-            &mut self,
+            &self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
-            for entry in &mut self.0 {
+            for entry in &self.0 {
                 crate::interpreter::Consumer::notify(entry, region, landing);
             }
         }
@@ -2733,11 +2731,7 @@ pub(crate) mod test_helpers {
     }
 
     impl super::Consumer for RegionLog {
-        fn notify(
-            &mut self,
-            region: &Projection,
-            _: &mut crate::interpreter::dispatcher::Landing<'_>,
-        ) {
+        fn notify(&self, region: &Projection, _: &mut crate::interpreter::dispatcher::Landing<'_>) {
             self.regions
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -2747,7 +2741,16 @@ pub(crate) mod test_helpers {
 
     /// The consumer a [`NotifyingOp`] was subscribed with, which a test notifies through.
     pub(crate) type InputConsumer =
-        std::sync::Arc<std::sync::RwLock<Option<Box<dyn super::Consumer>>>>;
+        std::sync::Arc<std::sync::RwLock<Option<crate::interpreter::SharedConsumer>>>;
+
+    /// The consumer `consumer` holds, cloned out so no lock is held while it is notified.
+    pub(crate) fn subscribed(consumer: &InputConsumer) -> crate::interpreter::SharedConsumer {
+        consumer
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the operator was subscribed")
+    }
 
     /// An operator over a fixed tile that keeps the consumer it is subscribed with, so a test
     /// notifies an operator above it from where the operator's input would.
@@ -2811,7 +2814,7 @@ pub(crate) mod test_helpers {
             *self
                 .consumer
                 .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(consumer);
+                .unwrap_or_else(PoisonError::into_inner) = Some(consumer.into());
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
             spy.script = self.script.clone();
             spy.pulled = self.pulled.clone();
@@ -2821,14 +2824,7 @@ pub(crate) mod test_helpers {
 
     /// Notify through the consumer a [`NotifyingOp`] was subscribed with.
     pub(crate) fn notify_input(consumer: &InputConsumer, arrived: &Projection) {
-        crate::interpreter::dispatcher::notify_for_test(
-            &mut **consumer
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_mut()
-                .unwrap(),
-            arrived,
-        );
+        crate::interpreter::dispatcher::notify_for_test(&*subscribed(consumer), arrived);
     }
 
     /// A store's parts are collections held to the contract like any other: a decided set

@@ -71,13 +71,7 @@ fn dispatched_with(
     );
     let roots: Vec<_> = consumers
         .iter()
-        .map(|consumer| {
-            consumer
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .producer_slot()
-                .clone()
-        })
+        .map(|consumer| consumer.producer_slot().clone())
         .collect();
     for (name, root) in names.iter().zip(&roots) {
         let root = root.read().unwrap_or_else(PoisonError::into_inner);
@@ -2450,8 +2444,6 @@ fn dispatched_live_observed(
         .find(|output| output.name == "out")
         .and_then(|output| output.sink_consumer.clone())
         .unwrap_or_else(|| panic!("{source} writes to sink out"))
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
         .producer_slot()
         .clone();
     let mut batches = batches.into_iter();
@@ -3109,8 +3101,6 @@ fn a_cartesian_product_of_two_live_sources(
         .iter()
         .find_map(|output| output.sink_consumer.as_ref())
         .expect("one sink")
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
         .producer_slot()
         .clone();
     let mut boundaries = Vec::new();

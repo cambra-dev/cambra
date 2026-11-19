@@ -1607,7 +1607,7 @@ struct Boxed(Box<dyn Consumer>);
 
 impl Consumer for Boxed {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -1670,7 +1670,7 @@ fn a_push_lands_restated_by_the_chain_and_past_the_gate() {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Boxed(arm))));
+        .pushing_to(Arc::new(Boxed(arm)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
@@ -1705,7 +1705,7 @@ fn a_push_naming_every_tag_whole_lands_universal() {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Boxed(path))));
+        .pushing_to(Arc::new(Boxed(path)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
@@ -1734,7 +1734,7 @@ fn a_push_reaching_a_reader_twice_is_queued_once() {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Paths(paths))));
+        .pushing_to(Arc::new(Paths(paths)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
@@ -1754,18 +1754,18 @@ struct Paths(Vec<Box<dyn Consumer>>);
 
 impl Consumer for Paths {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        for path in &mut self.0 {
+        for path in &self.0 {
             path.notify(region, landing);
         }
     }
 }
 
 /// The routes a push of key 0 takes through `consumer` ([`Landing::route`]).
-fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
+fn walk(consumer: &dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
     let mut landing = crate::interpreter::dispatcher::Landing::route();
     consumer.notify(
         &Projection::admitting(Predicate::point(Value::UInt(0))),
@@ -1781,11 +1781,11 @@ fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Rout
 fn a_route_walk_records_whether_each_path_keeps_its_keys() {
     let shared = gated_entry(&ints());
 
-    let mut paths = Paths(vec![
+    let paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
     ]);
-    let reached: Vec<_> = walk(&mut paths)
+    let reached: Vec<_> = walk(&paths)
         .into_iter()
         .map(|route| (route.pipeline, route.keeps_keys))
         .collect();
@@ -1799,7 +1799,7 @@ struct WidensDeliveries(Box<dyn Consumer>);
 
 impl Consumer for WidensDeliveries {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -1824,7 +1824,7 @@ fn planned_through(
     if waits {
         dispatcher.wait_for_inputs(PipelineId(1));
     }
-    let walked: SharedConsumer = Arc::new(RwLock::new(Boxed(walked)));
+    let walked: SharedConsumer = Arc::new(Boxed(walked));
     let (changes, completions) = crate::interpreter::dispatcher::walk_routes(
         &walked,
         &[Projection::admitting(Predicate::point(Value::UInt(0)))],
@@ -1836,7 +1836,7 @@ fn planned_through(
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Boxed(pushed))));
+        .pushing_to(Arc::new(Boxed(pushed)));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
             .write()
@@ -1923,7 +1923,7 @@ fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
 fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
     let shared = gated_entry(&ints());
 
-    let mut paths = Paths(vec![
+    let paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
         crate::interpreter::notifications::widening_restating_complete(
@@ -1935,7 +1935,7 @@ fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
             forwarding_consumer_keeping_keys(&shared),
         ),
     ]);
-    let parts: Vec<_> = walk(&mut paths)
+    let parts: Vec<_> = walk(&paths)
         .into_iter()
         .map(|route| route.completes_part)
         .collect();
@@ -1962,7 +1962,7 @@ fn a_read_decided_only_whole_records_no_part() {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .base_mut()
-            .pushing_to(Arc::new(RwLock::new(Paths(paths))));
+            .pushing_to(Arc::new(Paths(paths)));
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
         dispatcher.wait_for_inputs(PipelineId(1));
         if whole_only {
@@ -1997,7 +1997,7 @@ fn a_read_decided_only_whole_records_its_whole_push() {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Paths(paths))));
+        .pushing_to(Arc::new(Paths(paths)));
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.wait_for_inputs(PipelineId(1));
     dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
@@ -2027,7 +2027,7 @@ fn a_push_widened_on_its_way_fails_the_run() {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Boxed(widening))));
+        .pushing_to(Arc::new(Boxed(widening)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
@@ -2046,16 +2046,16 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
     struct Cycle(test_helpers::InputConsumer);
     impl Consumer for Cycle {
         fn notify(
-            &mut self,
+            &self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
-            if let Some(back) = self
+            let back = self
                 .0
-                .write()
+                .read()
                 .unwrap_or_else(PoisonError::into_inner)
-                .as_mut()
-            {
+                .clone();
+            if let Some(back) = back {
                 back.notify(region, landing);
             }
         }
@@ -2063,14 +2063,14 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
     let back = Arc::new(RwLock::new(None));
     let shared = shared_consumer(Box::new(Cycle(back.clone())));
     *back.write().unwrap_or_else(PoisonError::into_inner) =
-        Some(forwarding_consumer_keeping_keys(&shared));
+        Some(forwarding_consumer_keeping_keys(&shared).into());
     let scripted = Scripted::cutting(keys_between(0, 1), vec![keys_between(0, 1)]);
     let path = forwarding_consumer_keeping_keys(&shared);
     scripted
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Boxed(path))));
+        .pushing_to(Arc::new(Boxed(path)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
@@ -2107,7 +2107,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(RwLock::new(Through(input))));
+        .pushing_to(Arc::new(Through(input)));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
@@ -2130,16 +2130,11 @@ struct Through(test_helpers::InputConsumer);
 
 impl Consumer for Through {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.0
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-            .expect("the operator was subscribed")
-            .notify(region, landing);
+        test_helpers::subscribed(&self.0).notify(region, landing);
     }
 }
 
@@ -2308,7 +2303,7 @@ fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
         .complete_target()
         .write()
         .unwrap_or_else(PoisonError::into_inner) = Some((PipelineId(1), input.clone()));
-    let consumer: SharedConsumer = Arc::new(RwLock::new(entry));
+    let consumer: SharedConsumer = Arc::new(entry);
 
     for (pusher, expected_reader) in [(0, 1), (2, 3)] {
         let breaker = Scripted::holding(input.universal_guard());

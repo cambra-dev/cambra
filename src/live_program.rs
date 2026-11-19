@@ -42,7 +42,7 @@
 //! parameterized by an iteration input that is not part of the term, so the term
 //! does not identify it.
 
-use std::sync::{PoisonError, RwLock};
+use std::sync::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -173,10 +173,7 @@ impl Branch {
         self.main_producer = None;
         for output in &self.program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                consumer
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .detach();
+                consumer.detach();
             }
         }
         self.program.outputs.clear();

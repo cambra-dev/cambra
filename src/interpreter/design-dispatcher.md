@@ -344,6 +344,8 @@ in-flight claims. A claim moves the oldest ready package to the in-flight map; a
 removes its entry, even when an earlier package is still running. Package indices increase for the
 run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
 pipelines permit at most one package in flight. No queue lock is held while an operator executes.
+A delivery takes no lock beyond what each consumer's own state needs
+([The notification contract](design-operators.md#the-notification-contract)).
 
 Queue entries retain only ready and in-flight guards. Collection capacity can retain its peak
 allocation; it does not grow with the number of acknowledged packages. The accumulated region

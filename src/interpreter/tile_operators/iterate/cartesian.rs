@@ -103,7 +103,7 @@ struct CartesianSource {
 
 impl Consumer for CartesianSource {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -621,10 +621,7 @@ mod tests {
         let mut probe = crate::interpreter::dispatcher::Landing::probe(
             crate::interpreter::dispatcher::PipelineId(0),
         );
-        consumer
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .notify(&Projection::Everything, &mut probe);
+        consumer.notify(&Projection::Everything, &mut probe);
         let before = p.read_in_pipeline(p.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = before else {
             panic!("product rows")

@@ -4190,7 +4190,7 @@ struct FinalKeyConsumer {
 
 impl Consumer for FinalKeyConsumer {
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {

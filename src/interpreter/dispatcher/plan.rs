@@ -122,10 +122,9 @@ pub fn run_program_into(
     let mut targets: Vec<RunTarget> = Vec::new();
     for (at, output) in program.outputs.iter_mut().enumerate() {
         if let Some(consumer) = &output.sink_consumer {
-            let consumer_ref = consumer.read().unwrap_or_else(PoisonError::into_inner);
             targets.push((
-                consumer_ref.producer_slot().clone(),
-                consumer_ref.sink(),
+                consumer.producer_slot().clone(),
+                consumer.sink(),
                 TargetEntry::Sink(consumer.clone()),
             ));
         } else if let Some(producer) = output.producer.take() {
@@ -193,10 +192,7 @@ impl Drop for MainGivenBackOnUnwind<'_> {
 fn complete_sinks(targets: &[RunTarget]) {
     for (_, _, entry) in targets {
         if let TargetEntry::Sink(consumer) = entry {
-            consumer
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .complete();
+            consumer.complete();
         }
     }
 }
@@ -243,10 +239,9 @@ impl Targets {
     pub fn add_sinks(&mut self, program: &CompiledProgram) {
         for output in &program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                let consumer_ref = consumer.read().unwrap_or_else(PoisonError::into_inner);
                 self.0.push((
-                    consumer_ref.producer_slot().clone(),
-                    consumer_ref.sink(),
+                    consumer.producer_slot().clone(),
+                    consumer.sink(),
                     TargetEntry::Sink(consumer.clone()),
                 ));
             }
@@ -374,16 +369,13 @@ fn run_targets(
     {
         let local = PipelineId(planner.local[*pipeline]);
         match entry {
-            TargetEntry::Sink(consumer) => consumer
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .place(
-                    local,
-                    breaker
-                        .read()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .input_tiling(InputId::ONLY),
-                ),
+            TargetEntry::Sink(consumer) => consumer.place(
+                local,
+                breaker
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .input_tiling(InputId::ONLY),
+            ),
             TargetEntry::Main(placement) => placement.set(Some(local)),
         }
     }
@@ -1380,10 +1372,7 @@ fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     }
     for (_, _, entry) in targets {
         match entry {
-            TargetEntry::Sink(consumer) => consumer
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .unplace(),
+            TargetEntry::Sink(consumer) => consumer.unplace(),
             TargetEntry::Main(placement) => placement.set(None),
         }
     }
@@ -1648,11 +1637,9 @@ fn queue_starts(dispatcher: &Dispatcher, starts: &Starts) {
     }
 }
 
-/// A sink output's consumer, which the planner places in the sink's pipeline.
-// shared-state-ok: the compiled output's own handle on its sink consumer
-// (`CompiledOutput::sink_consumer`), which the planner places and reads the sink's producer
-// through; no tile crosses it.
-type SinkTarget = Arc<RwLock<crate::interpreter::sinks::SinkConsumer>>;
+/// A sink output's consumer, which the planner places in the sink's pipeline. The consumer keeps
+/// its placement behind its own lock, so placing it takes no lock a notification waits on.
+type SinkTarget = Arc<crate::interpreter::sinks::SinkConsumer>;
 
 /// A root of the run: the slot of the producer its sink breaker pulls, the `DataSink` the breaker
 /// hands each answer to, and what the planner places in the root's pipeline.
@@ -3508,7 +3495,7 @@ mod tests {
 
     fn ordering_path_of(extent: &Extent) -> Option<Vec<SmolStr>> {
         LiveLeaf {
-            consumer: Arc::new(RwLock::new(|| {})),
+            consumer: Arc::new(|| {}),
             extent: extent.clone(),
         }
         .ordering_path()
@@ -3681,11 +3668,7 @@ mod tests {
                 .iter()
                 .find_map(|output| output.sink_consumer.as_ref())
                 .expect("one sink");
-            let slot = consumer
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .producer_slot()
-                .clone();
+            let slot = consumer.producer_slot().clone();
             planner.pipelines_under(
                 &mut **slot
                     .write()

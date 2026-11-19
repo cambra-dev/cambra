@@ -82,10 +82,15 @@ JUSTIFICATION = re.compile(r"//\s*shared-state-ok:\s*\S")
 EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `RouteTable`"),
+    # A sink consumer's placement, which the planner writes before a run and `notify` reads. What
+    # crosses it is a pipeline's index and a tiling, never a tile.
+    ("src/interpreter/sinks.rs", "cell of `Option<(PipelineId, Tiling)>`"),
     # The test sink's accumulator: a sink is a terminal consumer at the I/O boundary,
     # and `DataSink::process` takes `&self`.
     ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
-    ("src/interpreter/mod.rs", "shared cell of `C`"),
+    # The shared consumers a thread is notifying, which `notify_shared` checks a notification
+    # against to find re-entry. What crosses it is a consumer's address, never a tile.
+    ("src/interpreter/notifications.rs", "ambient mutable state"),
     # `Arrivals`, the regions an input has notified since they were last taken; see its type
     # doc. `subscribe` installs its consumer on the input before the producer exists, and the cell
     # connects the two; what crosses it is a region, never a tile.
@@ -127,9 +132,6 @@ EXPECTED_EXCEPTIONS = [
     # The placement an entry and its breaker share, which the planner writes before a run; what
     # crosses it is a pipeline's index. See `Placement`.
     ("src/interpreter/dispatcher.rs", "shared cell of `Option<PipelineId>`"),
-    # A compiled output's handle on its sink consumer, which the planner places and reads the
-    # sink's producer through. See `SinkTarget`.
-    ("src/interpreter/dispatcher/plan.rs", "shared cell of `crate::interpreter::sinks::SinkConsumer`"),
     # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
     # what it is handed; nothing reads it back into the graph. See `Collected`.
     ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),

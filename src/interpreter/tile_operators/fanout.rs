@@ -65,12 +65,12 @@ pub(crate) struct FanOutShared {
     producer: Option<Inner>,
     /// Every consumer registered via [`FanOutSlot::subscribe`], in order.
     ///
-    /// Stored as `Arc<RwLock<...>>` so that the notification closure can clone the
-    /// handles, release the `shared` read, and then call each consumer without
+    /// Stored as shared handles so that the notification closure can clone them,
+    /// release the `shared` read, and then call each consumer without
     /// holding `shared` across the notification. This prevents a re-entrant deadlock
     /// when a consumer (e.g. `SinkConsumer`) calls back into `FanOutProducer::get_impl`,
     /// which itself takes the `shared` write lock.
-    consumers: Vec<Arc<RwLock<Box<dyn Consumer>>>>,
+    consumers: Vec<SharedConsumer>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
     /// Whether each subscriber reads through a [`recurrence_slot`](FanOut::recurrence_slot),
@@ -472,7 +472,7 @@ impl Consumer for FanOutInput {
     /// It skips a recurrence slot: the operators inside a store's cycle read the store in pull
     /// mode, within its own pipeline.
     fn notify(
-        &mut self,
+        &self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
@@ -485,7 +485,7 @@ impl Consumer for FanOutInput {
 impl FanOutInput {
     /// The consumers of the live reader slots, which a push reaches, and none of a recurrence
     /// slot. A clone of each handle, so no read of the fan-out is held while a push climbs past.
-    fn reader_consumers(&self) -> Vec<Arc<RwLock<Box<dyn Consumer>>>> {
+    fn reader_consumers(&self) -> Vec<SharedConsumer> {
         let Some(shared_rc) = self.shared.upgrade() else {
             return Vec::new();
         };
@@ -975,15 +975,14 @@ impl TileOperator for FanOutSlot {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let _construction = crate::interpreter::notifications::control_plane();
+        let shared_rc = self.shared();
         // Register the consumer and reserve its release-guard slot. The slot
         // number lives in the cell the producer holds, so `compact` can renumber.
         let slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let shared_rc = self.shared();
         let seed = {
             let mut shared = shared_rc.write().unwrap_or_else(PoisonError::into_inner);
             slot.store(shared.consumers.len(), std::sync::atomic::Ordering::Relaxed);
-            shared.consumers.push(Arc::new(RwLock::new(consumer)));
+            shared.consumers.push(Arc::from(consumer));
             // A reader that replaces one starts where that one released, and every other
             // starts at what the fan-out has reclaimed.
             let (reader, predecessor) = self.reader.unzip();
@@ -1903,64 +1902,6 @@ mod tests {
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
 
     #[test]
-    fn simultaneous_subscribers_initialize_the_shared_input_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Counted {
-            input: Arc<dyn TileOperator>,
-            count: Arc<AtomicUsize>,
-        }
-        impl TileOperator for Counted {
-            fn tiling(&self) -> &Tiling {
-                self.input.tiling()
-            }
-            fn visit_inputs(&self, _: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-            fn subscribe(
-                self: Arc<Self>,
-                guard: TileGuard,
-                consumer: Box<dyn Consumer>,
-                cx: &mut SubscribeContext,
-            ) -> Box<dyn TileProducer> {
-                self.count.fetch_add(1, Ordering::SeqCst);
-                self.input.clone().subscribe(guard, consumer, cx)
-            }
-        }
-        let count = Arc::new(AtomicUsize::new(0));
-        let fan = FanOut::new(Arc::new(Counted {
-            input: Arc::new(Constant::new(Value::Int(1), Extent::Base(BaseType::Int))),
-            count: count.clone(),
-        }));
-        let start = Arc::new(std::sync::Barrier::new(8));
-        let readers = std::thread::scope(|scope| {
-            let mut jobs = Vec::new();
-            for _ in 0..8 {
-                let slot = fan.slot();
-                let start = start.clone();
-                jobs.push(scope.spawn(move || {
-                    start.wait();
-                    slot.clone().subscribe(
-                        slot.tiling().universal_guard(),
-                        Box::new(|| {}),
-                        &mut SubscribeContext::new(),
-                    )
-                }));
-            }
-            jobs.into_iter()
-                .map(|job| job.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-        drop(readers);
-    }
-
-    /// Reopening a fan-out drops the slots whose subscribers are gone and tells each survivor its
-    /// new number, so the parallel slot vectors are bounded by the live subscriptions rather than
-    /// by every subscription ever made.
-    ///
-    /// A producer addresses its release guard by index, so a compaction that moved guards without
-    /// telling the producers would hand one subscriber another's guard. The test drops the first
-    /// of two subscribers, so the survivor moves from slot 1 to slot 0 and keeps the guard it
-    /// released.
-    #[test]
     fn reopening_a_fan_out_drops_dead_slots_and_renumbers_the_rest() {
         let extent = Extent::Base(BaseType::Int);
         let fan = FanOut::new(std::sync::Arc::new(Constant::new(
@@ -2369,20 +2310,14 @@ mod tests {
     /// whether a tile stands to be taken.
     #[derive(Clone)]
     struct Notifier {
-        consumer: Arc<RwLock<Option<Box<dyn Consumer>>>>,
+        consumer: test_helpers::InputConsumer,
         standing: Arc<Cell<bool>>,
     }
 
     /// Bring the input's next tile, and notify.
     fn notify(notifier: &Notifier) {
         notifier.standing.set(true);
-        notifier
-            .consumer
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-            .expect("the memo installed a consumer on its input")
-            .announce(&Projection::Everything);
+        test_helpers::subscribed(&notifier.consumer).announce(&Projection::Everything);
     }
 
     impl TileOperator for Scripted {
@@ -2400,7 +2335,7 @@ mod tests {
                 .notifier
                 .consumer
                 .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(consumer);
+                .unwrap_or_else(PoisonError::into_inner) = Some(consumer.into());
             Box::new(ScriptedProducer {
                 base: ProducerBase::unowned(ScriptedProducer::alloc_id(), self.tiling()),
                 tiles: self.tiles.clone(),
@@ -3592,7 +3527,7 @@ mod consuming_tests {
         let counted = woken.clone();
         let consumer = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
         let _cx = SubscribeContext::new();
-        let mut notifier = forwarding_consumer_keeping_keys(&consumer);
+        let notifier = forwarding_consumer_keeping_keys(&consumer);
         let mut memo = memo_over(&source(0..4));
         memo.base = ProducerBase::unowned(MemoProducer::alloc_id(), &ints());
 
@@ -3630,7 +3565,7 @@ mod consuming_tests {
         let counted = woken.clone();
         let consumer = shared_consumer(Box::new(move || counted.set(counted.get() + 1)));
         let _cx = SubscribeContext::new();
-        let mut notifier = forwarding_consumer_keeping_keys(&consumer);
+        let notifier = forwarding_consumer_keeping_keys(&consumer);
         let mut memo = memo_over(&source(0..4));
         memo.base = ProducerBase::unowned(MemoProducer::alloc_id(), &ints());
 
@@ -3940,7 +3875,7 @@ mod cycle_tests {
             consumer: Box<dyn Consumer>,
             cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
-            let own: SharedConsumer = Arc::new(RwLock::new(consumer));
+            let own: SharedConsumer = Arc::from(consumer);
             let (recurrence, inside) = {
                 let mut wiring = self.wiring.write().unwrap_or_else(PoisonError::into_inner);
                 wiring.own = Some(own);

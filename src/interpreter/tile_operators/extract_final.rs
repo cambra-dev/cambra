@@ -590,7 +590,7 @@ mod tests {
     struct DelayedDefault {
         tiling: Tiling,
         ready: Arc<Cell<bool>>,
-        consumer: Arc<RwLock<Option<Box<dyn Consumer>>>>,
+        consumer: test_helpers::InputConsumer,
     }
 
     struct DelayedDefaultProducer {
@@ -612,7 +612,7 @@ mod tests {
             *self
                 .consumer
                 .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(consumer);
+                .unwrap_or_else(PoisonError::into_inner) = Some(consumer.into());
             Box::new(DelayedDefaultProducer {
                 base: ProducerBase::unowned(DelayedDefaultProducer::alloc_id(), &self.tiling),
                 ready: self.ready.clone(),
@@ -671,12 +671,7 @@ mod tests {
         assert!(!producer.read_in_pipeline(guard.clone()).is_terminal());
 
         ready.set(true);
-        consumer
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-            .unwrap()
-            .announce(&Projection::Everything);
+        test_helpers::subscribed(&consumer).announce(&Projection::Everything);
         assert_eq!(notifications.get(), 0, "bug pin: the fallback wake is lost");
         let Tile::Scalar(result) = producer.read_in_pipeline(guard) else {
             panic!("expected a scalar fallback");

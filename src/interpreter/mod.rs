@@ -43,7 +43,6 @@ pub use unary_op::*;
 
 use smol_str::{SmolStr, format_smolstr};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 // ============================================================================
 // Consumer Protocol
@@ -61,30 +60,30 @@ use std::sync::RwLock;
 /// program").
 pub trait Consumer: Send + Sync {
     /// Record an announced region and deliver it toward its dispatcher entries.
-    fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
+    ///
+    /// It takes `&self`, so delivery takes no lock on the consumer: state it records sits behind
+    /// its own lock or atomic, released before it notifies another consumer.
+    fn notify(&self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 }
 
-/// Blanket implementation: Arc<RwLock<C>> implements Consumer when C does.
-// shared-state-ok: this is what makes a shared *notification* handle a consumer;
-// a wakeup carries no value, so it is not a dataflow edge.
-impl<C: Consumer + ?Sized> Consumer for Arc<RwLock<C>> {
-    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+/// A shared consumer is one. Each notification passes the re-entry check ([`notify_shared`]).
+impl<C: Consumer + ?Sized> Consumer for Arc<C> {
+    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         notify_shared(self, region, landing)
     }
 }
 
-/// A boxed consumer is one, so it can be shared behind an `Arc<RwLock<_>>` as a
-/// [`SharedConsumer`].
+/// A boxed consumer is one, so it can be shared as a [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
-    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         (**self).notify(region, landing)
     }
 }
 
-/// Blanket implementation: FnMut() implements Consumer, ignoring the region.
+/// Blanket implementation: Fn() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
-impl<F: FnMut() + Send + Sync> Consumer for F {
-    fn notify(&mut self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
+impl<F: Fn() + Send + Sync> Consumer for F {
+    fn notify(&self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
         if landing.is_delivery() {
             self()
         }

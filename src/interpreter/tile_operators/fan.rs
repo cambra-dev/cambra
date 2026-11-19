@@ -1342,7 +1342,7 @@ mod nested_projection_tests {
     #[test]
     fn a_zip_restates_an_arms_inner_rows_as_the_groups_it_pairs() {
         use crate::interpreter::tile_operators::test_helpers::{
-            InputConsumer, NotifyingOp, RegionLog, notify_input,
+            InputConsumer, NotifyingOp, RegionLog, notify_input, subscribed,
         };
         use crate::interpreter::{Predicate, Value};
         let (tile, tiling) = two_levels_of_ints();
@@ -1376,12 +1376,7 @@ mod nested_projection_tests {
             let mut landing = crate::interpreter::dispatcher::Landing::probe_complete(
                 crate::interpreter::dispatcher::PipelineId(0),
             );
-            consumer
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_mut()
-                .expect("the arm was subscribed")
-                .notify(region, &mut landing);
+            subscribed(consumer).notify(region, &mut landing);
         };
         regions
             .write()

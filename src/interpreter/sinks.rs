@@ -9,7 +9,7 @@ use std::sync::PoisonError;
 use std::sync::RwLock;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 
@@ -43,7 +43,8 @@ pub struct DoneNotifier {
 
 impl DoneNotifier {
     /// Record this sink's completion.  Sends on the shared channel iff this was the last one.
-    pub fn signal(self) {
+    /// The caller signals once.
+    pub fn signal(&self) {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _ = self.tx.send(());
         }
@@ -71,15 +72,22 @@ impl DoneNotifier {
 /// A region delivery queues work for its sink pipeline. After every pipeline finishes,
 /// [`complete`](Self::complete) reconciles terminal output and signals [`DoneNotifier`].
 /// The producer slot is filled after subscription returns.
+///
+/// Every method takes `&self`: the compiled output and the operator graph share the consumer
+/// (`CompiledOutput::sink_consumer`), and a notification takes no lock on it.
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
     /// The sink that receives completed packages and the final terminal tile.
     sink: Arc<dyn DataSink>,
-    done: Option<DoneNotifier>,
+    done: DoneNotifier,
+    /// Whether [`complete`](Self::complete) has run, which signals `done` at most once.
+    completed: AtomicBool,
     /// The sink's pipeline in a dispatched run, and the tiling of the producer it pulls,
     /// which a push names regions of ([`place`](Self::place)).
-    placed: Option<(PipelineId, Tiling)>,
+    // shared-state-ok: the planner writes the placement before a run and `notify` reads it; what
+    // crosses it is a pipeline's index and a tiling, never a tile.
+    placed: RwLock<Option<(PipelineId, Tiling)>>,
 }
 
 impl SinkConsumer {
@@ -90,16 +98,17 @@ impl SinkConsumer {
             Self {
                 producer: producer.clone(),
                 sink,
-                done: Some(done),
-                placed: None,
+                done,
+                completed: AtomicBool::new(false),
+                placed: RwLock::new(None),
             },
             producer,
         )
     }
 
     /// Reconcile terminal output and signal completion after all sink pipelines finish.
-    pub(crate) fn complete(&mut self) {
-        if self.done.is_none() {
+    pub(crate) fn complete(&self) {
+        if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
         let mut slot = self
@@ -116,17 +125,14 @@ impl SinkConsumer {
             tile.is_terminal(),
             "a finished sink reconciles a terminal tile"
         );
-        self.done
-            .take()
-            .expect("completion is signalled once")
-            .signal();
+        self.done.signal();
     }
 
     /// Release the producer chain owned by this consumer during version teardown.
     /// Operators retained by the replacement can still reference this consumer; clearing its
     /// slot prevents those references from retaining the retired producer graph. Paused or refused
     /// runs remove their placement separately with [`unplace`](Self::unplace).
-    pub fn detach(&mut self) {
+    pub fn detach(&self) {
         *self
             .producer
             .write()
@@ -144,24 +150,26 @@ impl SinkConsumer {
     }
 
     /// Take the sink out of the pipeline it was placed in: a push that reaches it queues nothing.
-    pub(crate) fn unplace(&mut self) {
-        self.placed = None;
+    pub(crate) fn unplace(&self) {
+        *self.placed.write().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Place the sink in `pipeline` of a dispatched run, whose breaker pulls a producer of
     /// `input`: a push that reaches the sink queues for that pipeline what it names of `input`.
-    pub(crate) fn place(&mut self, pipeline: PipelineId, input: Tiling) {
-        self.placed = Some((pipeline, input));
+    pub(crate) fn place(&self, pipeline: PipelineId, input: Tiling) {
+        *self.placed.write().unwrap_or_else(PoisonError::into_inner) = Some((pipeline, input));
     }
 }
 
 impl Consumer for SinkConsumer {
     /// Cache invalidation executes no sink; output delivery is scheduled by `notify`.
-    fn notify(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        if let Some((pipeline, input)) = &self.placed
-            && let Some(guard) = pushed_guard(region, input)
-        {
-            landing.queue(*pipeline, &guard);
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        let queued = match &*self.placed.read().unwrap_or_else(PoisonError::into_inner) {
+            Some((pipeline, input)) => pushed_guard(region, input).map(|guard| (*pipeline, guard)),
+            None => None,
+        };
+        if let Some((pipeline, guard)) = queued {
+            landing.queue(pipeline, &guard);
         }
     }
 }

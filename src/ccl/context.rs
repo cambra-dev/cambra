@@ -1300,7 +1300,7 @@ pub struct CompiledOutput {
     pub producer: Option<Box<dyn TileProducer>>,
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
     /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
-    pub sink_consumer: Option<Arc<std::sync::RwLock<SinkConsumer>>>,
+    pub sink_consumer: Option<Arc<SinkConsumer>>,
     /// `Some` for `main` outputs: the placement of the
     /// [`Entry`](crate::interpreter::dispatcher::Entry) in front of the caller's consumer, which a
     /// dispatched run sets to the `main` output's pipeline, as it places a sink's consumer in the
@@ -3713,7 +3713,7 @@ fn compile_version(
 
             let notifier = notifiers.pop().unwrap();
             let (sink_consumer, producer_slot) = SinkConsumer::new(sink, notifier);
-            let consumer_rc = Arc::new(std::sync::RwLock::new(sink_consumer));
+            let consumer_rc = Arc::new(sink_consumer);
             let sink_producer = op.clone().subscribe(
                 universal,
                 Box::new(consumer_rc.clone()),
