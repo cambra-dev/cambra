@@ -176,7 +176,10 @@ Between two claims the serial driver may retain a loop or transaction scope's op
 A loop request's state is `InductionRun::request`, which lives on the store producer and which run
 cleanup drops (`InductionStoreProducer::clear_run`). A pause between claims would have to keep it on
 the store and re-key its package, which names a queue index in the old plan, to a region of the
-store's input. This is a conjecture; nothing implements a pause between claims.
+store's input. This is a conjecture; nothing implements a pause between claims. A run recovered
+from breaker copies taken between claims rebuilds the open request instead of keeping it: the
+store's pipeline queues what the store has not released, and the loop's next round first runs the
+position its drive emitted past the store's decided path (`TileProducer::emitted_undecided`).
 
 ### A run that unwinds
 

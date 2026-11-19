@@ -1487,13 +1487,6 @@ pub trait Breaker {
         false
     }
 
-    /// Whether the breaker is a store whose loop or transaction scope has a request open, whose
-    /// state lives in the run rather than in the store.
-    #[cfg(test)]
-    fn has_open_request(&self) -> bool {
-        false
-    }
-
     /// How many inputs the breaker consumes, each the input of a pipeline of its own: one, but for
     /// a transaction store, which consumes one per writer.
     fn inputs(&self) -> usize {
@@ -2044,6 +2037,18 @@ pub trait TileProducer: Send + Sync {
     /// source delivers no more; `None` for any other producer. A loop's scope runs a round per
     /// position the drive emits.
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
+        None
+    }
+
+    /// Where this producer is the drive of a loop run in rounds, the path of the position it has
+    /// emitted past `decided`, the path the loop's store has decided through; `None` where there
+    /// is none and for any other producer.
+    ///
+    /// A round decides the position it emits before the next round asks, and a store that resumes
+    /// a predecessor's run is decided through the position its drive resumes at, so a running loop
+    /// finds none. A loop recovered from copies finds one where the run stopped between the
+    /// drive's emit and the store's step, and its next round runs that position again.
+    fn emitted_undecided(&self, _decided: Option<&crate::interpreter::Path>) -> Option<Vec<Value>> {
         None
     }
 

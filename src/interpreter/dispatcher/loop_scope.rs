@@ -318,12 +318,6 @@ struct Request {
 }
 
 impl InductionRun {
-    /// Whether a request of the loop's scope is open: claimed, and not yet answered by its rounds.
-    #[cfg(test)]
-    pub(crate) fn has_open_request(&self) -> bool {
-        self.request.is_some()
-    }
-
     pub(super) fn new(body: Body, starts: Vec<PipelineId>) -> Self {
         Self {
             body,
@@ -475,8 +469,10 @@ impl InductionStoreProducer {
         self.final_guard().is_universal()
     }
 
-    /// The path of the position the drive emits next, which the next round runs: the next its
-    /// source delivers. `None` once the source delivers no more.
+    /// The path of the position the next round runs: the position the drive has emitted past the
+    /// store's decided path, where there is one, as in a run recovered from copies taken between
+    /// the drive's emit and the store's step; otherwise the next position the source delivers.
+    /// `None` once the source delivers no more.
     ///
     /// # Panics
     ///
@@ -484,12 +480,14 @@ impl InductionStoreProducer {
     /// drive.
     fn next_round_position(&mut self) -> Option<Vec<Value>> {
         let drive = self.drive();
+        let decided = self.decided_through();
         let mut next = None;
         self.reach_local(drive, &mut |breaker, _| {
-            next = breaker
-                .as_producer()
-                .and_then(|producer| producer.next_position())
-                .flatten();
+            next = breaker.as_producer().and_then(|producer| {
+                producer
+                    .emitted_undecided(decided.as_ref())
+                    .or_else(|| producer.next_position().flatten())
+            });
         });
         next
     }
