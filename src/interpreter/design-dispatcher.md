@@ -295,13 +295,14 @@ beneath a row besides whole keys, the push names the keys (`spelled_part`). A re
 spells is pushed once one does, at the latest once it is whole (`Pushes::push_final`), and a finish
 that leaves one fails the run.
 
-A sink's release follows the release contract: a scalar held under a key is complete once there, so
-a read can release a row whole before any answer states the row complete. That happens where an
-answer passes on the incompleteness of a row it reads only a field of, as `[p.0 for p in xs]` over
-rows whose collection field grows. A sink's or a `main` output's producer released whole answers no
-key, so the run's finish states it complete (`pull_at_finish`, for `SinkConsumer::complete` and
-`SinkBreaker::finish`). A statement of completion per field of a row, which would let the answer
-state such a row complete, is not represented.
+A sink's release follows the release contract: a plain value held under a key is complete once
+there, so a read can release a row whole. A field selector states complete each row it holds where
+the field it selects is plain (`Tile::state_held_values_complete`). Its input states a row complete
+only once all its fields are, so without it `[p.0 for p in xs]` over rows whose collection field
+grows would answer no row complete. A sink's or a `main` output's producer that its reader released
+whole has handed all it holds, so where its pull at the run's finish does not state it complete, the
+finish states it complete (`pull_at_finish`, for `SinkConsumer::complete` and
+`SinkBreaker::finish`).
 
 A breaker that folds or extracts what it is handed, or steps until its guard is released, reads
 its input once, after every source yields everything. An aggregate, an extract and a store are
