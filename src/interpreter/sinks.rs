@@ -107,8 +107,8 @@ impl SinkConsumer {
         let mut slot = self.producer.borrow_mut();
         let producer = slot.as_mut().expect("a compiled sink holds its producer");
         // A producer released whole answers nothing more, and the run's finish states what it
-        // handed complete: under the release contract a held scalar is complete once there, so a
-        // release can name a row whole before any answer states the row complete
+        // handed complete: under the release contract a plain value held under a key is complete
+        // once there, so a release can name a row whole before any answer states the row complete
         // (`src/interpreter/design-dispatcher.md`, "Reading a widened input again").
         let tile = pull_at_finish(&mut **producer);
         self.sink.process(&tile);
