@@ -1143,17 +1143,18 @@ binder is specialized at the definition, as before.
 
 Coalescing walks the tree twice (`coalesce_pass`, `Pass` in `infer/solve.rs`).
 
-The **write pass** records everything coalescing adds to the graph. It pins each variable a pin
-site pins ([Pin sites](#pin-sites)), and it specializes each use of a generalized binding: the clone
-is freshened, pinned to the use's instantiation, and walked by the write pass in turn, so a
-generalized definition calling another specializes the inner use under the outer clone's pin. It
-also walks the terms the types on each node hold (refinement predicates, a witness projection's
-term, a family's arguments) as trees of their own, so a use inside a filter or a group-by key is
-specialized like any other. It rewrites what must change before anything reads it: a trait
-function's call into a use of the instance's function, an operator into a call, `c ▷
-Iterable::elements` into `c`. It stamps nothing. What it decides for each use (`Plan`) is the
-specialization that serves it, or that its instantiation did not resolve, and the errors it raises
-are reported when the stamp pass reaches their nodes.
+The **write pass** records everything coalescing adds to the graph. It pins each variable a pin site
+pins ([Pin sites](#pin-sites)), and it specializes each use of a generalized binding: the clone is
+freshened, pinned to the use's instantiation, and walked by the write pass in turn, so a generalized
+definition calling another specializes the inner use under the outer clone's pin. It also walks the
+terms the types on each node hold (refinement predicates, a witness projection's term, a family's
+arguments) as trees of their own, so a use inside a filter or a group-by key is specialized like any
+other. It rewrites what must change before anything reads it: a trait function's call into a use of
+the instance's function, an operator into a call, `c ▷ Iterable::elements` into `c`. After the walk
+it records each membership whose bound is still open ([Membership is decided at
+materialization](#membership-is-decided-at-materialization)). It stamps nothing. What it decides for
+each use (`Plan`) is the specialization that serves it, or that its instantiation did not resolve,
+and the errors it raises are reported when the stamp pass reaches their nodes.
 
 The **stamp pass** is the walk over the graph the write pass leaves. It resolves children before
 the enclosing expression and stamps each node's type, fills binder slots, rebuilds a generalized
@@ -3484,6 +3485,15 @@ judged whole: equality compares its coalesced predicate, and subtyping reads its
 resolution kept for no tree, such as a display or a specialization key, decides none. A position
 that materializes as a variable has no membership to decide, and the kind stays on the variable.
 
+A kind whose bound is still open records its membership before any check reads it. The membership
+`𝑑 ∈ SubtypesOf(𝐵)` is the edge `𝑑 <: 𝐵`, and where `𝐵` is an annotation hole (`g: Map(_, _) =
+box(…)`) that edge is the only bound determining it. At the end of the write pass
+([Coalescing in two passes](#coalescing-in-two-passes)), `settle_open_memberships` in
+`infer/solve.rs` materializes each variable carrying a kind whose bound does not resolve to a closed
+type. It records `𝑑 <: 𝐵` for each membership the materialization collects whose bound is still
+open. A recording can open another, so the sweep repeats until one records nothing. A check at
+materialization reads the kind's bound resolved, and records nothing on the graph.
+
 An edge that reads the candidate's variable through a substitution records the kind on the
 suspension standing for it there
 ([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
@@ -3502,11 +3512,10 @@ since only the original's suspension list reaches it. A loop over a definition's
 `Elements` through an elimination, so the kind a collection annotation states inside the body sits
 on such a suspension, and each use decides it at its own types.
 
-On a materialized type the check abstains only on an inference variable left in it. On the
-concrete fragment it is a decision: `formal/CclFormal/TypeKind.lean` proves its image
-`admitsCheck` decides `Admits` (`admitsCheck_iff_admits`), and
-`differential_admits_vs_lean_model` compares the two. A failure is a
-`CoalesceError::KindMismatch`, reported against the kind's sum.
+On a materialized type the check abstains only on an inference variable left in it or in the kind's
+bound. On the concrete fragment it is a decision: `formal/CclFormal/TypeKind.lean` proves its image
+`admitsCheck` decides `Admits` (`admitsCheck_iff_admits`), and `differential_admits_vs_lean_model`
+compares the two. A failure is a `CoalesceError::KindMismatch`, reported against the kind's sum.
 
 A candidate whose head is resolved is decided when the edge is drawn: equality for
 `Enumerated`, the head for `UIntRanges`, and an ordinary subtype edge to `𝑏` for
