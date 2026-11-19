@@ -1603,7 +1603,8 @@ pub fn lower_expr(
     expr: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let lowered = lower_expr_inner(expr, ctx)?;
+    // One frame per nested expression; the stack grows on demand, as the other deep walks do.
+    let lowered = stacker::maybe_grow(512 * 1024, 1024 * 1024, || lower_expr_inner(expr, ctx))?;
     Ok(ctx.tag_source(lowered, expr.span))
 }
 
