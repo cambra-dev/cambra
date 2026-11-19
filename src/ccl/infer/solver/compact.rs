@@ -2497,6 +2497,16 @@ fn compact_type_with(
     collapse: bool,
     capability_vars: bool,
 ) -> CompactGraph {
+    solver.read(|solver| compact_type_reading(solver, ty, collapse, capability_vars))
+}
+
+/// [`compact_type_with`] inside its read ([`Solver::read`]).
+fn compact_type_reading(
+    solver: &mut Solver,
+    ty: &Type,
+    collapse: bool,
+    capability_vars: bool,
+) -> CompactGraph {
     let mut st = CompactState::new(collapse);
     st.capability_vars = capability_vars;
     if capability_vars {

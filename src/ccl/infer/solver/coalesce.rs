@@ -1218,7 +1218,8 @@ pub(crate) fn collecting_memberships<R>(
     f: impl FnOnce(&mut Solver) -> R,
 ) -> (R, Vec<PendingMembership>) {
     solver.pending_memberships.push(Vec::new());
-    let out = f(solver);
+    // A materialization reads the graph ([`Solver::read`]).
+    let out = solver.read(f);
     let pending = solver
         .pending_memberships
         .pop()
