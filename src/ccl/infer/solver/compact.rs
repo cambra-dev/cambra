@@ -1986,8 +1986,7 @@ impl CompactType {
         // Sums share the function slot with plain functions. Its kind merge retains
         // boxed/plain conflicts; this merge neither introduces nor dissolves a sum.
         // See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
-        let mut vars = lhs.vars;
-        vars.extend(rhs.vars);
+        let vars = union_into_larger(lhs.vars, rhs.vars);
         let (lhs_origins, rhs_origins) = (lhs.origins, rhs.origins);
         #[allow(clippy::mutable_key_type)]
         // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
@@ -2203,7 +2202,7 @@ impl CompactType {
     /// Take the variable identities of a contribution that
     /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
     fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
-        self.vars.extend(identity.vars);
+        self.vars = union_into_larger(std::mem::take(&mut self.vars), identity.vars);
         self.origins = self.origins.union(identity.origins);
         self
     }
@@ -2423,6 +2422,16 @@ impl CompactionInput {
 /// The compactions a fixed-graph batch shares ([`with_fixed_graph_compactions`]).
 #[cfg(debug_assertions)]
 pub(crate) type FixedCompactions = HashMap<CompactionInput, CompactGraph>;
+
+/// `a ∪ b`, inserting the smaller set's elements into the larger. A variable's value carries every
+/// variable its bounds reach, so along a chain one side of a merge holds the chain so far and the
+/// other a few new arrivals; inserting the chain into the arrivals instead costs the chain's
+/// length at every link.
+fn union_into_larger<T: Ord>(a: BTreeSet<T>, b: BTreeSet<T>) -> BTreeSet<T> {
+    let (mut larger, smaller) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    larger.extend(smaller);
+    larger
+}
 
 /// Share complete compactions while `f` reads a fixed inference graph. The caller must not
 /// add bounds or change scopes during the batch. Each nested batch starts empty, and its
