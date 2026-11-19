@@ -667,6 +667,33 @@ fn a_capability_beyond_a_written_type_is_reported_once(#[case] code: &str) {
     );
 }
 
+/// A value that meets a written function type has that type: a later error that renders the
+/// value's type renders what the written type states, not the capability it refused.
+#[test]
+fn a_value_past_a_written_type_renders_as_the_type() {
+    let code = indoc! {"
+        def noisy(n: Int) => Int:
+            out << n
+            n
+        def pick(n: Int) => (Int => Int) causes nothing:
+            noisy
+        def call_pick(n: Int):
+            pick(n)
+        z: Bool = call_pick(1)
+        z
+    "};
+    let errors = super::modules::compile_errors(&program(&format!("{PRELUDE}\n{code}"), &[]));
+    assert_eq!(super::modules::report_count(&errors), 2, "{errors}");
+    assert!(
+        errors.contains("which the function type it must have does not state"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("annotated as Bool, but inferred as Int => Int\n"),
+        "{errors}"
+    );
+}
+
 /// A clause naming no variable is reported at the item naming it, which no node of the tree
 /// stands for, rather than at the whole definition.
 #[test]
