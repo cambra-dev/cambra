@@ -4,6 +4,7 @@
 use smol_str::SmolStr;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::PoisonError;
 
 use bit_set::BitSet;
 use intervalsets::{
@@ -1443,7 +1444,10 @@ impl Predicate {
     fn applies_to_level(&self, extent: &Extent) -> bool {
         // Resolve transparent extent wrappers before matching.
         let extent = match extent {
-            Extent::DataSourceDomain(src) => src.borrow().element_extent(),
+            Extent::DataSourceDomain(src) => src
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

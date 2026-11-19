@@ -15,8 +15,7 @@
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
 //! is the `x: Mut(V, Txn) := e` annotation here).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -2378,11 +2377,11 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -2392,7 +2391,8 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
 
     // One request arrives, and the source is left **open** — no
     // terminal yield predicate — so `b`'s writer never drains.
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
 
     let result = producer.run();
@@ -2437,11 +2437,11 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -2453,7 +2453,8 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     );
     let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
 
     let result = producer.run();
@@ -2495,19 +2496,21 @@ fn final_key_notifications_wait_for_every_requested_key() {
     let mut ctx = GlobalContext::default();
     let finite = ctx.register_test_sink("finite");
     let pair = ctx.register_test_sink("pair");
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(source.clone());
     let loaded = LoadedProgram::test(code);
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     source
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     source
-        .borrow_mut()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
     crate::it::serving::dispatch_until_idle(&mut program);
     let Value::Function(rows) = finite.value().expect("a is complete") else {
@@ -2516,7 +2519,10 @@ fn final_key_notifications_wait_for_every_requested_key() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].output, Value::Int(3));
     assert!(pair.value().is_err(), "b is still live");
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     crate::it::serving::dispatch_until_idle(&mut program);
     let Value::Function(rows) = pair.value().expect("both keys are complete") else {
         panic!("sink rows")
@@ -2549,11 +2555,11 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -2565,7 +2571,8 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     );
     let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(5))]);
 
     let result = producer.run();
@@ -2682,8 +2689,6 @@ fn live_reply_combines_request_and_store() {
     use cambra::ccl::context::CompileResultExt;
     use cambra::ccl::{BaseType, Type};
     use cambra::interpreter::{Extent, TestDataSource, Value, sort_function_by_domain};
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     let code = indoc! {r#"
         resps: Feed(_)
@@ -2697,11 +2702,11 @@ fn live_reply_combines_request_and_store() {
         resps
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -2714,11 +2719,15 @@ fn live_reply_combines_request_and_store() {
         producer.run();
     }
 
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(5)),
-        (Value::UInt(1), Value::Int(15)),
-    ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(5)),
+            (Value::UInt(1), Value::Int(15)),
+        ]);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
 
     let mut result = producer.run();
     result.compact();
@@ -3676,19 +3685,23 @@ fn broadcast_off_async_source_sibling_loop() {
         out
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "src",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(1)),
-        (Value::UInt(1), Value::Int(2)),
-        (Value::UInt(2), Value::Int(3)),
-    ]);
+    );
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(1)),
+            (Value::UInt(1), Value::Int(2)),
+            (Value::UInt(2), Value::Int(3)),
+        ]);
     // A *complete* finite source: all keys available, no more coming — so the
     // sibling loop terminates and `cnt`'s final (3) is decided.
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     ctx.register_source(src.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -3838,11 +3851,11 @@ fn live_read_progresses_past_deny() {
         resps
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -3850,17 +3863,22 @@ fn live_read_progresses_past_deny() {
     let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
     // Request 0 (req = 100) arrives first and latches whatever the store has then.
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::from(0u64)));
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.
     let _ = producer.run();
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(1), Value::Int(200))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     let mut result = producer.run();
     result.compact();
 
@@ -4533,17 +4551,21 @@ fn a_checked_lookup_at_keys_off_a_source_in_a_writing_block() {
         out
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "src",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(1)),
-        (Value::UInt(1), Value::Int(2)),
-        (Value::UInt(2), Value::Int(1)),
-    ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    );
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(1)),
+            (Value::UInt(1), Value::Int(2)),
+            (Value::UInt(2), Value::Int(1)),
+        ]);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     ctx.register_source(src.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -5500,22 +5522,25 @@ fn a_block_value_replies_while_its_source_is_open() {
         resps
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
-    )));
+    );
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
     let compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = crate::it::serving::ProgramRunner::new(compiled);
 
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(30)),
-        (Value::UInt(1), Value::Int(50)),
-    ]);
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Int(30)),
+            (Value::UInt(1), Value::Int(50)),
+        ]);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     let mut open = producer.run();
     open.compact();
@@ -5544,9 +5569,12 @@ fn a_block_value_replies_while_its_source_is_open() {
         "each request is answered while the source is open"
     );
 
-    src.borrow_mut()
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .add_data(&[(Value::UInt(2), Value::Int(40))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     let mut result = producer.run();
     result.compact();
     assert_eq!(
