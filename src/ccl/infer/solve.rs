@@ -1,6 +1,6 @@
 // Coalescing and specialization share a context and recurse into each other:
 // parents need specialized child types before resolving their own type.
-// See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
+// See `src/ccl/design/type-inference.md`, "Coalescing in two passes".
 
 use crate::ccl::Label;
 use crate::ccl::infer::api::RelatedPositions;
@@ -70,11 +70,21 @@ fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, b
 /// The scope holds definition-site frames and shadow markers; the predicate memo
 /// preserves sharing under the walk's rewrite conditions.
 ///
-/// Emission precedes the walk, but the graph remains mutable: specialization pins
-/// can add bounds. Function-before-argument traversal and the debug read-stability
-/// check guard against invalidating types already consumed by a parent. See
-/// `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
+/// The walk runs twice over the tree ([`Pass`]): once to pin and specialize, recording on the
+/// graph, and once to stamp every node from the graph that leaves. See
+/// `src/ccl/design/type-inference.md`, "Coalescing in two passes".
 pub(super) struct CoalesceCtx {
+    /// Which of the two passes over the tree is running ([`Pass`]).
+    pass: Pass,
+    /// What the write pass decided, which the stamp pass carries out ([`Plan`]).
+    plan: Plan,
+    /// The errors the write pass raised, by the node raising them, which the stamp pass reports
+    /// when it reaches that node, so they stand among the stamp pass's errors where a single walk
+    /// raised them.
+    replay: HashMap<NodeId, Vec<LocatedInferError>>,
+    /// The predicates the write pass has walked, by allocation: a predicate shared by several
+    /// types is one term, whose uses are specialized once.
+    walked_predicates: HashMap<*const Expr, Rc<Expr>>,
     /// The program's trait instances, which a trait function's call is dispatched to
     /// ([`matching_instance`]).
     instances: Rc<InstanceTable>,
@@ -180,16 +190,13 @@ pub(super) struct CoalesceCtx {
     /// Where each variable occurs in other variables' lower bounds, for the pins
     /// ([`position_type`]).
     occurrences: OccurrenceIndex,
-    /// Every read the walk performed, for the end-of-pass ordering-invariant
-    /// check ([`assert_reads_stable`]). Debug builds only.
-    #[cfg(debug_assertions)]
-    reads: Vec<ReadRecord>,
-    /// How many refinement predicates enclose the walk's position within the tree being
-    /// walked. A specialization's clone is a tree of its own and starts at zero. Debug
-    /// builds only: [`specialize_use`] asserts with it that two uses in a tree never share
-    /// instantiation variables.
-    #[cfg(debug_assertions)]
-    in_predicate: usize,
+    /// How many terms a type holds enclose the walk's position within the tree being walked:
+    /// refinement predicates, a witness projection's term, a family's arguments
+    /// ([`HeldTerm`](crate::ccl::ty::HeldTerm)). A specialization's clone is a tree of its own
+    /// and starts at zero. The stamp pass rewrites a held term's nodes as the write pass
+    /// rewrites the tree's ([`rewrites_here`]), and [`specialize_use`] asserts with it that two
+    /// uses in a tree never share instantiation variables.
+    in_held: usize,
     /// Predicate-resolution inputs on the current recursion path, including held type
     /// slots. Equal predicates alone do not identify a resolution input.
     predicates_in_progress: Vec<crate::ccl::Refinement>,
@@ -299,372 +306,72 @@ impl CoalesceCtx {
     fn is_lambda_param(&self, name: &Name) -> bool {
         self.lambda_params.iter().any(|n| n == name)
     }
-
-    /// Log one read for [`assert_reads_stable`] (debug builds; free in
-    /// release). `unresolved` must be the var-laden type *as resolved* —
-    /// its shared `Rc<InferVar>`s are what let the end-of-pass check
-    /// re-resolve it against the final graph.
-    fn record_read(&mut self, unresolved: &Type, resolved: &Type, label: impl FnOnce() -> String) {
-        self.record_read_for(ReadPurpose::Stamp, unresolved, resolved, label);
-    }
-
-    /// [`record_read`](Self::record_read) for a use's instantiation resolution,
-    /// which is consumed structurally rather than stamped on the tree — see
-    /// [`ReadPurpose::Instantiation`].
-    fn record_read_instantiation(
-        &mut self,
-        unresolved: &Type,
-        resolved: &Type,
-        label: impl FnOnce() -> String,
-    ) {
-        self.record_read_for(ReadPurpose::Instantiation, unresolved, resolved, label);
-    }
-
-    fn record_read_for(
-        &mut self,
-        purpose: ReadPurpose,
-        unresolved: &Type,
-        resolved: &Type,
-        label: impl FnOnce() -> String,
-    ) {
-        #[cfg(debug_assertions)]
-        self.reads.push(ReadRecord {
-            purpose,
-            unresolved: unresolved.clone(),
-            resolved: resolved.clone(),
-            label: label(),
-        });
-        #[cfg(not(debug_assertions))]
-        {
-            let _ = (purpose, unresolved, resolved, label);
-        }
-    }
 }
 
-/// What the walk did with a read's result — which decides how much of it the
-/// ordering-invariant check holds fixed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReadPurpose {
-    /// The resolution was **stamped on a node**, so every part of it is
-    /// load-bearing downstream: refinements are compared (by layer
-    /// count — see [`types_agree_modulo_unread`]) along with the base skeleton.
+/// The two passes coalescing makes over a tree.
+///
+/// Everything that records on the inference graph runs in the first: the pins, and each
+/// use's specialization, whose clone is pinned to the use's instantiation. Everything that
+/// reads a node's resolved type runs in the second, over the graph the first leaves, so each
+/// read sees the graph every other read sees (`src/ccl/design/type-inference.md`, "Coalescing in
+/// two passes").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pass {
+    /// Specialize every use and pin every variable the walk pins, stamping nothing.
+    Write,
+    /// Stamp every node, carrying out what the write pass decided for each use.
     Stamp,
-    /// A use's instantiation resolution in [`specialize_use`], which is consumed
-    /// *structurally* — it seeds the clone's channel-domain pairings
-    /// (`seed_chan_dom_pairings`) and blames a resolution failure — and is **not**
-    /// what the use node ends up carrying (that is the specialization's own
-    /// coalesced type). It is also not the specialization key: keying on a resolved
-    /// type is exactly the bug [`SpecKey`] replaced.
-    ///
-    /// Refinements are excluded from the comparison here, and the reason is not that
-    /// a bound arrives late — nothing does. An argument's refinement reaches the
-    /// instantiation as a **lower** bound on the domain variable
-    /// (`(8, 0) <: ?dom`, from the emit-time `arg <: domain` edge), and a domain is
-    /// a *negative* position, where coalescing intersects **upper** bounds. So the
-    /// refinement is in the graph before this read and simply not on the side the read
-    /// consults. The pin that immediately follows adds the clone's parameter
-    /// variable as an upper bound of `?dom` and drives the same information into
-    /// it, which is the path that makes the refinement visible — so re-resolving the
-    /// snapshot at end of pass yields it (`pick = \lo, hi -> …` at `pick(8, 0)`:
-    /// `?dom` has `lower=[(8, 0)] upper=[?52]` and resolves to `(Int)`; after the
-    /// pin, `upper=[?52, (?89)]` and it resolves to `(8)`).
-    ///
-    /// That makes the drift a property of *when* the read is taken relative to the
-    /// pin, not of any bound going stale — which is why every [`Stamp`](Self::Stamp)
-    /// read is stable and only this one moves. Excluding refinements is sound because
-    /// this resolution's consumers are refinement-insensitive: `seed_chan_dom_pairings`
-    /// matches positions constructor-wise *through* refinements to find rigid
-    /// `ChanDom` names, and it already tolerates a position where the two sides
-    /// disagree structurally. Nothing about *sharing* rides on this read — that is
-    /// [`SpecKey`]'s job, and it consults both bound lists precisely so it does not
-    /// depend on which polarity a rendering would have picked. The *base skeleton*
-    /// is still held fixed here: a stale skeleton would pair channel domains wrong.
-    Instantiation,
 }
 
-/// One type the walk read (debug builds): the var-laden type exactly as it
-/// was resolved, and what it resolved to. The snapshot shares the live
-/// `Rc<InferVar>`s with the graph, so re-resolving it later observes every
-/// bound added since — which is what [`assert_reads_stable`] exploits.
-#[cfg(debug_assertions)]
-struct ReadRecord {
-    purpose: ReadPurpose,
-    unresolved: Type,
-    resolved: Type,
-    label: String,
+/// What the write pass decided, for the stamp pass ([`CoalesceCtx::plan`]).
+#[derive(Default)]
+struct Plan {
+    /// Each use the write pass reached, by its node, and what was done for it.
+    uses: HashMap<NodeId, UseDecision>,
+    /// Every specialization the write pass made, indexed by [`Specialization::plan`].
+    specs: Vec<PlannedSpecialization>,
+    /// The nodes whose walk the write pass ended at the node, having reported why: the stamp
+    /// pass ends there too.
+    stopped: std::collections::HashSet<NodeId>,
+    /// The tags each `match` pinned an unreachable payload for, by its node, which the stamp
+    /// pass checks against the scrutinee's resolved type. Debug builds only.
+    #[cfg(debug_assertions)]
+    pinned_tags: HashMap<NodeId, Vec<Label>>,
 }
 
-/// Verify every recorded read against the final graph. Later specialization pins must
-/// preserve the types the coalesce walk has already consumed.
-#[cfg(debug_assertions)]
-fn assert_reads_stable(solver: &mut Solver, reads: &[ReadRecord]) {
-    super::solver::compact::with_fixed_graph_compactions(solver, |solver| {
-        for r in reads {
-            let now = resolve_var_type(solver, &r.unresolved);
-            debug_assert!(
-                matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t, r.purpose == ReadPurpose::Stamp)),
-                "ordering invariant (specialization may only add bounds to \
-             variables the walk has not yet read) violated: `{}` was read as \
-             {} during the walk, but the final graph resolves it to {:?}",
-                r.label,
-                r.resolved,
-                now,
-            );
-        }
-    });
+/// What the write pass did for one use of a generalized binding ([`Plan::uses`]).
+enum UseDecision {
+    /// The use's instantiation did not resolve, so no specialization serves it.
+    Failed,
+    /// The use raised an error that stops its specialization, which the stamp pass reports.
+    Refused,
+    /// The specialization [`Plan::specs`] holds at this index serves the use.
+    Served { spec: usize },
 }
 
-/// Compare a recorded type's structure with its final-graph resolution.
-///
-/// Bases, ranges, sources, binder names, and function/product/variant structure
-/// must agree. Stamped reads additionally compare refinement-wrapper depth, not
-/// the number of predicates inside each refinement set. The preliminary
-/// [`Instantiation`](ReadPurpose::Instantiation) read omits that depth check.
-///
-/// Underdetermined positions are wildcards: re-resolution mints new `Infer`
-/// placeholders, and error paths can retain `Hole`. Predicate contents are not
-/// compared, since discharge and specialization can rebuild their terms. Scope
-/// validity and post-inference reconciliation check separate obligations; this
-/// function does not prove predicate equivalence.
-#[cfg(debug_assertions)]
-fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool {
-    // Peel the refinements, counting them. The *base* under the refinements is
-    // what recurses structurally; predicate content is out of scope (above).
-    fn peel<'t>(mut t: &'t Type, layers: &mut usize) -> &'t Type {
-        while let Type::Refinement(inner, _) = t {
-            *layers += 1;
-            t = inner;
-        }
-        t
-    }
-    // **Read through a place type before counting layers.** A place type is
-    // transparent, and the value behind it may itself be refined, so peeling first
-    // would compare a refined value's layer count (`{Int | __elem == 0}`, one layer)
-    // against the place type's own (`Mut({Int | __elem == 0}, d)`, zero) and reject a pair
-    // that is in fact the same type. That is what made a mutable variable with a refined value
-    // look like drift. The test is [`Type::is_place`] rather than a bare `matches!`
-    // for the same reason every other shape test peels: a refined place type is still a
-    // place type, and a *place-versus-its-read-view* pair is exactly the asymmetry this
-    // arm exists to allow.
-    if read.is_place() || now.is_place() {
-        return histories_agree(read, now, refinements);
-    }
-    let (mut read_layers, mut now_layers) = (0, 0);
-    let read = peel(read, &mut read_layers);
-    let now = peel(now, &mut now_layers);
-    if refinements && read_layers != now_layers {
-        return false;
-    }
-    match (read, now) {
-        (Type::Infer(_) | Type::Hole, _) | (_, Type::Infer(_) | Type::Hole) => true,
-        (Type::Base(a), Type::Base(b)) => a == b,
-        (Type::UIntRange(a), Type::UIntRange(b)) => a == b,
-        (Type::DataSource(a), Type::DataSource(b)) => a == b,
-        (Type::Txn, Type::Txn) => true,
-        // Nominal channel domains agree by name (the level is freshening
-        // bookkeeping, not identity - see `ChanLevel`).
-        (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
-        (Type::Param(a), Type::Param(b)) => a == b,
-        (Type::FamilyApp(a), Type::FamilyApp(b)) => a == b,
-        (Type::Nominal(d1, a1), Type::Nominal(d2, a2)) => {
-            d1 == d2
-                && a1
-                    .iter()
-                    .zip(a2)
-                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
-        }
-        // A bipolar argument read once whole and once split agrees side by side.
-        (Type::Split { .. }, _) | (_, Type::Split { .. }) => {
-            let ((ri, ro), (ni, no)) = (
-                crate::ccl::nominal::sides(read),
-                crate::ccl::nominal::sides(now),
-            );
-            types_agree_modulo_unread(ri, ni, refinements)
-                && types_agree_modulo_unread(ro, no, refinements)
-        }
-        (
-            Type::Fun {
-                binder: n1,
-                fun_kind: k1,
-                domain: d1,
-                codomain: c1,
-                ..
-            },
-            Type::Fun {
-                binder: n2,
-                fun_kind: k2,
-                domain: d2,
-                codomain: c2,
-                ..
-            },
-        ) => {
-            // Two sums agree iff their binders' type kinds agree pairwise, binder by binder
-            // — and one kind agrees with another when it is the same kind and their children
-            // agree in order. A kind's children are ordinary types
-            // ([`crate::ccl::ty::TypeKind::children`]), so this is the same relation the rest
-            // of the walk uses, and the order is a materialization contract.
-            let slots_agree = k1.witnesses().len() == k2.witnesses().len()
-                && k1.witnesses().iter().zip(k2.witnesses()).all(|(a, b)| {
-                    // **Answered, not as written.** A witness ranges over an index
-                    // variable ([`crate::ccl::Type::sum_over`]), so the skeleton a bound
-                    // determines is what the variable resolves to; comparing the variables
-                    // reports two spellings of one kind as a disagreement.
-                    let (x, y) = (a.type_kind(), b.type_kind());
-                    let blank = |k: &crate::ccl::ty::TypeKind| k.map_children(|_| Type::Hole);
-                    blank(&x) == blank(&y)
-                        && x.children().len() == y.children().len()
-                        && x.children()
-                            .iter()
-                            .zip(y.children())
-                            .all(|(p, q)| types_agree_modulo_unread(p, q, refinements))
-                });
-            // Capabilities are not compared. A specialization pin relates no capabilities, since
-            // uses differing only in them share a clone, so a clone's function bound meets a
-            // use's at an input with other capabilities; and nothing after specialization reads
-            // an effect off a materialized type (`src/ccl/design/type-inference.md`,
-            // "Polymorphism and materialization").
-            slots_agree
-                && n1 == n2
-                && types_agree_modulo_unread(d1, d2, refinements)
-                && types_agree_modulo_unread(c1, c2, refinements)
-        }
-        // An open tuple read and a closed one resolved later is a width the walk read
-        // before it was fixed, so the two shapes never agree.
-        (Type::Tuple(xs), Type::Tuple(ys)) | (Type::OpenTuple(xs), Type::OpenTuple(ys)) => {
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .zip(ys)
-                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
-        }
-        // A component's name is a spelling, not part of the type (`src/ccl/design/
-        // type-inference.md`, "Representation"), so components agree by position.
-        (Type::DepTuple(xs), Type::DepTuple(ys)) => {
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .zip(ys)
-                    .all(|((_, x), (_, y))| types_agree_modulo_unread(x, y, refinements))
-        }
-        // A binder's name is a spelling, as a component's is.
-        (
-            Type::Family {
-                binders: xb,
-                body: x,
-            },
-            Type::Family {
-                binders: yb,
-                body: y,
-            },
-        ) => {
-            xb.len() == yb.len()
-                && xb
-                    .iter()
-                    .zip(yb)
-                    .all(|((_, x), (_, y))| types_agree_modulo_unread(x, y, refinements))
-                && types_agree_modulo_unread(x, y, refinements)
-        }
-        (Type::Record(xs), Type::Record(ys)) => {
-            xs.len() == ys.len()
-                && xs.iter().zip(ys).all(|((nx, x), (ny, y))| {
-                    nx == ny && types_agree_modulo_unread(x, y, refinements)
-                })
-        }
-        // Openness is compared, not ignored: two variants differing only in it are
-        // different *demands*. Nothing should reach this check open at all — it runs
-        // on post-phase trees, and a demand is never an expression's own type — but
-        // coalesce does *carry* openness (a diagnostic naming a demand has to render
-        // it), so nothing upstream forces the closure. Comparing it here is what
-        // makes an `Open` that escaped onto a node show up as a disagreement.
-        (Type::Variant(xs, ox), Type::Variant(ys, oy)) => {
-            ox == oy
-                && xs.len() == ys.len()
-                && xs.iter().zip(ys).all(|((kx, x), (ky, y))| {
-                    kx == ky && types_agree_modulo_unread(x, y, refinements)
-                })
-        }
-        // The anonymous type-witness reference agrees with itself, in either
-        // spelling: the stored positional form and the in-flight named form are
-        // one occurrence read at two moments.
-        (Type::WitnessRef(_), Type::WitnessRef(_)) => true,
-        // A projection agrees with one holding an equal term, by normal form.
-        (Type::WitnessProjection(a), Type::WitnessProjection(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// The history half of [`types_agree_modulo_unread`], split out because it must run
-/// **before** the refinement-count comparison (see the call site).
-///
-/// Two histories of *different* kinds never agree — an `Overwrite` and a `Feed` are
-/// distinct places even if their read views coincidentally line up. Rejecting that
-/// explicitly is what keeps the read-through below from binding `kind` from whichever
-/// side matched first, which would compare one side's read view against the other's
-/// raw place type: an asymmetric and potentially-permissive result on a mis-kinded tree.
-///
-/// Otherwise a history reads through transparently (the solver's read-through rule,
-/// mirrored in `provide_function`): a read agrees with the place's read view, and two
-/// places agree iff their read views do. The read view is kind-specific — a `Feed`
-/// reads as its whole channel `domain ⤇ value`, an `Overwrite` derefs to its
-/// scalar `value`. A `Feed` channel domain is the rigid nominal `ChanDom(d)`,
-/// which `channelize` erases to the concrete channel domain by substitution; the
-/// `ChanDom` arm agrees it by name.
-///
-/// A **place type's own** outer refinements are peeled and not counted, unlike
-/// everywhere else in this comparison. They cannot be: the two sides here are legally a
-/// place type and its read view, which sit at different depths, so there is no layer count
-/// to compare. Only the place side is peeled — the read view carries the value's own
-/// refinements, and those are compared by the ordinary rule, layers and all.
-#[cfg(debug_assertions)]
-fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
-    use crate::ccl::HistoryKind;
-    fn peel_place(t: &Type) -> &Type {
-        if t.is_place() {
-            t.peel_refinements()
-        } else {
-            t
-        }
-    }
-    let (read, now) = (peel_place(read), peel_place(now));
-    if let (
-        Type::History {
-            history_kind: k0, ..
-        },
-        Type::History {
-            history_kind: k1, ..
-        },
-    ) = (read, now)
-        && k0 != k1
-    {
-        return false;
-    }
-    let (function, kind, other) = match (read, now) {
-        (
-            Type::History {
-                function,
-                history_kind,
-            },
-            other,
-        )
-        | (
-            other,
-            Type::History {
-                function,
-                history_kind,
-            },
-        ) => (function, history_kind, other),
-        _ => unreachable!("called only when at least one side peels to a History"),
-    };
-    match kind {
-        // A feed reads as its whole collection, the history's data function.
-        HistoryKind::Append => types_agree_modulo_unread(function, other, refinements),
-        HistoryKind::Overwrite => {
-            let Type::Fun { codomain, .. } = function.peel_refinements() else {
-                unreachable!("a history's function is a function")
-            };
-            types_agree_modulo_unread(codomain, other, refinements)
-        }
-    }
+/// A specialization the write pass made, before the stamp pass stamps its clone.
+struct PlannedSpecialization {
+    /// The generalized `let` whose binding it specializes ([`SpecializeFrame::let_node`]).
+    let_node: NodeId,
+    name: Name,
+    key: SpecKey,
+    shareable: bool,
+    instantiation: Type,
+    /// The binder it stands under, with the binders its variables entered, when it is placed
+    /// below its definition ([`CoalesceCtx::placed`]).
+    placement: Option<(Name, Vec<Name>)>,
+    /// The clone, pinned and walked by the write pass; taken by the stamp pass when it stamps it.
+    clone: Option<Expr>,
+    /// Each node of the clone paired with the node of the definition it copies.
+    origins: Rc<HashMap<NodeId, NodeId>>,
+    /// The level the clone is walked at.
+    level: Level,
+    arguments: Vec<(smol_str::SmolStr, Type)>,
+    pin_succeeded: bool,
+    #[cfg(debug_assertions)]
+    held: bool,
+    #[cfg(debug_assertions)]
+    instance_call: bool,
 }
 
 /// One entry of the coalesce walk's lexical scope.
@@ -683,6 +390,9 @@ enum ScopeEntry {
 /// being coalesced.
 struct SpecializeFrame {
     name: Name,
+    /// The generalized `let`'s node, which identifies this binding's specializations across
+    /// the two passes ([`PlannedSpecialization::let_node`]).
+    let_node: NodeId,
     /// The generalized binder's occurrence, which each specialization's binder copies.
     occurrence: NodeId,
     /// The uncoalesced definition, cloned (and freshened) once per distinct use
@@ -835,6 +545,8 @@ struct Specialization {
     /// as provenance and a globally-fresh uid for identity (so it can neither
     /// capture nor be captured).
     name: Name,
+    /// Its index in [`Plan::specs`].
+    plan: usize,
     /// The specialized, fully-coalesced definition. Spliced as a `let`
     /// binding around the generalized `let`'s body once that body's walk
     /// completes — if [`referenced`](Self::referenced).
@@ -1693,6 +1405,10 @@ pub(super) fn coalesce_pass(
     use_capabilities: crate::ccl::capabilities::UseCapabilities,
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
+        pass: Pass::Write,
+        plan: Plan::default(),
+        replay: HashMap::new(),
+        walked_predicates: HashMap::new(),
         instance_functions: instances.declared_bindings().cloned().collect(),
         instances,
         defining: Vec::new(),
@@ -1715,10 +1431,7 @@ pub(super) fn coalesce_pass(
         opaque_params_at: Vec::new(),
         assumptions: Vec::new(),
         occurrences: OccurrenceIndex::default(),
-        #[cfg(debug_assertions)]
-        reads: Vec::new(),
-        #[cfg(debug_assertions)]
-        in_predicate: 0,
+        in_held: 0,
         predicates_in_progress: Vec::new(),
         #[cfg(debug_assertions)]
         skipped_as_generalized: std::collections::HashSet::new(),
@@ -1730,19 +1443,31 @@ pub(super) fn coalesce_pass(
     ctx.occurrences.add_roots(expr);
     pin_unreached_values(solver, expr, 0, &mut ctx);
     coalesce_node(solver, expr, 0, &mut ctx);
+    debug_assert!(
+        ctx.scope.is_empty() && ctx.placed.is_empty() && ctx.specializing.is_empty(),
+        "coalesce scope must be balanced: every frame/shadow pushed during the \
+         walk is popped when its binder's subtree completes"
+    );
+    // The write pass's errors are reported where the stamp pass reaches their nodes.
+    for error in std::mem::take(&mut ctx.errors) {
+        ctx.replay.entry(error.node_id).or_default().push(error);
+    }
+    ctx.pass = Pass::Stamp;
+    ctx.current_node = expr.node_id();
+    coalesce_node(solver, expr, 0, &mut ctx);
+    // A node the stamp pass did not reach keeps its errors.
+    let mut unreached: Vec<_> = std::mem::take(&mut ctx.replay)
+        .into_values()
+        .flatten()
+        .collect();
+    unreached.sort_by_key(|e| e.node_id);
+    ctx.errors.extend(unreached);
     decide_suspended_memberships(solver, expr.node_id(), &mut ctx);
     debug_assert!(
         ctx.scope.is_empty(),
         "coalesce scope must be balanced: every frame/shadow pushed during the \
          walk is popped when its binder's subtree completes"
     );
-    // With the whole graph in its final state, re-check every read the walk
-    // performed (skipped on the error path — a failed program's reads are
-    // not expected to be stable).
-    #[cfg(debug_assertions)]
-    if ctx.errors.is_empty() {
-        assert_reads_stable(solver, &ctx.reads);
-    }
     // Every node's capabilities are known once inference ends, those of a node the walk
     // resolves no type at included.
     settle_capabilities(solver, expr);
@@ -2449,14 +2174,6 @@ fn assert_pinned_tags_are_unreachable(
     }
 }
 
-#[cfg(not(debug_assertions))]
-fn assert_pinned_tags_are_unreachable(
-    _solver: &mut Solver,
-    _scrutinee: Option<&Expr>,
-    _pinned_tags: &[Label],
-) {
-}
-
 /// Whether a **value** has reached `ty` — as opposed to merely something
 /// determining what it must be.
 ///
@@ -2536,6 +2253,12 @@ fn resolve_binder_slot(
     level: Level,
     ctx: &mut CoalesceCtx,
 ) {
+    // The write pass specializes the uses in the slot's predicates; resolving it is the stamp
+    // pass's.
+    if ctx.pass == Pass::Write {
+        walk_type_predicates(solver, slot, level, ctx);
+        return;
+    }
     let source = slot.clone();
     let (resolved, pending) =
         crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
@@ -2697,8 +2420,9 @@ impl crate::ccl::infer::solver::smt::ScopeEnv for ResolvingScope<'_> {
 /// Resolve expression and binder types while specializing generalized uses.
 ///
 /// Children resolve before their parent; applications visit the function before
-/// the argument. Pins may add bounds, but must not invalidate prior reads.
-/// See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
+/// the argument. The write pass pins and specializes, and the stamp pass resolves every
+/// node from the graph that leaves ([`Pass`]). See `src/ccl/design/type-inference.md`,
+/// "Coalescing in two passes".
 ///
 /// Binder slots and predicates require explicit visits beyond expression children.
 /// Let RHSs and mutable initializers retain emission's one-level increment.
@@ -2709,6 +2433,11 @@ fn coalesce_node(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: &mut C
     // for its own extent, so an error is blamed on the node that raised it
     // rather than on an ancestor. Mirrors `emit_node` / `check_node`.
     let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
+    if ctx.pass == Pass::Stamp
+        && let Some(raised) = ctx.replay.remove(&expr.node_id())
+    {
+        ctx.errors.extend(raised);
+    }
     // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
@@ -2720,18 +2449,24 @@ fn coalesce_node(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: &mut C
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
 /// bookkeeping it is wrapped in.
 fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    let expr_id = expr.node_id();
+    if ctx.pass == Pass::Stamp && ctx.plan.stopped.contains(&expr_id) {
+        return;
+    }
+    let rewrites = rewrites_here(ctx);
     // `c ▷ Iterable::elements` over a structural collection is `c`: the collection rule
     // answered its obligation, so the collection is its own `Elements` and `elements` the
     // identity (`src/ccl/design/type-inference.md`, "A collection is answered off the
     // table"). The call goes before anything reads it, here and in each copy a predicate
     // holds, so no pass after inference meets it.
-    if !ctx.discarding
+    if rewrites
+        && !ctx.discarding
         && let Some(collection) = elements_of_a_collection(solver, expr)
     {
         *expr = collection;
         return coalesce_node_inner(solver, expr, level, ctx);
     }
-    if !ctx.discarding {
+    if rewrites && !ctx.discarding {
         dispatch_operator(solver, expr, ctx);
     }
     // A trait function's call answered by an instance whose `def`s implement it becomes a use of
@@ -2740,14 +2475,16 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     // dropped resolves nothing to choose by: its operands are the definition's own, and
     // each use's clone chooses at its own types.
     let mut instance_call = false;
-    if matches!(expr.node, TypedExprNode::TraitFn { .. }) && !ctx.discarding {
+    if rewrites && matches!(expr.node, TypedExprNode::TraitFn { .. }) && !ctx.discarding {
         match matching_instance(solver, expr, ctx) {
             Err(error) => {
                 ctx.push_error(error);
+                ctx.plan.stopped.insert(expr.node_id());
                 return;
             }
             Ok(Some(instance)) => {
                 if instance.binds_functions() && !use_instance_function(expr, &instance, ctx) {
+                    ctx.plan.stopped.insert(expr.node_id());
                     return;
                 }
                 instance_call = true;
@@ -2764,6 +2501,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         deferred: Some(call),
         ..
     } = &mut expr.node
+        && rewrites
     {
         let selected = call
             .selected_instance()
@@ -2782,7 +2520,10 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     if let TypedExprNode::Var(name) = &expr.node
         && let Some(frame_idx) = lookup_generalized(&ctx.scope, name)
     {
-        specialize_use(solver, expr, frame_idx, instance_call, ctx);
+        match ctx.pass {
+            Pass::Write => specialize_use(solver, expr, frame_idx, instance_call, ctx),
+            Pass::Stamp => stamp_use(solver, expr, frame_idx, ctx),
+        }
         return;
     }
     // A generalized `let` rebuilds itself around its body's demanded
@@ -2818,16 +2559,15 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         | TypedExprNode::Reading(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {
-            // Specialization can deposit demands on the argument's variables.
-            // Read the argument only after those pins; see
-            // `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
             coalesce_node(solver, function, level, ctx);
             coalesce_node(solver, argument, level, ctx);
             // A projection requirement does not determine its input's width.
             // Use the resolved argument; predicates reach this same branch.
             // See `src/ccl/design/type-inference.md`,
             // "Closing the single-sided blind spots (no separate pass)".
-            specialize_projection_domain(function, &argument.ty);
+            if ctx.pass == Pass::Stamp {
+                specialize_projection_domain(function, &argument.ty);
+            }
         }
         // **A cast's predicates are read once, below, after its two slots converge.** The
         // `target` is a type slot the `expr.ty` walk does not reach, so it needs its own
@@ -2852,7 +2592,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         TypedExprNode::Lambda { params, body } => {
             // Before the body reads the parameters. In a walk whose types are dropped, an
             // unbounded parameter is the definition's own, and the uses supply it.
-            if !ctx.discarding {
+            if ctx.pass == Pass::Write && !ctx.discarding {
                 pin_unobservable_param(solver, &expr.ty, ctx);
             }
             let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
@@ -2969,6 +2709,9 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             for e in elts.iter_mut() {
                 coalesce_node(solver, e, level, ctx);
             }
+            if ctx.pass == Pass::Write {
+                return walk_annotation_predicates(solver, expr, level, ctx);
+            }
             // A direct projection's requirement can omit untouched input fields.
             // Specialize its domain from the preceding resolved codomain, then
             // rebuild the chain from its endpoints. Lambdas derive their parameter
@@ -3081,31 +2824,40 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             // one recorded on the *variable* to resolve consistently everywhere it
             // appears. The scrutinee is such an occurrence — its type is the
             // variant these payload variables sit inside — so the pin precedes its
-            // walk, not just the branches'. Pinning after it would leave the
-            // scrutinee's reading of the payload stale, which is the ordering
-            // invariant `assert_reads_stable` enforces. The pin reads only the
-            // constraint graph, which emission has already finished building, so
-            // nothing here depends on the scrutinee having been coalesced.
+            // walk, not just the branches': the pins of a scrutinee's own subtree read
+            // the payload variables too. The pin reads only the constraint graph,
+            // which emission has already finished building, so nothing here depends
+            // on the scrutinee having been coalesced.
             //
             // In a walk whose types are dropped — a definition checked alone, or dead
             // code — a scrutinee no value reaches stands for what the uses supply, so
             // an arm with no value at its payload is not unreachable: its payload is
             // a parameter of the definition, and pinning it would decide a type no
             // use chose.
-            let pin = !ctx.discarding
-                || scrutinee
-                    .as_ref()
-                    .is_some_and(|s| value_reaches(solver, &s.ty));
-            let pinned_tags: Vec<Label> = branches
-                .iter()
-                .filter_map(|b| b.pattern.as_ref())
-                .filter(|p| pin && pin_unobservable_arm_payload(solver, p, ctx))
-                .map(|p| p.tag())
-                .collect();
+            if ctx.pass == Pass::Write {
+                let pin = !ctx.discarding
+                    || scrutinee
+                        .as_ref()
+                        .is_some_and(|s| value_reaches(solver, &s.ty));
+                let pinned_tags: Vec<Label> = branches
+                    .iter()
+                    .filter_map(|b| b.pattern.as_ref())
+                    .filter(|p| pin && pin_unobservable_arm_payload(solver, p, ctx))
+                    .map(|p| p.tag())
+                    .collect();
+                #[cfg(debug_assertions)]
+                ctx.plan.pinned_tags.insert(expr_id, pinned_tags);
+                #[cfg(not(debug_assertions))]
+                let _ = pinned_tags;
+            }
             if let Some(s) = scrutinee {
                 coalesce_node(solver, s, level, ctx);
             }
-            assert_pinned_tags_are_unreachable(solver, scrutinee.as_deref(), &pinned_tags);
+            #[cfg(debug_assertions)]
+            if ctx.pass == Pass::Stamp {
+                let pinned_tags = ctx.plan.pinned_tags.remove(&expr_id).unwrap_or_default();
+                assert_pinned_tags_are_unreachable(solver, scrutinee.as_deref(), &pinned_tags);
+            }
             // An arm knows which constructor built the value it matched, and a default arm
             // which ones did not (`src/ccl/design/type-inference.md`, "Arm facts").
             let case_facts = match scrutinee.as_deref() {
@@ -3146,7 +2898,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         TypedExprNode::NominalCtor { payload, .. } => {
             // Before anything reads the value's type. In a walk whose types are dropped, an
             // argument nothing determines is the definition's own, and the uses supply it.
-            if !ctx.discarding {
+            if ctx.pass == Pass::Write && !ctx.discarding {
                 pin_unobservable_ctor_args(solver, &expr.ty, ctx);
             }
             coalesce_node(solver, payload, level, ctx);
@@ -3170,6 +2922,9 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         // which reports it.
         TypedExprNode::Feed { value, row, .. } => {
             coalesce_node(solver, value, level, ctx);
+            if ctx.pass == Pass::Write {
+                return walk_annotation_predicates(solver, expr, level, ctx);
+            }
             let source = row.clone();
             let (resolved, pending) =
                 crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
@@ -3300,6 +3055,9 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     // whose *element* types disagree), the parameter slot fails too and the error surfaces
     // from there instead. Deferring says which position owns the answer, not that there is
     // one.
+    if ctx.pass == Pass::Write {
+        return walk_annotation_predicates(solver, expr, level, ctx);
+    }
     if let TypedExprNode::Var(name) = &expr.node
         && ctx.is_lambda_param(name)
         && matches!(
@@ -3309,11 +3067,10 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     {
         return;
     }
-    // The node rendered for a message, only where one is written: an error, or a debug read
-    // record. Rendering spells the node's whole subtree, so rendering every node would cost
-    // time quadratic in the tree's depth. The read record and the resolution error below
-    // render the node before the arms after them change it; a failed membership renders it
-    // as coalescing leaves it.
+    // The node rendered for a message, only where one is written. Rendering spells the
+    // node's whole subtree, so rendering every node would cost time quadratic in the tree's
+    // depth. The resolution error below renders the node before the arms after it change it;
+    // a failed membership renders it as coalescing leaves it.
     let label = |solver: &mut Solver, expr: &Expr| {
         crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), expr)
     };
@@ -3355,7 +3112,6 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
                 // may overwrite `expr.ty` afterwards via *structural* recovery
                 // — `specialize_projection_domain`, let-closing — which is not a
                 // graph read and so is not what this guards.)
-                ctx.record_read(&expr.ty, &ty, || label(solver, expr));
                 expr.ty = ty;
                 // The node's capabilities and its own, resolved as its type is (`src/ccl/design/
                 // type-inference.md`, "4.9 Capabilities").
@@ -3496,6 +3252,85 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     if !ctx.discarding {
         run_instance_primitive(solver, expr, &ctx.instances);
     }
+}
+
+/// The write pass at the end of a node: the predicates on the node's types, the slots emission
+/// typed an annotation's predicates on (`emit_annotation_predicates`), each walked as a tree of
+/// its own so that a use of a generalized binding inside one is specialized, and its clone
+/// pinned, before the stamp pass reads anything.
+///
+/// The stamp pass meets these predicates again, and copies of them: resolving a type copies the
+/// predicates it carries, and a substitution acting on one rewrites its terms. A copy's use is
+/// served by the specialization of the use it copies: the same instantiation, or one its key
+/// shares ([`stamp_use`]).
+fn walk_annotation_predicates(
+    solver: &mut Solver,
+    expr: &mut Expr,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+) {
+    let mut slots: Vec<Type> = vec![expr.ty.clone()];
+    slots.extend(expr.user_annotation.clone());
+    let binding = |b: &TypedBinding, slots: &mut Vec<Type>| {
+        slots.push(b.ty.clone());
+        slots.extend(b.user_annotation.as_ref().map(|a| a.ty.clone()));
+    };
+    match &expr.node {
+        TypedExprNode::Cast { target, .. } => slots.push(target.clone()),
+        TypedExprNode::Feed { row, .. } => slots.push(row.clone()),
+        TypedExprNode::Lambda { params, .. } => {
+            for param in params {
+                binding(param, &mut slots);
+            }
+        }
+        TypedExprNode::Let { binding: b, .. } | TypedExprNode::MutDecl { binding: b, .. } => {
+            binding(b, &mut slots)
+        }
+        _ => {}
+    }
+    for slot in &slots {
+        walk_type_predicates(solver, slot, level, ctx);
+    }
+}
+
+/// [`walk_annotation_predicates`] for one type: each predicate it carries, once per allocation.
+fn walk_type_predicates(solver: &mut Solver, ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
+    fn collect(ty: &Type, out: &mut Vec<Rc<Expr>>) {
+        use crate::ccl::ty::HeldTerm;
+        match ty {
+            Type::Refinement(_, refinements) => {
+                out.extend(refinements.iter().map(|r| Rc::clone(r.held())))
+            }
+            Type::WitnessProjection(p) => out.push(Rc::clone(p.held())),
+            Type::FamilyApp(app) => out.extend(app.args.iter().map(|a| Rc::clone(a.held()))),
+            _ => {}
+        }
+        ty.walk_children(|child| collect(child, out));
+    }
+    let mut predicates = Vec::new();
+    collect(ty, &mut predicates);
+    for predicate in predicates {
+        let at = Rc::as_ptr(&predicate);
+        if ctx.walked_predicates.contains_key(&at) {
+            continue;
+        }
+        ctx.walked_predicates.insert(at, Rc::clone(&predicate));
+        // A copy at the predicate's own ids: what the write pass decides for a use inside it,
+        // the stamp pass finds by that use's node.
+        let mut walked = predicate.clone_preserving_ids();
+        ctx.in_held += 1;
+        coalesce_node(solver, &mut walked, level, ctx);
+        ctx.in_held -= 1;
+    }
+}
+
+/// Whether the walk rewrites the node it is at before reading it: a trait function's call
+/// into a use of the instance's function, an operator into a call, a collection's `elements`
+/// into the collection. The write pass rewrites the tree, and the stamp pass each predicate,
+/// whose copies the write pass never meets: a type's predicates are made as its types are
+/// read.
+fn rewrites_here(ctx: &CoalesceCtx) -> bool {
+    ctx.pass == Pass::Write || ctx.in_held > 0
 }
 
 /// Replace an arithmetic operator answered by an instance whose `def`s implement it with the call of
@@ -4003,15 +3838,9 @@ fn coalesce_type_predicates_go(
                         symbolic(&entered),
                     );
                     ctx.predicates_in_progress.push(this.clone());
-                    #[cfg(debug_assertions)]
-                    {
-                        ctx.in_predicate += 1;
-                    }
+                    ctx.in_held += 1;
                     coalesce_node(solver, pred, level, ctx);
-                    #[cfg(debug_assertions)]
-                    {
-                        ctx.in_predicate -= 1;
-                    }
+                    ctx.in_held -= 1;
                     ctx.predicates_in_progress.pop();
                     crate::ccl::ccl_utils::type_element_reads_from_base(pred, &base);
                     true
@@ -4081,7 +3910,9 @@ fn coalesce_type_predicates_go(
             let memo = ctx.pred_memo.clone();
             for arg in &mut app.args {
                 memo.rebuild(arg, &(), |term| {
+                    ctx.in_held += 1;
                     coalesce_node(solver, term, level, ctx);
+                    ctx.in_held -= 1;
                     true
                 });
                 scope.close_held(solver, arg);
@@ -4103,7 +3934,9 @@ fn coalesce_type_predicates_go(
         Type::WitnessProjection(p) => {
             let memo = ctx.pred_memo.clone();
             memo.rebuild(p, &(), |term| {
+                ctx.in_held += 1;
                 coalesce_node(solver, term, level, ctx);
+                ctx.in_held -= 1;
                 true
             });
             // A determined witness is its one candidate, the spelling `ty::unboxed_type` gives.
@@ -4171,12 +4004,11 @@ fn share_with_its_origin(solver: &Solver, ctx: &mut CoalesceCtx, r: &mut crate::
     }
 }
 
-// Specialization runs inside coalescing while each use still exposes its live
-// instantiation graph. Parents consume resolved clones, and the enclosing let
-// retains only referenced specializations. Pins may add bounds during the walk;
-// function-before-argument order and the debug read-stability check guard reads
-// already consumed. See `src/ccl/design/type-inference.md`,
-// "Specialization scope and lifecycle" and "Coalesce ordering and read stability".
+// Specialization runs in the write pass while each use still exposes its live
+// instantiation graph, and the stamp pass stamps each clone where it first serves a
+// use. Parents consume resolved clones, and the enclosing let retains only referenced
+// specializations. See `src/ccl/design/type-inference.md`, "Specialization scope and
+// lifecycle" and "Coalescing in two passes".
 
 /// Whether `ty` holds no inference variable and no type parameter: a type an instance head
 /// can be matched against.
@@ -4235,38 +4067,15 @@ pub(super) fn specialize_use(
     #[cfg_attr(not(debug_assertions), allow(unused_variables))] instance_call: bool,
     ctx: &mut CoalesceCtx,
 ) {
-    // Resolve against the current graph, including pins made before this visit.
-    // A use inside another specialization sees that outer clone's pin. Later pins
-    // can still add bounds; assert_reads_stable checks the recorded structure.
-    let resolved = match resolve_var_type(solver, &use_expr.ty) {
-        Ok(t) => t,
-        Err(err) => {
-            let label = crate::ccl::symbolic::symbolic_in(
-                &crate::ccl::ty::RenderCtx::new(solver),
-                use_expr,
-            );
-            let error = map_coalesce_err(err, &label);
-            let carried = reachable_vars(solver, &use_expr.ty);
-            let node = ctx.current_node;
-            let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
-                unreachable!("lookup_generalized returns indices of Generalized entries only");
-            };
-            frame.failed_uses.push((error.clone(), carried));
-            frame.failed_use_nodes.insert(node);
-            ctx.push_read_error(solver, &use_expr.ty, error);
-            return;
-        }
+    // Resolve against the current graph, including pins made before this visit: a use
+    // inside another specialization sees that outer clone's pin. A use whose
+    // instantiation does not resolve gets no specialization, and the stamp pass reports it.
+    let Ok(resolved) = resolve_var_type(solver, &use_expr.ty) else {
+        ctx.plan
+            .uses
+            .insert(use_expr.node_id(), UseDecision::Failed);
+        return;
     };
-    // Log the use's instantiation read for the ordering-invariant check. The
-    // snapshot keeps the live instantiation vars; the pin below (and any
-    // later specialization) may only *add* bounds to them, so re-resolving at
-    // end-of-pass must still agree on the *skeleton*. Refinements are excluded
-    // because the pin that immediately follows is itself what moves them, and
-    // this resolution's consumers are refinement-insensitive (see
-    // `ReadPurpose::Instantiation`).
-    ctx.record_read_instantiation(&use_expr.ty, &resolved, || {
-        crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), use_expr)
-    });
     // The specialization key: what decides whether this use may share an
     // existing clone. Read off the live graph *before* the pin, exactly as every
     // other use's is, so both sides of the comparison below are one procedure at
@@ -4325,42 +4134,23 @@ pub(super) fn specialize_use(
             unreachable!("lookup_generalized returns indices of Generalized entries only");
         };
         let frame_name = frame.name.clone();
-        let survives = surviving_use(ctx, frame_idx);
         if let Some(placed) = ctx
             .placed
-            .iter_mut()
+            .iter()
             .find(|p| p.frame_name == frame_name && p.binder == *binder && shares(&p.spec))
         {
-            placed.spec.referenced |= survives;
-            let (name, ty) = (placed.spec.name.clone(), placed.spec.def.ty.clone());
-            let at_use = use_expr.node_id();
-            let enclosing = ctx.specializing.clone();
-            let shared: Vec<HeldError> = placed
-                .spec
-                .raised
-                .iter()
-                .map(|(origin, error)| HeldError {
-                    at_use,
-                    origin: *origin,
-                    enclosing: enclosing.clone(),
-                    error: error.clone(),
-                })
-                .collect();
-            let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
-                unreachable!("lookup_generalized returns indices of Generalized entries only");
-            };
-            frame.held.extend(shared);
-            use_expr.node = TypedExprNode::Var(name);
-            use_expr.ty = ty;
+            let spec = placed.spec.plan;
+            ctx.plan
+                .uses
+                .insert(use_expr.node_id(), UseDecision::Served { spec });
             return;
         }
     }
-    let surviving = surviving_use(ctx, frame_idx);
     let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
     if placement.is_none()
-        && let Some(spec) = frame.specs.iter_mut().find(|s| shares(s))
+        && let Some(spec) = frame.specs.iter().find(|s| shares(s))
     {
         // Equal instantiations identify copies of one use only while inference instantiates
         // every use with fresh variables. Two uses in the tree itself are distinct, so where
@@ -4370,7 +4160,7 @@ pub(super) fn specialize_use(
         assert!(
             (shareable && spec.shareable && spec.key == key)
                 || spec.held
-                || ctx.in_predicate > 0
+                || ctx.in_held > 0
                 || (spec.instance_call && instance_call),
             "two uses of `{}` in the tree share the instantiation {instantiation}: \
              inference instantiates each use with fresh variables, and only a refinement \
@@ -4378,12 +4168,10 @@ pub(super) fn specialize_use(
              \"A use the key does not determine shares no clone\")",
             spec.name.base(),
         );
-        let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
-        // Sharing is what makes an entry live: an entry minted for a discarded use
-        // is spliced after all once a surviving use adopts it.
-        if surviving {
-            spec.referenced = true;
-        }
+        let spec = spec.plan;
+        ctx.plan
+            .uses
+            .insert(use_expr.node_id(), UseDecision::Served { spec });
         // A hit is *not* re-pinned, and the reason is worth recording because
         // pinning here looks like the obvious way to make the key's faithfulness
         // checked rather than argued. It is not available: a miss pins a
@@ -4395,21 +4183,6 @@ pub(super) fn specialize_use(
         // have intersected away instead fails `T ⊀ {T | p}` outright). Checking a
         // hit needs a non-recording *subsumption* test rather than a constrain,
         // which the solver has no notion of today.
-        let enclosing = ctx.specializing.clone();
-        let at_use = use_expr.node_id();
-        let shared: Vec<HeldError> = spec
-            .raised
-            .iter()
-            .map(|(origin, error)| HeldError {
-                at_use,
-                origin: *origin,
-                enclosing: enclosing.clone(),
-                error: error.clone(),
-            })
-            .collect();
-        frame.held.extend(shared);
-        use_expr.node = TypedExprNode::Var(name);
-        use_expr.ty = ty;
         return;
     }
     let base_name = frame.name.clone();
@@ -4455,6 +4228,9 @@ pub(super) fn specialize_use(
         };
         if let Some(error) = error {
             ctx.push_error(error);
+            ctx.plan
+                .uses
+                .insert(use_expr.node_id(), UseDecision::Refused);
             return;
         }
         arguments
@@ -4770,39 +4546,23 @@ pub(super) fn specialize_use(
         );
     }
 
-    // Coalesce the clone re-entrantly, in the definition site's scope: every
-    // entry above the frame (including the frame itself — CCL `let` is
-    // non-recursive, so the definition cannot reference its own name and a
-    // same-named *outer* binding below the frame must stay visible) was
-    // introduced between the definition and this use and is suspended for the
-    // duration. Nested generalized `let`s inside the clone push their own
-    // frames on the truncated stack and specialize recursively.
+    // Walk the clone re-entrantly, in the definition site's scope: every entry above the
+    // frame (including the frame itself — CCL `let` is non-recursive, so the definition
+    // cannot reference its own name and a same-named *outer* binding below the frame must
+    // stay visible) was introduced between the definition and this use and is suspended
+    // for the duration. Nested generalized `let`s inside the clone push their own frames
+    // on the truncated stack and specialize recursively. The stamp pass walks it again,
+    // in the same scope, to stamp it ([`stamp_use`]).
     let pin_succeeded = pinned.is_ok();
-    let mut kept: Vec<(Option<NodeId>, LocatedInferError)> = Vec::new();
-    let before = ctx.errors.len();
     let origins = Rc::new(origins);
-    //
-    // An instance's function is the exception: a trait function's call in its body may be
-    // answered by the same instance at other types, `Area(Two(T))`'s `area` calling `Area`
-    // at `T`, so its frame stays in scope and that call specializes it again. No source
-    // names the binding, so nothing else reaches it.
-    let kept_to = if ctx.instance_functions.contains(&base_name) {
-        frame_idx + 1
-    } else {
-        frame_idx
-    };
-    let suspended = ctx.scope.split_off(kept_to);
-    // A placed clone stands under the binders its variables entered, so a use inside it whose
-    // instance reads one of them is placed there too.
-    if let Some((_, entered)) = &placement {
-        ctx.scope
-            .extend(entered.iter().cloned().map(ScopeEntry::Shadow));
-    }
+    let level = cutoff + 1 + raise;
+    let at_use = use_expr.node_id();
+    let suspended = suspend_for_clone(ctx, frame_idx, &base_name, placement.as_ref());
     ctx.specializing.push(ActiveSpecialization {
         name: base_name.clone(),
         key: key.clone(),
-        arguments,
-        at_use: use_expr.node_id(),
+        arguments: arguments.clone(),
+        at_use,
         copies: Rc::clone(&origins),
     });
     // The clone is a tree of its own, with variables no earlier walk could register or
@@ -4811,69 +4571,68 @@ pub(super) fn specialize_use(
     // pinned there.
     ctx.occurrences.add_roots(&clone);
     if !ctx.discarding {
-        pin_unreached_values(solver, &clone, cutoff + 1 + raise, ctx);
+        pin_unreached_values(solver, &clone, level, ctx);
     }
-    #[cfg(debug_assertions)]
-    let in_predicate = std::mem::take(&mut ctx.in_predicate);
-    coalesce_node(solver, &mut clone, cutoff + 1 + raise, ctx);
-    #[cfg(debug_assertions)]
-    {
-        ctx.in_predicate = in_predicate;
-    }
+    let in_held = std::mem::take(&mut ctx.in_held);
+    coalesce_node(solver, &mut clone, level, ctx);
+    ctx.in_held = in_held;
     ctx.specializing.pop();
-    ctx.scope.truncate(kept_to);
-    ctx.scope.extend(suspended);
-    if pin_succeeded {
-        let raised = ctx.errors.split_off(before);
-        let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
-            unreachable!("suspended entries were restored above the frame");
-        };
-        let at_use = use_expr.node_id();
-        let enclosing = ctx.specializing.clone();
-        kept = raised
-            .into_iter()
-            .map(|error| (origins.get(&error.node_id).copied(), error))
-            .collect();
-        frame
-            .held
-            .extend(kept.iter().map(|(origin, error)| HeldError {
-                at_use,
-                origin: *origin,
-                enclosing: enclosing.clone(),
-                error: error.clone(),
-            }));
-    }
-    // (The pin's effect on this use's own resolution — and on every other
-    // read the walk made — is checked in bulk at end-of-pass by
-    // `assert_reads_stable`, which is where the ordering invariant lives.)
+    restore_after_clone(ctx, suspended);
 
-    use_expr.node = TypedExprNode::Var(spec_name.clone());
-    use_expr.ty = clone.ty.clone();
-    let referenced = surviving_use(ctx, frame_idx);
+    let plan = ctx.plan.specs.len();
+    ctx.plan
+        .uses
+        .insert(at_use, UseDecision::Served { spec: plan });
     let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
         unreachable!("suspended entries were restored above the frame");
     };
+    #[cfg(debug_assertions)]
+    let held = ctx.in_held > 0;
+    ctx.plan.specs.push(PlannedSpecialization {
+        let_node: frame.let_node,
+        name: spec_name.clone(),
+        key: key.clone(),
+        shareable,
+        instantiation: instantiation.clone(),
+        placement: placement.clone(),
+        clone: Some(clone),
+        origins,
+        level,
+        arguments,
+        pin_succeeded,
+        #[cfg(debug_assertions)]
+        held,
+        #[cfg(debug_assertions)]
+        instance_call,
+    });
+    let spec = Specialization {
+        key,
+        shareable,
+        instantiation,
+        #[cfg(debug_assertions)]
+        held,
+        #[cfg(debug_assertions)]
+        instance_call,
+        name: spec_name,
+        plan,
+        def: Expr::default(),
+        referenced: false,
+        raised: Vec::new(),
+    };
     if let Some((binder, _)) = placement {
-        let (frame_name, transparency) = (frame.name.clone(), frame.transparency);
+        let (frame_name, occurrence, transparency, parameter_mode) = (
+            frame.name.clone(),
+            frame.occurrence,
+            frame.transparency,
+            frame.parameter_mode,
+        );
         ctx.placed.push(Placed {
             binder,
             frame_name,
-            occurrence: frame.occurrence,
+            occurrence,
             transparency,
-            parameter_mode: frame.parameter_mode,
-            spec: Specialization {
-                key,
-                shareable,
-                instantiation,
-                #[cfg(debug_assertions)]
-                held: ctx.in_predicate > 0,
-                #[cfg(debug_assertions)]
-                instance_call,
-                name: spec_name,
-                def: clone,
-                referenced,
-                raised: kept,
-            },
+            parameter_mode,
+            spec,
         });
         return;
     }
@@ -4883,25 +4642,291 @@ pub(super) fn specialize_use(
     // table write-only (see `src/ccl/design/type-inference.md`,
     // "Keying a specialization").
     debug_assert!(
-        !shareable || frame.specs.iter().all(|s| !s.shareable || s.key != key),
+        !shareable
+            || frame
+                .specs
+                .iter()
+                .all(|s| !s.shareable || s.key != spec.key),
         "specialization memo invariant (one shareable entry per distinct key) violated: \
-         minting a second specialization of `{}` for key {key} — the lookup and \
+         minting a second specialization of `{}` for key {} — the lookup and \
          the insert disagree about what identifies a specialization",
         frame.name,
+        spec.key,
     );
-    frame.specs.push(Specialization {
-        key,
-        shareable,
-        instantiation,
-        #[cfg(debug_assertions)]
-        held: ctx.in_predicate > 0,
-        #[cfg(debug_assertions)]
-        instance_call,
-        name: spec_name,
-        def: clone,
-        referenced,
-        raised: kept,
+    frame.specs.push(spec);
+}
+
+/// Suspend the scope entries a clone of the binding at `frame_idx` does not see, and enter the
+/// binders its placement stands under: the scope the definition stands in, where the clone is
+/// walked. Every entry above the frame was introduced between the definition and the use.
+///
+/// An instance's function is the exception: a trait function's call in its body may be
+/// answered by the same instance at other types, `Area(Two(T))`'s `area` calling `Area` at
+/// `T`, so its frame stays in scope and that call specializes it again. No source names the
+/// binding, so nothing else reaches it.
+fn suspend_for_clone(
+    ctx: &mut CoalesceCtx,
+    frame_idx: usize,
+    base_name: &Name,
+    placement: Option<&(Name, Vec<Name>)>,
+) -> (usize, Vec<ScopeEntry>) {
+    let kept_to = if ctx.instance_functions.contains(base_name) {
+        frame_idx + 1
+    } else {
+        frame_idx
+    };
+    let suspended = ctx.scope.split_off(kept_to);
+    // A placed clone stands under the binders its variables entered, so a use inside it whose
+    // instance reads one of them is placed there too.
+    if let Some((_, entered)) = placement {
+        ctx.scope
+            .extend(entered.iter().cloned().map(ScopeEntry::Shadow));
+    }
+    (kept_to, suspended)
+}
+
+/// Undo [`suspend_for_clone`].
+fn restore_after_clone(ctx: &mut CoalesceCtx, (kept_to, suspended): (usize, Vec<ScopeEntry>)) {
+    ctx.scope.truncate(kept_to);
+    ctx.scope.extend(suspended);
+}
+
+/// The stamp pass at a use of a generalized binding: what the write pass decided for it
+/// ([`Plan::uses`]), carried out. The graph records nothing more here: the use's
+/// specialization was made, and its clone pinned, by the write pass ([`specialize_use`]).
+fn stamp_use(solver: &mut Solver, use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
+    let spec = match ctx.plan.uses.get(&use_expr.node_id()) {
+        Some(UseDecision::Refused) => return,
+        Some(UseDecision::Served { spec }) => *spec,
+        Some(UseDecision::Failed) => return report_failed_use(solver, use_expr, frame_idx, ctx),
+        None => copied_use_spec(solver, use_expr, frame_idx, ctx),
+    };
+    serve_use(solver, use_expr, frame_idx, spec, ctx);
+}
+
+/// Report a use whose instantiation did not resolve, so that no specialization serves it.
+fn report_failed_use(
+    solver: &mut Solver,
+    use_expr: &mut Expr,
+    frame_idx: usize,
+    ctx: &mut CoalesceCtx,
+) {
+    let err = match resolve_var_type(solver, &use_expr.ty) {
+        Err(err) => err,
+        Ok(resolved) => panic!(
+            "internal error: the use `{}` failed to resolve while uses were specialized, and \
+             resolves to {resolved} once they all are, though specializing records nothing \
+             on a use's own instantiation that would let it resolve",
+            crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), use_expr),
+        ),
+    };
+    let label =
+        crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(solver), use_expr);
+    let error = map_coalesce_err(err, &label);
+    let carried = reachable_vars(solver, &use_expr.ty);
+    let node = ctx.current_node;
+    let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    frame.failed_uses.push((error.clone(), carried));
+    frame.failed_use_nodes.insert(node);
+    ctx.push_read_error(solver, &use_expr.ty, error);
+}
+
+/// The specialization serving a use the write pass never met: a use in a copy of a predicate,
+/// which resolving a type makes. The copy's use shares the specialization of the use it
+/// copies, which has its instantiation, or which its key shares (`src/ccl/design/
+/// type-inference.md`, "A use the key does not determine shares no clone").
+fn copied_use_spec(
+    solver: &mut Solver,
+    use_expr: &Expr,
+    frame_idx: usize,
+    ctx: &CoalesceCtx,
+) -> usize {
+    let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    assert!(
+        ctx.in_held > 0,
+        "internal error: the write pass reaches every use of `{}` outside a predicate, and \
+         not this one",
+        frame.name,
+    );
+    let let_node = frame.let_node;
+    let ours = |s: &&PlannedSpecialization| s.let_node == let_node;
+    if let Some(at) = ctx
+        .plan
+        .specs
+        .iter()
+        .position(|s| ours(&s) && s.instantiation == use_expr.ty)
+    {
+        return at;
+    }
+    let shared = resolve_var_type(solver, &use_expr.ty)
+        .ok()
+        .and_then(|resolved| {
+            let shareable = !crate::ccl::subst::type_contains_infer(&resolved)
+                && !coalesce_positive(solver, &use_expr.ty)
+                    .is_ok_and(|values| has_output_variable(&values, true));
+            let key = spec_key(solver, &use_expr.ty);
+            ctx.plan
+                .specs
+                .iter()
+                .position(|s| ours(&s) && shareable && s.shareable && s.key == key)
+        });
+    shared.unwrap_or_else(|| {
+        panic!(
+            "internal error: a predicate's copy of a use of `{}` needs a specialization the \
+             use it copies did not make: its instantiation is not that use's, and its key \
+             shares none",
+            frame.name,
+        )
+    })
+}
+
+/// Serve `use_expr` by the write pass's specialization at `spec`: stamp its clone where the
+/// stamp pass first meets one of its uses, and point the use at it.
+fn serve_use(
+    solver: &mut Solver,
+    use_expr: &mut Expr,
+    frame_idx: usize,
+    spec: usize,
+    ctx: &mut CoalesceCtx,
+) {
+    let surviving = surviving_use(ctx, frame_idx);
+    let at_use = use_expr.node_id();
+    let Some(mut clone) = ctx.plan.specs[spec].clone.take() else {
+        return share_specialization(use_expr, frame_idx, spec, surviving, ctx);
+    };
+    let planned = &ctx.plan.specs[spec];
+    let (name, key, arguments, origins, level, placement, pin_succeeded) = (
+        planned.name.clone(),
+        planned.key.clone(),
+        planned.arguments.clone(),
+        Rc::clone(&planned.origins),
+        planned.level,
+        planned.placement.clone(),
+        planned.pin_succeeded,
+    );
+    let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    let base_name = frame.name.clone();
+    let before = ctx.errors.len();
+    let suspended = suspend_for_clone(ctx, frame_idx, &base_name, placement.as_ref());
+    ctx.specializing.push(ActiveSpecialization {
+        name: base_name,
+        key: key.clone(),
+        arguments,
+        at_use,
+        copies: Rc::clone(&origins),
     });
+    let in_held = std::mem::take(&mut ctx.in_held);
+    coalesce_node(solver, &mut clone, level, ctx);
+    ctx.in_held = in_held;
+    ctx.specializing.pop();
+    restore_after_clone(ctx, suspended);
+    let mut kept: Vec<(Option<NodeId>, LocatedInferError)> = Vec::new();
+    if pin_succeeded {
+        let raised = ctx.errors.split_off(before);
+        let enclosing = ctx.specializing.clone();
+        kept = raised
+            .into_iter()
+            .map(|error| (origins.get(&error.node_id).copied(), error))
+            .collect();
+        let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+            unreachable!("suspended entries were restored above the frame");
+        };
+        frame
+            .held
+            .extend(kept.iter().map(|(origin, error)| HeldError {
+                at_use,
+                origin: *origin,
+                enclosing: enclosing.clone(),
+                error: error.clone(),
+            }));
+    }
+    use_expr.node = TypedExprNode::Var(name.clone());
+    use_expr.ty = clone.ty.clone();
+    let planned = &ctx.plan.specs[spec];
+    let stamped = Specialization {
+        key,
+        shareable: planned.shareable,
+        instantiation: planned.instantiation.clone(),
+        #[cfg(debug_assertions)]
+        held: planned.held,
+        #[cfg(debug_assertions)]
+        instance_call: planned.instance_call,
+        name,
+        plan: spec,
+        def: clone,
+        referenced: surviving,
+        raised: kept,
+    };
+    let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+        unreachable!("suspended entries were restored above the frame");
+    };
+    match placement {
+        Some((binder, _)) => {
+            let (frame_name, occurrence, transparency, parameter_mode) = (
+                frame.name.clone(),
+                frame.occurrence,
+                frame.transparency,
+                frame.parameter_mode,
+            );
+            ctx.placed.push(Placed {
+                binder,
+                frame_name,
+                occurrence,
+                transparency,
+                parameter_mode,
+                spec: stamped,
+            });
+        }
+        None => frame.specs.push(stamped),
+    }
+}
+
+/// Serve `use_expr` by a specialization the stamp pass has already stamped for another use.
+///
+/// The use takes the clone's errors too: its types are the clone's, so they are its own
+/// ([`Specialization::raised`]). Sharing is what makes an entry live: one minted for a
+/// discarded use is spliced after all once a surviving use adopts it.
+fn share_specialization(
+    use_expr: &mut Expr,
+    frame_idx: usize,
+    spec: usize,
+    surviving: bool,
+    ctx: &mut CoalesceCtx,
+) {
+    let enclosing = ctx.specializing.clone();
+    let at_use = use_expr.node_id();
+    let name = &ctx.plan.specs[spec].name;
+    let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    let stamped = match ctx.placed.iter_mut().find(|p| p.spec.name == *name) {
+        Some(placed) => &mut placed.spec,
+        None => frame
+            .specs
+            .iter_mut()
+            .find(|s| s.name == *name)
+            .expect("a stamped specialization stands in its frame or under its binder"),
+    };
+    stamped.referenced |= surviving;
+    let shared: Vec<HeldError> = stamped
+        .raised
+        .iter()
+        .map(|(origin, error)| HeldError {
+            at_use,
+            origin: *origin,
+            enclosing: enclosing.clone(),
+            error: error.clone(),
+        })
+        .collect();
+    use_expr.node = TypedExprNode::Var(stamped.name.clone());
+    use_expr.ty = stamped.def.ty.clone();
+    frame.held.extend(shared);
 }
 
 /// Whether a use being specialized on `frame_idx` will still be in the program
@@ -4947,6 +4972,8 @@ pub(super) fn coalesce_generalized_let(
     else {
         unreachable!("coalesce_generalized_let is only called on a generalized Let");
     };
+    // The write pass leaves the `let` as it found it, for the stamp pass to rebuild.
+    let unchanged = (ctx.pass == Pass::Write).then(|| binding.clone_preserving_ids());
     let mut body = *body;
     // Every specialization is the one binding, split by use type, so each
     // carries its transparency.
@@ -4987,6 +5014,7 @@ pub(super) fn coalesce_generalized_let(
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             occurrence: binding.occurrence.id(),
+            let_node: expr.node_id(),
             name: binding.name,
             def: *bound_expr,
             cutoff: level,
@@ -5007,6 +5035,24 @@ pub(super) fn coalesce_generalized_let(
     let Some(ScopeEntry::Generalized(mut frame)) = ctx.scope.pop() else {
         unreachable!("the binding's frame still tops the scope after a balanced body walk");
     };
+    if let Some(binding) = unchanged {
+        // The definition is walked alone after its last use, as the stamp pass checks it, so
+        // the uses inside it are specialized too.
+        if has_type_params {
+            ctx.opaque_params_at.push(level + 1);
+        }
+        typecheck_discarded_definition(solver, &mut frame.def, level, &requires, ctx);
+        if has_type_params {
+            ctx.opaque_params_at.pop();
+        }
+        expr.node = TypedExprNode::Let {
+            binding,
+            bound_expr: Box::new(frame.def),
+            body: Box::new(body),
+        };
+        expr.user_annotation = saved_annotation;
+        return;
+    }
     // The body walk's reports of a defect a failed use of this binding carries, at a
     // node whose type carries that use's instantiation, set aside until the definition
     // alone says whether the defect is its own.
@@ -5166,7 +5212,9 @@ fn splice_placed(solver: &mut Solver, ctx: &mut CoalesceCtx, binders: &[Name], b
         .into_iter()
         .partition(|p| binders.contains(&p.binder));
     ctx.placed = rest;
-    if here.is_empty() {
+    // The write pass only decides which uses share a placed specialization; the stamp pass
+    // splices them.
+    if here.is_empty() || ctx.pass == Pass::Write {
         return;
     }
     let _chain = crate::ccl::provenance::enter(
@@ -5294,6 +5342,10 @@ fn typecheck_discarded_definition(
     coalesce_node(solver, def, level + 1, ctx);
     ctx.assumptions.truncate(depth);
     ctx.discarding = was_discarding;
+    // The write pass's errors are reported, and judged, where the stamp pass raises them.
+    if ctx.pass == Pass::Write {
+        return Vec::new();
+    }
     // A message names the binder an A-normalization temp or a mutable variable's read was
     // given rather than the term or the variable it stands for, and the caller respells it
     // against the tree inference leaves, which this definition is dropped from. Respelled
@@ -5581,29 +5633,6 @@ mod clone_probe {
 #[cfg(test)]
 mod tests {
     use crate::ccl::infer::solver::Solver;
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "ordering invariant")]
-    fn final_graph_verification_compares_every_recorded_read() {
-        let solver = &mut Solver::new();
-        let ty = Type::Base(BaseType::Int);
-        let reads = vec![
-            super::ReadRecord {
-                purpose: super::ReadPurpose::Stamp,
-                unresolved: ty.clone(),
-                resolved: ty.clone(),
-                label: "first read".into(),
-            },
-            super::ReadRecord {
-                purpose: super::ReadPurpose::Stamp,
-                unresolved: ty,
-                resolved: Type::Base(BaseType::Bool),
-                label: "second read".into(),
-            },
-        ];
-        super::assert_reads_stable(solver, &reads);
-    }
-
     #[test]
     fn unresolved_materialization_preserves_variable_identity() {
         let solver = &mut Solver::new();
@@ -5670,91 +5699,6 @@ mod tests {
         assert_eq!(specialized_domain(&refined(place_ty.clone())), expected);
         // A non-mutable variable input is untouched.
         assert_eq!(specialized_domain(&int), expected);
-    }
-
-    // ----- ordering-invariant comparison (`types_agree_modulo_unread`) -----
-
-    // A refinement that appears (or vanishes) between a read and the final graph is
-    // a bound that arrived after the read consumed the variable — the staleness
-    // the ordering invariant forbids — so a `Stamp` read rejects it. A use's
-    // `Instantiation` read is the one place refinements are excluded, because the
-    // pin that follows the read is itself what moves them and that read's
-    // consumers (channel-domain pairing, error blame) do not look at refinements.
-    // Sharing does *not* ride on it — that is `SpecKey`'s job.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn refinement_drift_fails_a_stamp_read_and_passes_an_instantiation_read() {
-        use super::types_agree_modulo_unread;
-        let plain = Type::Base(BaseType::Int);
-        let refined = refined_int(TypedExpr::lit(Lit::Int(8)));
-        for (read, now) in [(&plain, &refined), (&refined, &plain)] {
-            assert!(
-                !types_agree_modulo_unread(read, now, true),
-                "a stamp read must not tolerate refinement drift ({read} vs {now})"
-            );
-            assert!(
-                types_agree_modulo_unread(read, now, false),
-                "an instantiation read compares skeletons only ({read} vs {now})"
-            );
-        }
-        // The skeleton *under* the refinements is held fixed either way — a stale
-        // one would pair the clone's channel domains against the wrong positions.
-        assert!(!types_agree_modulo_unread(
-            &plain,
-            &Type::Base(BaseType::String),
-            false
-        ));
-    }
-
-    /// A **place type reads through** before any layer is counted, and the two sides of
-    /// that read are legally at different depths: a mutable variable whose value is refined
-    /// agrees with the refined value itself. Counting first compares one layer against
-    /// the place type's own zero and calls the pair drift — which is what made a mutable variable
-    /// with a refined value look unsound.
-    ///
-    /// A refinement on the place type *itself* is looked through for the same reason every
-    /// other shape test looks through one: a refined mutable variable is still a mutable variable. The
-    /// value behind it is still compared layer for layer, so real drift there is caught.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn a_place_agrees_with_its_read_view_through_refinements() {
-        use super::types_agree_modulo_unread;
-        use crate::ccl::Refinement;
-        let refined = refined_int(TypedExpr::lit(Lit::Int(8)));
-        let mut_var = |value: Type| Type::mutable(Type::Txn, value);
-        let refinement = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
-        let on_the_place =
-            |t: Type| Type::refined_one(t, Refinement::sharing(&refinement.predicate));
-
-        for (read, now) in [
-            // place type vs its read view: the refined value sits one layer deeper.
-            (mut_var(refined.clone()), refined.clone()),
-            (refined.clone(), mut_var(refined.clone())),
-            // a claim on the place type is transparent, on either side.
-            (on_the_place(mut_var(refined.clone())), refined.clone()),
-            (
-                on_the_place(mut_var(refined.clone())),
-                mut_var(refined.clone()),
-            ),
-        ] {
-            assert!(
-                types_agree_modulo_unread(&read, &now, true),
-                "a place type is transparent to the read it stands for ({read} vs {now})"
-            );
-        }
-
-        // Drift *behind* the place type is still drift, and the two kinds still never
-        // agree — reading through must not have relaxed either.
-        assert!(!types_agree_modulo_unread(
-            &mut_var(refined.clone()),
-            &mut_var(Type::Base(BaseType::Int)),
-            true
-        ));
-        assert!(!types_agree_modulo_unread(
-            &mut_var(refined.clone()),
-            &Type::feed(Type::Txn, refined),
-            true
-        ));
     }
 
     // Scope validation runs in debug and no-assertions builds.

@@ -269,12 +269,9 @@ impl<T> IntoIterator for TagMap<T> {
 /// *be* that sum, where what it failed was to be a subtype of a partial one. The
 /// rendering keeps the two apart with a trailing `| …`.
 ///
-/// Nothing else reads it. [`Extent`](crate::interpreter::Extent) has no counterpart,
-/// and no AST node's coalesced type comes out open — a demand is what a consumer
-/// requires, not what any expression *is*. That is an invariant rather than a
-/// theorem, so it is watched instead of assumed: `types_agree_modulo_unread`
-/// compares openness, and an `Open` that escaped onto a node surfaces there as a
-/// disagreement.
+/// Nothing else reads it. [`Extent`](crate::interpreter::Extent) has no counterpart. A
+/// node's coalesced type can still carry it: a function whose domain demands an arm set
+/// is stamped with that demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Openness {
     /// These arms and no others. The default, and what every sum *value* has.

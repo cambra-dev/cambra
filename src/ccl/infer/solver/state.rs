@@ -228,10 +228,6 @@ pub struct Solver {
     /// ([`crate::ccl::infer::solver::traits::Held`]), which
     /// [`crate::ccl::infer::solver::traits::settle_held_answers`] deposits.
     pub(crate) held_answers: Vec<Rc<crate::ccl::infer::solver::traits::TraitObligation>>,
-    /// The compactions shared while a batch reads a fixed graph
-    /// ([`crate::ccl::infer::solver::compact::with_fixed_graph_compactions`]).
-    #[cfg(debug_assertions)]
-    pub(crate) fixed_compactions: Option<crate::ccl::infer::solver::compact::FixedCompactions>,
 }
 
 /// The only code that makes a detached solver, so a rendering is the only reader of one: no
@@ -278,8 +274,6 @@ impl Solver {
             #[cfg(debug_assertions)]
             dropped: Default::default(),
             held_answers: Vec::new(),
-            #[cfg(debug_assertions)]
-            fixed_compactions: None,
         }
     }
 
