@@ -434,6 +434,24 @@ impl Breaker for RekeySortedProducer {
 }
 
 impl BreakingProducer for RekeySortedProducer {
+    /// The output, the rows held above a gap, the keys called complete, and the input consumed and
+    /// released.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Box::new(RekeyState {
+            output: state.output.clone(),
+            held: state.held.clone(),
+            complete: state.complete.clone(),
+            released_through: state.released_through.clone(),
+            consumed: state.consumed.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        *self.state.get_mut().unwrap_or_else(PoisonError::into_inner) =
+            checkpoint::state_of::<RekeyState>(&self.name(), state);
+    }
+
     fn complete(&self) -> TileGuard {
         let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state_guard;
@@ -460,6 +478,7 @@ impl BreakingProducer for RekeySortedProducer {
 }
 
 /// The keys a [`RekeySortedProducer`] has called complete.
+#[derive(Clone)]
 enum Complete {
     /// Under [`KeyOrder::Rising`], every key through the highest complete one, `None` before
     /// any.

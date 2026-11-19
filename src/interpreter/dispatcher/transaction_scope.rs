@@ -8,6 +8,16 @@ use super::*;
 use crate::interpreter::commit_operator::CommitProducer;
 use crate::interpreter::tile_operators::StoreCell;
 
+impl TransactionRun {
+    /// Whether a writer has a request open or a finish begun.
+    #[cfg(test)]
+    pub(crate) fn has_open_request(&self) -> bool {
+        self.writers
+            .iter()
+            .any(|writer| !matches!(writer.attempt, Attempt::Idle))
+    }
+}
+
 pub(crate) struct TransactionRun {
     pub(super) writers: Vec<WriterRun>,
     /// How many attempts in a row changed nothing a later attempt reads

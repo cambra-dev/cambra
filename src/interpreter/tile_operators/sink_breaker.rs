@@ -44,8 +44,13 @@ enum Hands {
         /// package's answer, in a debug build only, for the check that they add up to a terminal
         /// one.
         answer: Option<Box<Tile>>,
-        /// Whether an answer handed so far was terminal.
-        handed_terminal: bool,
+        /// Whether an answer handed so far was terminal, in this run or an earlier one over the
+        /// same output (`Targets::add_main`). It outlives the run, as the release of the
+        /// producer does, so a run after a recovery does not hand the terminal answer again.
+        handed_terminal: Arc<std::sync::atomic::AtomicBool>,
+        /// Whether `handed_terminal` was set as the run began: an earlier run handed the terminal
+        /// answer, so this one hands nothing.
+        handed_before: bool,
         /// Whether the output reads a loop's scope, directly or through other pipelines
         /// ([`SinkBreaker::reads_a_loop`]).
         loop_beneath: bool,
@@ -63,7 +68,9 @@ impl SinkBreaker {
                 ..
             } => {
                 if *each_package {
-                    *handed_terminal |= tile.is_terminal();
+                    if tile.is_terminal() {
+                        handed_terminal.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     self.sink.process(&tile);
                     if !cfg!(debug_assertions) {
                         return;
@@ -88,15 +95,22 @@ impl SinkBreaker {
     }
 
     /// The breaker of a `main` output, which hands what it pulls of `producer` to `sink` once, at
-    /// its finish ([`Hands::Main`]).
-    pub(crate) fn main(producer: ProducerSlot, sink: Arc<dyn DataSink>) -> Self {
+    /// its finish ([`Hands::Main`]). `handed_terminal` records whether a run over this output has
+    /// handed the terminal answer.
+    pub(crate) fn main(
+        producer: ProducerSlot,
+        sink: Arc<dyn DataSink>,
+        handed_terminal: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let handed_before = handed_terminal.load(std::sync::atomic::Ordering::SeqCst);
         Self {
             producer,
             sink,
             hands: Mutex::new(Hands::Main {
                 each_package: false,
                 answer: None,
-                handed_terminal: false,
+                handed_terminal,
+                handed_before,
                 loop_beneath: false,
             }),
         }
@@ -155,10 +169,14 @@ impl Breaker for SinkBreaker {
             answer,
             handed_terminal,
             loop_beneath,
+            handed_before,
         } = self.hands.get_mut().unwrap_or_else(PoisonError::into_inner)
         else {
             return;
         };
+        if *handed_before {
+            return;
+        }
         let mut slot = Self::input(&self.producer);
         let producer = slot.as_mut().expect("a sink has subscribed its producer");
         let tiling = producer.tiling().clone();
@@ -185,8 +203,9 @@ impl Breaker for SinkBreaker {
             );
             // Handed even with no row where no answer handed before was terminal: it states the
             // output complete, as after a delivery of no key or a key a filter drops.
-            if !*handed_terminal {
+            if !handed_terminal.load(std::sync::atomic::Ordering::SeqCst) {
                 self.sink.process(&rest);
+                handed_terminal.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             return;
         }
@@ -196,6 +215,7 @@ impl Breaker for SinkBreaker {
             "a `main` output is handed a terminal answer at its finish"
         );
         self.sink.process(&answer);
+        handed_terminal.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -329,7 +349,11 @@ mod tests {
         let (spy, script) = ProjectionSpy::scripted(input(vec![0], through(0)), tiling);
         let producer: ProducerSlot = Arc::new(RwLock::new(Some(Box::new(spy))));
         let sink = Arc::new(Recording::default());
-        (SinkBreaker::main(producer, sink.clone()), sink, script)
+        (
+            SinkBreaker::main(producer, sink.clone(), Arc::default()),
+            sink,
+            script,
+        )
     }
 
     fn input(keys: Vec<i64>, complete: Predicate) -> Tile {

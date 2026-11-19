@@ -3510,6 +3510,355 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     assert_eq!(rendered_in_key_order(&value), expected, "{source}");
 }
 
+/// A run recovers from a checkpoint alone and answers as one run, whether it stops at the first
+/// delivery's pause or crashes at any crash point of its two deliveries ([`recovers`]).
+///
+/// After the stop, the test drops the run's context, compiled program, producers and source. A
+/// second compilation of the same text receives the checkpoint (`checkpoint::restore`) and runs
+/// what is left. The `main` output's recipient stands outside both processes and outlives them.
+/// It is handed each key once, and an answer that states the output complete.
+///
+/// The recovered source models one of two external systems. Without `retains`, it holds only what
+/// the first run had not released, so a recovered breaker that reads a released position again
+/// finds nothing. With `retains`, it holds everything, as a topic does, so such a breaker counts
+/// the position twice.
+#[rstest_log::rstest]
+#[case::a_map(
+    "[x * 10 for x in source1()]",
+    "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]"
+)]
+#[case::a_filter(
+    "[x for x in source1() if x != 2]",
+    "[u0 -> 1, u2 -> 3, u3 -> 4, u4 -> 5]"
+)]
+#[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15")]
+#[case::a_sum("sum(source1())", "15")]
+#[case::a_live_product("sum([x * y for x in source1() for y in source1()])", "225")]
+#[case::a_live_static_product("sum([x * y for x in source1() for y in [10, 20]])", "450")]
+#[case::a_static_read(
+    "[x + sum([1, 2]) for x in source1()]",
+    "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]"
+)]
+#[case::a_live_read(
+    "[x + sum(source1()) for x in source1()]",
+    "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]"
+)]
+#[case::a_loop(indoc! {"
+    total := 0
+    for x in source1():
+        total += x
+    total
+"}, "15")]
+#[case::a_loop_over_a_binding(indoc! {"
+    xs = source1()
+    total := 0
+    for x in xs:
+        total += x
+    total
+"}, "15")]
+#[case::a_transaction(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    for x in source1():
+        with begin():
+            pool := pool - x
+    await_final(pool)
+"}, "85")]
+#[case::a_choice_on_a_sum(indoc! {"
+    s = sum(source1())
+    1 if s > 10 else 0
+"}, "1")]
+#[case::a_choice_per_element(indoc! {"
+    s = sum(source1())
+    [x if s > 10 else 0 for x in source1()]
+"}, "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]")]
+#[case::a_reply_per_transaction(indoc! {"
+    out: Feed(_)
+    pool: Mut(Int, Txn) := 100
+    for x in source1():
+        with begin():
+            pool := pool - x
+            out << pool
+    out
+"}, "[u0 -> 99, u1 -> 97, u2 -> 94, u3 -> 90, u4 -> 85]")]
+#[case::a_reply_over_a_concatenation(indoc! {"
+    out: Feed(_)
+    pool: Mut(Int, Txn) := 100
+    for x in source1() ++ [10]:
+        with begin():
+            pool := pool - x
+            out << x
+    out
+"}, "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10]")]
+#[case::a_conditional_write(indoc! {"
+    xs = [x for x in source1()]
+    total := 0
+    for x in xs:
+        if x > 2:
+            total := x
+    total
+"}, "5")]
+#[case::two_writers_on_one_store(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    for x in source1():
+        with begin():
+            pool := pool - x
+    for y in source1():
+        with begin():
+            pool := pool + y
+    await_final(pool)
+"}, "100")]
+#[case::a_memo_read_twice(indoc! {"
+    xs = source1()
+    [x + sum(xs) for x in xs]
+"}, "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]")]
+#[case::a_nested_loop(indoc! {"
+    total := 0
+    for x in source1():
+        for y in [1, 2]:
+            total += x * y
+    total
+"}, "45")]
+fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
+    #[case] source: &str,
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(false, true)] retains: bool,
+) {
+    assert!(
+        recovers(source, expected, rows, retains, None),
+        "a run checkpointed at its first pause recovers: {source}"
+    );
+    let mut step = 1;
+    while recovers(source, expected, rows, retains, Some(step)) {
+        step += 1;
+    }
+    assert!(step > 1, "a run takes a step: {source}");
+}
+
+/// A crash the test stops a process at, as an unwind out of [`Persisting::stepped`].
+struct Crashed;
+
+/// A run's observer that persists every breaker whose releases changed after each step, as a
+/// breaker that persists before it releases would have (`Checkpoint::persist`), pauses at every
+/// drained boundary, and crashes after the crash point `crash_after` names.
+///
+/// A crash point is a step after which no loop's or transaction's request is open
+/// (`Persisted::Whole`). An open request's state lives in the run, which no checkpoint holds, and
+/// recovering it is the pause between claims that `design-dispatcher.md`, "What a pause and a
+/// reload keep", calls a conjecture.
+struct Persisting {
+    roots: Vec<crate::interpreter::sinks::ProducerSlot>,
+    checkpoint: crate::interpreter::tile_operators::checkpoint::Checkpoint,
+    /// Whether the run has handed the `main` output its terminal answer, which the sink keeps
+    /// beside its release (`Targets::main_handed_terminal`).
+    handed_terminal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `handed_terminal` as of the latest copy.
+    persisted_handed: bool,
+    /// The crash points passed so far.
+    steps: usize,
+    crash_after: Option<usize>,
+}
+
+impl crate::interpreter::dispatcher::RunObserver for Persisting {
+    fn drained(&mut self, _changed: bool) -> std::ops::ControlFlow<()> {
+        std::ops::ControlFlow::Break(())
+    }
+
+    fn stepped(&mut self) {
+        use crate::interpreter::tile_operators::checkpoint::Persisted;
+        let persisted = self.checkpoint.persist(&self.roots, false);
+        assert_ne!(
+            persisted,
+            Persisted::Partial,
+            "a run on one worker ends no step with a store borrowed"
+        );
+        self.persisted_handed = self
+            .handed_terminal
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if persisted == Persisted::Whole {
+            self.steps += 1;
+            if self.crash_after == Some(self.steps) {
+                std::panic::resume_unwind(Box::new(Crashed));
+            }
+        }
+    }
+}
+
+/// A compilation of `source` over a source `source1` holding `entries` with `yielded`, and the
+/// run of its `main` output into `main`.
+fn compiled_over_source1(
+    source: &str,
+    entries: &[(Value, Value)],
+    yielded: crate::interpreter::Predicate,
+    main: &std::sync::Arc<MainAnswers>,
+) -> (
+    GlobalContext,
+    crate::ccl::SourceDefinition<TestDataSource>,
+    crate::interpreter::sinks::ProducerSlot,
+    crate::interpreter::dispatcher::Targets,
+) {
+    let mut ctx = GlobalContext::default();
+    let feed = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+        crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+    );
+    ctx.register_source(feed.clone());
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let producer = program
+        .main_mut()
+        .and_then(|output| output.producer.take())
+        .expect("a `main` output");
+    let slot: crate::interpreter::sinks::ProducerSlot =
+        std::sync::Arc::new(std::sync::RwLock::new(Some(producer)));
+    let mut targets = crate::interpreter::dispatcher::Targets::default();
+    targets.add_main(&program, slot.clone(), main.clone());
+    let mut written = feed.write().unwrap_or_else(PoisonError::into_inner);
+    written.add_data(entries);
+    written.set_yield_predicate(yielded);
+    drop(written);
+    (ctx, feed, slot, targets)
+}
+
+/// Run `source` over `two_batches` in a process that stops, recover in another from the
+/// checkpoint alone, run what is left, and check the answer. Answers `false`, checking nothing,
+/// where the run ends before the crash point `crash_after` names.
+///
+/// With `crash_after` `None`, the process stops at the first delivery's pause and every breaker
+/// is copied there (`checkpoint::capture`). Otherwise it crashes at that crash point
+/// ([`Persisting`]), and each breaker recovers from its copy as of its last release
+/// (`Checkpoint::persist`). Both runs use one worker, so no worker steps while the test copies.
+fn recovers(
+    source: &str,
+    expected: &str,
+    rows: usize,
+    retains: bool,
+    crash_after: Option<usize>,
+) -> bool {
+    use crate::interpreter::dispatcher::Ended;
+    use crate::interpreter::tile_operators::checkpoint;
+    let main = std::sync::Arc::new(MainAnswers::default());
+    let batches = two_batches();
+    let delivered = std::cell::Cell::new(1);
+    let (checkpoint, released, old_source) = {
+        let (_ctx, feed, slot, targets) =
+            compiled_over_source1(source, &batches[0].0, batches[0].1.clone(), &main);
+        let mut observer = Persisting {
+            roots: vec![slot.clone()],
+            checkpoint: checkpoint::Checkpoint::default(),
+            handed_terminal: targets.main_handed_terminal(),
+            persisted_handed: false,
+            steps: 0,
+            crash_after,
+        };
+        let run = |observer: &mut Persisting| match targets
+            .run_with_workers(rows, 1, observer)
+            .unwrap_or_else(|refused| panic!("{refused}"))
+        {
+            Ended::Paused(_) => true,
+            Ended::Done(_) => false,
+        };
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                run(&mut observer),
+                "the first delivery's run pauses: {source}"
+            );
+            if crash_after.is_none() {
+                return;
+            }
+            let mut written = feed.write().unwrap_or_else(PoisonError::into_inner);
+            written.add_data(&batches[1].0);
+            written.set_yield_predicate(batches[1].1.clone());
+            drop(written);
+            delivered.set(2);
+            assert!(
+                !run(&mut observer),
+                "the last delivery's run ends: {source}"
+            );
+        }));
+        let checkpoint = match (crashed, crash_after) {
+            (Ok(()), None) => (
+                checkpoint::capture(&[slot]),
+                observer
+                    .handed_terminal
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            (Ok(()), Some(_)) => return false,
+            (Err(payload), Some(_)) if payload.is::<Crashed>() => {
+                (observer.checkpoint, observer.persisted_handed)
+            }
+            (Err(payload), _) => std::panic::resume_unwind(payload),
+        };
+        let released = feed
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_released_predicate();
+        (checkpoint, released, feed.downgrade())
+    };
+    assert!(
+        old_source.upgrade().is_none(),
+        "the checkpoint holds no handle on the first process's source: {source}"
+    );
+    let delivered = delivered.get();
+    let kept: Vec<(Value, Value)> = batches[..delivered]
+        .iter()
+        .flat_map(|(entries, _)| entries.iter().cloned())
+        .filter(|(key, _)| retains || !released.contains(key))
+        .collect();
+    let (_ctx, feed, slot, targets) =
+        compiled_over_source1(source, &kept, batches[delivered - 1].1.clone(), &main);
+    let (checkpoint, handed_terminal) = checkpoint;
+    checkpoint::restore(&[slot], checkpoint);
+    targets
+        .main_handed_terminal()
+        .store(handed_terminal, std::sync::atomic::Ordering::SeqCst);
+    let run = || {
+        targets
+            .run_with_workers(rows, 1, &mut PauseAtOnce)
+            .unwrap_or_else(|refused| panic!("{refused}"))
+    };
+    if delivered == 1 {
+        assert!(
+            matches!(run(), Ended::Paused(_)),
+            "the recovered run pauses before the last delivery: {source}"
+        );
+        let mut written = feed.write().unwrap_or_else(PoisonError::into_inner);
+        written.add_data(&batches[1].0);
+        written.set_yield_predicate(batches[1].1.clone());
+        drop(written);
+    }
+    assert!(
+        matches!(run(), Ended::Done(_)),
+        "the recovered run ends after the last delivery: {source}, crash after {crash_after:?}"
+    );
+    let value = main.kept.value().expect("the `main` output's value");
+    assert_eq!(
+        rendered_in_key_order(&value),
+        expected,
+        "{source}, crash after {crash_after:?}"
+    );
+    assert!(
+        main.printed
+            .lock()
+            .expect("no answer panics")
+            .iter()
+            .any(crate::interpreter::Tile::is_terminal),
+        "the recipient is handed an answer that states the output complete: {source}, crash after \
+         {crash_after:?}"
+    );
+    if let Value::Function(_) = &value {
+        assert_eq!(
+            main.keys.load(std::sync::atomic::Ordering::SeqCst),
+            value.as_function().iter().count(),
+            "the recipient is handed each key once, across the crash: {source}, crash after \
+             {crash_after:?}"
+        );
+    }
+    true
+}
+
 /// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.
 fn one_key_batches_then_empty(batches: u64) -> Vec<Batch> {
     let mut all = one_key_batches(batches);

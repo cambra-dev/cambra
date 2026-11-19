@@ -433,6 +433,27 @@ impl Breaker for ExtractFinalProducer {
 }
 
 impl BreakingProducer for ExtractFinalProducer {
+    /// The final value once there is one, whether it is complete, and the row at the greatest key
+    /// merged so far.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Box::new((
+            state.final_tile.clone(),
+            state.complete,
+            state.merged.clone(),
+        ))
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let (final_tile, complete, merged) =
+            checkpoint::state_of::<(Option<Tile>, bool, Tile)>(&self.name(), state);
+        *self.state.get_mut().unwrap_or_else(PoisonError::into_inner) = FinalValueState {
+            final_tile,
+            complete,
+            merged,
+        };
+    }
+
     /// The extracted value, once there is one: none while the source has not drained, or while a
     /// default it fell back to has not converged. The next `consume_impl` reads the default again.
     fn complete(&self) -> TileGuard {
