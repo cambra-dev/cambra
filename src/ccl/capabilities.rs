@@ -2799,7 +2799,13 @@ impl CapabilityVar {
         }
         // The variables reaching this one, each with the edges into it. A worklist
         // fixpoint, since edges can form cycles and two paths can filter differently.
+        //
+        // A variable whose resolution is cached at the current count is settled: its stopped
+        // value is what it passes on, so the walk takes it from the cache and does not descend
+        // into what flows into it. Resolving each node of a long spine would otherwise walk
+        // the whole spine below it.
         let mut nodes: HashMap<CapabilityVarId, Rc<CapabilityVar>> = HashMap::new();
+        let mut settled: HashSet<CapabilityVarId> = HashSet::new();
         let mut stack: Vec<Rc<CapabilityVar>> = Vec::new();
         let mut sets: HashMap<CapabilityVarId, BTreeSet<LocatedCapability>> = HashMap::new();
         sets.insert(self.uid, own(solver, self));
@@ -2812,6 +2818,14 @@ impl CapabilityVar {
             if v.uid == self.uid || nodes.contains_key(&v.uid) {
                 continue;
             }
+            if direction.is_none()
+                && let Some(capabilities) = v.state(solver).resolved_at.at(&now)
+            {
+                sets.insert(v.uid, capabilities);
+                settled.insert(v.uid);
+                nodes.insert(v.uid, v);
+                continue;
+            }
             sets.insert(v.uid, own(solver, &v));
             for (w, filter) in v.state(solver).incoming.iter() {
                 if allows(filter) {
@@ -2820,53 +2834,88 @@ impl CapabilityVar {
             }
             nodes.insert(v.uid, v);
         }
-        let incoming_of = |solver: &Solver, uid: CapabilityVarId| {
-            if uid == self.uid {
-                self.incoming(solver)
-            } else {
-                nodes[&uid].incoming(solver)
-            }
-        };
         let receiver = |uid: CapabilityVarId| -> &CapabilityVar {
             if uid == self.uid { self } else { &nodes[&uid] }
         };
-        let ids: Vec<CapabilityVarId> = sets.keys().copied().collect();
-        loop {
-            let mut changed = false;
-            for &id in &ids {
-                let into_var = receiver(id);
-                for (src, filter) in incoming_of(solver, id) {
-                    if !allows(&filter) || !filter.holds(solver) {
-                        continue;
-                    }
-                    // What `src` passes on is its stopped value.
-                    let written = src.written_uppers(solver);
-                    let flowing: Vec<LocatedCapability> = sets[&src.uid]
-                        .iter()
-                        .filter_map(|l| {
-                            if admitted(solver, &written, l) {
-                                filter.pass(solver, l)
-                            } else {
-                                None
-                            }
-                        })
-                        .filter(|l| into_var.in_scope(&l.item))
-                        .map(|l| LocatedCapability {
-                            at: filter.at.or(l.at),
-                            ..l
-                        })
-                        .collect();
-                    let into = sets.get_mut(&id).expect("every reached variable has a set");
-                    for l in flowing {
-                        changed |= into.insert(l);
+        // The edges out of each variable reached, into each one not settled: a settled
+        // variable's set is whole.
+        let mut out_edges: HashMap<CapabilityVarId, Vec<(CapabilityVarId, Filter)>> =
+            HashMap::new();
+        for &id in sets.keys() {
+            if settled.contains(&id) {
+                continue;
+            }
+            for (src, filter) in receiver(id).state(solver).incoming.iter() {
+                if allows(filter) {
+                    out_edges
+                        .entry(src.uid)
+                        .or_default()
+                        .push((id, filter.clone()));
+                }
+            }
+        }
+        // A capability crosses an edge by itself, whatever else the source holds, so a
+        // variable passes on only what reached it since it last passed: each capability
+        // crosses each edge once. Every set starts as what its variable has yet to pass.
+        let mut arrived: HashMap<CapabilityVarId, Vec<LocatedCapability>> = sets
+            .iter()
+            .map(|(id, set)| (*id, set.iter().cloned().collect()))
+            .collect();
+        let mut work: Vec<CapabilityVarId> = arrived.keys().copied().collect();
+        let mut queued: HashSet<CapabilityVarId> = work.iter().copied().collect();
+        while let Some(src) = work.pop() {
+            queued.remove(&src);
+            let passing = arrived.remove(&src).unwrap_or_default();
+            let Some(edges) = out_edges.get(&src) else {
+                continue;
+            };
+            // What `src` passes on is its stopped value.
+            let written = receiver(src).written_uppers(solver);
+            for (id, filter) in edges {
+                if !filter.holds(solver) {
+                    continue;
+                }
+                let into_var = receiver(*id);
+                let flowing: Vec<LocatedCapability> = passing
+                    .iter()
+                    .filter_map(|l| {
+                        if admitted(solver, &written, l) {
+                            filter.pass(solver, l)
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|l| into_var.in_scope(&l.item))
+                    .map(|l| LocatedCapability {
+                        at: filter.at.or(l.at),
+                        ..l
+                    })
+                    .collect();
+                let into = sets.get_mut(id).expect("every reached variable has a set");
+                for l in flowing {
+                    if into.insert(l.clone()) {
+                        arrived.entry(*id).or_default().push(l);
+                        if queued.insert(*id) {
+                            work.push(*id);
+                        }
                     }
                 }
             }
-            if !changed {
-                break;
-            }
         }
         let mut out = sets.remove(&self.uid).expect("the variable's own set");
+        // Every variable reached and not settled has its whole set now: every edge into it was
+        // followed. Its stopped value is its resolution, so it is cached as resolving it would.
+        if direction.is_none() {
+            for (id, v) in &nodes {
+                if settled.contains(id) {
+                    continue;
+                }
+                let mut resolved = sets.remove(id).expect("every reached variable has a set");
+                let written = v.written_uppers(solver);
+                resolved.retain(|l| admitted(solver, &written, l));
+                v.state(solver).resolved_at.store(now, resolved);
+            }
+        }
         if stop {
             let written = self.written_uppers(solver);
             out.retain(|l| admitted(solver, &written, l));
