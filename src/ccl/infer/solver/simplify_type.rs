@@ -79,7 +79,8 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
     // Guards against re-entering a rec-var bound during analysis.
     let mut rec_processed: BTreeSet<InferVarId> = BTreeSet::new();
     // co_occurrences[(pol, uid)] = set of items that ALWAYS co-occur with uid at polarity pol.
-    let mut co_occurrences: HashMap<(bool, InferVarId), HashSet<CoOccItem>> = HashMap::new();
+    let mut co_occurrences: HashMap<(bool, InferVarId), std::rc::Rc<HashSet<CoOccItem>>> =
+        HashMap::new();
     // The variables of each data function's domain, an invariant position.
     let mut invariant_sites: Vec<BTreeSet<InferVarId>> = Vec::new();
 
@@ -143,13 +144,10 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
             continue;
         }
         for pol in [true, false] {
-            let occs: Vec<CoOccItem> = co_occurrences
-                .get(&(pol, v))
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            for item in occs {
+            let Some(occs) = co_occurrences.get(&(pol, v)).cloned() else {
+                continue;
+            };
+            for item in occs.iter().cloned() {
                 if var_subst.contains_key(&v) {
                     break; // v was just eliminated; stop processing
                 }
@@ -176,10 +174,15 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
                                 // Non-recursive: intersect v's !pol co-occs with w's !pol co-occs.
                                 #[allow(clippy::mutable_key_type)]
                                 // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
-                                let w_neg: HashSet<CoOccItem> =
+                                let w_neg =
                                     co_occurrences.get(&(!pol, w)).cloned().unwrap_or_default();
-                                if let Some(v_neg) = co_occurrences.get_mut(&(!pol, v)) {
-                                    v_neg.retain(|t| *t == CoOccItem::Var(v) || w_neg.contains(t));
+                                if let Some(v_neg) = co_occurrences.get_mut(&(!pol, v))
+                                    && v_neg
+                                        .iter()
+                                        .any(|t| *t != CoOccItem::Var(v) && !w_neg.contains(t))
+                                {
+                                    std::rc::Rc::make_mut(v_neg)
+                                        .retain(|t| *t == CoOccItem::Var(v) || w_neg.contains(t));
                                 }
                             }
                         }
@@ -228,28 +231,32 @@ fn simplify_analyze(
     input_rec_vars: &BTreeMap<InferVarId, CompactType>,
     all_vars: &mut BTreeSet<InferVarId>,
     rec_processed: &mut BTreeSet<InferVarId>,
-    co_occurrences: &mut HashMap<(bool, InferVarId), HashSet<CoOccItem>>,
+    co_occurrences: &mut HashMap<(bool, InferVarId), std::rc::Rc<HashSet<CoOccItem>>>,
     invariant_sites: &mut Vec<BTreeSet<InferVarId>>,
 ) {
     // Items present at this position (vars + atoms).
     #[allow(clippy::mutable_key_type)]
     // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
-    let here: HashSet<CoOccItem> = ct
-        .vars
-        .iter()
-        .map(|&v| CoOccItem::Var(v))
-        .chain(ct.atoms.iter().map(|a| CoOccItem::Atom(a.clone())))
-        .collect();
+    let here: std::rc::Rc<HashSet<CoOccItem>> = std::rc::Rc::new(
+        ct.vars
+            .iter()
+            .map(|&v| CoOccItem::Var(v))
+            .chain(ct.atoms.iter().map(|a| CoOccItem::Atom(a.clone())))
+            .collect(),
+    );
 
     for &tv in &ct.vars {
         all_vars.insert(tv);
         // Intersect existing co-occurrence set with items here, or initialize it.
         match co_occurrences.entry((pol, tv)) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.get_mut().retain(|x| here.contains(x));
+                if !std::rc::Rc::ptr_eq(e.get(), &here) && e.get().iter().any(|x| !here.contains(x))
+                {
+                    std::rc::Rc::make_mut(e.get_mut()).retain(|x| here.contains(x));
+                }
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(here.clone());
+                e.insert(std::rc::Rc::clone(&here));
             }
         }
         // If tv has a recursive bound in the input, process it once (guards cycles).
