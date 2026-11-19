@@ -9,9 +9,8 @@ use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType, TypeEntry, Typ
 use std::{collections::HashSet, rc::Rc};
 
 use super::modules::Reached;
-use super::modules::module_body;
+use super::modules::{MODULE_BODY, fill_module_body, is_module_body, module_body};
 use super::*;
-use crate::ccl::Duplicate;
 use crate::{
     ccl::{
         BaseType, BindingTransparency, Branch, Expr, FieldKey, Label, Lit, Pattern, PatternHead,
@@ -52,12 +51,11 @@ pub(super) fn lower_chain_recovering(
     let body = contributing_stmts(stmts)
         .rev()
         .fold(placeholder, |acc, (i, stmt)| {
-            let backup = acc.clone_preserving_ids();
-            match lower_middle_stmt(stmt, &stmts[..i], acc, &outer_bindings, ctx, true) {
-                Ok(e) => e,
+            match lower_around_hole(stmt, &stmts[..i], &outer_bindings, ctx) {
+                Ok(e) => fill_module_body(e, acc),
                 Err(e) => {
                     errors.push(e.with_stand_in());
-                    stand_in_for_failed(stmt, &stmts[..i], &outer_bindings, backup, ctx)
+                    stand_in_for_failed(stmt, &stmts[..i], &outer_bindings, acc, ctx)
                 }
             }
         });
@@ -77,6 +75,36 @@ pub(super) fn lower_chain_recovering(
     errors.extend(associated);
     errors.extend(nominal::instances_reaching_parameters(&reaches, ctx));
     Some(body)
+}
+
+/// The top-level statement `stmt` lowered around [`MODULE_BODY`](super::modules::MODULE_BODY),
+/// which stands for the chain lowered from the statements after it.
+///
+/// A statement's lowering places its continuation once, at the end of its spine, and reads
+/// nothing of it. So the chain takes the placeholder's place
+/// ([`fill_module_body`](super::modules::fill_module_body)) to give the statement lowered over
+/// it, and a failure leaves the chain as it was, with no copy taken to recover it.
+fn lower_around_hole(
+    stmt: &Spanned<ChlStmt>,
+    preceding: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let placeholder = Expr::throwaway(TypedExprNode::Var(Name::raw(MODULE_BODY)));
+    let lowered = lower_middle_stmt(stmt, preceding, placeholder, outer_bindings, ctx, true)?;
+    debug_assert_eq!(
+        placeholders_in(&lowered),
+        1,
+        "a statement's lowering places its continuation exactly once"
+    );
+    Ok(lowered)
+}
+
+/// How many [`MODULE_BODY`](super::modules::MODULE_BODY) placeholders `e` holds.
+fn placeholders_in(e: &Expr) -> usize {
+    let mut count = usize::from(is_module_body(e));
+    e.walk_children(|child| count += placeholders_in(child));
+    count
 }
 
 /// Declare the instances among a module's top-level `stmts`, then check the requirements
@@ -236,31 +264,16 @@ pub(super) fn lower_stmts_recovering(
         }
     };
 
-    // Middle statements: each call takes ownership of `acc` (the continuation
-    // we've built so far), so when one fails we need a snapshot to fall back
-    // to. Cloning unconditionally is fine — lowering isn't a hot path and
-    // errors are exceptional.
-    //
-    // The snapshot preserves ids, and must. It is a *rollback copy*, not a
-    // sibling: at most one of `acc` and `backup` ever reaches the tree.
-    //
-    // TODO(rollback-copy): ripe for refactoring — this is quadratic. The
-    // continuation grows with every statement and is copied whole for each one,
-    // so a clean compile of an n-statement program does O(n^2) node copies for a
-    // value the happy path drops. Preserving ids keeps it off the *id* ledger
-    // (a freshening clone would deep-mint all of it), but the copy itself
-    // remains. The fix is to stop needing a snapshot: have `lower_middle_stmt`
-    // borrow, or return the continuation back on the error path, so recovery
-    // costs nothing when nothing fails.
+    // Middle statements, each over the chain below it ([`lower_around_hole`]); a failed one
+    // is a stand-in over that chain.
     let body = contributing_stmts(rest)
         .rev()
         .fold(final_expr, |acc, (i, stmt)| {
-            let backup = acc.clone_preserving_ids();
-            match lower_middle_stmt(stmt, &rest[..i], acc, &outer_bindings, ctx, true) {
-                Ok(e) => e,
+            match lower_around_hole(stmt, &rest[..i], &outer_bindings, ctx) {
+                Ok(e) => fill_module_body(e, acc),
                 Err(e) => {
                     errors.push(e.with_stand_in());
-                    stand_in_for_failed(stmt, &rest[..i], &outer_bindings, backup, ctx)
+                    stand_in_for_failed(stmt, &rest[..i], &outer_bindings, acc, ctx)
                 }
             }
         });
