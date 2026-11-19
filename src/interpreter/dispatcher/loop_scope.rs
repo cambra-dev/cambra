@@ -21,31 +21,256 @@ pub(super) enum Member {
 /// Dispatcher metadata installed on one induction producer for one run. It retains no handle to
 /// its own StoreCell; the plan's lifetime guard clears it before that run exits.
 pub(crate) struct InductionRun {
-    /// Configured but never executed here; moved into the run before the first request.
-    pub(super) body_graph: Option<Dispatcher>,
-    pub(super) shared: Option<SharedLoop>,
-    pub(super) members: Vec<Member>,
-    /// Entries placed at global body IDs after activation. Explicitly queued source entries
-    /// stay unplaced so external source pushes reach their completeness targets.
-    placements: Vec<Vec<Placement>>,
+    pub(super) body: Body,
     /// The inner pipelines a round queues its position for: the sources, and the nested loops,
     /// which take it once the pipelines they read have finished the round.
     starts: Vec<PipelineId>,
-    /// The body planning tree, in local pipeline order.
-    pub(super) planned: Vec<Planned>,
     opened: bool,
     request: Option<Request>,
-    /// The local drive index resolved while planning the body graph.
-    drive: PipelineId,
 }
 
-pub(super) struct SharedLoop {
+/// A scope's inner pipelines: a loop's body ([`InductionRun`]), or a transaction writer's
+/// ([`WriterRun`](super::transaction_scope::WriterRun)). Planning builds them as a graph of their
+/// own, which execution appends to the run's shared dispatcher between the scope's own pipeline
+/// and its step (`Execution::attach_body` in `plan.rs`).
+pub(super) struct Body {
+    /// The planned graph, until execution appends it.
+    graph: Option<Dispatcher>,
+    pub(super) members: Vec<Member>,
+    /// Each inner pipeline's entries, by local id. While the body runs, every entry is placed at
+    /// its pipeline's global id except a source's, which stays unplaced so the source's pushes
+    /// reach their completeness targets. Every entry is cleared once the body finishes, and when
+    /// it is dropped.
+    placements: Vec<Vec<Placement>>,
+    /// The body planning tree, in local pipeline order.
+    pub(super) planned: Vec<Planned>,
+    /// The one inner pipeline whose breaker answers `TileProducer::next_position`: a loop's drive,
+    /// a writer's transaction driver.
+    pub(super) driver: PipelineId,
+    /// Where the body sits in the run's shared dispatcher, once appended.
+    attached: Option<Attached>,
+    /// Whether the inner pipelines' entries are placed at their global ids and the pipelines
+    /// run, which they do from the first request on. Only an attached body activates.
+    active: bool,
+    /// Whether the followers are released since they were last held, so a release is made once.
+    followers_released: bool,
+    /// The region the scope's pipeline consumed, from the scope's finish until the inner pipelines
+    /// and the step have finished.
+    finishing: Option<Option<TileGuard>>,
+}
+
+/// Where a body sits in the run's shared dispatcher.
+pub(super) struct Attached {
+    /// The scope's own pipeline in the dispatcher around it, whose claims are its requests.
     pub(super) pipeline: PipelineId,
-    pub(super) base: usize,
+    /// The global id of the first inner pipeline; the others follow it in local order.
+    base: usize,
+    /// The pipeline that follows every inner one, whose claim ends a round or an attempt.
     pub(super) step: PipelineId,
-    pub(super) active: bool,
-    pub(super) followers_released: bool,
-    pub(super) finishing: Option<Option<TileGuard>>,
+}
+
+impl Body {
+    pub(super) fn new(
+        graph: Dispatcher,
+        members: Vec<Member>,
+        placements: Vec<Vec<Placement>>,
+        planned: Vec<Planned>,
+        driver: PipelineId,
+    ) -> Self {
+        Self {
+            graph: Some(graph),
+            members,
+            placements,
+            planned,
+            driver,
+            attached: None,
+            active: false,
+            followers_released: false,
+            finishing: None,
+        }
+    }
+
+    /// The planned graph, for execution to append to the run's dispatcher.
+    pub(super) fn take_graph(&mut self) -> Dispatcher {
+        self.graph.take().expect("a body's graph is appended once")
+    }
+
+    /// Record where execution appended the graph: after the scope's pipeline `pipeline`, from
+    /// global id `base`, with the step `step`.
+    pub(super) fn attach(&mut self, pipeline: PipelineId, base: usize, step: PipelineId) {
+        debug_assert!(
+            self.graph.is_none() && self.attached.is_none(),
+            "a body's graph is taken, then attached, once"
+        );
+        self.attached = Some(Attached {
+            pipeline,
+            base,
+            step,
+        });
+    }
+
+    /// Where the body sits in the run's dispatcher.
+    ///
+    /// # Panics
+    ///
+    /// Before [`attach`](Self::attach): a body is reached through the handlers attaching installs.
+    pub(super) fn attached(&self) -> &Attached {
+        self.attached
+            .as_ref()
+            .expect("a body is reached once it is attached")
+    }
+
+    pub(super) fn is_attached(&self) -> bool {
+        self.attached.is_some()
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// The global id of the inner pipeline `local`; its local id before the body is attached,
+    /// while planning probes the body graph alone.
+    pub(super) fn global(&self, local: PipelineId) -> PipelineId {
+        PipelineId(self.attached.as_ref().map_or(0, |attached| attached.base) + local.0)
+    }
+
+    /// The global ids of the inner pipelines, none before the body is attached.
+    pub(super) fn pipelines(&self) -> Vec<PipelineId> {
+        match &self.attached {
+            Some(attached) => (attached.base..attached.base + self.members.len())
+                .map(PipelineId)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The inner pipelines and the step.
+    fn with_step(&self) -> impl Iterator<Item = PipelineId> + use<> {
+        let step = self.attached().step;
+        self.pipelines().into_iter().chain(std::iter::once(step))
+    }
+
+    /// Place each inner pipeline's entries at its global id, except a source's, and let the inner
+    /// pipelines and the step run. Whether this call activated the body: it does so once.
+    pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
+        if self.active {
+            return false;
+        }
+        self.active = true;
+        for (local, placements) in self.placements.iter().enumerate() {
+            let pipeline = self.global(PipelineId(local));
+            for placement in placements {
+                placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
+            }
+            dispatcher.hold_pipeline(pipeline, false);
+        }
+        dispatcher.hold_pipeline(self.attached().step, false);
+        true
+    }
+
+    /// Hold back the pipelines that follow the inner pipelines and the step, once the body runs.
+    pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
+        if !self.active {
+            return;
+        }
+        dispatcher.hold_followers(self.with_step(), true);
+        self.followers_released = false;
+    }
+
+    /// Let the pipelines that follow the inner pipelines and the step run, unless the body does
+    /// not run or they already may. Whether this call released them.
+    pub(super) fn release_followers(&mut self, dispatcher: &Dispatcher) -> bool {
+        if !self.active || self.followers_released {
+            return false;
+        }
+        dispatcher.hold_followers(self.with_step(), false);
+        self.followers_released = true;
+        true
+    }
+
+    /// Begin the scope's finish, which consumed `consumed` of the scope's pipeline.
+    pub(super) fn begin_finish(&mut self, consumed: Option<TileGuard>) {
+        debug_assert!(self.finishing.is_none(), "a scope finishes once");
+        self.finishing = Some(consumed);
+    }
+
+    /// Whether the scope's finish has begun and the body has not finished.
+    pub(super) fn is_finishing(&self) -> bool {
+        self.finishing.is_some()
+    }
+
+    /// Close the inner sources, so the inner pipelines finish once they have read what is queued.
+    pub(super) fn close_sources(&self, dispatcher: &Dispatcher) {
+        for pipeline in self.pipelines() {
+            if dispatcher.is_source(pipeline) {
+                dispatcher.close(pipeline);
+            }
+        }
+    }
+
+    /// The scope's pipeline and the region it consumed, once its finish has begun and the inner
+    /// pipelines and the step have all finished.
+    pub(super) fn take_finish(
+        &mut self,
+        dispatcher: &Dispatcher,
+    ) -> Option<(PipelineId, Option<TileGuard>)> {
+        self.finishing.as_ref()?;
+        let pipeline = self.attached.as_ref()?.pipeline;
+        let finished = self
+            .with_step()
+            .all(|pipeline| dispatcher.states[pipeline.0].phase.load() == Phase::Finished);
+        if !finished {
+            return None;
+        }
+        let consumed = self.finishing.take().expect("the finish is pending");
+        Some((pipeline, consumed))
+    }
+
+    /// Call `call` with the breaker of the inner pipeline `local`.
+    pub(super) fn reach(&self, local: PipelineId, call: &mut Call<'_>) {
+        reach_member(&self.members[local.0], call);
+    }
+
+    /// Where the driver's source records its complete pushes ([`CompletionTarget`]).
+    pub(super) fn driver_target(&self) -> Option<CompletionTarget> {
+        let mut target = None;
+        self.reach(self.driver, &mut |breaker, _| {
+            target = breaker
+                .as_producer()
+                .and_then(|producer| producer.completes_through());
+        });
+        target
+    }
+
+    /// Have the driver's source record its complete pushes at `pipeline`, the scope's pipeline,
+    /// as complete regions of the driver's input ([`CompletionTarget`]).
+    pub(super) fn complete_driver_through(&self, pipeline: PipelineId) {
+        self.reach(self.driver, &mut |breaker, _| {
+            if let Some(target) = breaker
+                .as_producer()
+                .and_then(|producer| producer.completes_through())
+            {
+                *target.borrow_mut() = Some((pipeline, breaker.input_tiling(InputId::ONLY)));
+            }
+        });
+    }
+
+    /// Clear every inner pipeline's entries.
+    pub(super) fn unplace(&self) {
+        for placement in self.placements.iter().flatten() {
+            placement.set(None);
+        }
+    }
+}
+
+/// A dropped body leaves no entry placed and no completion recorded at a pipeline of its run.
+impl Drop for Body {
+    fn drop(&mut self) {
+        self.unplace();
+        if let Some(target) = self.driver_target() {
+            *target.borrow_mut() = None;
+        }
+    }
 }
 
 struct Request {
@@ -57,32 +282,12 @@ struct Request {
 }
 
 impl InductionRun {
-    pub(super) fn new(
-        body_graph: Dispatcher,
-        members: Vec<Member>,
-        placements: Vec<Vec<Placement>>,
-        starts: Vec<PipelineId>,
-        planned: Vec<Planned>,
-        drive: PipelineId,
-    ) -> Self {
+    pub(super) fn new(body: Body, starts: Vec<PipelineId>) -> Self {
         Self {
-            body_graph: Some(body_graph),
-            shared: None,
-            members,
-            placements,
+            body,
             starts,
-            planned,
             opened: false,
             request: None,
-            drive,
-        }
-    }
-}
-
-impl Drop for InductionRun {
-    fn drop(&mut self) {
-        for placement in self.placements.iter().flatten() {
-            placement.set(None);
         }
     }
 }
@@ -105,77 +310,42 @@ impl InductionStoreProducer {
         self.run.as_mut().expect("an induction run is planned")
     }
 
+    /// The run's body, for the execution that attaches and drives it.
+    pub(super) fn body_mut(&mut self) -> &mut Body {
+        &mut self.run_mut().body
+    }
+
     fn pipeline(&self, local: PipelineId) -> PipelineId {
-        PipelineId(self.run().shared.as_ref().map_or(0, |shared| shared.base) + local.0)
+        self.run().body.global(local)
     }
 
     fn activate(&mut self, dispatcher: &Dispatcher) {
-        let run = self.run_mut();
-        let shared = run
-            .shared
-            .as_mut()
-            .expect("an induction run has global pipelines");
-        if shared.active {
-            return;
+        if self.run_mut().body.activate(dispatcher) {
+            self.hold_followers(dispatcher);
         }
-        shared.active = true;
-        for (local, placements) in run.placements.iter().enumerate() {
-            let pipeline = PipelineId(shared.base + local);
-            for placement in placements {
-                placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
-            }
-            dispatcher.hold_pipeline(pipeline, false);
-        }
-        dispatcher.hold_pipeline(shared.step, false);
-        self.hold_followers(dispatcher);
     }
 
     pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
-        let run = self.run_mut();
-        let Some(shared) = &mut run.shared else {
-            return;
-        };
-        if !shared.active {
-            return;
-        }
-        dispatcher.hold_followers(
-            (shared.base..shared.base + run.members.len())
-                .map(PipelineId)
-                .chain(std::iter::once(shared.step)),
-            true,
-        );
-        shared.followers_released = false;
+        self.run_mut().body.hold_followers(dispatcher);
     }
 
     pub(super) fn settlement_pipelines(&self) -> Vec<PipelineId> {
-        let Some(shared) = &self.run().shared else {
-            return Vec::new();
-        };
-        if !shared.active || self.run().request.is_none() {
+        let body = &self.run().body;
+        if !body.is_active() || self.run().request.is_none() {
             return Vec::new();
         }
-        (0..self.run().members.len()).filter(|&local| {
-            !matches!(&self.run().members[local], Member::Scope(scope) if induction(scope).has_package())
-        }).map(|local| PipelineId(shared.base + local)).collect()
+        (0..body.members.len())
+            .filter(|&local| {
+                !matches!(&body.members[local], Member::Scope(scope) if induction(scope).has_package())
+            })
+            .map(|local| body.global(PipelineId(local)))
+            .collect()
     }
 
     pub(super) fn release_followers(&mut self, dispatcher: &Dispatcher) -> bool {
         let run = self.run_mut();
-        let Some(shared) = &mut run.shared else {
-            return false;
-        };
-        if !shared.active || run.request.is_none() || shared.followers_released {
-            return false;
-        }
         // The serial coordinator takes one claim before holding followers again.
-        dispatcher.hold_followers(
-            (shared.base..shared.base + run.members.len())
-                .map(PipelineId)
-                .chain(std::iter::once(shared.step)),
-            false,
-        );
-        shared.followers_released = true;
-        true
+        run.request.is_some() && run.body.release_followers(dispatcher)
     }
 
     pub(super) fn begin_shared(
@@ -198,60 +368,23 @@ impl InductionStoreProducer {
             "a scope finishes after completing its requests"
         );
         self.activate(dispatcher);
-        self.run_mut()
-            .shared
-            .as_mut()
-            .expect("a shared scope has global pipelines")
-            .finishing = Some(consumed);
-        for &local in &self.run().starts {
-            if dispatcher.is_source(self.pipeline(local)) {
-                dispatcher.close(self.pipeline(local));
-            }
-        }
-    }
-
-    pub(super) fn take_shared_finish(
-        &mut self,
-        dispatcher: &Dispatcher,
-    ) -> Option<(PipelineId, Option<TileGuard>)> {
-        let run = self.run_mut();
-        let shared = run.shared.as_mut()?;
-        if shared.finishing.is_none()
-            || !(shared.base..shared.base + run.members.len())
-                .chain(std::iter::once(shared.step.0))
-                .all(|pipeline| dispatcher.states[pipeline].phase.load() == Phase::Finished)
-        {
-            return None;
-        }
-        Some((
-            shared.pipeline,
-            shared.finishing.take().expect("the finish is pending"),
-        ))
-    }
-
-    pub(super) fn unplace_shared(&self) {
-        for placement in self.run().placements.iter().flatten() {
-            placement.set(None);
-        }
+        let body = &mut self.run_mut().body;
+        body.begin_finish(consumed);
+        body.close_sources(dispatcher);
     }
 
     /// Place local entries for a planning probe; attached execution keeps global entries live.
     fn placed<R>(&mut self, run: impl FnOnce(&mut Self) -> R) -> R {
-        if self
-            .run()
-            .shared
-            .as_ref()
-            .is_some_and(|shared| shared.active)
-        {
+        if self.run().body.is_active() {
             return run(self);
         }
-        let placements = self.run().placements.clone();
+        let placements = self.run().body.placements.clone();
         let _placed = Placed::new(&placements);
         run(self)
     }
 
     fn reach_local(&mut self, pipeline: PipelineId, call: &mut Call<'_>) {
-        let member = self.run().members[pipeline.0].clone();
+        let member = self.run().body.members[pipeline.0].clone();
         reach_member(&member, call);
     }
 
@@ -259,7 +392,6 @@ impl InductionStoreProducer {
         if self.run.is_none() {
             return;
         }
-        self.forget_through_drive();
         for placement in self.seed_placements() {
             placement.set(None);
         }
@@ -268,7 +400,7 @@ impl InductionStoreProducer {
 
     pub(crate) fn begin_loop_run(&mut self) {
         let Some(run) = &self.run else { return };
-        let count = run.members.len();
+        let count = run.body.members.len();
         for local in 0..count {
             self.reach_local(PipelineId(local), &mut |breaker, _| breaker.begin_run());
         }
@@ -305,7 +437,7 @@ impl InductionStoreProducer {
     /// Where no source in the store's chain among the scope's pipelines, or more than one, is a
     /// drive.
     fn drive(&self) -> PipelineId {
-        self.run().drive
+        self.run().body.driver
     }
 
     /// Have the entry in front of the drive's source record a complete push of the source's keys
@@ -336,13 +468,7 @@ impl InductionStoreProducer {
 
     /// Where the drive's source's complete pushes record ([`CompletionTarget`]).
     fn drive_target(&mut self) -> Option<CompletionTarget> {
-        let mut target = None;
-        self.reach_local(self.drive(), &mut |breaker, _| {
-            target = breaker
-                .as_producer()
-                .and_then(|producer| producer.completes_through());
-        });
-        target
+        self.run().body.driver_target()
     }
 
     /// The paths the pushes `regions` from the range in front of `consumer` take to the drive's
@@ -380,11 +506,11 @@ impl InductionStoreProducer {
     }
 
     fn closing_readers(&self, dispatcher: &Dispatcher) -> Vec<PipelineId> {
-        (0..self.run().members.len())
+        (0..self.run().body.members.len())
             .map(PipelineId)
             .filter(|&pipeline| {
                 !(dispatcher.is_source(self.pipeline(pipeline))
-                    && matches!(self.run().members[pipeline.0], Member::Chain(_)))
+                    && matches!(self.run().body.members[pipeline.0], Member::Chain(_)))
             })
             .collect()
     }
@@ -563,8 +689,8 @@ impl InductionStoreProducer {
                 dispatcher.queue_round(self.pipeline(reader), &row);
             }
         }
-        if let Some(shared) = &self.run().shared {
-            dispatcher.queue_round(shared.step, guard);
+        if self.run().body.is_attached() {
+            dispatcher.queue_round(self.run().body.attached().step, guard);
         }
     }
 
@@ -593,6 +719,7 @@ impl InductionStoreProducer {
     /// The breaker subscriptions of the inner pipelines a round queues or publishes.
     pub(super) fn chain_breakers(&self) -> Vec<BreakerHandle> {
         self.run()
+            .body
             .members
             .iter()
             .filter_map(|member| match member {
@@ -650,7 +777,7 @@ impl Drop for Placed<'_> {
 mod tests {
     use indoc::indoc;
 
-    use super::super::plan::{Execution, InductionRuns, Planner};
+    use super::super::plan::{Execution, Planner, ScopeRuns};
     use super::*;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;
@@ -683,7 +810,7 @@ mod tests {
     /// A program compiled with its sinks unpulled and no notification delivered, and the scope of
     /// its one store.
     struct Compiled {
-        _runs: InductionRuns,
+        _runs: ScopeRuns,
         _ctx: GlobalContext,
         operators: OperatorMap,
         scope: StoreCell,
@@ -711,7 +838,7 @@ mod tests {
                 store: stores[0].store().expect("the program subscribed its store"),
             });
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
-            let mut runs = InductionRuns::new();
+            let mut runs = ScopeRuns::new();
             let scope = planner.build_scope(0, usize::MAX, &mut Vec::new(), &mut runs);
             induction(&scope).begin_run();
             let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
@@ -774,12 +901,7 @@ mod tests {
         }
 
         fn run_one_round(&self) {
-            let step = induction(&self.scope)
-                .run()
-                .shared
-                .as_ref()
-                .expect("attached scope")
-                .step;
+            let step = induction(&self.scope).run().body.attached().step;
             for _ in 0..1000 {
                 if self.tick() == Some(step) {
                     return;
@@ -937,6 +1059,7 @@ mod tests {
         let kinds = |kind: &str| {
             induction(&compiled.scope)
                 .run()
+                .body
                 .planned
                 .iter()
                 .filter(|plan| plan.name.starts_with(kind))
@@ -945,7 +1068,7 @@ mod tests {
         assert!(
             kinds("InductionDriver") == 1 && kinds("Memo") >= 1,
             "the drive and the guard's `Memo`s: {:?}",
-            induction(&compiled.scope).run().planned
+            induction(&compiled.scope).run().body.planned
         );
         let whole = induction(&compiled.scope)
             .input_tiling(InputId::ONLY)
