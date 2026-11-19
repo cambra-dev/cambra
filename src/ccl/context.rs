@@ -815,7 +815,7 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
 /// [`GlobalContext::state_conflicts`] reads their answers as. Both are produced
 /// by operator conversion and returned from here, so this is the path a consumer
 /// of the compilation API imports them by.
-pub use crate::interpreter::operator_conversion::{ReuseTally, StateConflict, UnreadablePrefix};
+pub use crate::interpreter::operator_conversion::{ReuseTally, StateConflict, UnreadableInput};
 
 /// One open `http_serve` route: what lowering binds it by, plus the listener
 /// needed to stop serving it.
@@ -1205,7 +1205,7 @@ impl GlobalContext {
         predecessor: &OperatorMap,
         previous: &Expr,
         planned: &Expr,
-    ) -> Vec<UnreadablePrefix> {
+    ) -> Vec<UnreadableInput> {
         self.conversion
             .unreadable_inputs(predecessor, previous, planned)
     }
