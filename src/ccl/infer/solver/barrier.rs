@@ -99,7 +99,7 @@ fn check_barrier(
     barrier: &Rc<BarrierVar>,
     failures: &mut Vec<BarrierFailure>,
 ) -> bool {
-    let previous = barrier.checked(solver).clone();
+    let previous = barrier.checked(solver);
     let (checked_resolution, checked_uppers) = match previous {
         Some(BarrierCheck::Failed) => return false,
         Some(BarrierCheck::Passed { resolution, uppers }) => (resolution, uppers),
@@ -108,10 +108,13 @@ fn check_barrier(
     let uppers = barrier.uppers(solver).to_vec();
     let (own, escaped) = super::compact::barrier_resolution(solver, barrier);
     if uppers.is_empty() && escaped.is_empty() {
-        *barrier.checked_mut(solver) = Some(BarrierCheck::Passed {
-            resolution: None,
-            uppers: 0,
-        });
+        barrier.record_check(
+            solver,
+            BarrierCheck::Passed {
+                resolution: None,
+                uppers: 0,
+            },
+        );
         return false;
     }
     // A resolution that does not materialize is not checked: the same join is what the
@@ -128,10 +131,13 @@ fn check_barrier(
         None
     };
     let Some(resolved) = materialized else {
-        *barrier.checked_mut(solver) = Some(BarrierCheck::Passed {
-            resolution: None,
-            uppers: uppers.len(),
-        });
+        barrier.record_check(
+            solver,
+            BarrierCheck::Passed {
+                resolution: None,
+                uppers: uppers.len(),
+            },
+        );
         return false;
     };
     if !escaped.is_empty() {
@@ -141,7 +147,7 @@ fn check_barrier(
             resolved,
             origin,
         });
-        *barrier.checked_mut(solver) = Some(BarrierCheck::Failed);
+        barrier.record_check(solver, BarrierCheck::Failed);
         return false;
     }
     // An unchanged resolution has passed every upper bound already checked against it.
@@ -164,13 +170,16 @@ fn check_barrier(
                 report: upper.report.clone(),
                 failure: cache.take_failure(),
             });
-            *barrier.checked_mut(solver) = Some(BarrierCheck::Failed);
+            barrier.record_check(solver, BarrierCheck::Failed);
             return true;
         }
     }
-    *barrier.checked_mut(solver) = Some(BarrierCheck::Passed {
-        resolution: Some(resolved),
-        uppers: uppers.len(),
-    });
+    barrier.record_check(
+        solver,
+        BarrierCheck::Passed {
+            resolution: Some(resolved),
+            uppers: uppers.len(),
+        },
+    );
     true
 }
