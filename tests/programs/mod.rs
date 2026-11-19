@@ -45,6 +45,7 @@ mod polymorphic;
 mod prefix_lines;
 mod reachability;
 mod refinement;
+mod skill_examples;
 mod source_accumulator;
 mod source_shared;
 mod source_two_runs;

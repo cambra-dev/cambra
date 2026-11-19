@@ -1,0 +1,26 @@
+# A stateful module: it declares a transactional variable, so it is `run`, never imported. Each
+# `run` statement is a separate run with its own arguments and its own copy of `balance`.
+
+# `import a::b` binds `b`, here `pricing`, the file `pricing.cambra` beside the root file. A `use`
+# clause also binds the named members unqualified. Every path is absolute from the root's
+# directory, and `a::b` is the file `a/b.cambra`.
+import pricing use Money
+
+# A parameter takes its value from each `run` statement's keyword arguments.
+param fee: Int
+
+# A public mutable variable is always `Txn`. Other modules read and write it as `run_name::balance`
+# inside a `with begin():` block. An induction variable (`x := …` without `Txn`) cannot be public.
+pub balance: Mut(Int, Txn) := 0
+
+for amount in [100, 250]:
+    with begin():
+        balance += Money::new(amount).plus_fee(fee).extract()
+
+# A public function over private state is how a module limits what others may do to it. This one
+# writes `balance`, so it requires `Transaction` and runs inside its caller's block. The interface
+# `cambra check ledger.cambra` prints states its contract:
+#   pub refund: Int => Int requires Transaction, ReadTxn(balance) causes WriteTxn(balance)
+pub def refund(n: Int):
+    balance -= n
+    n
