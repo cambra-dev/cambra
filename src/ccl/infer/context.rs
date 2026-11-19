@@ -2724,13 +2724,19 @@ impl InferCtx {
                     .map(|t| self.normalize_annotation_in(t, telescope))
                     .collect(),
             ),
-            // Born after inference with its references closed, so the
-            // telescope needs no extension: no component spells an earlier one by name.
-            Type::DepTuple(cs) => Type::DepTuple(
-                cs.iter()
-                    .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
-                    .collect(),
-            ),
+            // A component stands under the components before it, as a codomain under its
+            // function's binder: a variable minted for a hole there may read them.
+            Type::DepTuple(cs) => {
+                let mut inner = telescope.clone();
+                let mut out = Vec::with_capacity(cs.len());
+                for (n, t) in cs {
+                    out.push((n.clone(), self.normalize_annotation_in(t, &inner)));
+                    if let Some(n) = n {
+                        inner = inner.extended(n.clone());
+                    }
+                }
+                Type::DepTuple(out)
+            }
             // The body is under every binder, as a named function's codomain is under its
             // binder: a variable minted there may read them.
             Type::Family { binders, body } => {
