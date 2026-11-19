@@ -111,10 +111,19 @@ Transaction and induction drivers sample the store's committed snapshot. The pla
 seed opening before admitting their source items. Transaction replies commit as taps and are
 rekeyed from commit ticks to their original source positions.
 
-Live concatenation can wait for source closure. Rebuilding a feed reader across reload can replay
-values emitted before the cut. A live collection inside a record or a nested row reaches its reader
-before the source closes through a read of a widened input
-([Reading a widened input again](#reading-a-widened-input-again)).
+A transaction store is notified of a delivery's keys as its writer's items, read off the extents of
+its input and its live ranges (`store_items`), since a writer may read its source through requests
+no push climbs. Where the input's domain is the live source's own, a delivery's keys are the items.
+Over a concatenation a live range's positions stand under every arm whose extent is the range's
+(`Notifies::Items`), and an arm whose extent reads no live source, as a list arm, is queued whole
+with the first notification, so its items commit before the source delivers anything, unless the
+store waits for its seed or for a pipeline it reads. A tagged guard is not cut into morsels, so a
+delivery is one package of the store at any morsel size. A store with an arm of any other extent, as
+a union nested under a tag, takes its input whole once its sources close. A store that reads its
+items through another pipeline takes them as that pipeline's positions where its route to the store
+is an identity. Rebuilding a feed reader across reload can replay values emitted before the cut. A
+live collection inside a record or a nested row reaches its reader before the source closes through
+a read of a widened input ([Reading a widened input again](#reading-a-widened-input-again)).
 
 ### Pause and reload
 
