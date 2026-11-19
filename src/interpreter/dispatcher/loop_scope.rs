@@ -406,10 +406,7 @@ impl Body {
     /// scope's input, names no position, as a closing round gives a row's remainder past the
     /// positions its domain has. `None` where it holds no row or its source has offered nothing.
     fn ready_rows(&self) -> Option<(TileGuard, TileGuard)> {
-        let input = self.driver_target().and_then(|target| {
-            let target = target.read().unwrap_or_else(PoisonError::into_inner);
-            target.as_ref().map(|(_, input)| input.clone())
-        });
+        let input = self.driver_input();
         let held = self.held.as_ref()?;
         let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
         let delivered = offered.region.as_ref()?;
@@ -431,9 +428,57 @@ impl Body {
         });
     }
 
+    /// The scope's input, over which the drive's source offers the scope its pushes. `None`
+    /// before the drive offers them ([`InductionStoreProducer::decide_through_drive`]).
+    fn driver_input(&self) -> Option<Tiling> {
+        self.driver_target().and_then(|target| {
+            let target = target.read().unwrap_or_else(PoisonError::into_inner);
+            target.as_ref().map(|(_, input)| input.clone())
+        })
+    }
+
     /// Mark this scope a nested loop's, whose rows come from the loop around it.
+    ///
+    /// Each run plans a new body, whose record of what the drive's source delivered
+    /// ([`ready_rows`](Self::ready_rows)) would start empty. It starts with what the drive has
+    /// released of its source instead: the source delivered that region before the drive released
+    /// it, and no push delivers it again. A run restored from checkpoints (`docs/durability.md`,
+    /// "Checkpoints") holds the drive's releases and no record of the pushes before them. After a
+    /// crash inside a round of the loop around, that loop gives the round's row again, and only
+    /// this starting record makes the row ready.
+    ///
+    /// # Panics
+    ///
+    /// Before the drive offers the scope its source's pushes
+    /// ([`InductionStoreProducer::decide_through_drive`]).
     pub(super) fn take_rows_from_outer(&mut self) {
+        debug_assert!(
+            self.held.is_none()
+                && self
+                    .offers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .region
+                    .is_none(),
+            "a nested scope starts its record of deliveries once, before any row or push reaches it"
+        );
         self.rows_from_outer = true;
+        let input = self
+            .driver_input()
+            .expect("a nested loop's drive offers its source's pushes");
+        let mut released = None;
+        self.reach(self.driver, &mut |breaker, at| {
+            released = Some(breaker.input_released(at));
+        });
+        let released = released.expect("a nested loop has a drive");
+        if released.is_empty() {
+            return;
+        }
+        let region = Projection::of(&released)
+            .unwrap_or_else(|why| panic!("a drive's release names rows of its source: {why}"));
+        if let Some(delivered) = pushed_guard(&region, &input) {
+            self.offer(&delivered);
+        }
     }
 
     /// Close the scope's pipeline once everything offered to it is queued.
@@ -603,12 +648,6 @@ enum Round {
 }
 
 impl InductionRun {
-    /// Whether a request of the loop's scope is open: claimed, and not yet answered by its rounds.
-    #[cfg(test)]
-    pub(crate) fn has_open_request(&self) -> bool {
-        self.request.is_some()
-    }
-
     pub(super) fn new(body: Body, starts: Vec<PipelineId>) -> Self {
         Self {
             body,
@@ -765,16 +804,20 @@ impl InductionStoreProducer {
         self.final_guard().is_universal()
     }
 
-    /// The path of the position the drive emits next, which the next round runs: the next its
-    /// source delivers. `None` once the source delivers no more.
+    /// The path of the position the next round runs: the position the drive has emitted past the
+    /// store's decided path, where there is one, as in a run recovered from copies taken between
+    /// the drive's emit and the store's step; otherwise the next position the source delivers.
+    /// `None` once the source delivers no more.
     fn next_round_position(&mut self) -> Option<Vec<Value>> {
         let drive = self.drive();
+        let decided = self.decided_through();
         let mut next = None;
         self.reach_local(drive, &mut |breaker, _| {
-            next = breaker
-                .as_producer()
-                .and_then(|producer| producer.next_position())
-                .flatten();
+            next = breaker.as_producer().and_then(|producer| {
+                producer
+                    .emitted_undecided(decided.as_ref())
+                    .or_else(|| producer.next_position().flatten())
+            });
         });
         next
     }

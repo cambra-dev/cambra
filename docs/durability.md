@@ -967,11 +967,11 @@ producers. Persisting needs each producer state as data that can be written to s
 read back. `BreakingProducer::checkpoint` copies a breaker's state out as data and
 `BreakingProducer::restore` installs it into a graph compiled again from the same text. A
 prototype in `src/interpreter/tile_operators/checkpoint.rs` copies a breaker after each step that
-changed what it released, so each breaker's copy is of its own moment, and a test recovers from
-those copies after a crash at any step with no loop's or transaction's request open. An open
-request lives in the run and is not copied. The state is a `Box<dyn Any>` with no encoding, so
-nothing writes it to stable storage yet, and a breaker's only identity across compilations is its
-position in a walk of the graph.
+changed what it released or what it states complete, so each breaker's copy is of its own moment,
+and a test recovers from those copies after a crash at any step. A loop's or a transaction's open
+request is not copied: the recovered run rebuilds it from the stores and drives. The state is a
+`Box<dyn Any>` with no encoding, so nothing writes it to stable storage yet, and a breaker's only
+identity across compilations is its position in a walk of the graph.
 
 A producer chooses when to checkpoint. Checkpointing once the input it has taken since its last
 checkpoint passes a bound keeps what recovery recomputes for that producer below the bound, which

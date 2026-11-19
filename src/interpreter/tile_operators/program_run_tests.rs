@@ -3817,6 +3817,20 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             total += x * y
     total
 "}, "45")]
+#[case::a_nested_loop_of_three_positions(indoc! {"
+    total := 0
+    for x in source1():
+        for y in [1, 2, 3]:
+            total += x * y
+    total
+"}, "90")]
+#[case::a_nested_loop_over_the_source(indoc! {"
+    total := 0
+    for x in source1():
+        for y in source1():
+            total += x * y
+    total
+"}, "225")]
 fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     #[case] source: &str,
     #[case] expected: &str,
@@ -3837,14 +3851,12 @@ fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
 /// A crash the test stops a process at, as an unwind out of [`Persisting::stepped`].
 struct Crashed;
 
-/// A run's observer that persists every breaker whose releases changed after each step, as a
-/// breaker that persists before it releases would have (`Checkpoint::persist`), pauses at every
+/// A run's observer that persists every breaker whose releases or stated completeness changed
+/// after each step (`Checkpoint::persist`), pauses at every
 /// drained boundary, and crashes after the crash point `crash_after` names.
 ///
-/// A crash point is a step after which no loop's or transaction's request is open
-/// (`Persisted::Whole`). An open request's state lives in the run, which no checkpoint holds, and
-/// recovering it is the pause between claims that `design-dispatcher.md`, "What a pause and a
-/// reload keep", calls a conjecture.
+/// Every top-level step is a crash point, those inside a loop's or a transaction's open request
+/// included: the recovered run rebuilds the request from the breakers (`checkpoint.rs`).
 struct Persisting {
     roots: Vec<crate::interpreter::sinks::ProducerSlot>,
     checkpoint: crate::interpreter::tile_operators::checkpoint::Checkpoint,
@@ -3864,21 +3876,16 @@ impl crate::interpreter::dispatcher::RunObserver for Persisting {
     }
 
     fn stepped(&mut self) {
-        use crate::interpreter::tile_operators::checkpoint::Persisted;
-        let persisted = self.checkpoint.persist(&self.roots, false);
-        assert_ne!(
-            persisted,
-            Persisted::Partial,
+        assert!(
+            self.checkpoint.persist(&self.roots, false),
             "a run on one worker ends no step with a store borrowed"
         );
         self.persisted_handed = self
             .handed_terminal
             .load(std::sync::atomic::Ordering::SeqCst);
-        if persisted == Persisted::Whole {
-            self.steps += 1;
-            if self.crash_after == Some(self.steps) {
-                std::panic::resume_unwind(Box::new(Crashed));
-            }
+        self.steps += 1;
+        if self.crash_after == Some(self.steps) {
+            std::panic::resume_unwind(Box::new(Crashed));
         }
     }
 }
@@ -3927,8 +3934,9 @@ fn compiled_over_source1(
 ///
 /// With `crash_after` `None`, the process stops at the first delivery's pause and every breaker
 /// is copied there (`checkpoint::capture`). Otherwise it crashes at that crash point
-/// ([`Persisting`]), and each breaker recovers from its copy as of its last release
-/// (`Checkpoint::persist`). Both runs use one worker, so no worker steps while the test copies.
+/// ([`Persisting`]), and each breaker recovers from its latest copy (`Checkpoint::persist`). Both
+/// runs use one worker, so no worker steps while the test copies. The crash points are every
+/// top-level step, so the test is quadratic in a program's steps.
 fn recovers(
     source: &str,
     expected: &str,

@@ -978,13 +978,6 @@ impl Breaker for InductionStoreProducer {
         false
     }
 
-    #[cfg(test)]
-    fn has_open_request(&self) -> bool {
-        self.run
-            .as_ref()
-            .is_some_and(crate::interpreter::dispatcher::loop_scope::InductionRun::has_open_request)
-    }
-
     /// A loop runs its positions in order, and takes a request none of whose positions is next as
     /// one that only closes positions absent from its source. The store's pipeline and every
     /// pipeline it reads, transitively, therefore publish in position order: each has one package
@@ -1347,13 +1340,6 @@ impl Breaker for CommitProducer {
     /// Commits are decided in transaction order.
     fn consumes_concurrently(&self) -> bool {
         false
-    }
-
-    #[cfg(test)]
-    fn has_open_request(&self) -> bool {
-        self.run.as_ref().is_some_and(
-            crate::interpreter::dispatcher::transaction_scope::TransactionRun::has_open_request,
-        )
     }
 
     /// A transaction's driver holds one item in its live window, the next its source delivers, so
@@ -3683,6 +3669,21 @@ impl InductionStoreProducer {
             let levels = path_levels(producer.tiling());
             producer.release(domain_prefix_over(row.to_vec(), &levels));
         }
+    }
+
+    /// The path the loop's rounds have decided through: [`decided_path`](Self::decided_path), or,
+    /// before the store has decided a position, the position a predecessor's run reached
+    /// (`resumed_after`), through which the store opens decided. `None` before anything is.
+    pub(crate) fn decided_through(&self) -> Option<Path> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.decided_path(&state).or_else(|| {
+            self.resumed_after
+                .as_ref()
+                .map(|resumed| Path::from(vec![resumed.value().clone()]))
+        })
     }
 
     /// The path this induction store has decided through: the last row it opened at each level,
@@ -6094,6 +6095,7 @@ impl TileOperator for InductionDriver {
                 // and what the store's frontier is checked against. `None` for a driver
                 // starting with its source, which has emitted nothing.
                 emitted_through: self.resumed_after.clone().map(one_component),
+                replaying: false,
                 decided_through: None,
                 // And inherits the release cursor with it. A resuming driver has no
                 // interest in the prefix below the position it starts at, which is
@@ -6208,6 +6210,10 @@ struct InductionDriverState {
     /// item cursor, and it is not recoverable from the window, which a release compacts
     /// emitted rows away from.
     emitted_through: Option<Path>,
+    /// Whether the driver was restored from a checkpoint and has emitted nothing since. Only
+    /// then can `emitted_through` lie past the store's decided path at a round's start
+    /// ([`TileProducer::emitted_undecided`]).
+    replaying: bool,
     /// The furthest frontier the store has shown. A row the store has decided whole and every
     /// reader has released leaves the store ([`Engines::remove_covered`]), and its frontier
     /// with it, so a store whose next row has not opened shows none. The store decides in
@@ -6435,6 +6441,26 @@ impl TileProducer for InductionDriverProducer {
         Some(next)
     }
 
+    /// The highest position emitted, where it lies past `decided` and the driver has emitted
+    /// nothing since a restore. No earlier position is undecided: a round decides the position
+    /// it emits before the next round emits. A running driver answers `None`, since rounds
+    /// planned ahead let its emits pass the decided path. The window may no longer hold the
+    /// row: a reader in the body that consumed it released it.
+    fn emitted_undecided(&self, decided: Option<&Path>) -> Option<Vec<Value>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.replaying {
+            return None;
+        }
+        state
+            .emitted_through
+            .as_ref()
+            .filter(|emitted| decided.is_none_or(|decided| *emitted > decided))
+            .map(|path| path.to_vec())
+    }
+
     fn completes_through(&self) -> Option<crate::interpreter::dispatcher::CompletionTarget> {
         Some(self.decides.clone())
     }
@@ -6542,6 +6568,7 @@ impl BreakingProducer for InductionDriverProducer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.window.resume(saved.window);
         state.emitted_through = saved.emitted_through;
+        state.replaying = true;
         state.source_released_through = saved.source_released_through;
         state.source_fully_released = saved.source_fully_released;
         state.source_complete = saved.source_complete;
@@ -6832,6 +6859,7 @@ impl InductionDriverProducer {
                 );
                 state.source.items.remove(&pos);
                 state.emitted_through = Some(pos);
+                state.replaying = false;
             }
         }
 
@@ -7121,6 +7149,8 @@ impl TileOperator for TransactDriver {
 
 /// A [`TransactDriverProducer`]'s state as a checkpoint copies it out.
 struct TransactDriverCheckpoint {
+    /// Whether the source said it adds nothing more ([`DecodedSource::terminal`]).
+    source_terminal: bool,
     rendered: Tile,
     window: DriverWindowProgress,
     latest_emit: Option<(Position, Position)>,
@@ -7430,16 +7460,18 @@ impl Breaker for TransactDriverProducer {
 }
 
 impl BreakingProducer for TransactDriverProducer {
-    /// The window of attempts, the last emit, the source region released, and the last
-    /// rendering. The decoded source is a cache of input the
-    /// drive has not released, which a drive compiled again reads whole at its first step, as an
-    /// induction drive does.
+    /// The window of attempts, the last emit, the source region released, the last rendering,
+    /// and whether the source has said it adds nothing more. The rest of the decoded source is a
+    /// cache of input the drive has not released, which a drive compiled again reads whole at its
+    /// first step, as an induction drive does. A drive that released its source whole pulls it no
+    /// more ([`advance`](Self::advance)), so only the copy keeps that the source ended.
     fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Box::new(TransactDriverCheckpoint {
+            source_terminal: state.source.terminal,
             rendered: state.rendered.clone(),
             window: state.window.progress(),
             latest_emit: state.latest_emit.clone(),
@@ -7455,6 +7487,7 @@ impl BreakingProducer for TransactDriverProducer {
             .state
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.source.terminal = saved.source_terminal;
         state.rendered = saved.rendered;
         state.window.resume(saved.window);
         state.latest_emit = saved.latest_emit;

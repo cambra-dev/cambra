@@ -10,15 +10,24 @@
 //!
 //! [`Checkpoint::persist`] models the write-ahead rule of `docs/durability.md`: a breaker persists
 //! its state before it releases its input. A test calls it after every top-level step, and it
-//! copies out each breaker whose releases changed since its last copy, so each breaker's copy is
-//! its state as of its last release, and breakers' copies are of different moments. The model
-//! never stops a run between a copy and the release it covers, nor inside one step.
+//! copies out each breaker whose releases or stated completeness changed since its last copy, so
+//! breakers' copies are of different moments. The model never stops a run between a copy and the
+//! release it covers, nor inside one step.
 //!
-//! Four gaps remain:
+//! A copy is taken where stated completeness changes as well as where a release changes. A reader that
+//! takes output the breaker states complete may hold it after the breaker's state has moved on, and
+//! the breaker must then answer that output the same way after a recovery. A transaction drive is
+//! the case that needs it: the row it emits for an attempt carries the store's frontier at the
+//! emit, which a drive recovered from an older copy would read differently.
 //!
-//! - A crash while a loop's or a transaction's request is open loses the request, which lives in
-//!   the run ([`Persisted::DuringRequest`]). A drive that had released a position the store had
-//!   not yet decided recovers past it, and nothing asks the store for it again.
+//! A loop's or a transaction's open request is run state and is not copied. A recovered run
+//! rebuilds it from the breakers. The store's pipeline queues the positions of its input the store
+//! has not released, as after a pause (`src/interpreter/design-dispatcher.md`, "Pause and
+//! reload"), and a loop's round first runs the position its drive emitted past the store's decided
+//! path ([`TileProducer::emitted_undecided`](super::TileProducer::emitted_undecided)).
+//!
+//! Three gaps remain:
+//!
 //! - A breaker's identity is its position in [`walk`], checked by its kind, tiling and input
 //!   roles. That holds only between two compilations of one text in one version.
 //! - A non-breaker that decides its upstream release from state built on a pull, such as
@@ -58,6 +67,10 @@ struct BreakerCheckpoint {
     /// The guard the breaker released to each producer it visits as an input, in visit order: a
     /// store's seeds as well as its body.
     taken: Vec<TileGuard>,
+    /// What the breaker stated complete ([`BreakingProducer::complete`]) when copied. Restore
+    /// does not install it; [`Checkpoint::persist`] copies the breaker again once it changes, since
+    /// a reader may then take output the breaker must answer the same way after a recovery.
+    stated: TileGuard,
 }
 
 /// What tells a breaker from another at the same position of [`walk`]: its name without the
@@ -105,29 +118,32 @@ pub(crate) struct Checkpoint {
 
 #[cfg(test)]
 impl Checkpoint {
-    /// Copy out each breaker under `roots` whose releases differ from its latest copy, or every
-    /// breaker where `every` is set, and every root's release. Answers what the step is to a
-    /// crash ([`Persisted`]).
-    pub(crate) fn persist(&mut self, roots: &[ProducerSlot], every: bool) -> Persisted {
+    /// Copy out each breaker under `roots` whose releases or stated completeness differ from its
+    /// latest copy, or every breaker where `every` is set, and every root's release.
+    ///
+    /// Answers `false`, and copies nothing, where a store is borrowed and the walk reached only
+    /// part of the graph. With one worker no step ends with a store borrowed; with several, a
+    /// worker can be inside one.
+    pub(crate) fn persist(&mut self, roots: &[ProducerSlot], every: bool) -> bool {
         let mut identities = Vec::new();
         let mut copies = Vec::new();
-        let mut open = false;
         let complete = walk_roots(roots, &mut |breaker| {
             let at = identities.len();
             identities.push(identity_of(breaker));
-            open |= breaker.has_open_request();
             let taken = taken_of(breaker);
+            let stated = breaker.complete();
             let changed = match self.breakers.get(at).and_then(Option::as_ref) {
-                Some(latest) => latest.taken != taken,
-                None => taken.iter().any(|guard| !guard.is_empty()),
+                Some(latest) => latest.taken != taken || latest.stated != stated,
+                None => taken.iter().any(|guard| !guard.is_empty()) || !stated.is_empty(),
             };
             copies.push((every || changed).then(|| BreakerCheckpoint {
                 state: breaker.checkpoint(),
                 taken,
+                stated,
             }));
         });
         if !complete {
-            return Persisted::Partial;
+            return false;
         }
         if self.identities.is_empty() {
             self.breakers = (0..identities.len()).map(|_| None).collect();
@@ -154,25 +170,8 @@ impl Checkpoint {
                     .clone()
             })
             .collect();
-        match open {
-            true => Persisted::DuringRequest,
-            false => Persisted::Whole,
-        }
+        true
     }
-}
-
-/// What a step is to a crash, as [`Checkpoint::persist`] answers it.
-#[cfg(test)]
-#[derive(Debug, PartialEq)]
-pub(crate) enum Persisted {
-    /// A store was borrowed, so the walk reached part of the graph and nothing was copied. With
-    /// one worker no step ends with a store borrowed; with several, a worker can be inside one.
-    Partial,
-    /// Every breaker was copied as needed, but a loop's or a transaction's request is open, whose
-    /// state lives in the run, which no checkpoint holds.
-    DuringRequest,
-    /// Every breaker was copied as needed, and recovering from the copies needs nothing else.
-    Whole,
 }
 
 /// Call `visit` on every breaker beneath `producer` once, depth first, a producer before its
@@ -235,10 +234,9 @@ fn walk_roots(roots: &[ProducerSlot], visit: &mut dyn FnMut(&mut dyn BreakingPro
 #[cfg(test)]
 pub(crate) fn capture(roots: &[ProducerSlot]) -> Checkpoint {
     let mut checkpoint = Checkpoint::default();
-    assert_eq!(
+    assert!(
         checkpoint.persist(roots, true),
-        Persisted::Whole,
-        "a drained boundary borrows no store and has no request open"
+        "a drained boundary borrows no store"
     );
     checkpoint
 }
