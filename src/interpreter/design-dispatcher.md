@@ -124,8 +124,20 @@ Transaction and induction drivers sample the store's committed snapshot. The pla
 seed opening before admitting their source items. Transaction replies commit as taps and are
 rekeyed from commit ticks to their original source positions.
 
-Live concatenation can wait for source closure. A live collection inside a record or a nested row
-reaches its reader once that row is whole ([A widened push](#a-widened-push)).
+A transaction store is notified of a delivery's keys as its writer's items, read off the extents of
+its input and its live ranges (`store_items`), since a writer may read its source through requests
+no push climbs. Where the input's domain is the live source's own, a delivery's keys are the items.
+Over a concatenation, a live range's positions stand under every arm whose extent is the range's
+(`Notifies::Items`). An arm whose extent reads no source, as a list arm, is queued whole with the
+first notification. Its items then commit before the source delivers anything, unless the store
+waits for its seed or for a pipeline it reads. A tagged guard is not cut into morsels
+(`cut_positions`), so a delivery is one package of the store at any morsel size. A store with an arm
+of any other extent, as a union nested under a tag, takes the arrivals its sources' ranges bring, as
+any pipeline does. A store that reads its items through another pipeline takes them as that
+pipeline's positions where its route to the store is an identity.
+
+A live collection inside a record or a nested row reaches its reader once that row is whole
+([A widened push](#a-widened-push)).
 
 ### Pause and reload
 
