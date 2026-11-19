@@ -2431,6 +2431,18 @@ fn dispatched_live_observed(
     source: &str,
     rows: usize,
     batches: Vec<Batch>,
+    idle: impl FnMut(&crate::interpreter::TestSink, &crate::interpreter::sinks::ProducerSlot),
+) -> (Value, Vec<Planned>) {
+    let workers = crate::interpreter::dispatcher::default_workers();
+    dispatched_live_observed_on(source, rows, workers, batches, idle)
+}
+
+/// [`dispatched_live_observed`] with `workers` workers.
+fn dispatched_live_observed_on(
+    source: &str,
+    rows: usize,
+    workers: usize,
+    batches: Vec<Batch>,
     mut idle: impl FnMut(&crate::interpreter::TestSink, &crate::interpreter::sinks::ProducerSlot),
 ) -> (Value, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
@@ -2463,13 +2475,17 @@ fn dispatched_live_observed(
         feed.set_yield_predicate(complete);
     };
     deliver(batches.next());
-    let planned =
-        crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+    let planned = crate::interpreter::dispatcher::run_program_polling_with_workers(
+        &mut program,
+        rows,
+        workers,
+        &mut || {
             idle(&sink, &root);
             deliver(batches.next())
-        })
-        .unwrap_or_else(|refused| panic!("{refused}"))
-        .planned;
+        },
+    )
+    .unwrap_or_else(|refused| panic!("{refused}"))
+    .planned;
     assert!(
         program.done.try_recv().is_ok(),
         "{source}: the run's last pull of the sink finds it done"
@@ -4893,9 +4909,10 @@ fn canonical(value: &Value) -> String {
 }
 
 /// A registered sink reading a live source through a widened pipeline holds each delivery's rows
-/// before the next delivery, once each, at every morsel size: through an equality join, a
-/// collection per row, a record component, and a collection inside a tuple row. The value at each
-/// idle is the source's keys 0 and 1, then keys 0 to 3, and the final value all five.
+/// before the next delivery, once each, at every morsel size and with one worker or four, where the
+/// pool admits no pipeline that is queued reads again: through an equality join, a collection per
+/// row, a record component, and a collection inside a tuple row. The value at each idle is the
+/// source's keys 0 and 1, then keys 0 to 3, and the final value all five.
 #[rstest_log::rstest]
 #[case::equality_join(
     "out << [x for x in source1() for y in [2, 4] if x == y]",
@@ -4955,20 +4972,61 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
     #[case] body: &str,
     #[case] expected: &[&str],
     #[values(1, usize::MAX)] rows: usize,
+    #[values(1, 4)] workers: usize,
 ) {
     let source = format!("out = test_sink()\n{body}\n");
     let mut written = Vec::new();
-    let (value, _) = dispatched_live_observed(&source, rows, three_batches(), |sink, _| {
-        assert_eq!(
-            sink.value(),
-            Err(crate::interpreter::SinkReadError::Incomplete),
-            "the feed stays open until the source ends"
-        );
-        let partial = sink
-            .written_so_far()
-            .unwrap_or_else(|error| panic!("{body}: the delivery's rows reach the sink: {error}"));
-        written.push(canonical(&single_value(&partial)));
-    });
+    let (value, planned) =
+        dispatched_live_observed_on(&source, rows, workers, three_batches(), |sink, _| {
+            assert_eq!(
+                sink.value(),
+                Err(crate::interpreter::SinkReadError::Incomplete),
+                "the feed stays open until the source ends"
+            );
+            let partial = sink.written_so_far().unwrap_or_else(|error| {
+                panic!("{body}: the delivery's rows reach the sink: {error}")
+            });
+            written.push(canonical(&single_value(&partial)));
+        });
     written.push(canonical(&single_value(&value)));
     assert_eq!(written, expected, "{body}");
+    // Each case's only pipeline with a parallel level is the memo over the live source, which is
+    // queued reads again, so the pool admits nothing and no package runs on a worker.
+    assert!(
+        planned.iter().all(|planned| planned.worker_claims == 0),
+        "{body}: a pipeline queued reads again runs on the coordinator: {planned:?}"
+    );
+}
+
+/// A loop over a map literal inside another loop: the inner loop's `MapAggregate` reads a
+/// `MapResult` chain whose inner `MapResult` restates the outermost keys only. Its parallel level
+/// names the inner level, but the chain refuses a pull there, so the pool admits no package of it
+/// at any number of workers, and each answers what one worker answers.
+#[test]
+fn a_fold_over_a_chain_refusing_its_inner_level_answers_at_each_dop() {
+    let source = indoc! {r#"
+        out = test_sink()
+        for i in [1, 2]:
+            for q in map(["a" -> 1, "b" -> 2]):
+                out << q
+    "#};
+    let written = |workers: usize| {
+        let mut ctx = GlobalContext::default();
+        let sink = ctx.register_test_sink("out");
+        let mut program =
+            compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
+        let _operators = ctx.take_operator_map();
+        crate::interpreter::dispatcher::run_program_with_workers(&mut program, 1, workers)
+            .unwrap_or_else(|refused| panic!("{source} dispatches: {refused:?}"));
+        sink.value()
+            .unwrap_or_else(|error| panic!("{source} writes: {error:?}"))
+    };
+    let one = written(1);
+    assert_eq!(
+        one.to_string(),
+        r#"Function [ {u0, "a"} -> 1, {u0, "b"} -> 2, {u1, "a"} -> 1, {u1, "b"} -> 2 ]"#
+    );
+    for workers in [2, 4] {
+        assert_eq!(written(workers), one, "{workers} workers");
+    }
 }
