@@ -726,6 +726,25 @@ fn run_targets(
             }
         }
     }
+    // Over live sources, a reader that waits for its inputs reads all of its input again at each
+    // push that reaches it widened, where its breaker reads an open input, so what such a push
+    // brings is published before the sources close. A `main` output reads an open input only
+    // once it hands each package's answer.
+    if !live.is_empty() {
+        for (pipeline, &takes_arrivals) in arrivals.iter().enumerate() {
+            if dispatcher.infos[pipeline].waits_for_inputs
+                && !takes_arrivals
+                && reads_open_input(&mut reach, PipelineId(pipeline))
+            {
+                let mut input = None;
+                reach(PipelineId(pipeline), &mut |breaker, at| {
+                    input = Some(breaker.input_tiling(at));
+                });
+                let input = input.expect("a reach calls the breaker it reaches");
+                dispatcher.read_again_on_widened_push(PipelineId(pipeline), &input);
+            }
+        }
+    }
     // Initialize every planned breaker before any package executes.
     for pipeline in 0..members.names.len() {
         reach(PipelineId(pipeline), &mut |breaker, _| breaker.begin_run());
@@ -2814,7 +2833,9 @@ enum Notifies {
     /// Of the region a push of a delivery's keys through the range's consumer brings the
     /// pipeline's entry.
     Arrivals,
-    /// Of its whole input, once every source it reads yields everything, and of nothing before.
+    /// Of its whole input once every source it reads yields everything, and, where its breaker
+    /// reads an open input (`Breaker::reads_open_input`), read again after each delivery
+    /// ([`Dispatcher::notify_again`]).
     Whole,
     /// A loop's scope: of a delivery's keys as the positions of its rounds.
     Rounds,
@@ -2878,6 +2899,7 @@ impl LivePipeline {
         // Several ranges can read one source, so a scope or a store is notified of the positions
         // they gained together, once.
         let mut positions = Predicate::False;
+        let mut delivered = false;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
         for (leaf, notified) in &mut self.leaves {
             let yielded = leaf.extent.complete_region();
@@ -2902,7 +2924,7 @@ impl LivePipeline {
                         arrivals = arrivals.union(&arrival.guard);
                     }
                 }
-                Notifies::Whole => {}
+                Notifies::Whole => delivered = true,
                 Notifies::Rounds | Notifies::Items => {
                     // A round runs once every position before it is complete, so a range read in
                     // rounds must yield a prefix of the positions of the field that orders it. A
@@ -2955,15 +2977,24 @@ impl LivePipeline {
                 &Projection::admitting(positions).guard(&self.input),
             );
         }
-        if complete {
-            if matches!(self.notifies, Notifies::Whole) {
-                notify_unreleased(
-                    dispatcher,
-                    reach,
-                    self.pipeline,
-                    &self.input.universal_guard(),
-                );
+        // A delivery reaches a widened pipeline as a change anywhere in its input. A breaker that
+        // reads an open input reads all of it again, releasing what the answer states complete,
+        // which publishes it before the sources close. Every widened pipeline reads its input once
+        // every source yields everything, held until the inputs it waits for have completed it:
+        // that read takes what no read again took, as rows an input that reaches it widened
+        // completes after the last delivery.
+        if matches!(self.notifies, Notifies::Whole) {
+            if delivered
+                && reads_open_input(reach, self.pipeline)
+                && reads_unreleased(reach, self.pipeline)
+            {
+                dispatcher.notify_again(self.pipeline, &self.input.universal_guard());
             }
+            if complete && reads_unreleased(reach, self.pipeline) {
+                dispatcher.notify(self.pipeline, &self.input.universal_guard());
+            }
+        }
+        if complete {
             dispatcher.close(self.pipeline);
             self.closed = true;
             changed = true;
@@ -2990,6 +3021,27 @@ fn notify_unreleased(
     if let Some(pending) = pending {
         dispatcher.notify(pipeline, &pending);
     }
+}
+
+/// Whether `pipeline`'s breaker reads an open input (`Breaker::reads_open_input`).
+fn reads_open_input(reach: &mut Reach<'_>, pipeline: PipelineId) -> bool {
+    let mut reads_open = false;
+    reach(pipeline, &mut |breaker, _| {
+        reads_open = breaker.reads_open_input();
+    });
+    reads_open
+}
+
+/// Whether the pipeline's input has not released all of itself. A read of a widened pipeline's
+/// input asks for everything rather than for what is unreleased: that region can name keys beneath
+/// the outermost or within a record, which a widened operator cannot be pulled at, and a released
+/// key answers nothing.
+fn reads_unreleased(reach: &mut Reach<'_>, pipeline: PipelineId) -> bool {
+    let mut released_whole = false;
+    reach(pipeline, &mut |breaker, at| {
+        released_whole = breaker.input_released(at).is_universal();
+    });
+    !released_whole
 }
 
 /// [`drive`] over a run with source pipelines over live sources (`live`). The other sources

@@ -2375,6 +2375,34 @@ fn two_batches() -> Vec<Batch> {
     ]
 }
 
+/// Three deliveries of `source1`: keys 0 and 1, keys 2 and 3, then key 4 with everything called
+/// complete, each value one more than its key.
+fn three_batches() -> Vec<Batch> {
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    vec![
+        (
+            entries(0..2),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(1)),
+        ),
+        (
+            entries(2..4),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(3)),
+        ),
+        (entries(4..5), crate::interpreter::Predicate::True),
+    ]
+}
+
+/// The value written under a sink's one row.
+fn single_value(written: &Value) -> Value {
+    let [binding] = written.as_function().as_slice() else {
+        panic!("the sink holds one row: {written:?}")
+    };
+    binding.output.clone()
+}
+
 /// Two deliveries whose first yields keys 0 and 2 but not 1, so the first yield is not a prefix of
 /// the source's keys, which every live source's yield is.
 fn out_of_order_batches() -> Vec<Batch> {
@@ -2642,7 +2670,8 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
 
 /// A feed of a map over a live source is keyed by the sink's one row, which holds the whole map, so
 /// a delivery's keys reach the pipeline above the source widened. The pipeline reads its input
-/// whole once the source yields everything.
+/// again after each delivery, so the sink holds each delivery's rows before the next, and once more
+/// after the source yields everything.
 #[rstest_log::rstest]
 #[case::every_key(
     indoc! {"
@@ -2663,12 +2692,63 @@ fn a_feed_of_a_map_over_a_live_source(
     #[case] expected: Vec<(u64, i64)>,
     #[values(1, usize::MAX)] rows: usize,
 ) {
-    let (value, planned) = dispatched_live(source, rows, two_batches());
-    assert_eq!(keyed_ints(&value), expected);
+    let mut written_before_next_delivery = Vec::new();
+    let (value, planned) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+        assert_eq!(
+            sink.value(),
+            Err(crate::interpreter::SinkReadError::Incomplete),
+            "the feed stays open until the source ends"
+        );
+        let partial = sink
+            .written_so_far()
+            .map(|written| keyed_ints(&single_value(&written)))
+            .unwrap_or_default();
+        written_before_next_delivery.push(partial);
+    });
+    assert_eq!(keyed_ints(&single_value(&value)), expected);
+    // The rows of the keys delivered before each idle, keys 0 and 1, then keys 0 to 3.
+    let delivered_through = |last: u64| -> Vec<(u64, i64)> {
+        expected
+            .iter()
+            .copied()
+            .filter(|&(key, _)| key <= last)
+            .collect()
+    };
+    assert_eq!(
+        written_before_next_delivery,
+        vec![delivered_through(1), delivered_through(3)],
+        "each delivery's rows reach the sink before the next, each once"
+    );
     assert!(
         planned.iter().any(|plan| plan.live && plan.whole),
         "a live pipeline reads its input whole: {planned:?}"
     );
+}
+
+/// A filter that reads a sum over the same live source holds its rows until the sum is decided: the
+/// sum of the first delivery passes the filter and the sum of every delivery does not, so the sink
+/// holds no row at any idle and none at the end.
+#[rstest_log::rstest]
+fn a_filter_over_an_undecided_sum_writes_nothing_before_the_sum_is_decided(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        out << [x for x in source1() if sum(source1()) < 10]
+    "};
+    let mut idles = 0;
+    let (value, _) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+        idles += 1;
+        assert_eq!(
+            sink.written_so_far()
+                .map(|written| keyed_ints(&single_value(&written)))
+                .unwrap_or_default(),
+            Vec::new(),
+            "a row of an undecided filter reaches no sink"
+        );
+    });
+    assert_eq!(idles, 2);
+    assert_eq!(keyed_ints(&single_value(&value)), Vec::new());
 }
 
 /// A feed written in a loop over a live source, at the `main` output: the output is handed each
@@ -3242,6 +3322,28 @@ impl crate::interpreter::dispatcher::RunObserver for PauseAtOnce {
             total += x * y
     total
 "}, "45")]
+#[case::an_equality_join(
+    "[x for x in source1() for y in [2, 4] if x == y]",
+    "[(_0: u1, _1: u0) -> 2, (_0: u3, _1: u1) -> 4]"
+)]
+#[case::a_collection_per_row(
+    "[[y * x for y in source1()] for x in [1, 2]]",
+    "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+      u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]"
+)]
+#[case::a_record_component(
+    "r = (n=1, xs=source1())\nr.xs",
+    "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]"
+)]
+#[case::a_field_of_a_bound_tuple_row(indoc! {"
+    xs = [(x, [y * x for y in source1()]) for x in [1, 2]]
+    [p.0 for p in xs]
+"}, "[u0 -> 1, u1 -> 2]")]
+#[case::a_bound_tuple_row(indoc! {"
+    xs = [(x, [y * x for y in source1()]) for x in [1, 2]]
+    [p.1 for p in xs]
+"}, "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+      u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]")]
 fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     #[case] source: &str,
     #[case] expected: &str,
@@ -3303,7 +3405,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         "the first delivery's run pauses, and the run after the last delivery ends"
     );
     let value = main.kept.value().expect("the `main` output's value");
-    assert_eq!(rendered_in_key_order(&value), expected, "{source}");
+    assert_eq!(canonical(&value), expected, "{source}");
 }
 
 /// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.
@@ -3574,19 +3676,30 @@ fn a_sum_over_live_rows_carrying_a_constant(
 }
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
-/// a delivery's keys reach the sink's pipeline widened, and that pipeline reads its input whole
-/// once the source yields everything, waiting for inputs until the sum is decided.
+/// a delivery's keys reach the sink's pipeline widened. That pipeline waits for its inputs until
+/// the sum is decided, reads its input again after each delivery, so the sink holds each
+/// delivery's rows before the next, and reads it once more after the source yields everything.
 #[rstest_log::rstest]
 fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
         out = test_sink()
         out << [x for x in source1() if sum([1, 2, 3]) > 5]
     "};
-    let (value, planned) = dispatched_live(source, rows, two_batches());
-    assert_eq!(
-        keyed_ints(&value),
-        (0..5).map(|key| (key, key as i64 + 1)).collect::<Vec<_>>()
-    );
+    let mut written_before_next_delivery = Vec::new();
+    let (value, planned) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+        let partial = sink
+            .written_so_far()
+            .map(|written| keyed_ints(&single_value(&written)))
+            .unwrap_or_default();
+        written_before_next_delivery.push(partial);
+    });
+    let through = |last: u64| {
+        (0..=last)
+            .map(|key| (key, key as i64 + 1))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(written_before_next_delivery, vec![through(1), through(3)]);
+    assert_eq!(keyed_ints(&single_value(&value)), through(4));
     assert!(
         planned
             .iter()
@@ -4369,4 +4482,119 @@ fn small_morsels_refresh_transaction_sources(
     #[values(1, 2, usize::MAX)] rows: usize,
 ) {
     assert_eq!(dispatched(source, rows).0, expected);
+}
+
+/// `value` with every collection's rows sorted, so two values compare equal whatever order their
+/// rows arrived in.
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Function(bindings) => {
+            let mut rows: Vec<String> = bindings
+                .iter()
+                .map(|binding| {
+                    format!(
+                        "{} -> {}",
+                        canonical(&binding.input),
+                        canonical(&binding.output)
+                    )
+                })
+                .collect();
+            rows.sort();
+            format!("[{}]", rows.join(", "))
+        }
+        Value::Record(fields) => {
+            let mut fields: Vec<String> = fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", canonical(value)))
+                .collect();
+            fields.sort();
+            format!("({})", fields.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A registered sink reading a live source through a widened pipeline holds each delivery's rows
+/// before the next delivery, once each, at every morsel size: through an equality join, a
+/// collection per row, a record component, and a collection inside a tuple row. The value at each
+/// idle is the source's keys 0 and 1, then keys 0 to 3, and the final value all five.
+#[rstest_log::rstest]
+#[case::equality_join(
+    "out << [x for x in source1() for y in [2, 4] if x == y]",
+    &[
+        "[(_0: u1, _1: u0) -> 2]",
+        "[(_0: u1, _1: u0) -> 2, (_0: u3, _1: u1) -> 4]",
+        "[(_0: u1, _1: u0) -> 2, (_0: u3, _1: u1) -> 4]",
+    ],
+)]
+#[case::collection_per_row(
+    "out << [[y * x for y in source1()] for x in [1, 2]]",
+    &[
+        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+          u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]",
+    ],
+)]
+#[case::record_component(
+    "r = (n=1, xs=source1())\nout << r.xs",
+    &[
+        "[u0 -> 1, u1 -> 2]",
+        "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]",
+        "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]",
+    ],
+)]
+#[case::collection_in_a_tuple_row(
+    "out << [(x, [y * x for y in source1()]) for x in [1, 2]]",
+    &[
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
+    ],
+)]
+#[case::a_field_of_a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.0 for p in xs]",
+    &["[u0 -> 1, u1 -> 2]", "[u0 -> 1, u1 -> 2]", "[u0 -> 1, u1 -> 2]"],
+)]
+#[case::a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
+    &[
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
+    ],
+)]
+#[case::the_collection_field_of_a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.1 for p in xs]",
+    &[
+        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+          u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]",
+    ],
+)]
+fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
+    #[case] body: &str,
+    #[case] expected: &[&str],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = format!("out = test_sink()\n{body}\n");
+    let mut written = Vec::new();
+    let (value, _) = dispatched_live_observed(&source, rows, three_batches(), |sink, _| {
+        assert_eq!(
+            sink.value(),
+            Err(crate::interpreter::SinkReadError::Incomplete),
+            "the feed stays open until the source ends"
+        );
+        let partial = sink
+            .written_so_far()
+            .unwrap_or_else(|error| panic!("{body}: the delivery's rows reach the sink: {error}"));
+        written.push(canonical(&single_value(&partial)));
+    });
+    written.push(canonical(&single_value(&value)));
+    assert_eq!(written, expected, "{body}");
 }
