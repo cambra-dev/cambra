@@ -8,6 +8,7 @@
 //! op-conversion lowering consume.
 
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use std::collections::HashSet;
 
 use super::*;
@@ -360,15 +361,19 @@ fn compile_predicates_in_type(
         } => {
             compile_predicates_in_type(domain, memo, slot);
             match name {
-                Some(b) => crate::ccl::subst::map_opened_codomain(b, codomain, |opened| {
-                    compile_predicates_in_type(opened, memo, slot)
-                }),
+                Some(b) => crate::ccl::subst::map_opened_codomain(
+                    &mut Solver::none(),
+                    b,
+                    codomain,
+                    |opened| compile_predicates_in_type(opened, memo, slot),
+                ),
                 None => compile_predicates_in_type(codomain, memo, slot),
             }
         }
         Type::DepTuple(components) => {
             let names = crate::ccl::subst::tuple_component_names(components);
             let mut opened: Vec<(Option<Name>, Type)> = crate::ccl::subst::open_tuple_components(
+                &mut Solver::none(),
                 components,
                 |j, _| crate::ccl::subst::Mapping::Rename(names[j].clone()),
                 crate::ccl::Ids::Fresh,
@@ -380,7 +385,11 @@ fn compile_predicates_in_type(
                 (Some(name.clone()), t)
             })
             .collect();
-            crate::ccl::subst::close_tuple_components(&mut opened, crate::ccl::Ids::Fresh);
+            crate::ccl::subst::close_tuple_components(
+                &mut Solver::none(),
+                &mut opened,
+                crate::ccl::Ids::Fresh,
+            );
             for ((_, component), (_, t)) in components.iter_mut().zip(opened) {
                 *component = t;
             }
@@ -390,9 +399,12 @@ fn compile_predicates_in_type(
             for (_, t) in binders.iter_mut() {
                 compile_predicates_in_type(t, memo, slot);
             }
-            crate::ccl::subst::map_opened_family_body(binders, body, |opened| {
-                compile_predicates_in_type(opened, memo, slot)
-            });
+            crate::ccl::subst::map_opened_family_body(
+                &mut Solver::none(),
+                binders,
+                body,
+                |opened| compile_predicates_in_type(opened, memo, slot),
+            );
         }
         _ => ty.walk_children_mut(|child| compile_predicates_in_type(child, memo, slot)),
     }

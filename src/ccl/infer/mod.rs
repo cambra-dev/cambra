@@ -67,6 +67,7 @@ impl ModuleCheckParam {
     }
 }
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -255,9 +256,13 @@ fn find_node(expr: &Expr, id: NodeId) -> Option<&Expr> {
 }
 
 /// Why two functions' kinds do not relate, read off what each side's kind settled to.
-fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
+fn kind_mismatch_reason(solver: &mut Solver, lhs: &Type, rhs: &Type) -> &'static str {
     use crate::ccl::ty::KindPin;
-    let pin = |t: &Type| t.peel_refinements().fun_kind_of().map(|k| k.resolved());
+    let pin = |t: &Type| {
+        t.peel_refinements()
+            .fun_kind_of()
+            .map(|k| k.resolved_in(solver))
+    };
     match (pin(lhs), pin(rhs)) {
         (Some(KindPin::Sum(_)), Some(KindPin::Plain)) => {
             "a sum reached a plain collection — a sum's domain is its witness, which no written \
@@ -284,10 +289,10 @@ fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
 /// when the message is written: the variables' bounds are gone by then, and the
 /// message reads them (`chl_print` writes a read of a collection as `xs[i]!` and a
 /// call as `f(x)`, which only the callee's type tells apart).
-pub(super) fn coalesce_for_error(ty: &Type) -> Type {
-    let mut resolved = resolve_var_type(ty).unwrap_or(Type::Hole);
-    resolve_predicate_types(&mut resolved);
-    respell_tuple_binders(&mut resolved);
+pub(super) fn coalesce_for_error(solver: &mut Solver, ty: &Type) -> Type {
+    let mut resolved = resolve_var_type(solver, ty).unwrap_or(Type::Hole);
+    resolve_predicate_types(solver, &mut resolved);
+    respell_tuple_binders(solver, &mut resolved);
     resolved
 }
 
@@ -295,15 +300,15 @@ pub(super) fn coalesce_for_error(ty: &Type) -> Type {
 /// no later one reads is unnamed, as a plain tuple's are, and a name the compiler minted that a
 /// later component reads, as `uncurry`'s scheme names its keys, is respelled `k`, numbered where
 /// the type already holds that spelling (the spelling `chl_print` gives a minted key binder).
-fn respell_tuple_binders(ty: &mut Type) {
+fn respell_tuple_binders(solver: &mut Solver, ty: &mut Type) {
     let mut taken: HashSet<String> = crate::ccl::subst::type_free_vars(ty)
         .iter()
         .map(|n| n.base().to_string())
         .collect();
-    respell_in(ty, &mut taken);
+    respell_in(solver, ty, &mut taken);
 
-    fn respell_in(ty: &mut Type, taken: &mut HashSet<String>) {
-        ty.walk_children_mut(|child| respell_in(child, taken));
+    fn respell_in(solver: &mut Solver, ty: &mut Type, taken: &mut HashSet<String>) {
+        ty.walk_children_mut(|child| respell_in(solver, child, taken));
         let Type::DepTuple(components) = ty else {
             return;
         };
@@ -313,6 +318,7 @@ fn respell_tuple_binders(ty: &mut Type) {
             .map(|_| Name::fresh("__respelled"))
             .collect();
         let mut opened = crate::ccl::subst::open_tuple_components(
+            solver,
             components,
             |j, _| crate::ccl::subst::Mapping::Rename(placeholders[j].clone()),
             crate::ccl::Ids::Fresh,
@@ -343,7 +349,7 @@ fn respell_tuple_binders(ty: &mut Type) {
                 for from in renames {
                     let rename = crate::ccl::subst::Subst::rename(from.clone(), to.clone());
                     for later in &mut opened[i + 1..] {
-                        *later = rename.apply_type(later);
+                        *later = rename.apply_type_in(solver, later);
                     }
                 }
             }
@@ -356,25 +362,25 @@ fn respell_tuple_binders(ty: &mut Type) {
 /// Resolve every node type inside `ty`'s refinement predicates, on a copy of each
 /// predicate: the copy is for a message, so nothing shares it. See
 /// [`coalesce_for_error`] for why a message's types are resolved when it is raised.
-pub(super) fn resolve_predicate_types(ty: &mut Type) {
-    fn resolve_expr(e: &mut TypedExpr) {
+pub(super) fn resolve_predicate_types(solver: &mut Solver, ty: &mut Type) {
+    fn resolve_expr(solver: &mut Solver, e: &mut TypedExpr) {
         // A collection's `elements` call is the identity, which coalescing drops; the message
         // reads the collection as the program spells it.
-        while let Some(collection) = solve::elements_of_a_collection(e) {
+        while let Some(collection) = solve::elements_of_a_collection(solver, e) {
             *e = collection;
         }
-        if let Ok(resolved) = resolve_var_type(&e.ty) {
+        if let Ok(resolved) = resolve_var_type(solver, &e.ty) {
             e.ty = resolved;
         }
-        resolve_predicate_types(&mut e.ty);
-        e.walk_children_mut(resolve_expr);
+        resolve_predicate_types(solver, &mut e.ty);
+        e.walk_children_mut(|x| resolve_expr(solver, x));
     }
     match ty {
         Type::Refinement(_, refinements) => {
             refinements.rewrite_each(|_, r| {
                 let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
                 let mut predicate = (*r.predicate).duplicate();
-                resolve_expr(&mut predicate);
+                resolve_expr(solver, &mut predicate);
                 *r = Refinement::born(Rc::new(predicate));
             });
         }
@@ -383,20 +389,24 @@ pub(super) fn resolve_predicate_types(ty: &mut Type) {
         Type::WitnessProjection(p) => {
             let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
             let mut term = (*p.term).duplicate();
-            resolve_expr(&mut term);
+            resolve_expr(solver, &mut term);
             *p = crate::ccl::ty::WitnessProjection::new(Rc::new(term), p.position);
         }
         _ => {}
     }
-    ty.walk_children_mut(resolve_predicate_types);
+    ty.walk_children_mut(|x| resolve_predicate_types(solver, x));
 }
 
 /// Map a [`ConstrainError`] onto the public [`InferError`] enum.
-pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferError {
+pub(super) fn map_constrain_err(
+    solver: &mut Solver,
+    err: ConstrainError,
+    ctx_label: &str,
+) -> InferError {
     match err {
         ConstrainError::Mismatch { lhs, rhs } => {
-            let lhs_ty = coalesce_for_error(&lhs);
-            let rhs_ty = coalesce_for_error(&rhs);
+            let lhs_ty = coalesce_for_error(solver, &lhs);
+            let rhs_ty = coalesce_for_error(solver, &rhs);
             // `constrain_subtype(lhs, rhs)` means `lhs <: rhs`. If rhs is a function
             // and lhs is not, the caller passed a non-function where a function
             // was expected (e.g. applying a non-function at an Apply site).
@@ -415,7 +425,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         }
         ConstrainError::MissingField { key, in_type } => InferError::MissingField {
             key,
-            found: Box::new(coalesce_for_error(&in_type)),
+            found: Box::new(coalesce_for_error(solver, &in_type)),
             at: ctx_label.to_string(),
         },
         // `ExtraTag` is `MissingField`'s dual: the width violation is a *tag set*,
@@ -424,18 +434,18 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // better fix, and is left to whoever next works the variant diagnostics.
         ConstrainError::ExtraTag { tag, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
-            found: Box::new(coalesce_for_error(&in_type)),
+            found: Box::new(coalesce_for_error(solver, &in_type)),
             expected: None,
         },
         ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
-            found: Box::new(coalesce_for_error(&found)),
-            expected: Some(Box::new(coalesce_for_error(&required))),
+            found: Box::new(coalesce_for_error(solver, &found)),
+            expected: Some(Box::new(coalesce_for_error(solver, &required))),
         },
         ConstrainError::KindMismatch { lhs, rhs } => InferError::TypeMismatch {
-            ctx: format!("{ctx_label} ({})", kind_mismatch_reason(&lhs, &rhs)),
-            found: Box::new(coalesce_for_error(&lhs)),
-            expected: Some(Box::new(coalesce_for_error(&rhs))),
+            ctx: format!("{ctx_label} ({})", kind_mismatch_reason(solver, &lhs, &rhs)),
+            found: Box::new(coalesce_for_error(solver, &lhs)),
+            expected: Some(Box::new(coalesce_for_error(solver, &rhs))),
         },
         ConstrainError::ParamReadsBinder { chosen, binder } => {
             let binder = binder.source_spelling().map(str::to_string);
@@ -499,7 +509,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // Reported with the same `ctx` a coalesce-time kinding failure uses: the two
         // differ only in when the type side became known.
         ConstrainError::NotOfKind { found, type_kind } => InferError::TypeMismatch {
-            found: Box::new(coalesce_for_error(&found)),
+            found: Box::new(coalesce_for_error(solver, &found)),
             expected: Some(Box::new(Type::sum_over(type_kind, None, Type::Hole))),
             ctx: "collection annotation".to_string(),
         },
@@ -530,17 +540,20 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             // conflict, since the side would otherwise render as `_`.
             if let Some(conflict) = [&lhs, &rhs]
                 .into_iter()
-                .find_map(|t| resolve_var_type(t).err())
+                .find_map(|t| resolve_var_type(solver, t).err())
             {
                 return map_coalesce_err(conflict, ctx_label);
             }
-            let (found, expected) = (coalesce_for_error(&lhs), coalesce_for_error(&rhs));
+            let (found, expected) = (
+                coalesce_for_error(solver, &lhs),
+                coalesce_for_error(solver, &rhs),
+            );
             // Where the two render alike, the report is the sub-comparison that found
             // them unequal ([`ConstrainError::DataDomainMismatch`]'s `cause`, whose doc
             // says why it is carried): its own sides differ structurally, so
             // [`identical_rendering_hint`] can quote the divergence.
             if crate::ccl::chl_print::renders_alike(&found, &expected) {
-                return map_constrain_err(*cause, ctx_label);
+                return map_constrain_err(solver, *cause, ctx_label);
             }
             InferError::TypeMismatch {
                 ctx: "collection domain (a collection's domain is its data, so it is \
@@ -555,14 +568,17 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // same `InferError` so the message follows the situation rather than which phase
         // noticed it.
         ConstrainError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
-            domains: domains.iter().map(coalesce_for_error).collect(),
+            domains: domains
+                .iter()
+                .map(|x| coalesce_for_error(solver, x))
+                .collect(),
             origin: ctx_label.to_string(),
         },
         ConstrainError::NoJoin { types } => InferError::IncompatibleBounds {
             polarity: true,
             conflicting: types
                 .iter()
-                .map(|t| coalesce_for_error(t).to_string())
+                .map(|t| coalesce_for_error(solver, t).to_string())
                 .collect::<Vec<_>>()
                 .join(" | "),
             origin: ctx_label.to_string(),
@@ -751,6 +767,8 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
 pub(crate) fn case_result_ty<'a>(
     arms: impl IntoIterator<Item = &'a Type>,
 ) -> Result<Type, InferError> {
+    // A run of its own: the join is decided by the arms' types alone.
+    let solver = &mut Solver::new();
     let arms: Vec<&Type> = arms.into_iter().collect();
     let mut telescope = crate::ccl::infer_var::Telescope::empty();
     for name in arms
@@ -760,13 +778,13 @@ pub(crate) fn case_result_ty<'a>(
     {
         telescope = telescope.extended(name);
     }
-    let result = Type::Infer(crate::ccl::InferVar::fresh_in(0, &telescope));
+    let result = Type::Infer(crate::ccl::InferVar::fresh_in(solver, 0, &telescope));
     let mut cache = solver::ConstrainCache::for_derivation(solver::Derivation::PostPass);
     for arm in arms {
-        solver::constrain_subtype_in(arm, &result, &mut cache, &solver::smt::NoScope)
-            .map_err(|e| map_constrain_err(e, "Case arm"))?;
+        solver::constrain_subtype_in(solver, arm, &result, &mut cache, &solver::smt::NoScope)
+            .map_err(|e| map_constrain_err(solver, e, "Case arm"))?;
     }
-    resolve_var_type(&result).map_err(|e| map_coalesce_err(e, "Case arm"))
+    resolve_var_type(solver, &result).map_err(|e| map_coalesce_err(e, "Case arm"))
 }
 
 /// Run Cambra's type inference on `expr`.
@@ -803,19 +821,15 @@ pub(crate) fn run(
 /// the first capability beyond it entered, with the clause or the written type as the secondary
 /// label.
 /// `beyond_clause` spells a capability a clause does not list ([`InferCtx::item_beyond_clause`]).
-fn push_capability_failures(
-    errors: &mut Vec<LocatedInferError>,
-    expr: &Expr,
-    beyond_clause: &dyn Fn(&crate::ccl::capabilities::Capability, chl_parser::ast::Span) -> String,
-) {
+fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr, ctx: &mut InferCtx) {
     use crate::ccl::capabilities::Blame;
     use crate::ccl::infer_var::Origin;
     // Each use of a polymorphic definition checks its own copy of the definition's bounds,
     // and the copies name the definition's nodes, so one failure is reported once.
     let mut reported = HashSet::new();
-    for failure in crate::ccl::capabilities::exceeded_uppers() {
+    for failure in crate::ccl::capabilities::exceeded_uppers(&mut ctx.solver) {
         let item = match failure.blame {
-            Blame::Clause(at) => beyond_clause(&failure.capability.item, at),
+            Blame::Clause(at) => ctx.item_beyond_clause(&failure.capability.item, at),
             _ => failure.capability.item.to_string(),
         };
         if !reported.insert((failure.capability.at, item.clone(), failure.blame)) {
@@ -1387,18 +1401,33 @@ fn run_once(
     public: &HashSet<Name>,
     marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
 ) -> Result<Inferred, RunFailure> {
-    let result = attempt_run(expr, sources, instances, params, reported, public, marks);
+    // Convert source registry once; reuse across all node emissions.
+    let mut sub_ctx = {
+        // The run's solver: the sources' variables are minted in it, and the context that
+        // types the tree takes it over, so the two share one graph.
+        let mut pre = InferCtx::new(Solver::new(), HashMap::new(), expr.node_id());
+        let translated: HashMap<String, Type> = sources
+            .iter()
+            .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))
+            .collect();
+        // Seed the blame cursor with the root: every error is stamped with the
+        // node whose rule raised it, and the root is the outermost such node.
+        let mut ctx = InferCtx::new(std::mem::take(&mut pre.solver), translated, expr.node_id());
+        ctx.instances = Rc::clone(instances);
+        ctx
+    };
+    let result = attempt_run(&mut sub_ctx, expr, params, reported, public, marks);
     if result.is_err() {
-        solve::settle_capabilities(expr);
+        solve::settle_capabilities(&mut sub_ctx.solver, expr);
     }
     result
 }
 
-/// [`run_once`] up to settling a failed run's capabilities.
+/// [`run_once`] up to settling a failed run's capabilities, in `sub_ctx`, which holds the run's
+/// solver.
 fn attempt_run(
+    sub_ctx: &mut InferCtx,
     expr: &mut Expr,
-    sources: &HashMap<String, Type>,
-    instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
@@ -1407,19 +1436,6 @@ fn attempt_run(
     let failed = |errors| RunFailure {
         errors,
         recovered: Vec::new(),
-    };
-    // Convert source registry once; reuse across all node emissions.
-    let mut sub_ctx = {
-        let pre = InferCtx::new(HashMap::new(), expr.node_id());
-        let translated: HashMap<String, Type> = sources
-            .iter()
-            .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))
-            .collect();
-        // Seed the blame cursor with the root: every error is stamped with the
-        // node whose rule raised it, and the root is the outermost such node.
-        let mut ctx = InferCtx::new(translated, expr.node_id());
-        ctx.instances = Rc::clone(instances);
-        ctx
     };
     let opened = sub_ctx
         .open_module_params(params)
@@ -1437,21 +1453,24 @@ fn attempt_run(
     // After any error the passes below do not run: the graph holds whatever
     // constraints the failed statements wrote before they failed, and lacks the
     // rest. `run_with_params` starts over without those statements instead.
-    let emitted = emit_node(expr, &mut sub_ctx);
-    if emitted.is_err() || typing::Typing::recoveries(&sub_ctx) != 0 {
-        solver::traits::clear_held_answers();
+    let emitted = emit_node(expr, sub_ctx);
+    if emitted.is_err() || typing::Typing::recoveries(&*sub_ctx) != 0 {
+        solver::traits::clear_held_answers(&mut sub_ctx.solver);
     }
     // Every definition settled its own families' held answers as it closed; what remains
     // names a family no definition declares, such as a module check's parameter.
     let emitted = emitted.and_then(|ty| {
-        solver::traits::settle_held_answers(None, &mut solver::ConstrainCache::new()).map_err(
-            |e| LocatedInferError {
-                error: map_constrain_err(e, "a requirement under `forall`"),
-                node_id: expr.node_id(),
-                also: Box::default(),
-                related: RelatedPositions::default(),
-            },
-        )?;
+        solver::traits::settle_held_answers(
+            &mut sub_ctx.solver,
+            None,
+            &mut solver::ConstrainCache::new(),
+        )
+        .map_err(|e| LocatedInferError {
+            error: map_constrain_err(&mut sub_ctx.solver, e, "a requirement under `forall`"),
+            node_id: expr.node_id(),
+            also: Box::default(),
+            related: RelatedPositions::default(),
+        })?;
         Ok(ty)
     });
     let mut errors = std::mem::take(&mut sub_ctx.errors);
@@ -1481,7 +1500,12 @@ fn attempt_run(
     // Check each barrier variable's upper bounds against its resolution. The checks add
     // bounds, so they run before anything reads the graph: compaction reads a barrier
     // variable's lower bounds and nothing else (`solver::barrier`).
-    push_barrier_failures(&mut errors, expr.node_id(), "this value");
+    push_barrier_failures(
+        &mut sub_ctx.solver,
+        &mut errors,
+        expr.node_id(),
+        "this value",
+    );
     if !errors.is_empty() {
         return Err(sub_ctx.failure(errors));
     }
@@ -1495,7 +1519,7 @@ fn attempt_run(
     errors.extend(sub_ctx.uncompiled_exceptions());
     errors.extend(sub_ctx.settle_catches());
     errors.extend(
-        crate::ccl::capabilities::partly_caught()
+        crate::ccl::capabilities::partly_caught(&mut sub_ctx.solver)
             .into_iter()
             .map(|p| {
                 LocatedInferError::new(
@@ -1517,7 +1541,9 @@ fn attempt_run(
     // it was approximating incrementally. Debug-only, and it leaves the graph as it
     // found it.
     #[cfg(debug_assertions)]
-    solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok());
+    solver::traits::verify_narrowing_is_complete(&mut sub_ctx.solver, |solver, ty| {
+        resolve_var_type(solver, ty).ok()
+    });
 
     // Every requirement a definition places on one of its own values is recorded by
     // now, so this is where they can be read *together* — the step narrowing cannot
@@ -1544,7 +1570,8 @@ fn attempt_run(
             }
         }
         let mut cache = solver::ConstrainCache::new();
-        let failures = solver::traits::resolve_operand_requirements(&mut cache);
+        let failures =
+            solver::traits::resolve_operand_requirements(&mut sub_ctx.solver, &mut cache);
         let located = failures.into_iter().map(|failure| {
             let (blame_vars, error, origins) = match failure {
                 OperandFailure::Unsatisfiable { vars, requirements } => (
@@ -1574,7 +1601,7 @@ fn attempt_run(
                     origins,
                 } => (
                     vars,
-                    map_constrain_err(error, "a value an operator constrains"),
+                    map_constrain_err(&mut sub_ctx.solver, error, "a value an operator constrains"),
                     origins,
                 ),
             };
@@ -1616,7 +1643,9 @@ fn attempt_run(
     {
         let mut cache = solver::ConstrainCache::new();
         if let Err((error, node)) =
-            solver::traits::deliver_resolutions(&mut cache, |ty| resolve_var_type(ty).ok())
+            solver::traits::deliver_resolutions(&mut sub_ctx.solver, &mut cache, |solver, ty| {
+                resolve_var_type(solver, ty).ok()
+            })
         {
             let failure = cache.take_failure();
             // A loop's positions are the one operand known to reach here
@@ -1625,7 +1654,7 @@ fn attempt_run(
                 (
                     Some(crate::ccl::TypedExprNode::For { iter, .. }),
                     ConstrainError::NoTraitInstance { found, .. },
-                ) => typing::Typing::unordered_loop(&sub_ctx, node, iter.node_id(), found),
+                ) => typing::Typing::unordered_loop(sub_ctx, node, iter.node_id(), found),
                 _ => None,
             };
             if let Some(unordered) = unordered {
@@ -1638,7 +1667,8 @@ fn attempt_run(
                 _ => "a value a trait requires",
             };
             return Err(failed(vec![
-                LocatedInferError::new(map_constrain_err(error, what), node).with_failure(failure),
+                LocatedInferError::new(map_constrain_err(&mut sub_ctx.solver, error, what), node)
+                    .with_failure(failure),
             ]));
         }
     }
@@ -1652,9 +1682,7 @@ fn attempt_run(
             _ => at_written_source(expr, e),
         })
         .collect();
-    push_capability_failures(&mut conditional, expr, &|item, clause| {
-        sub_ctx.item_beyond_clause(item, clause)
-    });
+    push_capability_failures(&mut conditional, expr, sub_ctx);
     conditional.extend(sub_ctx.requirements_beyond_clauses());
     if !conditional.is_empty() {
         return Err(failed(conditional));
@@ -1678,10 +1706,11 @@ fn attempt_run(
     // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
     let mut errors = coalesce_pass(
+        &mut sub_ctx.solver,
         expr,
         std::mem::take(&mut sub_ctx.bound_at_annotation),
         std::mem::take(&mut sub_ctx.definition_telescopes),
-        Rc::clone(instances),
+        Rc::clone(&sub_ctx.instances),
         std::mem::take(&mut sub_ctx.use_capabilities),
     );
     sub_ctx.name_varying_binders(&mut errors);
@@ -1763,7 +1792,9 @@ fn attempt_run(
     let unsupplied: Vec<LocatedInferError> = top_level
         .iter()
         .filter(|l| match &l.item {
-            crate::ccl::capabilities::Capability::Every(every) => every.holds(&transaction),
+            crate::ccl::capabilities::Capability::Every(every) => {
+                every.holds(&mut sub_ctx.solver, &transaction)
+            }
             item => *item == transaction,
         })
         .map(|l| {
@@ -1784,7 +1815,9 @@ fn attempt_run(
             crate::ccl::capabilities::Capability::Causes(
                 crate::ccl::capabilities::Effect::Raise(raised),
             ) => {
-                let ty = raised.resolved().unwrap_or_else(|| raised.ty.clone());
+                let ty = raised
+                    .resolved(&mut sub_ctx.solver)
+                    .unwrap_or_else(|| raised.ty.clone());
                 let at = l.at.unwrap_or(raised.site);
                 Some(
                     LocatedInferError::new(
@@ -1797,7 +1830,9 @@ fn attempt_run(
                 )
             }
             // `Effect` raises every type unless it takes `Raise(*)` away.
-            crate::ccl::capabilities::Capability::Every(every) if every.raises_anything() => {
+            crate::ccl::capabilities::Capability::Every(every)
+                if every.raises_anything(&mut sub_ctx.solver) =>
+            {
                 Some(LocatedInferError::new(
                     InferError::ExceptionEscapes {
                         ty: l.item.to_string(),
@@ -1812,9 +1847,24 @@ fn attempt_run(
         return Err(failed(escaping_exceptions));
     }
     top_level.extend(exported.appends);
+    #[cfg(debug_assertions)]
+    if std::env::var_os("DUMP_KINDS").is_some() {
+        eprintln!(
+            "=== kind vars ===\n{}",
+            crate::ccl::ty::dump_kind_vars(&sub_ctx.solver)
+        );
+        eprintln!(
+            "=== correspondences ===\n{}",
+            solver::compact::dump_kind_correspondences(&mut sub_ctx.solver)
+        );
+        eprintln!(
+            "=== typed tree ===\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
     Ok(Inferred {
         ty: expr.ty.clone(),
-        schemes: sub_ctx.schemes_noted,
+        schemes: std::mem::take(&mut sub_ctx.schemes_noted),
         opened,
         top_level,
         inert,
@@ -1945,10 +1995,14 @@ mod tests {
 
     #[test]
     fn distinct_domain_variables_keep_the_domain_mismatch() {
+        let solver = &mut Solver::new();
+        let lhs = crate::ccl::InferVar::fresh(solver, 0);
+        let rhs = crate::ccl::InferVar::fresh(solver, 0);
         let error = map_constrain_err(
+            solver,
             ConstrainError::DataDomainMismatch {
-                lhs: Box::new(Type::Infer(crate::ccl::InferVar::fresh(0))),
-                rhs: Box::new(Type::Infer(crate::ccl::InferVar::fresh(0))),
+                lhs: Box::new(Type::Infer(lhs)),
+                rhs: Box::new(Type::Infer(rhs)),
                 cause: Box::new(ConstrainError::Mismatch {
                     lhs: Box::new(Type::Base(BaseType::Int)),
                     rhs: Box::new(Type::Base(BaseType::String)),

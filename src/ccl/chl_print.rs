@@ -16,6 +16,7 @@
 //! the written type as [`OUTER_ARGUMENT`], and
 //! anything else as [`NOT_PRINTABLE`].
 
+use crate::ccl::infer::solver::Solver;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
@@ -277,7 +278,8 @@ impl Printer {
                             .map(|(k, d)| format!("{k}: {d}"))
                             .collect();
                         let at: Vec<Name> = names.iter().map(|n| Name::raw(n.as_str())).collect();
-                        let bound = crate::ccl::subst::family_at_names(bound, &at);
+                        let bound =
+                            crate::ccl::subst::family_at_names(&mut Solver::none(), bound, &at);
                         family_bounds.push(format!(
                             "forall ({}) {}({}) <: {}",
                             binders.join(", "),
@@ -329,7 +331,7 @@ impl Printer {
         format!(
             "forall ({}) {body}{}",
             params.join(", "),
-            crate::ccl::capabilities::clauses(requires, &capabilities)
+            crate::ccl::capabilities::clauses(&mut Solver::scratch(), requires, &capabilities)
         )
     }
 
@@ -566,7 +568,7 @@ impl Printer {
         let dependent = name.filter(|n| crate::ccl::subst::codomain_depends_on(n, codomain));
         // The domain is written only where the form shows it: `Array` and `Source` name
         // theirs by a length and a source.
-        let shown_domain = !(fun_kind.resolved().is_data()
+        let shown_domain = !(fun_kind.resolved_in(&Solver::scratch()).is_data()
             && dependent.is_none()
             && matches!(domain, Type::UIntRange(_) | Type::DataSource(_)));
         let dom = if shown_domain {
@@ -574,7 +576,7 @@ impl Printer {
         } else {
             String::new()
         };
-        let is_data = fun_kind.resolved().is_data();
+        let is_data = fun_kind.resolved_in(&Solver::scratch()).is_data();
         let binder = name.map(|n| (n, self.binder(n, if is_data { "k" } else { "x" })));
         self.binders.push(binder.as_ref().map(|(_, s)| s.clone()));
         if let Some((n, s)) = &binder {
@@ -630,7 +632,12 @@ impl Printer {
             let alternatives: Vec<String> = candidates
                 .iter()
                 .map(|candidate| {
-                    let values = crate::ccl::ty::instantiate_witness(codomain, w.id(), candidate);
+                    let values = crate::ccl::ty::instantiate_witness(
+                        &mut Solver::scratch(),
+                        codomain,
+                        w.id(),
+                        candidate,
+                    );
                     let alternative = Type::Fun {
                         name: name.cloned(),
                         fun_kind: FunKind::Data(None),
@@ -981,7 +988,7 @@ impl Printer {
         };
         let target = self.expr(f, Prec::Postfix, env);
         let (_, arg) = argument.written();
-        let text = if fun_kind.resolved().is_data() {
+        let text = if fun_kind.resolved_in(&Solver::scratch()).is_data() {
             format!("{target}[{arg}]!")
         } else {
             format!("{target}({arg})")
@@ -1224,6 +1231,7 @@ impl fmt::Display for VariantArms {
 
 #[cfg(test)]
 mod tests {
+
     use std::rc::Rc;
 
     use super::{NOT_PRINTABLE, OUTER_ARGUMENT, chl_type};

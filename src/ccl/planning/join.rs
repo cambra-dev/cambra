@@ -1106,7 +1106,11 @@ fn convert_loop_join(
     // output domain matches the original tuple type expected by the caller.
     let canonical: Vec<usize> = (0..arm_types.len()).collect();
     if arm_order == canonical {
-        return Ok(Some(refine_extent(expr, refinement)));
+        return Ok(Some(refine_extent(
+            &mut crate::ccl::infer::solver::Solver::none(),
+            expr,
+            refinement,
+        )));
     }
 
     // perm[j] = position of canonical arm j in arm_order (i.e. where to find it in actual).
@@ -1159,7 +1163,11 @@ fn convert_loop_join(
         Builtin::MapDomain,
         Type::data_fun(canonical_ty.clone(), canonical_ty.clone()),
     );
-    let result = refine_extent(result, refinement);
+    let result = refine_extent(
+        &mut crate::ccl::infer::solver::Solver::none(),
+        result,
+        refinement,
+    );
     checker.check(&result).expect("Bad permute_domain expr");
     Ok(Some(result))
 }

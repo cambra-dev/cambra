@@ -65,6 +65,7 @@
 use crate::ccl::Label;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
+use crate::ccl::infer::solver::Solver;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::Duplicate;
@@ -1119,7 +1120,7 @@ fn flatten_begin_bodies(mut expr: Expr) -> Expr {
         let taken = std::mem::take(&mut **body);
         let before = taken.capabilities.set();
         **body = flatten_block(taken);
-        dropped = Some(before.without(&body.capabilities.set()));
+        dropped = Some(before.without(&mut Solver::none(), &body.capabilities.set()));
     }
     // What the body did that flattening dropped with the node doing it, a value evaluated for
     // nothing or an inlined call's clause beyond its body, the block still does.
@@ -1880,7 +1881,10 @@ fn strip(
                 provenance::Nature::Expansion,
             );
             g.blame(&[begin_id]);
-            Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
+            Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(
+                &mut Solver::none(),
+                *block,
+            ))
         };
         if is_site(&footprint, &block, txn_mut_vars) {
             // A block that mentions a transactional variable → a commit-record site keyed on the
@@ -2663,7 +2667,7 @@ fn strip_valued_block(
     let defer = Name::fresh("__block_value");
     let values = Name::fresh("__values");
     let block = feed_block_value(*block, &defer, &value_ty);
-    let block = crate::ccl::ccl_utils::statement_tag_cases_to_guards(block);
+    let block = crate::ccl::ccl_utils::statement_tag_cases_to_guards(&mut Solver::none(), block);
     let (txn_block, lifted) = partition_block(block, txn_mut_vars);
     // In a branch the site runs where the branch's condition holds, and the path lends the block
     // the bindings it reads and the values of earlier blocks ([`restrict_to_path`]).
@@ -3621,21 +3625,28 @@ fn block_keys(
         set.params.is_empty(),
         "a block's effects hold a clause variable after specialization, which gives each \
          block its use's effects: {}",
-        crate::ccl::capabilities::clauses(Vec::new(), footprint)
+        crate::ccl::capabilities::clauses(&mut Solver::none(), Vec::new(), footprint)
     );
     let mut keys: Vec<&Name> = txn_mut_vars.iter().collect();
     keys.sort();
     let writes: Vec<Name> = keys
         .iter()
-        .filter(|k| set.states(&Capability::Causes(Effect::WriteTxn((**k).clone()))))
+        .filter(|k| {
+            set.states(
+                &mut Solver::none(),
+                &Capability::Causes(Effect::WriteTxn((**k).clone())),
+            )
+        })
         .map(|k| (*k).clone())
         .collect();
     let read_by_block = free_reads(block);
     let reads = keys
         .iter()
         .filter(|k| {
-            set.states(&Capability::Requires(Requirement::read_txn((**k).clone())))
-                || (writes.contains(k) && read_by_block.contains(**k))
+            set.states(
+                &mut Solver::none(),
+                &Capability::Requires(Requirement::read_txn((**k).clone())),
+            ) || (writes.contains(k) && read_by_block.contains(**k))
         })
         .map(|k| (*k).clone())
         .collect();

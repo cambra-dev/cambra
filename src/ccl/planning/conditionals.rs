@@ -21,6 +21,7 @@
 //! and a `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` are described ones
 //! (`src/ccl/design/collections.md`, "Compiling a conditional collection").
 
+use crate::ccl::infer::solver::Solver;
 use std::rc::Rc;
 
 use crate::ccl::Duplicate;
@@ -242,7 +243,7 @@ fn instantiate_witness_in_types(
             instantiate_witness_in_types(pred, binder, candidate, memo);
             true
         });
-        *ty = crate::ccl::ty::instantiate_witness(ty, binder, candidate);
+        *ty = crate::ccl::ty::instantiate_witness(&mut Solver::none(), ty, binder, candidate);
         // **And drop the binder it bound.** Substituting the occurrences leaves the sum
         // quantifying a witness nothing mentions — a wrapper asserting a choice already
         // made. It is not inert: the next realization reads the *outermost* binder to know

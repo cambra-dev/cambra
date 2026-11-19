@@ -1,9 +1,6 @@
-//! Inference type variables and the per-thread inference arena.
-//!
-//! Holds the [`InferVarId`] identity machinery, the subtyping [`Bound`] /
-//! [`InferBounds`] / [`InferVar`] structures the solver mutates in
-//! place, and the thread-local [`ACTIVE_ARENA`] that owns every variable minted
-//! during an inference run so their `Rc` cycles can be broken at teardown.
+//! Inference type variables: the [`InferVarId`] identity machinery, the [`InferVar`] handle,
+//! and the subtyping [`Bound`] / [`InferBounds`] state the run's solver holds for each one
+//! (`src/ccl/design/type-inference.md`, "3.2 The solver: who owns inference variables").
 
 use std::{
     cell::RefCell,
@@ -14,6 +11,7 @@ use std::{
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::ccl::infer::solver::state::Solver;
 use crate::ccl::{Name, Type, subst};
 
 /// A unique identifier for an inference type variable.
@@ -184,9 +182,9 @@ impl Bound {
     /// change of *witness* scope is a pure α-conversion with nothing to wait for, so
     /// suspending it only lets the reference reach a position still spelled in the scope
     /// it left. The binder half stays suspended: a discharge's term is not known yet.
-    fn force_witnesses(ty: &Type, s: &subst::Subst) -> (Type, subst::Subst) {
+    fn force_witnesses(solver: &mut Solver, ty: &Type, s: &subst::Subst) -> (Type, subst::Subst) {
         match s.without_witnesses() {
-            Some(rest) => (s.apply_witnesses(ty), rest),
+            Some(rest) => (s.apply_witnesses(solver, ty), rest),
             None => (ty.clone(), s.clone()),
         }
     }
@@ -207,8 +205,8 @@ impl Bound {
     /// A bound whose *content* side carries an explicit morphism (holder side
     /// identity) — e.g. the dependent application's `result‹[x ↦ arg]›` lower
     /// edge.
-    pub fn with_subst(ty: Type, ty_subst: subst::Subst) -> Self {
-        let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
+    pub fn with_subst(solver: &mut Solver, ty: Type, ty_subst: subst::Subst) -> Self {
+        let (ty, ty_subst) = Self::force_witnesses(solver, &ty, &ty_subst);
         Bound {
             origin: None,
             self_subst: subst::Subst::id(),
@@ -232,8 +230,13 @@ impl Bound {
     }
 
     /// A fully general two-sided edge.
-    pub fn edge(self_subst: subst::Subst, ty: Type, ty_subst: subst::Subst) -> Self {
-        let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
+    pub fn edge(
+        solver: &mut Solver,
+        self_subst: subst::Subst,
+        ty: Type,
+        ty_subst: subst::Subst,
+    ) -> Self {
+        let (ty, ty_subst) = Self::force_witnesses(solver, &ty, &ty_subst);
         Bound {
             origin: None,
             self_subst,
@@ -264,20 +267,23 @@ impl Bound {
     /// rendered content. An elimination the holder side performs does have an
     /// inverse on what the content can say of the holder: its read-back
     /// (`subst::Elim::ReadBack`).
-    pub fn render_subst(&self) -> subst::Subst {
+    pub fn render_subst(&self, solver: &mut Solver) -> subst::Subst {
         if self.self_subst.is_id() {
             return self.ty_subst.clone();
         }
         self.rendered
             .0
-            .get_or_init(|| subst::Subst::then(&self.ty_subst, &self.holder_inverse()))
+            .get_or_init(|| {
+                let inverse = self.holder_inverse(solver);
+                subst::Subst::then(solver, &self.ty_subst, &inverse)
+            })
             .clone()
     }
 
     /// The holder side of [`render_subst`](Self::render_subst): `self_subst` inverted where
     /// it is invertible, and otherwise its rename part inverted, its term part acting as the
     /// identity.
-    fn holder_inverse(&self) -> subst::Subst {
+    fn holder_inverse(&self, solver: &mut Solver) -> subst::Subst {
         if self.self_subst.is_id() {
             return subst::Subst::id();
         }
@@ -316,7 +322,10 @@ impl Bound {
                 // is `σᵢ(𝑐)`; in the holder's own frame it is the binder. `𝑐` is spelled in the
                 // content's frame, so the read-back goes ahead of the renames' inverse, which
                 // respells it as it respells the content.
-                subst::Subst::then(&self.self_subst.read_backs(), &inv)
+                {
+                    let read_backs = self.self_subst.read_backs(solver);
+                    subst::Subst::then(solver, &read_backs, &inv)
+                }
             }
         }
     }
@@ -331,16 +340,17 @@ impl Bound {
     /// application can reach an inference variable the type holds, and then it suspends on the
     /// variable and pushes onto its `suspensions` ([`subst::Subst::suspended`]), so a scope
     /// check on that path changes solver state.
-    pub(crate) fn rendered_names(&self) -> BTreeSet<Name> {
-        let read_back = self.self_subst.read_backs();
+    pub(crate) fn rendered_names(&self, solver: &mut Solver) -> BTreeSet<Name> {
+        let read_back = self.self_subst.read_backs(solver);
         let names = if read_back.is_id() && !self.ty_subst.has_witnesses() {
             self.ty_subst.names_after(subst::type_free_vars(&self.ty))
         } else {
             subst::type_free_vars(
-                &subst::Subst::then(&self.ty_subst, &read_back).apply_type(&self.ty),
+                &subst::Subst::then(solver, &self.ty_subst, &read_back)
+                    .apply_type_in(solver, &self.ty),
             )
         };
-        self.holder_inverse().names_after(names)
+        self.holder_inverse(solver).names_after(names)
     }
 
     /// The term names this bound can put in its holder: the names it puts there now
@@ -353,7 +363,7 @@ impl Bound {
     /// through a witness projection on a term, a join leaves that term's occurrences in place
     /// ([`subst::Mapping::Join`]), and compaction checks a joined binder in a data domain only
     /// on refinements.
-    pub(crate) fn reachable_names(&self) -> BTreeSet<Name> {
+    pub(crate) fn reachable_names(&self, solver: &mut Solver) -> BTreeSet<Name> {
         fn scopes(ty: &Type, out: &mut BTreeSet<Name>) {
             match ty {
                 Type::Infer(v) => v.telescope.extend_with_accounted(out),
@@ -364,14 +374,14 @@ impl Bound {
         let mut names = subst::type_free_vars(&self.ty);
         scopes(&self.ty, &mut names);
         let names = self.ty_subst.names_after(names);
-        self.holder_inverse().names_after(names)
+        self.holder_inverse(solver).names_after(names)
     }
 
     /// The bound type expressed in the holder's context — see
     /// [`render_subst`](Self::render_subst).
     #[cfg(test)]
-    pub fn materialize(&self) -> Type {
-        self.render_subst().apply_type(&self.ty)
+    pub fn materialize(&self, solver: &mut Solver) -> Type {
+        self.render_subst(solver).apply_type_in(solver, &self.ty)
     }
 }
 
@@ -390,8 +400,8 @@ impl Bound {
 ///
 /// The lists are private because that read/write asymmetry is the whole point:
 /// every write goes through [`lower_mut`](Self::lower_mut) /
-/// [`set_lower`](Self::set_lower) / [`clear`](Self::clear), so "mutation is
-/// copy-on-write" is checked by the compiler rather than by convention.
+/// [`set_lower`](Self::set_lower), so "mutation is copy-on-write" is checked by
+/// the compiler rather than by convention.
 ///
 /// Writing while a reader holds the list is not hypothetical: the transitive
 /// closure in `constrain_go` walks a snapshot of one bound list while the
@@ -443,12 +453,6 @@ pub struct InferBounds {
 pub struct GuardedBound {
     pub guard: crate::ccl::ty::RefinementSet,
     pub bound: Bound,
-}
-
-#[derive(Default)]
-struct InferVarArena {
-    vars: Vec<Rc<InferVar>>,
-    positions: HashMap<InferVarId, usize>,
 }
 
 thread_local! {
@@ -511,19 +515,6 @@ impl InferBounds {
     /// [`set_lower`](Self::set_lower).
     pub fn set_upper(&mut self, bounds: Vec<Bound>) {
         self.upper = Rc::new(bounds);
-    }
-
-    /// Sever both bound lists, releasing the [`Bound`]s they hold.
-    ///
-    /// Assignment, not `lower_mut().clear()`. On a variable that never took a
-    /// bound the list *is* the shared empty one, so `Rc::make_mut` would
-    /// allocate a copy in order to clear it — twice per variable, over the
-    /// population that dominates. And on a genuinely shared list it would clear
-    /// the copy and sever nothing, which is the opposite of what teardown wants:
-    /// dropping the `Rc` is what releases the bounds, and with them the
-    /// reference cycle, once no reader is left.
-    pub fn clear(&mut self) {
-        *self = Self::default();
     }
 }
 
@@ -703,9 +694,13 @@ pub(crate) trait TelescopeWalk {
 /// an error. A program source is never one: a source reference is a
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
-pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
+pub(crate) fn bound_scope_gaps(
+    solver: &mut Solver,
+    telescope: &Telescope,
+    bound: &Bound,
+) -> BTreeSet<Name> {
     bound
-        .rendered_names()
+        .rendered_names(solver)
         .into_iter()
         .filter(|n| !telescope.contains(n))
         .collect()
@@ -724,7 +719,12 @@ pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet
 /// `debug_assertions` would make two compilers: a release build would accept a tree a
 /// debug build rejects, and the trees it accepted would be exactly the ones carrying a
 /// reference some pass failed to rewrite.
-pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: &Bound) {
+pub(crate) fn enforce_bound_scope(
+    solver: &mut Solver,
+    holder: &InferVar,
+    side: &'static str,
+    bound: &Bound,
+) {
     // The record-time closure invariant, as an internal error (see
     // `src/ccl/design/type-inference.md`, "The invariant"). Every gap is an
     // error: the names a bound puts in its holder are the telescope's entries, and a
@@ -735,7 +735,7 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
     if cfg!(debug_assertions) {
         let free: Vec<_> = crate::ccl::ty::free_witness_refs(&bound.ty, &[])
             .into_iter()
-            .filter(|w| !bound.ty_subst.maps_witness(w) && !holder.may_name_witness(w))
+            .filter(|w| !bound.ty_subst.maps_witness(w) && !holder.may_name_witness(solver, w))
             .collect();
         assert!(
             free.is_empty(),
@@ -745,7 +745,7 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
             bound.ty,
         );
     }
-    let gaps = bound_scope_gaps(&holder.telescope, bound);
+    let gaps = bound_scope_gaps(solver, &holder.telescope, bound);
     if let Some(open) = gaps.iter().next() {
         panic!(
             "open bound recorded on ?{}: `{open:?}` is free in the {side} bound `{}` once \
@@ -781,14 +781,11 @@ pub enum StandsFor {
 pub struct InferVar {
     /// Stable, globally-unique identity.
     pub uid: InferVarId,
-    /// Scope level the variable belongs to: where it was minted, or lower once a
-    /// monomorphic binding claims it ([`InferVar::lower_level`]).
-    level: std::cell::Cell<Level>,
-    /// The binders in lexical scope at creation — immutable like `uid`, and what a
-    /// recorded bound must close against.
+    /// The scope level the variable was minted at. A monomorphic binding can lower it
+    /// ([`InferVar::lower_level`]); the lowered level is the solver's.
+    initial_level: Level,
+    /// The binders in lexical scope at creation, which a recorded bound must close against.
     pub telescope: Telescope,
-    /// Mutable lower/upper bound lists.
-    pub bounds: RefCell<InferBounds>,
     /// **The kind of the function this variable may turn out to be.**
     ///
     /// A variable can stand for a function, and a function has a kind — so it carries one,
@@ -801,25 +798,29 @@ pub struct InferVar {
     /// two sums recorded below this one variable's kind, so the position they meet at is over
     /// one binder — its own — rather than over two binders with nothing to relate them.
     pub fun_kind: Rc<crate::ccl::ty::FunKindVar>,
+    /// The solver holding what is recorded on this variable ([`InferState`]).
+    home: Option<crate::ccl::infer::solver::state::Home>,
+}
+
+/// What a run has recorded on an [`InferVar`], held by the run's
+/// [`Solver`](crate::ccl::infer::solver::state::Solver).
+#[derive(Default)]
+pub(crate) struct InferState {
+    /// The level a monomorphic binding moved the variable down to, below its initial one.
+    lowered_to: Option<Level>,
+    /// The lower and upper bounds.
+    pub(crate) bounds: InferBounds,
     /// Trait obligations this variable is an operand of, with the position it
     /// occupies in each. Every lower bound recorded here is delivered to them by
     /// `notify_lower` (`src/ccl/infer/solver/traits.rs`), which is how an operator's
     /// requirement is resolved incrementally rather than by a pass that goes
     /// looking for obligations once solving has stopped.
-    ///
-    /// The list lives on the variable rather than in a side map on the inference
-    /// context because the three places that must reach it — the bound-recording
-    /// arms, `extrude`, and `freshen_above` — are free functions with no context in
-    /// hand. Like [`bounds`](Self::bounds) it is severed at arena teardown: an
-    /// obligation holds its output `Type`, which holds a variable, which holds the
-    /// obligation.
-    pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    pub(crate) watches: Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>,
     /// The variables standing for this one under a substitution, one per substitution
     /// (`Subst::suspended`): `𝛼[σ]` is one type, so every occurrence of `𝛼` under `σ` is
     /// the one variable. Two variables for it would each take their own bounds and could
-    /// resolve apart. Severed at arena teardown with [`bounds`](Self::bounds): a held
-    /// variable's bound holds this one.
-    pub suspensions: RefCell<Vec<(subst::Subst, Rc<InferVar>)>>,
+    /// resolve apart.
+    pub(crate) suspensions: Vec<(subst::Subst, Rc<InferVar>)>,
     /// Whether the variable **names one data domain**: it was minted for a
     /// [`Type::SharedHole`] written as a function annotation's domain, which is how lowering
     /// claims that the positions annotated with that id are one domain. A data domain is
@@ -827,14 +828,14 @@ pub struct InferVar {
     /// draws its domain in both directions even while neither kind is known
     /// (`constrain_go`'s invariant-domain arm). Set once, at minting, so the edge an equation
     /// takes does not depend on when it is drawn.
-    named_domain: std::cell::Cell<bool>,
+    named_domain: bool,
     /// The type chosen outside every binder that this variable stands for ([`StandsFor`]): what
     /// a bound naming a binder outside the variable's scope is reported against
     /// ([`InferVar::stands_for`]). A variable minted for a type parameter is marked at minting,
     /// a hole in a constant family when normalization reads the annotation that writes the
     /// family (`mark_constant_family_holes`), and a proxy or suspension when it is minted, with
     /// its original's mark.
-    stands_for: RefCell<Option<StandsFor>>,
+    stands_for: Option<StandsFor>,
     /// **The witness binders this variable sits under**: the functions it was minted as a part
     /// of, by their kind, or the one it copies was.
     ///
@@ -842,9 +843,9 @@ pub struct InferVar {
     /// anywhere else the reference would have left its binder — so a substitution's witness half
     /// suspends only on a variable some scope here may bind the mapped witness for
     /// ([`subst::Subst`]). Placed where the variable is minted, like the
-    /// [`telescope`](Self::telescope) the name half reads; [`enforce_bound_scope`] rejects a
+    /// [`telescope`](InferVar::telescope) the name half reads; [`enforce_bound_scope`] rejects a
     /// bound naming a witness free that no scope here binds.
-    witness_scopes: RefCell<Vec<WitnessScope>>,
+    witness_scopes: Vec<WitnessScope>,
 }
 
 /// A function a variable is a part of, as what binds its witnesses: a funkind variable, whose
@@ -867,50 +868,19 @@ impl WitnessScope {
         }
     }
 
-    pub(crate) fn may_bind(&self, w: &crate::ccl::ty::WitnessId) -> bool {
+    pub(crate) fn may_bind(&self, solver: &Solver, w: &crate::ccl::ty::WitnessId) -> bool {
         match self {
-            WitnessScope::Kind(k) => k.may_bind(w),
+            WitnessScope::Kind(k) => k.may_bind(solver, w),
             WitnessScope::Binders(ws) => ws.contains(w),
         }
     }
-}
-
-thread_local! {
-    /// Storage for every inference variable minted during the active inference
-    /// run on this thread — owned directly by this slot, not shared. Installed
-    /// empty by [`arena_enter`] on scope entry and removed by
-    /// [`arena_exit`] at teardown, which hands the variables back so their
-    /// bounds can be cleared. Inference runs one-at-a-time per thread: this is
-    /// a single slot, not a stack, because nesting an inference run inside
-    /// another on the same thread is a bug (caught by the `debug_assert!` in
-    /// [`arena_enter`]), not a supported mode. `None` outside any inference
-    /// run, in which case [`InferVar::fresh`] records nowhere (a harmless
-    /// no-op — used by unit tests that mint vars directly).
-    static ACTIVE_ARENA: RefCell<Option<InferVarArena>> =
-        const { RefCell::new(None) };
-}
-
-thread_local! {
-    /// Every [`BarrierVar`] minted during the active inference run on this thread,
-    /// with the lifetime and single-slot discipline of [`ACTIVE_ARENA`]. `None`
-    /// outside any inference run, in which case [`BarrierVar::fresh`] records
-    /// nowhere: `opaque_output` mints its placeholders before inference starts.
-    static BARRIER_ARENA: RefCell<Option<Vec<Rc<BarrierVar>>>> =
-        const { RefCell::new(None) };
-}
-
-thread_local! {
-    /// The memberships recorded on suspensions during the active inference run on this
-    /// thread, with the lifetime of [`ACTIVE_ARENA`] ([`SuspendedMembership`]).
-    static SUSPENDED_MEMBERSHIPS: RefCell<SuspendedMemberships> =
-        RefCell::new(SuspendedMemberships::default());
 }
 
 /// The recorded memberships in recording order, which is the order the coalesce pass decides
 /// them in, indexed by the suspension each is recorded on: an instantiation looks up every
 /// variable it copies.
 #[derive(Default)]
-struct SuspendedMemberships {
+pub(crate) struct SuspendedMemberships {
     recorded: Vec<SuspendedMembership>,
     by_var: HashMap<InferVarId, Vec<usize>>,
 }
@@ -927,122 +897,45 @@ pub(crate) struct SuspendedMembership {
 }
 
 /// Record a membership on a suspension, for the coalesce pass to decide.
-pub(crate) fn record_suspended_membership(m: SuspendedMembership) {
-    SUSPENDED_MEMBERSHIPS.with(|ms| {
-        let mut ms = ms.borrow_mut();
-        let at = ms.recorded.len();
-        ms.by_var.entry(m.var.uid).or_default().push(at);
-        ms.recorded.push(m);
-    });
+pub(crate) fn record_suspended_membership(solver: &mut Solver, m: SuspendedMembership) {
+    let ms = &mut solver.suspended_memberships;
+    let at = ms.recorded.len();
+    ms.by_var.entry(m.var.uid).or_default().push(at);
+    ms.recorded.push(m);
 }
 
 /// The memberships recorded on the suspension `original`, for an instantiation to record on
 /// its copy: a copy of a suspension stands at no tree position either, so the coalesce pass
 /// decides its kinds as it decides the original's.
-pub(crate) fn suspended_memberships_of(original: &InferVar) -> Vec<SuspendedMembership> {
-    SUSPENDED_MEMBERSHIPS.with(|ms| {
-        let ms = ms.borrow();
-        let Some(at) = ms.by_var.get(&original.uid) else {
-            return Vec::new();
-        };
-        at.iter()
-            .map(|&i| {
-                let m = &ms.recorded[i];
-                SuspendedMembership {
-                    var: Rc::clone(&m.var),
-                    kind: m.kind.clone(),
-                    witnesses: m.witnesses.clone(),
-                    origin: m.origin,
-                }
-            })
-            .collect()
-    })
+pub(crate) fn suspended_memberships_of(
+    solver: &Solver,
+    original: &InferVar,
+) -> Vec<SuspendedMembership> {
+    let ms = &solver.suspended_memberships;
+    let Some(at) = ms.by_var.get(&original.uid) else {
+        return Vec::new();
+    };
+    at.iter()
+        .map(|&i| {
+            let m = &ms.recorded[i];
+            SuspendedMembership {
+                var: Rc::clone(&m.var),
+                kind: m.kind.clone(),
+                witnesses: m.witnesses.clone(),
+                origin: m.origin,
+            }
+        })
+        .collect()
 }
 
 /// Is a membership recorded on the suspension `var`?
-pub(crate) fn has_suspended_memberships(var: &InferVar) -> bool {
-    SUSPENDED_MEMBERSHIPS.with(|ms| ms.borrow().by_var.contains_key(&var.uid))
+pub(crate) fn has_suspended_memberships(solver: &Solver, var: &InferVar) -> bool {
+    solver.suspended_memberships.by_var.contains_key(&var.uid)
 }
 
-/// The memberships recorded on suspensions since [`arena_enter`].
-pub(crate) fn take_suspended_memberships() -> Vec<SuspendedMembership> {
-    SUSPENDED_MEMBERSHIPS.with(|ms| std::mem::take(&mut *ms.borrow_mut()).recorded)
-}
-
-/// Begin capturing every [`InferVar::fresh`] minted on this thread.
-///
-/// Inference is non-reentrant: at most one arena may be active per thread at a
-/// time. The `debug_assert!` enforces the slot is free before installing a
-/// fresh capture buffer, so an accidental nested inference run trips loudly in
-/// debug builds.
-pub(crate) fn arena_enter() {
-    // The merge-name memo clears at the *next* run's entry rather than at exit:
-    // planning reads participants after inference tears the arena down.
-    ACTIVE_ARENA.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        debug_assert!(
-            slot.is_none(),
-            "inference is non-reentrant: an InferArena is already active on this thread",
-        );
-        *slot = Some(InferVarArena::default());
-    });
-    BARRIER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
-    SUSPENDED_MEMBERSHIPS.with(|ms| *ms.borrow_mut() = SuspendedMemberships::default());
-}
-
-/// Whether an inference run is active on this thread ([`arena_enter`]).
-#[cfg(debug_assertions)]
-pub(crate) fn arena_is_active() -> bool {
-    ACTIVE_ARENA.with(|slot| slot.borrow().is_some())
-}
-
-/// Stop capturing and return every variable minted since [`arena_enter`], so
-/// the caller can clear their bounds. Yields an empty `Vec` if no run was
-/// active (which the [`InferArena`](crate::ccl::infer::InferArena) RAII guard
-/// makes unreachable in practice).
-pub(crate) fn arena_exit() -> Vec<Rc<InferVar>> {
-    ACTIVE_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default().vars)
-}
-
-/// Stop capturing barrier variables and return every one minted since
-/// [`arena_enter`], so the caller can clear their bounds.
-pub(crate) fn barrier_arena_exit() -> Vec<Rc<BarrierVar>> {
-    BARRIER_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default())
-}
-
-/// Every barrier variable minted so far this run, *without* ending the arena: the
-/// enumeration `solver::barrier::solve_barrier_vars` checks. A snapshot, so a
-/// caller may mint more while iterating it.
-pub(crate) fn arena_barrier_vars() -> Vec<Rc<BarrierVar>> {
-    BARRIER_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default())
-}
-
-/// Every variable minted so far this run, *without* ending the arena.
-///
-/// The enumeration a whole-graph check needs. Unlike a walk of the expression tree
-/// this reaches variables no node's type mentions any more — in particular a
-/// generalized definition's, which coalesce deliberately never visits in place. Hands
-/// back a snapshot rather than a borrow so a caller is free to touch the arena.
-pub(crate) fn arena_vars() -> Vec<Rc<InferVar>> {
-    ACTIVE_ARENA.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|a| a.vars.clone())
-            .unwrap_or_default()
-    })
-}
-
-/// The variable this run minted under `uid`, if the arena still holds it.
-///
-/// For a caller holding an id rather than the `Rc` — a compact position records which
-/// variables stood at it, and materializing one back needs the variable itself, with the
-/// level and telescope that decide whether generalization quantifies it.
-pub(crate) fn lookup(uid: &InferVarId) -> Option<Rc<InferVar>> {
-    ACTIVE_ARENA.with(|slot| {
-        let slot = slot.borrow();
-        let arena = slot.as_ref()?;
-        arena.positions.get(uid).map(|i| Rc::clone(&arena.vars[*i]))
-    })
+/// The memberships recorded on suspensions so far this run.
+pub(crate) fn take_suspended_memberships(solver: &mut Solver) -> Vec<SuspendedMembership> {
+    std::mem::take(&mut solver.suspended_memberships).recorded
 }
 
 /// What [`var_edges_held_elsewhere`] gives each variable: the variables recorded below it on
@@ -1056,49 +949,44 @@ pub(crate) type HeldElsewhere = HashMap<InferVarId, (Vec<Rc<InferVar>>, Vec<Rc<I
 /// `v` needs both ends ([`crate::ccl::infer::solver::compact::compact_type_for_display`]). An
 /// edge under a substitution states a fact about an instance, not the variable, and is left
 /// out.
-pub(crate) fn var_edges_held_elsewhere() -> HeldElsewhere {
+pub(crate) fn var_edges_held_elsewhere(solver: &Solver) -> HeldElsewhere {
     let mut index = HeldElsewhere::new();
-    ACTIVE_ARENA.with(|slot| {
-        for u in slot.borrow().iter().flat_map(|a| &a.vars) {
-            let s = u.bounds.borrow();
-            for (holds_upper, list) in [(true, s.upper()), (false, s.lower())] {
-                for b in list.iter() {
-                    if let Type::Infer(v) = &b.ty
-                        && b.self_subst.is_id()
-                        && b.ty_subst.is_id()
-                    {
-                        let (below, above) = index.entry(v.uid).or_default();
-                        if holds_upper { below } else { above }.push(Rc::clone(u));
-                    }
+    for u in solver.infer_vars() {
+        let s = u.bounds(solver);
+        for (holds_upper, list) in [(true, s.upper()), (false, s.lower())] {
+            for b in list.iter() {
+                if let Type::Infer(v) = &b.ty
+                    && b.self_subst.is_id()
+                    && b.ty_subst.is_id()
+                {
+                    let (below, above) = index.entry(v.uid).or_default();
+                    if holds_upper { below } else { above }.push(Rc::clone(u));
                 }
             }
         }
-    });
+    }
     index
 }
 
 impl InferVar {
-    /// Mint a fresh, unconstrained inference variable at `level`.
+    /// Mint a fresh, unconstrained inference variable at `level`, owned by `solver`.
     ///
-    /// If an inference arena is active on this thread (see [`arena_enter`]),
-    /// the new variable is registered with it so the arena owns a strong
-    /// handle and can clear its bounds at teardown, breaking the `Rc` cycles
-    /// that mutual subtyping constraints create. With no active arena (e.g.
-    /// direct use in unit tests) registration is a no-op.
     /// Scope-free: the telescope is empty. For test minting and
     /// solver-internal placeholders with no lexical position; a variable
     /// proxying or freshening an existing one inherits that one's telescope
     /// via [`fresh_in`](Self::fresh_in), and emission mints through
     /// `InferCtx::fresh`, which passes the live scope.
-    pub fn fresh(level: Level) -> Rc<InferVar> {
-        Self::fresh_in(level, &Telescope::empty())
+    pub fn fresh(solver: &mut Solver, level: Level) -> Rc<InferVar> {
+        Self::fresh_in(solver, level, &Telescope::empty())
     }
 
     /// Mint a fresh variable carrying `telescope` as its scope, over a fresh kind.
-    pub fn fresh_in(level: Level, telescope: &Telescope) -> Rc<InferVar> {
-        let funkind = crate::ccl::ty::FunKindVar::fresh();
-        funkind.place_at(level);
-        Self::fresh_over(level, telescope, funkind)
+    pub fn fresh_in(solver: &mut Solver, level: Level, telescope: &Telescope) -> Rc<InferVar> {
+        {
+            let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+            kind.place_at(solver, level);
+            Self::fresh_over(solver, level, telescope, kind)
+        }
     }
 
     /// Mint a fresh variable over a **given** kind, for a copy of an existing one.
@@ -1109,6 +997,7 @@ impl InferVar {
     /// kind ([`crate::ccl::infer::solver::scheme`]), which shares the instantiation's cache
     /// with the copied bounds and so relates to the same positions the original did.
     pub fn fresh_over(
+        solver: &mut Solver,
         level: Level,
         telescope: &Telescope,
         fun_kind: Rc<crate::ccl::ty::FunKindVar>,
@@ -1116,48 +1005,93 @@ impl InferVar {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             fun_kind,
-            level: std::cell::Cell::new(level),
+            initial_level: level,
             telescope: telescope.clone(),
-            bounds: RefCell::new(InferBounds::default()),
-            watches: RefCell::new(Vec::new()),
-            suspensions: RefCell::new(Vec::new()),
-            named_domain: std::cell::Cell::new(false),
-            stands_for: RefCell::new(None),
-            witness_scopes: RefCell::new(Vec::new()),
+            home: Some(solver.next_infer_home()),
         });
-        ACTIVE_ARENA.with(|slot| {
-            if let Some(arena) = slot.borrow_mut().as_mut() {
-                arena.positions.insert(var.uid, arena.vars.len());
-                arena.vars.push(Rc::clone(&var));
-            }
-        });
+        solver.adopt_infer(&var, InferState::default());
         var
     }
-}
 
-// Identity-based: two inference variables are equal iff they share a `uid`.
-// Borrow-free and cycle-free (never touches `bounds`), so it's safe to call
-// on a variable whose bound graph is cyclic or currently borrowed.
-impl InferVar {
+    /// The solver slot holding what is recorded on this variable, where a solver minted it.
+    pub(crate) fn home(&self) -> Option<crate::ccl::infer::solver::state::Home> {
+        self.home
+    }
+
     /// The scope level the variable belongs to.
-    pub fn level(&self) -> Level {
-        self.level.get()
+    pub fn level(&self, solver: &Solver) -> Level {
+        solver
+            .infer_state(self)
+            .lowered_to
+            .unwrap_or(self.initial_level)
+    }
+
+    /// The lower and upper bounds recorded on this variable.
+    pub fn bounds<'s>(&self, solver: &'s Solver) -> &'s InferBounds {
+        &solver.infer_state(self).bounds
+    }
+
+    /// The bounds, for recording more.
+    pub fn bounds_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut InferBounds {
+        &mut solver.infer_state_mut(self).bounds
+    }
+
+    /// The trait obligations watching this variable ([`InferState::watches`]).
+    pub fn watches<'s>(
+        &self,
+        solver: &'s Solver,
+    ) -> &'s [(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)] {
+        &solver.infer_state(self).watches
+    }
+
+    /// The watching obligations, for adding one.
+    pub fn watches_mut<'s>(
+        &self,
+        solver: &'s mut Solver,
+    ) -> &'s mut Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)> {
+        &mut solver.infer_state_mut(self).watches
+    }
+
+    /// The variables standing for this one under a substitution ([`InferState::suspensions`]).
+    pub fn suspensions<'s>(&self, solver: &'s Solver) -> &'s [(subst::Subst, Rc<InferVar>)] {
+        &solver.infer_state(self).suspensions
+    }
+
+    /// The suspensions, for adding one.
+    pub fn suspensions_mut<'s>(
+        &self,
+        solver: &'s mut Solver,
+    ) -> &'s mut Vec<(subst::Subst, Rc<InferVar>)> {
+        &mut solver.infer_state_mut(self).suspensions
     }
 
     /// Whether a witness binder this variable sits under may bind `w`.
-    pub fn may_name_witness(&self, w: &crate::ccl::ty::WitnessId) -> bool {
-        self.witness_scopes.borrow().iter().any(|s| s.may_bind(w))
+    pub fn may_name_witness(&self, solver: &Solver, w: &crate::ccl::ty::WitnessId) -> bool {
+        solver
+            .infer_state(self)
+            .witness_scopes
+            .iter()
+            .any(|s| s.may_bind(solver, w))
     }
 
     /// Whether this variable is a part of a function whose scope satisfies `f`.
-    pub fn in_witness_scope(&self, f: impl Fn(&WitnessScope) -> bool) -> bool {
-        self.witness_scopes.borrow().iter().any(f)
+    pub fn in_witness_scope(
+        &self,
+        solver: &Solver,
+        f: impl Fn(&Solver, &WitnessScope) -> bool,
+    ) -> bool {
+        solver
+            .infer_state(self)
+            .witness_scopes
+            .iter()
+            .any(|s| f(solver, s))
     }
 
     /// The funkind variables whose functions this variable is a part of.
-    pub fn witness_scope_kinds(&self) -> Vec<Rc<crate::ccl::ty::FunKindVar>> {
-        self.witness_scopes
-            .borrow()
+    pub fn witness_scope_kinds(&self, solver: &Solver) -> Vec<Rc<crate::ccl::ty::FunKindVar>> {
+        solver
+            .infer_state(self)
+            .witness_scopes
             .iter()
             .filter_map(|s| match s {
                 WitnessScope::Kind(k) => Some(Rc::clone(k)),
@@ -1167,55 +1101,57 @@ impl InferVar {
     }
 
     /// Place a freshly minted variable under `scope`'s binders: it is a part of that function.
-    pub fn place_under(&self, scope: WitnessScope) {
-        self.witness_scopes.borrow_mut().push(scope);
+    pub fn place_under(&self, solver: &mut Solver, scope: WitnessScope) {
+        solver.infer_state_mut(self).witness_scopes.push(scope);
     }
 
     /// Place every variable occurring in `ty` under the binders of a function of kind `kind`:
     /// `ty` is a part of that function, as built by a pass that copies such a function's type
     /// (an instantiation, an annotation's normalization).
-    pub fn place_parts_under(ty: &Type, kind: &crate::ccl::ty::FunKind) {
+    pub fn place_parts_under(solver: &mut Solver, ty: &Type, kind: &crate::ccl::ty::FunKind) {
         let Some(scope) = WitnessScope::of_kind(kind) else {
             return;
         };
-        ty.walk_infer_vars(&mut |v| v.place_under(scope.clone()));
+        ty.walk_infer_vars(&mut |v| v.place_under(solver, scope.clone()));
     }
 
     /// Carry `original`'s placement onto `self`, a copy of it at the same position (a proxy,
     /// a suspension).
-    pub fn inherit_witness_placement(&self, original: &InferVar) {
-        let scopes = original.witness_scopes.borrow().clone();
-        self.witness_scopes.borrow_mut().extend(scopes);
+    pub fn inherit_witness_placement(&self, solver: &mut Solver, original: &InferVar) {
+        let scopes = solver.infer_state(original).witness_scopes.clone();
+        solver.infer_state_mut(self).witness_scopes.extend(scopes);
     }
 
     /// [`Self::inherit_witness_placement`] keeping only the scopes `keep` accepts: a copy under
     /// a substitution that discharges a scope's binders has left that scope.
     pub fn inherit_witness_placement_where(
         &self,
+        solver: &mut Solver,
         original: &InferVar,
-        keep: impl Fn(&WitnessScope) -> bool,
+        keep: impl Fn(&Solver, &WitnessScope) -> bool,
     ) {
-        let scopes: Vec<WitnessScope> = original
+        let scopes: Vec<WitnessScope> = solver
+            .infer_state(original)
             .witness_scopes
-            .borrow()
             .iter()
-            .filter(|s| keep(s))
+            .filter(|s| keep(solver, s))
             .cloned()
             .collect();
-        self.witness_scopes.borrow_mut().extend(scopes);
+        solver.infer_state_mut(self).witness_scopes.extend(scopes);
     }
 
     /// [`Self::inherit_witness_placement`] for a copy whose kinds and witnesses were renamed
     /// (a freshened copy): each scope through `kind` and `witness`.
     pub fn inherit_witness_placement_renamed(
         &self,
+        solver: &mut Solver,
         original: &InferVar,
         kind: impl Fn(&Rc<crate::ccl::ty::FunKindVar>) -> Rc<crate::ccl::ty::FunKindVar>,
         witness: impl Fn(&crate::ccl::ty::WitnessId) -> crate::ccl::ty::WitnessId,
     ) {
-        let scopes: Vec<WitnessScope> = original
+        let scopes: Vec<WitnessScope> = solver
+            .infer_state(original)
             .witness_scopes
-            .borrow()
             .iter()
             .map(|s| match s {
                 WitnessScope::Kind(k) => WitnessScope::Kind(kind(k)),
@@ -1224,45 +1160,46 @@ impl InferVar {
                 }
             })
             .collect();
-        self.witness_scopes.borrow_mut().extend(scopes);
+        solver.infer_state_mut(self).witness_scopes.extend(scopes);
     }
 
-    /// Whether the variable names one data domain ([`InferVar::named_domain`]).
-    pub fn names_domain(&self) -> bool {
-        self.named_domain.get()
+    /// Whether the variable names one data domain ([`InferState::named_domain`]).
+    pub fn names_domain(&self, solver: &Solver) -> bool {
+        solver.infer_state(self).named_domain
     }
 
-    /// Mark the variable as naming one data domain ([`InferVar::named_domain`]).
-    pub(crate) fn mark_named_domain(&self) {
-        self.named_domain.set(true);
+    /// Mark the variable as naming one data domain ([`InferState::named_domain`]).
+    pub(crate) fn mark_named_domain(&self, solver: &mut Solver) {
+        solver.infer_state_mut(self).named_domain = true;
     }
 
     /// The type chosen outside every binder that this variable stands for
-    /// ([`InferVar::stands_for`]).
-    pub fn stands_for(&self) -> Option<StandsFor> {
-        self.stands_for.borrow().clone()
+    /// ([`InferState::stands_for`]).
+    pub fn stands_for(&self, solver: &Solver) -> Option<StandsFor> {
+        solver.infer_state(self).stands_for.clone()
     }
 
-    /// Record that the variable stands for `chosen` ([`InferVar::stands_for`]).
-    pub(crate) fn mark_stands_for(&self, chosen: StandsFor) {
-        *self.stands_for.borrow_mut() = Some(chosen);
+    /// Record that the variable stands for `chosen` ([`InferState::stands_for`]).
+    pub(crate) fn mark_stands_for(&self, solver: &mut Solver, chosen: StandsFor) {
+        solver.infer_state_mut(self).stands_for = Some(chosen);
     }
 
     /// Stand for what `original` stands for, if anything: for a variable that proxies or
     /// suspends on it, which resolves to what `original` does.
-    pub(crate) fn inherit_stands_for(&self, original: &InferVar) {
-        if let Some(chosen) = original.stands_for() {
-            self.mark_stands_for(chosen);
+    pub(crate) fn inherit_stands_for(&self, solver: &mut Solver, original: &InferVar) {
+        if let Some(chosen) = original.stands_for(solver) {
+            self.mark_stands_for(solver, chosen);
         }
     }
+
     /// Move the variable down to `level` if it sits above it. A monomorphic binding
     /// claims its right-hand side's variables this way
     /// ([`lower_levels`](crate::ccl::infer::solver::constrain::lower_levels)).
-    pub(crate) fn lower_level(&self, level: Level) {
-        if self.level.get() > level {
-            self.level.set(level);
-            if self.fun_kind.level().is_some() {
-                self.fun_kind.place_at(level);
+    pub(crate) fn lower_level(&self, solver: &mut Solver, level: Level) {
+        if self.level(solver) > level {
+            solver.infer_state_mut(self).lowered_to = Some(level);
+            if self.fun_kind.level(solver).is_some() {
+                self.fun_kind.place_at(solver, level);
             }
         }
     }
@@ -1296,30 +1233,37 @@ impl fmt::Debug for InferVar {
 pub struct BarrierVar {
     /// Stable, globally-unique identity.
     pub uid: BarrierVarId,
-    /// Set while [`BarrierVar::level`] reads this variable's bounds, so a bound that
-    /// reaches the variable again contributes 0 instead of recursing.
-    reading_level: std::cell::Cell<bool>,
     /// The opaque binders the variable sits outside of: those the lambda body it
     /// annotates binds. A refinement naming one cannot be read outside the body.
     pub opaque: Rc<[Name]>,
+    /// The solver holding what is recorded on this variable ([`BarrierState`]), where a solver
+    /// minted it.
+    home: Option<crate::ccl::infer::solver::state::Home>,
+}
+
+/// What a run has recorded on a [`BarrierVar`].
+#[derive(Default)]
+pub(crate) struct BarrierState {
+    /// Set while [`BarrierVar::level`] reads this variable's bounds, so a bound that
+    /// reaches the variable again contributes 0 instead of recursing.
+    reading_level: std::cell::Cell<bool>,
     /// The gathered lower bounds. The variable resolves to their join with the
     /// refinements at its positive positions dropped (the `BarrierVar` arm of
     /// `solver::compact::compact_go`).
-    pub lowers: RefCell<Vec<Bound>>,
+    pub(crate) lowers: Vec<Bound>,
     /// The gathered upper bounds. Each is checked against the resolution from
     /// `lowers` by `solver::barrier::solve_barrier_vars`, not closed against the
     /// lowers as they arrive.
-    pub uppers: RefCell<Vec<BarrierUpper>>,
+    pub(crate) uppers: Vec<BarrierUpper>,
     /// Trait obligations watching an inference variable this barrier variable is a lower
     /// bound of, with the operand position each watches. Every lower bound recorded here
     /// is delivered to them (`notify_barrier_lower` in `src/ccl/infer/solver/traits.rs`):
     /// the resolution's base is a lower bound's base, so the watched variable resolves to
-    /// it. Severed at arena teardown, as [`InferVar::watches`] is.
-    pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    /// it.
+    pub(crate) watches: Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>,
     /// What `solver::barrier::solve_barrier_vars` last checked: `None` before the
-    /// first check. Severed at arena teardown with the bounds, since the resolution
-    /// holds types that can reach this variable.
-    pub checked: RefCell<Option<BarrierCheck>>,
+    /// first check.
+    pub(crate) checked: Option<BarrierCheck>,
 }
 
 /// An upper bound of a [`BarrierVar`], with the error a failed check of it reports.
@@ -1359,52 +1303,113 @@ pub enum BarrierCheck {
 }
 
 impl BarrierVar {
-    /// Mint a fresh barrier variable outside the binders `opaque`, over `lowers` and
-    /// `uppers`.
+    /// Mint a fresh barrier variable owned by `solver`, outside the binders `opaque`, over
+    /// `lowers` and `uppers`.
     pub fn fresh(
+        solver: &mut Solver,
         opaque: Rc<[Name]>,
         lowers: Vec<Bound>,
         uppers: Vec<BarrierUpper>,
     ) -> Rc<BarrierVar> {
         let barrier = Rc::new(BarrierVar {
             uid: fresh_barrier_var_id(),
-            reading_level: std::cell::Cell::new(false),
             opaque,
-            lowers: RefCell::new(lowers),
-            uppers: RefCell::new(uppers),
-            watches: RefCell::new(Vec::new()),
-            checked: RefCell::new(None),
+            home: Some(solver.next_barrier_home()),
         });
-        BARRIER_ARENA.with(|slot| {
-            if let Some(arena) = slot.borrow_mut().as_mut() {
-                arena.push(Rc::clone(&barrier));
-            }
-        });
+        solver.adopt_barrier(
+            &barrier,
+            BarrierState {
+                lowers,
+                uppers,
+                ..BarrierState::default()
+            },
+        );
         barrier
+    }
+
+    /// Mint a barrier variable outside every run, with nothing recorded: `opaque_output`
+    /// places its placeholders before inference starts.
+    pub fn unowned(opaque: Rc<[Name]>) -> Rc<BarrierVar> {
+        Rc::new(BarrierVar {
+            uid: fresh_barrier_var_id(),
+            opaque,
+            home: None,
+        })
+    }
+
+    /// The solver slot holding what is recorded on this variable, where a solver minted it.
+    pub(crate) fn home(&self) -> Option<crate::ccl::infer::solver::state::Home> {
+        self.home
+    }
+
+    /// The gathered lower bounds ([`BarrierState::lowers`]).
+    pub fn lowers<'s>(&self, solver: &'s Solver) -> &'s [Bound] {
+        &solver.barrier_state(self).lowers
+    }
+
+    /// The lower bounds, for recording more.
+    pub fn lowers_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut Vec<Bound> {
+        &mut solver.barrier_state_mut(self).lowers
+    }
+
+    /// The gathered upper bounds ([`BarrierState::uppers`]).
+    pub fn uppers<'s>(&self, solver: &'s Solver) -> &'s [BarrierUpper] {
+        &solver.barrier_state(self).uppers
+    }
+
+    /// The upper bounds, for recording more.
+    pub fn uppers_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut Vec<BarrierUpper> {
+        &mut solver.barrier_state_mut(self).uppers
+    }
+
+    /// The trait obligations watching this variable ([`BarrierState::watches`]).
+    pub fn watches<'s>(
+        &self,
+        solver: &'s Solver,
+    ) -> &'s [(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)] {
+        &solver.barrier_state(self).watches
+    }
+
+    /// The watching obligations, for adding one.
+    pub fn watches_mut<'s>(
+        &self,
+        solver: &'s mut Solver,
+    ) -> &'s mut Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)> {
+        &mut solver.barrier_state_mut(self).watches
+    }
+
+    /// What the last check found ([`BarrierState::checked`]).
+    pub fn checked<'s>(&self, solver: &'s Solver) -> &'s Option<BarrierCheck> {
+        &solver.barrier_state(self).checked
+    }
+
+    /// What the last check found, for recording a new check.
+    pub fn checked_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut Option<BarrierCheck> {
+        &mut solver.barrier_state_mut(self).checked
     }
 
     /// The scope level the variable belongs to, with the meaning of [`InferVar`]'s: a
     /// generalized `let` quantifies a barrier variable above its level. It is the
     /// maximum [`type_level`](crate::ccl::infer::solver::type_level) of the bounding
     /// types in `lowers` and `uppers`, and 0 when both are empty.
-    pub fn level(&self) -> Level {
-        if self.reading_level.replace(true) {
+    pub fn level(&self, solver: &Solver) -> Level {
+        let state = solver.barrier_state(self);
+        if state.reading_level.replace(true) {
             return 0;
         }
-        let level = self
+        let level = state
             .lowers
-            .borrow()
             .iter()
-            .map(|b| crate::ccl::infer::solver::type_level(&b.ty))
+            .map(|b| crate::ccl::infer::solver::type_level(solver, &b.ty))
             .chain(
-                self.uppers
-                    .borrow()
+                state
+                    .uppers
                     .iter()
-                    .map(|u| crate::ccl::infer::solver::type_level(&u.bound.ty)),
+                    .map(|u| crate::ccl::infer::solver::type_level(solver, &u.bound.ty)),
             )
             .max()
             .unwrap_or(0);
-        self.reading_level.set(false);
+        state.reading_level.set(false);
         level
     }
 }
@@ -1431,46 +1436,6 @@ mod tests {
     use super::*;
     use crate::ccl::BaseType;
 
-    fn a_bound() -> Bound {
-        Bound::conc(Type::Base(BaseType::Int))
-    }
-
-    /// Teardown clears every variable in the arena, and most of them never took
-    /// a bound — so clearing must hand the list back to the shared empty `Rc`
-    /// rather than allocate a copy to clear. Pointer identity is the check: a
-    /// `Rc::make_mut` + `clear` on the shared empty list installs a *fresh* `Rc`
-    /// and fails here.
-    #[test]
-    fn clearing_bounds_restores_the_shared_empty_list() {
-        let mut bounds = InferBounds::default();
-        bounds.lower_mut().push(a_bound());
-        bounds.clear();
-        NO_BOUNDS.with(|empty| {
-            assert!(Rc::ptr_eq(bounds.lower(), empty));
-            assert!(Rc::ptr_eq(bounds.upper(), empty));
-        });
-    }
-
-    /// Clearing severs the holder's reference instead of emptying a copy — which
-    /// is what releases the `Bound`s (and the reference cycle through them) once
-    /// the last reader is gone.
-    #[test]
-    fn clearing_severs_a_shared_list_rather_than_emptying_a_copy() {
-        let mut bounds = InferBounds::default();
-        bounds.lower_mut().push(a_bound());
-        let reader = Rc::clone(bounds.lower());
-
-        bounds.clear();
-
-        assert!(bounds.lower().is_empty(), "the holder released its list");
-        assert_eq!(reader.len(), 1, "the reader's snapshot is untouched");
-        assert_eq!(
-            Rc::strong_count(&reader),
-            1,
-            "the holder no longer references the bounds it dropped"
-        );
-    }
-
     /// A telescope is a scope path: membership sees every enclosing entry, a
     /// shadowing binder is a separate entry, and extension shares the tail
     /// rather than copying it.
@@ -1495,6 +1460,7 @@ mod tests {
     /// [`enforce_bound_scope`] rejects a bound with a non-empty gap set.
     #[test]
     fn bound_scope_gaps_reads_the_bound_as_its_edge_leaves_it() {
+        let solver = &mut Solver::new();
         use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
         use std::rc::Rc as StdRc;
         let dep = |referenced: &str| {
@@ -1510,36 +1476,42 @@ mod tests {
         let scope = Telescope::empty().extended(Name::raw("k"));
 
         // Covered by the telescope.
-        assert!(bound_scope_gaps(&scope, &Bound::conc(dep("k"))).is_empty());
+        assert!(bound_scope_gaps(solver, &scope, &Bound::conc(dep("k"))).is_empty());
         // Covered by the edge substitution: it discharges `x` to a term naming nothing.
         let discharged = Bound::with_subst(
+            solver,
             dep("x"),
             Subst::discharge(Name::raw("x"), TypedExpr::lit(Lit::Int(7))),
         );
-        assert!(bound_scope_gaps(&scope, &discharged).is_empty());
+        assert!(bound_scope_gaps(solver, &scope, &discharged).is_empty());
         // Discharged to a term naming a binder the holder cannot name: what lands in the holder
         // is `y`.
         let to_a_name = Bound::with_subst(
+            solver,
             dep("x"),
             Subst::discharge(Name::raw("x"), TypedExpr::var(Name::raw("y"))),
         );
         assert_eq!(
-            bound_scope_gaps(&scope, &to_a_name)
+            bound_scope_gaps(solver, &scope, &to_a_name)
                 .iter()
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>(),
             ["y"]
         );
         // Covered by neither: the open bound the design retires.
-        let gaps = bound_scope_gaps(&scope, &Bound::conc(dep("y")));
+        let gaps = bound_scope_gaps(solver, &scope, &Bound::conc(dep("y")));
         assert_eq!(
             gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
             ["y"]
         );
         // Renamed onto a binder the holder cannot name: the edge's domain covers `y`, but what
         // lands in the holder is `z`.
-        let renamed = Bound::with_subst(dep("y"), Subst::rename(Name::raw("y"), Name::raw("z")));
-        let gaps = bound_scope_gaps(&scope, &renamed);
+        let renamed = Bound::with_subst(
+            solver,
+            dep("y"),
+            Subst::rename(Name::raw("y"), Name::raw("z")),
+        );
+        let gaps = bound_scope_gaps(solver, &scope, &renamed);
         assert_eq!(
             gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
             ["z"]
@@ -1547,18 +1519,20 @@ mod tests {
         // A holder side that renames `k` to `j` reads `j` in the content as the holder's `k`,
         // which the telescope holds; a content `j` standing for the holder's `m` is not held.
         let through_the_holder = Bound::edge(
+            solver,
             Subst::rename(Name::raw("k"), Name::raw("j")),
             dep("j"),
             Subst::id(),
         );
-        assert!(bound_scope_gaps(&scope, &through_the_holder).is_empty());
+        assert!(bound_scope_gaps(solver, &scope, &through_the_holder).is_empty());
         let through_the_holder = Bound::edge(
+            solver,
             Subst::rename(Name::raw("m"), Name::raw("j")),
             dep("j"),
             Subst::id(),
         );
         assert_eq!(
-            bound_scope_gaps(&scope, &through_the_holder)
+            bound_scope_gaps(solver, &scope, &through_the_holder)
                 .iter()
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>(),
@@ -1573,6 +1547,7 @@ mod tests {
     /// `snapshot_write_to_an_unannotated_mut_var`).
     #[test]
     fn an_opaque_binder_covers_a_reference_on_a_holder_minted_before_it() {
+        let solver = &mut Solver::new();
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
         let read = Name::mut_read();
@@ -1581,12 +1556,12 @@ mod tests {
             Refinement::born(StdRc::new(TypedExpr::var(read.clone()))),
         );
         let root = Telescope::empty();
-        let holder = InferVar::fresh_in(0, &root);
-        assert!(!bound_scope_gaps(&holder.telescope, &Bound::conc(dep.clone())).is_empty());
+        let holder = InferVar::fresh_in(solver, 0, &root);
+        assert!(!bound_scope_gaps(solver, &holder.telescope, &Bound::conc(dep.clone())).is_empty());
         // Entering the binder reaches the telescope already stamped on `holder`:
         // the opaque set is shared by every telescope derived from `root`.
         root.extended(Name::raw("elsewhere")).enter_opaque(&read);
-        assert!(bound_scope_gaps(&holder.telescope, &Bound::conc(dep)).is_empty());
+        assert!(bound_scope_gaps(solver, &holder.telescope, &Bound::conc(dep)).is_empty());
     }
 
     /// The record-time closure invariant is an internal error on the live
@@ -1596,14 +1571,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "open bound recorded")]
     fn recording_an_open_bound_is_an_internal_error() {
+        let solver = &mut Solver::new();
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
         let dep = Type::refined_one(
             Type::Base(BaseType::Int),
             Refinement::born(StdRc::new(TypedExpr::var(Name::fresh("escaped")))),
         );
-        let holder = InferVar::fresh(0);
-        enforce_bound_scope(&holder, "lower", &Bound::conc(dep));
+        let holder = InferVar::fresh(solver, 0);
+        enforce_bound_scope(solver, &holder, "lower", &Bound::conc(dep));
     }
 
     /// A [`Name::Raw`] gap is an internal error like any other. The form does
@@ -1614,14 +1590,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "open bound recorded")]
     fn a_raw_gap_is_an_internal_error() {
+        let solver = &mut Solver::new();
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
         let dep = Type::refined_one(
             Type::Base(BaseType::Int),
             Refinement::born(StdRc::new(TypedExpr::var(Name::raw("a")))),
         );
-        let holder = InferVar::fresh(0);
-        enforce_bound_scope(&holder, "lower", &Bound::conc(dep));
+        let holder = InferVar::fresh(solver, 0);
+        enforce_bound_scope(solver, &holder, "lower", &Bound::conc(dep));
     }
 
     /// A fresh variable's lists are the shared empty one, so minting costs no

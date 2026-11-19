@@ -16,6 +16,7 @@
 //! indexed form builds a level at a time.
 
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use std::rc::Rc;
 
 use crate::ccl::Duplicate;
@@ -353,7 +354,7 @@ pub(crate) fn lifted_past(binding: &TypedBinding, bound_expr: &Expr, ty: &Type) 
     }
     crate::ccl::subst::Subst::discharge(
         &binding.name,
-        crate::ccl::ccl_utils::predicate_term(bound_expr),
+        crate::ccl::ccl_utils::predicate_term(&mut Solver::none(), bound_expr),
     )
     .apply_type(ty)
 }
