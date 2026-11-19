@@ -1324,6 +1324,10 @@ impl TileProducer for SelectFieldProducer {
             let at_field = self.at_field(dropped);
             self.input.release(at_field);
         }
+        // A row is complete for this field once the field's value is, where the input states a
+        // row complete only once all its fields are. A plain field is complete once held, so each
+        // held row is; a field of any other value states nothing here.
+        tile.state_held_values_complete();
         tile.restrict_to(&projection, self.tiling());
         tile
     }
@@ -1369,9 +1373,9 @@ mod nested_projection_tests {
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{
-        QuietSpy, ReleaseSpy, TestTileProducer,
+        QuietSpy, ReleaseSpy, ScriptedProducer, TestTileProducer,
     };
-    use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Value, validate_tile};
     use bit_set::BitSet;
     use std::cell::RefCell;
 
@@ -1831,6 +1835,98 @@ mod tests {
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![1]));
         assert_eq!(**codomain, Tile::Scalar(ColumnValue::Ints(vec![5])));
+    }
+
+    /// What `SelectField(a)` states complete over key `0` of rows `{a, b}`, where `b` is a
+    /// collection still growing: first with `a` holding `earlier`, then after the part of key
+    /// `0` that holds `later` merges into its input.
+    fn stated_as_a_arrives(earlier: Tile, later: Tile, a_tiling: Tiling) -> (Predicate, Predicate) {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let row_tiling = Tiling::Record(HashMap::from([
+            ("a".into(), a_tiling.clone()),
+            (
+                "b".into(),
+                Tiling::data_function(uint(), Tiling::Scalar(int())),
+            ),
+        ]));
+        let input_tiling = Tiling::data_function(uint(), row_tiling);
+        let field_tiling = Tiling::data_function(uint(), a_tiling);
+        // Key `0`'s part holding `a` and the `b` element at `b_key`.
+        let part = |a: Tile, b_key: u64| {
+            let b = Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![b_key]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                Predicate::False,
+                BitSet::new(),
+            );
+            Tile::data_function(
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::record(HashMap::from([
+                    ("a".into(), a),
+                    ("b".into(), b),
+                ]))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let (input, cell) = ScriptedProducer::new(part(earlier, 0), input_tiling.clone());
+        let mut producer = SelectFieldProducer {
+            base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
+            input: Box::new(input),
+            name: "a".into(),
+            input_tiling,
+        };
+        let mut stated = || {
+            let out = producer.read_in_pipeline(producer.tiling().universal_guard());
+            assert!(validate_tile(&out), "{out:?}");
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = out
+            else {
+                panic!("the field is a collection: {out:?}")
+            };
+            domain_predicate
+        };
+        let before = stated();
+        cell.borrow_mut().merge(part(later, 1));
+        (before, stated())
+    }
+
+    /// A selected scalar that has not arrived leaves its row open, and the row is complete once
+    /// the scalar arrives.
+    #[test]
+    fn select_field_leaves_a_row_open_until_its_scalar_arrives() {
+        let (before, after) = stated_as_a_arrives(
+            Tile::Scalar(ColumnValue::Ints(vec![])),
+            Tile::Scalar(ColumnValue::Ints(vec![5])),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        assert!(before.is_false(), "{before:?}");
+        assert!(after.contains(&Value::UInt(0)), "{after:?}");
+    }
+
+    /// A selected record of scalars with one field arrived leaves its row open, and the row is
+    /// complete once the other field arrives.
+    #[test]
+    fn select_field_leaves_a_row_open_until_every_field_of_its_record_arrives() {
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let record_tiling =
+            Tiling::Record(HashMap::from([("x".into(), int()), ("y".into(), int())]));
+        let record = |x: Vec<i64>, y: Vec<i64>| {
+            Tile::record(HashMap::from([
+                ("x".into(), Tile::Scalar(ColumnValue::Ints(x))),
+                ("y".into(), Tile::Scalar(ColumnValue::Ints(y))),
+            ]))
+        };
+        let (before, after) = stated_as_a_arrives(
+            record(vec![5], vec![]),
+            record(vec![], vec![6]),
+            record_tiling,
+        );
+        assert!(before.is_false(), "{before:?}");
+        assert!(after.contains(&Value::UInt(0)), "{after:?}");
     }
 
     /// Each input's deleted row is dropped from what `Zip` emits, so each input is released

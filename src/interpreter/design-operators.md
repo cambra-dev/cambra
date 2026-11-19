@@ -795,6 +795,15 @@ be complete. `Zip`, unions and pairing operators therefore intersect their state
 A fully released union arm contributes an empty tile with `True` completeness and imposes
 no further restriction.
 
+A record row is complete once all its fields are, so a field read alone can be complete earlier.
+A plain value, a scalar or a record of scalars, is complete once held, which is what the release
+contract releases (`Tile::to_guard`). Where the field `SelectField` selects is plain, the selector
+states complete each row it holds whose cells of that field have arrived
+(`Tile::state_held_values_complete`). A row stays open while the field's scalar column, or a column
+of a record field, has not arrived. The selector states only the rows it holds: that no further row
+arrives is the input's statement of its keys, so over an outer live source the selected collection
+stays open until that source's rows are complete.
+
 ## The notification contract
 
 `Consumer::notify(region, landing)` announces a region and marks cached reads of that region

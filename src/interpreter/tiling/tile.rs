@@ -1836,6 +1836,23 @@ impl Tile {
         matches!(self, Tile::DataFunction { .. })
     }
 
+    /// Whether this is a plain value, a scalar or a record of plain values, that holds its cells
+    /// at each of `rows` rows. A plain value's cells are final once held. A column that has not
+    /// arrived is empty ([`validate_tile`]), so a scalar or a record field with an empty column
+    /// holds no cell yet. A field whose cells at some rows were released (`absent`) holds a cell
+    /// at each of the others. An aggregation and a store carry a completeness of their own, and a
+    /// collection holds a level.
+    fn holds_plain_values(&self, rows: usize) -> bool {
+        match self {
+            Tile::Scalar(cv) => rows == 0 || !cv.is_empty(),
+            Tile::Record { fields, absent } => fields.iter().all(|(name, field)| {
+                let released = absent.get(name).map_or(0, BitSet::len);
+                field.holds_plain_values(rows.saturating_sub(released))
+            }),
+            Tile::DataFunction { .. } | Tile::Aggregation { .. } | Tile::Store { .. } => false,
+        }
+    }
+
     /// Whether a level sits here, or inside a record here.
     ///
     /// A [`Self::Record`] is one sub-tile per field over the *same* rows, so it introduces
@@ -2260,6 +2277,52 @@ impl Tile {
                 })
                 .collect(),
         )
+    }
+
+    /// State complete each key the innermost collection level holds where its values are plain
+    /// and their cells are held ([`Tile::holds_plain_values`]). Under the release contract a
+    /// plain value is complete once held. An operator whose rows read only such a value calls it
+    /// where its input's row statement also covers values it does not read, as a field selector
+    /// over a record whose other field still grows (`src/interpreter/design-operators.md`, "The
+    /// completeness contract"). It states nothing where the values beneath the innermost level
+    /// are not plain, as a record holding a level, an aggregation or a store. It also states
+    /// nothing where a column of those values has not arrived: a key stated complete gains nothing
+    /// further, so its missing cell would never arrive.
+    ///
+    /// A tile valid before the call is valid after it ([`validate_tile`]).
+    pub(crate) fn state_held_values_complete(&mut self) {
+        fn walk(tile: &mut Tile, row_paths: &[Vec<Value>]) {
+            let Tile::DataFunction {
+                domain, codomain, ..
+            } = &*tile
+            else {
+                return;
+            };
+            if matches!(**codomain, Tile::DataFunction { .. }) {
+                let paths = tile.key_paths(row_paths);
+                if let Tile::DataFunction { codomain, .. } = tile {
+                    walk(codomain, &paths);
+                }
+                return;
+            }
+            if !codomain.holds_plain_values(domain.len()) {
+                return;
+            }
+            let held = tile.held_keys(row_paths);
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = tile
+            {
+                *domain_predicate = domain_predicate.union(&held);
+            }
+        }
+        let was_valid = cfg!(debug_assertions) && validate_tile(self);
+        walk(self, &[Vec::new()]);
+        debug_assert!(
+            !was_valid || validate_tile(self),
+            "stating held plain values complete keeps a valid tile valid: every key it states \
+             holds its cells, {self:?}"
+        );
     }
 
     /// The keys this collection holds, each beneath the path of the row holding it.
@@ -3451,6 +3514,238 @@ mod tests {
     use super::super::predicate::same_region;
     use super::*;
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, TileGuard, Value};
+
+    // ── Held values that hold no level ────────────────────────────────────────
+
+    /// Held keys whose values hold no level are stated complete, besides what was stated.
+    #[test]
+    fn held_values_with_no_level_are_stated_complete() {
+        let mut tile = Tile::DataFunction {
+            row_starts: vec![0],
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+            domain_predicate: Predicate::point(Value::UInt(5)),
+            deleted: BitSet::new(),
+            absent_keys: Predicate::False,
+        };
+        tile.state_held_values_complete();
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            unreachable!()
+        };
+        let expected = Predicate::point(Value::UInt(5)).union(&Predicate::from_column_value(
+            &ColumnValue::UInts(vec![0, 1]),
+        ));
+        assert!(
+            same_region(domain_predicate, &expected),
+            "{domain_predicate:?}"
+        );
+    }
+
+    /// A statement already present is kept beside the held keys, whatever its qualification.
+    #[test]
+    fn held_values_join_a_qualified_statement_already_present() {
+        let row = Predicate::exactly(&[Value::UInt(7)]);
+        let stated = Predicate::qualified(row.clone(), Predicate::point(Value::UInt(9)));
+        let mut tile = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::DataFunction {
+                row_starts: vec![0],
+                domain: ColumnValue::UInts(vec![0]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+                domain_predicate: stated.clone(),
+                deleted: BitSet::new(),
+                absent_keys: Predicate::False,
+            }),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.state_held_values_complete();
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            unreachable!()
+        };
+        let Tile::DataFunction {
+            domain_predicate: inner,
+            ..
+        } = &**codomain
+        else {
+            unreachable!()
+        };
+        let held = Predicate::qualified(row, Predicate::point(Value::UInt(0)));
+        assert!(same_region(inner, &stated.union(&held)), "{inner:?}");
+    }
+
+    /// Beneath an enclosing level, each held key is stated complete under the path of its row,
+    /// and the enclosing level states nothing new.
+    #[test]
+    fn held_values_beneath_a_level_are_stated_under_their_rows() {
+        let mut tile = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::DataFunction {
+                row_starts: vec![0],
+                domain: ColumnValue::UInts(vec![0, 1]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+                domain_predicate: Predicate::False,
+                deleted: BitSet::new(),
+                absent_keys: Predicate::False,
+            }),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.state_held_values_complete();
+        let Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } = &tile
+        else {
+            unreachable!()
+        };
+        assert!(domain_predicate.is_false());
+        let Tile::DataFunction {
+            domain_predicate: inner,
+            ..
+        } = &**codomain
+        else {
+            unreachable!()
+        };
+        let row = Predicate::exactly(&[Value::UInt(7)]);
+        let keys = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1]));
+        assert!(
+            same_region(inner, &Predicate::qualified(row, keys)),
+            "{inner:?}"
+        );
+    }
+
+    /// Key `0` of a collection stating nothing complete, over `values`.
+    fn one_open_key(values: Tile) -> Tile {
+        Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(values),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    /// What `tile`'s innermost level states complete after [`Tile::state_held_values_complete`],
+    /// which keeps the tile valid.
+    fn stated_after_held_values(tile: &mut Tile) -> Predicate {
+        assert!(validate_tile(tile), "{tile:?}");
+        tile.state_held_values_complete();
+        assert!(validate_tile(tile), "{tile:?}");
+        let mut level = &*tile;
+        while let Tile::DataFunction {
+            codomain,
+            domain_predicate,
+            ..
+        } = level
+        {
+            if !codomain.is_data_function() {
+                return domain_predicate.clone();
+            }
+            level = codomain;
+        }
+        unreachable!("the tile is a collection: {tile:?}")
+    }
+
+    /// A key whose scalar has not arrived is not stated complete, and is once the scalar merges
+    /// into the tile.
+    #[test]
+    fn a_held_key_whose_scalar_has_not_arrived_is_not_stated_complete() {
+        let mut tile = one_open_key(Tile::Scalar(ColumnValue::Ints(vec![])));
+        assert!(stated_after_held_values(&mut tile).is_false());
+        tile.deepest_values_mut()
+            .merge(Tile::Scalar(ColumnValue::Ints(vec![10])));
+        let stated = stated_after_held_values(&mut tile);
+        assert!(
+            same_region(&stated, &Predicate::point(Value::UInt(0))),
+            "{stated:?}"
+        );
+    }
+
+    /// A key whose record of scalars holds one field and not the other is not stated complete,
+    /// and is once the other field merges into the tile.
+    #[test]
+    fn a_held_key_whose_record_is_partly_filled_is_not_stated_complete() {
+        let record = |x: Vec<i64>, y: Vec<i64>| {
+            Tile::record(HashMap::from([
+                ("x".into(), Tile::Scalar(ColumnValue::Ints(x))),
+                ("y".into(), Tile::Scalar(ColumnValue::Ints(y))),
+            ]))
+        };
+        let mut tile = one_open_key(record(vec![10], vec![]));
+        assert!(stated_after_held_values(&mut tile).is_false());
+        tile.deepest_values_mut().merge(record(vec![], vec![20]));
+        let stated = stated_after_held_values(&mut tile);
+        assert!(
+            same_region(&stated, &Predicate::point(Value::UInt(0))),
+            "{stated:?}"
+        );
+    }
+
+    /// A field whose cell at a row was released holds its cell at each other row, so the
+    /// released cell keeps no key open. Keys `0, 1` hold `y` at key `1` only, its cell at key `0`
+    /// released; they are stated complete once `x` merges into the tile.
+    #[test]
+    fn a_released_cell_leaves_its_key_stated_complete_once_the_others_arrive() {
+        let record = |x: Vec<i64>, y: Vec<i64>, released: &[usize]| Tile::Record {
+            fields: HashMap::from([
+                ("x".into(), Tile::Scalar(ColumnValue::Ints(x))),
+                ("y".into(), Tile::Scalar(ColumnValue::Ints(y))),
+            ]),
+            absent: released
+                .iter()
+                .map(|&row| ("y".into(), BitSet::from_iter([row])))
+                .collect(),
+        };
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(record(vec![], vec![21], &[0])),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert!(stated_after_held_values(&mut tile).is_false());
+        tile.deepest_values_mut()
+            .merge(record(vec![10, 11], vec![], &[]));
+        let stated = stated_after_held_values(&mut tile);
+        let keys = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1]));
+        assert!(same_region(&stated, &keys), "{stated:?}");
+    }
+
+    /// Beneath an enclosing level of rows `7, 8`, whose rows hold different numbers of keys,
+    /// the keys are not stated complete before their scalars arrive, and each is stated complete
+    /// under its row once they merge into the tile.
+    #[test]
+    fn held_keys_beneath_a_level_are_stated_once_their_scalars_arrive() {
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![7, 8]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![0, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert!(stated_after_held_values(&mut tile).is_false());
+        tile.deepest_values_mut()
+            .merge(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12])));
+        let stated = stated_after_held_values(&mut tile);
+        let under = |row: u64, keys: Vec<u64>| {
+            Predicate::qualified(
+                Predicate::exactly(&[Value::UInt(row)]),
+                Predicate::from_column_value(&ColumnValue::UInts(keys)),
+            )
+        };
+        let expected = under(7, vec![0]).union(&under(8, vec![0, 1]));
+        assert!(same_region(&stated, &expected), "{stated:?}");
+    }
 
     // ── The keys compaction removes ───────────────────────────────────────────
 
