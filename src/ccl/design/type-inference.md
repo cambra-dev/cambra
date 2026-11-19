@@ -2937,10 +2937,14 @@ They do not denote the immutable value required by this substitution: a mutable 
 its seed, and a write is not the written value. They are eliminated before consumers of the
 lifted type use that representation.
 
-Coalescing closes the result using the resolved body and definition. Nested lets close from
-inside outward. If lambda elimination rewrites a definition held by the result type, its let
-rebuild must discharge the rewritten definition again. The post-pass check likewise reconstructs
-from the tree it receives, not from a pre-transformation held term.
+Coalescing closes the result using the resolved body and definition. Nested lets close from inside
+outward. Coalescing does not resolve a `let`'s own result variable, nor an effect statement's or a
+mutable introduction's type, which is its body's own: each takes its body's coalesced type, and
+resolving the variable would compact the whole spine below it, quadratic in the spine's length. A
+conflict on that variable is one on the body's variable, which every upper bound on it reaches when
+it is recorded, so it is reported at the body. If lambda elimination rewrites a definition held by
+the result type, its let rebuild must discharge the rewritten definition again. The post-pass check
+likewise reconstructs from the tree it receives, not from a pre-transformation held term.
 
 #### A lambda's codomain drops the body's opaque binders
 
