@@ -865,7 +865,7 @@ fn projects_a_uint_range(solver: &mut Solver, p: &crate::ccl::ty::WitnessProject
     }
     // This query runs while `reading_sums` holds `v`, which answers a cycle through it, so its
     // result must not enter a fixed-graph batch's memo ([`with_fixed_graph_compactions`]).
-    let term = compact_type_with(solver, &p.term.ty, true, false).term;
+    let term = compact_type_with(solver, &p.term.ty, true, false, false).term;
     solver.reading_sums.remove(&v.uid);
     term.fun
         .and_then(|f| f.binders.get(p.position).map(|w| w.type_kind.clone()))
@@ -1104,6 +1104,11 @@ impl CompactFun {
 ///
 /// Every two values are equal: positions holding the same types are one position whatever
 /// their contributions' births, so the field changes no comparison compaction makes.
+///
+/// Only a failure reported at a position reads them, so only a compaction that asks collects
+/// them ([`compact_type_with_origins`]); every other position's are empty. A position holds as
+/// many births as contributions reach it, and a chain of conditionals reaches each with all of
+/// the chain's, so collecting them on every compaction costs a copy of the chain per position.
 #[derive(Debug, Clone, Default)]
 pub struct ContributionOrigins {
     born: BTreeMap<BornAt, Vec<Type>>,
@@ -2442,13 +2447,19 @@ pub fn compact_type(solver: &mut Solver, ty: &Type) -> CompactGraph {
         {
             return done.clone();
         }
-        let graph = compact_type_with(solver, ty, true, false);
+        let graph = compact_type_with(solver, ty, true, false, false);
         if let Some(memo) = solver.fixed_compactions.as_mut() {
             memo.insert(input, graph.clone());
         }
         return graph;
     }
-    compact_type_with(solver, ty, true, false)
+    compact_type_with(solver, ty, true, false, false)
+}
+
+/// [`compact_type`], with each position's [`ContributionOrigins`] collected: what a failure
+/// reported at a position reads.
+pub fn compact_type_with_origins(solver: &mut Solver, ty: &Type) -> CompactGraph {
+    compact_type_with(solver, ty, true, false, true)
 }
 
 /// [`compact_type`] with the opposite-polarity collapse suppressed **entirely**,
@@ -2465,14 +2476,14 @@ pub fn compact_type(solver: &mut Solver, ty: &Type) -> CompactGraph {
 /// [`fallback_allowed`] already confines the collapse to the entered position, so
 /// disabling it there disables it everywhere.
 pub fn compact_type_polarity_only(solver: &mut Solver, ty: &Type) -> CompactGraph {
-    compact_type_with(solver, ty, false, false)
+    compact_type_with(solver, ty, false, false, false)
 }
 
 /// [`compact_type_polarity_only`], with each function position's capabilities also holding the
 /// capability variables standing at it, which a rendering of a polymorphic type names
 /// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
 pub fn compact_type_for_display(solver: &mut Solver, ty: &Type) -> CompactGraph {
-    compact_type_with(solver, ty, false, true)
+    compact_type_with(solver, ty, false, true, false)
 }
 
 fn compact_type_with(
@@ -2480,8 +2491,9 @@ fn compact_type_with(
     ty: &Type,
     collapse: bool,
     capability_vars: bool,
+    origins: bool,
 ) -> CompactGraph {
-    solver.read(|solver| compact_type_reading(solver, ty, collapse, capability_vars))
+    solver.read(|solver| compact_type_reading(solver, ty, collapse, capability_vars, origins))
 }
 
 /// [`compact_type_with`] inside its read ([`Solver::read`]).
@@ -2490,9 +2502,11 @@ fn compact_type_reading(
     ty: &Type,
     collapse: bool,
     capability_vars: bool,
+    origins: bool,
 ) -> CompactGraph {
     let mut st = CompactState::new(collapse);
     st.capability_vars = capability_vars;
+    st.origins = origins;
     if capability_vars {
         st.held_elsewhere = Some(Rc::new(crate::ccl::infer_var::var_edges_held_elsewhere(
             solver,
@@ -3150,6 +3164,9 @@ struct CompactState {
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
+    /// Whether each position collects its [`ContributionOrigins`]: only a failure reported at a
+    /// position reads them ([`compact_type_with_origins`]).
+    origins: bool,
     /// Whether each function position records the capability variables standing at it
     /// ([`CapabilitySet::vars`](crate::ccl::capabilities::CapabilitySet::vars)): only a rendering of a
     /// polymorphic type reads them ([`compact_type_for_display`]).
@@ -3230,6 +3247,7 @@ impl CompactState {
             rec_vars: BTreeMap::new(),
             collapse,
             capability_vars: false,
+            origins: false,
             held_elsewhere: None,
             scope: RefinementScope::default(),
             data_domain_depth: 0,
@@ -3742,7 +3760,7 @@ fn compact_go(
     });
     // A type a variable's bound holds is born where the bound says; the variable's arm
     // records it. Any other type contributes without a recorded birth.
-    if !stands_for_a_variable(ty) {
+    if st.origins && !stands_for_a_variable(ty) {
         ct.origins = ct.origins.union(ContributionOrigins::unknown());
     }
     ct
@@ -4533,7 +4551,7 @@ fn expand_variable(
             Subst::then(solver, &rendered, subst_acc)
         };
         let mut bc = compact_bound(solver, &b.ty, pol, &inner_acc, pos.under(&new_parents), st);
-        if !stands_for_a_variable(&b.ty) {
+        if st.origins && !stands_for_a_variable(&b.ty) {
             bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
         }
         bound = CompactType::merge(solver, pol, bound, bc);
@@ -4669,7 +4687,7 @@ fn expand_variable(
             let inner_acc = Subst::then(solver, &rendered, subst_acc);
             let mut bc =
                 compact_bound(solver, &b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
-            if !stands_for_a_variable(&b.ty) {
+            if st.origins && !stands_for_a_variable(&b.ty) {
                 bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
             }
             recovered = Some(match recovered {
