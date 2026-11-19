@@ -25,11 +25,14 @@ no owner in that model. A source has one: the version that declares it.
   values of one declared type. Each element is a new version of the configuration.
 - **Configuration value**: one element of a configuration source.
 - **Secret configuration source**: a configuration source whose elements are `Secret(T)` values,
-  which no program unwraps ([Secret configuration](#secret-configuration)).
+  which a program unwraps only by an operation that causes `Reveal` ([Secret
+  configuration](#secret-configuration)).
 - **Secret combinator**: `flat_map`, or a function written over it such as `map` or `map2`, which
   applies a function to the values inside secrets and returns its result as a `Secret`.
-- **Verifier**: a function that compares a secret in constant time and returns a plain `Bool`
-  ([Verifying a secret](#verifying-a-secret)).
+- **`Reveal`**: the effect of unwrapping a secret, which `reveal` and an append of a secret to a
+  sink cause ([Revealing a secret](#revealing-a-secret)).
+- **Verifier**: a function that compares a secret in constant time and reveals only the result
+  ([Revealing a secret](#revealing-a-secret)).
 - **Configuration payload**: the map from configuration-source name to an encoded value that a
   create or reload request carries beside the program.
 - **Configuration API**: the engine endpoint that decodes a configuration payload and delivers each
@@ -81,14 +84,15 @@ Every name is a placeholder ([Open questions](#open-questions)).
 | `secret_source(name)` | `String => Source(Secret(T))` | Declares the secret configuration source `name` |
 | `source_or(name, default)` | `{String, T} => Source(T)` | Declares `name` with `default` as its value until one is supplied |
 | `first(s)` | `Source(T) => T` | The value `s` holds when the version starts, which a mutable variable's declaration takes as its initial value |
-| `Secret(T)` | nominal builtin | Holds a value no program unwraps |
+| `Secret(T)` | nominal builtin | Holds a value that only an operation causing `Reveal` unwraps |
 | `secret(v)` | `@Builtin`, `T => Secret(T)` | Wraps `v` as a `Secret` |
 | `s.flat_map(f)` | `@Builtin`, `{Secret(T), (T => Secret(U) requires Context)} => Secret(U)` | Applies `f` to the value `s` holds |
+| `reveal(s)` | `@Builtin`, `Secret(T) => T causes Reveal` | The value `s` holds |
 | `s.map(f)` | `{Secret(T), (T => U requires Context)} => Secret(U)` | `s.flat_map(lambda x: secret(f(x)))` |
 | `s.map2(t, f)` | `{Secret(T), Secret(U), ({T, U} => V requires Context)} => Secret(V)` | `s.flat_map(lambda x: t.map(lambda y: f(x, y)))` |
 | `sequence(xs)` | `List(Secret(T)) => Secret(List(T))` | A fold of `xs` over `map2` |
-| `hmac_verify(key, msg, sig)` | `@Builtin`, `{Secret(String), String, String} => Bool` | Whether `sig` is the HMAC-SHA256 of `msg` under `key`, compared in constant time |
-| `secret_eq(s, guess)` | `@Builtin`, `{Secret(String), String} => Bool` | Whether `s` holds `guess`, compared in constant time |
+| `secret_eq(s, guess)` | `{Secret(T), T} => Bool requires Equatable(T, T) causes Reveal` | `reveal(s.map(lambda v: constant_time_eq(v, guess)))` |
+| `hmac_verify(key, msg, sig)` | `{Secret(String), String, String} => Bool causes Reveal` | `reveal(key.map(lambda k: constant_time_eq(hmac_sha256(k, msg), sig)))` |
 
 Opening a source requires `ObserveWorld`. The engine knows every configuration source before the
 version runs, so `source`, `secret_source` and `source_or` are called only as the whole right-hand
@@ -141,13 +145,13 @@ name.
 
 A secret configuration source's elements have type **`Secret(T)`**, a nominal builtin as `Set` and
 `Map` are ([chl-spec.md, "Collection operations"](chl-spec.md#collection-operations)). A builtin
-has no constructors and no `extract`, so no program unwraps a `Secret`. `secret(v)` builds one. A
-program stores a `Secret`, passes it, and folds it into a mutable variable. It computes on the
-value inside through the **secret combinators**, whose results are `Secret` values again.
-`flat_map` is the one `@Builtin` combinator, and `map`, `map2` and `sequence` are ordinary
-polymorphic functions that `std::config` writes over it ([The `std::config`
-interface](#the-stdconfig-interface)). A sink whose element type has a `Secret` field unwraps that
-field as it hands the element out. The spelling below is a placeholder:
+has no constructors and no `extract`. `secret(v)` builds a `Secret`. A program stores a `Secret`,
+passes it, and folds it into a mutable variable. It computes on the value inside through the
+**secret combinators**, whose results are `Secret` values again. `flat_map` is the one `@Builtin`
+combinator, and `map`, `map2` and `sequence` are ordinary polymorphic functions that `std::config`
+writes over it ([The `std::config` interface](#the-stdconfig-interface)). Two operations unwrap a
+`Secret`, `reveal` and an append to a sink, and each causes the effect `Reveal` ([Revealing a
+secret](#revealing-a-secret)). The spelling below is a placeholder:
 
 ```python
 key: Mut(Secret(PaymentsKey), Txn) := config::first(payments_key)
@@ -162,8 +166,9 @@ for req in charges:
 ```
 
 `payments_api` is a sink for outbound requests, which is not designed yet. Its element type is
-`{auth: Secret(String), body: Charge}`, so the inspector shows each request's `body` and redacts
-its `auth`. A sink that unwraps a value manages it, its error text included.
+`{auth: String, body: Charge}`, and the append puts a `Secret(String)` at `auth`. The sink unwraps
+it as it encodes the request, so the append causes `Reveal`, and the inspector shows each request's
+`body` and redacts its `auth`.
 
 `map2` combines two secrets into one, as a key and its certificate combine into one TLS identity:
 `cert.map2(pkey, lambda c, k: (cert=c, key=k))`. `sequence` combines a list of secrets. A program
@@ -173,13 +178,13 @@ secret, which no fixed-arity combinator does.
 
 ### Confinement is typing
 
-No value computed from a secret leaves a `Secret` except through a sink or a verifier ([Verifying a
-secret](#verifying-a-secret)). Existing type rules check this, and none of them is particular to
-secrets:
+No value computed from a secret leaves a `Secret` except through an operation that causes
+`Reveal`. Existing type rules check this, and none of them is particular to secrets:
 
 - **A `Secret(T)` is not a `T`.** Subtyping relates a nominal type only to itself and its
   refinements ([chl-spec.md, "A nominal type is opaque"](chl-spec.md#a-nominal-type-is-opaque)), so
-  a `Secret(String)` passed where a `String` is expected is a type error.
+  a `Secret(String)` passed where a `String` is expected is a type error. The one exception is an
+  element appended to a feed that a sink consumes, and that append causes `Reveal`.
 - **The function a combinator applies causes nothing.** `flat_map`'s parameter type,
   `(T => Secret(U) requires Context)`, has no `causes` clause, and a written type's clauses are
   exact ([chl-spec.md, "Writing requirements and
@@ -202,7 +207,8 @@ Both appends below are compile errors:
 leaked: Feed(String)
 for req in charges:
     with begin():
-        leaked << key.map(lambda k: k.api_key)    # a Secret(String) is not a String
+        leaked << key.map(lambda k: k.api_key)    # a Secret(String) is not a String, and no
+                                                  # sink consumes leaked
         key.map(lambda k: leaked << k.api_key)    # the function causes Append(leaked)
 ```
 
@@ -217,15 +223,39 @@ program"](chl-spec.md#inputs-from-outside-the-program)), so the redacted terms a
 program runs. Redaction is decided from types and call paths, never by matching a value's text,
 which GitHub Actions does and which misses an encoded or reformatted copy ([Security
 hardening](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions)).
-The inspector shows a redacted value as a marker.
+The inspector shows a redacted value as a marker. A value `reveal` returns is not a `Secret`, and
+the inspector shows it.
 
-### Verifying a secret
+### Revealing a secret
 
-A **verifier** is a `std::config` function that compares a secret in constant time and returns a
-plain `Bool`. It is the one way a program decides on a secret outside a `Secret`.
-`hmac_verify(key, msg, sig)` checks that `sig` is the HMAC-SHA256 of `msg` under `key`, and
-`secret_eq(s, guess)` checks that `s` holds `guess`. A webhook checks its signature before it acts
-on a request:
+`Reveal` is an effect, and no construct discharges it, as none discharges `AffectWorld`
+([chl-spec.md, "Discharging requirements and
+effects"](chl-spec.md#discharging-requirements-and-effects)). Two operations cause it:
+
+- **`reveal(s)` returns the value `s` holds.** A function that calls `reveal`, directly or through
+  a call, has `Reveal` in its `causes` clause, and `cambra check` prints it ([chl-spec.md, "9.14
+  Checking a module on its own"](chl-spec.md#914-checking-a-module-on-its-own)). The function a
+  combinator applies causes nothing, so it cannot reveal.
+- **A sink unwraps a `Secret` at any position.** A value appended to a feed that a sink consumes
+  may hold a `Secret(T)` at any position where the feed's element type has a `T`. The sink unwraps
+  each one as it encodes the element, and the append causes `Reveal`. A sink names no positions,
+  so a client whose protocol takes a key in a header, a query parameter or a body field takes it
+  there. A sink that unwraps a value manages it, its error text included.
+
+```python
+calls << (method="POST", url=base_url + "/charges",
+          headers=map([("X-Api-Key", key)]),       # key: Secret(String) where a String goes
+          body=json::encode(c))
+```
+
+Up to the append, the element holds the `Secret`, so the inspector shows the method, the URL and the
+body, and redacts the key.
+
+A **verifier** compares a secret in constant time and reveals only the result. `secret_eq` and
+`hmac_verify` are library functions over `reveal` ([The `std::config`
+interface](#the-stdconfig-interface)), so their types say `causes Reveal`. A webhook checks its
+signature before it acts on a request, and a login checks a stored password hash with
+`secret_eq(stored, argon2id(given, salt))`:
 
 ```python
 hook_key: Mut(Secret(String), Txn) := config::first(hook_secret)   # folded as above
@@ -236,11 +266,18 @@ for r in hooks:
             events << parse(r.body)
 ```
 
-`hooks` stands for a source whose elements carry a body and a signature. Each call reveals the
-result of one comparison. A verifier bounds what one call reveals, not what many calls reveal: a
-low-entropy secret, such as a PIN, is recovered through `secret_eq` by trying every candidate, and
-limiting attempts is the program's job. Whether a program may unwrap a secret any other way is open
-([Open questions](#open-questions)).
+`hooks` stands for a source whose elements carry a body and a signature. A verifier bounds what one
+call reveals, not what many calls reveal: a low-entropy secret, such as a PIN, is recovered through
+`secret_eq` by trying every candidate, and limiting attempts is the program's job.
+
+**A function type bounds `Reveal`.** A written function type's clauses are exact, so a parameter
+`handler: (Request => Response causes Effect except Reveal)`, or one typed with a clause variable
+`E <: Effect except Reveal`, accepts only a function that reveals nothing ([chl-spec.md, "Kinds and
+bounds"](chl-spec.md#kinds-and-bounds)). A Module type's entry bounds a run's member the same way.
+A `def` states the bound as `causes only Effect except Reveal`, which also puts every other effect
+in its contract. That clause holds the top `WriteTxn(*)`, so every call counts as writing every
+transactional variable, for transaction footprints and `await_final`. A clause that infers the
+body's effects less one capability is a dependency ([Dependencies](#dependencies)).
 
 ## Where configuration comes from
 
@@ -302,10 +339,12 @@ works"](../src/ccl/design/program-evolution.md#how-a-reload-works)). This is a r
 
 A remote keystore is a (sink, source) pair, as `http_serve` is a (source, sink) pair: the program
 feeds requests to the sink and reads the keystore's replies from the source. A request carries a
-secret, such as a Vault token, in a `Secret` field. A reply types each secret field `Secret`, as in
-`{token: Secret(String), expires_at: time::Instant}`, so a program schedules its next refresh from
-`expires_at` without unwrapping the token. Nothing else about a keystore is particular to
-configuration.
+secret, such as a Vault token, as a `Secret` at the position the keystore expects it, and the sink
+unwraps it ([Revealing a secret](#revealing-a-secret)). The source decodes each reply at its
+declared type and wraps each position the type marks `Secret`, as the Configuration API does. A
+reply typed `{token: Secret(String), expires_at: time::Instant}` lets a program schedule its next
+refresh from `expires_at` without unwrapping the token. Nothing else about a keystore is
+particular to configuration.
 
 Vault is one instance. A credential with a short lease is refreshed on a timer, `time::alarms()`:
 each alarm feeds a request carrying the token, and each reply is folded into a transactional mutable
@@ -413,10 +452,13 @@ key, is the application's to detect.
 - **Where secret values live at rest** ([Secret values at rest
   [Open]](#secret-values-at-rest-open)).
 - **Local files** ([Local files [Open]](#local-files-open)).
-- **Revealing a secret.** Whether a program may unwrap a `Secret(T)` into a `T` other than through
-  a verifier is undecided. A general reveal would let a program unwrap any secret whole and send it
-  anywhere. If one exists, which programs may call it belongs to the security design ([Out of
-  scope](#out-of-scope)).
+- **Values computed from a secret that are not secret.** Ciphertext and a signature are computed
+  from a key and are meant to leave as plain values. `reveal(key.map(lambda k: aes_gcm(k, nonce,
+  pt)))` expresses each one as a `Reveal`. Whether an operation can state that its result is not
+  secret, so that it causes no `Reveal`, is undecided.
+- **Redacting part of a string.** A secret formatted into a string, such as a query string
+  `?key=…&q=1`, makes the whole string a `Secret`, and the inspector redacts all of it. A format
+  combinator whose result keeps its plain segments visible would redact only the secret ones.
 - **Combining secrets without nesting.** Combining N secrets nests `flat_map` N deep. A second
   `@Builtin` combinator, `using(f)`, would combine any number at one depth. It calls `f` once,
   passing it a function that unwraps any secret, and returns `f`'s result as a `Secret`:
@@ -435,18 +477,21 @@ key, is the application's to detect.
   each one as `map` does. The cost is inference that is polymorphic over scope labels, and tracking
   of implicit flows: a branch on a labeled value labels every effect inside the branch.
 - **Names.** Every name in this document's examples is a placeholder until the design settles:
-  `std::config` and its functions, `Secret`, `secret`, the combinators, the verifiers, and the CLI's
-  commands.
+  `std::config` and its functions, `Secret`, `secret`, `reveal`, `Reveal`, the combinators, the
+  verifiers, and the CLI's commands.
 
 ## Out of scope
 
 These belong to a security design that comes later:
 
-- **Who may reload a program, create a branch, set a secret, or send a secret to a sink.**
+- **Who may reload a program, create a branch, set a secret, or ship a module that causes
+  `Reveal`.**
   Whoever can reload a program can ship one that sends every secret it holds to a sink, as anyone
   who can create a Kubernetes Pod can read the Secrets it mounts ([Secrets good
   practices](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)). Role-based
-  access and policy controls, such as a policy naming the sinks a secret may reach, answer it.
+  access and policy controls, such as a policy naming the modules that may cause `Reveal`, answer
+  it. A module's top level has no `causes` clause, so nothing in the language bounds what a whole
+  module reveals.
 - **Authenticating to the control port.** It has none today. It binds loopback
   (`src/control_port.rs`), so every process on the engine's host reaches it.
 - **Idempotent control port requests.** A create or reload request sent twice appends its
@@ -458,9 +503,18 @@ These belong to a security design that comes later:
 
 ## Dependencies
 
-- `Secret` as a nominal builtin, and `secret`, `flat_map` and the verifiers as `@Builtin` functions
-  of `std::config` ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)).
-- A sink whose element type has `Secret` fields, which unwraps them as it hands an element out.
+- `Secret` as a nominal builtin, and `secret`, `flat_map` and `reveal` as `@Builtin` functions of
+  `std::config` ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)).
+- `Reveal` as an effect in the table of [chl-spec.md, "6.9
+  Capabilities"](chl-spec.md#69-capabilities), discharged by no construct, as `AffectWorld` is not.
+- A `causes` clause that infers a `def`'s effects less one capability, such as
+  `causes only _ except Reveal`. `causes only Effect except Reveal` excludes `Reveal` but claims
+  every other effect. `except RunTransaction` needs the same form, for a function that must not
+  commit.
+- A feed type that states a sink consumes the feed, and typing for an element that holds a
+  `Secret(T)` at a position of type `T`. A collection literal that mixes `T` and `Secret(T)`, such
+  as a header map with one secret value, has no join today ([chl-spec.md, "A nominal type is
+  opaque"](chl-spec.md#a-nominal-type-is-opaque)).
 - The std root ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)), which holds
   `std::config`.
 - An outbound (sink, source) pair, for remote keystores.
