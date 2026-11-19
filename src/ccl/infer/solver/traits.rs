@@ -4121,10 +4121,9 @@ pub fn resolve_operand_requirements(
         // Re-read the solver's variables every pass rather than snapshotting once. Every variable
         // being a root is what makes the sweep complete — it is why a function's domain
         // needs no traversal of its own — and a deposit is an ordinary
-        // `constrain_subtype`, which is entitled to mint variables (an extrusion proxy,
-        // which `copy_watches` gives the original's requirements). Measured, the list
-        // does not currently grow here; re-reading makes that irrelevant instead of
-        // load-bearing.
+        // `constrain_subtype`, which mints variables: carrying the base down a lower bound
+        // composes the bound's substitutions, and a substitution reaching a variable
+        // suspends on it ([`entails_deposit`] keeps that from feeding itself).
         let vars = solver.infer_vars().to_vec();
         resolve_pass(
             solver,
@@ -4452,6 +4451,32 @@ fn conflicting_base(
         .cloned()
 }
 
+/// Whether `var` already lies below `base` because a variable it is bounded above by has had
+/// `base` deposited: `var <: 𝑢‹σ›` and `𝑢 <: base` give `var <: base‹σ›`, which is `var <: base`,
+/// since a substitution leaves a base as it is. Only an edge with nothing on `var`'s side: under
+/// an elimination there, what lies below the base is the collection's codomain, not `var`.
+///
+/// Depositing anyway is not just redundant. A suspension `𝑣‹σ›` stands at `𝑣`'s place, so it is
+/// offered `𝑣`'s deposit, and recording it carries the base down the suspension's lower bound
+/// under `σ` composed with that bound's own substitutions. The composition suspends on the
+/// variables its terms' types hold and mints the suspensions, which the next pass finds at the
+/// same places and deposits on in turn: one more pass per level of a chain of comprehensions,
+/// each over every variable.
+fn entails_deposit(
+    solver: &mut Solver,
+    var: &Rc<InferVar>,
+    base: &BaseType,
+    deposited: &std::collections::HashSet<(InferVarId, BaseType)>,
+) -> bool {
+    var.bounds(solver).upper().iter().any(|bound| {
+        bound.self_subst.is_id()
+            && matches!(
+                peel_refinements(&bound.ty),
+                Type::Infer(up) if deposited.contains(&(up.uid, base.clone()))
+            )
+    })
+}
+
 /// Queue `ty` one `step` below `path`, if it is a variable once refinements are peeled.
 fn descend(ty: &Type, path: &StepPath, step: Step, frontier: &mut Vec<(Rc<InferVar>, StepPath)>) {
     if let Type::Infer(up) = peel_refinements(ty) {
@@ -4603,9 +4628,12 @@ fn resolve_pass(
                         continue;
                     }
                     for var in &place.vars {
-                        if !deposited.insert((var.uid, (*only).clone())) {
+                        if deposited.contains(&(var.uid, (*only).clone()))
+                            || entails_deposit(solver, var, only, deposited)
+                        {
                             continue;
                         }
+                        deposited.insert((var.uid, (*only).clone()));
                         let deposit = Type::Base((*only).clone());
                         if let Err(error) =
                             constrain_subtype(solver, &Type::Infer(Rc::clone(var)), &deposit, cache)
@@ -5500,6 +5528,51 @@ mod tests {
             only.assoc.as_slice(),
             [(Assoc::Output, Type::Base(BaseType::Int))]
         ));
+    }
+
+    /// The sweep deposits the base its requirements determine on the variable they land on, and
+    /// not on a suspension of it, which the deposit already bounds: recording it there would
+    /// compose the suspension's substitution and mint more suspensions to deposit on.
+    #[test]
+    fn a_suspension_of_a_deposited_variable_takes_no_deposit() {
+        let solver = &mut Solver::new();
+        let node_id = provenance::NodeId::fresh();
+        let x = Name::raw("x");
+        let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let v = InferVar::fresh_over(solver, 0, &telescope, kind);
+        let operand = Type::Infer(Rc::clone(&v));
+        let ob = TraitObligation::new(
+            Trait::addable(),
+            vec![(Assoc::Output, fresh_var(solver, 0))],
+            node_id,
+            crate::ccl::infer_var::Origin::Node(node_id),
+        );
+        let mut cache = ConstrainCache::new();
+        ob.narrow(solver, 1, &InstanceHead::Base(BaseType::Int), &mut cache)
+            .expect("Int is addable");
+        ob.watch(solver, &operand, 0);
+        let Type::Infer(held) =
+            crate::ccl::subst::Subst::rename(x, Name::raw("y")).apply_type_in(solver, &operand)
+        else {
+            panic!("a renaming of a binder the variable may read suspends on it");
+        };
+        assert!(!Rc::ptr_eq(&held, &v));
+        let held_uppers = held.bounds(solver).upper().len();
+
+        let failures = resolve_operand_requirements(solver, &mut cache);
+
+        assert!(failures.is_empty());
+        let int = Type::Base(BaseType::Int);
+        assert!(
+            v.bounds(solver).upper().iter().any(|b| b.ty == int),
+            "the requirement determines Int, so the operand is bounded by it",
+        );
+        assert_eq!(
+            held.bounds(solver).upper().len(),
+            held_uppers,
+            "the suspension is below Int through the operand, and takes no bound of its own",
+        );
     }
 
     /// `^+`'s obligation deposits the sum on its output; `+`'s deposits a bare `Int`. The
