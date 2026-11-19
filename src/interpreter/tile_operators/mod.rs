@@ -1810,6 +1810,14 @@ pub trait TileProducer {
         format!("{}#{}", base, self.producer_id())
     }
 
+    /// The release this producer started at because it replaces a reader across a reload, read
+    /// off that reader's fan-out slot (`FanOutSlot::subscribe`); `None` for a producer that
+    /// replaces none. A store read starts its own release record there
+    /// (`commit_operator::inherited_release`).
+    fn inherited_release(&self) -> Option<&TileGuard> {
+        None
+    }
+
     /// Returns the current obsolete guard for this producer. The producer will
     /// never return any more data in the guarded region via `get`.
     fn obsolete_guard(&self) -> &TileGuard {

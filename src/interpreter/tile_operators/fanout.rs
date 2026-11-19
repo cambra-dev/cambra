@@ -5,6 +5,8 @@ use std::{
 };
 
 use super::*;
+use crate::ccl::provenance::NodeId;
+use crate::interpreter::Prefix;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
@@ -71,36 +73,50 @@ struct FanOutShared {
     /// parallel to [`consumers`](Self::consumers): an operator inside the store's cycle, which a
     /// push skips.
     recurrence: Vec<bool>,
-    /// What every subscriber had agreed to release the last time one released,
-    /// and so what this fan-out has already passed upstream.
+    /// What every slot [`counted_indices`](Self::counted_indices) names, and every retired slot,
+    /// had agreed to release the last time one released, and so what this fan-out has already
+    /// passed upstream.
     ///
-    /// A subscriber registering from now on starts here rather than at nothing.
-    /// The region is gone: the fan-out told its input it would not be read again,
-    /// so the input is free to have dropped it and a late subscriber that claimed
-    /// to still want it would hold the intersection back at a frontier no one is
-    /// waiting on. Within one version every subscription is made before any data
-    /// flows, so this is the empty guard and seeding from it changes nothing;
-    /// across a version handover it is what a rebuilt subscriber inherits from the
-    /// one it replaces.
+    /// It decides what the input may reclaim and nothing else. A subscriber starts at the
+    /// release of the reader it replaces ([`retired`](Self::retired)), and at this region only
+    /// where it replaces none: the region is gone, so a subscriber claiming to want it would
+    /// hold the intersection back at a frontier no one is waiting on. Within one version every
+    /// subscription is made before any data flows, so this is the empty guard then.
     released: TileGuard,
-    /// The highest position [`released`](Self::released) has ever named, for an
-    /// output whose domain is a monotone `UInt` iteration position.
+    /// The reader each slot serves, parallel to [`release_guards`](Self::release_guards): the
+    /// nodes of the terms whose conversion minted it, across the versions that kept the reader
+    /// and were held at the fan-out's last alias or compaction ([`FanOut::alias_readers`]).
+    /// Empty for a slot no version replaces a reader through, and for one whose versions are
+    /// all gone, which no compilation can name as a predecessor.
+    readers: Vec<Vec<Named>>,
+    /// The last position each slot's releases have named as a prefix, parallel to
+    /// [`release_guards`](Self::release_guards), for an output whose domain is ordered.
     ///
-    /// Kept alongside the guard rather than read off it, because the guard loses
-    /// the number at the end: a consumer that finishes an iteration releases the
-    /// whole domain, and a universal release names no position. This watermark
-    /// only ever rises, so it still says where the iteration got to after that
-    /// last release.
-    ///
-    /// [`released`]: FanOutShared::released
-    released_position: Option<Position>,
+    /// Kept beside the guard rather than read off it, because a drive that finishes releases
+    /// the whole domain, and a universal release names no position. It rises only on a release
+    /// that is itself a prefix ([`Predicate::as_prefix_in`]), so a release of keys absent above
+    /// the drive's cursor does not move it.
+    positions: Vec<Option<Position>>,
+    /// The slots a version handover found dead, with the readers they served, so that a
+    /// subscriber replacing one starts at that reader's release
+    /// ([`FanOutSlot::subscribe`]). They hold the reclamation intersection back until the
+    /// handover settles ([`FanOut::settle_handover`]), so nothing a replacement still reads is
+    /// reclaimed in between.
+    retired: Vec<RetiredSlot>,
+    /// Whether a version handover is open: from [`FanOut::reopen`] until
+    /// [`FanOut::settle_handover`]. While it is, a slot that dies keeps its guard in the
+    /// reclamation intersection where it served a reader
+    /// ([`counted_indices`](Self::counted_indices)). A replacement for that reader may subscribe
+    /// later in the same handover and start at that guard.
+    handing_over: bool,
     /// Each subscriber's slot number, parallel to [`release_guards`] and
     /// [`consumers`].
     ///
     /// The [`FanOutProducer`] a subscription handed out owns the strong side, so
     /// a dead entry means that subscriber's producer has been dropped. Its slot
-    /// is then skipped: it neither blocks the release intersection nor gets
-    /// notified.
+    /// is then skipped: it is not notified, and it holds the release intersection
+    /// back only while a handover is open and it served a reader
+    /// ([`counted_indices`](Self::counted_indices)).
     ///
     /// A `Cell<usize>` rather than a bare token because the slot number *is* the
     /// subscription's identity, and [`compact`](Self::compact) renumbers. A
@@ -131,13 +147,111 @@ struct FanOutShared {
     admission: crate::interpreter::scheduler::Admission,
 }
 
+/// The reader a fan-out slot serves across a reload: the node of the term whose conversion minted
+/// the slot. A slot minted in a new version for a term that corresponds to one in the version it
+/// replaces starts at the release of that term's slot (`src/ccl/design/program-evolution.md`,
+/// "Where a rebuilt reader picks up"). A term mints at most one slot of a fan-out a reload can
+/// keep, which subscribing asserts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotReader {
+    node: NodeId,
+}
+
+impl SlotReader {
+    /// The slot the term at `node` mints.
+    pub fn new(node: NodeId) -> Self {
+        Self { node }
+    }
+}
+
+/// One compiled version of a program, alive while an operator map of it is held: by the branch
+/// that runs it, or by a compilation that replaces it, from the offer until the handover settles.
+/// A fan-out drops the names a version gave its readers once that version is not held, at its
+/// next alias or compaction ([`FanOut::alias_readers`]).
+#[derive(Clone, Default)]
+pub struct Version(Rc<()>);
+
+/// A name that a version gives the reader of a slot ([`FanOutShared::readers`]).
+struct Named {
+    reader: SlotReader,
+    version: Weak<()>,
+}
+
+impl Named {
+    fn new(reader: SlotReader, version: &Version) -> Self {
+        Self {
+            reader,
+            version: Rc::downgrade(&version.0),
+        }
+    }
+}
+
+/// Drop the names of `names` whose version no operator map holds any more.
+fn drop_dead_names(names: &mut Vec<Named>) {
+    names.retain(|named| named.version.strong_count() > 0);
+}
+
+/// Whether a slot with the names `names` serves `reader`.
+fn serves(names: &[Named], reader: SlotReader) -> bool {
+    names.iter().any(|named| named.reader == reader)
+}
+
+/// A slot a version handover found dead ([`FanOutShared::retired`]).
+struct RetiredSlot {
+    readers: Vec<Named>,
+    guard: TileGuard,
+    position: Option<Position>,
+}
+
 impl FanOutShared {
+    /// The release and the last prefix position of the slot that served `reader`, live, dead
+    /// or retired.
+    fn release_of(&self, reader: SlotReader) -> Option<(&TileGuard, &Option<Position>)> {
+        let in_slots = (0..self.readers.len())
+            .find(|&i| serves(&self.readers[i], reader))
+            .map(|i| (&self.release_guards[i], &self.positions[i]));
+        in_slots.or_else(|| {
+            self.retired
+                .iter()
+                .find(|r| serves(&r.readers, reader))
+                .map(|r| (&r.guard, &r.position))
+        })
+    }
+
+    /// Drop every name whose version is no longer held, from every slot and every retired slot.
+    fn drop_dead_names(&mut self) {
+        for names in self
+            .readers
+            .iter_mut()
+            .chain(self.retired.iter_mut().map(|r| &mut r.readers))
+        {
+            drop_dead_names(names);
+        }
+    }
+
     /// The slots whose subscriber still exists, in subscription order.
     fn live_indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.subscribers
             .iter()
             .enumerate()
             .filter(|(_, s)| s.strong_count() > 0)
+            .map(|(i, _)| i)
+    }
+
+    /// The slots whose guards constrain what the input may reclaim: every live slot, and while a
+    /// handover is open every dead slot that served a reader. A slot under an operator the new
+    /// version declined dies when the offer is released
+    /// ([`OpConversionContext::release_offer`]), and a replacement for its reader may subscribe
+    /// after that.
+    ///
+    /// [`OpConversionContext::release_offer`]: crate::interpreter::operator_conversion::OpConversionContext::release_offer
+    fn counted_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.subscribers
+            .iter()
+            .enumerate()
+            .filter(|&(i, s)| {
+                s.strong_count() > 0 || (self.handing_over && !self.readers[i].is_empty())
+            })
             .map(|(i, _)| i)
     }
 
@@ -150,9 +264,12 @@ impl FanOutShared {
     ///
     /// Safe only when no producer is mid-pull, since a renumber between a
     /// producer reading its index and using it would address another
-    /// subscriber's guard. [`FanOut::reopen`] is the one caller, and it runs at a
-    /// version handover with the graph already torn down.
+    /// subscriber's guard. [`FanOut::reopen`] and [`FanOut::settle_handover`] are the
+    /// callers, and they run at a version handover with the graph already torn down.
+    ///
+    /// It also drops the reader names of every version no operator map holds any more.
     fn compact(&mut self) {
+        self.drop_dead_names();
         // Upgrade once: `keep` and the renumbering must agree on which slots are
         // live, and reading liveness twice would let them disagree.
         let live: Vec<_> = self.subscribers.iter().map(Weak::upgrade).collect();
@@ -163,10 +280,24 @@ impl FanOutShared {
             cell.set(next);
         }
         let keep: Vec<bool> = live.iter().map(Option::is_some).collect();
+        // A dead slot that served a reader is what that reader's replacement starts at.
+        for (at, kept) in keep.iter().enumerate() {
+            if !kept && !self.readers[at].is_empty() {
+                // A slot that died before the handover stopped counting toward the
+                // intersection, which may have moved past it since, and those rows are gone.
+                self.retired.push(RetiredSlot {
+                    readers: std::mem::take(&mut self.readers[at]),
+                    guard: self.release_guards[at].union(&self.released),
+                    position: self.positions[at].clone(),
+                });
+            }
+        }
         retain_flagged(&mut self.subscribers, &keep);
         retain_flagged(&mut self.consumers, &keep);
         retain_flagged(&mut self.release_guards, &keep);
         retain_flagged(&mut self.recurrence, &keep);
+        retain_flagged(&mut self.readers, &keep);
+        retain_flagged(&mut self.positions, &keep);
         debug_assert_eq!(
             self.consumers.len(),
             self.subscribers.len(),
@@ -515,7 +646,10 @@ impl FanOut {
             release_guards: Vec::new(),
             recurrence: Vec::new(),
             released: tiling.empty_guard(),
-            released_position: None,
+            readers: Vec::new(),
+            positions: Vec::new(),
+            retired: Vec::new(),
+            handing_over: false,
             subscribers: Vec::new(),
             reentrancy,
             admission: crate::interpreter::scheduler::Admission::new(Notified::clear()),
@@ -538,10 +672,34 @@ impl FanOut {
     /// takes a [`recurrence_slot`](Self::recurrence_slot) instead — see
     /// [`FanHold`].
     pub fn slot(&self) -> Box<dyn TileOperator> {
-        self.slot_holding(FanHold::Reader {
-            shared: self.shared.clone(), // shares the Rc — always connected
-            input: self.input.clone(),
-        })
+        self.slot_holding(
+            FanHold::Reader {
+                shared: self.shared.clone(), // shares the Rc — always connected
+                input: self.input.clone(),
+            },
+            None,
+        )
+    }
+
+    /// A slot for the reader `reader`, which starts at the release of `predecessor`'s slot,
+    /// the slot of the reader it replaces in the version before, where this fan-out holds one
+    /// ([`FanOutSlot::subscribe`]).
+    ///
+    /// For a reader of a fan-out a reload can keep: a binding, a store or an iteration input
+    /// ([`OperatorMap`](crate::interpreter::operator_conversion::OperatorMap)).
+    pub fn slot_read_by(
+        &self,
+        reader: SlotReader,
+        predecessor: Option<SlotReader>,
+        version: &Version,
+    ) -> Box<dyn TileOperator> {
+        self.slot_holding(
+            FanHold::Reader {
+                shared: self.shared.clone(),
+                input: self.input.clone(),
+            },
+            Some((Named::new(reader, version), predecessor)),
+        )
     }
 
     /// A slot for an operator that this fan-out's own input chain contains.
@@ -550,17 +708,25 @@ impl FanOut {
     /// recover each position's prior value. Such a reader must not own the
     /// fan-out — see [`FanHold`].
     pub fn recurrence_slot(&self) -> Box<dyn TileOperator> {
-        self.slot_holding(FanHold::Recurrence {
-            shared: Rc::downgrade(&self.shared),
-            input: Rc::downgrade(&self.input),
-        })
+        self.slot_holding(
+            FanHold::Recurrence {
+                shared: Rc::downgrade(&self.shared),
+                input: Rc::downgrade(&self.input),
+            },
+            None,
+        )
     }
 
-    fn slot_holding(&self, hold: FanHold) -> Box<dyn TileOperator> {
+    fn slot_holding(
+        &self,
+        hold: FanHold,
+        reader: Option<(Named, Option<SlotReader>)>,
+    ) -> Box<dyn TileOperator> {
         let result = FanOutSlot {
             hold,
             base: OperatorBase::new(self.tiling.clone()),
             primary: !*self.used.borrow(),
+            reader,
         };
         *self.used.borrow_mut() = true;
         Box::new(result)
@@ -622,7 +788,7 @@ impl FanOut {
     /// spent operator is rebuilt: keeping it binds the name to nothing. An
     /// iteration input is taken instead — a recurrence continuing over it wants
     /// the position it reached, which
-    /// [`released_position`](Self::released_position) reports as well from a
+    /// [`released_position_of`](Self::released_position_of) reports as well from a
     /// spent operator as from a live one, and a spent one is what a finished
     /// iteration looks like. The handover carries such an operator either way: a
     /// store that can no longer produce still holds the value its variables hand
@@ -631,38 +797,81 @@ impl FanOut {
         self.shared.borrow().released.is_universal()
     }
 
-    /// The last position this fan-out's subscribers have collectively released,
-    /// for an output that is a function of a position domain.
+    /// The last position the slot that served `reader` released as a prefix, for an output
+    /// that is a function of an ordered domain.
     ///
-    /// What a version keeping this fan-out has to know in order to place a
-    /// recurrence over it. The producer beneath it will offer positions above
-    /// this and no others, so a drive told to start anywhere else either decides
-    /// a position a second time or waits for one that has gone.
+    /// What a version keeping this fan-out has to know to place a recurrence over it where
+    /// `reader` is the recurrence's predecessor: a drive told to start anywhere else either
+    /// decides a position a second time or waits for one that has gone.
     ///
-    /// `None` when nothing has been released, and when the output is not
-    /// position-domained — the two are the same answer to the caller, which has
-    /// no position to start above either way. A consumer that finished the
-    /// iteration is not one of those cases: the position it got to is retained
-    /// past the universal release that closed it
-    /// ([`FanOutShared::released_position`]).
-    pub fn released_position(&self) -> Option<Position> {
-        self.shared.borrow().released_position.clone()
+    /// `None` when that slot released no prefix, when no slot served `reader`, and when the
+    /// output is not position-domained, which are one answer to the caller: there is no
+    /// position to start above. A drive that finished the iteration is not one of those cases:
+    /// the position it got to is kept past the universal release that closed it
+    /// ([`FanOutShared::positions`]).
+    pub fn released_position_of(&self, reader: SlotReader) -> Option<Position> {
+        let shared = self.shared.borrow();
+        shared.release_of(reader).and_then(|(_, at)| at.clone())
     }
 
-    /// Whether every live slot has released the same region.
-    ///
-    /// A subscriber added now starts at the intersection over the live slots,
-    /// and [`released_position`](Self::released_position) is read off the same
-    /// intersection, so when the slots disagree neither is where any one reader
-    /// stopped (`src/ccl/design/program-evolution.md`, "Routes across
-    /// branches").
-    pub fn live_slots_agree(&self) -> bool {
+    /// The most names one slot of this fan-out answers to, over its live, dead and retired
+    /// slots.
+    #[cfg(test)]
+    pub(crate) fn most_names_of_a_slot(&self) -> usize {
         let shared = self.shared.borrow();
-        let mut guards = shared.live_indices().map(|i| &shared.release_guards[i]);
-        let Some(first) = guards.next() else {
-            return true;
-        };
-        guards.all(|g| g == first)
+        shared
+            .readers
+            .iter()
+            .chain(shared.retired.iter().map(|r| &r.readers))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// What the slot that served `reader` released, live, dead or retired; `None` where no
+    /// slot served it.
+    pub fn released_by(&self, reader: SlotReader) -> Option<TileGuard> {
+        let shared = self.shared.borrow();
+        shared.release_of(reader).map(|(guard, _)| guard.clone())
+    }
+
+    /// Record that the readers this fan-out's slots served under the nodes `renamed` maps from
+    /// are also the readers at the nodes it maps to: a version that keeps a reader, inside a
+    /// kept region, keeps its slot, and the version after it names that reader by the kept
+    /// version's nodes ([`OpConversionContext::keep_region`]). `version` is the version that names
+    /// them so. The slot answers to the names of every version still held, since
+    /// branch-and-reload keeps a reader for a second branch that names it by its own nodes, and
+    /// drops the names of every version no longer held.
+    ///
+    /// [`OpConversionContext::keep_region`]: crate::interpreter::operator_conversion::OpConversionContext
+    pub fn alias_readers(&self, renamed: &HashMap<NodeId, NodeId>, version: &Version) {
+        let mut shared = self.shared.borrow_mut();
+        let shared = &mut *shared;
+        shared.drop_dead_names();
+        let lists = shared
+            .readers
+            .iter_mut()
+            .chain(shared.retired.iter_mut().map(|r| &mut r.readers));
+        for readers in lists {
+            let aliases: Vec<Named> = readers
+                .iter()
+                .filter_map(|named| renamed.get(&named.reader.node))
+                .map(|&node| SlotReader { node })
+                .filter(|&alias| !serves(readers, alias))
+                .map(|alias| Named::new(alias, version))
+                .collect();
+            readers.extend(aliases);
+        }
+    }
+
+    /// End a version handover: the slots it found dead, and the ones that died while it was open,
+    /// stop holding the reclamation intersection back and are dropped, now that every replacement
+    /// has subscribed and started at its predecessor's release.
+    pub fn settle_handover(&self) {
+        let mut shared = self.shared.borrow_mut();
+        shared.compact();
+        shared.retired.clear();
+        shared.handing_over = false;
     }
 
     /// The name of every producer registered with a data source from inside
@@ -675,16 +884,17 @@ impl FanOut {
     /// Reopen this fan-out for a fresh set of slots, keeping the inner
     /// producer and everything it has accumulated.
     ///
-    /// For carrying one operator across a program reload. Only the
-    /// [`inspect`](TileOperator::inspect) bookkeeping resets: which slot
-    /// renders the input subtree and which renders a back-reference. The
-    /// subscriptions need no attention, because each is tied to the life of the
-    /// producer it handed out ([`FanOutShared::subscribers`]) — a subscriber the
-    /// reload dropped stops counting on its own, and one the reload carried
-    /// forward keeps its guard.
+    /// For carrying one operator across a program reload. The
+    /// [`inspect`](TileOperator::inspect) bookkeeping resets: which slot renders the input subtree
+    /// and which renders a back-reference. The dead slots retire, and the handover stays open until
+    /// [`settle_handover`](Self::settle_handover): until then every slot that served a reader holds
+    /// the reclamation intersection back, dead or alive, so a replacement starts at a guard nothing
+    /// has reclaimed past. A subscriber the reload carried forward keeps its guard.
     pub fn reopen(&self) {
         *self.used.borrow_mut() = false;
-        self.shared.borrow_mut().compact();
+        let mut shared = self.shared.borrow_mut();
+        shared.compact();
+        shared.handing_over = true;
     }
 }
 
@@ -775,6 +985,9 @@ struct FanOutSlot {
     /// True for the first handle returned by [`FanOut::slot`], false for subsequent ones.
     /// The primary renders its input subtree in inspect; copies emit a back-reference.
     primary: bool,
+    /// The reader this slot serves, named by the version that minted it, and the one it
+    /// replaces ([`FanOut::slot_read_by`]).
+    reader: Option<(Named, Option<SlotReader>)>,
 }
 
 impl FanOutSlot {
@@ -811,17 +1024,50 @@ impl TileOperator for FanOutSlot {
         // number lives in the cell the producer holds, so `compact` can renumber.
         let slot = Rc::new(Cell::new(0usize));
         let shared_rc = self.shared();
-        {
+        let (seed, inherited) = {
             let mut shared = shared_rc.borrow_mut();
             slot.set(shared.consumers.len());
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
-            let carried = shared.released.clone();
-            shared.release_guards.push(carried);
+            // A slot subscribes once, so its name moves into the fan-out's record.
+            let (reader, predecessor) = self.reader.take().unzip();
+            // A reader that replaces one starts where that one released, and every other
+            // starts at what the fan-out has reclaimed.
+            let carried = predecessor
+                .flatten()
+                .and_then(|p| shared.release_of(p))
+                .map(|(guard, at)| (guard.clone(), at.clone()));
+            let inherited = carried.as_ref().map(|(guard, _)| guard.clone());
+            let (seed, position) = match carried {
+                Some((guard, at)) => {
+                    // The intersection ran over the predecessor's slot, so what it reclaimed
+                    // the predecessor had released. Otherwise the replacement would ask for
+                    // rows that are gone.
+                    debug_assert!(
+                        guard.subsumes(&shared.released),
+                        "a replaced reader's release covers what the fan-out reclaimed: \
+                         {guard:?} vs {:?}",
+                        shared.released
+                    );
+                    (guard, at)
+                }
+                None => (shared.released.clone(), None),
+            };
+            debug_assert!(
+                reader.as_ref().is_none_or(|named| shared
+                    .live_indices()
+                    .all(|i| !serves(&shared.readers[i], named.reader))),
+                "one live slot of a fan-out serves each reader: {:?}",
+                reader.as_ref().map(|named| named.reader)
+            );
+            shared.release_guards.push(seed.clone());
+            shared.readers.push(reader.into_iter().collect());
+            shared.positions.push(position);
             shared
                 .recurrence
                 .push(matches!(self.hold, FanHold::Recurrence { .. }));
             shared.subscribers.push(Rc::downgrade(&slot));
-        } // borrow released here before we might call input.subscribe
+            (seed, inherited)
+        }; // borrow released here before we might call input.subscribe
 
         // Decide whether *this* call should drive the inner subscribe.
         // `producer.is_none()` is the standard "first subscription" check;
@@ -886,7 +1132,11 @@ impl TileOperator for FanOutSlot {
             // `_guard` drops here, resetting `subscribing_inner`.
         }
 
+        let mut base =
+            ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, scheduler);
+        base.obsolete_guard = seed;
         Box::new(FanOutProducer {
+            base,
             // The fan-out's own id rather than a fresh one, so every slot's
             // producer reads as the same `FanOut#n`. `ProbeTable` keys on
             // `(node_id, producer_id)`, and that stays unique here because each
@@ -894,12 +1144,12 @@ impl TileOperator for FanOutSlot {
             // component separates them, not the second. Subscribing one slot
             // twice would land both producers in one slot; nothing does, and
             // `FanOut::slot` mints a fresh slot per call.
-            base: ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, scheduler),
             // The producer a subscription hands out holds the fan-out the same
             // way this slot does: a recurrence's producer must not own it
             // either.
             hold: self.hold.clone(),
             slot,
+            inherited,
         })
     }
 
@@ -923,6 +1173,10 @@ struct FanOutProducer {
     // it to index its own release guard, which it would have done with a plain
     // `usize` if dead slots never had to be reclaimed.
     slot: Rc<Cell<usize>>,
+    /// The release this subscription started at because its slot replaces a reader across a
+    /// reload: that reader's release, read off its slot. `None` for a slot that replaces no
+    /// reader of this fan-out, which starts at [`FanOutShared::released`] instead.
+    inherited: Option<TileGuard>,
 }
 
 impl FanOutProducer {
@@ -938,6 +1192,10 @@ impl FanOutProducer {
 
 impl TileProducer for FanOutProducer {
     impl_producer_base!();
+
+    fn inherited_release(&self) -> Option<&TileGuard> {
+        self.inherited.as_ref()
+    }
 
     /// The fan-out's input, which every slot pulls through the shared state. Nothing is
     /// visited while a pull holds that state, or after a recurrence's fan-out has gone.
@@ -1151,15 +1409,35 @@ impl TileProducer for FanOutProducer {
             self.name(),
             shared.release_guards[index]
         );
+        // The slot's position rises to the last position of whichever of its accumulated
+        // release and this increment is a prefix: a drive that releases position by position
+        // releases no prefix each time but accumulates one, and a release of keys absent above
+        // the drive's cursor leaves the accumulated release no prefix while the drive's own
+        // increments still are.
+        let domain = self.tiling().domain_extent();
+        let through = |guard: &TileGuard| match guard {
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                match pred.as_prefix_in(domain.as_ref()) {
+                    Some(Prefix::Through(position)) => Some(position),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let position = through(&accumulated).max(through(&obsolete_guard));
+        shared.positions[index] = shared.positions[index].clone().max(position);
         shared.release_guards[index] = accumulated;
-        // Only live subscribers constrain the release. A subscriber whose
-        // producer has been dropped never releases again, so counting its guard
-        // would hold the intersection wherever that subscriber left it and the
-        // input would retain everything from there on.
+        // Live subscribers and the slots an open handover holds constrain the release: the ones
+        // it retired and the ones that died since. Outside a handover a subscriber whose producer
+        // has been dropped never releases again, so counting its guard would hold the
+        // intersection wherever that subscriber left it and the input would retain everything
+        // from there on.
         let intersection = shared
-            .live_indices()
-            .fold(self.tiling().universal_guard(), |acc, i| {
-                acc.intersect(&shared.release_guards[i])
+            .counted_indices()
+            .map(|i| &shared.release_guards[i])
+            .chain(shared.retired.iter().map(|r| &r.guard))
+            .fold(self.tiling().universal_guard(), |acc, guard| {
+                acc.intersect(guard)
             });
         trace!(
             "{} releasing: {intersection:?} from slots {:?} live {:?}",
@@ -1179,11 +1457,6 @@ impl TileProducer for FanOutProducer {
         // arriving here would fail the intersect rather than land in the `else`
         // ([`FunctionGuard::intersect`] has no mixed arm), so the position cannot
         // be silently lost.
-        if let TileGuard::Function(FunctionGuard::Domain(pred)) = &intersection
-            && let Some(position) = pred.max_released_position()
-        {
-            shared.released_position = shared.released_position.clone().max(Some(position));
-        }
         shared.released = intersection.clone();
         let cell = match shared
             .producer
@@ -1902,6 +2175,326 @@ mod tests {
             mine,
             "the survivor's guard moved with it, and it reads its new slot"
         );
+    }
+
+    /// The positions of a stream: `UInt` keys over `Int` values.
+    fn positions() -> Tiling {
+        Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    fn released_points(points: &[u64]) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::union_all(
+            points
+                .iter()
+                .map(|&p| Predicate::point(Value::UInt(p)))
+                .collect(),
+        )))
+    }
+
+    fn released_through(last: u64) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+            last,
+        ))))
+    }
+
+    /// A fan-out over a stream of positions, whose slots a test keys by reader.
+    fn keyed_fan() -> FanOut {
+        let (input, _, _) =
+            test_helpers::ProjectionSpyOp::new(positions().empty_tile(), positions());
+        FanOut::new(Box::new(input))
+    }
+
+    fn a_reader() -> SlotReader {
+        SlotReader::new(NodeId::fresh())
+    }
+
+    thread_local! {
+        /// Names the readers of every test that holds no version of its own; held for the
+        /// whole test.
+        static HELD: Version = Version::default();
+    }
+
+    fn read_by(
+        fan: &FanOut,
+        reader: SlotReader,
+        predecessor: Option<SlotReader>,
+        sched: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        HELD.with(|version| read_in(fan, reader, predecessor, version, sched))
+    }
+
+    /// [`read_by`] in `version`.
+    fn read_in(
+        fan: &FanOut,
+        reader: SlotReader,
+        predecessor: Option<SlotReader>,
+        version: &Version,
+        sched: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        fan.slot_read_by(reader, predecessor, version).subscribe(
+            positions().empty_guard(),
+            Box::new(|| {}),
+            sched,
+        )
+    }
+
+    /// A reader a reload rebuilds starts at the release of the reader it replaces, read off
+    /// that reader's slot, and not at the intersection a lagging sibling holds back.
+    #[test]
+    fn a_rebuilt_reader_starts_at_its_predecessors_release_not_a_lagging_siblings() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let (fast, lagging) = (a_reader(), a_reader());
+        let mut fast_read = read_by(&fan, fast, None, &mut sched);
+        let mut lagging_read = read_by(&fan, lagging, None, &mut sched);
+        fast_read.release(released_through(9));
+        lagging_read.release(released_through(4));
+        drop(fast_read);
+        fan.reopen();
+
+        let rebuilt = a_reader();
+        let _rebuilt_read = read_by(&fan, rebuilt, Some(fast), &mut sched);
+        assert_eq!(fan.released_by(rebuilt), Some(released_through(9)));
+        assert_eq!(
+            fan.released_position_of(rebuilt),
+            Some(Position::new(Value::UInt(9)))
+        );
+        assert_eq!(
+            fan.shared.borrow().released,
+            released_through(4),
+            "the intersection only reclaims, and the lagging sibling holds it back"
+        );
+    }
+
+    /// Two readers a reload rebuilds each start at their own predecessor's release: one that
+    /// finished through 9 does not restart at 4 because the other stopped there.
+    #[test]
+    fn two_rebuilt_readers_each_start_at_their_own_predecessors_release() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let (fast, slow) = (a_reader(), a_reader());
+        let mut fast_read = read_by(&fan, fast, None, &mut sched);
+        let mut slow_read = read_by(&fan, slow, None, &mut sched);
+        fast_read.release(released_through(9));
+        slow_read.release(released_through(4));
+        drop((fast_read, slow_read));
+        fan.reopen();
+
+        let (fast_again, slow_again) = (a_reader(), a_reader());
+        let _fast = read_by(&fan, fast_again, Some(fast), &mut sched);
+        let _slow = read_by(&fan, slow_again, Some(slow), &mut sched);
+        assert_eq!(fan.released_by(fast_again), Some(released_through(9)));
+        assert_eq!(fan.released_by(slow_again), Some(released_through(4)));
+    }
+
+    /// A release with holes is carried exactly: positions 0 and 2 released and 1 not, so the
+    /// rebuilt reader still reads 1. No prefix is released, so there is no position to resume
+    /// past.
+    #[test]
+    fn a_release_with_holes_is_carried_exactly() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let first = a_reader();
+        let mut read = read_by(&fan, first, None, &mut sched);
+        read.release(released_points(&[0, 2]));
+        drop(read);
+        fan.reopen();
+
+        let rebuilt = a_reader();
+        let _read = read_by(&fan, rebuilt, Some(first), &mut sched);
+        assert_eq!(fan.released_by(rebuilt), Some(released_points(&[0, 2])));
+        assert_eq!(fan.released_position_of(rebuilt), None);
+    }
+
+    /// A reader with no predecessor on this fan-out starts at what the fan-out has reclaimed.
+    #[test]
+    fn a_reader_with_no_predecessor_starts_at_what_the_fan_out_reclaimed() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let mut read = read_by(&fan, a_reader(), None, &mut sched);
+        read.release(released_through(3));
+        drop(read);
+        fan.reopen();
+        fan.settle_handover();
+
+        let new = a_reader();
+        let _read = read_by(&fan, new, Some(a_reader()), &mut sched);
+        assert_eq!(fan.released_by(new), Some(released_through(3)));
+    }
+
+    /// The slots a handover retires hold the reclamation intersection back until it settles,
+    /// so a live sibling's release in between reclaims nothing the replacement still reads.
+    #[test]
+    fn retired_slots_hold_reclamation_back_until_the_handover_settles() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let mut retiring = read_by(&fan, a_reader(), None, &mut sched);
+        let mut live = read_by(&fan, a_reader(), None, &mut sched);
+        retiring.release(released_through(4));
+        drop(retiring);
+        fan.reopen();
+
+        live.release(released_through(9));
+        assert_eq!(fan.shared.borrow().released, released_through(4));
+        fan.settle_handover();
+        live.release(released_through(10));
+        assert_eq!(fan.shared.borrow().released, released_through(10));
+    }
+
+    /// A slot that dies after the handover begins holds the reclamation intersection back until
+    /// the handover settles. A slot under an operator the new version declined dies so, when the
+    /// offer is released. A replacement that subscribes first releases past it, and a later
+    /// replacement still starts at its predecessor's release. Once the handover settles, the dead
+    /// slots stop counting.
+    #[test]
+    fn a_slot_that_dies_during_the_handover_holds_reclamation_back_until_it_settles() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let (ahead, behind) = (a_reader(), a_reader());
+        let mut ahead_read = read_by(&fan, ahead, None, &mut sched);
+        let mut behind_read = read_by(&fan, behind, None, &mut sched);
+        ahead_read.release(released_through(9));
+        behind_read.release(released_through(4));
+        fan.reopen();
+        drop(ahead_read);
+        drop(behind_read);
+
+        let mut ahead_again = read_by(&fan, a_reader(), Some(ahead), &mut sched);
+        ahead_again.release(released_through(10));
+        assert_eq!(fan.shared.borrow().released, released_through(4));
+        let behind_again = a_reader();
+        let mut behind_read_again = read_by(&fan, behind_again, Some(behind), &mut sched);
+        assert_eq!(fan.released_by(behind_again), Some(released_through(4)));
+        fan.settle_handover();
+        behind_read_again.release(released_through(10));
+        assert_eq!(fan.shared.borrow().released, released_through(10));
+    }
+
+    /// A slot's position rises on a release that is a prefix, accumulated or as given, and on
+    /// no other: a point above the start, a release with a hole above the prefix and the
+    /// universal release leave it where it is.
+    #[test]
+    fn a_slots_position_rises_only_on_a_prefix() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let reader = a_reader();
+        let mut read = read_by(&fan, reader, None, &mut sched);
+        let at = |fan: &FanOut| fan.released_position_of(reader).map(|p| p.into_value());
+        read.release(released_points(&[5]));
+        assert_eq!(at(&fan), None, "a point above an empty start is no prefix");
+        read.release(released_through(3));
+        assert_eq!(at(&fan), Some(Value::UInt(3)));
+        read.release(released_points(&[9]));
+        assert_eq!(
+            at(&fan),
+            Some(Value::UInt(3)),
+            "the holes at 4 and 6 to 8 are no prefix"
+        );
+        read.release(positions().universal_guard());
+        assert_eq!(
+            at(&fan),
+            Some(Value::UInt(3)),
+            "the universal release names no position, so the last one stands"
+        );
+    }
+
+    /// A slot answers to the readers its reader is renamed to, as a version that keeps a
+    /// reader inside a kept region names it by its own nodes.
+    #[test]
+    fn a_slot_answers_to_the_nodes_its_reader_is_renamed_to() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let reader = a_reader();
+        let mut read = read_by(&fan, reader, None, &mut sched);
+        read.release(released_through(2));
+        let renamed = NodeId::fresh();
+        HELD.with(|version| fan.alias_readers(&HashMap::from([(reader.node, renamed)]), version));
+        assert_eq!(
+            fan.released_by(SlotReader::new(renamed)),
+            Some(released_through(2))
+        );
+        assert_eq!(fan.released_by(reader), Some(released_through(2)));
+    }
+
+    /// A slot kept across reloads answers to the names of the versions still held and drops the
+    /// rest. Version 1 mints the reader, versions 2 and 3 keep it under their own nodes, and an
+    /// older branch holds version 2 while the main branch moves on. Dropping version 1 drops its
+    /// name, and the names of versions 2 and 3 still find the slot. Dropping version 2 drops its
+    /// name at version 4's alias.
+    #[test]
+    fn a_kept_slot_answers_only_to_the_names_of_versions_still_held() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let (v1, v2, v3) = (Version::default(), Version::default(), Version::default());
+        let first = a_reader();
+        let mut read = read_in(&fan, first, None, &v1, &mut sched);
+        read.release(released_through(2));
+        let (second, third) = (NodeId::fresh(), NodeId::fresh());
+        fan.alias_readers(&HashMap::from([(first.node, second)]), &v2);
+        fan.alias_readers(&HashMap::from([(second, third)]), &v3);
+        let names = |fan: &FanOut| -> Vec<NodeId> {
+            fan.shared.borrow().readers[0]
+                .iter()
+                .map(|named| named.reader.node)
+                .collect()
+        };
+        assert_eq!(names(&fan), vec![first.node, second, third]);
+
+        drop(v1);
+        fan.reopen();
+        fan.settle_handover();
+        assert_eq!(names(&fan), vec![second, third]);
+        assert_eq!(fan.released_by(first), None, "version 1 is gone");
+        for held in [second, third] {
+            assert_eq!(
+                fan.released_by(SlotReader::new(held)),
+                Some(released_through(2))
+            );
+        }
+
+        drop(v2);
+        let (v4, fourth) = (Version::default(), NodeId::fresh());
+        fan.alias_readers(&HashMap::from([(third, fourth)]), &v4);
+        assert_eq!(names(&fan), vec![third, fourth]);
+    }
+
+    /// A slot that died before the handover stopped counting toward the intersection, which a
+    /// live sibling moved past it since. It retires covering what the fan-out reclaimed, so the
+    /// intersection does not move backwards, and its successor asks for no reclaimed row.
+    #[test]
+    fn a_slot_that_died_before_the_handover_retires_covering_what_was_reclaimed() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let early = a_reader();
+        let mut early_read = read_by(&fan, early, None, &mut sched);
+        let mut live = read_by(&fan, a_reader(), None, &mut sched);
+        early_read.release(released_through(2));
+        drop(early_read);
+        live.release(released_through(9));
+        assert_eq!(fan.shared.borrow().released, released_through(9));
+        fan.reopen();
+
+        live.release(released_through(10));
+        assert_eq!(fan.shared.borrow().released, released_through(9));
+        let successor = a_reader();
+        let _read = read_by(&fan, successor, Some(early), &mut sched);
+        assert_eq!(fan.released_by(successor), Some(released_through(9)));
+    }
+
+    /// One live slot of a fan-out serves each reader: a second would leave a successor two
+    /// releases to start from.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "one live slot of a fan-out serves each reader")]
+    fn a_reader_with_two_live_slots_on_one_fan_out_is_refused() {
+        let fan = keyed_fan();
+        let mut sched = Scheduler::new();
+        let reader = a_reader();
+        let _first = read_by(&fan, reader, None, &mut sched);
+        let _second = read_by(&fan, reader, None, &mut sched);
     }
 
     /// A subscriber that registers after the fan-out has released starts having

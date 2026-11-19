@@ -971,7 +971,7 @@ const FOLD_PLUS_ZERO: &str = indoc! {r#"
 /// with [`FOLD_TIMES_ONE`] subscribes to `main`'s kept iteration and is never
 /// pulled. `main` folds `4, 8`, reloads to [`FOLD_PLUS_ZERO`], which keeps the
 /// iteration and rebuilds the store, and folds `16`. Returns `main`'s `x`, or
-/// the reload's refusal.
+/// the reload's error.
 fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> Result<i64, String> {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start_text(&mut ctx, FOLD, &no_main).expect("v1 compiles");
@@ -991,21 +991,17 @@ fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> Result<i64, String
     Ok(x_of(&live, MAIN_BRANCH))
 }
 
-/// A reload that keeps an iteration another branch also reads, and has read
-/// less of, is refused.
+/// A reload that keeps an iteration another branch also reads, and has read less
+/// of, resumes the rebuilt store one past where its own predecessor read, and `x`
+/// is `31` (`1 + 2 + 4 + 8 + 16`) with the lagging branch as without it.
 ///
-/// Without the lagging branch the reload is accepted and `x` is `31`
-/// (`1 + 2 + 4 + 8 + 16`). With it, the rebuilt store would resume one past the
-/// kept iteration's `FanOut::released_position`, which is read off the
-/// intersection of every live slot's release, so the lagging branch's slot
-/// would hold it at the position the branch was created at and `4` and `8`
-/// would fold twice. `LiveProgram::check` refuses that reload instead
-/// (`OperatorMap::disagreeing_kept_iterations`).
+/// The rebuilt store's drive starts at the release of the slot its predecessor
+/// read (`FanOut::released_position_of`), not at the intersection of every slot's
+/// release, which the lagging branch holds at the position it was created at.
 #[test]
-fn a_reload_over_an_iteration_a_lagging_branch_reads_is_refused() {
+fn a_reload_over_an_iteration_a_lagging_branch_reads_resumes_where_it_stopped() {
     assert_eq!(reload_over_a_kept_iteration(false), Ok(31));
-    let refusal = reload_over_a_kept_iteration(true).expect_err("refused");
-    assert!(refusal.contains("fold elements twice"), "{refusal}");
+    assert_eq!(reload_over_a_kept_iteration(true), Ok(31));
 }
 
 /// [`FOLD`] with an edited program value and the same loop, so a branch built

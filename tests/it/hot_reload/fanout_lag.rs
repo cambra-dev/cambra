@@ -1,28 +1,35 @@
-//! A reload replays output when a rebuilt reader subscribes to a kept fan-out
-//! whose readers disagree about what they have released.
+//! A reader a reload rebuilds over a kept fan-out whose readers disagree about what
+//! they have released.
 //!
-//! `FanOutSlot::subscribe` seeds every new subscriber with `FanOutShared::released`,
-//! the intersection of all subscribers' releases, not with the release of the
-//! subscriber it replaces. A reader the reload rebuilds therefore starts at the
-//! slowest sibling's frontier and receives again every position between that
-//! frontier and the one its predecessor had reached.
+//! `FanOutSlot::subscribe` seeds a rebuilt reader's slot with the release of the
+//! reader it replaces, read off that reader's slot, and the reader starts its own
+//! release record there (`src/ccl/design/program-evolution.md`, "Where a rebuilt
+//! reader picks up"). The intersection of every slot's release only reclaims, so a
+//! sibling that lags does not move where the rebuilt reader starts.
 //!
 //! Every feed case here reads a `defer` feed whose other writer the reload edits.
 //! That edit rebuilds the `out` binding, and with it the `StoreDenseRead` that reads
 //! the feed's tap off the store. The loop is unchanged, so the store and its fan-out
 //! are kept.
 //!
-//! Except for the real-binary pull-reader regression, each test is a pinned failure: it asserts the wrong output the runtime
-//! produces today, so it passes now and turns red on any change to that output. Each
-//! test's doc comment gives the correct output. A change that fixes the bug should
-//! replace the pinned value with the correct one and rename the test to state the
-//! behavior it then pins.
+//! `an_early_replacement_releasing_before_a_later_one_subscribes_reclaims_nothing_it_reads`
+//! drives two sinks whose readers share a kept feed's fan-out through four versions, so that
+//! one replacement releases during the reload before the other subscribes.
+//!
+//! `a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix` is a pinned
+//! failure: it asserts the wrong output the runtime produces today, so it turns red on
+//! any change to that output, and its doc comment gives the correct output.
 
-use indoc::indoc;
+use std::{cell::RefCell, rc::Rc};
+
+use indoc::{formatdoc, indoc};
 
 use cambra::{
-    ccl::context::GlobalContext,
-    interpreter::{ColumnValue, FunctionGuard, Tile, TileGuard},
+    ccl::{Type, context::GlobalContext},
+    interpreter::{
+        BaseType, ColumnValue, Extent, FunctionGuard, Predicate, TestDataSource, TestSink, Tile,
+        TileGuard, Value,
+    },
     live_program::{LiveProgram, MAIN_BRANCH},
 };
 
@@ -70,9 +77,18 @@ fn feed(source: &str, reads_n: bool, mark: &str) -> String {
 /// Pull `main` once and release what it delivered, as the binary's driver does
 /// (`run_program` in `src/main.rs`).
 fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) {
+    pull_branch(ctx, live, MAIN_BRANCH)
+}
+
+/// [`pull`] of branch `branch`'s `main`.
+fn pull_branch(
+    ctx: &mut GlobalContext,
+    live: &mut LiveProgram,
+    branch: &str,
+) -> (Vec<String>, bool) {
     ctx.scheduler().check_for_notifications();
     let producer = live
-        .main_producer_mut(MAIN_BRANCH)
+        .main_producer_mut(branch)
         .expect("the program's value is `out`");
     let tile = producer.get(producer.tiling().universal_guard());
     let Tile::DataFunction {
@@ -102,15 +118,30 @@ fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) 
 /// Run the feed over [`ITEMS`] for `pulls` pulls, reload with the second writer
 /// edited, drive to the end, and return everything `main` emitted.
 fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
+    emitted_across_reloads(reads_n, &[pulls])
+}
+
+/// Run the feed over [`ITEMS`], and before each count of pulls in `cuts` run that
+/// many pulls and then reload with the second writer edited again; drive to the end,
+/// and return everything `main` emitted.
+fn emitted_across_reloads(reads_n: bool, cuts: &[usize]) -> Vec<String> {
     let mut ctx = GlobalContext::default();
     let mut live = LiveProgram::start_text(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main)
         .expect("v1 compiles");
     let mut all = Vec::new();
-    for _ in 0..pulls {
-        all.extend(pull(&mut ctx, &mut live).0);
-    }
-    live.reload_text(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, "!"), &no_main)
+    for (version, &pulls) in cuts.iter().enumerate() {
+        for _ in 0..pulls {
+            all.extend(pull(&mut ctx, &mut live).0);
+        }
+        let mark = "!".repeat(version + 1);
+        live.reload_text(
+            &mut ctx,
+            MAIN_BRANCH,
+            &feed(ITEMS, reads_n, &mark),
+            &no_main,
+        )
         .expect("only the second writer changed");
+    }
     for _ in 0..100 {
         let (emitted, done) = pull(&mut ctx, &mut live);
         all.extend(emitted);
@@ -129,22 +160,20 @@ fn emitted_at_each_cut(reads_n: bool) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Assert that each cut's output is the pinned buggy output, and name every cut
-/// that differs.
-fn assert_cuts_pinned(actual: &[Vec<String>], pinned: &[Vec<String>]) {
+/// Assert that each cut's output is `expected`'s, and name every cut that differs.
+fn assert_each_cut_emits(actual: &[Vec<String>], expected: &[Vec<String>]) {
     let changed: Vec<String> = actual
         .iter()
-        .zip(pinned)
+        .zip(expected)
         .enumerate()
-        .filter(|(_, (actual, pinned))| actual != pinned)
-        .map(|(pulls, (actual, pinned))| {
-            format!("{pulls} pulls:\n    actual: {actual:?}\n    pinned: {pinned:?}")
+        .filter(|(_, (actual, expected))| actual != expected)
+        .map(|(pulls, (actual, expected))| {
+            format!("{pulls} pulls:\n    actual: {actual:?}\n    expected: {expected:?}")
         })
         .collect();
     assert!(
         changed.is_empty(),
-        "the feed's output across a reload changed. If the replay was fixed, pin the \
-         correct output from this test's doc comment instead.\n  {}",
+        "the feed's output across a reload is wrong at these cuts:\n  {}",
         changed.join("\n  "),
     );
 }
@@ -153,78 +182,56 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
 }
 
-/// PINNED FAILURE. The value at the cut is emitted twice, as in
-/// [`a_feed_repeats_the_position_the_recurrence_still_reads`].
-///
-/// Correct at every cut from 0 to 10 pulls:
+/// The feed emits each value once at every cut from 0 to 10 pulls:
 ///
 /// ```text
 /// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// ```
-///
-/// Pinned: cuts 0 and 1 are correct, and each cut from 2 to 10 repeats the last value
-/// decided before the swap:
-///
-/// ```text
-/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
 /// ```
 ///
 /// The second writer reads `n` without taking anything (see [`feed`]), and releases the
-/// store's fan-out once its empty loop is done, so the kept fan-out's release is what the
-/// recurrence has read: the rebuilt tap reader starts one position behind its predecessor.
+/// store's fan-out once its empty loop is done, so the kept fan-out's reclamation
+/// intersection is what the recurrence has read, one position behind the tap reader. The
+/// rebuilt tap reader starts at its predecessor's own release, read off that reader's slot,
+/// not at the intersection (`src/ccl/design/program-evolution.md`, "Where a rebuilt reader
+/// picks up").
 #[test]
-fn a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut() {
-    let pinned: Vec<Vec<String>> = (0..=10)
-        .map(|pulls| match pulls {
-            0 | 1 => strings(&EXPECTED),
-            // The last value decided before the swap, twice.
-            _ => {
-                let decided = (pulls - 1).min(EXPECTED.len());
-                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
-            }
-        })
-        .collect();
-    assert_cuts_pinned(&emitted_at_each_cut(true), &pinned);
+fn a_feed_read_by_a_sibling_that_takes_nothing_resumes_after_the_cut() {
+    let expected = vec![strings(&EXPECTED); 11];
+    assert_each_cut_emits(&emitted_at_each_cut(true), &expected);
 }
 
-/// PINNED FAILURE. The value at the cut is emitted twice.
-///
-/// Correct at every cut from 0 to 10 pulls:
+/// The feed emits each value once at every cut from 0 to 10 pulls:
 ///
 /// ```text
 /// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
 /// ```
 ///
-/// Pinned: cuts 0 and 1 are correct. Each cut from 2 to 10 repeats the last value
-/// decided before the swap, which after the fold finished is the last value:
-///
-/// ```text
-/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 8 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
-/// ```
-///
-/// In-process only: through the binary over `stdin` the recurrence has caught up at
-/// the quiet point where `--control` reloads, and nothing is replayed.
-///
-/// No reader here is unpulled. The induction driver's recurrence slot reads each key
-/// at the store's frontier, the position before the one it feeds, so its release trails
-/// the tap reader's by one position, and the rebuilt tap reader is seeded at the driver's
-/// frontier.
+/// The induction driver's recurrence slot reads each key at the store's frontier, the
+/// position before the one it feeds, so its release trails the tap reader's by one position.
+/// The rebuilt tap reader starts at its predecessor's own release, not at the driver's.
 #[test]
-fn a_feed_repeats_the_position_the_recurrence_still_reads() {
-    let pinned: Vec<Vec<String>> = (0..=10)
-        .map(|pulls| match pulls {
-            0 | 1 => strings(&EXPECTED),
-            // The last value decided before the swap, twice.
-            _ => {
-                let decided = (pulls - 1).min(EXPECTED.len());
-                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
+fn a_feed_resumes_after_the_cut_while_the_recurrence_trails_it() {
+    let expected = vec![strings(&EXPECTED); 11];
+    assert_each_cut_emits(&emitted_at_each_cut(false), &expected);
+}
+
+/// A second reload starts the tap reader at the release of the reader the first
+/// reload built, so the feed emits each value once across both cuts.
+#[test]
+fn a_feed_reloaded_twice_resumes_after_each_cut() {
+    // Before the first position is decided, partway, and later, then at once and
+    // partway into the second version.
+    for first in [1, 3, 5] {
+        for second in [0, 3] {
+            for reads_n in [false, true] {
+                assert_eq!(
+                    emitted_across_reloads(reads_n, &[first, second]),
+                    strings(&EXPECTED),
+                    "cuts after {first} and {second} more pulls, reads_n {reads_n}"
+                );
             }
-        })
-        .collect();
-    assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
+        }
+    }
 }
 
 /// A real-binary reload preserves the pull reader's release at the cut. A deferred release
@@ -235,7 +242,7 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
 /// `["a", "ab", "abc"]`.
 ///
 /// The program of
-/// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
+/// [`a_feed_read_by_a_sibling_that_takes_nothing_resumes_after_the_cut`], over
 /// `stdin`, reloaded through `--control` at a quiet point between lines.
 #[test]
 fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
@@ -270,6 +277,180 @@ fn a_stdin_feed_preserves_its_release_when_its_other_writer_is_edited() {
         printed,
         vec!["a", "ab", "abc"],
         "the rebuilt pull reader resumes after the cut: {out}"
+    );
+}
+
+/// Two sinks read the feed `f` through one kept fan-out. Version `k` writes `v * k` to each,
+/// and a sink marked as waiting adds the sum of a source that has not completed, so its
+/// reader takes nothing from the fan-out while it waits.
+fn two_readers_of_a_feed(k: i64, a_waits: bool, b_waits: bool) -> String {
+    let wait = |waits: bool, source: &str| {
+        if waits {
+            format!(" + sum({source}())")
+        } else {
+            String::new()
+        }
+    };
+    formatdoc! {r#"
+        a = test_sink()
+        b = test_sink()
+        f: Feed(_)
+        n := 0
+        for x in nums():
+            n := n + x
+            f << n
+        for v in f:
+            a << v * {k}{a_wait}
+        for v in f:
+            b << v * {k}{b_wait}
+    "#,
+        a_wait = wait(a_waits, "hold_a"),
+        b_wait = wait(b_waits, "hold_b"),
+    }
+}
+
+/// A test source of integers named `name`, registered with `ctx`.
+fn int_source(ctx: &mut GlobalContext, name: &str) -> Rc<RefCell<TestDataSource>> {
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        name,
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    source
+}
+
+/// Add rows `from..=to` of `nums`, row `i` holding `i + 1`, and declare every row up to `to`
+/// complete.
+fn add_nums(nums: &Rc<RefCell<TestDataSource>>, from: u64, to: u64) {
+    let rows: Vec<(Value, Value)> = (from..=to)
+        .map(|i| {
+            (
+                Value::UInt(i),
+                Value::Int(i64::try_from(i).expect("fits") + 1),
+            )
+        })
+        .collect();
+    let mut nums = nums.borrow_mut();
+    nums.add_data(&rows);
+    nums.set_yield_predicate(Predicate::at_or_below(Value::UInt(to)));
+}
+
+/// Deliver until a pass delivers nothing, so every sink has taken what the program decided.
+fn deliver_until_quiet(ctx: &mut GlobalContext) {
+    for _ in 0..100 {
+        if !ctx.scheduler().check_for_notifications() {
+            return;
+        }
+    }
+    panic!("delivery never went quiet");
+}
+
+/// What `sink` holds, as the value written at each position of `nums`, in position order.
+fn by_position(sink: &TestSink) -> Vec<(u64, i64)> {
+    let Value::Function(bindings) = sink.value().expect("the sink is complete") else {
+        panic!("a feed reads as a function");
+    };
+    let mut written: Vec<(u64, i64)> = bindings
+        .iter()
+        .map(|b| match (&b.input, &b.output) {
+            (Value::UInt(position), Value::Int(value)) => (*position, *value),
+            other => panic!("a position and an integer, got {other:?}"),
+        })
+        .collect();
+    written.sort_unstable();
+    written
+}
+
+/// A reload whose first sink's replacement releases before the second sink's replacement
+/// subscribes reclaims nothing the second still reads. Each sink holds each position's value
+/// once, written by the version that decided it:
+///
+/// ```text
+/// a: 1, 3 (v1)  12, 20 (v2)  60, 84, 112, 144 (v4)
+/// b: 1, 3 (v1)  24, 40, 60, 84, 112, 144 (v4)
+/// ```
+///
+/// The four versions place the cut. Version 1 has both readers release through position 1.
+/// Version 2 holds `b` back, and `a` releases through 3. Version 3 holds both back while the
+/// fold decides positions 4 and 5. Version 4 releases `a`, so in the reload `a`'s replacement
+/// subscribes, takes positions 4 and 5 when it is pulled, and releases through 5. `b`'s
+/// replacement subscribes after that and starts at its predecessor's release, through 1.
+///
+/// `release_offer` drops both predecessors before either replacement subscribes, so only the
+/// open handover keeps `b`'s predecessor's release in the reclamation intersection
+/// (`src/ccl/design/program-evolution.md`, "Where a rebuilt reader picks up"). Without it the
+/// fan-out reclaims through 5 before `b`'s replacement subscribes, and subscribing asserts.
+#[test]
+fn an_early_replacement_releasing_before_a_later_one_subscribes_reclaims_nothing_it_reads() {
+    let mut ctx = GlobalContext::default();
+    let nums = int_source(&mut ctx, "nums");
+    int_source(&mut ctx, "hold_a");
+    let hold_b = int_source(&mut ctx, "hold_b");
+    let a = ctx.register_test_sink("a");
+    let b = ctx.register_test_sink("b");
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &two_readers_of_a_feed(1, false, false), &no_main)
+            .expect("v1 compiles");
+    add_nums(&nums, 0, 1);
+    deliver_until_quiet(&mut ctx);
+    for (k, a_waits, b_waits, through) in [(2, false, true, 3), (3, true, true, 5)] {
+        live.reload_text(
+            &mut ctx,
+            MAIN_BRANCH,
+            &two_readers_of_a_feed(k, a_waits, b_waits),
+            &no_main,
+        )
+        .expect("only the writes changed");
+        add_nums(&nums, through - 1, through);
+        deliver_until_quiet(&mut ctx);
+    }
+    live.reload_text(
+        &mut ctx,
+        MAIN_BRANCH,
+        &two_readers_of_a_feed(4, false, true),
+        &no_main,
+    )
+    .expect("only the writes changed");
+    add_nums(&nums, 6, 7);
+    nums.borrow_mut().set_yield_predicate(Predicate::True);
+    {
+        let mut hold_b = hold_b.borrow_mut();
+        hold_b.add_data(&[(Value::UInt(0), Value::Int(0))]);
+        hold_b.set_yield_predicate(Predicate::True);
+    }
+    let finished = (0..100).any(|_| {
+        ctx.scheduler().check_for_notifications();
+        live.poll_finished()
+    });
+    assert!(finished, "both sinks complete");
+    assert_eq!(
+        by_position(&a),
+        [
+            (0, 1),
+            (1, 3),
+            (2, 12),
+            (3, 20),
+            (4, 60),
+            (5, 84),
+            (6, 112),
+            (7, 144)
+        ],
+        "`a` holds each position once"
+    );
+    assert_eq!(
+        by_position(&b),
+        [
+            (0, 1),
+            (1, 3),
+            (2, 24),
+            (3, 40),
+            (4, 60),
+            (5, 84),
+            (6, 112),
+            (7, 144)
+        ],
+        "`b`'s replacement starts after position 1"
     );
 }
 
@@ -368,4 +549,85 @@ fn drive_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String 
         }
     }
     panic!("the fold never settled");
+}
+
+/// The most names one slot answers to, over the fan-outs `branch` holds.
+fn most_names_held_by(live: &LiveProgram, branch: &str) -> usize {
+    live.held_operators(branch)
+        .expect("the branch exists")
+        .iter()
+        .filter_map(std::rc::Weak::upgrade)
+        .map(|fan| fan.most_names_of_a_slot())
+        .max()
+        .unwrap_or(0)
+}
+
+/// A reader kept across reloads answers to the names of the versions still held. A branch
+/// created from `main` holds an older version while `main` reloads six times. After each reload a
+/// kept slot answers to three names: the version `main` runs, the version it replaced, whose names
+/// go at the next compaction, and the branch's. Without dropping the names of versions no longer
+/// held, the count grows by one each reload. Reloading the branch finds its predecessors by the
+/// branch's own names, so its feed emits each value it had not emitted once. Once the branch is
+/// deleted and `main` reloads again, a slot answers to two names. `main`'s feed emits each value
+/// once throughout.
+#[test]
+fn reloads_beside_a_kept_branch_keep_only_the_names_of_versions_still_held() {
+    let mut ctx = GlobalContext::default();
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &feed(ITEMS, false, ""), &no_main).expect("v1 compiles");
+    let mut all = pull(&mut ctx, &mut live).0;
+    live.create_branch_text(
+        &mut ctx,
+        "old",
+        MAIN_BRANCH,
+        &feed(ITEMS, false, ""),
+        &no_main,
+    )
+    .expect("the branch compiles");
+    let mut most = Vec::new();
+    for version in 1..=6 {
+        all.extend(pull(&mut ctx, &mut live).0);
+        live.reload_text(
+            &mut ctx,
+            MAIN_BRANCH,
+            &feed(ITEMS, false, &"!".repeat(version)),
+            &no_main,
+        )
+        .expect("only the second writer changed");
+        most.push(most_names_held_by(&live, MAIN_BRANCH));
+    }
+    assert_eq!(
+        most, [3; 6],
+        "a kept slot's names stay bounded across reloads"
+    );
+    live.reload_text(&mut ctx, "old", &feed(ITEMS, false, "#"), &no_main)
+        .expect("only the branch's second writer changed");
+    let mut old = Vec::new();
+    for _ in 0..100 {
+        let (emitted, done) = pull_branch(&mut ctx, &mut live, "old");
+        old.extend(emitted);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        old,
+        strings(&EXPECTED[1..]),
+        "the branch branched after `a`"
+    );
+    live.delete_branch(&mut ctx, "old")
+        .expect("the branch is deleted");
+    live.reload_text(&mut ctx, MAIN_BRANCH, &feed(ITEMS, false, "?"), &no_main)
+        .expect("only the second writer changed");
+    let after = most_names_held_by(&live, MAIN_BRANCH);
+    assert_eq!(after, 2, "deleting the branch drops its version's names");
+    for _ in 0..100 {
+        let (emitted, done) = pull(&mut ctx, &mut live);
+        all.extend(emitted);
+        if done {
+            assert_eq!(all, strings(&EXPECTED));
+            return;
+        }
+    }
+    panic!("the feed never finished: {all:?}");
 }
