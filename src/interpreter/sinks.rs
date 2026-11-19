@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use crate::interpreter::{Consumer, DataSink, tile_operators::TileProducer};
+use crate::interpreter::{Consumer, DataSink, Predicate, Tile, tile_operators::TileProducer};
 use crate::interpreter::{
     dispatcher::{Landing, PipelineId, pushed_guard},
     tile_operators::Tiling,
@@ -106,9 +106,11 @@ impl SinkConsumer {
         }
         let mut slot = self.producer.borrow_mut();
         let producer = slot.as_mut().expect("a compiled sink holds its producer");
-        let tile = producer
-            .get(producer.tiling().universal_guard())
-            .closed_over(producer.tiling());
+        // A producer released whole answers nothing more, and the run's finish states what it
+        // handed complete: under the release contract a held scalar is complete once there, so a
+        // release can name a row whole before any answer states the row complete
+        // (`src/interpreter/design-dispatcher.md`, "Reading a widened input again").
+        let tile = pull_at_finish(&mut **producer);
         self.sink.process(&tile);
         producer.release(tile.to_guard());
         assert!(
@@ -159,5 +161,49 @@ impl Consumer for SinkConsumer {
         {
             landing.queue(*pipeline, &guard);
         }
+    }
+}
+
+/// What a sink's or a `main` output's producer answers at the run's finish: its pull at the
+/// universal guard, closed over its tiling. Where that answer is not terminal although the
+/// producer is released whole, the finish states what was handed complete with an empty
+/// collection that states every key complete ([`complete_and_empty`]). Under the release contract
+/// a held scalar is complete once there, so a read can release a row whole before any answer
+/// states it complete (`src/interpreter/design-dispatcher.md`, "Reading a widened input again").
+pub(crate) fn pull_at_finish(producer: &mut dyn TileProducer) -> Tile {
+    let tiling = producer.tiling().clone();
+    let pulled = producer.get(tiling.universal_guard()).closed_over(&tiling);
+    if pulled.is_terminal() || !producer.obsolete_guard().is_universal() {
+        return pulled;
+    }
+    // The finish states complete only what the reads handed: a producer released whole answers
+    // no key, and a key it holds no level beneath was complete once handed.
+    debug_assert!(
+        pulled.is_empty(),
+        "a producer released whole answers no key at the finish: {pulled:?}"
+    );
+    complete_and_empty(&tiling).unwrap_or(pulled)
+}
+
+/// The tile of `tiling`, a collection, that holds nothing and states every key complete; `None`
+/// where `tiling` is no collection.
+fn complete_and_empty(tiling: &Tiling) -> Option<Tile> {
+    match tiling.empty_tile() {
+        Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            deleted,
+            absent_keys,
+            ..
+        } => Some(Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            domain_predicate: Predicate::True,
+            deleted,
+            absent_keys,
+        }),
+        _ => None,
     }
 }

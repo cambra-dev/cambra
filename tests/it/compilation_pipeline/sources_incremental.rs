@@ -138,15 +138,11 @@ fn test_source_filter_nonterminal() {
 // 30s: the original flake site; one of the heaviest compiles, ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
+#[case("[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 == y.0]")]
 #[case(
-    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 == y.0]",
-    false
+    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 <= y.0 and x.0 >= y.0]"
 )]
-#[case(
-    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 <= y.0 and x.0 >= y.0]",
-    true
-)]
-fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
+fn test_inner_join(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let record_type = Type::Tuple(vec![
         Type::Base(BaseType::Int),
@@ -272,11 +268,7 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
 
     assert_eq!(
         extract_join_rows(tile),
-        if streams {
-            vec![((10, 10), (100, "a1".into(), "b1".into()))]
-        } else {
-            Vec::new()
-        }
+        vec![((10, 10), (100, "a1".into(), "b1".into()))]
     );
 
     data_source1.borrow_mut().publish_rows(&[(
@@ -306,14 +298,10 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
     // src1[20] (_0=200) does not match any src2 row via the x._0==y._0 filter.
     assert_eq!(
         extract_join_rows(tile),
-        if streams {
-            vec![
-                ((10, 10), (100, "a1".into(), "b1".into())),
-                ((10, 20), (100, "a1".into(), "b2".into())),
-            ]
-        } else {
-            Vec::new()
-        }
+        vec![
+            ((10, 10), (100, "a1".into(), "b1".into())),
+            ((10, 20), (100, "a1".into(), "b2".into())),
+        ]
     );
 
     data_source1.borrow_mut().publish_rows(&[(
@@ -326,34 +314,29 @@ fn test_inner_join(#[case] code: &str, #[case] streams: bool) {
     data_source1
         .borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(30u64)));
+    let every_match = vec![
+        ((10, 10), (100, "a1".into(), "b1".into())),
+        ((10, 20), (100, "a1".into(), "b2".into())),
+        ((30, 10), (100, "a3".into(), "b1".into())),
+        ((30, 20), (100, "a3".into(), "b2".into())),
+    ];
+    assert_eq!(extract_join_rows(producer.run()), every_match);
 
+    // Closing the sources brings no row twice.
     data_source1
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
     data_source2
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    let tile = producer.run();
-
-    assert_eq!(
-        extract_join_rows(tile),
-        vec![
-            ((10, 10), (100, "a1".into(), "b1".into())),
-            ((10, 20), (100, "a1".into(), "b2".into())),
-            ((30, 10), (100, "a3".into(), "b1".into())),
-            ((30, 20), (100, "a3".into(), "b2".into()))
-        ]
-    );
+    assert_eq!(extract_join_rows(producer.run()), every_match);
 }
 
 /// Simpler version of test_inner_join to make it easier to debug.
 #[rstest]
-#[case("[x + y for x in source1() for y in source2() if x == y]", false)]
-#[case(
-    "[x + y for x in source1() for y in source2() if x <= y and x >= y]",
-    true
-)]
-fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
+#[case("[x + y for x in source1() for y in source2() if x == y]")]
+#[case("[x + y for x in source1() for y in source2() if x <= y and x >= y]")]
+fn test_incremental_join_simple(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
 
     let src1 = Rc::new(RefCell::new(TestDataSource::new(
@@ -412,14 +395,7 @@ fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
         rows
     }
 
-    assert_eq!(
-        extract_rows(tile),
-        if streams {
-            vec![((1, 10), 200)]
-        } else {
-            Vec::new()
-        }
-    );
+    assert_eq!(extract_rows(tile), vec![((1, 10), 200)]);
 
     // Phase 2: extend src1 with a second element; src2 is unchanged.
     src2.borrow_mut()
@@ -430,35 +406,25 @@ fn test_incremental_join_simple(#[case] code: &str, #[case] streams: bool) {
     let tile = producer.run();
 
     // Cross-product of src1={10, 30} × src2={20}: two pairs.
-    assert_eq!(
-        extract_rows(tile),
-        if streams {
-            vec![((1, 10), 200), ((1, 20), 200)]
-        } else {
-            Vec::new()
-        }
-    );
+    assert_eq!(extract_rows(tile), vec![((1, 10), 200), ((1, 20), 200)]);
 
     // Phase 3: extend src2 with a second element; src1 is unchanged.
     src1.borrow_mut()
         .publish_rows(&[(Value::UInt(2), Value::Int(100))]);
     src1.borrow_mut()
         .set_yield_predicate(Predicate::at_or_below(Value::from(2u64)));
+    let every_match = vec![
+        ((1, 10), 200),
+        ((1, 20), 200),
+        ((2, 10), 200),
+        ((2, 20), 200),
+    ];
+    assert_eq!(extract_rows(producer.run()), every_match);
 
+    // Closing the sources brings no row twice.
     src1.borrow_mut().set_yield_predicate(Predicate::True);
     src2.borrow_mut().set_yield_predicate(Predicate::True);
-    let tile = producer.run();
-
-    // Cross-product of src1={10, 30} × src2={20}: two pairs.
-    assert_eq!(
-        extract_rows(tile),
-        vec![
-            ((1, 10), 200),
-            ((1, 20), 200),
-            ((2, 10), 200),
-            ((2, 20), 200)
-        ]
-    );
+    assert_eq!(extract_rows(producer.run()), every_match);
 }
 
 /// `sum(source1())` accumulates values across batches and emits the final sum only
@@ -1427,13 +1393,13 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
-/// A record component publishes once its row is whole. A bare collection publishes each source
-/// delivery. Both yield the same collection once the source closes.
+/// A record component and a bare collection both publish each source delivery, and both yield the
+/// same collection once the source closes.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::component("r = (n=1, xs=source1()); r.xs", false)]
-#[case::bare_source("source1()", true)]
-fn test_a_collection_component_grows_with_its_source(#[case] code: &str, #[case] streams: bool) {
+#[case::component("r = (n=1, xs=source1()); r.xs")]
+#[case::bare_source("source1()")]
+fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1475,21 +1441,16 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str, #[case]
         ))
     };
 
-    if !streams {
-        assert!(pull(&test_source, &[(0, 10), (1, 20)], false).is_empty());
-        assert!(pull(&test_source, &[(2, 30)], false).is_empty());
-    } else {
-        assert_eq!(
-            pull(&test_source, &[(0, 10), (1, 20)], false),
-            expected(vec![0, 1], vec![10, 20], false),
-            "the rows delivered so far, and the domain is not settled",
-        );
-        assert_eq!(
-            pull(&test_source, &[(2, 30)], false),
-            expected(vec![0, 1, 2], vec![10, 20, 30], false),
-            "the row added since joins the ones already there",
-        );
-    }
+    assert_eq!(
+        pull(&test_source, &[(0, 10), (1, 20)], false),
+        expected(vec![0, 1], vec![10, 20], false),
+        "the rows delivered so far, and the domain is not settled",
+    );
+    assert_eq!(
+        pull(&test_source, &[(2, 30)], false),
+        expected(vec![0, 1, 2], vec![10, 20, 30], false),
+        "the row added since joins the ones already there",
+    );
     assert_eq!(
         pull(&test_source, &[], true),
         expected(vec![0, 1, 2], vec![10, 20, 30], true),
@@ -1505,12 +1466,9 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str, #[case]
 /// field reach the product as one record guard (`TileGuard::union`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::component("r = (n=1, xs=source1()); r.xs", false)]
-#[case::bare_source("source1()", true)]
-fn test_a_released_collection_component_is_not_redelivered(
-    #[case] code: &str,
-    #[case] streams: bool,
-) {
+#[case::component("r = (n=1, xs=source1()); r.xs")]
+#[case::bare_source("source1()")]
+fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1545,26 +1503,6 @@ fn test_a_released_collection_component_is_not_redelivered(
         ))
     };
 
-    if !streams {
-        assert!(pull_and_release(&[(0, 10), (1, 20)]).is_empty());
-        assert!(pull_and_release(&[(2, 30)]).is_empty());
-        assert!(pull_and_release(&[(3, 40)]).is_empty());
-        test_source
-            .borrow_mut()
-            .set_yield_predicate(Predicate::True);
-        let mut complete = producer.run();
-        complete.compact();
-        assert_eq!(
-            sort_function_by_domain(complete),
-            Tile::data_function(
-                ColumnValue::UInts(vec![0, 1, 2, 3]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
-                Predicate::True,
-                BitSet::new()
-            )
-        );
-        return;
-    }
     assert_eq!(
         pull_and_release(&[(0, 10), (1, 20)]),
         delivered(vec![0, 1], vec![10, 20]),
@@ -1880,16 +1818,16 @@ fn innermost_ints(tile: &Tile) -> Vec<i64> {
 /// close. The first batch's pull already holds that element under every row.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
-#[case::comprehension("[[y * x for y in source1()] for x in [1, 2]]", &[], &[1, 2, 2, 4])]
+#[case::comprehension("[[y * x for y in source1()] for x in [1, 2]]", &[1, 2], &[1, 2, 2, 4])]
 #[case::comprehension_bound_outside(
     indoc! {"
         ys = source1()
         [[y * x for y in ys] for x in [1]]
     "},
-    &[],
+    &[1],
     &[1, 2]
 )]
-fn a_nest_over_a_streamed_source_publishes_whole_rows(
+fn a_nest_over_a_streamed_source_runs_as_the_source_arrives(
     #[case] code: &str,
     #[case] first: &[i64],
     #[case] last: &[i64],
@@ -1948,8 +1886,8 @@ fn a_collection_per_row_over_a_streamed_source() {
     };
     assert_eq!(
         collections(each[0].clone()),
-        Vec::<i64>::new(),
-        "nested rows wait for whole-row publication"
+        vec![1, 2],
+        "after the first batch"
     );
     assert_eq!(
         collections(tile),
@@ -2001,18 +1939,18 @@ fn a_collection_per_row_released_as_it_is_read() {
     let never: fn(&Tile) -> bool = |_| false;
     assert_eq!(
         read(&[(0, 1)], Predicate::at_or_below(Value::UInt(0)), never),
-        (vec![], false),
-        "the first delivery leaves both rows open"
+        (vec![1, 2], false),
+        "the first element under both rows"
     );
     assert_eq!(
         read(&[(1, 5)], Predicate::at_or_below(Value::UInt(1)), never),
-        (vec![], false),
-        "the second delivery also leaves both rows open"
+        (vec![5, 10], false),
+        "only the element added since: the released pairs are not delivered again"
     );
     assert_eq!(
         read(&[], Predicate::True, Tile::is_terminal),
-        (vec![1, 2, 5, 10], true),
-        "closing the source publishes both complete rows exactly once"
+        (vec![], true),
+        "closing the source completes every row and delivers nothing new"
     );
 }
 

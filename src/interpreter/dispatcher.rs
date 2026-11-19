@@ -15,7 +15,7 @@
 //! `src/interpreter/design-dispatcher.md`, "The dispatcher".
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -28,6 +28,7 @@ use intervalsets::Bounding;
 use crate::interpreter::tile_operators::InputId;
 use crate::interpreter::tile_operators::{
     Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
+    spelled_part,
 };
 use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
@@ -143,6 +144,10 @@ struct QueueState {
     in_flight: HashMap<usize, TileGuard>,
     /// Deduplication and finish need the consumed region after individual packages are removed.
     region: Option<TileGuard>,
+    /// The indices of the packages queued or in flight that read a widened input again
+    /// ([`Queue::append_read_again_locked`]): their consume is a change for the pipeline's
+    /// readers ([`Dispatcher::land_change`]).
+    read_again: HashSet<usize>,
     /// Admission and transfers from waiting to ready share this lock with queue history.
     waiting_for_inputs: Vec<WaitingInput>,
     /// Cached union of guards waiting for input completion. Admission subtracts it without scanning the backlog.
@@ -150,6 +155,14 @@ struct QueueState {
 }
 
 impl QueueState {
+    /// Whether a read of a widened input again waits unclaimed, which reads whatever arrived
+    /// before its claim, so a second read queued now would read nothing the first does not.
+    fn read_again_waits(&self) -> bool {
+        self.ready
+            .iter()
+            .any(|(index, _)| self.read_again.contains(index))
+    }
+
     fn wait_for_inputs(&mut self, morsel: WaitingInput) {
         grow(&mut self.waiting_region, &morsel.guard);
         self.waiting_for_inputs.push(morsel);
@@ -224,6 +237,24 @@ impl Queue {
         true
     }
 
+    /// Append a read of a widened input again as a distinct package that records no region: it
+    /// discharges what its breaker releases rather than its guard
+    /// ([`Dispatcher::notify_again`]), so neither deduplication nor a finish counts it.
+    fn append_read_again_locked(&self, state: &mut QueueState, guard: &TileGuard) -> bool {
+        let Some(index) = self.reserve(1) else {
+            return false;
+        };
+        state.read_again.insert(index);
+        state.ready.push_back((index, guard.clone()));
+        true
+    }
+
+    /// Whether `package` reads a widened input again ([`Self::append_read_again_locked`]).
+    fn reads_again(&self, package: &WorkPackage) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.read_again.contains(&package.index)
+    }
+
     /// Append a repeated read of a loop's row, including its end, as a distinct package.
     fn append_again(&self, guard: &TileGuard) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -271,6 +302,7 @@ impl Queue {
         }
         on_ack();
         state.in_flight.remove(&package.index);
+        state.read_again.remove(&package.index);
         true
     }
 
@@ -370,6 +402,10 @@ struct PipelineInfo {
     /// ([`Landing::queue`]).
     routes: Option<Vec<ReadRoutes>>,
     ingress: Option<std::ops::Range<usize>>,
+    /// The universal guard of its input, where a widened push has it read all of its input
+    /// again ([`read_again_on_widened_push`](Dispatcher::read_again_on_widened_push)), and `None`
+    /// where it does not.
+    whole_input: Option<TileGuard>,
 }
 
 /// What the operators on a push's path have marked it with ([`Landing`]), as a push carries them
@@ -589,6 +625,7 @@ impl Dispatcher {
                 required_keys: Vec::new(),
                 routes: None,
                 ingress: None,
+                whole_input: None,
             })
             .collect();
         let states = infos
@@ -686,6 +723,7 @@ impl Dispatcher {
             required_keys: Vec::new(),
             routes: None,
             ingress: None,
+            whole_input: None,
         });
         *self.unfinished.get_mut() += 1;
         PipelineId(pipeline)
@@ -1414,6 +1452,58 @@ impl Dispatcher {
         }
     }
 
+    /// Have `pipeline`, which waits for its inputs' completion and takes no arrivals, read all of
+    /// `input`, the tiling its breaker's input answers, again at each push that reaches it
+    /// widened, besides the reads its inputs' completion releases. Its breaker takes and releases
+    /// what each answer states complete (`Breaker::reads_open_input`), so a reader of a live run
+    /// publishes what a widened push brings before its sources close. A read is queued only while
+    /// no read again waits unclaimed, which reads what the push brought when claimed. See
+    /// `src/interpreter/design-dispatcher.md`, "Reading a widened input again".
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` does not wait for its inputs' completion, or takes arrivals.
+    fn read_again_on_widened_push(&mut self, pipeline: PipelineId, input: &Tiling) {
+        let info = &mut self.infos[pipeline.0];
+        assert!(
+            info.waits_for_inputs && !info.arrivals,
+            "pipeline {} reads its input again at a widened push only where it waits for its \
+             inputs' completion and takes no arrivals",
+            pipeline.0
+        );
+        info.whole_input = Some(input.universal_guard());
+    }
+
+    /// Queue a read of all of `reader`'s input again
+    /// ([`read_again_on_widened_push`](Self::read_again_on_widened_push)) unless a read again
+    /// waits unclaimed, which reads what the push brought when claimed.
+    fn queue_read_again(&self, reader: usize) {
+        let guard = self.infos[reader]
+            .whole_input
+            .as_ref()
+            .expect("a pipeline that reads its input again knows its input");
+        let queue = &self.states[reader].queue;
+        let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // A live run consumes on one thread (`drive_live`), so a change reaches a reader while no
+        // read of that reader is consumed, and two reads of one open row never run at once.
+        debug_assert!(
+            !state
+                .in_flight
+                .keys()
+                .any(|index| state.read_again.contains(index)),
+            "pipeline {reader} is queued a read again while one of its reads is consumed"
+        );
+        if state.read_again_waits() {
+            return;
+        }
+        let appended = queue.append_read_again_locked(&mut state, guard);
+        self.ensure(appended, || {
+            format!("pipeline {reader} receives packages before it finishes")
+        });
+        drop(state);
+        self.advance();
+    }
+
     /// Mark `pipeline` as consuming its morsels one at a time, in the order they were queued, then
     /// its finish. Its breaker's state advances through them in order, as a loop's store completes
     /// its positions ascending.
@@ -1474,6 +1564,8 @@ impl Dispatcher {
             morsels: Vec::new(),
             complete: None,
             completed_keys: Vec::new(),
+            changed: false,
+            unspelled: false,
         }
     }
 
@@ -1624,6 +1716,43 @@ impl Dispatcher {
         );
         self.append_to_source(pipeline, &morsels);
         true
+    }
+
+    /// Queue `guard`, a guard of a source pipeline's input, as one package that reads it again:
+    /// the read of a pipeline its sources reach widened, which a delivery changes anywhere in its
+    /// input. The package discharges what its breaker releases rather than its guard
+    /// (`Breaker::reads_open_input`), so it records no region: it may meet a region queued
+    /// before, and the next read takes the rest. No read is queued while one waits unclaimed,
+    /// which reads the delivery when claimed. See `src/interpreter/design-dispatcher.md`,
+    /// "Reading a widened input again".
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` takes no arrivals or is closed.
+    fn notify_again(&self, pipeline: PipelineId, guard: &TileGuard) {
+        let _publisher = self.publisher();
+        if self.failed.load(Ordering::SeqCst) || guard.is_empty() {
+            return;
+        }
+        let p = pipeline.0;
+        self.ensure_source(pipeline);
+        let state = self.state(pipeline);
+        let mut admission = state
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.ensure(!admission.arrivals_closed, || {
+            format!("pipeline {p} is queued nothing once it is closed to arrivals")
+        });
+        if admission.read_again_waits() {
+            return;
+        }
+        let appended = state.queue.append_read_again_locked(&mut admission, guard);
+        self.ensure(appended, || {
+            format!("pipeline {p} is queued nothing once it is closed")
+        });
+        self.advance();
     }
 
     /// Refuse `pipeline` unless it takes arrivals: a source, one that reads no pipeline, or one
@@ -1905,6 +2034,9 @@ impl Dispatcher {
         }
         self.land_complete(p, complete.as_ref(), pushes.to.as_ref());
         self.land_completed_keys(p, &completed_keys);
+        if std::mem::take(&mut pushes.changed) {
+            self.land_change(p, pushes.to.as_ref());
+        }
         if morsels.is_empty() {
             return;
         }
@@ -1913,6 +2045,22 @@ impl Dispatcher {
         });
         self.land_in(p, &morsels, pushes.to.as_ref());
         self.advance();
+    }
+
+    /// Push a change of everything `pipeline`'s breaker answers through `to`, its breaker's
+    /// consumer, after the breaker read a widened input again: what it answers may have grown
+    /// where it completed nothing, or in a region no projection spells, which no package can name.
+    /// The change queues nothing and records nothing as pushed. Each reader whose entry it
+    /// reaches and that reads its input again at a widened push
+    /// ([`read_again_on_widened_push`](Self::read_again_on_widened_push)) reads it again, and
+    /// the operators on the way learn of it as of a delivery.
+    fn land_change(&self, pipeline: usize, to: Option<&SharedConsumer>) {
+        let Some(to) = to else {
+            return;
+        };
+        let mut landing = Landing::new(Target::Change { dispatcher: self }, pipeline);
+        to.borrow_mut()
+            .notify(&Projection::Everything, &mut landing);
     }
 
     /// Push `complete`, the region of its keys `pipeline`'s breaker has completed, through `to`, its
@@ -2296,6 +2444,12 @@ pub struct Pushes<'d> {
     completed_keys: Vec<Value>,
     /// The consumer the morsels climb, the pushing breaker's.
     to: Option<SharedConsumer>,
+    /// Whether the push follows a read of a widened input again, which climbs the consumer chain
+    /// as a change ([`Dispatcher::land_change`]).
+    changed: bool,
+    /// Whether the breaker completed a region no projection spells, which no push names yet
+    /// ([`push_final`](Self::push_final)). A finish leaves none.
+    unspelled: bool,
 }
 
 impl Pushes<'_> {
@@ -2331,10 +2485,18 @@ impl Pushes<'_> {
             breaker.complete().closed_over(breaker.tiling()),
             breaker.tiling(),
         );
+        // A push names a projection of the breaker's keys, so it pushes the part of the final
+        // guard a projection spells. The rest, such as a record whose collection field is
+        // complete through some rows, is pushed once a projection spells what it has grown to, at
+        // the latest once it is whole, which a finish checks. A reader that reads its input again
+        // learns of it before then through the change a read of a widened input pushes
+        // ([`Dispatcher::land_change`]).
         let complete = breaker.final_guard();
+        let spelled = spelled_part(&complete).unwrap_or_else(|| breaker.tiling().empty_guard());
+        self.unspelled = Projection::of(&complete).is_err() && !complete.is_empty();
         let guard = self.record(|pushed| match pushed {
-            Some(pushed) => guard_minus(&complete, pushed),
-            None => complete.clone(),
+            Some(pushed) => guard_minus(&spelled, pushed),
+            None => spelled.clone(),
         });
         self.cut(&guard, |guard, rows| breaker.morsels(guard, rows));
     }
@@ -2433,6 +2595,9 @@ pub struct Landing<'d> {
 enum Target<'d> {
     /// Queues each in the reader's queue.
     Queue { dispatcher: &'d Dispatcher },
+    /// Has each reader that reads its input again at a widened push read it, and queues nothing
+    /// else ([`Dispatcher::land_change`]).
+    Change { dispatcher: &'d Dispatcher },
     /// Records each, for a planner that probes which region of a reader's input a pipeline's push
     /// names; which edges keep keys the planner reads off a route walk ([`Landing::route`]).
     Probe(Vec<Arrival>),
@@ -2470,8 +2635,9 @@ pub(crate) struct Arrival {
 impl Landing<'_> {
     fn accepts_entry(&self, pipeline: PipelineId) -> bool {
         match &self.target {
-            Target::Queue { dispatcher } | Target::Completion { dispatcher, .. } => dispatcher
-                .infos[pipeline.0]
+            Target::Queue { dispatcher }
+            | Target::Change { dispatcher }
+            | Target::Completion { dispatcher, .. } => dispatcher.infos[pipeline.0]
                 .ingress
                 .as_ref()
                 .is_none_or(|from| from.contains(&self.from)),
@@ -2482,7 +2648,7 @@ impl Landing<'_> {
     pub(crate) fn is_delivery(&self) -> bool {
         matches!(
             self.target,
-            Target::Queue { .. } | Target::Completion { .. }
+            Target::Queue { .. } | Target::Change { .. } | Target::Completion { .. }
         )
     }
 
@@ -2537,7 +2703,10 @@ impl Landing<'_> {
     pub(crate) fn arrivals(self) -> Vec<Arrival> {
         match self.target {
             Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => arrivals,
-            Target::Queue { .. } | Target::Completion { .. } | Target::Route { .. } => {
+            Target::Queue { .. }
+            | Target::Change { .. }
+            | Target::Completion { .. }
+            | Target::Route { .. } => {
                 panic!("only a probing landing records arrivals")
             }
         }
@@ -2584,13 +2753,17 @@ impl Landing<'_> {
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
-    /// what is queued for it already: a push that reaches a breaker along two
-    /// paths, as a filter reads one memo for its values and its predicate, is queued once. A
-    /// reader that reads its input whole ([`Dispatcher::read_whole`]) takes no push, widened or
-    /// not, and nor does one that follows the pipeline that pushed ([`Dispatcher::follow`]). A
-    /// reader configured by [`Dispatcher::wait_for_inputs`] queues the rows a push brings once their inputs complete,
-    /// and nothing for a widened push or one to a reader that takes arrivals, but for a push of a
-    /// pipeline whose rows arrive as the reader's own keys ([`Dispatcher::queue_pushes_of`]).
+    /// what is queued for it already: a push that reaches a breaker along two paths, as a filter
+    /// reads one memo for its values and its predicate, is queued once. A reader that follows the
+    /// pipeline that pushed ([`Dispatcher::follow`]) takes no push. A reader that reads its input
+    /// whole ([`Dispatcher::read_whole`]) takes no push either, but for a widened push where it
+    /// reads its input again at one ([`Dispatcher::read_again_on_widened_push`]). A reader
+    /// configured by [`Dispatcher::wait_for_inputs`] queues the rows a push brings once their
+    /// inputs complete, and nothing for a widened push or one to a reader that takes arrivals,
+    /// but for a push of a pipeline whose rows arrive as the reader's own keys
+    /// ([`Dispatcher::queue_pushes_of`]); where it reads its input again at a widened push, it
+    /// also queues that read. A change ([`Dispatcher::land_change`]) queues only the read again
+    /// of a reader that reads its input again and does not follow the pipeline that pushed.
     ///
     /// # Panics
     ///
@@ -2607,6 +2780,20 @@ impl Landing<'_> {
         };
         let dispatcher = match &mut self.target {
             Target::Queue { dispatcher } => *dispatcher,
+            Target::Change { dispatcher } => {
+                let info = &dispatcher.infos[reader.0];
+                dispatcher.ensure(info.reads.contains(&self.from), || {
+                    format!(
+                        "pipeline {} pushes a change to pipeline {}, which reads it",
+                        self.from, reader.0
+                    )
+                });
+                // A reader that follows the pipeline that pushed takes its rows in rounds.
+                if info.whole_input.is_some() && !info.follows.contains(&self.from) {
+                    dispatcher.queue_read_again(reader.0);
+                }
+                return;
+            }
             Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => {
                 arrivals.push(Arrival {
                     pipeline: reader,
@@ -2652,9 +2839,17 @@ impl Landing<'_> {
             format!("pipeline {from} pushes to pipeline {r}, which reads it")
         });
         let info = &dispatcher.infos[r];
-        // A reader that reads its input whole takes no push, and a nested loop's scope, or a
-        // reader that waits for one, takes its rows in rounds.
-        if info.whole || info.follows.contains(&from) {
+        // A nested loop's scope, and a reader that waits for one, takes its rows in rounds.
+        if info.follows.contains(&from) {
+            return;
+        }
+        // A reader that reads its input whole takes no push but the read again a widened push
+        // brings it.
+        if info.whole {
+            if info.whole_input.is_some() && self.widened {
+                dispatcher.ensure_planned(from, r, &marked, false);
+                dispatcher.queue_read_again(r);
+            }
             return;
         }
         let queue = &dispatcher.states[r];
@@ -2668,6 +2863,9 @@ impl Landing<'_> {
             if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
                 dispatcher.ensure_planned(from, r, &marked, false);
                 dispatcher.queue_or_wait_for_inputs(r, guard, false);
+                if info.whole_input.is_some() && self.widened {
+                    dispatcher.queue_read_again(r);
+                }
             }
             return;
         }
@@ -2718,9 +2916,9 @@ impl Landing<'_> {
             self.from
         );
         match &self.target {
-            Target::Queue { dispatcher, .. } | Target::Completion { dispatcher, .. } => {
-                dispatcher.ensure(false, || message)
-            }
+            Target::Queue { dispatcher, .. }
+            | Target::Change { dispatcher }
+            | Target::Completion { dispatcher, .. } => dispatcher.ensure(false, || message),
             Target::Probe(_) | Target::ProbeCompletion(_) | Target::Route { .. } => {
                 panic!("{message}")
             }
@@ -3219,6 +3417,7 @@ pub(crate) fn consume(dispatcher: &Dispatcher, breakers: &[BreakerHandle], packa
 
 fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPackage) {
     let p = package.pipeline.0;
+    let read_again = dispatcher.states[p].queue.reads_again(&package);
     // The pushes land once the reach has returned: a breaker reached through a fan-out slot is
     // called while the walk holds the fan-out, which the push climbs.
     let mut landed = None;
@@ -3238,6 +3437,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
         {
             let mut pushes = dispatcher.pushes(package.pipeline);
             pushes.push_final(producer);
+            pushes.changed = read_again;
             landed = Some(pushes);
         }
     });
@@ -3320,6 +3520,12 @@ fn finish_with(
         );
         let mut pushes = dispatcher.pushes(pipeline);
         breaker.finish(input, &mut pushes);
+        dispatcher.ensure(!pushes.unspelled, || {
+            format!(
+                "pipeline {p} finishes having pushed all it completed: a region no projection \
+                 spells would reach no reader"
+            )
+        });
         finished = Some(pushes);
     });
     dispatcher.finish(finished.expect("a reach calls the breaker it reaches"));

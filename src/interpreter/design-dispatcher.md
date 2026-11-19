@@ -86,10 +86,12 @@ extent, including previously yielded regions when a run starts. The pipeline que
 breaker's input has not released. Subsequent polls announce additional progress. Several appearances
 of one source do not turn one delivered position into several loop requests.
 
-A route that preserves source positions can admit them as they arrive. A route that requires the
-whole source waits until that source closes. A loop or transaction whose source is supplied through
-another pipeline also waits for that pipeline to decide each admitted region. Compound source
-regions are retained as regions; they are not converted into an invented ordering of rows.
+A route that preserves source positions can admit them as they arrive. A route that widens them
+reads its whole input again after each delivery and once more after the source closes ([Reading a
+widened input again](#reading-a-widened-input-again)). A loop or transaction whose source is
+supplied through another pipeline also waits for that pipeline to decide each admitted region.
+Compound source regions are retained as regions; they are not converted into an invented ordering of
+rows.
 
 The run alternates source polling and consuming claimable work. When claims drain, it publishes held
 breaker output and continues if that makes more work available. A live source can remain open while
@@ -110,9 +112,9 @@ seed opening before admitting their source items. Transaction replies commit as 
 rekeyed from commit ticks to their original source positions.
 
 Live concatenation can wait for source closure. Rebuilding a feed reader across reload can replay
-values emitted before the cut. Field-specific publication from a memo remains a follow-up: a live
-collection inside a record or nested row can wait for source closure before its consumer receives
-a whole row. Bare collection outputs continue to stream completed keys.
+values emitted before the cut. A live collection inside a record or a nested row reaches its reader
+before the source closes through a read of a widened input
+([Reading a widened input again](#reading-a-widened-input-again)).
 
 ### Pause and reload
 
@@ -236,6 +238,63 @@ Breakers that publish while consuming announce their complete regions after each
 that hold output announce them in a later publication pass. Completion publishes final progress.
 Notifications queue dispatcher work and mark inline caches dirty; no deferred wakeup schedules work.
 
+## Reading a widened input again
+
+A pipeline that a live source reaches widened reads all of its input again after each change,
+where its breaker reads an open input (`Breaker::reads_open_input`). A sink does, a memo does, and
+so does a `main` output that hands each package's answer. Such a breaker releases what each answer
+makes releasable (`Tile::to_guard`), and the next read answers the rest; a memo also caches the
+open keys it read and merges what they gained.
+
+A read again is a package of the universal guard that records no region
+(`Queue::append_read_again_locked`). It discharges what its breaker releases, not its guard, so
+neither deduplication nor the finish check counts it, and the next read takes what it left open.
+It asks for the universal guard rather than for what is unreleased, because the unreleased region
+can name keys beneath the outermost level or within a record, where a widened operator cannot be
+pulled.
+
+Three events queue a read again:
+
+| Event | Pipeline | Entry point |
+| --- | --- | --- |
+| A delivery | A source pipeline notified of its whole input | `Dispatcher::notify_again` |
+| A push that reaches it widened | A reader that waits for its inputs and takes no arrivals | `Dispatcher::read_again_on_widened_push` |
+| A change | Either, where the consume of a read again in a pipeline it reads pushed one | `Dispatcher::land_change` |
+
+The consume of a read again pushes a change through its breaker's consumer, because what the
+breaker answers may have grown where it completed nothing, or in a region no projection spells,
+such as a record whose collection field grows. The change queues a read again for each reader that
+reads its input again and does not follow the pipeline that pushed, and nothing else; it records
+nothing as pushed. The operators on its way learn of it as of a delivery and mark inline caches
+dirty.
+
+No read again is queued while one of the same pipeline waits unclaimed, since that one reads
+whatever arrived before its claim. A live run consumes on one thread (`drive_live`), so no two reads
+of one open row run at once.
+
+Every widened pipeline also reads its input once every source yields everything, held until the
+inputs it waits for have completed it. That read carries the obligation the finish checks: it takes
+what no read again took, such as rows an input that reaches it widened completes after the last
+delivery.
+
+A push names a projection of the breaker's keys. Where the region a breaker completed holds cells
+beneath a row besides whole keys, the push names the keys (`spelled_part`). A region no projection
+spells is pushed once one does, at the latest once it is whole (`Pushes::push_final`), and a finish
+that leaves one fails the run. Before then only a reader that reads its input again learns of it,
+through the change.
+
+A sink's release follows the release contract: a scalar held under a key is complete once there, so
+a read can release a row whole before any answer states the row complete. That happens where an
+answer passes on the incompleteness of a row it reads only a field of, as `[p.0 for p in xs]` over
+rows whose collection field grows. A sink's or a `main` output's producer released whole answers no
+key, so the run's finish states it complete (`pull_at_finish`, for `SinkConsumer::complete` and
+`SinkBreaker::finish`). A statement of completion per field of a row, which would let the answer
+state such a row complete, is not represented.
+
+A breaker that folds or extracts what it is handed, or steps until its guard is released, reads
+its input once, after every source yields everything. An aggregate, an extract and a store are
+such breakers, so a final sum still waits for the input it needs.
+
 ## Reading each row once
 
 A dependent pipeline admits only regions whose required contributions are complete. It records the
@@ -249,6 +308,10 @@ Releases of the breaker's input record which consumed regions remain unnecessary
 
 Closing rounds are explicit repeated reads. The last value of a nested row does not establish the
 row's end, and an empty row still has completeness to deliver.
+
+A read of a widened input again is a repeated read too, and admits no region
+([Reading a widened input again](#reading-a-widened-input-again)): the regions recorded as admitted
+stay those of the packages whose guard is their obligation.
 
 A breaker's `complete()` is authoritative. It preserves completion after payload reclamation.
 `final_guard()` derives the region available for publication, accounting for release and resumed
