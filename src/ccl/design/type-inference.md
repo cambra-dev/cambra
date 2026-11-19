@@ -4880,10 +4880,21 @@ so each use checks what its own arguments add. A `def` whose `requires` clause i
 checked against the trait requirements its scheme reaches beyond those it writes
 (`InferCtx::requirements_beyond_clauses`).
 
-**A written type stops what exceeds it.** An edge out of a variable a written function type bounds
-carries only what the type states (`CapabilityVar::resolved`), so a capability beyond it is reported
-once, where it meets the type, and does not reach each variable downstream as a second error. A
-`def`'s `only` clause passes on what the body does, which a caller's `try` still reads.
+**A written type stops what exceeds it.** A variable a written function type bounds resolves to
+what the type states, and so does every edge out of it (`CapabilityVar::resolved`): the written type
+is the type of whatever meets it. A capability beyond it is reported once, where it meets the type,
+and no reader sees it past that point, neither a variable downstream, which would report it again,
+nor a type rendered from the bounded variable itself. Only the check of the bound reads what flows
+in beyond it (`CapabilityVar::resolved_unstopped`). Recording a bound is a fact like recording a
+capability, so no resolution read before it stands.
+
+Only a written function type stops, because only it defines the type at a position: what meets it
+is a separate value, which keeps its capabilities and is what the error reports. Every other bound
+asserts something of a type that is still inferred, and only checks it. A `def`'s `only` clause and
+a trait's signature bound the definition's own type, which an error beyond them spells
+(`InferCtx::item_beyond_clause`) and a caller's `try` reads; stopping there would rewrite the
+definition's type to agree with the clause it breaks. A clause variable's bound and a `with begin():`
+block's transaction bound check what each use or body brings.
 
 **A hole that a bounded clause reaches takes its bound.** A written type whose clause ends in `_`
 marks its variable (`CapabilityVar::mark_hole`). Once a `def`'s body is emitted, each marked
