@@ -1261,6 +1261,12 @@ impl TileProducer for SelectFieldProducer {
             let at_field = self.at_field(dropped);
             self.input.release(at_field);
         }
+        // A row is complete for this field once the field's value is, where the input states a
+        // row complete only once all its fields are. A plain field is complete once held, so each
+        // held row is.
+        if self.input.tiling().is_data_function() && tile.deepest_values().is_plain_value() {
+            tile.state_held_values_complete();
+        }
         tile.restrict_to(&projection, self.tiling());
         tile
     }

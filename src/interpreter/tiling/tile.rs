@@ -1874,6 +1874,17 @@ impl Tile {
     /// merge's key matching, and an operator putting a value into a column ask this one, a
     /// column having nowhere to put a level. The chain walks ([`Self::deepest_values`],
     /// [`Self::innermost_depth`], [`Self::key_levels`]) ask the first.
+    /// Whether this is a value of scalars alone, a scalar or a record of plain values, whose
+    /// cells are final once held. An aggregation and a store carry a completeness of their own,
+    /// and a collection holds a level.
+    pub(crate) fn is_plain_value(&self) -> bool {
+        match self {
+            Tile::Scalar(_) => true,
+            Tile::Record { fields, .. } => fields.values().all(Tile::is_plain_value),
+            Tile::DataFunction { .. } | Tile::Aggregation { .. } | Tile::Store { .. } => false,
+        }
+    }
+
     pub fn holds_a_level(&self) -> bool {
         match self {
             Tile::DataFunction { .. } => true,
@@ -2283,6 +2294,40 @@ impl Tile {
                 })
                 .collect(),
         )
+    }
+
+    /// State complete each key the innermost collection level holds where its values are plain
+    /// ([`Tile::is_plain_value`]). Under the release contract a plain value is complete once held
+    /// (`to_guard` names such keys releasable), so this states what `to_guard` already releases.
+    /// An operator whose rows read only such a value calls it where its input's row statement also
+    /// covers values it does not read, as a field selector over a record whose other field still
+    /// grows (`src/interpreter/design-operators.md`, "The completeness contract"). It states
+    /// nothing where the values beneath the innermost level are not plain: a record holding a
+    /// level, an aggregation or a store.
+    pub(crate) fn state_held_values_complete(&mut self) {
+        fn walk(tile: &mut Tile, row_paths: &[Vec<Value>]) {
+            let Tile::DataFunction { codomain, .. } = &*tile else {
+                return;
+            };
+            if matches!(**codomain, Tile::DataFunction { .. }) {
+                let paths = tile.key_paths(row_paths);
+                if let Tile::DataFunction { codomain, .. } = tile {
+                    walk(codomain, &paths);
+                }
+                return;
+            }
+            if !codomain.is_plain_value() {
+                return;
+            }
+            let held = tile.held_keys(row_paths);
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = tile
+            {
+                *domain_predicate = domain_predicate.union(&held);
+            }
+        }
+        walk(self, &[Vec::new()]);
     }
 
     /// The keys this collection holds, each beneath the path of the row holding it.
@@ -3474,6 +3519,112 @@ mod tests {
     use super::super::predicate::same_region;
     use super::*;
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, TileGuard, Value};
+
+    // ── Held values that hold no level ────────────────────────────────────────
+
+    /// Held keys whose values hold no level are stated complete, besides what was stated.
+    #[test]
+    fn held_values_with_no_level_are_stated_complete() {
+        let mut tile = Tile::DataFunction {
+            row_starts: vec![0],
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+            domain_predicate: Predicate::point(Value::UInt(5)),
+            deleted: BitSet::new(),
+            absent_keys: Predicate::False,
+        };
+        tile.state_held_values_complete();
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            unreachable!()
+        };
+        let expected = Predicate::point(Value::UInt(5)).union(&Predicate::from_column_value(
+            &ColumnValue::UInts(vec![0, 1]),
+        ));
+        assert!(
+            same_region(domain_predicate, &expected),
+            "{domain_predicate:?}"
+        );
+    }
+
+    /// A statement already present is kept beside the held keys, whatever its qualification.
+    #[test]
+    fn held_values_join_a_qualified_statement_already_present() {
+        let row = Predicate::exactly(&[Value::UInt(7)]);
+        let stated = Predicate::qualified(row.clone(), Predicate::point(Value::UInt(9)));
+        let mut tile = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::DataFunction {
+                row_starts: vec![0],
+                domain: ColumnValue::UInts(vec![0]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+                domain_predicate: stated.clone(),
+                deleted: BitSet::new(),
+                absent_keys: Predicate::False,
+            }),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.state_held_values_complete();
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            unreachable!()
+        };
+        let Tile::DataFunction {
+            domain_predicate: inner,
+            ..
+        } = &**codomain
+        else {
+            unreachable!()
+        };
+        let held = Predicate::qualified(row, Predicate::point(Value::UInt(0)));
+        assert!(same_region(inner, &stated.union(&held)), "{inner:?}");
+    }
+
+    /// Beneath an enclosing level, each held key is stated complete under the path of its row,
+    /// and the enclosing level states nothing new.
+    #[test]
+    fn held_values_beneath_a_level_are_stated_under_their_rows() {
+        let mut tile = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::DataFunction {
+                row_starts: vec![0],
+                domain: ColumnValue::UInts(vec![0, 1]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+                domain_predicate: Predicate::False,
+                deleted: BitSet::new(),
+                absent_keys: Predicate::False,
+            }),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.state_held_values_complete();
+        let Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } = &tile
+        else {
+            unreachable!()
+        };
+        assert!(domain_predicate.is_false());
+        let Tile::DataFunction {
+            domain_predicate: inner,
+            ..
+        } = &**codomain
+        else {
+            unreachable!()
+        };
+        let row = Predicate::exactly(&[Value::UInt(7)]);
+        let keys = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1]));
+        assert!(
+            same_region(inner, &Predicate::qualified(row, keys)),
+            "{inner:?}"
+        );
+    }
 
     // ── The keys compaction removes ───────────────────────────────────────────
 
