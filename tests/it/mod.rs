@@ -34,7 +34,7 @@ mod generated_pairs;
 mod hot_reload;
 mod http_server;
 mod inference_variants;
-mod inspector_goldens;
+mod inspector_wire;
 mod live_keys_readers;
 mod loop_body_binding_cost;
 mod nested_extract_allocations;
@@ -42,7 +42,7 @@ mod nested_filter_cost;
 mod predicate_sharing;
 mod predicate_sharing_review;
 // The gallery stays at `tests/programs/`: its `program.cambra` paths are read at run time
-// and recorded in the inspector's golden fixtures. Its root is `mod.rs` rather than
+// and recorded in the inspector's dumps (`inspector_wire.rs`). Its root is `mod.rs` rather than
 // `main.rs`, which autodiscovery would build as a binary of its own.
 #[path = "../programs/mod.rs"]
 mod programs;

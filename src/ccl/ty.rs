@@ -3110,11 +3110,9 @@ fn show_binders() -> bool {
     *ON.get_or_init(|| std::env::var_os("CCL_SHOW_BINDERS").is_some())
 }
 
-// This rendering IS the inspector wire format for types — the serde impl above
-// `collect_str`s it, and the golden fixtures pin it byte-exactly on every
-// `type` field. Changing any notation here (`⇒`, `0..n`, `Mut(…)`, the
-// singleton spelling, braces) is a deliberate corpus-wide re-bless: rerun
-// web/scripts/regen-fixtures.sh and commit the classified diff.
+// This rendering is the inspector wire format for types: the serde impl above
+// `collect_str`s it into every `type` field, where the frontend shows it and its
+// tests read it.
 /// Renders through [`fmt_type`] with no enclosing function: a self-contained
 /// type carries every function its references name, so the spelling is
 /// complete. A type shown detached from a function that binds one of its references renders that

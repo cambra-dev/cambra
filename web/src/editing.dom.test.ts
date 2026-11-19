@@ -16,8 +16,9 @@ import { SourceView, editorDiagnostics, statusLine } from "./sourceView";
 import { Store } from "./store";
 import type { Snapshot } from "./types";
 
-import { fixture, irPaneById, stubLayout, theNode } from "./__fixtures__/helpers";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
+import { dumped, fixture, irPaneById, stubLayout, theNode } from "./__fixtures__/helpers";
+
+const listMinJson = dumped("list_min");
 
 const listMin = fixture(listMinJson);
 

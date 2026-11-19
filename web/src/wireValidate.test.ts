@@ -1,29 +1,18 @@
-// Tests for the runtime wire-shape validator. Every real fixture
-// must validate (they are the source of truth for the shape); deliberately-
-// broken objects must throw with a path-naming message.
+// Tests for the runtime wire-shape validator. Every gallery program's payload
+// must validate (the backend's wire is the source of truth for the shape);
+// deliberately-broken objects must throw with a path-naming message.
 
 import { describe, expect, it } from "vitest";
 
 import { PANE_IDS, SCHEMA_VERSION, validateSnapshot } from "./wireValidate";
+import { allDumped, dumped } from "./__fixtures__/helpers";
 
-import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
-import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
-import listCompJson from "./__fixtures__/list_comp.snapshot.json";
-import failedJson from "./__fixtures__/failed.snapshot.json";
-import deferLiftJson from "./__fixtures__/defer_lift.snapshot.json";
-import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
+const listCompJson = dumped("list_comp");
+const failedJson = dumped("type_error");
+const sourceSharedJson = dumped("source_shared");
 
-describe("validateSnapshot: real fixtures", () => {
-  for (const [name, json] of [
-    ["arithmetic", arithmeticJson],
-    ["polymorphic", polymorphicJson],
-    ["list_min", listMinJson],
-    ["list_comp", listCompJson],
-    ["failed", failedJson],
-    ["defer_lift", deferLiftJson],
-    ["source_shared", sourceSharedJson],
-  ] as const) {
+describe("validateSnapshot: the gallery programs' payloads", () => {
+  for (const [name, json] of allDumped()) {
     it(`${name} validates and round-trips identity`, () => {
       const snap = validateSnapshot(json);
       expect(snap).toBe(json);
@@ -60,7 +49,7 @@ describe("validateSnapshot: real fixtures", () => {
     expect(vias).toContain("Comprehension");
   });
 
-  it("the failed (degraded) fixture validates with empty panes", () => {
+  it("a program that does not compile validates as the degraded payload, with empty panes", () => {
     const snap = validateSnapshot(failedJson);
     expect(snap.meta.payloadKind).toBe("failed");
     expect(snap.panes).toEqual([]);

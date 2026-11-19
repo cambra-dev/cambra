@@ -188,9 +188,10 @@ ci_doc() {
 }
 # The frontend's correctness checks: typecheck and vitest. `ci_web` and
 # `ci_fast` both call this, so the fast tier's web coverage is a subset of the
-# full gate's rather than a second list that drifts from it. Requires npm;
-# skipped (not failed) when npm is absent so the Rust-only local path still
-# works.
+# full gate's rather than a second list that drifts from it. Vitest's setup
+# dumps every gallery program through `cargo test` (`web/src/__fixtures__/dumps.ts`);
+# `CAMBRA_SNAPSHOT_PROFILE` names the profile to reuse. Requires npm; skipped
+# (not failed) when npm is absent so the Rust-only local path still works.
 ci_web_tests() {
   if ! command -v npm > /dev/null 2>&1; then
     echo "ci_web_tests: npm not found; skipping web frontend checks" >&2
@@ -245,56 +246,6 @@ ci_web() {
       echo "  (the bundle also embeds editors/vscode/syntaxes/cambra.tmLanguage.json and editors/highlight-classes.json)" >&2
       exit 1
     fi
-  )
-}
-# Golden-fixture drift gate: regenerate the frontend's snapshot fixtures into a
-# temp dir through the same script the fix path uses (regen-fixtures.sh, driven
-# by scripts/fixtures.manifest) and fail on any byte difference from the
-# committed copies. The fix on an intended wire change is the script itself:
-#   web/scripts/regen-fixtures.sh   # then commit the diff
-# (Cross-process dump determinism — the property this gate relies on — is
-# pinned corpus-wide by tests/it/inspector_goldens.rs under ci_test.)
-ci_fixtures() {
-  (
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "${tmp}"' EXIT
-    # A regen failure is a BUILD error, not fixture drift — bail before the
-    # comparisons below, which read "absent from the temp dir" as a fixture
-    # problem. Falling through would report the empty/partial temp dir as drift
-    # and, worse, name every unreached fixture an "orphan" and advise deleting
-    # it — its manifest row is fine, regen just never got there. Checked
-    # explicitly (`if !`) rather than via `set -e`: `ci_all` calls this gate on
-    # the left of a `||`, which suppresses errexit for this whole subshell.
-    if ! web/scripts/regen-fixtures.sh "${tmp}"; then
-      echo "ci_fixtures FAILED: fixture regeneration failed (see the error above) — a build/regen failure, NOT fixture drift" >&2
-      exit 1
-    fi
-    fix="web/src/__fixtures__"
-    drifted=0
-    for f in "${tmp}"/*.snapshot.json; do
-      name="$(basename "${f}")"
-      # cmp + a short excerpt, not a full `git diff`: a drifted snapshot diff
-      # is thousands of lines and buries which fixture failed.
-      if ! cmp -s "${fix}/${name}" "${f}"; then
-        committed_size="$(wc -c < "${fix}/${name}")"
-        regen_size="$(wc -c < "${f}")"
-        echo "ci_fixtures FAILED: fixture drift: ${name} (committed ${committed_size} bytes vs regenerated ${regen_size} bytes)" >&2
-        diff -u "${fix}/${name}" "${f}" | head -n 12 >&2 || true
-        echo "  re-bless via: web/scripts/regen-fixtures.sh, then commit the diff" >&2
-        echo "  (if web/src/ changed too: cd web && npm run build, then commit dist/index.html — ci_web compares it)" >&2
-        drifted=1
-      fi
-    done
-    # Orphan check: a committed fixture with no manifest row would otherwise be
-    # compared against nothing and rot silently.
-    for committed in "${fix}"/*.snapshot.json; do
-      name="$(basename "${committed}")"
-      if [[ ! -f "${tmp}/${name}" ]]; then
-        echo "ci_fixtures FAILED: orphan fixture: ${name} is committed but has no row in web/scripts/fixtures.manifest (add the row or delete the fixture)" >&2
-        drifted=1
-      fi
-    done
-    exit "${drifted}"
   )
 }
 # Installed npm packages and the VS Code `ci_vscode` downloads are not the
@@ -382,12 +333,12 @@ ci_fast() {
   # suite's failures.
   # shellcheck disable=SC2310
   ci_solver || failed=1
-  # Ahead of `ci_test`: the frontend checks are the cheapest in the set, so a
-  # broken `.ts` reports in seconds rather than after the Rust suite.
-  # shellcheck disable=SC2310
-  ci_web_tests || failed=1
   # shellcheck disable=SC2310
   ci_test || failed=1
+  # After `ci_test`: the frontend's tests dump the gallery programs through the
+  # suite's build (`web/src/__fixtures__/dumps.ts`), which is then in place.
+  # shellcheck disable=SC2310
+  ci_web_tests || failed=1
   exit "${failed}"
 }
 
@@ -437,9 +388,6 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test_no_assertions || failed="${failed} test_no_assertions"
-  # shellcheck disable=SC2310
-  # intentional: || captures failure without exiting
-  ci_fixtures || failed="${failed} fixtures"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_web || failed="${failed} web"

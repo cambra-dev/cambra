@@ -2,7 +2,7 @@
 //!
 //! The `/api/snapshot` half mirrors the frontend's `validateSnapshot`
 //! (`web/src/wireValidate.ts`), so the transport, the server and
-//! `tests/it/inspector_goldens.rs` check the contract the frontend reads. The two
+//! `tests/it/inspector_wire.rs` check the contract the frontend reads. The two
 //! cannot share code, so each language carries its own validator.
 //!
 //! The `/api/live` half, [`assert_probe_frame_shape`], has no TypeScript twin.
@@ -10,9 +10,9 @@
 //! `inspector_model::frame`'s golden test compares against the committed
 //! fixture `web/src/__fixtures__/probe_frame.json`.
 //!
-//! **Test-only.** Its callers are the inspector's unit tests and the golden corpus
-//! (`tests/it/inspector_goldens.rs`), the payload set that most needs validating,
-//! being the one the frontend reads; all are part of the library's test build.
+//! **Test-only.** Its callers are the inspector's unit tests and the gallery sweep
+//! (`tests/it/inspector_wire.rs`), whose dumps are the payloads the frontend's tests
+//! read; all are part of the library's test build.
 
 use serde_json::Value;
 

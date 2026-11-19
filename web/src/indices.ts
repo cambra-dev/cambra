@@ -136,7 +136,8 @@ export function buildIndices(
   // Depth-first is right almost everywhere: it is what answers a click on
   // `stdin()` with `Source(stdin)` rather than the `Apply` around it, and
   // `pool := pool - r` with `MutWrite(pool)` rather than its `ExprStmt`. Over
-  // the fixture corpus plus `txn_multi_read` it decides 134 coincident-span
+  // `udf_closure`, `polymorphic`, `list_min`, `list_comp`, `defer_lift`,
+  // `source_shared` and `txn_multi_read` it decides 134 coincident-span
   // groups, and the two general-looking alternatives — prefer the ancestor,
   // prefer the deepest non-leaf — change 70 and 67 of them respectively,
   // including those two for the worse. The unit clause changes 9, all of them

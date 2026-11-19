@@ -50,7 +50,6 @@ It does not count:
 - Anything that changes observable behaviour. That includes:
   - diagnostics and error text;
   - iteration order;
-  - the number of `NodeId`s a phase mints, which moves the inspector golden fixtures;
   - `Display` output.
 - Anything that contradicts a design doc. The exception is a doc that is plainly wrong about the
   code, or a doc or vault issue (`{{SRCS}}/vault/issues/`) that records the point as a

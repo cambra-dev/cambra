@@ -62,7 +62,7 @@ inspected is the compiler:
 - The **transport and delivery vehicle** is `src/inspector_server/`: it turns
   the model into JSON (`snapshot_json`), serves it over HTTP (`serve.rs`), and
   embeds the built frontend bundle. `wire_check.rs` is the structural validator
-  both those tests and `tests/it/inspector_goldens.rs` assert the wire against.
+  both those tests and `tests/it/inspector_wire.rs` assert the wire against.
 
 ```
 browser ──HTTP──> cambra --inspect-only ──> inspector_server ──> inspector_model ──> compile_program
@@ -75,9 +75,7 @@ browser ──HTTP──> cambra --inspect-only ──> inspector_server ──>
 |---|---|
 | `web/` | The CodeMirror 6 / TypeScript frontend. **Has its own [README](../web/README.md)** — build, tests, module layout, and the byte↔char bridge. |
 | `web/dist/index.html` | The built, self-contained single-file bundle, committed and `include_str!`-embedded by the server (so `cargo build` needs no Node). |
-| `web/src/__fixtures__/` | The golden snapshot corpus the frontend's tests read, blessed by `scripts/regen-fixtures.sh`. |
-| `scripts/fixtures.manifest` | Which gallery program each committed fixture is dumped from. |
-| `scripts/regen-fixtures.sh` | The re-bless path, and the `ci.sh` drift gate's regenerator. |
+| `web/src/__fixtures__/` | The frontend tests' helpers, and their setup (`dumps.ts`), which dumps every gallery program's payload before they run. |
 
 The programs are the demo gallery's (`tests/programs/`, tabulated in
 [docs/demo-programs.md](../docs/demo-programs.md)) — the inspector has no
@@ -136,20 +134,15 @@ starting the (never-exiting) server**:
 cargo run -q -- tests/programs/list_min/program.cambra --dump-snapshot
 ```
 
-Use this for inspecting the payload or regenerating the frontend's golden test
-fixtures (see the README in the web frontend's `__fixtures__` directory).
-
-A dump is always the whole payload. `scripts/fixtures.manifest` maps each
-committed fixture to the gallery program it is dumped from, and a program whose
-payload is too large to commit is asserted structurally in
-`tests/it/inspector_goldens.rs` instead of being pinned as a document.
+The frontend's tests read this dump of every gallery program. Their setup writes the dumps through
+`write_gallery_snapshots` in `tests/it/inspector_wire.rs` before any test runs.
 
 ## Testing
 
 **Backend (Rust):** `cargo test -p cambra` — the model and provenance substrate
 (`src/inspector_model/`), the JSON shape and server bodies
-(`src/inspector_server/`), and the golden corpus
-(`tests/it/inspector_goldens.rs`).
+(`src/inspector_server/`), and the wire over fresh dumps of the gallery programs
+(`tests/it/inspector_wire.rs`).
 
 **Frontend (TypeScript):** see [`web/README.md`](../web/README.md). In short, from
 `web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`. The source
