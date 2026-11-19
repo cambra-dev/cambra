@@ -1688,9 +1688,25 @@ home, which is the solver that minted it and the variable's slot in that solver'
 run learns is the state at that slot: an inference variable's bounds, trait watches and
 suspensions, a funkind variable's facts, a barrier variable's bounds, and a capability variable's
 capabilities, the edges into it and its upper bounds. A function that records takes `&mut Solver`,
-and so does one that resolves a type or a capability variable, which records as it reads: a
-suspension, a funkind variable's binder ids, a memoized answer. A read that records nothing takes
-`&Solver`.
+and so does one that resolves a type or a capability variable, which can record as it reads: a
+suspension, a funkind variable's binder ids. A read that records nothing takes `&Solver`.
+
+Every write to state a cached answer reads goes through an accessor that moves that state's count
+of facts: a solver variable's `Solver::var_state_mut`, through its sort's `Recorded::note_write`,
+`Solver::funkind_names_mut` for the binder names a funkind variable settles on, and
+`Solver::capability_run_mut` for the run's own record of capabilities (`state::Revisions`). No
+write is counted by a line of its own beside it. No cached answer reads a barrier variable's state,
+so it has no count. A cached answer records the counts of every kind of state it reads and is
+reused only while they stand. A funkind variable's resolution reads funkind state alone
+(`Solver::funkind_revision`), and not its binder names, which only its binder positions and a
+component's names read (`Solver::funkind_names_revision`). A capability variable's reads capability
+state, funkind state, since an edge's filter can hold only while a kind is data, inference state,
+since a bound compares exception and position types, and the run's record of capabilities, among
+them whether the exceptions' types a `try` reads are settled (`Solver::capability_revision`). A
+write to state an answer does not read leaves it standing: a funkind variable's resolution survives
+every capability write. Caches live apart from the facts (`state::Stamped`), in cells read through
+`&Solver`, since storing an answer records nothing, and each is stored at the counts taken before it
+was computed.
 
 Bounds and watches form cycles. A bound names another variable, and a variable watches an obligation
 whose output type names a variable. Each cycle runs through the solver's tables rather than through
@@ -4006,18 +4022,17 @@ Freshening preserves an obligation's operand separately from the watches propaga
 only if the original variable was that operand. Redelivery reads the copied operand's bounds in
 its own frame.
 
-A kind-component walk tracks visited kind identities in a hash set while retaining discovery
-order in its result. Each related kind is tested once per edge rather than against every kind
-already reached.
-The component is cached at the current kind-fact count through weak references. Its binder names
-are cached separately at the name-allocation count, so a new binder is visible without changing
+A kind-component walk tracks visited kind identities in a hash set while retaining discovery order
+in its result. Each related kind is tested once per edge rather than against every kind already
+reached. The component is cached at the current funkind revision through weak references. Its binder
+names are cached separately at the binder-name revision, so a new binder is visible without changing
 a kind edge. A content query that already finds a mapped term name, or whose content reads no
 witness, need not enumerate those binder names.
 
 Witness-position lookups cache the position of each reachable binder, including binders on
 concrete sum bounds and on originals a kind was copied from. Collection preserves the lookup's
-existing depth-first precedence and visits each kind identity once. Both the kind-fact and
-name-allocation counts invalidate the cache, including negative lookups. A freshened kind
+existing depth-first precedence and visits each kind identity once. Both the funkind and
+binder-name revisions invalidate the cache, including negative lookups. A freshened kind
 starts without its original's cache.
 
 ### Implementation limits

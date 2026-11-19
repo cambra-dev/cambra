@@ -756,30 +756,27 @@ pub(crate) struct FunKindState {
     /// a funkind variable is copied by every freshening that reaches it.
     level: Option<crate::ccl::infer_var::Level>,
     bounds: FunKindBounds,
-    /// [`FunKindVar::resolved`]'s answer, with the solver's kind-fact count it was computed
-    /// at: still the answer while no funkind variable has been written since.
-    resolved_at: RefCell<Option<(u64, KindPin)>>,
-    /// [`FunKindVar::component`]'s answer, with the kind-fact count it was computed at. Weak
+    /// [`FunKindVar::resolved`]'s answer, at the funkind revision it was computed at
+    /// ([`Solver::funkind_revision`](crate::ccl::infer::solver::Solver::funkind_revision)).
+    resolved_at: crate::ccl::infer::solver::state::Stamped<u64, KindPin>,
+    /// [`FunKindVar::component`]'s answer, at the funkind revision it was computed at. Weak
     /// references, so a kind does not keep its relations alive through the cache.
-    component_at: RefCell<Option<(u64, Rc<KindComponent>)>>,
-    /// Witness positions in this kind's graph ([`FunKindVar::binder_position`]), with the
-    /// kind-fact and binder-name counts they were computed at.
-    binder_positions_at: RefCell<Option<BinderPositions>>,
-}
-
-/// [`FunKindVar::binder_position`]'s answers, at the counts they were computed at.
-struct BinderPositions {
-    facts: u64,
-    names: u64,
-    positions: std::collections::HashMap<WitnessId, usize>,
+    component_at: crate::ccl::infer::solver::state::Stamped<u64, Rc<KindComponent>>,
+    /// Witness positions in this kind's graph ([`FunKindVar::binder_position`]), at the
+    /// revision of the facts and binder names they read
+    /// ([`Solver::funkind_names_revision`](crate::ccl::infer::solver::Solver::funkind_names_revision)).
+    binder_positions_at: crate::ccl::infer::solver::state::Stamped<
+        (u64, u64),
+        Rc<std::collections::HashMap<WitnessId, usize>>,
+    >,
 }
 
 /// A kind's [`component`](FunKindVar::component): the kinds reached, and their binder names
-/// at the binder-name count they were read at.
+/// at the revision they were read at.
 struct KindComponent {
     ids: std::collections::HashSet<FunKindVarId>,
     kinds: Vec<std::rc::Weak<FunKindVar>>,
-    binders_at: RefCell<Option<(u64, Vec<WitnessId>)>>,
+    binders_at: crate::ccl::infer::solver::state::Stamped<(u64, u64), Vec<WitnessId>>,
 }
 
 impl FunKindState {
@@ -941,15 +938,12 @@ impl FunKindVar {
     ///
     /// The answer is the join over every kind the walk reaches, and a kind it reaches
     /// reaches only kinds this one does, so a reached kind's cached answer stands in for
-    /// walking it. An answer is cached once a whole walk computes it, and is current until
-    /// any kind variable is written ([`Solver::funkind_facts`](crate::ccl::infer::solver::Solver)).
+    /// walking it. An answer is cached once a whole walk computes it, and is current until a
+    /// funkind variable is written ([`Solver::funkind_revision`](crate::ccl::infer::solver::Solver::funkind_revision)).
     pub fn resolved_in(&self, solver: &Solver) -> KindPin {
-        let now = solver.funkind_facts;
+        let now = solver.funkind_revision();
         fn cached(solver: &Solver, v: &FunKindVar, now: u64) -> Option<KindPin> {
-            match &*solver.funkind_state(v).resolved_at.borrow() {
-                Some((at, pin)) if *at == now => Some(pin.clone()),
-                _ => None,
-            }
+            solver.funkind_state(v).resolved_at.at(&now)
         }
         fn go(
             solver: &Solver,
@@ -989,7 +983,10 @@ impl FunKindVar {
             return pin;
         }
         let pin = go(solver, self, now, &mut std::collections::HashSet::new());
-        *solver.funkind_state(self).resolved_at.borrow_mut() = Some((now, pin.clone()));
+        solver
+            .funkind_state(self)
+            .resolved_at
+            .store(now, pin.clone());
         pin
     }
 
@@ -1184,13 +1181,9 @@ impl FunKindVar {
     /// it ([`Self::may_bind`]): its position in the sum binding it, since binders correspond
     /// by position across a kind edge.
     pub fn binder_position(&self, solver: &Solver, w: &WitnessId) -> Option<usize> {
-        let facts = solver.funkind_facts;
-        let names = solver.funkind_names;
-        if let Some(done) = &*solver.funkind_state(self).binder_positions_at.borrow()
-            && done.facts == facts
-            && done.names == names
-        {
-            return done.positions.get(w).copied();
+        let now = solver.funkind_names_revision();
+        if let Some(positions) = solver.funkind_state(self).binder_positions_at.at(&now) {
+            return positions.get(w).copied();
         }
         fn collect(
             solver: &Solver,
@@ -1228,22 +1221,19 @@ impl FunKindVar {
             &mut positions,
         );
         let result = positions.get(w).copied();
-        *solver.funkind_state(self).binder_positions_at.borrow_mut() = Some(BinderPositions {
-            facts,
-            names,
-            positions,
-        });
+        solver
+            .funkind_state(self)
+            .binder_positions_at
+            .store(now, Rc::new(positions));
         result
     }
 
     /// **The kinds whose binders [`Self::binder_position`] can place**, this one included: every
     /// kind reached through kind edges in either direction or through being copied.
     fn component(self: &Rc<Self>, solver: &Solver) -> Rc<KindComponent> {
-        let now = solver.funkind_facts;
-        if let Some((at, component)) = &*solver.funkind_state(self).component_at.borrow()
-            && *at == now
-        {
-            return Rc::clone(component);
+        let now = solver.funkind_revision();
+        if let Some(component) = solver.funkind_state(self).component_at.at(&now) {
+            return component;
         }
         let mut reached: Vec<Rc<FunKindVar>> = vec![Rc::clone(self)];
         let mut seen = std::collections::HashSet::from([self.uid]);
@@ -1270,9 +1260,12 @@ impl FunKindVar {
         let component = Rc::new(KindComponent {
             ids: seen,
             kinds: reached.iter().map(Rc::downgrade).collect(),
-            binders_at: RefCell::new(None),
+            binders_at: Default::default(),
         });
-        *solver.funkind_state(self).component_at.borrow_mut() = Some((now, Rc::clone(&component)));
+        solver
+            .funkind_state(self)
+            .component_at
+            .store(now, Rc::clone(&component));
         component
     }
 
@@ -1284,11 +1277,9 @@ impl FunKindVar {
     /// Every binder name minted so far by a kind in this one's [`component`](Self::component).
     pub fn component_binder_ids(self: &Rc<Self>, solver: &Solver) -> Vec<WitnessId> {
         let component = self.component(solver);
-        let now = solver.funkind_names;
-        if let Some((at, ids)) = &*component.binders_at.borrow()
-            && *at == now
-        {
-            return ids.clone();
+        let now = solver.funkind_names_revision();
+        if let Some(ids) = component.binders_at.at(&now) {
+            return ids;
         }
         let ids: Vec<_> = component
             .kinds
@@ -1296,7 +1287,7 @@ impl FunKindVar {
             .filter_map(std::rc::Weak::upgrade)
             .flat_map(|k| k.named_binder_ids(solver))
             .collect();
-        *component.binders_at.borrow_mut() = Some((now, ids.clone()));
+        component.binders_at.store(now, ids.clone());
         ids
     }
 
