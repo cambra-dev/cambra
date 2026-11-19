@@ -236,7 +236,7 @@ decided, the one built-in rule is that the last branch in the table cannot be de
 > `a_lagging_branch_does_not_make_a_reload_fold_twice`,
 > `a_lagging_branch_does_not_make_a_new_branch_fold_twice`,
 > `a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it`,
-> `a_reload_over_an_iteration_a_lagging_branch_reads_is_refused` and
+> `a_reload_over_an_iteration_a_lagging_branch_reads_resumes_where_it_stopped` and
 > `the_driver_pulls_every_branch_and_exits_when_all_have_finished`.
 
 **A branch's entry is its branch origin, its version number, its version, and the operators it
@@ -345,10 +345,10 @@ holds stay alive, because that branch holds them, and it goes on running them. A
 reload diffs against its own version, so a parent's reload never has to be followed by one.
 
 **A held operator must be run, not only held.** A held fragment nothing pulls stops releasing, so
-the `released_position` of every fan-out it reads stops rising, per [Guards intersect at a
-fan-out](#guards-intersect-at-a-fan-out). A reload that keeps such a fan-out as an iteration input
-is refused, per [Routes across branches](#routes-across-branches). A branch's outputs stay
-subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
+every fan-out it reads stops reclaiming, per [Guards intersect at a
+fan-out](#guards-intersect-at-a-fan-out). It does not move where another branch's rebuilt reader
+starts, per [Where a rebuilt reader picks up](#where-a-rebuilt-reader-picks-up). A branch's outputs
+stay subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
 `main` output (`LiveProgram::pull_mains`). It prints `main`'s value as `Got value: …` and every
 other branch's as `Got value from <branch>: …`, so a branch created under the name `main` after the
 first one is deleted prints unlabelled. A version whose `main` output has finished is no longer
@@ -403,8 +403,11 @@ predecessor's producers' releases, and the source's own agreement goes on govern
 A predecessor with no producer on a source records the agreement there. Every branch reading a
 source reads it through its own producer, and at the source no producer's progress moves where
 another branch's new producers start (`a_lagging_branch_does_not_make_a_reload_fold_twice`,
-`a_lagging_branch_does_not_make_a_new_branch_fold_twice`). A fan-out two branches share does not
-keep that separation, per the note below.
+`a_lagging_branch_does_not_make_a_new_branch_fold_twice`). A fan-out two branches share keeps the
+same separation: a rebuilt reader starts at the slot of the reader it replaces, per [Where a
+rebuilt reader picks up](#where-a-rebuilt-reader-picks-up), so another branch's lagging slot holds
+back what the fan-out reclaims and not where the reader starts
+(`a_reload_over_an_iteration_a_lagging_branch_reads_resumes_where_it_stopped`).
 
 **A branch's producers are the ones its version's compile registered and the ones under the
 operators it holds.** A producer registers with a source from `IterateExtent::subscribe`, which
@@ -416,20 +419,6 @@ outputs' producers. The carry runs before the reloaded branch's teardown, becaus
 its outputs' producers, and a producer's release record dies with the producer. A producer that
 registers outside every frame, which only a subscription made outside a compile does, is attributed
 to no branch.
-
-> **Open: a rebuilt reader resumes from the intersection over every slot.** A reader rebuilt behind
-> a kept fan-out starts at `FanOutShared::released`, the intersection over every live slot, not at
-> the slot of the reader it replaces, so any lagging slot holds it down. A rebuilt store over a kept
-> iteration resumes one past `FanOut::released_position`, read off the same intersection, and folds
-> the positions between a second time. `tests/it/hot_reload/fanout_lag.rs` pins the form of this one
-> version reaches on its own. Branch-and-reload reaches it a second way: within one version an
-> iteration input has one reader, and a branch that keeps the iteration and rebuilds the store adds
-> a second slot. `LiveProgram::check` refuses a reload or a creation that keeps an iteration whose
-> live slots disagree (`OperatorMap::disagreeing_kept_iterations`,
-> `a_reload_over_an_iteration_a_lagging_branch_reads_is_refused`), whether or not the store over it
-> is rebuilt, because that is decided at conversion, after the teardown. The fix that covers both
-> forms is per reader: snapshot each slot's guard before teardown, and resume a rebuilt reader from
-> the slot of the reader it replaces.
 
 **Every branch pins retention for every other.** A source keeps an element until every branch's
 producer releases it, so a slow branch holds memory for all of them, until it is reloaded or
@@ -484,10 +473,12 @@ changed](#a-binding-whose-operator-is-spent-is-rebuilt-not-changed)).
 
 An operator with no correspondent is built and subscribed like any other. Subscribing is how it
 learns where it is: a new subscriber's guard starts at what its input has already released, so it
-claims neither data that is gone nor data nobody has finished with. A `FanOut` seeds that guard from
-what it has released upstream, and a source seeds a newly registered producer the same way
-(`ProducerReleases`, `carry_release_to_new_producers`). This asks one thing of every producer: that
-it release what it has finished, and only that.
+claims neither data that is gone nor data nobody has finished with. A `FanOut` seeds a subscriber
+that replaces a reader from that reader's slot, and any other from what it has released upstream,
+per [Where a rebuilt reader picks up](#where-a-rebuilt-reader-picks-up). A source seeds a newly
+registered producer from its predecessor's producers (`ProducerReleases`,
+`carry_release_to_new_producers`). This asks one thing of every producer: that it release what it
+has finished, and only that.
 
 A loop driver has finished a row its source's filter removed once it reads past it, so it releases
 that row too (`test_filtered_rows_of_a_live_transaction_source_are_released`). Under an induction
@@ -510,9 +501,10 @@ Two things a subscription cannot supply are computed and handed to the operator 
   fan-out at handover, `Offer::mutable_state` carries it, and a rebuilt store seeds from it
   under the variable's `VarPath`.
 - **The position a rebuilt recurrence starts at.** It is derived from the input rather than carried,
-  but a store and a drive are told it at construction: one past `FanOut::released_position` for an
-  iteration the reload kept, `first_position_for_a_new_producer` for one built fresh over a source,
-  and `0` for one over a collection.
+  but a store and a drive are told it at construction: one past the position its predecessor's slot
+  released (`FanOut::released_position_of`) for an iteration the reload kept,
+  `first_position_for_a_new_producer` for one built fresh over a source, and `0` for one over a
+  collection.
 
 [Where a rebuilt store picks up](#where-a-rebuilt-store-picks-up) is both of those in full.
 
@@ -624,7 +616,7 @@ fold its whole input on top of the value it carries: the doubling
 `a_loop_added_over_a_folded_collection_reads_it_whole` pins.
 
 An iteration input is reused for the position it reached, not for what it supplies, and
-`FanOut::released_position` reports that from a spent operator as from a live one. So
+`FanOut::released_position_of` reports that from a spent operator as from a live one. So
 `iteration_input` looks the correspondence up through `OpConversionContext::correspondent` and takes
 a released-in-full operator. Keeping it says the fold is finished. Building a fresh one would offer
 every position of the collection again and fold the whole list onto the carried value
@@ -693,16 +685,59 @@ A reload reads two derived facts off a fan-out:
 - **`released_in_full`**: every subscriber has released everything, so the operator can only answer
   empty and a `Memo` input drops what it holds. A binding standing behind one hands its readers
   nothing.
-- **`released_position`**: the highest position the releases have named, kept beside the guard, and
-  only rising. A consumer that finishes an iteration releases the whole domain, and a universal
-  guard names no position. Without the watermark a fold that ran to the end of its list would read
-  as one that had released nothing, and its replacement would decide every position again
-  (`a_fold_over_a_fixed_collection_resumes_where_it_stopped`).
+- **`released_position_of`**: the last position one reader's slot released as a prefix, kept beside
+  its guard, and only rising. A consumer that finishes an iteration releases the whole domain, and a
+  universal guard names no position. Without the position a fold that ran to the end of its list
+  would read as one that had released nothing, and its replacement would decide every position
+  again (`a_fold_over_a_fixed_collection_resumes_where_it_stopped`).
+
+### Where a rebuilt reader picks up
+
+**A reader a reload rebuilds starts at the release of the reader it replaces, read off that
+reader's own fan-out slot.** A slot is keyed by the reader that minted it: the node of the term
+whose conversion minted it, and an ordinal for a term that mints several slots of one fan-out
+(`SlotReader`). A slot minted for a term whose correspondent read the fan-out starts at that
+correspondent's slot's guard (`FanOut::slot_read_by`). A slot minted for a term with no
+correspondent starts at the intersection. The intersection over every slot
+(`FanOutShared::released`) decides what the input reclaims and nothing else, so a sibling that
+lags, in this version or in another branch, does not move where a rebuilt reader starts
+(`two_rebuilt_readers_each_start_at_their_own_predecessors_release`,
+`a_reload_over_an_iteration_a_lagging_branch_reads_resumes_where_it_stopped`).
+
+**The release a reader starts at is exact.** A predecessor that released positions 0 and 2 and not
+1 hands its successor `{0, 2}`, and the successor reads 1
+(`a_release_with_holes_is_carried_exactly`).
+The two store reads that emit a stream, `StoreDenseRead` and `StoreValueStream`, start their own
+release record there too, because the store answers its whole state on every pull and the read
+filters by its own record (`a_feed_read_by_a_sibling_that_takes_nothing_resumes_after_the_cut`,
+`a_feed_reloaded_twice_resumes_after_each_cut`). A read of a settled value, `StoreFinalRead`,
+starts empty: each version's output takes the value once. A reader that drops what a release covers
+by position asserts that the release is a prefix (`released_prefix`), and every other reader keeps
+its exact release. `RekeySorted` releases the positions of exactly the keys its consumer released,
+above a gap as well, so the slot under a reply tap holds what the tap has finished with.
+
+**A retired slot holds reclamation back until the handover settles.** `FanOut::reopen` moves each
+dead slot that served a reader into the fan-out's retired record, which the reclamation intersection
+counts until `OpConversionContext::take_operator_map`, after every replacement has subscribed
+(`FanOut::settle_handover`, `retired_slots_hold_reclamation_back_until_the_handover_settles`). A
+replacement's guard covers what the fan-out reclaimed, which subscribing asserts.
+
+**A kept reader answers to the new version's nodes.** A reader inside a region a version keeps keeps
+its slot, and the version after names it by the keeping version's nodes. `keep_region` adds those
+nodes to the slot's readers and keeps the earlier ones, for a branch that shares the reader
+(`FanOut::alias_readers`, `a_slot_answers_to_the_nodes_its_reader_is_renamed_to`).
+
+**A recurrence resumes past its predecessor's position.** Each slot keeps the last position its
+releases named as a prefix, accumulated or as given. A release of keys absent above the drive's
+cursor is no prefix and leaves it (`a_slots_position_rises_only_on_a_prefix`). `iteration_input`
+resumes a rebuilt store one past the position of the slot its predecessor's drive read. A drive
+whose predecessor released its source whole reads the source as complete and pulls nothing.
 
 ### A drive runs one position behind its decision
 
 A drive holds the input it reads one position back through, so the release runs one position behind
-the decision, and a store resuming over a kept iteration starts one past `released_position`.
+the decision, and a store resuming over a kept iteration starts one past the position its
+predecessor's slot released (`FanOut::released_position_of`).
 `InductionDriver` asserts that a decision cannot precede the input it decides.
 
 Two cursors say where a resuming drive is, and neither is recoverable from the window.
@@ -973,14 +1008,14 @@ survive. The scope a site states is what is left, the calls and bindings around 
 walk (`state_identities`) assigns identity for both the guard and conversion to read.
 
 **The position** travels with the kept iteration operator and is not carried. A rebuilt store
-resumes one position past what its iteration operator has released (`FanOut::released_position`),
-which is where the retired recurrence had reached, per [A drive runs one position behind its
-decision](#a-drive-runs-one-position-behind-its-decision). The store's seed tick
-(`CommitEngine::seeded_at`) and the drive's cursors both come from that one number. A variable whose
-new version reads a different iteration seeds its value and takes that iteration's position. That is
-a variable moving between loops, or a program moving to another port: the positions it is about to
-decide belong to something its predecessor never read, so none is decided twice and none is skipped,
-while the value goes on.
+resumes one position past what its predecessor's slot of the iteration operator released
+(`FanOut::released_position_of`), which is where the retired recurrence had reached, per [A drive
+runs one position behind its decision](#a-drive-runs-one-position-behind-its-decision). The store's
+seed tick (`CommitEngine::seeded_at`) and the drive's cursors both come from that one number. A
+variable whose new version reads a different iteration seeds its value and takes that iteration's
+position. That is a variable moving between loops, or a program moving to another port: the
+positions it is about to decide belong to something its predecessor never read, so none is decided
+twice and none is skipped, while the value goes on.
 
 **Starting again is not starting at `0`.** A loop's iteration built fresh over a source starts at
 `first_position_for_a_new_producer`: `0` for a source nothing has read, and the released frontier
@@ -1105,9 +1140,9 @@ Where each part of a program stands after a swap:
 | Part of the program | Where it starts | Mechanism |
 | --- | --- | --- |
 | An operator the new version also has | Where it already was; nothing is replaced | Node correspondence, one more `FanOut` slot |
-| A rebuilt map or feed over a kept operator | What that operator has released | A new subscriber's guard starts there |
+| A rebuilt map or feed over a kept operator | What the reader it replaces released | Its slot starts at that reader's slot (`FanOut::slot_read_by`) |
 | A rebuilt map or feed over a source | What the predecessor's producers on that source released | `carry_release_to_new_producers` |
-| A rebuilt recurrence over a kept iteration | One past what that iteration's readers released | `FanOut::released_position` |
+| A rebuilt recurrence over a kept iteration | One past what its predecessor's drive released | `FanOut::released_position_of` |
 | A rebuilt recurrence over a rebuilt iteration | Where that iteration begins: a source's carried release, or `0` for a collection | `first_position_for_a_new_producer` |
 | A transaction writer's drive | Its writer's iteration input where the reload kept it, and `0` over a rebuilt one | Absolute item positions, released on the commit-ack |
 | A rebuilt store's commit tick | `0`, seeded from the carried value | Private and restartable |

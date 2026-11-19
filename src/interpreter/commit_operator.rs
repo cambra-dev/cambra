@@ -1644,73 +1644,25 @@ pub fn store_current(tile: &Tile, key: &Value) -> Option<(Position, Value)> {
     store_value_at(tile, &f, key).map(|v| (f, v))
 }
 
-/// A compacting prefix watermark over a monotone domain.
+/// The prefix `released`, a release of a domain whose consumer releases it in order, covers:
+/// nothing, every position through one, or the whole domain.
 ///
-/// Several commit-store readers/producers emit an append-only stream and, as a
-/// consumer releases a prefix, must stop re-emitting positions at or below the
-/// released edge (a re-emit would duplicate a domain position through a `Memo`
-/// merge). Each one otherwise hand-rolls the same watermark plus the monotone-max
-/// fold and the "≤ watermark" test; this centralizes that state and those two
-/// operations. The callers keep whatever *extra* work rides their release
-/// (forwarding the release upstream) — only the watermark itself lives here.
-#[derive(Default)]
-struct PrefixReleaseCursor {
-    /// What has been released: nothing, a prefix through a position, or the whole
-    /// domain. A domain has no greatest position to stand for "all" — a `UInt`
-    /// clock has `usize::MAX` but a pair domain has none — so the terminal release
-    /// is its own case rather than a saturating watermark.
-    through: ReleasedExtent,
-}
-
-impl PrefixReleaseCursor {
-    /// Advance the watermark to at least `pos` (monotone: never retreats).
-    fn advance_to(&mut self, pos: Position) {
-        self.through = match std::mem::replace(&mut self.through, ReleasedExtent::Nothing) {
-            ReleasedExtent::All => ReleasedExtent::All,
-            ReleasedExtent::Through(r) => ReleasedExtent::Through(r.max(pos)),
-            ReleasedExtent::Nothing => ReleasedExtent::Through(pos),
-        };
-    }
-
-    /// Mark the entire domain released — the terminal (`True`) release, after
-    /// which no position may re-emit.
-    fn release_all(&mut self) {
-        self.through = ReleasedExtent::All;
-    }
-
-    /// Whether `pos` is at or below the released watermark.
-    fn is_released(&self, pos: &Position) -> bool {
-        match &self.through {
-            ReleasedExtent::All => true,
-            ReleasedExtent::Through(r) => pos <= r,
-            ReleasedExtent::Nothing => false,
-        }
-    }
-
-    /// Advance the watermark from a released domain predicate, centralizing the
-    /// one decision every commit-store reader shares. A fully-decided (`True`)
-    /// release covers the whole domain — `release_all`, since no finite tick
-    /// bounds it and a bare `max_released_position` of `None` there would be misread
-    /// as "release nothing". A bounded release advances to its max released tick.
-    /// Anything else releases no prefix. Returns the extent so the caller can do
-    /// its own release-driven work (forward the release upstream, compact a
-    /// latched set) without re-deriving this classification — the gap that let one
-    /// reader silently drop the terminal case while the other handled it.
-    fn advance_from(&mut self, pred: &Predicate) -> ReleasedExtent {
-        if pred.as_bool() == Some(true) {
-            self.release_all();
-            ReleasedExtent::All
-        } else if let Some(w) = pred.max_released_position() {
-            self.advance_to(w.clone());
-            ReleasedExtent::Through(w)
-        } else {
-            ReleasedExtent::Nothing
-        }
+/// # Panics
+///
+/// Where `released` is not a prefix of the domain ([`Predicate::as_prefix_in`]): a reader that
+/// drops what such a release covers by position would otherwise drop positions below it that
+/// its consumer has not taken. A reader that cannot rely on the order keeps its exact release
+/// ([`TileGuard::whole_keys`]).
+fn released_prefix(released: &Predicate) -> ReleasedExtent {
+    match released.as_prefix_in(None) {
+        Some(crate::interpreter::Prefix::Nothing) => ReleasedExtent::Nothing,
+        Some(crate::interpreter::Prefix::Through(position)) => ReleasedExtent::Through(position),
+        Some(crate::interpreter::Prefix::All) => ReleasedExtent::All,
+        None => panic!("a prefix-releasing consumer releases a prefix of its domain: {released:?}"),
     }
 }
 
-/// The prefix a domain-predicate release covers, as classified by
-/// [`PrefixReleaseCursor::advance_from`]: nothing, a bounded prefix `≤ tick`, or
+/// The prefix a release covers ([`released_prefix`]): nothing, a bounded prefix `≤ tick`, or
 /// the whole (terminal) domain.
 #[derive(Default)]
 enum ReleasedExtent {
@@ -3587,9 +3539,20 @@ pub struct StoreValueStream {
     /// so two writers' taps to one defer don't smear each other's values across
     /// the shared commit clock.
     carry_forward: bool,
+    /// What the stream this one replaces had released, which this one starts at
+    /// ([`resuming`](Self::resuming)).
+    resumed: Option<TileGuard>,
 }
 
 impl StoreValueStream {
+    /// This stream, starting at `released`, what the stream it replaces across a reload had
+    /// released: it emits none of those ticks again. The stream forwards its releases to the
+    /// store's slot unchanged, so the slot's release is in this stream's coordinates.
+    pub fn resuming(mut self, released: Option<TileGuard>) -> Self {
+        self.resumed = released;
+        self
+    }
+
     pub fn new(
         store_op: Box<dyn TileOperator>,
         key: Value,
@@ -3610,6 +3573,7 @@ impl StoreValueStream {
             key,
             value_extent,
             carry_forward,
+            resumed: None,
         }
     }
 }
@@ -3638,19 +3602,26 @@ impl TileOperator for StoreValueStream {
         // decided names the stream's keys as it is.
         let store_producer =
             subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, scheduler);
+        let mut base = ProducerBase::new(
+            StoreValueStreamProducer::alloc_id(),
+            self.tiling(),
+            &self.base,
+            scheduler,
+        )
+        .sharing(gate);
+        if let Some(released) = &self.resumed {
+            debug_assert!(
+                released.check_from(self.tiling()),
+                "a replaced stream's release is a guard of this stream's output: {released:?}"
+            );
+            base.obsolete_guard = released.clone();
+        }
         Box::new(StoreValueStreamProducer {
-            base: ProducerBase::new(
-                StoreValueStreamProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base,
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
             carry_forward: self.carry_forward,
-            release_cursor: PrefixReleaseCursor::default(),
         })
     }
 }
@@ -3664,16 +3635,6 @@ struct StoreValueStreamProducer {
     /// across ticks that don't write the key) vs. reply tap (emit only at the
     /// tick that wrote it).
     carry_forward: bool,
-    /// Highest commit tick a consumer has released. The store's commit log only
-    /// grows, so `get` emits each tick exactly once: only ticks beyond this
-    /// cursor. A re-reading consumer that never releases leaves it empty and sees
-    /// the full projection every pull (and must *replace*, not merge); an
-    /// accumulating consumer (`Memo`, the reply-tap path) releases what it has
-    /// merged, so the next pull is the delta — without this, re-emitting merged
-    /// ticks would double them in the consumer's cache. (A `True`/terminal release
-    /// is "all ticks released", not "no tick" — see [`PrefixReleaseCursor::
-    /// advance_from`]; missing that was the reply-tap duplication bug.)
-    release_cursor: PrefixReleaseCursor,
 }
 
 impl TileProducer for StoreValueStreamProducer {
@@ -3764,8 +3725,13 @@ impl TileProducer for StoreValueStreamProducer {
         );
         let mut ticks: Vec<Value> = Vec::with_capacity(all_ticks.len());
         let mut values: Vec<Value> = Vec::with_capacity(all_ticks.len());
+        // The store's commit log only grows, so `get` emits each tick once: a consumer that
+        // merges what it reads (`Memo`, the reply-tap path) releases it, and the next pull is
+        // the rest. The release is exact, so a tick below a released one that the consumer
+        // has not taken stays.
+        let released = self.obsolete_guard().whole_keys();
         for (tick, v) in all_ticks.iter().zip(folded) {
-            if self.release_cursor.is_released(tick) {
+            if released.contains(tick.value()) {
                 continue;
             }
             if let Some(v) = v {
@@ -3783,28 +3749,14 @@ impl TileProducer for StoreValueStreamProducer {
         out
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Advance the emit cursor past every released commit tick (so we don't
-        // re-emit a merged prefix — a re-fold that unions this tap at a later
-        // frontier would otherwise duplicate a position through the `Memo` merge)
-        // AND forward that prefix upstream to the store: a consumer that merged
-        // commits `≤ max_tick` no longer needs them, so this read slot releases
-        // them. The store reclaims a version only once *every* slot (this reader,
-        // the writers) has released it — the cyclic `FanOut` intersects — so
-        // forwarding here is safe and is what lets a long-lived collection log shed
-        // its merged prefix. A terminal (`True`) release covers the whole
-        // changelog.
-        if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard {
-            let forward = match self.release_cursor.advance_from(pred) {
-                ReleasedExtent::Nothing => None,
-                ReleasedExtent::Through(max_tick) => {
-                    Some(Predicate::at_or_below(max_tick.into_value()))
-                }
-                ReleasedExtent::All => Some(Predicate::True),
-            };
-            if let Some(pred) = forward {
-                self.store_producer
-                    .release(TileGuard::Function(FunctionGuard::Domain(pred)));
-            }
+        // The ticks a consumer merged are this read's no longer, so they go upstream exactly
+        // as released: the store reclaims a version only once every slot (this reader, the
+        // writers) has released it, since the cyclic `FanOut` intersects, and reclaims only
+        // the run of ticks the intersection covers from the start
+        // (`CommitProducer::release_impl`). Widening a release to its last tick would hand
+        // the store ticks below it this read has not taken.
+        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard {
+            self.store_producer.release(obsolete_guard);
         }
     }
 }
@@ -4110,9 +4062,20 @@ pub struct StoreDenseRead {
     /// the levels above the store are counted, because the read's tiling carries the
     /// position level beneath them too — so this is not its innermost level.
     level: Option<CurryLevel>,
+    /// What the read this one replaces had released, which this one starts at
+    /// ([`resuming`](Self::resuming)).
+    resumed: Option<TileGuard>,
 }
 
 impl StoreDenseRead {
+    /// This read, starting at `released`, what the read it replaces across a reload had
+    /// released: it emits none of those positions again. The read forwards its releases to
+    /// the store's slot unchanged, so the slot's release is in this read's coordinates.
+    pub fn resuming(mut self, released: Option<TileGuard>) -> Self {
+        self.resumed = released;
+        self
+    }
+
     pub fn new(
         store_op: Box<dyn TileOperator>,
         key: Value,
@@ -4156,6 +4119,7 @@ impl StoreDenseRead {
             domain,
             enclosing,
             level,
+            resumed: None,
         }
     }
 }
@@ -4178,14 +4142,22 @@ impl TileOperator for StoreDenseRead {
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
         let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
+        let mut base = ProducerBase::new(
+            StoreDenseReadProducer::alloc_id(),
+            self.tiling(),
+            &self.base,
+            scheduler,
+        )
+        .sharing(gate);
+        if let Some(released) = &self.resumed {
+            debug_assert!(
+                released.check_from(self.tiling()),
+                "a replaced dense read's release is a guard of this read's output: {released:?}"
+            );
+            base.obsolete_guard = released.clone();
+        }
         Box::new(StoreDenseReadProducer {
-            base: ProducerBase::new(
-                StoreDenseReadProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base,
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -4193,7 +4165,6 @@ impl TileOperator for StoreDenseRead {
             domain: self.domain.clone(),
             enclosing: self.enclosing.clone(),
             level: self.level,
-            release_cursor: PrefixReleaseCursor::default(),
         })
     }
 }
@@ -4210,11 +4181,6 @@ struct StoreDenseReadProducer {
     enclosing: Vec<Extent>,
     /// The level of histories this read rebuilds — see [`StoreDenseRead::level`].
     level: Option<CurryLevel>,
-    /// Positions a consumer has released. The store holds its domain until *every* one
-    /// of its readers has released a position, so dropping this reader's own released
-    /// prefix is this reader's business — the same rule [`StoreValueStream`] follows on
-    /// the commit clock.
-    release_cursor: PrefixReleaseCursor,
 }
 
 impl StoreDenseReadProducer {
@@ -4421,13 +4387,15 @@ impl TileProducer for StoreDenseReadProducer {
             !self.carry_forward || folded.iter().all(Option::is_some),
             "the store's seed gives every accumulator a value, so the carry fold always resolves"
         );
-        // The released prefix is folded, so a carry is built across it, and dropped
-        // here: a consumer that has taken a position must not be handed it again, and
-        // the store keeps the position until *every* reader has released it.
+        // The released positions are folded, so a carry is built across them, and dropped
+        // here: a consumer that has taken a position must not be handed it again, and the
+        // store keeps the position until *every* reader has released it. The release is
+        // exact, so a position below a released one that the consumer has not taken stays.
+        let released = self.obsolete_guard().whole_keys();
         let mut kept: Vec<Position> = Vec::with_capacity(sorted.len());
         let mut values: Vec<Value> = Vec::with_capacity(sorted.len());
         for (p, v) in sorted.iter().zip(folded) {
-            if self.release_cursor.is_released(p) {
+            if released.contains(p.value()) {
                 continue;
             }
             if let Some(v) = v {
@@ -4471,13 +4439,8 @@ impl TileProducer for StoreDenseReadProducer {
         // its own to compute. Under rows the guard names rows, which the induction store has too
         // — a row released whole leaves its engine tree and its render together
         // ([`Engines::remove_covered`]), so the arm means there what it means here.
-        if self.enclosing.is_empty()
-            && let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard
-        {
-            // With no rows the released positions come off the render through this
-            // cursor; under rows `remove_guarded` takes the whole region at once.
-            self.release_cursor.advance_from(pred);
-        }
+        // The released positions come off the render through the accumulated release
+        // ([`TileGuard::whole_keys`]); under rows `remove_guarded` takes the whole region at once.
         self.store_producer.release(obsolete_guard);
     }
 }
@@ -4582,11 +4545,6 @@ struct DriverWindow {
     /// A window with no rows above its positions has the one group of inner rows under no
     /// outer row.
     groups: Vec<DriverGroup>,
-    /// Highest absolute position a consumer has released. The body fans this
-    /// input through a `Memo` that pulls it several times per round, so an
-    /// already-released position must not re-emit — that would duplicate a
-    /// domain position in the `Memo`'s append-merge.
-    release_cursor: PrefixReleaseCursor,
 }
 
 impl DriverWindow {
@@ -4635,7 +4593,6 @@ impl DriverWindow {
             attempts: 0,
             highest_pushed: None,
             groups: Vec::new(),
-            release_cursor: PrefixReleaseCursor::default(),
         }
     }
 
@@ -4744,7 +4701,10 @@ impl DriverWindow {
     /// commit-ack — reads the classification rather than re-deriving it. A driver that
     /// only reclaims uses [`reclaim`](Self::reclaim), which needs no cursor.
     fn acknowledge(&mut self, pred: &Predicate) -> ReleasedExtent {
-        let extent = self.release_cursor.advance_from(pred);
+        // The body fans this input through a `Memo` that pulls it several times per round, so a
+        // released position must not re-emit, which would duplicate a domain position in the
+        // `Memo`'s append-merge: the rows it covers leave the window here.
+        let extent = released_prefix(pred);
         // Only a window with no rows above its positions acknowledges, so its inner rows are
         // the one group's.
         debug_assert!(
@@ -5219,7 +5179,7 @@ impl InductionDriver {
             store_op,
             // **No [`Memo`] over the source.** This drive's release to it is its progress
             // record — `reclaim_consumed` reclaims the prefix it has emitted, and
-            // [`FanOut::released_position`] reads that back to place a replacement drive
+            // [`FanOut::released_position_of`] reads that back to place a replacement drive
             // across a reload. A `Memo` releases what it has *cached* rather than what its
             // consumer has finished with, so one here reports the whole source consumed on
             // the first pull and the replacement starts past the end.
@@ -6494,8 +6454,11 @@ impl TileProducer for TransactDriverProducer {
         }
         // The source is *complete* only when its tile is terminal. A batch source
         // (a list) is terminal on the first pull; a live source (an HTTP request
-        // stream) never is, so a momentarily drained one must not read as done.
-        let source_complete = self.source.terminal;
+        // stream) never is, so a momentarily drained one must not read as done. A source
+        // released whole is complete for this drive as well: a drive that replaces one that
+        // finished starts at its release, promises to read nothing more, and pulls nothing.
+        let source_complete =
+            self.source.terminal || self.source_producer.obsolete_guard().is_universal();
         // Positioned, so an item is named by where it sits in the source's own
         // domain rather than by where it sits in the columns still on offer. The
         // lowest position above the cursor is the next item: the cursor is
@@ -8554,6 +8517,55 @@ mod tests {
         }
     }
 
+    /// A dense reader's release is exact: releasing position 2 alone leaves positions 0, 1 and
+    /// 3 to emit, and a reader started at a predecessor's `{0, 2}` emits positions 1 and 3.
+    #[test]
+    fn a_dense_reader_drops_exactly_the_positions_it_released() {
+        let points = |at: &[u64]| {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::union_all(
+                at.iter()
+                    .map(|&p| Predicate::point(Value::UInt(p)))
+                    .collect(),
+            )))
+        };
+        let positions = |tile: Tile| -> Vec<u64> {
+            let Tile::DataFunction { domain, .. } = tile else {
+                panic!("dense read is a Function");
+            };
+            (0..domain.len())
+                .map(|i| match domain.index_at(i) {
+                    Value::UInt(p) => p,
+                    other => panic!("a position, got {other:?}"),
+                })
+                .collect()
+        };
+        let mut sched = Scheduler::new();
+
+        let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
+        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
+        let guard = reader.tiling().universal_guard();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
+        assert_eq!(
+            positions(pull_to_terminal(&mut sched, &mut producer)),
+            vec![0, 1, 2, 3]
+        );
+        producer.release(points(&[2]));
+        assert_eq!(
+            positions(pull_to_terminal(&mut sched, &mut producer)),
+            vec![0, 1, 3]
+        );
+
+        let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
+        let mut resumed = StoreDenseRead::new(fan.slot(), acc, value_extent(), true)
+            .resuming(Some(points(&[0, 2])));
+        let guard = resumed.tiling().universal_guard();
+        let mut producer = resumed.subscribe(guard, Box::new(|| {}), &mut sched);
+        assert_eq!(
+            positions(pull_to_terminal(&mut sched, &mut producer)),
+            vec![1, 3]
+        );
+    }
+
     /// Records the domain-release watermarks a producer receives — lets a test
     /// observe what `StoreDenseRead` forwards to the store *without* a second
     /// FanOut slot (which would perturb GC via the release intersection).
@@ -10237,6 +10249,69 @@ mod tests {
             honoring_release(&self.tile, self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A value stream's release is exact, and goes upstream as released: releasing tick 1 alone
+    /// leaves ticks 0 and 2 to emit and releases tick 1 to the store, and a stream started at a
+    /// predecessor's `{0}` emits ticks 1 and 2.
+    #[test]
+    fn a_value_stream_drops_and_forwards_exactly_the_ticks_it_released() {
+        let value_ext = Extent::Base(BaseType::Int);
+        let acc = acct("acc");
+        let mut engine = CommitEngine::new(HashMap::from([(acc.clone(), int(100))]));
+        for value in [60, 30] {
+            let snapshot = engine.watermark().clone();
+            engine.attempt(Proposal {
+                snapshot,
+                reads: HashMap::new(),
+                writes: HashMap::from([(acc.clone(), int(value))]),
+            });
+        }
+        let store_tiling = store_tiling(&["acc"]);
+        let store_tile = engine.render_full_store_tile(&store_tiling);
+        let ticks = |p: &mut Box<dyn TileProducer>| -> Vec<Value> {
+            let Tile::DataFunction { domain, .. } = p.get(p.tiling().universal_guard()) else {
+                panic!("expected a value stream")
+            };
+            (0..domain.len()).map(|i| domain.index_at(i)).collect()
+        };
+        let points = |at: &[u64]| {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::union_all(
+                at.iter()
+                    .map(|&t| Predicate::point(Value::UInt(t)))
+                    .collect(),
+            )))
+        };
+
+        let (spy, _, released) =
+            crate::interpreter::tile_operators::test_helpers::ProjectionSpyOp::new(
+                store_tile.clone(),
+                store_tiling.clone(),
+            );
+        let mut stream = StoreValueStream::new(Box::new(spy), acc.clone(), value_ext.clone(), true);
+        let g = stream.tiling().universal_guard();
+        let mut p = stream.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        assert_eq!(
+            ticks(&mut p),
+            vec![Value::UInt(0), Value::UInt(1), Value::UInt(2)]
+        );
+        p.release(points(&[1]));
+        assert_eq!(ticks(&mut p), vec![Value::UInt(0), Value::UInt(2)]);
+        assert_eq!(*released.borrow(), vec![points(&[1])]);
+
+        let mut resumed = StoreValueStream::new(
+            Box::new(FixedSource {
+                tiling: store_tiling,
+                tile: store_tile,
+            }),
+            acc,
+            value_ext,
+            true,
+        )
+        .resuming(Some(points(&[0])));
+        let g = resumed.tiling().universal_guard();
+        let mut p = resumed.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        assert_eq!(ticks(&mut p), vec![Value::UInt(1), Value::UInt(2)]);
     }
 
     /// `StoreValueStream` projects the store's history to `key`'s commit-value

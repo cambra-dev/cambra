@@ -63,7 +63,7 @@ use crate::chl_parser::SourceMap;
 use crate::control_port::phase_spelling;
 use crate::interpreter::{
     Consumer, Value,
-    operator_conversion::{OperatorMap, ReuseTally, StateConflict, UnreadablePrefix, VarPath},
+    operator_conversion::{OperatorMap, ReuseTally, StateConflict, UnreadableInput, VarPath},
     tile_operators::{FanOut, TileProducer},
 };
 
@@ -327,7 +327,7 @@ pub struct ReloadReport {
     /// read. Empty for a reload that adds no loop over a consumed input, which
     /// is every reload of a program whose collections are built rather than
     /// read.
-    pub unreadable: Vec<UnreadablePrefix>,
+    pub unreadable: Vec<UnreadableInput>,
 }
 
 /// What one accepted [`LiveProgram::create_branch`] did.
@@ -351,7 +351,7 @@ pub struct DiffReport {
     pub diff: String,
     /// The loops the new version adds that would begin above the beginning of
     /// what they read.
-    pub unreadable: Vec<UnreadablePrefix>,
+    pub unreadable: Vec<UnreadableInput>,
 }
 
 /// What a difference reads as where there is none.
@@ -373,7 +373,7 @@ fn phase_label(phase: Phase) -> String {
 /// raised it before a swap or `/reload` reported it after. It ends a reply
 /// rather than opening one: what changed is the answer, and this is the caveat
 /// on it.
-pub fn render_unreadable(unreadable: &[UnreadablePrefix]) -> String {
+pub fn render_unreadable(unreadable: &[UnreadableInput]) -> String {
     unreadable.iter().map(|u| format!("\n{u}")).collect()
 }
 
@@ -522,7 +522,7 @@ may move between loops.{remedy}",
 /// What a reload checks before anything is torn down, and what it reports.
 struct Checked {
     diff: String,
-    unreadable: Vec<UnreadablePrefix>,
+    unreadable: Vec<UnreadableInput>,
 }
 
 impl LiveProgram {
@@ -834,18 +834,6 @@ impl LiveProgram {
         if !conflicts.is_empty() {
             ctx.sources_and_sinks_mut().release_unrouted_ports();
             return Err(state_refusal(&conflicts));
-        }
-        if !predecessor
-            .disagreeing_kept_iterations(previous_ast, &planned)
-            .is_empty()
-        {
-            ctx.sources_and_sinks_mut().release_unrouted_ports();
-            return Err(ReloadError::Refused(
-                "this version keeps a loop's iteration that another branch also reads and \
-has read less of, so a store rebuilt over it would fold elements twice; reload or delete \
-the lagging branch first"
-                    .to_string(),
-            ));
         }
         // Read before teardown, off the same planned tree the guard used, so this
         // and `/diff` answer alike and neither has to walk a graph that is gone.
