@@ -1859,6 +1859,17 @@ impl Tile {
         matches!(self, Tile::DataFunction { .. })
     }
 
+    /// Whether this is a value of scalars alone, a scalar or a record of plain values, whose
+    /// cells are final once held. An aggregation and a store carry a completeness of their own,
+    /// and a collection holds a level.
+    pub(crate) fn is_plain_value(&self) -> bool {
+        match self {
+            Tile::Scalar(_) => true,
+            Tile::Record { fields, .. } => fields.values().all(Tile::is_plain_value),
+            Tile::DataFunction { .. } | Tile::Aggregation { .. } | Tile::Store { .. } => false,
+        }
+    }
+
     /// Whether a level sits here, or inside a record here.
     ///
     /// A [`Self::Record`] is one sub-tile per field over the *same* rows, so it introduces
@@ -1874,17 +1885,6 @@ impl Tile {
     /// merge's key matching, and an operator putting a value into a column ask this one, a
     /// column having nowhere to put a level. The chain walks ([`Self::deepest_values`],
     /// [`Self::innermost_depth`], [`Self::key_levels`]) ask the first.
-    /// Whether this is a value of scalars alone, a scalar or a record of plain values, whose
-    /// cells are final once held. An aggregation and a store carry a completeness of their own,
-    /// and a collection holds a level.
-    pub(crate) fn is_plain_value(&self) -> bool {
-        match self {
-            Tile::Scalar(_) => true,
-            Tile::Record { fields, .. } => fields.values().all(Tile::is_plain_value),
-            Tile::DataFunction { .. } | Tile::Aggregation { .. } | Tile::Store { .. } => false,
-        }
-    }
-
     pub fn holds_a_level(&self) -> bool {
         match self {
             Tile::DataFunction { .. } => true,
