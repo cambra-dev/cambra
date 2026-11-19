@@ -1631,8 +1631,10 @@ fn collect_mut_value_types(expr: &Expr, out: &mut HashMap<Name, Type>) {
         TypedExprNode::MutDecl { binding, .. } => {
             out.insert(binding.name.clone(), value_type_of(&binding.ty));
         }
-        TypedExprNode::Lambda { param, .. } if param.ty.mut_value_type().is_some() => {
-            out.insert(param.name.clone(), value_type_of(&param.ty));
+        TypedExprNode::Lambda { params, .. } => {
+            for param in params.iter().filter(|p| p.ty.mut_value_type().is_some()) {
+                out.insert(param.name.clone(), value_type_of(&param.ty));
+            }
         }
         _ => {}
     }
@@ -1714,10 +1716,11 @@ pub(crate) fn check_iteration_channel_feeds(
 ) -> Result<(), provenance::Located<String>> {
     let iterations: Vec<&Expr> = match &expr.node {
         TypedExprNode::For { body, .. } => vec![body],
-        TypedExprNode::Lambda { param, body } => match &body.node {
+        TypedExprNode::Lambda { params, body } => match &body.node {
             TypedExprNode::Apply { argument, function }
                 if matches!(&argument.node, TypedExprNode::Apply { argument: at, .. }
-                    if matches!(&at.node, TypedExprNode::Var(n) if *n == param.name)) =>
+                    if matches!(&at.node, TypedExprNode::Var(n)
+                        if *n == crate::ccl::one_param(params).name)) =>
             {
                 match &function.node {
                     TypedExprNode::Lambda { body, .. } => vec![&**body],
@@ -2104,7 +2107,6 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
         site: None,
-        role: Default::default(),
     }
 }
 
@@ -2532,10 +2534,16 @@ pub(crate) fn fold_induction_loop(
     // The element at the position: a group's reads its key.
     let element_ty = {
         let source = source_fun(&iter.ty);
-        let Type::Fun { name, codomain, .. } = &source else {
+        let Type::Fun {
+            binder,
+            domain,
+            codomain,
+            ..
+        } = &source
+        else {
             panic!("letrec phase: loop source is not a function: {source}")
         };
-        crate::ccl::subst::codomain_renamed(name.as_ref(), &r, codomain)
+        crate::ccl::subst::codomain_renamed(binder, domain, &r, codomain)
     };
     let domain_ty = loop_domain(iter);
     // The writer's argument carries nothing per position but the item, so a body whose value
@@ -4873,7 +4881,6 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
             },
             iter: Box::new(list),
             body: Box::new(body),

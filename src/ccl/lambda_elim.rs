@@ -189,9 +189,10 @@ fn compose_sum_generators(expr: &mut Expr) {
         return;
     }
     expr.walk_children_mut(compose_sum_generators);
-    let TypedExprNode::Lambda { param, body } = &expr.node else {
+    let TypedExprNode::Lambda { params, body } = &expr.node else {
         return;
     };
+    let param = crate::ccl::one_param(params);
     // The key ranges over a witness only in a lambda that is itself a collection over one: a
     // sum's own, or the one an unboxed source projects (`σ₁(𝑐)`).
     if !matches!(
@@ -337,16 +338,22 @@ fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {
         e: &mut Expr,
         operands: &[&Expr],
         at: &dyn Fn(usize, &Type) -> Expr,
+        memo: &crate::ccl::ccl_utils::PredMemo<()>,
     ) -> bool {
-        if let Some(i) = operands
-            .iter()
-            .position(|o| crate::ccl::ty::eq_term_modulo_ty_slots(o, e))
-        {
+        // A projection's domain distinguishes it from the same index at another product.
+        if let Some(i) = operands.iter().position(|o| *o == e) {
             *e = at(i, &e.ty);
             return true;
         }
         let mut changed = false;
-        e.walk_children_mut(|c| changed |= abstract_operands(c, operands, at));
+        // A quoted computation can read an operand in a cast's target or another type slot.
+        e.walk_type_slots_mut(|ty| {
+            changed |=
+                crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |pred, memo| {
+                    abstract_operands(pred, operands, at, memo)
+                });
+        });
+        e.walk_children_mut(|c| changed |= abstract_operands(c, operands, at, memo));
         changed
     }
     let mut stated = result.clone();
@@ -354,7 +361,7 @@ fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {
         &mut stated,
         &crate::ccl::ccl_utils::PredMemo::default(),
         &(),
-        &mut |pred, _| abstract_operands(pred, operands, &at),
+        &mut |pred, memo| abstract_operands(pred, operands, &at, memo),
     );
     if changed {
         Type::pi(q, input.clone(), stated)
@@ -405,7 +412,7 @@ pub(crate) fn strength_over(f: Expr, fun_kind: &FunKind) -> Expr {
 /// replaced by the same collection holding `(𝐴, 𝑣)` for each value `𝑣`.
 fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
     let Type::Fun {
-        name,
+        binder,
         domain,
         codomain,
         ..
@@ -422,7 +429,7 @@ fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
         Type::Tuple(vec![(**domain).clone(), values.clone()]),
     );
     Type::Fun {
-        name: name.clone(),
+        binder: binder.clone(),
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: Box::new(strengthened),
@@ -436,7 +443,7 @@ fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
 /// components in.
 pub(crate) fn pairing_components(element: &Expr) -> Option<Vec<Expr>> {
     let Type::Fun {
-        name: Some(a),
+        binder: crate::ccl::FunBinder::Whole(a),
         domain,
         ..
     } = element.ty.peel_refinements()
@@ -561,17 +568,19 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
     match (f.ty.peel_refinements(), g.ty.peel_refinements()) {
         (
             Type::Fun {
-                name,
+                binder,
                 domain: a,
                 codomain: b,
                 ..
             },
             Type::Fun {
-                name: g_name,
+                binder: g_name,
                 codomain: c,
                 ..
             },
         ) => {
+            // An eliminated lambda binds one parameter, so its type binds the input whole.
+            let (name, g_name) = (&binder.whole().cloned(), &g_name.whole().cloned());
             // Each codomain reads its own binder by index, so two operands naming different
             // binders bind the one domain under two spellings, and the pair takes either.
             debug_assert!(
@@ -591,7 +600,7 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
             {
                 let second = crate::ccl::subst::open_codomain(&g.ty, c);
                 return Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: fun_kind.clone(),
                     domain: a.clone(),
                     codomain: Box::new(Type::dep_tuple(vec![
@@ -612,7 +621,7 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
             match name.as_ref().or(g_name.as_ref()) {
                 Some(n) => Type::pi_kinded(n.clone(), *a.clone(), codomain, fun_kind.clone()),
                 None => Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: fun_kind.clone(),
                     domain: a.clone(),
                     codomain: Box::new(codomain),
@@ -819,7 +828,7 @@ fn arm_compose(
     // asserting a collection. Stamping `Data` here contradicts the `const` that
     // lifts the same value, which is built from the eliminated lambda's kind.
     typed_compose(chain).with_ty(Type::Fun {
-        name: None,
+        binder: crate::ccl::FunBinder::None,
         fun_kind: fun_kind.clone(),
         domain: Box::new(dom),
         codomain: Box::new(cod),
@@ -1059,7 +1068,7 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
             reads_in_collection_domain(param, inner)
         }
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
@@ -1071,7 +1080,7 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
                 FunKind::Var(v) => v.resolved().is_data(),
             };
             data && (crate::ccl::subst::type_free_vars(domain).contains(param)
-                || (name.as_ref() != Some(param) && reads_in_collection_domain(param, codomain)))
+                || (!binder.binds(param) && reads_in_collection_domain(param, codomain)))
         }
         Type::Tuple(ts) | Type::OpenTuple(ts) => {
             ts.iter().any(|t| reads_in_collection_domain(param, t))
@@ -1152,10 +1161,8 @@ fn builds_domain_reading(param: &Name, expr: &Expr) -> bool {
             TypedExprNode::Cast { target, .. } => {
                 target.domain().is_some_and(|d| narrows_by(param, &d, &[]))
             }
-            TypedExprNode::Lambda {
-                param: binding,
-                body,
-            } => {
+            TypedExprNode::Lambda { params, body } => {
+                let binding = crate::ccl::one_param(params);
                 matches!(
                     e.ty.peel_refinements(),
                     Type::Fun {
@@ -1265,16 +1272,16 @@ fn eta_expanded(v: Expr) -> Expr {
     let fun_kind = v.ty.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     let y = Name::fresh("__elem_at");
     let source_binder = match v.ty.peel_refinements() {
-        Type::Fun { name, .. } => name.as_ref(),
-        _ => None,
+        Type::Fun { binder, .. } => binder.clone(),
+        _ => crate::ccl::FunBinder::None,
     };
-    let codomain = crate::ccl::subst::codomain_renamed(source_binder, &y, &codomain);
+    let codomain = crate::ccl::subst::codomain_renamed(&source_binder, &domain, &y, &codomain);
     let body = Expr::apply(Expr::var(&y).with_ty(domain.clone()), v).with_ty(codomain.clone());
     let mut binding =
         crate::ccl::expr::TypedBinding::new_unannotated(y.clone(), Occurrence::mint());
     binding.ty = domain.clone();
     Expr::new(TypedExprNode::Lambda {
-        param: binding,
+        params: vec![binding],
         body: Box::new(body),
     })
     .with_ty(Type::fun_over(y, domain, codomain, fun_kind))
@@ -1288,7 +1295,7 @@ fn refined_lambda(value: Expr, target: &Type, ty: Type) -> Expr {
     let TypedExpr {
         node:
             TypedExprNode::Lambda {
-                param: inner_binding,
+                params: inner_params,
                 body: inner_body,
             },
         ..
@@ -1299,6 +1306,7 @@ fn refined_lambda(value: Expr, target: &Type, ty: Type) -> Expr {
             symbolic(&value)
         )
     };
+    let inner_binding = crate::ccl::into_one_param(inner_params);
     // The cast **adds** its refinements to the ones the binder already carries rather than
     // replacing them: a refinement set is a conjunction, and the partition's domain
     // refinement and the filter's both hold of the elements that survive. The cast target
@@ -1321,10 +1329,10 @@ fn refined_lambda(value: Expr, target: &Type, ty: Type) -> Expr {
     Expr::preserve(
         id,
         TypedExprNode::Lambda {
-            param: crate::ccl::expr::TypedBinding {
+            params: vec![crate::ccl::expr::TypedBinding {
                 ty: binder_ty,
                 ..inner_binding
-            },
+            }],
             body: inner_body,
         },
     )
@@ -1438,9 +1446,10 @@ fn elim_lambda_impl(
 
         // Nested lambda: λ x → λ y → body  ⟹  curry(λ(x,y) → body)
         TypedExprNode::Lambda {
-            param: y_binding,
+            params: y_params,
             body: inner_body,
         } => {
+            let y_binding = crate::ccl::into_one_param(y_params);
             let y = y_binding.name;
             let y_ty = y_binding.ty.clone();
 
@@ -1720,23 +1729,25 @@ fn elim_lambda_impl(
                 // the `zip` it builds.
                 let (compose_ty, step_ty) = match &pair.ty {
                     Type::Fun {
-                        name: pair_name,
+                        binder: pair_name,
                         domain: pair_domain,
                         codomain: cod,
                         ..
                     } => {
+                        let pair_name = &pair_name.whole().cloned();
                         match cod.as_ref() {
                             Type::Tuple(elts) if elts.len() == 2 => {
                                 match (&elts[0], &elts[1]) {
                                     (
                                         first @ Type::Fun { domain: a, .. },
                                         Type::Fun {
-                                            name: second_name,
+                                            binder: second_name,
                                             domain: _,
                                             codomain: c,
                                             ..
                                         },
                                     ) => {
+                                        let second_name = second_name.whole();
                                         // `compose`'s codomain is the *chain it produces*,
                                         // `A → C`, and a chain's kind is its head's — the
                                         // rule `typed_compose` builds by. A bare function type
@@ -1755,7 +1766,7 @@ fn elim_lambda_impl(
                                         let chain = match (&chain, second_name, &originals) {
                                             (
                                                 Type::Fun {
-                                                    name: None,
+                                                    binder: crate::ccl::FunBinder::None,
                                                     fun_kind,
                                                     ..
                                                 },
@@ -1768,7 +1779,10 @@ fn elim_lambda_impl(
                                                 fun_kind.clone(),
                                             ),
                                             (
-                                                Type::Fun { name: None, .. },
+                                                Type::Fun {
+                                                    binder: crate::ccl::FunBinder::None,
+                                                    ..
+                                                },
                                                 Some(_),
                                                 Some(originals),
                                             ) if reads_input => {
@@ -1987,11 +2001,8 @@ fn elim_lambda_impl(
             let x = Expr::var(param).with_ty(param_ty.clone());
             let call_v_result_ty = match &new_def.ty {
                 Type::Fun {
-                    name: Some(b),
-                    codomain,
-                    ..
-                } => crate::ccl::subst::discharge_codomain(b, &x, codomain),
-                Type::Fun { codomain, .. } => (**codomain).clone(),
+                    binder, codomain, ..
+                } => crate::ccl::subst::discharge_at_binder(binder, &x, codomain),
                 _ => Type::Hole,
             };
             let call_v =
@@ -2102,7 +2113,6 @@ fn elim_lambda_impl(
                         user_annotation: b.user_annotation.clone(),
                         transparency: b.transparency,
                         site: b.site.clone(),
-                        role: Default::default(),
                     };
                     (binding, def)
                 })
@@ -2654,7 +2664,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // Lambda: eliminate then continue. (Domain refinements ride the type
         // lattice via `cast`; the cast-wrapped-lambda arm below handles the
         // dependent case.)
-        TypedExprNode::Lambda { param, body } => {
+        TypedExprNode::Lambda { params, body } => {
+            let param = crate::ccl::into_one_param(params);
             // Render the pre-elimination lambda only in debug builds — the string
             // feeds just the assert below. Built as a `throwaway` over an
             // id-preserving copy, so the render mints nothing: a node minted
@@ -2663,7 +2674,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // one for the same program.
             #[cfg(debug_assertions)]
             let original = symbolic(&Expr::throwaway(TypedExprNode::Lambda {
-                param: param.clone_preserving_ids(),
+                params: vec![param.clone_preserving_ids()],
                 body: Box::new(body.clone_preserving_ids()),
             }));
             let mut result = elim_lambda_kinded(
@@ -2727,7 +2738,9 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 provenance::enter(node_id, "lambda_elim.filter", provenance::Nature::Expansion);
             let lambda = terms.pop().unwrap();
             let (param, filter_body) = match lambda.node {
-                TypedExprNode::Lambda { param, body, .. } => (param, *body),
+                TypedExprNode::Lambda { params, body } => {
+                    (crate::ccl::into_one_param(params), *body)
+                }
                 _ => unreachable!(),
             };
             let (guard, true_body) = extract_filter_case(filter_body);
@@ -3131,7 +3144,7 @@ mod tests {
         let g = var("g").with_ty(dependent_morphism(&binder));
         let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
         assert!(
-            matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
+            matches!(&paired, Type::Fun { binder: crate::ccl::FunBinder::Whole(n), .. } if n == &binder),
             "the pair binds what its second operand names, got {paired}",
         );
         // The name is half the property. The index the second operand carries has to sit
@@ -3172,7 +3185,7 @@ mod tests {
         let g = var("g").with_ty(refined);
         let paired = zip_pair_ty(&f, &g, &FunKind::Compute);
         assert!(
-            matches!(&paired, Type::Fun { name: Some(n), .. } if n == &binder),
+            matches!(&paired, Type::Fun { binder: crate::ccl::FunBinder::Whole(n), .. } if n == &binder),
             "a refined operand is still a function, so the pair binds what it names, \
              got {paired}",
         );
@@ -3198,7 +3211,7 @@ mod tests {
         for fun_kind in [FunKind::Data(None), FunKind::Compute] {
             let lambda = Expr::lambda("x", Occurrence::mint(), int.clone(), body.clone()).with_ty(
                 Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(int.clone()),
                     codomain: Box::new(int.clone()),
@@ -3238,7 +3251,7 @@ mod tests {
     /// Build a `Fun(a, b)` type.
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
@@ -3249,6 +3262,59 @@ mod tests {
     /// `Bool` base type, for predicate bodies and other boolean-typed nodes.
     fn bool_ty() -> Type {
         Type::Base(BaseType::Bool)
+    }
+
+    #[test]
+    fn operation_abstraction_distinguishes_projection_domains() {
+        let x = Name::fresh("x");
+        let pair_ty = Type::tuple(vec![Type::tuple(vec![int_ty(), int_ty()]), int_ty()]);
+        let pair = Expr::var(&x).with_ty(pair_ty.clone());
+        let inner = Expr::projection_of(&Expr::projection_of(&pair, 0), 1);
+        let predicate = Expr::binop(
+            Expr::var(Name::elem()).with_ty(int_ty()),
+            BinOpKind::Compare(CompareKind::Equals),
+            inner,
+        )
+        .with_ty(bool_ty());
+        let result = Type::refined_one(int_ty(), Refinement::born(Rc::new(predicate)));
+        let projection = Expr::proj_index(1).with_ty(pair_ty.projection_type(1).unwrap());
+        let input = Type::tuple(vec![pair_ty, projection.ty.clone()]);
+        let ty = operation_type(&[&pair, &projection], &input, &result);
+        assert!(crate::ccl::subst::type_free_vars(&ty).is_empty());
+        crate::ccl::infer::typecheck(&Expr::builtin(Builtin::Apply).with_ty(ty)).unwrap();
+    }
+
+    #[test]
+    fn operation_abstraction_reaches_a_quoted_cast_target() {
+        let limit = Name::fresh("limit");
+        let uint = Type::Base(BaseType::UInt);
+        let operand = Expr::var(&limit).with_ty(uint.clone());
+        let guard = Expr::binop(
+            Expr::var(Name::elem()).with_ty(uint.clone()),
+            BinOpKind::Compare(CompareKind::Greater),
+            operand.clone(),
+        )
+        .with_ty(bool_ty());
+        let domain = Type::refined_one(Type::UIntRange(3), Refinement::born(Rc::new(guard)));
+        let collection_ty = Type::data_fun(domain, uint.clone());
+        let identity =
+            Expr::builtin(Builtin::Id).with_ty(Type::data_fun(Type::UIntRange(3), uint.clone()));
+        let filtered = Expr::cast(identity, collection_ty.clone());
+        let contains_ty = Type::fun(uint.clone(), bool_ty());
+        let contains = Expr::apply(
+            filtered,
+            Expr::builtin(Builtin::CollectionContains)
+                .with_ty(Type::fun(collection_ty, contains_ty.clone())),
+        )
+        .with_ty(contains_ty);
+        let predicate =
+            Expr::apply(Expr::var(Name::elem()).with_ty(uint.clone()), contains).with_ty(bool_ty());
+        let result = Type::refined_one(uint.clone(), Refinement::born(Rc::new(predicate)));
+        let ty = operation_type(&[&operand], &uint, &result);
+        assert!(
+            crate::ccl::subst::type_free_vars(&ty).is_empty(),
+            "an operand in a quoted cast's target is bound by the operation: {ty}",
+        );
     }
 
     /// Compare two expressions structurally, ignoring type annotations.
@@ -3688,7 +3754,6 @@ mod tests {
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
                 },
                 empty_payload: false,
             }),

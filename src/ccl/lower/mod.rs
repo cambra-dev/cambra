@@ -1474,19 +1474,6 @@ impl LoweringContext {
         self.shadow_depth.get(name).is_some_and(|&depth| depth > 0)
     }
 
-    /// Mint a fresh synthetic parameter name for a multi-arg lambda's tupled
-    /// domain, e.g. `__arg_tuple_0`, `__arg_tuple_1`, …
-    ///
-    /// Each multi-arg lambda gets a distinct name so that substitutions
-    /// performed in an outer lambda — which insert `Var(outer_name)` into
-    /// the body — do not get captured by an inner lambda's binder of the
-    /// same name. All minted names share the [`TUPLE_ARG_PREFIX`] prefix,
-    /// which user code cannot bind (double-underscore + synthetic suffix),
-    /// so the substitution helper can remain non-capture-avoiding.
-    pub(super) fn fresh_tuple_arg(&mut self) -> String {
-        self.mint_synthetic_id(TUPLE_ARG_PREFIX)
-    }
-
     /// Mint a unique `__result_N` name for the defer handle in generator functions.
     ///
     /// Counter-minted to avoid collisions when user code contains a binding
@@ -1554,11 +1541,6 @@ pub(crate) fn marked_nodes(
         })
         .collect()
 }
-
-/// Prefix for synthetic parameter names representing the tupled domain of a
-/// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
-/// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
-const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
 
 impl LoweringContext {
     /// How a diagnostic names the deferred binding `name`: the call a minted channel stands

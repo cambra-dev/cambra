@@ -414,6 +414,61 @@ checker carries the omitted statements to later copies of the module's code; see
 Check mode shares the rules and does not recover at statements: its rules record a failed
 constraint and continue, and an error a rule returns ends the walk.
 
+#### A lambda's parameters
+
+A lambda takes a **parameter list** (`docs/chl-spec.md`, "Parameter lists"). Its domain is the
+product of the parameters' types (`Type::params_domain`): the one parameter's type, the tuple of
+several, or the unit for none. `emit_lambda` binds the parameters in order, each later one's
+annotation emitted with the earlier ones in scope, so the domain of several is the dependent tuple
+whose component `𝑘` reads the components before it. The body sees each parameter by its own name,
+and so does the function type: one parameter is its whole input (`FunBinder::Whole`), and any
+other number is a list binding each component by one name (`FunBinder::Parameters`).
+
+A function type's binder names the input in one of three ways: not at all, its one parameter by
+one name (`(x: A) => B`), or a parameter list, each parameter by one name (`(a: A, b: B) => C`). A
+closed codomain reads a whole input as `PiRef { component: None }`; a projection of it and a
+parameter of a list both close as `PiRef { component: Some(𝑗) }`. The names are opening addresses
+and display spellings. A written function of one tuple naming its components,
+`{(a: A), (b: B(a))} => C(a)`, takes the tuple whole and reads a component as its projection,
+`(p: {(a: A), (b: B(a))}) => C(p.0)`, the form a message writes it in. **A parameter list's
+length is part of the type**, and the only part of the binder that is: the Fun/Fun rule relates
+two functions only when both take lists of one length or both take one parameter
+(`FunBinder::parameter_count`), and dropping an unread binder keeps a list's length
+(`FunBinder::unread`). The codomain edge aligns the two binders name for name
+(`Subst::aligned_binders`). A lambda's parameters form one signature
+for contributions
+([A handle received through a parameter](#a-handle-received-through-a-parameter)).
+
+A call passing other than one argument passes their list (`TypedExprNode::Arguments`), which
+A-normalization may have put under `let`s naming its operands; a tuple passed as one argument is
+an ordinary `Tuple`. `emit_apply` reads the list's length, refuses a callee whose type already
+states another (`emit::call_arity`, `InferError::CallArity`), and otherwise expects a function of a
+parameter list that long, each parameter discharged to its argument (`Typing::apply`). A builtin
+takes the tuple of its operands as one argument. The callee is emitted first for a list. An
+argument its parameter takes by reference passes its handle; the others pass values.
+
+**Where a later parameter's type reads an earlier one, each argument meets its own parameter, the
+earlier parameters discharged at the earlier arguments**, as the result is: `f(𝑥, 𝑦)` of
+`(𝑎: A, 𝑏: B(𝑎)) => C(𝑎, 𝑏)` takes `𝑦` at `B(𝑥)`, whatever `𝑥`'s type has resolved to when the
+edge is drawn. The expected function names its parameters `𝑥ᵢ`, each one's part minted under the
+ones before it, and its domain is the dependent tuple naming them; each argument's edge carries the
+call's discharge `[𝑥ᵢ ↦ argᵢ]` on its parameter's side (`Typing::apply`,
+`context::reads_earlier_parameters`). A list none of whose types reads an earlier parameter takes
+its arguments whole, with nothing to discharge: the discharge makes an argument's edge meet another
+instance of its parameter's part, which would part what that edge carries, a sum's witness, from
+the parameter. Two parameter lists meet with the left's domain read under the
+right's names (`constrain::onto_parameter_names`), so a callee's later parameter reads the earlier
+one as `𝑥ᵢ`, and the discharge reaches it when the closure carries the callee's bound across to
+the argument: a lower view carrying a discharge moves the upper bound through it
+(`constrain::bridge_holder_gap`). Meeting the argument tuple's type with the domain instead would
+read `𝑎` as any value of `𝑥`'s type, which bounds nothing. A check relates each argument to its
+parameter opened at the arguments the same way (`check::parameters_at_arguments`). An argument
+known only by its type, `f(one(), 5)` with `one` returning `Int`, bounds nothing, and the call is
+refused. Once inference has checked every call, it rewrites each
+list to the tuple of its arguments, the empty one to unit (`TypedExpr::erase_argument_lists`),
+which is how every later pass passes several values; a predicate reads a list as that tuple too
+(`ccl_utils::predicate_term`).
+
 #### A lambda applied where it stands binds its parameter first
 
 An application `𝑎 ▷ (λ 𝑥 → body)` whose parameter has no annotation relates `𝑎` to the
@@ -603,9 +658,8 @@ realization with their body or value. The first candidate of each group in evalu
 reported. The unresolved inference variables an open tuple's positions leave on the nodes they reach
 are not reported beside it.
 Lowering states the width wherever it builds a tuple that the program only projects: a
-multi-parameter `def`'s argument tuple binder (`lower::functions`), a multi-generator
-comprehension's iteration record binder (`comprehension::encode`), and each read of a tuple
-pattern's payload (`TupleAssignment`).
+multi-generator comprehension's iteration record binder (`comprehension::encode`), and each read
+of a tuple pattern's payload (`TupleAssignment`).
 
 ### Closing the single-sided blind spots (no separate pass)
 
@@ -2154,10 +2208,8 @@ Lowering represents a bounded annotation as `Type::BoundedHole(𝑇)`. Normaliza
 with a fresh inference variable and records `𝑇` as an upper bound. It is an annotation marker,
 not another runtime type or a new subtype constructor.
 
-The marker can occur inside a compound annotation. Multi-parameter lowering constructs one tuple
-parameter, so `def f(x: 𝐴, y <: 𝐵, z)` needs the annotation
-`Tuple([𝐴, BoundedHole(𝐵), Hole])`. A single mode flag on that tuple binder could not represent
-the three positions independently.
+Each parameter carries its own annotation, so `def f(x: 𝐴, y <: 𝐵, z)` binds `y` at
+`BoundedHole(𝐵)`, `x` at `𝐴` and `z` at its slot.
 
 Structural traversals such as substitution can preserve the marker before inference. Constraint
 and compaction rules must not consume an unnormalized `BoundedHole`; their unreachable branches
@@ -2183,8 +2235,12 @@ its holes normalize to fresh variables constrained by body uses and calls.
 Completion retains the annotation's declared structure. It pairs equal-length tuples by position,
 records by field name, function domains and codomains structurally, and history children by role.
 Unmentioned record fields are not copied. A refinement keeps its declared predicates while filling
-its base from the peeled RHS. Dependent function codomains align the initializer's binder with
-the annotation's binder before copying a type into it. Shapes not handled by completion retain
+its base from the peeled RHS. Function codomains complete at the annotation's binder when an
+invertible correspondence transports the initializer's variables there. A reindexing between a
+whole input and its component parameters maps names to terms, so completion uses the initializer's
+scope instead. The declared codomain closes at its own binder and opens in the chosen scope.
+This preserves annotation binders where transport permits it and keeps unresolved variables out
+of scopes that would require inverting a discharge. Shapes not handled by completion retain
 the annotation and are checked by the later subtype constraint.
 
 Completion is a structural operation, not a reverse subtype edge. Relying solely on one-way
@@ -2611,9 +2667,9 @@ Names identify the captured environment. Indices identify binders carried inside
 type, so alpha-renaming those binders does not change the stored references. Refinement equality,
 compaction, and keys can compare a predicate without recovering a discarded outer name pairing.
 
-The function's `name` slot supplies the address used when opening its codomain and a display
-spelling, not the identity of its closed references. `codomain_depends_on` determines whether
-materialization keeps that slot. Indices count named and unnamed function crossings alike;
+The function's binder supplies the address used when opening its codomain and a display
+spelling, not the identity of its closed references. `binder_reads` determines whether
+materialization keeps the binder. Indices count named and unnamed function crossings alike;
 removing spelling metadata must not change what they count.
 
 #### Interior term binders stay named, and compare by position
@@ -2671,6 +2727,10 @@ references; descent into a function, application and reading a stored predicate 
 `PiWalk` implements closing and opening across mixed type and predicate-term structure.
 `close_pi_binder` closes occurrences of one named binder. `open_pi_binder` replaces references
 to the enclosing function with a `Mapping`, leaving references bound inside the codomain intact.
+Opening receives the binder's input type. Component references become projections over that type;
+whole-input references opened at component names become tuples with typed elements. Tuple and family
+opening carry each binder's type through the same API. The conversion memo includes the input type
+because the resulting projection types depend on it.
 
 **Construction closes.** `Type::pi`, `pi_kinded`, and `fun_like` close the codomain they
 construct. Rebuilds such as `emit_cast` and `emit_compose` also close dependent results. A
@@ -2692,8 +2752,9 @@ candidate is read off the projected term's type, written where the enclosing bin
 variables, so it reads them by name.
 
 **Descent opens.** The function constraint arm opens a closed codomain at its binder's name when the
-reader needs named references. During `LiveSolve`, it does so toward a side whose codomain contains
-inference variables; concrete closed pairs can compare index-to-index.  A `PostPass` or
+reader needs named references. During `LiveSolve`, it does so toward a codomain with inference
+variables or one that still reads its own binder by name. Concrete closed pairs compare
+index-to-index. A `PostPass` or
 `RefinementBlind` derivation opens dependent codomains unconditionally because different passes may
 have produced different stored forms. Unconditionally opening concrete pairs during live solving
 could capture an unrelated free name matching a display spelling.
@@ -2985,16 +3046,15 @@ places that feed the channel, so an alias introduces no scope of its own.
 
 Where the resolved binding is a joined binder, such as a lambda's parameter, the contribution
 crosses it as well as the binders after it. A projection of a product that is not a literal
-resolves to the product's binder. For an unannotated `def emit(v, out)`, `out` is a projection of
-the argument tuple, so the contribution crosses the tuple's binder. Joining over it drops the value
-facts about `v`, and refuses a collection domain that varies with `v`, as every join does.
+resolves to the product's binder.
 
-A curried function's parameters form one signature: lowering marks the first
-`BindingRole::FunctionParameter` and the rest `BindingRole::Temporary`. A contribution to a handle
-received through one of them crosses the target and the signature's earlier parameters, except the
-ones its history type names (`InferCtx::contribution_crossing`).
-So `def emit(v: Int, out: Feed(_))` infers a row that does not depend on the value of `v`. A
-function defined in another's body starts its own signature.
+A lambda's parameters form one signature, which its first parameter names
+(`InferCtx::parameter_groups`). A contribution to a handle received through one of them crosses the
+target and the signature's earlier parameters, except the ones its history type names
+(`InferCtx::contribution_crossing`). So `def emit(v: Int, out: Feed(_))` infers a row that does not
+depend on the value of `v`: joining over `v` drops the value facts about it, and refuses a
+collection domain that varies with `v`, as every join does. A function defined in another's body
+starts its own signature.
 
 Where the resolved binding is a feed binding, the feed is checked against that binding's contract,
 which holds the key binder a projected handle's own type lacks (`InferCtx::feed_contract`).
@@ -3967,7 +4027,10 @@ refinement: a group-by under a loop whose key reads the loop's binder has keys
 `{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
 always was.
 
-A program cannot write a dependent tuple. Inference introduces one through `uncurry(𝑛)`, which
+A function of several parameters takes a dependent tuple when a later parameter's type reads an
+earlier one. Written dependent tuples, `{(𝑎: 𝐴), (𝑏: 𝐷(𝑎))}`, are planned
+(`docs/chl-spec.md`, "Named components"). Inference also introduces a dependent tuple through
+`uncurry(𝑛)`, which
 flattens a comprehension over several generators ([ir.md, "Several
 generators"](ir.md#several-generators)). Its scheme keys the flattened collection by
 `(𝑘₁ : 𝛼₁) × … × 𝛼ₙ`, each `𝛼ᵢ` a variable standing under `𝑘₁ … 𝑘ᵢ₋₁`, so a generator whose source
@@ -3984,7 +4047,7 @@ dependent tuple when an inner loop's keys depend on an outer loop's value
 
 `Type::DepTuple(Vec<(Option<Name>, Type)>)` is a telescope: each component is a binder in the
 shape of a `Fun`'s, whose scope is the components after it. The name slot is an opening address
-and a display spelling, as `Fun::name` is; it is not part of the type's identity.
+and a display spelling, as `Fun::binder`'s names are; it is not part of the type's identity.
 
 A reference to an earlier component is a `Name::PiBound`, and its index counts crossings into a
 binder's scope, of which a function's codomain and the components after a tuple component are
@@ -4022,6 +4085,11 @@ tuple are already open wherever the tuple is held, so no index shifts. In
 `{Int | __elem ∈ keys(𝑝.0)}`. Check mode's projection rule (`emit_proj`) requires a projection's
 codomain to be that type, read with the projection's own binder as `𝑝`.
 
+`Type::projection_type` constructs the function whose result reads earlier components of its own
+input. `Expr::projection_of` applies that function to the projected value and discharges its binder.
+Each projection function binds the input its result reads, including projections inside a quoted
+term's type slots.
+
 The nested-lambda rule types `.1` out of the pair it builds as `(𝑝 : 𝑇) ⇒ 𝐷(𝑝.0)`, with the
 pair's own binder as the projection's, as every morphism eliminated from `λ 𝑝 → …` binds it. The
 projection applied to `𝑝` discharges `𝑝` at itself, which `subst::discharge_codomain` answers by
@@ -4042,11 +4110,21 @@ Feeds are the second form of mutability") from one `uncurry(𝑛)` over its leve
 Two dependent tuples of one length relate component by component (`constrain_go`). During
 inference a component reads the ones before it by name, as a codomain reads its function's
 binder, so each side's names are aligned onto the other's for the components after them, and a
-side closed to indices opens at its names where the other side holds variables. Compaction keeps
-a dependent tuple in a slot of its own (`CompactType::dep_tuple`), component `𝑘` compacted under
-the binders of the `𝑘` components before it. A plain tuple's components close their references to
-binders around the tuple `𝑘` less deep, so the two slots do not merge, and a position meeting both
-names two shapes. Materialization builds the tuple with `Type::dep_tuple`, which collapses it to
+side closed to indices opens at its names where the other side holds variables. Compaction places
+every positional component `𝑘` under the `𝑘` components before it. A plain tuple introduces unnamed
+crossings and weakens references to enclosing binders by `𝑘` (`subst::weaken_pi_binders`).
+A dependent tuple uses its component binders. Both presentations use the same coordinates.
+Equal closed widths merge component by component into `CompactType::dep_tuple`.
+Materializing a plain tuple removes the unnamed crossings with `subst::tuple_of_components`.
+
+A plain tuple meets a dependent one with its components unnamed, so the dependent side opens at
+its names, and each later component is judged with the earlier names bound at the plain tuple's
+component types (`ComponentScope`): `{Int | __elem == 1} × {Int | __elem == 5}` is below
+`(𝑎 : Int) × {Int | __elem >= 𝑎}` since `5 >= 𝑎` given `𝑎 == 1`. A dependent tuple meets an open
+tuple position by position, each
+component joined over the earlier ones (`Mapping::Join`), and compaction meets an open tuple into
+a dependent one when the open prefix fits its closed width. Materialization builds the tuple
+with `Type::dep_tuple`, which collapses it to
 the plain tuple where no component reads an earlier one. As a collection's domain it is
 invariant, like every domain.
 
@@ -4582,13 +4660,14 @@ Every position of a requirement is an ordinary inference variable, but a require
 
 Places are found by following **upper** bounds: `𝑣 <: 𝑈` means `𝑣`'s value reaches `𝑈`, so a requirement on `𝑈` is one on `𝑣`. A variable bound stays at the same place, `𝑣` and `𝑈` being two variables for one value; a structural one descends, so in `𝑣 <: (𝑈₀, 𝑈₁)` the requirements on `𝑈₀` belong one field deeper and not to `𝑣`. Each `𝑈ᵢ` is itself a variable, which is why the path is load-bearing rather than decorative: it is what separates the value `𝑈₀` stands for from `𝑣`'s, and what lets variables reached by different routes be recognized as one value.
 
-A variable alone is the wrong unit because the parameter a programmer writes is not one variable. `λ 𝑎 𝑏 → …` uncurries to a lambda over a tuple and rewrites each occurrence of `𝑎` to a projection of that tuple, so each occurrence has its own inference variable and none of them carries both of `𝑎`'s requirements. Written curried, `𝑎` is a binder its occurrences share, and one variable carries both. Only the spelling differs.
-
 Which positions are steps is decided per type former, by an exhaustive match. The rules are one comment per former at `places_under`, in `src/ccl/infer/solver/traits.rs`.
 
 A function's **codomain** is a step; its **domain** is not. Descent groups requirements that constrain the same value, and is not how they are reached — every variable is a root, so all requirements are reached regardless. Across `𝑣 <: (𝐷 ⇒ 𝐶)` and `𝑣 <: (𝐷′ ⇒ 𝐶′)`, the codomains `𝐶` and `𝐶′` consume one value, `𝑣`'s result, and so group. `𝐷` and `𝐷′` are two arguments feeding one parameter — two values — and intersecting their requirements would ask a question the program does not pose. `dom(𝑣)` is a root in its own right, so nothing is missed.
 
-Reading the graph once, at the end, is what [`link_watches`](#delivery-the-watch-follows-the-edge) cannot do: it runs when an edge is **recorded**, so an edge predating an obligation never carries it, and it follows **variable** edges only, stopping at the structural hop a multi-parameter lambda introduces. Two consequences: currying is unobservable, `λ 𝑎 𝑏 → (𝑎 + 1, 𝑎 < 𝑏)` and its curried form taking one type; and `λ 𝑎 𝑏 → (𝑎 + 𝑏, 𝑎 + 1, 𝑏 + "s")` is rejected, where no single requirement is wrong and no variable carries two.
+[`link_watches`](#delivery-the-watch-follows-the-edge) runs when an edge is recorded and follows
+variable edges only. Reading the completed graph also reaches requirements behind structural
+bounds, including tuple fields. Grouping those requirements by the value they constrain is
+independent of lambda parameter grouping.
 
 Two problems look like they want an obligation of their own, and are not:
 
@@ -4652,13 +4731,10 @@ included, for a name.
   argument no instance accepts fails the obligation where it arrives, as an operator's operand
   does. A `let` binding a name to a function of an instance is generalized (`should_generalize`),
   so each use of the name opens the signature afresh.
-- **A signature with a pass-by-reference parameter is curried.** A `Mut(V)`, `Mut(V, Txn)` or
-  `Feed(V)` among several parameters makes the signature's type `𝐴 ⇒ 𝐵 ⇒ 𝑂` in place of
-  `(𝐴, 𝐵) ⇒ 𝑂` (`function_over`), the shape a `def` with such a parameter lowers to, so a call
-  applies it argument by argument and inlining substitutes the caller's variable into the
-  instance function's named binder. Lowering reads the shape off the signature
-  (`lower::traits::instance_function`), which is lowered before any body, where a `def`'s is read
-  off its name. An instance's function takes each such parameter's annotation from the signature.
+- **A signature with reference parameters has one product domain.** `function_over` uses the
+  single input alone, a tuple for several inputs, and unit for none, matching a `def`'s parameter
+  list. An instance function takes each parameter's annotation from the signature. Calls pass
+  one argument tuple, and inlining substitutes its components for the instance's named parameters.
 - **A requirement's name** chooses no instance. Under `requires a: Area(S)`, `a::area` is the node
   at `Area(S)`, whose obligation the assumption `Area(S)` answers, as it answers
   `summon(Area(_))::area` applied to an `S`. Each use of the definition passes the instance its

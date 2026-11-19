@@ -210,7 +210,7 @@ impl OperatorSchemes {
             SCHEME_LEVEL,
             fun(
                 Type::Fun {
-                    name: Some(elem.clone()),
+                    binder: crate::ccl::FunBinder::Whole(elem.clone()),
                     fun_kind: crate::ccl::FunKind::Data(None),
                     domain: Box::new(delta.clone()),
                     codomain: Box::new(epsilon.clone()),
@@ -481,7 +481,7 @@ pub(super) fn uncurried_value_at_its_tuple(
         crate::ccl::provenance::Nature::Machinery,
     );
     let Type::Fun {
-        name,
+        binder,
         fun_kind,
         domain: argument,
         codomain,
@@ -522,11 +522,11 @@ pub(super) fn uncurried_value_at_its_tuple(
     }
     let read = crate::ccl::subst::Subst::discharging(&env).apply_type(&value);
     Type::Fun {
-        name,
+        binder,
         fun_kind,
         domain: argument,
         codomain: Box::new(Type::Fun {
-            name: Some(p),
+            binder: crate::ccl::FunBinder::Whole(p),
             fun_kind: result_kind,
             domain: tuple,
             codomain: Box::new(read),
@@ -595,7 +595,7 @@ fn uncurry_scheme(n: usize) -> PolyScheme {
         .zip(&keys)
         .rev()
         .fold(value.clone(), |inner, (name, key)| Type::Fun {
-            name: Some(name.clone()),
+            binder: crate::ccl::FunBinder::Whole(name.clone()),
             fun_kind: crate::ccl::FunKind::Data(None),
             domain: Box::new(key.clone()),
             codomain: Box::new(inner),
@@ -705,15 +705,14 @@ mod tests {
         // it, the bare lambda is a `Compute` function and `max`'s `Data` demand
         // rejects it on *kind* before the codomain orderability under test.
         let lam = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(TypedExpr::new(TypedExprNode::Record(vec![
                 RecordEntry::new("a", Occurrence::mint(), lit_int(1)),
                 RecordEntry::new("b", Occurrence::mint(), lit_int(2)),

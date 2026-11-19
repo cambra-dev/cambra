@@ -7,6 +7,7 @@ use crate::ccl::RecordEntry;
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
+use crate::ccl::FunBinder;
 use crate::ccl::capabilities::{Capability, Effect, Requirement};
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::chl_print::chl_type;
@@ -251,9 +252,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             }
         }
 
-        TypedExprNode::Lambda { param, body } => {
+        TypedExprNode::Lambda { params, body } => {
             let stamped = expr.user_annotation.clone();
-            emit_lambda(param, body, &recorded_ty, stamped.as_ref(), ctx)?
+            emit_lambda(params, body, &recorded_ty, stamped.as_ref(), ctx)?
         }
 
         // Cast: rebuild `value`'s function type with `target`'s domain refinements.
@@ -299,6 +300,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Tuple(elts) => emit_tuple(elts, ctx)?,
 
+        // A call's argument list passes the tuple of its arguments, and the empty one unit;
+        // the call checks it against the callee's parameter list (`emit_apply`).
+        TypedExprNode::Arguments(elts) if elts.is_empty() => Type::Base(BaseType::Unit),
+        TypedExprNode::Arguments(elts) => emit_tuple(elts, ctx)?,
+
         TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
 
         TypedExprNode::Proj(key) => {
@@ -332,8 +338,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // them; a node built anywhere else would have its refinements never discharged.
             // Inference meets the node as lowering built it; the post-inference check meets
             // it after inlining has substituted the argument, which is already checked.
+            let parameter = |e: &Expr| matches!(&e.node, TypedExprNode::Var(n) if n.base().starts_with("__ctor_arg"));
             debug_assert!(
-                matches!(&payload.node, TypedExprNode::Var(n) if n.base() == "__ctor_arg")
+                parameter(payload)
+                    || matches!(&payload.node, TypedExprNode::Tuple(parts) if parts.iter().all(parameter))
                     || matches!(&payload.node, TypedExprNode::Lit(crate::ccl::Lit::Unit)),
                 "a NominalCtor is built only as its constructor function's body or as a \
                  nullary constructor's value; anywhere else its refinements are never \
@@ -665,7 +673,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         // A codomain reading the binder is typed opened, with the binder in scope at the
         // domain, and closed again.
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain: d,
             codomain: c,
@@ -679,21 +687,20 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 }
             }
             emit_annotation_predicates(d, ctx)?;
-            match name {
-                Some(b) if crate::ccl::subst::references_enclosing_function(c) => {
-                    let bound = ctx.normalize(&ctx.refinement_domain(d));
-                    let mut opened = crate::ccl::subst::open_pi_binder(
-                        &crate::ccl::subst::Mapping::Rename(b.clone()),
-                        c,
-                    );
-                    ctx.scoped(b, &bound, |ctx| {
-                        emit_annotation_predicates(&mut opened, ctx)
-                    })?;
-                    **c = crate::ccl::subst::close_pi_binder(b, &opened);
-                    Ok(())
-                }
-                _ => emit_annotation_predicates(c, ctx),
+            if binder.is_none() || !crate::ccl::subst::references_enclosing_function(c) {
+                return emit_annotation_predicates(c, ctx);
             }
+            // The codomain is typed opened, with the binder's names in scope at their types,
+            // and closed again.
+            let b = crate::ccl::subst::named_binder(binder);
+            let mut opened = crate::ccl::subst::open_at_binder(&b, d, c);
+            let scope: Vec<(Name, Type)> = crate::ccl::subst::binder_scope(&b, d)
+                .into_iter()
+                .map(|(n, t)| (n, ctx.normalize(&ctx.refinement_domain(&t))))
+                .collect();
+            under_scope(&scope, &mut opened, ctx)?;
+            **c = crate::ccl::subst::close_at_binder(&b, &opened);
+            Ok(())
         }
         // The body is typed opened, with each binder in scope at its domain, and closed again.
         Type::Family { binders, body } => {
@@ -717,20 +724,8 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 .collect();
             let mut opened = crate::ccl::subst::opened_family_body(binders, body)
                 .unwrap_or_else(|| (**body).clone());
-            fn under<C: Typing>(
-                scope: &[(Name, Type)],
-                body: &mut Type,
-                ctx: &mut C,
-            ) -> Result<(), LocatedInferError> {
-                match scope.split_first() {
-                    None => emit_annotation_predicates(body, ctx),
-                    Some(((name, bound), rest)) => {
-                        ctx.scoped(name, bound, |ctx| under(rest, body, ctx))
-                    }
-                }
-            }
             let scope: Vec<(Name, Type)> = names.iter().cloned().zip(bounds).collect();
-            under(&scope, &mut opened, ctx)?;
+            under_scope(&scope, &mut opened, ctx)?;
             let enclosing: Vec<Option<Name>> = names.into_iter().map(Some).collect();
             **body = crate::ccl::subst::close_pi_binders(&enclosing, &opened);
             Ok(())
@@ -758,10 +753,25 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             emit_annotation_predicates(input, ctx)?;
             emit_annotation_predicates(output, ctx)
         }
+        // Each component is typed opened, with the components before it in scope at their
+        // types, and closed again, as a family's body is.
         Type::DepTuple(cs) => {
-            for (_, t) in cs.iter_mut() {
-                emit_annotation_predicates(t, ctx)?;
+            let names = crate::ccl::subst::tuple_component_names(cs);
+            let mut opened = crate::ccl::subst::open_tuple_components(cs, |j, _| {
+                crate::ccl::subst::Mapping::Rename(names[j].clone())
+            });
+            let mut scope: Vec<(Name, Type)> = Vec::with_capacity(cs.len());
+            for (name, component) in names.iter().zip(opened.iter_mut()) {
+                under_scope(&scope, component, ctx)?;
+                scope.push((
+                    name.clone(),
+                    ctx.normalize(&ctx.refinement_domain(component)),
+                ));
             }
+            let mut closed: Vec<(Option<Name>, Type)> =
+                names.into_iter().map(Some).zip(opened).collect();
+            crate::ccl::subst::close_tuple_components(&mut closed);
+            *cs = closed;
             Ok(())
         }
         Type::Record(fs) => {
@@ -793,6 +803,19 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         // are registered when a predicate in the body mentions one. The bounds were
         // typed as they were opened (`Typing::open_poly`).
         Type::Poly(poly) => emit_annotation_predicates(&mut std::rc::Rc::make_mut(poly).body, ctx),
+    }
+}
+
+/// [`emit_annotation_predicates`] on `body`, with each binder of `scope`, outermost first, in
+/// scope at its type.
+fn under_scope<C: Typing>(
+    scope: &[(Name, Type)],
+    body: &mut Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    match scope.split_first() {
+        None => emit_annotation_predicates(body, ctx),
+        Some(((name, bound), rest)) => ctx.scoped(name, bound, |ctx| under_scope(rest, body, ctx)),
     }
 }
 
@@ -931,39 +954,51 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             complete_annotation(base, inferred.peel_refinements()),
             refinements.clone(),
         ),
-        // The binder and kind come from the *annotation*, per the rule
-        // above: a kind is something an annotation can state (`List(T)` is a data
-        // function by construction), so it is a claim to keep rather than a shape to
-        // fill in.
+        // Kind and capabilities are the annotation's claims. Completion chooses a binder
+        // presentation for its result without changing those claims.
         (
             Type::Fun {
-                name: an,
+                binder: an,
+                fun_kind,
                 domain: ad,
                 codomain: ac,
-                ..
+                capabilities,
             },
             Type::Fun {
-                name: inn,
+                binder: inn,
                 domain: id,
                 codomain: ic,
                 ..
             },
         ) => {
-            // The codomain is filled under `an`, so the initializer's binder aligns to
-            // it first ([`Subst::aligned`], the alignment `constrain_go` draws its own
-            // codomain edge under). `fun_like` then closes over `an`, which reaches only
-            // a reference already spelled `an` — so an unaligned copy would leave the
-            // initializer's name free rather than bound. Binders are uid-unique, so a
-            // nested arm's alignment targets a disjoint name and the two commute.
-            let aligned = crate::ccl::subst::Subst::id().aligned(inn, an);
-            let cod = complete_annotation(ac, &aligned.apply_type(ic));
-            debug_assert!(
-                inn.as_ref()
-                    .is_none_or(|i| !crate::ccl::subst::type_free_vars(&cod).contains(i)),
-                "a filled codomain still references the initializer's binder {inn:?}, so \
-                 the alignment did not reach it: {cod}",
-            );
-            Type::fun_like(ann, complete_annotation(ad, id), cod)
+            // An annotation writing its domain states its parameter list, and one of another
+            // length fails the initializer's edge, so it is kept as written. One leaving its
+            // domain to inference takes the initializer's binder, as a `def`'s clauses do.
+            if an.parameter_count() != inn.parameter_count() && !matches!(**ad, Type::Hole) {
+                return ann.clone();
+            }
+            let domain = complete_annotation(ad, id);
+            let annotated = crate::ccl::subst::named_binder(if an.is_none() { inn } else { an });
+            let alignment = crate::ccl::subst::Subst::id().aligned_binders(inn, &annotated);
+            let inferred = crate::ccl::subst::open_at_binder(inn, id, ic);
+            // Preserve the annotation's binder when the initializer's variables can be
+            // transported by an invertible correspondence. A product reindexing maps names
+            // to terms, so completion stays in the initializer's scope there.
+            let (target, inferred) = if alignment.invert().is_some() {
+                (annotated, alignment.apply_type(&inferred))
+            } else {
+                (crate::ccl::subst::named_binder(inn), inferred)
+            };
+            let declared = crate::ccl::subst::close_at_binder(an, ac);
+            let declared = crate::ccl::subst::open_at_binder(&target, &domain, &declared);
+            let cod = complete_annotation(&declared, &inferred);
+            Type::Fun {
+                codomain: Box::new(crate::ccl::subst::close_at_binder(&target, &cod)),
+                binder: target,
+                fun_kind: fun_kind.clone(),
+                domain: Box::new(domain),
+                capabilities: capabilities.clone(),
+            }
         }
         // A nominal type's arguments are left to normalization, which makes each hole a
         // variable the initializer bounds. Filled from the initializer here, a family argument
@@ -988,10 +1023,123 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
 }
 
 pub(super) fn emit_lambda<C: Typing>(
-    param: &mut TypedBinding,
+    params: &mut [TypedBinding],
     body: &mut Expr,
     recorded: &Type,
     stamped: Option<&Type>,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    // The first parameter's annotation is read in the scope enclosing the lambda; a later
+    // one's is read with the parameters before it bound, as a dependent tuple's component
+    // reads the components before it.
+    let first = match params.first_mut() {
+        Some(first) => Some(bind_parameter(first, ctx)?),
+        None => None,
+    };
+    // All of a lambda's parameters are one signature, which a contribution through any of
+    // them crosses whole (`InferCtx::contribution_crossing`); the first names it.
+    let group = params.first().map(|p| p.name.clone());
+    // A lambda's result passes its value along, as a statement's continuation does: a
+    // mutable variable it ends in is read, and a feed stays the handle the function hands
+    // back (`docs/chl-spec.md`, "8.3 Reads").
+    // Where the body's labels go depends on the lambda's kind, which a lowering stamp
+    // states where there is one, as `emit_node` applies to this result.
+    let (emitted, capabilities) = ctx.function_body(stamped.unwrap_or(recorded), |ctx| {
+        let mut domain = Vec::with_capacity(params.len());
+        let body_ty = emit_under_params(params, first, group.as_ref(), &mut domain, body, ctx)?;
+        Ok::<_, LocatedInferError>((domain, body_ty))
+    });
+    let (domain, body_ty) = emitted?;
+    ctx.note_result(&body_ty, returned_node(body));
+
+    // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
+    // predicate nested in `body_ty` that closes over the parameter (the
+    // dependent-refinement case) stays bound. The binder is cosmetic for
+    // ordinary functions — coalesce strips it when the codomain does not
+    // reference it (see `coalesce_compact_go`) — so monomorphic output is
+    // unchanged. Any other number of parameters binds their list, each by its own name
+    // ([`FunBinder::Parameters`]).
+    //
+    // The rule derives the domain and the codomain; the **kind is inferred**. A
+    // `λ` node is the same node whether it denotes a collection or a compute function —
+    // a comprehension's `λ __iter_record → __iter_record ▷ xs ▷ f` and a plain
+    // `λ x → x + 1` are indistinguishable *here* — so the rule says what it
+    // knows: a function of some kind. What decides it is everywhere the lambda is
+    // used or declared, and those are ordinary constraints: a `data_fun`
+    // annotation from lowering, a declared `Data` recurrence carrier, an
+    // aggregate's `Data` demand, a `Compute` parameter position. Each pins the
+    // variable at the edge where the claim is actually made
+    // (`constrain_fun_kind`), and an unconstrained kind resolves to the compute-function
+    // default at coalesce (`FunKind::resolved`).
+    //
+    // In Check mode `recorded` is the node's resolved type, so reading the kind
+    // back reproduces what inference settled instead of minting a second
+    // variable that nothing would constrain.
+    // A lambda of any other number of parameters than one takes their list
+    // ([`FunBinder::Parameters`]), the empty one included.
+    let (binder, domain) = match (params, domain.as_slice()) {
+        ([param], [ty]) => (FunBinder::Whole(param.name.clone()), ty.clone()),
+        (params, tys) => {
+            let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
+            let domain =
+                Type::params_domain(names.iter().cloned().zip(tys.iter().cloned()).collect());
+            (
+                FunBinder::Parameters(names.into_iter().map(Some).collect()),
+                domain,
+            )
+        }
+    };
+    let ty = Type::Fun {
+        binder,
+        fun_kind: match recorded {
+            Type::Fun { fun_kind, .. } => fun_kind.clone(),
+            _ => FunKind::Compute,
+        },
+        domain: Box::new(domain),
+        codomain: Box::new(body_ty),
+        capabilities,
+    };
+    if stamped
+        .unwrap_or(recorded)
+        .fun_kind()
+        .is_some_and(|k| k.resolved().is_data())
+    {
+        ctx.note_data_loop(ctx.current_node(), &ty);
+    }
+    Ok(ty)
+}
+
+/// Emit `body` under `params`, entering each in turn: `first`, the type the first was bound at
+/// outside the function body, and each later one bound ([`bind_parameter`]) under the ones
+/// before it. Pushes each parameter's type onto `domain`, and returns the body's type.
+fn emit_under_params<C: Typing>(
+    params: &mut [TypedBinding],
+    first: Option<Type>,
+    group: Option<&Name>,
+    domain: &mut Vec<Type>,
+    body: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let Some((param, rest)) = params.split_first_mut() else {
+        return emit_passed_read(body, ctx);
+    };
+    let ty = match first {
+        Some(ty) => ty,
+        None => bind_parameter(param, ctx)?,
+    };
+    domain.push(ty.clone());
+    let group = group.expect("a lambda with parameters has a signature");
+    // The param is bound in scope under the *unrefined* simple type, so `Var(param)` body
+    // references stay bare; restriction refinements decorate only the function boundary.
+    ctx.scoped_parameter(param, group, &ty, |ctx| {
+        emit_under_params(rest, None, Some(group), domain, body, ctx)
+    })
+}
+
+/// The type `param` binds at, written to its slot: its **declared** type when it has one, and
+/// its slot otherwise.
+fn bind_parameter<C: Typing>(
+    param: &mut TypedBinding,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // User annotation on the param might contain a predicate, so we
@@ -1022,7 +1170,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // the type lattice (introduced by `cast`), not the lambda node, so the param
     // binds under its bare type here.
     let declared = param.annotation_ty().unwrap_or(&param.ty).clone();
-    let mut param_simple = ctx.normalize(&declared);
+    let mut simple = ctx.normalize(&declared);
     // A refinement riding `param.ty` rather than a `user_annotation` — the shape
     // lowering gives a re-keying producer's key binder,
     // `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}` — has its predicate typed
@@ -1036,63 +1184,10 @@ pub(super) fn emit_lambda<C: Typing>(
     // resolved predicate and would mistype planning's function predicates (`D ⇒ Bool`)
     // as bare `__elem`-Bool ones. A no-op for the ordinary unrefined param.
     if param.user_annotation.is_none() {
-        ctx.type_annotation_predicates(&mut param_simple)?;
+        ctx.type_annotation_predicates(&mut simple)?;
     }
-    param.ty = param_simple.clone();
-    // The param is bound in scope under the *unrefined* `param_simple`, so
-    // `Var(param)` body references stay bare; restriction refinements decorate only
-    // the function boundary.
-    // A lambda's result passes its value along, as a statement's continuation does: a
-    // mutable variable it ends in is read, and a feed stays the handle the function hands
-    // back (`docs/chl-spec.md`, "8.3 Reads").
-    // Where the body's labels go depends on the lambda's kind, which a lowering stamp
-    // states where there is one, as `emit_node` applies to this result.
-    let (body_ty, capabilities) = ctx.function_body(stamped.unwrap_or(recorded), |ctx| {
-        ctx.scoped_parameter(param, &param_simple, |ctx| emit_passed_read(body, ctx))
-    });
-    let body_ty = body_ty?;
-    ctx.note_result(&body_ty, returned_node(body));
-
-    // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
-    // predicate nested in `body_ty` that closes over the parameter (the
-    // dependent-refinement case) stays bound. The binder is cosmetic for
-    // ordinary functions — coalesce strips it when the codomain does not
-    // reference it (see `coalesce_compact_go`) — so monomorphic output is
-    // unchanged.
-    //
-    // The rule derives the domain and the codomain; the **kind is inferred**. A
-    // `λ` node is the same node whether it denotes a collection or a compute function —
-    // a comprehension's `λ __iter_record → __iter_record ▷ xs ▷ f` and a plain
-    // `λ x → x + 1` are indistinguishable *here* — so the rule says what it
-    // knows: a function of some kind. What decides it is everywhere the lambda is
-    // used or declared, and those are ordinary constraints: a `data_fun`
-    // annotation from lowering, a declared `Data` recurrence carrier, an
-    // aggregate's `Data` demand, a `Compute` parameter position. Each pins the
-    // variable at the edge where the claim is actually made
-    // (`constrain_fun_kind`), and an unconstrained kind resolves to the compute-function
-    // default at coalesce (`FunKind::resolved`).
-    //
-    // In Check mode `recorded` is the node's resolved type, so reading the kind
-    // back reproduces what inference settled instead of minting a second
-    // variable that nothing would constrain.
-    let ty = Type::Fun {
-        name: Some(param.name.clone()),
-        fun_kind: match recorded {
-            Type::Fun { fun_kind, .. } => fun_kind.clone(),
-            _ => FunKind::Compute,
-        },
-        domain: Box::new(param_simple),
-        codomain: Box::new(body_ty),
-        capabilities,
-    };
-    if stamped
-        .unwrap_or(recorded)
-        .fun_kind()
-        .is_some_and(|k| k.resolved().is_data())
-    {
-        ctx.note_data_loop(ctx.current_node(), &ty);
-    }
-    Ok(ty)
+    param.ty = simple.clone();
+    Ok(simple)
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -1178,23 +1273,20 @@ pub(super) fn emit_cast<C: Typing>(
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
     // which is what keeps the O8 contravariant-domain discharge from leaving an
     // undischarged binder in the domain's refinement predicate (design §5.2, O8).
-    let name = match value_ty.peel_refinements() {
-        Type::Fun { name: Some(k), .. } => Some(k.clone()),
-        _ => None,
+    let binder = match value_ty.peel_refinements() {
+        Type::Fun { binder, .. } => binder.clone(),
+        _ => FunBinder::None,
     };
     // Construction closes (see `Type::pi`): re-viewing the value at the
     // target rebuilds a function around the value's codomain, so references to
     // the preserved binder close here. Idempotent when `v` came out of a
     // closed function (its references are already indices).
-    let v = match &name {
-        Some(k) => crate::ccl::subst::close_pi_binder(k, &v),
-        None => v,
-    };
+    let v = crate::ccl::subst::close_at_binder(&binder, &v);
     // The re-viewed value does what the value does, settled by the target's kind: a
     // function re-viewed as a collection runs where the cast stands.
     let capabilities = ctx.composed_capabilities(target, std::slice::from_ref(&value_ty));
     Ok(Type::Fun {
-        name,
+        binder,
         fun_kind,
         domain: Box::new(domain),
         codomain: Box::new(v),
@@ -1254,43 +1346,71 @@ pub(super) fn emit_apply<C: Typing>(
         let key = key.clone_preserving_ids();
         return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
     }
-    let raw_arg_ty = ctx.subexpr(argument)?;
-    // A method call's function is resolved here, the argument now typed: the receiver's
-    // type picks the candidate that replaces the placeholder.
-    if matches!(function.node, TypedExprNode::Method { .. }) {
-        resolve_method(function, &raw_arg_ty, ctx)?;
-    }
-    // A lambda applied where it stands, `𝑎 ▷ (λ 𝑥 → body)`, binds `𝑥` to `𝑎` as
-    // `let 𝑥 = 𝑎 in body` does, so the argument reaches the parameter's slot before the
-    // body is emitted. A comprehension's generator is one: its element then reads the
-    // binder's type from the source, as a method call in it needs. The application edge
-    // below states the same relation again (`src/ccl/design/type-inference.md`, "A lambda
-    // applied where it stands binds its parameter first").
-    if let TypedExprNode::Lambda { param, .. } = &mut function.node
-        && param.user_annotation.is_none()
-        && matches!(param.ty, Type::Hole)
-    {
-        let slot = ctx.binding_slot(&mut param.ty);
-        let read = read_value(argument, &raw_arg_ty, ctx);
-        ctx.require_sub(&read, &slot, &|| "this argument".to_string())?;
-    }
-    // `(𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` is a loop's step at the position `𝑟`, the form a `for` loop
-    // lowers to (`lower::loops::tagged_for_loop`): `𝑥` is `𝑠`'s value at `𝑟`.
-    if let TypedExprNode::Lambda { param, .. } = &function.node
-        && let TypedExprNode::Apply {
-            argument: position,
-            function: source,
-        } = &argument.node
-        && let TypedExprNode::Var(r) = &position.node
-    {
-        ctx.note_loop_source(&param.name, r, source, &position.ty, &raw_arg_ty);
-    }
-    // A function position is a value position, so a mutable variable mention there reads
-    // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
-    // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
-    // relating a mutable variable only to another.
-    let fn_ty = ctx.subexpr(function)?;
-    let fn_ty = read_value(function, &fn_ty, ctx);
+    // The arguments of a call with several are a tuple, which A-normalization may have put
+    // under `let`s naming its operands. A component taken by reference passes its handle;
+    // the other components pass values. The callee is emitted first to supply their modes.
+    // A method and a lambda applied where it stands read their argument's type, so they are
+    // emitted after it.
+    //
+    // A call passing other than one argument passes a list of them, which only a function of a
+    // parameter list that long takes (`docs/chl-spec.md`, "Parameter lists"). A builtin takes
+    // the tuple of its operands as one argument.
+    let list = argument_tuple(argument, false)
+        .map(|(_, n)| n)
+        .filter(|_| !matches!(function.node, TypedExprNode::Builtin(_)));
+    let arguments = argument_tuple(argument, !ctx.reads_argument_lists()).filter(|_| {
+        !matches!(
+            function.node,
+            TypedExprNode::Method { .. } | TypedExprNode::Lambda { .. }
+        )
+    });
+    let (raw_arg_ty, fn_ty, passed) = if let Some((tuple, width)) = arguments {
+        let fn_ty = emit_function(function, ctx)?;
+        let params = parameter_type(function, &fn_ty)
+            .and_then(|param| param_components(param, width))
+            .filter(|params| params.iter().any(|p| p.history_parts().is_some()));
+        let passed = params.is_some();
+        if let Some(params) = params {
+            ctx.pass_arguments(tuple, params);
+        }
+        (ctx.subexpr(argument)?, fn_ty, passed)
+    } else {
+        let raw_arg_ty = ctx.subexpr(argument)?;
+        // A method call's function is resolved here, the argument now typed: the receiver's
+        // type picks the candidate that replaces the placeholder.
+        if matches!(function.node, TypedExprNode::Method { .. }) {
+            resolve_method(function, &raw_arg_ty, ctx)?;
+        }
+        // A lambda of one parameter applied where it stands, `𝑎 ▷ (λ 𝑥 → body)`, binds `𝑥`
+        // to `𝑎` as `let 𝑥 = 𝑎 in body` does, so the argument reaches the parameter's slot
+        // before the body is emitted. A comprehension's generator is one: its element then
+        // reads the binder's type from the source, as a method call in it needs. The
+        // application edge below states the same relation again
+        // (`src/ccl/design/type-inference.md`, "A lambda applied where it stands binds its
+        // parameter first").
+        if let TypedExprNode::Lambda { params, .. } = &mut function.node
+            && let [param] = params.as_mut_slice()
+            && param.user_annotation.is_none()
+            && matches!(param.ty, Type::Hole)
+        {
+            let slot = ctx.binding_slot(&mut param.ty);
+            let read = read_value(argument, &raw_arg_ty, ctx);
+            ctx.require_sub(&read, &slot, &|| "this argument".to_string())?;
+        }
+        // `(𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` is a loop's step at the position `𝑟`, the form a `for`
+        // loop lowers to (`lower::loops::tagged_for_loop`): `𝑥` is `𝑠`'s value at `𝑟`.
+        if let TypedExprNode::Lambda { params, .. } = &function.node
+            && let [param] = params.as_slice()
+            && let TypedExprNode::Apply {
+                argument: position,
+                function: source,
+            } = &argument.node
+            && let TypedExprNode::Var(r) = &position.node
+        {
+            ctx.note_loop_source(&param.name, r, source, &position.ty, &raw_arg_ty);
+        }
+        (raw_arg_ty, emit_function(function, ctx)?, false)
+    };
     // **The one position where a mutable variable's handle survives.** If the parameter is a
     // mutable variable the argument is passed *by reference* and the handle must reach the
     // parameter, so the invariance rule relates the two value types directly — that is
@@ -1298,92 +1418,15 @@ pub(super) fn emit_apply<C: Typing>(
     // than two edges that have to agree. Every other argument is a value position, so a
     // mutable variable mention there reads.
     //
-    // Deciding it here is sound because the parameter is read off the *head of the
-    // spine* (`parameter_type`) rather than off the immediately-applied type — a call is
-    // curried, so the applied type says nothing about an argument past the first — and
-    // because a pass-by-reference parameter is bound at its `Mut(V, D)` by the only code
-    // that mints one (`lower::functions::uncurry_params`). Rule 2 guarantees the
-    // mutable variable is the parameter itself and never nested inside it, so there is no
-    // composite to walk.
-    let param_ty = parameter_type(function, &fn_ty).cloned();
-    // A node under an annotation that is not a handle reads (`emit_node`), which here would
-    // read the handle this position has to pass. Only lowering annotates an expression (a
-    // source `x: T = e` annotates the binding), and it annotates generator sources, the
-    // kind stamps on `Compose` and lambda nodes, and a `**` exponent, none of which is a
-    // pass-by-reference argument.
-    debug_assert!(
-        param_ty
-            .as_ref()
-            .is_none_or(|param| param.mut_value_type().is_none())
-            || argument.user_annotation.is_none(),
-        "a pass-by-reference argument carries no annotation, got {:?}",
-        argument.user_annotation
-    );
-    // A pass-by-reference parameter's argument names a mutable variable where it is passed
-    // (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
-    // (downward-only)"): a bare variable whose own type is `Mut`, read through the
-    // A-normalization temps naming it ([`written_variable`]). A computed argument
-    // (`bump(x if c else y)`) has no one introduction to write, and a plain `x` holds no
-    // mutable variable for the caller to observe the write through.
-    if param_ty
-        .as_ref()
-        .is_some_and(|param| param.mut_value_type().is_some())
-    {
-        let refused = match written_variable(argument, ctx) {
-            TempNames::Computed => Some(InferError::MutNotBareVariable {
-                at: symbolic(argument),
-            }),
-            TempNames::Variable(_, ty) if ty.mut_value_type().is_none() => {
-                Some(InferError::MutArgNotMutable {
-                    at: symbolic(argument),
-                })
-            }
-            // The callee may read and write the variable, so the call does, whether or not the
-            // callee does (`docs/chl-spec.md`, "Discharging requirements and effects"). Passing
-            // a transactional variable needs no transaction: the callee writes it in a block of
-            // its own, or requires one.
-            TempNames::Variable(variable, _) => {
-                ctx.record_capability(Capability::Requires(Requirement::read(variable.clone())));
-                ctx.record_capability(Capability::Causes(Effect::Write(variable)));
-                None
-            }
-        };
-        if let Some(error) = refused {
-            return Err(LocatedInferError::new(error, argument.node_id()));
-        }
-    }
-    let arg_ty = match (param_ty, raw_arg_ty.mut_value_type()) {
-        // A handle reaching its pass-by-reference parameter: invariance relates the two
-        // value types directly, in both directions.
-        (Some(param), Some(_)) if param.mut_value_type().is_some() => raw_arg_ty,
-        // A mutable variable an A-normalization temp names, which the check above passed:
-        // the temp holds the variable's value. So the value edge is emitted here, against
-        // the parameter's value, rather than left to the relation. A value meeting a handle
-        // is not a subtyping fact, and making it one is what put a coercion back in the
-        // lattice: the rule that knows this position is pass-by-reference is the rule that
-        // should read through the handle. The application edge below then relates handle
-        // to handle.
-        (Some(param), None) if param.mut_value_type().is_some() => {
-            let value = param
-                .mut_value_type()
-                .expect("guarded by the match arm")
-                .clone();
-            let read = read_value(argument, &raw_arg_ty, ctx);
-            ctx.require_sub(&read, &value, &|| "pass-by-reference argument".to_string())?;
-            param
-        }
-        // A feed reaching a `Feed` parameter: the callee may feed it, so the call does, as
-        // for a `Mut` parameter.
-        (Some(param), None) if param.as_feed().is_some() && raw_arg_ty.as_feed().is_some() => {
-            if let TypedExprNode::Var(a) = &argument.node {
-                ctx.record_capability(Capability::Causes(Effect::Append(a.clone())));
-            }
-            raw_arg_ty
-        }
-        // Every other position is a value position, so a mutable variable mention reads. A
-        // feed is passed as the handle it is: the parameter's constraints decide whether
-        // the callee feeds it or reads it.
-        _ => read_passed(argument, &raw_arg_ty, ctx),
+    // Deciding it here is sound because a pass-by-reference parameter is bound at its
+    // `Mut(V, D)` by the only code that mints one (`lower::functions::lower_params`). A call
+    // of several arguments passes each component of its tuple to one parameter.
+    // The tuple's rule passed each argument to its parameter already.
+    let arg_ty = if passed {
+        raw_arg_ty
+    } else {
+        let param_ty = parameter_type(function, &fn_ty).cloned();
+        passed_argument(argument, &raw_arg_ty, param_ty.as_ref(), ctx)?
     };
     // The application's type is the function's codomain with its Pi binder
     // discharged to the argument (dependent application, design §5). `apply`
@@ -1408,7 +1451,12 @@ pub(super) fn emit_apply<C: Typing>(
         TypedExprNode::Proj(key @ ProjKey::Index(_)) => projection(key),
         _ => "this call".to_string(),
     };
-    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| at.clone());
+    if ctx.reads_argument_lists() {
+        call_arity(function, &fn_ty, list)?;
+    }
+    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), list, &|| {
+        at.clone()
+    });
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;
     }
@@ -1426,6 +1474,40 @@ pub(super) fn emit_apply<C: Typing>(
         }),
         _ => applied,
     }
+}
+
+/// Refuse a call whose function is known to take a parameter list of another length than the
+/// arguments it passes: `list` is the length of the call's argument list, or `None` for one
+/// argument. Functions are never partially applied, and a tuple passed as one argument does not
+/// spread over a parameter list (`docs/chl-spec.md`, "Parameter lists"). A function known only
+/// once inference solves it fails its application's function edge instead
+/// ([`InferError::CallArity`]'s hint).
+fn call_arity(function: &Expr, fn_ty: &Type, list: Option<usize>) -> Result<(), LocatedInferError> {
+    if matches!(
+        function.node,
+        TypedExprNode::Builtin(_) | TypedExprNode::Method { .. }
+    ) {
+        return Ok(());
+    }
+    let Type::Fun { binder, .. } = fn_ty.peel_refinements() else {
+        return Ok(());
+    };
+    let params = binder.parameter_count();
+    if params == list {
+        return Ok(());
+    }
+    let function_name = match &function.node {
+        TypedExprNode::Var(name) => name.source_spelling().map(str::to_string),
+        _ => None,
+    };
+    Err(LocatedInferError::new(
+        InferError::CallArity {
+            function: function_name,
+            params: params.unwrap_or(1),
+            args: list.unwrap_or(1),
+        },
+        function.node_id(),
+    ))
 }
 
 /// Check the key against the collection domain's base and return the supplied value type.
@@ -1611,7 +1693,7 @@ fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
         _ => collection.clone(),
     };
     let Type::Fun {
-        name,
+        binder,
         domain,
         codomain,
         ..
@@ -1623,7 +1705,11 @@ fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     // discharge is computed or read back is the context's call. A codomain that names it in
     // neither reference form makes the discharge vacuous, so this needs no dependence test
     // of its own ([`crate::ccl::subst::discharge_codomain`]).
-    Some(((**domain).clone(), name.clone(), (**codomain).clone()))
+    Some((
+        (**domain).clone(),
+        binder.whole().cloned(),
+        (**codomain).clone(),
+    ))
 }
 
 /// Record an operator's single obligation and give back its result type.
@@ -1720,18 +1806,128 @@ fn refine_result(
     refinement.refine(result, &operands)
 }
 
-/// The declared parameter type an argument is passed at, or `None` when the callee is
-/// opaque here.
+/// Type the function of an application: a function position is a value position, so a
+/// mutable variable mention there reads (`src/ccl/design/mutability.md`, "A mutable variable
+/// read is an explicit operation"). Undereffed it meets the demand `fn_ty <: (x: d) ⇒
+/// result` as a mismatch, the relation relating a mutable variable only to another.
+fn emit_function<C: Typing>(function: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
+    let fn_ty = ctx.subexpr(function)?;
+    Ok(read_value(function, &fn_ty, ctx))
+}
+
+/// The argument list `argument` is ([`TypedExprNode::Arguments`]), under the `let`s
+/// A-normalization puts around a call's argument to name its operands, with its length. A check
+/// meets every list as the tuple inference rewrote it to (`erased`), whose components pass to
+/// the callee's parameters alike.
+fn argument_tuple(argument: &Expr, erased: bool) -> Option<(NodeId, usize)> {
+    match &argument.node {
+        TypedExprNode::Arguments(components) => Some((argument.node_id(), components.len())),
+        TypedExprNode::Tuple(components) if erased => Some((argument.node_id(), components.len())),
+        TypedExprNode::Let { body, .. } => argument_tuple(body, erased),
+        _ => None,
+    }
+}
+
+/// The types of the `width` parameters a domain `param` is the product of, when it is one
+/// (`Type::params_domain`). A dependent tuple's components read the ones before them by
+/// index, which a by-reference test of their head does not open.
+fn param_components(param: &Type, width: usize) -> Option<Vec<Type>> {
+    match param.peel_refinements() {
+        Type::Tuple(ts) if ts.len() == width => Some(ts.clone()),
+        Type::DepTuple(cs) if cs.len() == width => {
+            Some(cs.iter().map(|(_, t)| t.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+/// The type `argument`, of type `raw`, passes to a parameter of type `param`.
 ///
-/// An n-ary surface call lowers to a **curried** `Apply` spine — `f(a, b)` is
-/// `Apply(Apply(f, a), b)` — and [`Typing::apply`] types every application as a *fresh
-/// variable*, so the type of the function being applied is a bare `Infer` for every
-/// argument after the first. The head of the spine is the only node whose type spells
-/// the parameters out, so the spine's length is this argument's position and its
-/// parameter is the domain reached by peeling that many codomains.
-///
-/// `fn_ty` is the applied function's freshly-emitted type, used when `function` *is*
-/// the head, so this does not depend on the writeback having landed.
+/// A pass-by-reference parameter's argument names a mutable variable where it is passed
+/// (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class
+/// (downward-only)"): a bare variable whose own type is `Mut`, read through the
+/// A-normalization temps naming it ([`written_variable`]). A computed argument
+/// (`bump(x if c else y)`) has no one introduction to write, and a plain `x` holds no
+/// mutable variable for the caller to observe the write through.
+fn passed_argument<C: Typing>(
+    argument: &Expr,
+    raw: &Type,
+    param: Option<&Type>,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    // A node under an annotation that is not a handle reads (`emit_node`), which here would
+    // read the handle this position has to pass. Only lowering annotates an expression (a
+    // source `x: T = e` annotates the binding), and it annotates generator sources, the
+    // kind stamps on `Compose` and lambda nodes, and a `**` exponent, none of which is a
+    // pass-by-reference argument.
+    debug_assert!(
+        param.is_none_or(|param| param.mut_value_type().is_none())
+            || argument.user_annotation.is_none(),
+        "a pass-by-reference argument carries no annotation, got {:?}",
+        argument.user_annotation
+    );
+    if param.is_some_and(|param| param.mut_value_type().is_some()) {
+        let refused = match written_variable(argument, ctx) {
+            TempNames::Computed => Some(InferError::MutNotBareVariable {
+                at: symbolic(argument),
+            }),
+            TempNames::Variable(_, ty) if ty.mut_value_type().is_none() => {
+                Some(InferError::MutArgNotMutable {
+                    at: symbolic(argument),
+                })
+            }
+            // The callee may read and write the variable, so the call does, whether or not the
+            // callee does (`docs/chl-spec.md`, "Discharging requirements and effects"). Passing
+            // a transactional variable needs no transaction: the callee writes it in a block of
+            // its own, or requires one.
+            TempNames::Variable(variable, _) => {
+                ctx.record_capability(Capability::Requires(Requirement::read(variable.clone())));
+                ctx.record_capability(Capability::Causes(Effect::Write(variable)));
+                None
+            }
+        };
+        if let Some(error) = refused {
+            return Err(LocatedInferError::new(error, argument.node_id()));
+        }
+    }
+    Ok(match (param, raw.mut_value_type()) {
+        // A handle reaching its pass-by-reference parameter: invariance relates the two
+        // value types directly, in both directions.
+        (Some(param), Some(_)) if param.mut_value_type().is_some() => raw.clone(),
+        // A mutable variable an A-normalization temp names, which the check above passed:
+        // the temp holds the variable's value. So the value edge is emitted here, against
+        // the parameter's value, rather than left to the relation. A value meeting a handle
+        // is not a subtyping fact, and making it one is what put a coercion back in the
+        // lattice: the rule that knows this position is pass-by-reference is the rule that
+        // should read through the handle. The application edge below then relates handle
+        // to handle.
+        (Some(param), None) if param.mut_value_type().is_some() => {
+            let value = param
+                .mut_value_type()
+                .expect("guarded by the match arm")
+                .clone();
+            let read = read_value(argument, raw, ctx);
+            ctx.require_sub(&read, &value, &|| "pass-by-reference argument".to_string())?;
+            param.clone()
+        }
+        // A feed reaching a `Feed` parameter: the callee may feed it, so the call does, as
+        // for a `Mut` parameter.
+        (Some(param), None) if param.as_feed().is_some() && raw.as_feed().is_some() => {
+            if let TypedExprNode::Var(a) = &argument.node {
+                ctx.record_capability(Capability::Causes(Effect::Append(a.clone())));
+            }
+            raw.clone()
+        }
+        // Every other position is a value position, so a mutable variable mention reads. A
+        // feed is passed as the handle it is: the parameter's constraints decide whether
+        // the callee feeds it or reads it.
+        _ => read_passed(argument, raw, ctx),
+    })
+}
+
+/// The domain of the function an application's `function`, of type `fn_ty`, applies: read off
+/// the head of a spine of applications, `f(a)(b)`, whose type states the functions each
+/// application returns where the applied type is a variable.
 fn parameter_type<'t>(function: &'t Expr, fn_ty: &'t Type) -> Option<&'t Type> {
     let mut head = function;
     let mut applied = 0usize;
@@ -1830,6 +2026,19 @@ pub(super) fn emit_tuple<C: Typing>(
     elts: &mut [Expr],
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    // A call's arguments, which its callee takes some of by reference: each passes to its
+    // parameter ([`passed_argument`]), a mutable variable's handle to a `Mut` parameter.
+    if let Some(params) = ctx.take_arguments(ctx.current_node()) {
+        let mut fields = BTreeMap::new();
+        for ((i, e), param) in elts.iter_mut().enumerate().zip(&params) {
+            let raw = ctx.subexpr(e)?;
+            fields.insert(
+                FieldKey::Index(i),
+                passed_argument(e, &raw, Some(param), ctx)?,
+            );
+        }
+        return Ok(product(fields));
+    }
     let mut fields = BTreeMap::new();
     for (i, e) in elts.iter_mut().enumerate() {
         // A bare mutable read in a tuple denotes its *value* (reads deref, design
@@ -2227,7 +2436,10 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // opened at that one name and related under it, so the joined codomain is minted where
     // the binder is in scope.
     let binder = match recorded.peel_refinements() {
-        Type::Fun { name: Some(b), .. } => Some(b.clone()),
+        Type::Fun {
+            binder: FunBinder::Whole(b),
+            ..
+        } => Some(b.clone()),
         _ => None,
     };
     let dom_var = ctx.fresh();
@@ -2255,6 +2467,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
             Some(b) if crate::ccl::subst::references_enclosing_function(&cod) => {
                 crate::ccl::subst::open_pi_binder(
                     &crate::ccl::subst::Mapping::Rename(b.clone()),
+                    &dom,
                     &cod,
                 )
             }
@@ -2283,7 +2496,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // read is a collection: the node *is* the merged map.
     let fun_kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     Ok(ctx.requantify_opened(Type::Fun {
-        name: binder,
+        binder: binder.into(),
         fun_kind,
         domain: Box::new(dom_var),
         codomain: Box::new(cod_var),
@@ -2832,6 +3045,11 @@ fn emit_let_bound<C: Typing>(
     let mut at_annotation = false;
     // The type the variable is bound at over the body.
     let annotation = binding.user_annotation.as_ref();
+    let _completion = crate::ccl::provenance::enter(
+        bound_expr.node_id(),
+        "infer.annotation_completion",
+        crate::ccl::provenance::Nature::Machinery,
+    );
     let scheme_ty = match annotation.map(|a| &a.ty) {
         // An annotation whose predicates did not type declares nothing usable.
         Some(_) if !annotation_typed => {
@@ -3338,25 +3556,7 @@ pub(super) fn emit_proj<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let (domain, codomain) = ctx.provide_function(node_ty, &|| projection(key))?;
     let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
-    // A dependent tuple's component is its type opened at the earlier components
-    // of the projected value (`src/ccl/design/type-inference.md`, "Projection"),
-    // and the projection's Pi binder names that value.
-    if let (ProjKey::Index(k), Type::DepTuple(components)) = (key, domain.peel_refinements()) {
-        // A component that reads no earlier one opens at nothing, so an unnamed projection
-        // needs no binder for it; one that does needs the projection's.
-        let binder = match node_ty.peel_refinements() {
-            Type::Fun { name: Some(b), .. } => b.clone(),
-            _ => {
-                assert!(
-                    !components.get(*k).is_some_and(|(_, c)| {
-                        crate::ccl::subst::references_binder_within(c, *k as u32)
-                    }),
-                    "`.{k}` out of the dependent tuple {domain} reads earlier components, but \
-                     its type {node_ty} names no binder for the tuple"
-                );
-                Name::fresh("__proj")
-            }
-        };
+    if let (ProjKey::Index(k), Type::DepTuple(_)) = (key, domain.peel_refinements()) {
         let _g = crate::ccl::provenance::enter(
             node_id,
             "check.dependent_projection",
@@ -3364,14 +3564,19 @@ pub(super) fn emit_proj<C: Typing>(
         );
         // An index past the last component has no type; it falls to the plain tuple's
         // requirement below, which reports it as it does an index past a `Tuple`'s end.
-        if let Some(component) = domain.component_type(*k, |j, ty| {
-            Expr::apply(
-                Expr::var(&binder).with_ty(domain.clone()),
-                Expr::proj_index(j).with_ty(Type::fun(domain.clone(), ty.clone())),
-            )
-            .with_ty(ty.clone())
-        }) {
-            ctx.require_sub(&component, &codomain, &|| projection(key))?;
+        let binder = match node_ty.peel_refinements() {
+            Type::Fun {
+                binder: FunBinder::Whole(b),
+                ..
+            } => b.clone(),
+            _ => Name::fresh("__proj"),
+        };
+        if let Some(component) =
+            domain.component_type(*k, |j, _| Expr::projection(&binder, &domain, j))
+        {
+            ctx.scoped(&binder, &domain, |ctx| {
+                ctx.require_sub(&component, &codomain, &|| projection(key))
+            })?;
             return Ok(node_ty.clone());
         }
     }
@@ -3394,7 +3599,7 @@ pub(super) fn emit_list<C: Typing>(
     // `Data` over it.
     let fun_kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     let fun_ty = |domain, codomain| Type::Fun {
-        name: None,
+        binder: FunBinder::None,
         fun_kind: fun_kind.clone(),
         domain: Box::new(domain),
         codomain: Box::new(codomain),
@@ -4555,7 +4760,7 @@ fn compose_chain<C: Typing>(
     }
     let cod = crate::ccl::subst::open_codomain(&ty, &cod);
     let own = match ty.peel_refinements() {
-        Type::Fun { name, .. } => name.clone(),
+        Type::Fun { binder, .. } => binder.whole().cloned(),
         _ => None,
     };
     let here = own.clone().map(|b| (b, dom.clone()));
@@ -4590,7 +4795,7 @@ pub(super) fn emit_compose<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     assert!(elts.len() >= 2, "Compose requires at least two elements");
     let recorded_binder = match recorded.peel_refinements() {
-        Type::Fun { name, .. } => name.clone(),
+        Type::Fun { binder, .. } => binder.whole().cloned(),
         _ => None,
     };
     let ChainEnds {
@@ -4645,7 +4850,9 @@ pub(super) fn emit_compose<C: Typing>(
                     item,
                 ));
             ctx.scoped(&position, &first_dom, |ctx| {
-                ctx.apply(&last_ty, item, &at, None, &|| "this expression".to_string())
+                ctx.apply(&last_ty, item, &at, None, None, &|| {
+                    "this expression".to_string()
+                })
             })?
         }
         _ => cod,
@@ -4696,7 +4903,7 @@ pub(super) fn emit_compose<C: Typing>(
         Type::pi_kinded(position, first_dom, cod, fun_kind).with_capabilities(capabilities)
     } else {
         Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind,
             domain: Box::new(first_dom),
             codomain: Box::new(cod),
@@ -4745,7 +4952,7 @@ pub(super) fn writer_tap_histories(
     node_id: NodeId,
 ) -> Vec<(Label, Type)> {
     let Type::Fun {
-        name: binder,
+        binder,
         domain: body_dom,
         codomain,
         ..
@@ -4780,7 +4987,7 @@ pub(super) fn writer_tap_histories(
                 domain
             };
             let Some(p) = binder
-                .as_ref()
+                .whole()
                 .filter(|p| crate::ccl::subst::type_free_vars(t).contains(*p))
             else {
                 return (f.clone(), crate::ccl::ccl_utils::history_ty(domain, t));
@@ -4915,9 +5122,13 @@ fn emit_transact_writer<C: Typing>(
                 .as_function(&s_ty, &|| "the transaction's source".to_string())?
                 .1;
             match (s_ty.peel_refinements(), half(0)) {
-                (Type::Fun { name: Some(e), .. }, Some(first)) => {
-                    crate::ccl::subst::discharge_codomain(e, &first, &codomain)
-                }
+                (
+                    Type::Fun {
+                        binder: FunBinder::Whole(e),
+                        ..
+                    },
+                    Some(first),
+                ) => crate::ccl::subst::discharge_codomain(e, &first, &codomain),
                 _ => codomain,
             }
         }
@@ -4925,9 +5136,13 @@ fn emit_transact_writer<C: Typing>(
     };
     let (_d, item) = ctx.as_function(&s_ty, &|| "the transaction's source".to_string())?;
     let item = match (s_ty.peel_refinements(), half(1)) {
-        (Type::Fun { name: Some(k), .. }, Some(second)) => {
-            crate::ccl::subst::discharge_codomain(k, &second, &item)
-        }
+        (
+            Type::Fun {
+                binder: FunBinder::Whole(k),
+                ..
+            },
+            Some(second),
+        ) => crate::ccl::subst::discharge_codomain(k, &second, &item),
         _ => item,
     };
 

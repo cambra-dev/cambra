@@ -321,6 +321,7 @@ pub(super) fn keys_family(
     let x = name.clone().unwrap_or_else(|| Name::fresh("__x"));
     let component = crate::ccl::subst::open_pi_binder(
         &crate::ccl::subst::Mapping::Rename(x.clone()),
+        enclosing,
         component,
     );
     // **A projection through the row**: the inner collection is a sum the row holds, whose
@@ -688,7 +689,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
         return Ok(true);
     }
     let Type::Fun {
-        name,
+        binder,
         fun_kind,
         domain,
         codomain,
@@ -708,12 +709,12 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
     let old_domain = (**domain).clone();
     // The binder stays: a row whose keys depend on the pair reads it in the codomain, which
     // is stored closed against it.
-    let name = name.clone();
+    let binder = binder.clone();
     let fun_kind = fun_kind.clone();
     let codomain = (**codomain).clone();
     retype_subtree(g, &old_domain, &pair_ty);
     g.ty = Type::Fun {
-        name: name.clone(),
+        binder: binder.clone(),
         fun_kind,
         domain: Box::new(pair_ty.clone()),
         codomain: codomain.clone().into(),
@@ -732,7 +733,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
             Type::fun(pair_ty.clone(), pair_ty.clone()),
         );
         chain = compose(filter, chain).with_ty(Type::Fun {
-            name: name.clone(),
+            binder: binder.clone(),
             fun_kind: crate::ccl::FunKind::Compute,
             domain: Box::new(pair_ty.clone()),
             codomain: Box::new(codomain.clone()),
@@ -770,8 +771,11 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
         return Ok(false);
     };
     let a = first_name.clone().unwrap_or_else(|| Name::fresh("__x"));
-    let second =
-        crate::ccl::subst::open_pi_binder(&crate::ccl::subst::Mapping::Rename(a.clone()), second);
+    let second = crate::ccl::subst::open_pi_binder(
+        &crate::ccl::subst::Mapping::Rename(a.clone()),
+        first,
+        second,
+    );
     let filters: Vec<crate::ccl::Refinement> = second
         .refinements()
         .iter()
@@ -836,9 +840,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
     // codomain, which is stored closed against it. A generic type is read at its body
     // (`crate::ccl::generalize::close_free_params` closes what is built from it).
     let Type::Fun {
-        name: binder,
-        codomain,
-        ..
+        binder, codomain, ..
     } = crate::ccl::generalize::opened(&chain.ty).clone()
     else {
         unreachable!("matched a function")
@@ -858,7 +860,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
         )?;
         let filter = apply_primitive(p, Builtin::FilterValues, kept.clone());
         chain = compose(filter, chain).with_ty(Type::Fun {
-            name: binder.clone(),
+            binder: binder.clone(),
             fun_kind: crate::ccl::FunKind::Compute,
             domain: Box::new(product.clone()),
             codomain: codomain.clone(),

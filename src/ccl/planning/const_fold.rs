@@ -342,7 +342,7 @@ fn gate_operand_at(
         let ty = match whole {
             Some(whole) => whole.clone(),
             None => Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: fun_kind.clone(),
                 domain: domain.clone(),
                 codomain: Box::new(logic.ty.codomain()?),

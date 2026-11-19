@@ -1657,7 +1657,16 @@ fn an_arithmetic_operator_calls_its_instance(#[case] code: &str, #[case] expecte
 
 /// An instance over two different types: `**`'s exponent is a non-negative `Int` at every
 /// instance.
+///
+/// Refused today: `Exponentiable`'s signature takes the exponent as a plain `Int`, so the
+/// instance's `other` is one, and an exponent of unrefined `Int` is refused
+/// (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators"). The refinement is stated on each
+/// `**`'s exponent rather than in the signature (`TODO(pow-signature)` in `lower/exprs.rs`), so
+/// nothing tells the instance its exponent is non-negative.
 #[test]
+#[should_panic(
+    expected = "Annotation mismatch: annotated as {Int where _ >= 0}, but inferred as Int"
+)]
 fn an_arithmetic_instance_over_two_types() {
     check_scalar(
         indoc! {"

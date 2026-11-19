@@ -180,7 +180,7 @@ fn shuffle(rng: &mut Rng, n: usize) -> Vec<usize> {
 #[test]
 fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
     let fun_over = |fun_kind: FunKind| Type::Fun {
-        name: None,
+        binder: cambra::ccl::FunBinder::None,
         fun_kind,
         domain: Box::new(Type::UIntRange(3)),
         codomain: Box::new(Type::Base(BaseType::Int)),

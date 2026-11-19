@@ -95,7 +95,9 @@ use crate::ccl::ccl_utils::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
-use crate::ccl::{Branch, Name, PredicateId, Type, TypedBinding, TypedExpr, TypedExprNode};
+use crate::ccl::{
+    Branch, FunBinder, Name, PredicateId, Type, TypedBinding, TypedExpr, TypedExprNode,
+};
 
 /// A term binder name.
 pub type Binder = Name;
@@ -1150,6 +1152,15 @@ impl Subst {
         }
     }
 
+    /// Whether this discharges a binder to a value: a term whose type is no mutable variable's
+    /// or feed's handle. A handle passed to a parameter is the parameter, which a closure may
+    /// read as a correspondence; a value is not.
+    pub fn discharges_a_value(&self) -> bool {
+        self.binders.values().any(|m| {
+            matches!(m, Mapping::Discharge(term) if term.ty.peel_refinements().history_parts().is_none())
+        })
+    }
+
     /// Split into the rename entries and the discharge entries — a variant
     /// partition, exact by construction (see [`Mapping`]). The two act on
     /// disjoint binders, so the original is their parallel union; this is the
@@ -1498,6 +1509,24 @@ impl Subst {
     pub fn aligned(&self, from: &Option<Name>, to: &Option<Name>) -> Subst {
         match (from, to) {
             (Some(k), Some(x)) => self.extended_rename(k, x),
+            _ => self.clone(),
+        }
+    }
+
+    /// [`aligned`](Self::aligned) for two functions' binders: a codomain read under `from`
+    /// crosses into the scope of `to`, name for name, a whole input's or each parameter's of two
+    /// lists of one length. Binders of other shapes share no name: two functions of different
+    /// parameter lists do not relate.
+    pub fn aligned_binders(&self, from: &FunBinder, to: &FunBinder) -> Subst {
+        match (from, to) {
+            (FunBinder::Whole(k), FunBinder::Whole(x)) => self.extended_rename(k, x),
+            (FunBinder::Parameters(ks), FunBinder::Parameters(xs)) if ks.len() == xs.len() => ks
+                .iter()
+                .zip(xs)
+                .fold(self.clone(), |s, (k, x)| match (k, x) {
+                    (Some(k), Some(x)) => s.extended_rename(k, x),
+                    _ => s,
+                }),
             _ => self.clone(),
         }
     }
@@ -1948,6 +1977,26 @@ impl Subst {
         self.witness_mappings().any(|(k, _)| k == w)
     }
 
+    /// The component `x ▷ .𝑖` is, where `e` is that projection and this substitution discharges
+    /// `x` to a tuple former: a template, as a discharge's term is.
+    fn discharged_component(&self, e: &TypedExpr) -> Option<TypedExpr> {
+        let TypedExprNode::Apply { function, argument } = &e.node else {
+            return None;
+        };
+        let (TypedExprNode::Proj(crate::ccl::ProjKey::Index(i)), TypedExprNode::Var(n)) =
+            (&function.node, &argument.node)
+        else {
+            return None;
+        };
+        let Some(Mapping::Discharge(term)) = self.binders.get(n) else {
+            return None;
+        };
+        let TypedExprNode::Tuple(parts) = &term.node else {
+            return None;
+        };
+        parts.get(*i).map(TypedExpr::clone_preserving_ids)
+    }
+
     fn apply_expr_inner(&self, e: &TypedExpr) -> TypedExpr {
         use TypedExprNode::*;
         // Transport mode *builds*: it returns a new `TypedExpr` rather than
@@ -1961,6 +2010,12 @@ impl Subst {
             "subst.transport",
             crate::ccl::provenance::Nature::Machinery,
         );
+        // A projection of a binder discharged to a tuple former is that former's component:
+        // a function of several parameters applied to the tuple of its arguments reads each
+        // parameter as its argument.
+        if let Some(component) = self.discharged_component(e) {
+            return Mapping::Discharge(Rc::new(component)).as_expr(&e.ty);
+        }
         let node = match &e.node {
             Var(n) => match self.binders.get(n) {
                 // A renamed reference stands where the occurrence stood, so it takes the
@@ -2036,14 +2091,16 @@ impl Subst {
                 }
             }
 
-            Lambda { param, body } => {
-                // Domain refinements ride the param's *type* (a
-                // `Type::Refinement`); `apply_type_slots` rewrites that slot
+            Lambda { params, body } => {
+                // Domain refinements ride each param's *type* (a
+                // `Type::Refinement`); `apply_type_slots` rewrites those slots
                 // below, under the unrestricted substitution.
-                let inner = self.under_binder(&param.name, body);
+                let inner = params
+                    .iter()
+                    .fold(self.clone(), |s, p| s.under_binder(&p.name, body));
                 let body = Box::new(inner.apply_expr(body));
-                let param = param.clone();
-                Lambda { param, body }
+                let params = params.clone();
+                Lambda { params, body }
             }
 
             // The loop target binds only in the body; the source sees the
@@ -2159,9 +2216,10 @@ impl Subst {
             position, target, ..
         } = &mut e.node
         {
-            target.ty = self.under_binder_ty(position, &target.ty);
+            let binder = FunBinder::Whole(position.as_ref().clone());
+            target.ty = self.under_binders_ty(&binder, &target.ty);
             if let Some(annotation) = &mut target.user_annotation {
-                annotation.ty = self.under_binder_ty(position, &annotation.ty);
+                annotation.ty = self.under_binders_ty(&binder, &annotation.ty);
             }
         }
     }
@@ -2309,6 +2367,13 @@ impl Subst {
             .keys()
             .any(|k| is_free(k, e) || crate::ccl::capabilities::names_in_tree(k, e))
         {
+            return;
+        }
+        // A projection of a binder discharged to a tuple former is that former's component,
+        // built at the projection's own id as a replaced `Var` is.
+        if let Some(component) = self.discharged_component(e) {
+            *e = Mapping::Discharge(Rc::new(component)).as_expr_preserving(e.node_id, &e.ty);
+            e.absorb_children_capabilities();
             return;
         }
         // A mapped `Var` is replaced wholesale (the replacement carries its
@@ -2486,7 +2551,7 @@ impl Subst {
             Type::History { function, .. } => self.rewrite_type_go(function, memo),
 
             Type::Fun {
-                name: None,
+                binder: FunBinder::None,
                 fun_kind,
                 domain,
                 codomain,
@@ -2505,7 +2570,7 @@ impl Subst {
             }
 
             Type::Fun {
-                name: Some(b),
+                binder,
                 fun_kind,
                 domain,
                 codomain,
@@ -2519,10 +2584,13 @@ impl Subst {
                 }
                 self.rewrite_type_go(domain, memo);
                 // Restricted to the entries that act on the codomain, as the structural mode's
-                // [`Self::under_binder_ty`] is: a range naming the binder captures only where
+                // [`Self::under_binders_ty`] is: a range naming the binder captures only where
                 // the substitution reaches inside.
-                let restricted = self.shadow(b).acting_on_type(codomain);
-                restricted.assert_no_capture(b);
+                let restricted = binder
+                    .names()
+                    .fold(self.clone(), |s, b| s.shadow(b))
+                    .acting_on_type(codomain);
+                binder.names().for_each(|b| restricted.assert_no_capture(b));
                 restricted.rewrite_type_go(codomain, memo);
             }
 
@@ -2848,13 +2916,13 @@ impl Subst {
                     .insert(0, Elim::Kind(Rc::clone(k), Rc::clone(c)));
                 match into_kind.apply_type_inner(ty) {
                     Type::Fun {
-                        name,
+                        binder,
                         domain,
                         codomain,
                         capabilities,
                         ..
                     } => Type::Fun {
-                        name,
+                        binder,
                         fun_kind: FunKind::Data(None),
                         domain,
                         codomain,
@@ -2934,13 +3002,13 @@ impl Subst {
             Type::ChanDom(name, lvl) => Type::ChanDom(self.handle_target(name), *lvl),
 
             Type::Fun {
-                name: None,
+                binder: FunBinder::None,
                 fun_kind,
                 domain,
                 codomain,
                 capabilities,
             } => Type::Fun {
-                name: None,
+                binder: FunBinder::None,
                 fun_kind: self.apply_fun_kind(fun_kind),
                 domain: Box::new(self.apply_domain(fun_kind, domain)),
                 codomain: Box::new(self.apply_type(codomain)),
@@ -2948,16 +3016,16 @@ impl Subst {
             },
 
             Type::Fun {
-                name: Some(b),
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 capabilities,
             } => {
                 let domain = Box::new(self.apply_domain(fun_kind, domain));
-                let inner = self.under_binder_ty(b, codomain);
+                let inner = self.under_binders_ty(binder, codomain);
                 Type::Fun {
-                    name: Some(b.clone()),
+                    binder: binder.clone(),
                     fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
@@ -3140,12 +3208,15 @@ impl Subst {
         }
     }
 
-    /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder):
-    /// shadow the Pi binder in `codomain`. Capture is asserted unreachable
-    /// for the same reason (see `under_binder`).
-    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> Type {
-        let restricted = self.shadow(binder).acting_on_type(codomain);
-        restricted.assert_no_capture(binder);
+    /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder): shadow every name of
+    /// a function's `binder` in `codomain`. Capture is asserted unreachable for the same reason
+    /// (see `under_binder`).
+    fn under_binders_ty(&self, binder: &FunBinder, codomain: &Type) -> Type {
+        let restricted = binder
+            .names()
+            .fold(self.clone(), |s, b| s.shadow(b))
+            .acting_on_type(codomain);
+        binder.names().for_each(|b| restricted.assert_no_capture(b));
         restricted.apply_type(codomain)
     }
 }
@@ -3380,7 +3451,7 @@ pub fn type_contains_infer(ty: &Type) -> bool {
 pub fn name_spelled_stored_binders(ty: &Type) -> Vec<Binder> {
     fn go(ty: &Type, out: &mut Vec<Binder>, visited: &mut BTreeSet<PredicateId>) {
         if let Type::Fun {
-            name: Some(b),
+            binder: FunBinder::Whole(b),
             codomain,
             ..
         } = ty
@@ -3461,21 +3532,22 @@ pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
         "a `PiBound` is a reference, never a binder, so nothing abstracts over \
          one: closing at one would rewrite references to an unrelated function",
     );
-    if !is_free_in_type(binder, ty) {
-        return ty.clone();
-    }
-    let enclosing = [Some(binder.clone())];
-    let mut out = ty.clone();
-    PiWalk::new(PiMode::Close(&enclosing)).ty(&mut out, 0);
-    out
+    close_at_binder(&FunBinder::Whole(binder.clone()), ty)
 }
 
-/// Close `ty`'s references to `binders`, the binders around it outermost first, into indices:
-/// a reference to binder `𝑗` of `𝑛` becomes `PiBound(𝑛 − 1 − 𝑗)` plus the crossings walked inside
-/// `ty`. [`close_pi_binder`] is the one-binder case, and a [`Type::Family`]'s body is closed
-/// over all its binders at once ([`Type::family`]).
-pub fn close_pi_binders(binders: &[Option<Name>], ty: &Type) -> Type {
-    if !binders.iter().flatten().any(|b| is_free_in_type(b, ty)) {
+/// Close `ty`'s references to `binder`, the binder of the function it is the codomain of, into
+/// indices ([`close_pi_binder`] for any [`FunBinder`]): the whole input's name and a projection
+/// `p.𝑗` of it, and the name of component `𝑗`, become their references.
+pub fn close_at_binder(binder: &FunBinder, ty: &Type) -> Type {
+    close_at_binders(std::slice::from_ref(binder), ty)
+}
+
+fn close_at_binders(binders: &[FunBinder], ty: &Type) -> Type {
+    if !binders
+        .iter()
+        .flat_map(FunBinder::names)
+        .any(|b| is_free_in_type(b, ty))
+    {
         return ty.clone();
     }
     let mut out = ty.clone();
@@ -3483,12 +3555,152 @@ pub fn close_pi_binders(binders: &[Option<Name>], ty: &Type) -> Type {
     out
 }
 
+/// `binder` with a fresh name for each component it leaves unnamed, the names a codomain is
+/// opened at.
+pub fn named_binder(binder: &FunBinder) -> FunBinder {
+    let named = |cs: &[Option<Name>]| -> Vec<Option<Name>> {
+        cs.iter()
+            .map(|n| Some(n.clone().unwrap_or_else(|| Name::fresh("__component"))))
+            .collect()
+    };
+    match binder {
+        FunBinder::Parameters(cs) => FunBinder::Parameters(named(cs)),
+        other => other.clone(),
+    }
+}
+
+/// `codomain`, stored under `binder` over `domain`, opened at the binder's names: a reference to
+/// the whole input becomes its name, or the tuple of the components' names, and a reference to
+/// a component becomes the component's name, or the projection of the input's name. `binder`
+/// names every component ([`named_binder`]).
+pub fn open_at_binder(binder: &FunBinder, domain: &Type, codomain: &Type) -> Type {
+    if !references_enclosing_function(codomain) {
+        return codomain.clone();
+    }
+    let mut out = codomain.clone();
+    match binder {
+        FunBinder::None => panic!(
+            "an unnamed function's codomain references it: the index has no binder to open at"
+        ),
+        FunBinder::Whole(p) => PiWalk::new(PiMode::Open(&Mapping::Rename(p.clone())))
+            .over(domain)
+            .ty(&mut out, 0),
+        FunBinder::Parameters(cs) => {
+            let names: Vec<Name> = cs
+                .iter()
+                .map(|n| {
+                    n.clone()
+                        .expect("a components binder a codomain is opened at names each one")
+                })
+                .collect();
+            PiWalk::new(PiMode::OpenComponents(&names))
+                .over(domain)
+                .ty(&mut out, 0);
+        }
+    }
+    out
+}
+
+/// The names `binder` puts in scope over a codomain, each with the type it ranges over: the
+/// whole input's over `domain`, or each component's over its component of `domain`, a
+/// dependent tuple's opened at the names before it. `binder` names every component
+/// ([`named_binder`]).
+pub fn binder_scope(binder: &FunBinder, domain: &Type) -> Vec<(Name, Type)> {
+    match binder {
+        FunBinder::None => Vec::new(),
+        FunBinder::Whole(p) => vec![(p.clone(), domain.clone())],
+        FunBinder::Parameters(cs) => {
+            let names: Vec<Name> = cs
+                .iter()
+                .map(|n| {
+                    n.clone()
+                        .expect("a components binder in scope names each one")
+                })
+                .collect();
+            let types: Vec<Type> = match domain.peel_refinements() {
+                Type::Tuple(ts) => ts.clone(),
+                Type::DepTuple(components) => {
+                    open_tuple_components(components, |j, _| Mapping::Rename(names[j].clone()))
+                }
+                other => vec![other.clone(); names.len()],
+            };
+            names.into_iter().zip(types).collect()
+        }
+    }
+}
+
+/// Whether `codomain`, read off a function binding `binder`, reads it — closed or
+/// name-spelled ([`codomain_depends_on`] for any [`FunBinder`]).
+pub fn binder_reads(binder: &FunBinder, codomain: &Type) -> bool {
+    references_enclosing_function(codomain) || {
+        let free = type_free_vars(codomain);
+        binder.names().any(|n| free.contains(n))
+    }
+}
+
+/// Plug `argument` in for `binder` throughout `codomain` ([`discharge_codomain`] for any
+/// [`FunBinder`]): a component reads `argument`'s component, off a tuple former or projected.
+pub fn discharge_at_binder(binder: &FunBinder, argument: &TypedExpr, codomain: &Type) -> Type {
+    match binder {
+        FunBinder::Whole(p) => discharge_codomain(p, argument, codomain),
+        FunBinder::None => codomain.clone(),
+        FunBinder::Parameters(cs) => {
+            let target = Mapping::Discharge(Rc::new(argument.clone_preserving_ids()));
+            let opened = if references_enclosing_function(codomain) {
+                open_pi_binder(&target, &argument.ty, codomain)
+            } else {
+                codomain.clone()
+            };
+            let free = type_free_vars(&opened);
+            let env: HashMap<Name, TypedExpr> = cs
+                .iter()
+                .enumerate()
+                .filter_map(|(j, n)| Some((j, n.as_ref()?)))
+                .filter(|(_, n)| free.contains(*n))
+                .map(|(j, n)| {
+                    let _g = crate::ccl::provenance::enter(
+                        argument.node_id(),
+                        "subst.discharge_component",
+                        crate::ccl::provenance::Nature::Machinery,
+                    );
+                    let ty = argument
+                        .ty
+                        .component_type(j, |k, _| TypedExpr::projection_of(argument, k))
+                        .unwrap_or(Type::Hole);
+                    let part =
+                        component_of(&target, j as u32, NodeId::PLACEHOLDER, &ty, &argument.ty);
+                    (n.clone(), part)
+                })
+                .collect();
+            if env.is_empty() {
+                opened
+            } else {
+                Subst::discharge_env_in_type(&opened, &env)
+            }
+        }
+    }
+}
+
+/// Close `ty`'s references to `binders`, the binders around it outermost first, into indices:
+/// a reference to binder `𝑗` of `𝑛` becomes `PiBound(𝑛 − 1 − 𝑗)` plus the crossings walked inside
+/// `ty`. [`close_pi_binder`] is the one-binder case, and a [`Type::Family`]'s body is closed
+/// over all its binders at once ([`Type::family`]).
+pub fn close_pi_binders(binders: &[Option<Name>], ty: &Type) -> Type {
+    let binders: Vec<FunBinder> = binders.iter().cloned().map(FunBinder::from).collect();
+    close_at_binders(&binders, ty)
+}
+
 /// A family's body, stored under `n` binders, with binder `𝑗` opened at what `at(𝑗)` maps it
 /// to, outermost first: the body reaches binder `𝑗` at `𝑛 − 1 − 𝑗` ([`Type::Family`]).
-pub fn open_family_body(n: usize, body: &Type, mut at: impl FnMut(usize) -> Mapping) -> Type {
+pub fn open_family_body(
+    binders: &[(Option<Name>, Type)],
+    body: &Type,
+    mut at: impl FnMut(usize) -> Mapping,
+) -> Type {
     let mut out = body.clone();
-    for j in 0..n {
-        out = open_pi_binder_at(&at(j), &out, (n - 1 - j) as u32);
+    let n = binders.len();
+    for (j, (_, domain)) in binders.iter().enumerate() {
+        out = open_pi_binder_at(&at(j), domain, &out, (n - 1 - j) as u32);
     }
     out
 }
@@ -3508,7 +3720,7 @@ pub fn family_at_names(family: &Type, names: &[Name]) -> Type {
         .zip(names)
         .map(|((n, _), to)| n.clone().unwrap_or_else(|| to.clone()))
         .collect();
-    let opened = open_family_body(binders.len(), body, |j| Mapping::Rename(own[j].clone()));
+    let opened = open_family_body(binders, body, |j| Mapping::Rename(own[j].clone()));
     let renames: BTreeMap<Binder, Mapping> = own
         .iter()
         .zip(names)
@@ -3574,7 +3786,7 @@ pub fn discharge_binders(binders: &[Name], ty: &Type, args: &[Rc<TypedExpr>]) ->
     })
 }
 
-/// Open the function whose codomain `ty` was just extracted from
+/// Open the function over `domain` whose codomain `ty` was just extracted from
 /// it: every [`Name::PiBound`] reference to it — index equal to the
 /// codomains crossed to reach the reference — becomes `target`. The two
 /// replacement species are the two opening sites (see
@@ -3585,9 +3797,11 @@ pub fn discharge_binders(binders: &[Name], ty: &Type, args: &[Rc<TypedExpr>]) ->
 /// bound by functions inside `ty` are strictly smaller at their references and
 /// stay untouched; no index shifts, because opening only ever removes the
 /// enclosing function.
-pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
+pub fn open_pi_binder(target: &Mapping, domain: &Type, ty: &Type) -> Type {
     let mut out = ty.clone();
-    PiWalk::new(PiMode::Open(target)).ty(&mut out, 0);
+    PiWalk::new(PiMode::Open(target))
+        .over(domain)
+        .ty(&mut out, 0);
     out
 }
 
@@ -3609,14 +3823,14 @@ pub fn walk_children_opened<'t>(
 ) {
     match ty {
         Type::Fun {
-            name: Some(b),
+            binder,
             fun_kind,
             domain,
             codomain,
             // A capability names a variable bound outside the function, never its own binder,
             // so the binder's substitution reaches no capability.
             capabilities: _,
-        } => {
+        } if !binder.is_none() => {
             for w in fun_kind.witnesses() {
                 for t in w.types() {
                     visit(&[], Cow::Borrowed(t));
@@ -3624,8 +3838,9 @@ pub fn walk_children_opened<'t>(
             }
             visit(&[], Cow::Borrowed(domain));
             if references_enclosing_function(codomain) {
-                let opened = open_pi_binder(&Mapping::Rename(b.clone()), codomain);
-                visit(&[(b.clone(), (**domain).clone())], Cow::Owned(opened));
+                let binder = named_binder(binder);
+                let opened = open_at_binder(&binder, domain, codomain);
+                visit(&binder_scope(&binder, domain), Cow::Owned(opened));
             } else {
                 visit(&[], Cow::Borrowed(codomain));
             }
@@ -3677,13 +3892,19 @@ pub fn tuple_component_names(components: &[(Option<Name>, Type)]) -> Vec<Name> {
 /// the form a rewrite of a function's codomain works in (`src/ccl/design/type-inference.md`,
 /// "Where the conversions run"). A rewrite that reads the stored form instead carries the
 /// codomain's indices under whatever crossings it adds, where they name another function.
-pub fn map_opened_codomain(binder: &Name, codomain: &mut Type, edit: impl FnOnce(&mut Type)) {
+pub fn map_opened_codomain(
+    binder: &FunBinder,
+    domain: &Type,
+    codomain: &mut Type,
+    edit: impl FnOnce(&mut Type),
+) {
     if !references_enclosing_function(codomain) {
         return edit(codomain);
     }
-    let mut opened = open_pi_binder(&Mapping::Rename(binder.clone()), codomain);
+    let binder = named_binder(binder);
+    let mut opened = open_at_binder(&binder, domain, codomain);
     edit(&mut opened);
-    *codomain = close_pi_binder(binder, &opened);
+    *codomain = close_at_binder(&binder, &opened);
 }
 
 /// A [`Type::Family`]'s stored `body` with each of its `binders` read by name, or `None` when
@@ -3696,7 +3917,7 @@ pub fn opened_family_body(binders: &[(Option<Name>, Type)], body: &Type) -> Opti
     if !references_binder_within(body, binders.len() as u32) {
         return None;
     }
-    Some(open_family_body(binders.len(), body, |j| {
+    Some(open_family_body(binders, body, |j| {
         Mapping::Rename(
             binders[j]
                 .0
@@ -3729,9 +3950,16 @@ pub fn map_opened_family_body(
 pub fn close_tuple_components(components: &mut [(Option<Name>, Type)]) {
     for k in 1..components.len() {
         let (earlier, later) = components.split_at_mut(k);
-        let enclosing: Vec<Option<Name>> = earlier.iter().map(|(n, _)| n.clone()).collect();
+        let enclosing: Vec<FunBinder> = earlier
+            .iter()
+            .map(|(n, _)| FunBinder::from(n.clone()))
+            .collect();
         let ty = &mut later[0].1;
-        if !enclosing.iter().flatten().any(|n| is_free_in_type(n, ty)) {
+        if !enclosing
+            .iter()
+            .flat_map(FunBinder::names)
+            .any(|n| is_free_in_type(n, ty))
+        {
             continue;
         }
         PiWalk::new(PiMode::Close(&enclosing)).ty(ty, 0);
@@ -3747,12 +3975,23 @@ pub fn tuple_of_components(components: Vec<(Option<Name>, Type)>) -> Vec<Type> {
         .into_iter()
         .enumerate()
         .map(|(k, (_, mut ty))| {
-            if k > 0 {
-                PiWalk::new(PiMode::Lower(k as u32)).ty(&mut ty, 0);
+            if k > 0 && references_binder_within(&ty, u32::MAX) {
+                PiWalk::new(PiMode::Shift(-(k as i32))).ty(&mut ty, 0);
             }
             ty
         })
         .collect()
+}
+
+/// Move references to binders around `ty` past `by` new binders. References to binders
+/// introduced inside `ty` keep their distances.
+pub fn weaken_pi_binders(ty: &Type, by: u32) -> Cow<'_, Type> {
+    if by == 0 || !references_binder_within(ty, u32::MAX) {
+        return Cow::Borrowed(ty);
+    }
+    let mut out = ty.clone();
+    PiWalk::new(PiMode::Shift(by.try_into().expect("binder depth fits i32"))).ty(&mut out, 0);
+    Cow::Owned(out)
 }
 
 /// Open the binder `depth` crossings out of `ty` at `target`: the
@@ -3760,9 +3999,11 @@ pub fn tuple_of_components(components: Vec<(Option<Name>, Type)>) -> Vec<Type> {
 /// a dependent tuple opens component `𝑘`'s earlier components outermost first,
 /// component `𝑗` at depth `𝑘 − 1 − 𝑗`; opening the outermost remaining binder
 /// changes no distance to the ones inside it, so no index shifts.
-pub fn open_pi_binder_at(target: &Mapping, ty: &Type, depth: u32) -> Type {
+pub fn open_pi_binder_at(target: &Mapping, domain: &Type, ty: &Type, depth: u32) -> Type {
     let mut out = ty.clone();
-    PiWalk::new(PiMode::Open(target)).ty(&mut out, depth);
+    PiWalk::new(PiMode::Open(target))
+        .over(domain)
+        .ty(&mut out, depth);
     out
 }
 
@@ -3778,7 +4019,7 @@ pub fn open_tuple_components(
     for (k, (_, component)) in components.iter().enumerate() {
         let mut ty = component.clone();
         for (j, earlier) in opened.iter().enumerate() {
-            ty = open_pi_binder_at(&at(j, earlier), &ty, (k - 1 - j) as u32);
+            ty = open_pi_binder_at(&at(j, earlier), earlier, &ty, (k - 1 - j) as u32);
         }
         opened.push(ty);
     }
@@ -3840,23 +4081,21 @@ pub fn rewrite_pairing_projections_memo(
 
 /// `codomain`, read off a function binding `fun_binder`, spelled at the name `to`: what a
 /// binder of that name sees the function return at it.
-pub fn codomain_renamed(fun_binder: Option<&Name>, to: &Name, codomain: &Type) -> Type {
-    let opened = open_codomain_at(to, codomain);
-    match fun_binder {
-        Some(b) if b != to && type_free_vars(&opened).contains(b) => {
-            Subst::rename(b.clone(), to.clone()).apply_type(&opened)
-        }
-        _ => opened,
+pub fn codomain_renamed(fun_binder: &FunBinder, domain: &Type, to: &Name, codomain: &Type) -> Type {
+    let target = FunBinder::Whole(to.clone());
+    let opened = open_at_binder(&target, domain, codomain);
+    if fun_binder.names().any(|n| is_free_in_type(n, &opened)) {
+        Subst::id()
+            .aligned_binders(fun_binder, &target)
+            .apply_type(&opened)
+    } else {
+        opened
     }
 }
 
 /// `codomain` opened at `binder`, the function it was read off binding that name.
-fn open_codomain_at(binder: &Name, codomain: &Type) -> Type {
-    if references_enclosing_function(codomain) {
-        open_pi_binder(&Mapping::Rename(binder.clone()), codomain)
-    } else {
-        codomain.clone()
-    }
+fn open_codomain_at(binder: &Name, domain: &Type, codomain: &Type) -> Type {
+    open_at_binder(&FunBinder::Whole(binder.clone()), domain, codomain)
 }
 
 /// A morphism's `codomain` in the form its *consumer* speaks: descent
@@ -3871,13 +4110,20 @@ fn open_codomain_at(binder: &Name, codomain: &Type) -> Type {
 /// so a caller with nothing to open pays a scan.
 pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
     match morphism.peel_refinements() {
-        Type::Fun { name: Some(b), .. } if references_enclosing_function(codomain) => {
-            open_pi_binder(&Mapping::Rename(b.clone()), codomain)
+        Type::Fun { binder, domain, .. }
+            if !binder.is_none() && references_enclosing_function(codomain) =>
+        {
+            open_at_binder(&named_binder(binder), domain, codomain)
         }
         _ => {
             debug_assert!(
-                !matches!(morphism.peel_refinements(), Type::Fun { name: None, .. })
-                    || !references_enclosing_function(codomain),
+                !matches!(
+                    morphism.peel_refinements(),
+                    Type::Fun {
+                        binder: FunBinder::None,
+                        ..
+                    }
+                ) || !references_enclosing_function(codomain),
                 "an unnamed function's codomain references it: the index has no \
                  binder to open at, so nothing downstream can resolve it",
             );
@@ -3891,24 +4137,35 @@ pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
 /// no key, since its target is a term rather than a name.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum ConversionKey {
-    Close(Vec<Option<Name>>),
+    Close(Vec<FunBinder>),
     Rename(Name),
+    Components(Vec<Name>),
 }
 
 /// The conversions of every [`PiWalk`] a pass runs, keyed by the predicate's allocation, the
-/// conversion, the depth and the relevant shadow ([`PiWalk::shadow_key`]). A conversion is a
-/// function of those, so occurrences that shared one predicate leave sharing one conversion
-/// however many walks reach them (`src/ccl/design/type-inference.md`, "Sharing is an
+/// conversion and its input type, binder and element depths, and the relevant shadow
+/// ([`PiWalk::shadow_key`]).
+/// A conversion is a function of those. Occurrences that shared one predicate leave sharing
+/// one conversion however many walks reach them (`src/ccl/design/type-inference.md`, "Sharing is an
 /// invariant, not an optimization detail"). Each entry keeps its origin alive, so the
 /// allocation it is keyed by is not reused while the memo stands.
 #[derive(Default)]
 struct ConversionMemo {
-    entries: HashMap<ConversionEntryKey, (Rc<TypedExpr>, Rc<TypedExpr>)>,
+    entries: HashMap<ConversionEntryKey, Vec<ConvertedPredicate>>,
 }
 
-/// A [`ConversionMemo`] entry's key: the predicate's allocation, the conversion, the depth,
-/// and the relevant shadow. The entry holds the origin, kept alive, and its conversion.
-type ConversionEntryKey = (PredicateId, ConversionKey, u32, Vec<Name>);
+#[derive(Clone)]
+struct ConvertedPredicate {
+    input: Rc<Type>,
+    // Keep the allocation that the key names alive.
+    #[allow(dead_code)]
+    origin: Rc<TypedExpr>,
+    converted: Rc<TypedExpr>,
+}
+
+/// A [`ConversionMemo`] bucket's key: the predicate's allocation, conversion, binder and element
+/// depths, and relevant shadow. Entries distinguish input types outside the memo's borrow.
+type ConversionEntryKey = (PredicateId, ConversionKey, u32, u32, Vec<Name>);
 
 thread_local! {
     static CONVERSION_MEMO: std::cell::RefCell<Option<ConversionMemo>> =
@@ -3997,15 +4254,22 @@ pub(crate) fn with_conversion_memo<R>(f: impl FnOnce() -> R) -> R {
 enum PiMode<'a> {
     /// `Var(n)` where `n` names an enclosing function becomes `Var(PiBound(k))`,
     /// `k` the codomain crossings between the reference and it: that function's
-    /// distance in the stack (innermost last, unnamed crossings as `None`)
-    /// plus the crossings walked inside the converted structure itself.
-    Close(&'a [Option<Name>]),
+    /// distance in the stack (innermost last, unnamed crossings as [`FunBinder::None`])
+    /// plus the crossings walked inside the converted structure itself. A name of a
+    /// component, and a projection `p.𝑗` of a whole binder `p`, become the reference to
+    /// component `𝑗` (`PiRef::component`).
+    Close(&'a [FunBinder]),
     /// `Var(PiBound(d))` at depth `d` becomes the target (a `Var` for a
-    /// rename, the discharged term for an application).
+    /// rename, the discharged term for an application); a reference to component `𝑗` becomes
+    /// the target's component `𝑗`.
     Open(&'a Mapping),
-    /// A reference past the structure being walked comes `n` crossings closer: the `n`
-    /// binders it crossed there are gone. One to a binder the walk is inside of is left alone.
-    Lower(u32),
+    /// `Var(PiBound(d))` at depth `d` opened at the names of the input's components: a
+    /// reference to component `𝑗` becomes the `𝑗`th name, and a read of the whole input the
+    /// tuple of them.
+    OpenComponents(&'a [Name]),
+    /// Shift references to enclosing binders by this many crossings. A negative shift
+    /// removes binders that no reference reaches. Interior binders keep their distances.
+    Shift(i32),
 }
 
 /// The shared engine under [`close_pi_binder`] and [`open_pi_binder`]: one
@@ -4033,6 +4297,8 @@ struct PiWalk<'a> {
     /// (`src/ccl/design/type-inference.md`, "Interior term binders stay
     /// named, and compare by position").
     shadowed: Vec<Name>,
+    /// The input type whose components an opening reads.
+    whole_ty: Rc<Type>,
 }
 
 impl<'a> PiWalk<'a> {
@@ -4043,7 +4309,14 @@ impl<'a> PiWalk<'a> {
             memo: HashMap::new(),
             shadowed: Vec::new(),
             elems: 0,
+            whole_ty: Rc::new(Type::Hole),
         }
+    }
+
+    /// This walk opening a projection of the input by rename over `ty`, the input's type.
+    fn over(mut self, ty: &Type) -> Self {
+        self.whole_ty = Rc::new(ty.clone());
+        self
     }
 
     // `ty` and `expr` recurse into each other through refinement predicates, one frame
@@ -4073,7 +4346,7 @@ impl<'a> PiWalk<'a> {
                 .for_each(|t| self.ty(t, depth)),
             Type::BoundedHole(t) => self.ty(t, depth),
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
@@ -4091,9 +4364,7 @@ impl<'a> PiWalk<'a> {
                 }
                 self.ty(domain, depth);
                 let base = self.shadowed.len();
-                if let Some(b) = name {
-                    self.shadowed.push(b.clone());
-                }
+                self.shadowed.extend(binder.names().cloned());
                 self.ty(codomain, depth + 1);
                 self.shadowed.truncate(base);
             }
@@ -4153,11 +4424,11 @@ impl<'a> PiWalk<'a> {
     /// the enclosing functions being closed.
     fn shadow_key(&self) -> Vec<Name> {
         match &self.mode {
-            PiMode::Open(_) | PiMode::Lower(_) => Vec::new(),
+            PiMode::Open(_) | PiMode::OpenComponents(_) | PiMode::Shift(_) => Vec::new(),
             PiMode::Close(enclosing) => self
                 .shadowed
                 .iter()
-                .filter(|n| enclosing.iter().any(|f| f.as_ref() == Some(*n)))
+                .filter(|n| enclosing.iter().any(|f| f.binds(n)))
                 .cloned()
                 .collect(),
         }
@@ -4167,18 +4438,9 @@ impl<'a> PiWalk<'a> {
     fn conversion_key(&self) -> Option<ConversionKey> {
         match &self.mode {
             PiMode::Close(enclosing) => Some(ConversionKey::Close(enclosing.to_vec())),
-            PiMode::Open(Mapping::Rename(n)) => {
-                // An opening shifts what it puts in place by the refinements entered
-                // (`Self::elems`), which this key omits. A rename target reading no element
-                // puts nothing to shift.
-                debug_assert!(
-                    n.elem_index().is_none(),
-                    "a function opened at `{n}` by rename: the cross-pass memo key omits the \
-                     refinements entered, so no rename target may read an element",
-                );
-                Some(ConversionKey::Rename(n.clone()))
-            }
-            PiMode::Open(_) | PiMode::Lower(_) => None,
+            PiMode::OpenComponents(names) => Some(ConversionKey::Components(names.to_vec())),
+            PiMode::Open(Mapping::Rename(n)) => Some(ConversionKey::Rename(n.clone())),
+            PiMode::Open(_) | PiMode::Shift(_) => None,
         }
     }
 
@@ -4188,14 +4450,19 @@ impl<'a> PiWalk<'a> {
         let shadow = self.shadow_key();
         let pass_key = self
             .conversion_key()
-            .map(|c| (Rc::as_ptr(r.held()), c, depth, shadow.clone()));
+            .map(|c| (Rc::as_ptr(r.held()), c, depth, self.elems, shadow.clone()));
         let key = (Rc::as_ptr(r.held()), depth, self.elems, shadow);
         let from_pass = pass_key.as_ref().and_then(|k| {
-            CONVERSION_MEMO.with(|m| {
+            // Type equality normalizes quoted terms and can open binders. Compare outside
+            // the memo's borrow because normalization can consult and extend this memo.
+            let candidates = CONVERSION_MEMO.with(|m| {
                 m.borrow()
                     .as_ref()
-                    .and_then(|memo| memo.entries.get(k).map(|(_, done)| Rc::clone(done)))
-            })
+                    .and_then(|memo| memo.entries.get(k).cloned())
+            });
+            candidates?
+                .into_iter()
+                .find_map(|entry| (entry.input == self.whole_ty).then_some(entry.converted))
         });
         if let Some(done) = from_pass {
             self.memo.insert(key.clone(), Rc::clone(&done));
@@ -4249,7 +4516,11 @@ impl<'a> PiWalk<'a> {
             let origin = Rc::clone(&r_origin);
             CONVERSION_MEMO.with(|m| {
                 if let Some(memo) = m.borrow_mut().as_mut() {
-                    memo.entries.insert(k, (origin, Rc::clone(&done)));
+                    memo.entries.entry(k).or_default().push(ConvertedPredicate {
+                        input: Rc::clone(&self.whole_ty),
+                        origin,
+                        converted: Rc::clone(&done),
+                    });
                 }
             });
         }
@@ -4263,37 +4534,129 @@ impl<'a> PiWalk<'a> {
     fn expr_inner(&mut self, e: &mut TypedExpr, depth: u32) {
         match &self.mode {
             PiMode::Close(enclosing) => {
+                // A projection of the whole input and a component parameter denote the
+                // same input position. Store both as a component reference.
+                let component = match &e.node {
+                    TypedExprNode::Apply { function, argument }
+                        if let TypedExprNode::Proj(crate::ccl::ProjKey::Index(j)) =
+                            &function.node
+                            && let TypedExprNode::Var(n) = &argument.node =>
+                    {
+                        match n {
+                            Name::PiBound(r) if r.component.is_none() => {
+                                let mut r = r.clone();
+                                r.component = Some(*j as u32);
+                                Some(Name::PiBound(r))
+                            }
+                            _ if !self.shadowed.contains(n) => enclosing
+                                .iter()
+                                .rev()
+                                .position(|b| matches!(b, FunBinder::Whole(p) if p == n))
+                                .map(|dist| Name::pi_component(dist as u32 + depth, *j as u32, n)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(component) = component {
+                    e.node = TypedExprNode::Var(component);
+                    self.changed += 1;
+                }
                 if let TypedExprNode::Var(n) = &e.node
                     && !self.shadowed.contains(n)
-                    && let Some(dist) = enclosing.iter().rev().position(|f| f.as_ref() == Some(n))
+                    && let Some(dist) = enclosing.iter().rev().position(|f| f.binds(n))
                 {
                     // The spelling rides along as the reference's display
                     // hint: a diagnostic that blames this refinement detached from
                     // its function has none to read a name off.
-                    e.node = TypedExprNode::Var(Name::pi_bound(dist as u32 + depth, n));
+                    let index = dist as u32 + depth;
+                    e.node = TypedExprNode::Var(match &enclosing[enclosing.len() - 1 - dist] {
+                        FunBinder::Parameters(names) => {
+                            let j = names
+                                .iter()
+                                .position(|c| c.as_ref() == Some(n))
+                                .expect("found as a component's name");
+                            Name::pi_component(index, j as u32, n)
+                        }
+                        _ => Name::pi_bound(index, n),
+                    });
                     self.changed += 1;
                     // Fall through: the occurrence's type slot may itself
                     // carry references to convert.
                 }
             }
-            PiMode::Lower(by) => {
+            PiMode::Shift(by) => {
                 if let TypedExprNode::Var(Name::PiBound(r)) = &e.node
                     && r.index >= depth
                 {
-                    debug_assert!(
-                        r.index >= depth + by,
-                        "#{} reaches one of the {by} binders being removed, at depth {depth}",
-                        r.index
-                    );
+                    let index = r.index.checked_add_signed(*by).filter(|i| *i >= depth)
+                        .expect("shifting enclosing references neither captures nor removes their binders");
                     e.node = TypedExprNode::Var(Name::PiBound(crate::ccl::names::PiRef {
-                        index: r.index - by,
+                        index,
+                        component: r.component,
                         hint: r.hint.clone(),
                     }));
                     self.changed += 1;
                     // Fall through: the occurrence's type slot may carry references too.
                 }
             }
+            PiMode::OpenComponents(names) => {
+                if let TypedExprNode::Var(Name::PiBound(r)) = &e.node
+                    && r.index == depth
+                {
+                    let _g = crate::ccl::provenance::enter(
+                        e.node_id(),
+                        "subst.open_components",
+                        crate::ccl::provenance::Nature::Machinery,
+                    );
+                    match r.component {
+                        Some(j) => e.node = TypedExprNode::Var(names[j as usize].clone()),
+                        None => {
+                            let parts = names
+                                .iter()
+                                .enumerate()
+                                .map(|(j, n)| {
+                                    let component = self
+                                        .whole_ty
+                                        .component_type(j, |k, earlier| {
+                                            TypedExpr::var(&names[k]).with_ty(earlier.clone())
+                                        })
+                                        .unwrap_or(Type::Hole);
+                                    TypedExpr::var(n.clone()).with_ty(component)
+                                })
+                                .collect();
+                            e.node = TypedExprNode::Tuple(parts);
+                        }
+                    }
+                    self.changed += 1;
+                    self.ty(&mut e.ty, depth);
+                    return;
+                }
+            }
             PiMode::Open(target) => {
+                if let TypedExprNode::Var(Name::PiBound(r)) = &e.node
+                    && r.index == depth
+                    && let Some(j) = r.component
+                {
+                    let target = *target;
+                    let mut occurrence_ty = e.ty.clone();
+                    // The projection and its type enter the surrounding refinements
+                    // together below. Open the type in that projection's own frame.
+                    let surrounding = std::mem::replace(&mut self.elems, 0);
+                    self.ty(&mut occurrence_ty, depth);
+                    self.elems = surrounding;
+                    let _g = crate::ccl::provenance::enter(
+                        e.node_id(),
+                        "subst.open_component",
+                        crate::ccl::provenance::Nature::Machinery,
+                    );
+                    *e = component_of(target, j, e.node_id, &occurrence_ty, &self.whole_ty);
+                    if self.elems > 0 && !free_elem_indices(e).is_empty() {
+                        *e = shift_elems(e, self.elems);
+                    }
+                    self.changed += 1;
+                    return;
+                }
                 if let TypedExprNode::Var(n) = &e.node
                     && n.pi_bound_index() == Some(depth)
                 {
@@ -4335,6 +4698,51 @@ impl<'a> PiWalk<'a> {
             ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
         });
         self.shadowed.truncate(base);
+    }
+}
+
+/// Component `j` of what `target` maps a function's whole input to, at the occurrence
+/// `node_id` of type `ty`: a renamed input's projection over `whole_ty`, or a discharged term's
+/// component, read off a tuple former and projected out of anything else.
+fn component_of(
+    target: &Mapping,
+    j: u32,
+    node_id: NodeId,
+    ty: &Type,
+    whole_ty: &Type,
+) -> TypedExpr {
+    let project = |tuple: TypedExpr| {
+        let mut proj = TypedExpr::proj_index(j as usize);
+        proj.ty = tuple
+            .ty
+            .projection_type(j as usize)
+            .unwrap_or_else(|| match &tuple.node {
+                TypedExprNode::Var(name) => Type::fun_over(
+                    name.clone(),
+                    tuple.ty.clone(),
+                    ty.clone(),
+                    crate::ccl::FunKind::Compute,
+                ),
+                _ => Type::fun(tuple.ty.clone(), weaken_pi_binders(ty, 1).into_owned()),
+            });
+        TypedExpr::preserve(
+            node_id,
+            TypedExprNode::Apply {
+                function: Box::new(proj),
+                argument: Box::new(tuple),
+            },
+        )
+        .with_ty(ty.clone())
+    };
+    match target {
+        Mapping::Rename(to) => project(TypedExpr::var(to.clone()).with_ty(whole_ty.clone())),
+        Mapping::Discharge(t) => match &t.node {
+            TypedExprNode::Tuple(parts) if (j as usize) < parts.len() => {
+                parts[j as usize].clone_at(node_id)
+            }
+            _ => project((**t).clone()),
+        },
+        Mapping::Join(..) => unreachable!("a joined binder has no term; its occurrence stays"),
     }
 }
 
@@ -4466,7 +4874,7 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
 pub fn is_dependent(ty: &Type) -> bool {
     matches!(
         ty.peel_refinements(),
-        Type::Fun { name: Some(k), codomain, .. } if codomain_depends_on(k, codomain)
+        Type::Fun { binder: FunBinder::Whole(k), codomain, .. } if codomain_depends_on(k, codomain)
     )
 }
 
@@ -4482,11 +4890,12 @@ pub fn discharge_codomain(binder: &Name, argument: &TypedExpr, codomain: &Type) 
     // `(𝑝 : 𝑇) ⇒ 𝐶(𝑝.0)` is: the discharge is the identity, which is the descent
     // under the binder.
     if is_var_named(argument, binder) {
-        return open_codomain_at(binder, codomain);
+        return open_codomain_at(binder, &argument.ty, codomain);
     }
     let opened = if references_enclosing_function(codomain) {
         open_pi_binder(
             &Mapping::Discharge(Rc::new(argument.clone_preserving_ids())),
+            &argument.ty,
             codomain,
         )
     } else {
@@ -4514,11 +4923,11 @@ pub(crate) struct RefinementScope {
     /// The binders of the `Fun`s the walk is inside of, innermost last (`None`
     /// for an unnamed one — it still counts as a crossing). Pushed entering a
     /// codomain, never a domain: a binder scopes over its codomain only.
-    enclosing: Vec<Option<Name>>,
+    enclosing: Vec<FunBinder>,
     /// Keyed on (predicate identity, enclosing binders) so occurrences that
     /// entered a view sharing one predicate `Rc` leave sharing one `Rc` — the
     /// planning-cost concern of [`crate::ccl::Refinement::predicate`].
-    memo: HashMap<(PredicateId, Vec<Option<Name>>), ClosedRefinement>,
+    memo: HashMap<(PredicateId, Vec<FunBinder>), ClosedRefinement>,
 }
 
 /// A refinement [`RefinementScope::close`] closed, and its closing. The refinement is held so
@@ -4534,8 +4943,8 @@ struct ClosedRefinement {
 
 impl RefinementScope {
     /// Enter the codomain of a `Fun` binding `name` — one crossing deeper.
-    pub(crate) fn enter(&mut self, name: Option<Name>) {
-        self.enclosing.push(name);
+    pub(crate) fn enter(&mut self, binder: FunBinder) {
+        self.enclosing.push(binder);
     }
 
     /// Leave the codomain [`enter`](Self::enter) entered.
@@ -4544,7 +4953,7 @@ impl RefinementScope {
     }
 
     /// The entered binders, for a walk whose own memo is per-position too.
-    pub(crate) fn enclosing(&self) -> &[Option<Name>] {
+    pub(crate) fn enclosing(&self) -> &[FunBinder] {
         &self.enclosing
     }
 
@@ -4552,7 +4961,7 @@ impl RefinementScope {
     /// them become indices. A refinement referencing none of them keeps its predicate
     /// `Rc` and costs no walk.
     pub(crate) fn close(&mut self, r: &crate::ccl::Refinement) -> crate::ccl::Refinement {
-        if self.enclosing.iter().all(Option::is_none) {
+        if self.enclosing.iter().all(FunBinder::is_none) {
             return r.clone();
         }
         let key = (r.predicate_id(), self.enclosing.clone());
@@ -4575,13 +4984,13 @@ impl RefinementScope {
     /// `ty`, a type the walk puts at its position whole, closed against the functions entered so
     /// far.
     pub(crate) fn closed_type(&self, ty: &Type) -> Type {
-        close_pi_binders(&self.enclosing, ty)
+        close_at_binders(&self.enclosing, ty)
     }
 
     /// [`close`](Self::close), in place, for a term a type holds outside a refinement
     /// ([`Type::held_terms`]).
     pub(crate) fn close_held(&mut self, q: &mut (impl crate::ccl::HeldTerm + ?Sized)) {
-        if self.enclosing.iter().all(Option::is_none) {
+        if self.enclosing.iter().all(FunBinder::is_none) {
             return;
         }
         PiWalk::new(PiMode::Close(&self.enclosing)).held(q, 0);
@@ -5094,7 +5503,7 @@ mod tests {
         // Name-based: the same shape built field-wise keeps `k` a name, and
         // the shadow is what protects it.
         let ty = Type::Fun {
-            name: Some(Name::raw("k")),
+            binder: FunBinder::Whole(Name::raw("k")),
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::infer()),
             codomain: Box::new(refined(gt(var("i"), var("k")))),
@@ -5208,11 +5617,14 @@ mod tests {
 
         let out = Subst::discharge_env_in_place(compose, &env);
 
-        let Type::Fun { name, fun_kind, .. } = &out.ty else {
+        let Type::Fun {
+            binder, fun_kind, ..
+        } = &out.ty
+        else {
             panic!("a `Compose` over function elements types as a function")
         };
         assert_eq!(
-            (name.as_ref().map(Name::base), fun_kind),
+            (binder.whole().map(Name::base), fun_kind),
             (Some("n"), &crate::ccl::FunKind::Compute),
             "the function type's species and binder are the composition's, not its \
              elements' — `Type::fun` would have flattened both"
@@ -5369,10 +5781,10 @@ mod tests {
     #[test]
     fn a_lambda_keeps_its_param_name() {
         let e = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, TypedExpr::var("k"));
-        let TypedExprNode::Lambda { param, body } = live_rename().apply_expr(&e).node else {
+        let TypedExprNode::Lambda { params, body } = live_rename().apply_expr(&e).node else {
             panic!("expected a lambda");
         };
-        assert_eq!(param.name, Name::raw("x"));
+        assert_eq!(params[0].name, Name::raw("x"));
         assert_eq!(body.node, renamed());
     }
 
@@ -5421,10 +5833,10 @@ mod tests {
     #[test]
     fn a_pi_keeps_its_binder_name() {
         let t = Type::pi("b", Type::Hole, Type::Hole);
-        let Type::Fun { name, .. } = live_rename().apply_type(&t) else {
+        let Type::Fun { binder, .. } = live_rename().apply_type(&t) else {
             panic!("expected a function type");
         };
-        assert_eq!(name, Some(Name::raw("b")));
+        assert_eq!(binder, FunBinder::Whole(Name::raw("b")));
     }
 
     /// `unbox(𝑐)`'s elimination on a settled sum over two binders,
@@ -5438,7 +5850,7 @@ mod tests {
         let w1 = Witness::mint(TypeKind::Enumerated(vec![Type::UIntRange(3)]));
         let int = Type::Base(crate::interpreter::BaseType::Int);
         let sum = Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             domain: Box::new(Type::Tuple(vec![
                 Type::WitnessRef(*w0.id()),
                 Type::WitnessRef(*w1.id()),
@@ -5452,7 +5864,7 @@ mod tests {
         assert_eq!(
             Subst::eliminating(Rc::clone(&c)).apply_type(&sum),
             Type::Fun {
-                name: None,
+                binder: FunBinder::None,
                 fun_kind: FunKind::Data(None),
                 domain: Box::new(Type::Tuple(vec![projection(0), projection(1)])),
                 codomain: Box::new(int),
@@ -5535,10 +5947,10 @@ mod rewrite_tests {
 
         let out = Subst::discharge("k", int(5)).apply_expr(&e);
 
-        let TypedExprNode::Lambda { param, .. } = &out.node else {
+        let TypedExprNode::Lambda { params, .. } = &out.node else {
             panic!("lambda preserved");
         };
-        let [r] = param.ty.refinements() else {
+        let [r] = params[0].ty.refinements() else {
             panic!("param refinement preserved");
         };
         assert_eq!(
@@ -5575,10 +5987,10 @@ mod rewrite_tests {
         let TypedExprNode::Lambda { body, .. } = &function.node else {
             panic!("outer lambda preserved");
         };
-        let TypedExprNode::Lambda { param, .. } = &body.node else {
+        let TypedExprNode::Lambda { params, .. } = &body.node else {
             panic!("inner lambda preserved");
         };
-        assert_eq!(param.name, a, "the copied binding site is untouched");
+        assert_eq!(params[0].name, a, "the copied binding site is untouched");
         assert!(!is_free(&a, &e), "no free occurrence survives");
     }
 
@@ -5829,7 +6241,7 @@ mod locally_nameless_tests {
         let chain = close_pi_binder(
             &x,
             &Type::Fun {
-                name: Some(i.clone()),
+                binder: FunBinder::Whole(i.clone()),
                 fun_kind: crate::ccl::FunKind::Compute,
                 domain: Box::new(int()),
                 codomain: Box::new(refined(TypedExpr::var(x.clone()))),
@@ -5859,7 +6271,7 @@ mod locally_nameless_tests {
             "the plain tuple's component 1 reaches `x` at #0, got {uncurried:?}"
         );
 
-        let opened = open_pi_binder(&Mapping::Rename(y.clone()), &uncurried);
+        let opened = open_pi_binder(&Mapping::Rename(y.clone()), &int(), &uncurried);
         let Type::Tuple(components) = &opened else {
             panic!("opening preserves the tuple");
         };
@@ -6075,11 +6487,83 @@ mod locally_nameless_tests {
             "closing reads `k` by index: {closed}"
         );
         let at = TypedExpr::apply(TypedExpr::var(Name::elem()), TypedExpr::proj_index(0));
-        let opened = open_pi_binder(&Mapping::Discharge(Rc::new(at)), &closed);
+        let opened = open_pi_binder(&Mapping::Discharge(Rc::new(at)), &int(), &closed);
         assert_eq!(
             crate::ccl::symbolic::symbolic(predicate_of(&opened)),
             "__elem ▷ f == __elem^1.0"
         );
+    }
+
+    #[test]
+    fn opening_a_component_shifts_its_term_and_type_once() {
+        let a = Name::fresh("a");
+        let b = Name::fresh("b");
+        let component = refined(equals(
+            TypedExpr::var(Name::elem()),
+            TypedExpr::var(a.clone()).with_ty(int()),
+        ));
+        let domain = Type::dep_tuple(vec![
+            (Some(a.clone()), int()),
+            (Some(b.clone()), component.clone()),
+        ]);
+        let function = Type::fun_binding(
+            FunBinder::Parameters(vec![Some(a), Some(b.clone())]),
+            domain.clone(),
+            refined(equals(
+                TypedExpr::var(Name::elem()),
+                TypedExpr::var(b).with_ty(component),
+            )),
+            crate::ccl::FunKind::Compute,
+        );
+        let argument = TypedExpr::var(Name::elem()).with_ty(domain);
+        let result = crate::ccl::ccl_utils::applied_type(&function, &argument);
+        let TypedExprNode::BinOp { right: read, .. } = &predicate_of(&result).node else {
+            panic!("the result equates its element to the second component");
+        };
+        let TypedExprNode::Apply { argument, .. } = &read.node else {
+            panic!("the second component is projected from the argument");
+        };
+        assert!(matches!(&argument.node, TypedExprNode::Var(n) if *n == Name::elem_at(1)));
+        let TypedExprNode::BinOp { right: earlier, .. } = &predicate_of(&read.ty).node else {
+            panic!("the second component's type equates its element to the first");
+        };
+        let TypedExprNode::Apply { argument, .. } = &earlier.node else {
+            panic!("the first component is projected from the argument");
+        };
+        assert!(matches!(&argument.node, TypedExprNode::Var(n) if *n == Name::elem_at(2)));
+    }
+
+    #[test]
+    fn opening_a_component_keys_its_memo_by_the_input_type() {
+        let a = Name::fresh("a");
+        let b = Name::fresh("b");
+        let at = Name::fresh("input");
+        let codomain = close_at_binder(
+            &FunBinder::Parameters(vec![Some(a.clone()), Some(b)]),
+            &refined(equals(
+                TypedExpr::var(Name::elem()).with_ty(int()),
+                TypedExpr::var(a).with_ty(int()),
+            )),
+        );
+        let first = Type::tuple(vec![int(), Type::Base(BaseType::Bool)]);
+        let second = Type::tuple(vec![int(), Type::Base(BaseType::String)]);
+        let (one, two) = with_conversion_memo(|| {
+            (
+                open_at_binder(&FunBinder::Whole(at.clone()), &first, &codomain),
+                open_at_binder(&FunBinder::Whole(at), &second, &codomain),
+            )
+        });
+        let projection_domain = |ty: &Type| {
+            let TypedExprNode::BinOp { right, .. } = &predicate_of(ty).node else {
+                panic!("the predicate compares the element with the first component");
+            };
+            let TypedExprNode::Apply { function, .. } = &right.node else {
+                panic!("the component is projected from the input");
+            };
+            function.ty.domain().expect("a projection is a function")
+        };
+        assert_eq!(projection_domain(&one), first);
+        assert_eq!(projection_domain(&two), second);
     }
 
     /// A free-variable walk leaving a refinement binds its element and lowers each other
@@ -6124,6 +6608,27 @@ mod locally_nameless_tests {
             crate::ccl::symbolic::symbolic(predicate_of(&typed.ty)),
             "__elem == __elem^3"
         );
+    }
+
+    #[test]
+    fn weakening_moves_enclosing_binders_and_preserves_interior_binders() {
+        let outer = Name::fresh("outer");
+        let inner = Name::fresh("inner");
+        let body = refined(equals(
+            TypedExpr::var(outer.clone()),
+            TypedExpr::var(inner.clone()),
+        ));
+        let nested = Type::pi(inner, int(), body);
+        let closed = close_pi_binder(&outer, &nested);
+        let weakened = weaken_pi_binders(&closed, 2);
+        let opened = open_pi_binder_at(&Mapping::Rename(outer), &int(), &weakened, 2);
+        assert_eq!(opened, nested);
+        let lowered = tuple_of_components(vec![
+            (None, int()),
+            (None, int()),
+            (None, weakened.into_owned()),
+        ]);
+        assert_eq!(lowered[2], closed);
     }
 
     /// The same substitution passes a nested refinement that does not read its binder: an
@@ -6181,10 +6686,14 @@ mod locally_nameless_tests {
             refined(TypedExpr::var(k.clone())),
         );
         let closed = close_pi_binder(&k, &inner);
-        assert_eq!(open_pi_binder(&Mapping::Rename(k.clone()), &closed), inner);
+        assert_eq!(
+            open_pi_binder(&Mapping::Rename(k.clone()), &int(), &closed),
+            inner
+        );
 
         let applied = open_pi_binder(
             &Mapping::Discharge(Rc::new(TypedExpr::lit(Lit::Int(5)))),
+            &int(),
             &closed,
         );
         let Type::Fun { domain, .. } = &applied else {

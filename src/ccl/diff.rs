@@ -2612,7 +2612,7 @@ mod tests {
         let cast = TypedExpr::new(N::Cast {
             value: Box::new(int(1)),
             target: Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Refinement(
                     Box::new(Type::Base(BaseType::Int)),
@@ -2672,7 +2672,7 @@ mod tests {
             TypedExpr::new(N::Cast {
                 value: Box::new(var("f")),
                 target: Type::Fun {
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: FunKind::Compute,
                     domain: Box::new(Type::Refinement(
                         Box::new(Type::Base(BaseType::Int)),

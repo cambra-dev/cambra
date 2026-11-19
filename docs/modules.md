@@ -234,7 +234,7 @@ a user's `` `some `` builds that module's own tag.
   declares state whose type arguments are distinct types spelled alike are refused at the second
   `import` (`ProgramLowering::shared_import`).
 - **`Mut` parameters.** A call to an imported `def` with a `Mut` parameter, qualified or through
-  `use`, takes the curried shape the `def` lowers to.
+  `use`, passes a bare mutable variable as that argument, as a call to a local one does.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
   label, and `m::` qualifies the label of the module `m` names. A nominal type's constructor is not
   a label, so `Option::some` is the same in every module
@@ -358,10 +358,11 @@ top-level member, public and private, so that `m::hidden` can say the member is 
 The interface holds no contract. A module's check infers its members' contracts (`check_module`),
 and `cambra check` prints them with the interface (`Interface::written`).
 
-A `def` with a `Mut(…)` or `Feed(…)` parameter lowers as a curried chain, and its call sites
-must match (`LoweringContext::history_param_fns`). The interface carries that shape so a user's call site lowers
-correctly: a qualified callee reads it from the member, and a `use` name of such a `def` is
-registered in `history_param_fns` when its module begins lowering.
+A call of a `def` with a `Mut(…)` or `Feed(…)` parameter lowers an argument that is a bare name as
+the variable it names (`LoweringContext::history_param_fns`). The interface marks such a member
+so a user's call site lowers its arguments alike: a qualified callee reads the mark from the member,
+and a `use` name of such a `def` is registered in `history_param_fns` when its module begins
+lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
 (`transactional_vars`, `type_aliases`, `history_param_fns`, `shadow_depth`, `nominal_types`,
@@ -811,9 +812,7 @@ with its type, bound, or Module type, then each public member in the order decla
 prints established contracts alongside its diagnostics and exits unsuccessfully. Values whose
 omitted definitions establish no complete contract are absent from this partial interface. A value's
 contract is its annotation or the type it infers, a generalized one's written as a diagnostic writes
-an inferred polymorphic type, joins and all. A `def` with a `Mut` parameter lowers curried and is
-written as its callers apply it, one function of the tuple of its parameters
-(`Contract::uncurried`). Inference notes a generalized member's scheme while it is live
+an inferred polymorphic type, joins and all. Inference notes a generalized member's scheme while it is live
 (`Typing::note_scheme`), and a monomorphic member's type is the one its uses settled. A type
 parameter with no kind written is one inference variable for the whole check, and a contract writes
 that variable as the parameter (`write_opened`), so `def wrap(x): id(x)` over `def id(x: T) => T`

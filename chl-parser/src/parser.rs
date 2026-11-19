@@ -326,8 +326,29 @@ where
                 paren_record,
                 // The domain of a dependent function type, `(k: K)`.
                 type_binder
+                    .clone()
                     .then_ignore(just(Token::RParen))
                     .map_with(|binder, e| Spanned::new(e.span(), binder.node)),
+                // A function type's parameter list naming some of its parameters,
+                // `(a: A, B, c: C(a))`: entries of a parenthesised list, which lowering reads
+                // only as a function type's domain. A list naming none is a tuple below.
+                type_binder
+                    .clone()
+                    .or(bracketed_expr.clone())
+                    .separated_by(just(Token::Comma))
+                    .at_least(2)
+                    .collect::<Vec<_>>()
+                    .then_ignore(just(Token::RParen))
+                    .try_map(|entries, span| {
+                        if entries
+                            .iter()
+                            .any(|p| matches!(p.node, Expr::TypeBinder { .. }))
+                        {
+                            Ok(Spanned::new(span, Expr::Tuple(entries)))
+                        } else {
+                            Err(Rich::custom(span, "a list naming no parameter"))
+                        }
+                    }),
                 bracketed_expr
                     .clone()
                     .then(choice((
@@ -4471,6 +4492,55 @@ mod tests {
         assert!(
             matches!(domain.node, Expr::TypeBinder { .. }),
             "the domain `(k: K)` is a binder, got {:?}",
+            domain.node
+        );
+    }
+
+    /// A component of a brace product may be a binder, `{(a: A), (b: B(a))}`: a tuple naming
+    /// its components, in a type and as a function type's domain.
+    #[test]
+    fn a_brace_product_names_its_components() {
+        let Expr::FunctionType { domain, .. } = parse_e("{(a: A), B, (c: C(a))} => D(c)").node
+        else {
+            panic!("expected a function type");
+        };
+        let Expr::BraceGroup(parts) = &domain.node else {
+            panic!("expected a brace product, got {:?}", domain.node)
+        };
+        let named: Vec<Option<&str>> = parts
+            .iter()
+            .map(|p| match &p.node {
+                Expr::TypeBinder { name, .. } => Some(name.node.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [Some("a"), None, Some("c")]);
+    }
+
+    /// A function type's parameter list may name its parameters, `(a: A, B, c: C(a))`: a
+    /// parenthesised list of binders and types, which a list naming none, `(A, B)`, also is.
+    #[test]
+    fn a_parameter_list_names_its_parameters() {
+        let Expr::FunctionType { domain, .. } = parse_e("(a: A, B, c: C(a)) => D(c)").node else {
+            panic!("expected a function type");
+        };
+        let Expr::Tuple(entries) = &domain.node else {
+            panic!("expected a parameter list, got {:?}", domain.node)
+        };
+        let named: Vec<Option<&str>> = entries
+            .iter()
+            .map(|p| match &p.node {
+                Expr::TypeBinder { name, .. } => Some(name.node.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [Some("a"), None, Some("c")]);
+        let Expr::FunctionType { domain, .. } = parse_e("(A, B) => C").node else {
+            panic!("expected a function type");
+        };
+        assert!(
+            matches!(&domain.node, Expr::Tuple(entries) if entries.len() == 2),
+            "an unnamed list is a tuple of its types, got {:?}",
             domain.node
         );
     }

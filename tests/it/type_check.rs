@@ -421,7 +421,7 @@ fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
 
         f
     "#},
-    "((__arg_tuple_4: (Int, Int)) ⇒ {Int | __elem == __arg_tuple_4.0 + __arg_tuple_4.1})"
+    "(((a, b): (Int, Int)) ⇒ {Int | __elem == a + b})"
 )]
 fn refining_addition_records_the_sum(#[case] code: &str, #[case] expected: &str) {
     assert_eq!(format!("{}", infer_program(code)), expected);
@@ -2303,7 +2303,7 @@ fn test_aggregate_over_scalar_lambda_is_rejected() {
 // A `def`/lambda parameter's type annotation is a **checking-mode declaration**
 // that lowering must carry to the lambda so inference enforces it at the call
 // site — mirroring variable ascription (`x: T = e`). Regression for a
-// long-standing lowering gap: `uncurry_params` attached only `Mut(…)`
+// long-standing lowering gap: lowering attached only `Mut(…)`
 // annotations and dropped every other one, so a `def` param was inferred purely
 // from its body and any argument was accepted.
 #[test]
@@ -2503,7 +2503,7 @@ fn test_list_comp_identity() {
     assert_eq!(
         infer_program("[x for x in [1, 2]]"),
         Type::Fun {
-            name: None,
+            binder: cambra::ccl::FunBinder::None,
             fun_kind: cambra::ccl::FunKind::Data(None),
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int()),
@@ -2518,7 +2518,7 @@ fn test_list_comp_arithmetic_body() {
     assert_eq!(
         infer_program("[x + 1 for x in [1, 2]]"),
         Type::Fun {
-            name: None,
+            binder: cambra::ccl::FunBinder::None,
             fun_kind: cambra::ccl::FunKind::Data(None),
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int()),
@@ -2534,7 +2534,7 @@ fn test_list_comp_two_gens() {
     assert_eq!(
         ty,
         Type::Fun {
-            name: None,
+            binder: cambra::ccl::FunBinder::None,
             fun_kind: cambra::ccl::FunKind::Data(None),
             domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
             codomain: Box::new(int()),
@@ -3117,7 +3117,7 @@ fn map_injects_into_nominal_map_annotation() {
 fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
     let ty = infer_program("groupby([1, 2, 3], \\x -> x)");
     let Type::Fun {
-        name: Some(key_binder),
+        binder: cambra::ccl::FunBinder::Whole(key_binder),
         codomain,
         ..
     } = &ty
@@ -4162,7 +4162,6 @@ mod letrec_typing {
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
         }
     }
 

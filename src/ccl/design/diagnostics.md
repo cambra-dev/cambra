@@ -77,6 +77,11 @@ hide structural differences. A mismatch whose sides read alike reports the hidde
 a data-domain mismatch instead reports the sub-comparison that rejected it. Neither use decides
 type equality.
 
+A dependent tuple mismatch reads its temporary component binders at their literal values when
+their types are singletons. An earlier component `a: Int@5` therefore makes the later requirement
+`{Int where _ >= 5}` in the diagnostic. Captured names retain their written spelling. Solving keeps
+the component's binding and the declared dependent type.
+
 A family applied at a binder the compiler minted, outside the family that binds it, is written at
 the spelling an unnamed binder of the text would take: `V(k)`.
 
@@ -123,9 +128,12 @@ holds.
   `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)`, and `Printer::point` reads the combinators back to
   `_ == 1`. `nand`, `nor` and `xnor` are written as negations, `not (p and q)`, and
   `int_eq_uint((x, _))`, which relates an `Int` and a `UInt`, as `x == _`.
-- **A `def`'s parameter is written by its name.** A `def` of several parameters binds them as
-  one tuple (`uncurry_params` in `lower/functions.rs`), whose binder records the parameters'
-  spellings (`Name::positions`), so `__arg_tuple_0.0` is written `a`.
+- **A function's parameters are written by their names.** A function of several parameters takes
+  their list, whose type binds each parameter by its name (`Type::fun_of_params`,
+  `FunBinder::Parameters`). Its domain is written as the list, each parameter its result or a
+  later parameter reads named, `(lo: Int, x: Int) => {Int where _ >= lo}` (`docs/chl-spec.md`,
+  "Parameter lists"). A dependent tuple is written the same way in braces, each component a later
+  one reads named.
 - **What CHL cannot write is described, never dropped and never spelled with a name the program
   did not write.**
 
@@ -140,7 +148,8 @@ holds.
   | anything else: a channel domain, a positional variant, a sum of several witnesses | `‹not printable yet›` |
 
   The solver's binder for an application's expected function (`SyntheticKind::SolverArg`) is
-  written `‹outer argument›` too: a type reading it is that function's result.
+  written as the variable the application passes for it, and `‹outer argument›` where the argument
+  is not a variable: a type reading it is that function's result.
 
 `a_written_type_prints_as_an_annotation_that_lowers_back` (`ccl/chl_print.rs`) checks the rows
 marked "yes", and `tests/it/compilation_pipeline/chl_types.rs` checks the first table's rows

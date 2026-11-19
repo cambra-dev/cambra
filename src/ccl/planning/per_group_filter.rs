@@ -227,7 +227,7 @@ struct Narrowing {
 
 fn narrowing(expr: &Expr) -> Option<Narrowing> {
     let Type::Fun {
-        name: Some(binder),
+        binder: crate::ccl::FunBinder::Whole(binder),
         domain,
         codomain,
         ..
@@ -369,7 +369,7 @@ pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String
 /// filters of the input's values.
 fn refines_by_its_input(e: &Expr) -> bool {
     let Type::Fun {
-        name: Some(binder),
+        binder: crate::ccl::FunBinder::Whole(binder),
         domain,
         codomain,
         ..

@@ -329,7 +329,7 @@ pub enum FunKind {
     ///
     /// Carries the **Σ binders** of the sum this function is, when it is one: a
     /// `Σ (σ : 𝐾). σ ⤇ 𝑉` is a data function binding `σ` over its domain, and the binder
-    /// rides the function the way the Pi binder (`Fun::name`) rides it over the codomain. A
+    /// rides the function the way the Pi binder (`Fun::binder`) rides it over the codomain. A
     /// plain collection carries none (`None`; an empty list is not a state). A sum and a
     /// plain collection are distinct types with no common upper bound in either direction.
     /// Behind `Option<Rc<…>>` so the slot costs a plain collection one niche-optimized
@@ -1321,6 +1321,125 @@ impl SharedHoleMint {
     }
 }
 
+/// What a function's codomain reads its input by ([`Type::Fun`]'s binder): nothing, its one
+/// parameter by one name, or each parameter of a list by a name of its own.
+///
+/// The codomain reads the binder by index ([`Name::PiBound`](crate::ccl::Name::PiBound)): a whole
+/// binder as `PiRef { component: None }`, and a projection of it, `𝑝.𝑗`, as
+/// `PiRef { component: Some(𝑗) }`, as it reads a parameter list's parameter `𝑗`. The names are
+/// opening addresses and display spellings, as a [`Type::Family`]'s binders' are.
+/// See `src/ccl/design/type-inference.md`, "A lambda's parameters".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FunBinder {
+    /// The codomain reads nothing of the input.
+    None,
+    /// `(x: A) => B`: the codomain reads the input by one name.
+    Whole(crate::ccl::Name),
+    /// `(a: A, b: B) => C`: a function of a **parameter list** other than one parameter long,
+    /// its domain the product of the parameters' types. The codomain reads each parameter by its
+    /// name, as `PiRef { component: Some(𝑗) }` once closed, and an unnamed or unread parameter
+    /// is read by none.
+    ///
+    /// A parameter list is not a product: a function of two parameters is never a function
+    /// of one pair, so a call passes exactly as many arguments as the list is long
+    /// (`docs/chl-spec.md`, "Parameter lists"). Every other binder takes one parameter.
+    Parameters(Vec<Option<crate::ccl::Name>>),
+}
+
+impl FunBinder {
+    /// The name of the whole input, for a [`FunBinder::Whole`].
+    pub fn whole(&self) -> Option<&crate::ccl::Name> {
+        match self {
+            FunBinder::Whole(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Whether the binder names nothing.
+    pub fn is_none(&self) -> bool {
+        matches!(self, FunBinder::None)
+    }
+
+    /// The length of the parameter list a [`FunBinder::Parameters`] binds, and `None` for a
+    /// binder of one parameter: two function types relate only when these agree.
+    pub fn parameter_count(&self) -> Option<usize> {
+        match self {
+            FunBinder::Parameters(ps) => Some(ps.len()),
+            _ => None,
+        }
+    }
+
+    /// The names a [`FunBinder::Parameters`] gives its parameters.
+    pub fn parameters(&self) -> Option<&[Option<crate::ccl::Name>]> {
+        match self {
+            FunBinder::Parameters(ps) => Some(ps),
+            _ => None,
+        }
+    }
+
+    /// The binder of a function whose codomain reads none of its input: none at all, except
+    /// that a parameter list keeps its length, which is part of the type.
+    pub fn unread(&self) -> FunBinder {
+        match self {
+            FunBinder::Parameters(ps) => FunBinder::Parameters(vec![None; ps.len()]),
+            _ => FunBinder::None,
+        }
+    }
+
+    /// `self` with each name `rename` gives, the shape kept.
+    pub fn map_names(&self, mut rename: impl FnMut(&crate::ccl::Name) -> crate::ccl::Name) -> Self {
+        match self {
+            FunBinder::None => FunBinder::None,
+            FunBinder::Whole(n) => FunBinder::Whole(rename(n)),
+            FunBinder::Parameters(cs) => {
+                FunBinder::Parameters(cs.iter().map(|c| c.as_ref().map(&mut rename)).collect())
+            }
+        }
+    }
+
+    /// Every name the binder binds.
+    pub fn names(&self) -> impl Iterator<Item = &crate::ccl::Name> {
+        let (whole, components): (Option<&crate::ccl::Name>, &[Option<crate::ccl::Name>]) =
+            match self {
+                FunBinder::None => (None, &[]),
+                FunBinder::Whole(n) => (Some(n), &[]),
+                FunBinder::Parameters(ps) => (None, ps),
+            };
+        whole.into_iter().chain(components.iter().flatten())
+    }
+
+    /// The binder as a debug rendering writes it: `x` for a whole binder, `(a, _)` for a
+    /// parameter list naming some parameter, nothing for none.
+    pub fn spelled(&self) -> Option<String> {
+        match self {
+            FunBinder::None => None,
+            FunBinder::Parameters(names) if names.iter().all(Option::is_none) => None,
+            FunBinder::Whole(n) => Some(n.to_string()),
+            FunBinder::Parameters(names) => {
+                let spelled: Vec<_> = names
+                    .iter()
+                    .map(|n| {
+                        n.as_ref()
+                            .map_or_else(|| "_".to_string(), ToString::to_string)
+                    })
+                    .collect();
+                Some(format!("({})", spelled.join(", ")))
+            }
+        }
+    }
+
+    /// Whether the binder binds `name`.
+    pub fn binds(&self, name: &crate::ccl::Name) -> bool {
+        self.names().any(|n| n == name)
+    }
+}
+
+impl From<Option<crate::ccl::Name>> for FunBinder {
+    fn from(name: Option<crate::ccl::Name>) -> Self {
+        name.map_or(FunBinder::None, FunBinder::Whole)
+    }
+}
+
 /// A CCL type annotation.
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
@@ -1355,27 +1474,15 @@ pub enum Type {
     /// [`OpConversionContext::extent_of`](crate::interpreter::operator_conversion::OpConversionContext::extent_of)
     /// maps it to the extent `0..n`.
     UIntRange(u64),
-    /// A function type. When `name` is `None` it is the ordinary
-    /// non-dependent function type `domain ⇒ codomain`. When `name` is `Some(x)` it
-    /// is a **Pi type** `(x: domain) ⇒ codomain`: the binder `x` is in scope
-    /// in `codomain` and may be referenced by refinement predicates nested
-    /// anywhere within it.
-    ///
-    /// Inference always populates `name` when it introduces a function type
-    /// from a lambda's parameter (see `emit_lambda`); whether the codomain
-    /// actually references the binder is a *property* of the resulting type,
-    /// not a structural decision made up front. A `Some`-named function whose
-    /// codomain does not mention the binder is observationally identical to
-    /// the same function with `name: None` — the binder is only load-bearing
-    /// once a nested refinement closes over it (dependent application).
+    /// A function type whose result may depend on its input. The `binder` names the
+    /// whole input or its components within `codomain`; refinements there read it by index.
+    /// Inference retains a lambda's binder while its result is unresolved.
     Fun {
-        /// The Pi binder, if this function type is dependent. Bound in
-        /// `codomain`. The derived [`PartialEq`] *does* compare it, but the
-        /// α-aware comparisons that matter for dependent refinements strip it
-        /// first (`without_pi_names`), so two function types equal up to
-        /// renaming their Pi binder reconcile there (see the substitution
-        /// machinery).
-        name: Option<crate::ccl::Name>,
+        /// The Pi binder ([`FunBinder`]), bound in `codomain`. The derived [`PartialEq`]
+        /// *does* compare it, but the α-aware comparisons that matter for dependent
+        /// refinements strip it first (`without_pi_names`), so two function types equal up
+        /// to renaming their Pi binder reconcile there (see the substitution machinery).
+        binder: FunBinder,
         /// Whether this function is a compute function (`Compute`) or a data collection
         /// (`Data`). See [`FunKind`]. The derived [`PartialEq`] compares it: a
         /// data function and a compute function over the same domain/codomain
@@ -1388,7 +1495,7 @@ pub enum Type {
         fun_kind: FunKind,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
-        /// The result type. Covariant position; may reference `name`.
+        /// The result type. Covariant position; may reference `binder`.
         codomain: Box<Type>,
         /// What a call reads from its context and contributes besides its result
         /// (`docs/chl-spec.md`, "6.9 Capabilities"). A
@@ -1418,7 +1525,7 @@ pub enum Type {
     /// it; a reference is a [`Name::PiBound`](crate::ccl::Name::PiBound) whose
     /// index counts crossings into a binder's scope, so component `𝑘` reaches
     /// component `𝑗` at `𝑘 − 1 − 𝑗`. The name slot is an opening address and a
-    /// display spelling, as `Fun::name` is.
+    /// display spelling, as `Fun::binder` is.
     ///
     /// Built only by [`Type::dep_tuple`], which returns the `Tuple` of the same
     /// components when none references an earlier one, so a tuple has one
@@ -1686,7 +1793,7 @@ pub enum Type {
     /// declaration's index types at the nominal type's other arguments
     /// ([`NominalDecl::family_domains_at`](crate::ccl::nominal::NominalDecl::family_domains_at)),
     /// so subtyping does not relate them. The name slots are opening addresses and display
-    /// spellings, as `Fun::name` is.
+    /// spellings, as `Fun::binder` is.
     ///
     /// Built by [`Type::family`], which closes the body.
     Family {
@@ -2837,7 +2944,8 @@ impl Type {
     ///
     /// The single place a kind classifies a Σ's witness, so it is where a candidate-naming
     /// kind is checked for having any.
-    pub fn sum_over(type_kind: TypeKind, name: Option<crate::ccl::Name>, codomain: Type) -> Type {
+    pub fn sum_over(type_kind: TypeKind, binder: impl Into<FunBinder>, codomain: Type) -> Type {
+        let binder = binder.into();
         // **No candidates** leaves the witness no domain it could be, so `Σ (𝐷 : []). 𝐷 ⤇ 𝑉`
         // is a collection type nothing inhabits — and it is not caught downstream: it is
         // vacuously contained in every kind (a `∀` over no candidates), so it propagates as
@@ -2856,7 +2964,7 @@ impl Type {
         let witness = Witness::mint(type_kind);
         let domain = Type::WitnessRef(*witness.id());
         Type::Fun {
-            name,
+            binder,
             fun_kind: FunKind::Data(Some(Rc::new(vec![witness]))),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
@@ -2884,7 +2992,7 @@ impl Type {
             witness.id().clone()
         );
         let Type::Fun {
-            name,
+            binder,
             fun_kind: FunKind::Data(slot),
             domain,
             codomain,
@@ -2901,7 +3009,7 @@ impl Type {
             && rest.iter().any(|w| *w.id() == root)
         {
             return Type::Fun {
-                name,
+                binder,
                 fun_kind: FunKind::Data(slot),
                 domain,
                 codomain,
@@ -2914,7 +3022,7 @@ impl Type {
             ws.extend(rest.iter().cloned());
         }
         Type::Fun {
-            name,
+            binder,
             fun_kind: FunKind::Data(Some(Rc::new(ws))),
             domain,
             codomain,
@@ -3219,7 +3327,7 @@ fn fmt_type(
         // The codomain renders one function deeper, named or not: the index
         // counts crossings, so an unnamed one occupies an entry too.
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
@@ -3237,10 +3345,10 @@ fn fmt_type(
                     write!(f, "Σ (σ : {}). ", w.type_kind())?;
                 }
             }
-            let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+            let inner = symbolic::PiBinderEnv::crossing_fun(binders, binder);
             let cod = at(codomain, Some(&inner));
             let dom = at(domain, binders);
-            match name {
+            match binder.spelled() {
                 Some(x) => write!(f, "(({x}: {dom}) {} {cod}{capabilities})", fun_kind.arrow()),
                 None => write!(f, "({dom} {} {cod}{capabilities})", fun_kind.arrow()),
             }
@@ -3455,7 +3563,7 @@ fn fmt_type(
             history_kind,
         } => {
             let Type::Fun {
-                name,
+                binder,
                 domain,
                 codomain,
                 ..
@@ -3464,9 +3572,9 @@ fn fmt_type(
                 unreachable!("a history's function is a function, got {function:?}")
             };
             // The value renders inside the function's binder, as a function's codomain does.
-            let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+            let inner = symbolic::PiBinderEnv::crossing_fun(binders, binder);
             let (value, domain) = (at(codomain, Some(&inner)), at(domain, binders));
-            match (history_kind, name) {
+            match (history_kind, binder.spelled()) {
                 (HistoryKind::Overwrite, None) => write!(f, "Mut({value}, {domain})"),
                 (HistoryKind::Overwrite, Some(k)) => write!(f, "Mut({value}, {k}: {domain})"),
                 (HistoryKind::Append, None) => write!(f, "feed({domain} ⤇ {value})"),
@@ -3502,17 +3610,14 @@ fn fmt_type(
     }
 }
 
-/// The literal a **singleton** refinement pins, if `ty` is one: a base refined by
-/// exactly `__elem == <lit>` and nothing else.
-///
-/// Presentation only. The type keeps its general [`Type::Refinement`] shape — every
-/// rule that handles refinements handles this one unchanged — and this recognizes
-/// the shape just well enough to print it as what it means.
-fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
+/// The literal in the canonical singleton spelling, a base refined by exactly
+/// `__elem == <lit>`. Used for type display and diagnostic formatting. Typing retains
+/// the general [`Type::Refinement`] representation.
+pub(crate) fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
     let Type::Refinement(_, refinements) = ty else {
         return None;
     };
-    // Exactly one refinement: a base carrying further restrictions is not a singleton.
+    // Recognize only the canonical spelling; no predicate implication is needed for display.
     let r = refinements.sole()?;
     let TypedExprNode::BinOp {
         left,
@@ -3617,6 +3722,28 @@ impl Type {
         }
     }
 
+    /// The function projecting component `index`, whose result reads earlier components of
+    /// its own input. The caller records the projection terms the result type quotes.
+    pub fn projection_type(&self, index: usize) -> Option<Type> {
+        let input = crate::ccl::Name::fresh("__tuple");
+        let result = self.component_type(index, |j, earlier| {
+            let projection = TypedExpr::proj_index(j).with_ty(Type::fun_over(
+                input.clone(),
+                self.clone(),
+                earlier.clone(),
+                FunKind::Compute,
+            ));
+            TypedExpr::apply(TypedExpr::var(&input).with_ty(self.clone()), projection)
+                .with_ty(earlier.clone())
+        })?;
+        Some(Type::fun_over(
+            input,
+            self.clone(),
+            result,
+            FunKind::Compute,
+        ))
+    }
+
     /// The named product of `fields` — a [`Type::Record`], or
     /// [`BaseType::Unit`] when there are none. See [`Type::tuple`] for why the
     /// empty case collapses.
@@ -3635,13 +3762,13 @@ impl Type {
     pub fn with_capabilities(self, capabilities: crate::ccl::capabilities::Capabilities) -> Self {
         match self {
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 ..
             } => Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
@@ -3655,7 +3782,7 @@ impl Type {
     /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
         Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
@@ -3725,7 +3852,7 @@ impl Type {
         let name = name.into();
         let codomain = crate::ccl::subst::close_pi_binder(&name, &codomain);
         Type::Fun {
-            name: Some(name),
+            binder: FunBinder::Whole(name),
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
@@ -3738,7 +3865,7 @@ impl Type {
     #[cfg(debug_assertions)]
     pub(crate) fn unbound_index_function(&self) -> Option<&Type> {
         if let Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             codomain,
             ..
         } = self
@@ -3764,7 +3891,7 @@ impl Type {
     #[cfg(debug_assertions)]
     pub(crate) fn assert_indices_bound(&self) {
         if let Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             codomain,
             ..
         } = self.peel_refinements()
@@ -3794,7 +3921,7 @@ impl Type {
             Type::pi_kinded(binder, domain, codomain, fun_kind)
         } else {
             Type::Fun {
-                name: None,
+                binder: FunBinder::None,
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
@@ -3802,6 +3929,64 @@ impl Type {
             }
         }
     }
+    /// The argument type of a lambda over `params`, each a parameter's name and type: the
+    /// product of the types, where the product of one type is that type and of none is the
+    /// unit. Two or more make a dependent tuple, a later parameter's type reading the earlier
+    /// ones by name, which is the plain tuple when none does ([`Type::dep_tuple`]).
+    pub fn params_domain(params: Vec<(crate::ccl::Name, Self)>) -> Self {
+        let mut params = params;
+        match params.len() {
+            0 => Type::Base(BaseType::Unit),
+            1 => params.pop().expect("one parameter").1,
+            _ => Type::dep_tuple(params.into_iter().map(|(n, t)| (Some(n), t)).collect()),
+        }
+    }
+
+    /// The type of a lambda over `params` whose body has type `codomain`, which reads the
+    /// parameters by name: a function of [`Type::params_domain`].
+    ///
+    /// One parameter binds the whole input ([`Type::fun_over`]). Any other number is a
+    /// parameter list ([`FunBinder::Parameters`]), each read by the parameter's name; a codomain
+    /// reading none of them leaves them unnamed, the list's length kept. A function with no
+    /// parameters takes the empty list, its domain unit.
+    pub fn fun_of_params(
+        params: Vec<(crate::ccl::Name, Self)>,
+        codomain: Self,
+        fun_kind: FunKind,
+    ) -> Self {
+        match params.len() {
+            1 => {
+                let (name, domain) = params.into_iter().next().expect("one parameter");
+                Type::fun_over(name, domain, codomain, fun_kind)
+            }
+            _ => {
+                let names: Vec<Option<crate::ccl::Name>> =
+                    params.iter().map(|(n, _)| Some(n.clone())).collect();
+                let domain = Type::params_domain(params);
+                Type::fun_binding(FunBinder::Parameters(names), domain, codomain, fun_kind)
+            }
+        }
+    }
+
+    /// The function of `binder` that `codomain` is: `binder` bound over the codomain, its
+    /// references closed into indices, where the codomain reads it, and unnamed otherwise
+    /// ([`Type::fun_over`] for any [`FunBinder`]; [`FunBinder::unread`]).
+    pub fn fun_binding(binder: FunBinder, domain: Self, codomain: Self, fun_kind: FunKind) -> Self {
+        let binder = if crate::ccl::subst::binder_reads(&binder, &codomain) {
+            binder
+        } else {
+            binder.unread()
+        };
+        let codomain = crate::ccl::subst::close_at_binder(&binder, &codomain);
+        Type::Fun {
+            binder,
+            fun_kind,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
+        }
+    }
+
     /// The family `\\𝑘₀: 𝐾₀, … -> body` ([`Type::Family`]), closing the body's references
     /// to the binders by name into indices, as [`Type::pi`] closes a codomain.
     pub fn family(binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {
@@ -3905,7 +4090,7 @@ impl Type {
     /// (`name: None`, `kind: Data`) — a collection `domain ⤇ codomain`.
     pub fn data_fun(domain: Self, codomain: Self) -> Self {
         Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
@@ -3921,7 +4106,7 @@ impl Type {
         InferVar::place_parts_under(&domain, &fun_kind);
         InferVar::place_parts_under(&codomain, &fun_kind);
         Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
@@ -3971,7 +4156,7 @@ impl Type {
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 capabilities,
                 ..
@@ -3983,12 +4168,9 @@ impl Type {
                 // its codomain from node types, which reference the binder by
                 // name. Idempotent on a codomain extracted from a closed
                 // function — its references are already indices.
-                let codomain = match name {
-                    Some(b) => crate::ccl::subst::close_pi_binder(b, &codomain),
-                    None => codomain,
-                };
+                let codomain = crate::ccl::subst::close_at_binder(binder, &codomain);
                 Type::Fun {
-                    name: name.clone(),
+                    binder: binder.clone(),
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
@@ -4097,13 +4279,13 @@ impl Type {
             // is renamed is α-converted rather than having its domain's occurrences
             // captured by a name it no longer introduces.
             Type::Fun {
-                name,
+                binder,
                 fun_kind: FunKind::Data(Some(ws)),
                 domain,
                 codomain,
                 capabilities,
             } => Type::Fun {
-                name: name.clone(),
+                binder: binder.clone(),
                 fun_kind: FunKind::Data(Some(Rc::new(
                     ws.iter()
                         .map(|w| {
@@ -4484,7 +4666,7 @@ impl Type {
                     None => Type::WitnessRef(*w),
                 },
                 Type::Fun {
-                    name,
+                    binder,
                     fun_kind: FunKind::Data(Some(ws)),
                     domain,
                     codomain,
@@ -4505,7 +4687,7 @@ impl Type {
                     // canonicalization — so it is a deliberate re-binding rather than a
                     // derivation, and `bound_to` is how it is said.
                     Type::Fun {
-                        name: name.clone(),
+                        binder: binder.clone(),
                         fun_kind: FunKind::Data(Some(Rc::new(
                             kinds
                                 .into_iter()
@@ -4530,7 +4712,7 @@ impl Type {
         go(self, &mut Vec::new())
     }
 
-    /// A structural copy with every Pi binder name erased (`Fun.name → None`)
+    /// A structural copy with every Pi binder name erased (`Fun.binder → None`)
     /// and every function **kind** canonicalized to `Compute`.
     ///
     /// The binder is load-bearing only inside the type solver (it carries
@@ -4579,12 +4761,14 @@ impl Type {
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 ..
             } => Type::Fun {
-                name: None,
+                // A parameter list's length is shape, not a name.
+                binder: binder.unread(),
                 // Canonicalize the kind so the comparison is about *shape*. Nothing
                 // here says elimination may lose it — `elim_lambda_kinded` carries a
                 // lambda's kind across — only that these asserts are checking
@@ -5806,6 +5990,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::MutDecl { .. }
         | N::MutWrite { .. }
         | N::Tuple(_)
+        | N::Arguments(_)
         | N::Proj(_)
         | N::Record(_)
         | N::Source(..)
@@ -5912,19 +6097,29 @@ fn eq_term_modulo_ty_slots_go(
         }
         (
             N::Lambda {
-                param: p1,
+                params: p1,
                 body: b1,
-                ..
             },
             N::Lambda {
-                param: p2,
+                params: p2,
                 body: b2,
-                ..
             },
-            // A lambda's parameter is a binder the predicate introduces: pair
-            // the two and compare the bodies under the pairing, so the bodies'
-            // references to it match by position.
-        ) => eq_under_binder(pairs, &p1.name, &p2.name, &[(b1, b2)]),
+            // A lambda's parameters are binders the predicate introduces: pair
+            // them in order and compare the bodies under the pairing, so the bodies'
+            // references to them match by position.
+        ) => {
+            p1.len() == p2.len() && {
+                let base = pairs.len();
+                pairs.extend(
+                    p1.iter()
+                        .zip(p2)
+                        .map(|(a, b)| (a.name.clone(), b.name.clone())),
+                );
+                let matched = eq_term_modulo_ty_slots_go(b1, b2, pairs);
+                pairs.truncate(base);
+                matched
+            }
+        }
         (
             N::Aggregate {
                 input: i1,
@@ -6023,6 +6218,7 @@ fn eq_term_modulo_ty_slots_go(
         ) => c1 == c2 && eq_term_modulo_ty_slots_go(b1, b2, pairs),
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
+        | (N::Arguments(x), N::Arguments(y))
         | (N::Compose(x), N::Compose(y))
         | (N::Copair(x), N::Copair(y))
         | (N::DisjointJoin(x), N::DisjointJoin(y))
@@ -6275,8 +6471,12 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
     // children. Every other node's children sit in the node's own scope, so the
     // generic walk covers them.
     match &e.node {
-        TypedExprNode::Lambda { param, body } => {
-            hash_under_binder(state, scope, &param.name, &[body]);
+        TypedExprNode::Lambda { params, body } => {
+            params.len().hash(state);
+            let base = scope.len();
+            scope.extend(params.iter().map(|p| p.name.clone()));
+            hash_term_modulo_ty_slots(body, state, scope);
+            scope.truncate(base);
         }
         TypedExprNode::Let {
             binding,
@@ -6965,7 +7165,7 @@ mod tests {
             reads_k.clone(),
             FunKind::Compute,
         );
-        assert!(matches!(&dependent, Type::Fun { name: Some(n), .. } if *n == k));
+        assert!(matches!(&dependent, Type::Fun { binder: FunBinder::Whole(n), .. } if *n == k));
         #[cfg(debug_assertions)]
         dependent.assert_indices_bound();
         let plain = Type::fun_over(
@@ -6974,7 +7174,13 @@ mod tests {
             Type::Base(BaseType::Int),
             FunKind::Compute,
         );
-        assert!(matches!(plain, Type::Fun { name: None, .. }));
+        assert!(matches!(
+            plain,
+            Type::Fun {
+                binder: FunBinder::None,
+                ..
+            }
+        ));
     }
 
     /// An unnamed function over a codomain that reads it by index reads a binder with no name.
@@ -6993,7 +7199,7 @@ mod tests {
             unreachable!("a Pi is a function")
         };
         Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain,
@@ -7282,7 +7488,7 @@ mod tests {
             ),
         ));
         let target = Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind: FunKind::fresh_data(),
             domain: Box::new(Type::refined_one(
                 Type::Hole,
@@ -7911,7 +8117,7 @@ mod tests {
         );
         // (k: Int) ⇒ (Int ⇒ {Int | #1}) — one unnamed crossing in between.
         let ty = Type::Fun {
-            name: Some(Name::raw("k")),
+            binder: FunBinder::Whole(Name::raw("k")),
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refined)),

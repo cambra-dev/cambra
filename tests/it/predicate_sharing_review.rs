@@ -129,9 +129,10 @@ fn rewrite_reaches_the_lambda_param_type_slot() {
 
     Subst::discharge("k", int(5)).rewrite_expr(&mut e);
 
-    let TypedExprNode::Lambda { param, .. } = &e.node else {
+    let TypedExprNode::Lambda { params, .. } = &e.node else {
         panic!("lambda preserved");
     };
+    let param = &params[0];
     assert_eq!(
         **predicate_of(&param.ty),
         gt(int(5), int(0)),

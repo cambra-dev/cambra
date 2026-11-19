@@ -175,7 +175,7 @@ use super::helpers::{check_compile_error, check_scalar};
     indoc! {"
         def first(T, a: T, b: T) => T:
             a
-        pick: forall (T) {T, T} => T = first
+        pick: forall (T) (T, T) => T = first
         pick(3, 4)
     "},
     Value::Int(3),
@@ -425,7 +425,7 @@ fn type_parameters_check_and_run(#[case] code: &str, #[case] expected: Value) {
 )]
 #[case::polymorphic_annotation(
     indoc! {r#"
-        bigger: forall (T) {T, T} => T requires Orderable(T, T) = \a, b -> b if a < b else a
+        bigger: forall (T) (T, T) => T requires Orderable(T, T) = \a, b -> b if a < b else a
         bigger("a", "b") == "b"
     "#},
     Value::Bool(true),
@@ -435,11 +435,8 @@ fn requirements_check_and_run(#[case] code: &str, #[case] expected: Value) {
 }
 
 /// A nested definition whose result is the enclosing definition's parameter, reached through
-/// its own associated type bounded by that parameter, does not specialize: the enclosing
-/// definition's clone replays the nested one's obligation, answered by the nested one's own
-/// requirement, into a variable at the enclosing level. Pinned on the failure.
+/// its own associated type bounded by that parameter, specializes with the enclosing definition.
 #[test]
-#[should_panic(expected = "reaches a type fixed outside")]
 fn a_nested_member_bounded_by_the_enclosing_parameter() {
     check_scalar(
         indoc! {r#"
@@ -700,19 +697,19 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
     indoc! {"
         def less(a, b):
             a < b
-        pick: forall (T) {T, T} => T = less
+        pick: forall (T) (T, T) => T = less
         1
     "},
-    "inferred as forall (A, B) {A, B} => Bool requires Orderable(A, B)",
+    "inferred as forall (A, B) (A, B) => Bool requires Orderable(A, B)",
 )]
 #[case::requirement_naming_its_output(
     indoc! {"
         def add(a, b):
             a + b
-        pick: forall (T) {T, T} => T = add
+        pick: forall (T) (T, T) => T = add
         1
     "},
-    "inferred as forall (A, B) {A, B} => r::Output requires r: Addable(A, B)",
+    "inferred as forall (A, B) (A, B) => r::Output requires r: Addable(A, B)",
 )]
 // An open tuple is written only as a bound, so a parameter holds the position it bounds.
 #[case::open_tuple_behind_a_parameter(
@@ -748,10 +745,10 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
     indoc! {"
         def f(c, a):
             a if c else 1
-        pick: forall (T) {Bool, T} => T = f
+        pick: forall (T) (Bool, T) => T = f
         1
     "},
-    "inferred as forall (A) {Bool, A} => A ∨ {Int where _ == 1}",
+    "inferred as forall (A) (Bool, A) => A ∨ {Int where _ == 1}",
 )]
 #[case::lambda_right_hand_side(
     indoc! {"

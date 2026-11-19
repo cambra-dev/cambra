@@ -277,8 +277,9 @@ When design-doc prose and inline pseudo-code mix CCL syntax with meta-theoretic 
 
 Use the symbolic forms below in prose and inline pseudo-code (not in fenced code blocks, which represent literal source):
 
-- **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
-- **Function type with no named binder** (`Type::Fun` with `name: None`): `𝐴 ⇒ 𝐵`.
+- **Function type with a whole-input binder** (`Type::Fun` with `binder: FunBinder::Whole(_)`):
+  `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
+- **Function type with no binder** (`Type::Fun` with `binder: FunBinder::None`): `𝐴 ⇒ 𝐵`.
 - **Data function type** (`FunKind::Data`, rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is the data".
 - **Σ type**: **always write the binder, and kind it with `:`.** `Σ (𝐷 : [𝐷₀, 𝐷₁]). 𝐷 ⤇ 𝑉` — a sum is a data arrow carrying its binders, so the body is always the arrow, and every binder scopes over the domain. A described witness kind goes in the same position by name: `Σ (𝐷 : UIntRanges). 𝐷 ⤇ 𝑇`. A listing kind is written in **brackets** — `[𝑇₀, 𝑇₁]`, or `[𝑇₀, …]` where the length is beside the point — because braces are the record type's and a listing whose only cardinality marker is an `ᵢ` subscript (`{𝑇ᵢ}`) does not say whether it is one candidate or many. Reserve `∈` for membership of a candidate in a kind (`𝑑 ∈ 𝐾`, in a rule premise), not for the binder. Do **not** use an anonymous shorthand (`Σ[𝐷₀, 𝐷₁] ⤇ 𝑉`) or a lattice-operator spelling (`⨆[𝑇ᵢ]`) — the binder is what makes the scoping readable.
 - **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.

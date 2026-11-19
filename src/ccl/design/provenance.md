@@ -280,10 +280,9 @@ run's arguments, which linking replaces; `LetType.name`, which `uniquify` remove
 inside a `Type` (`Type::Fun`'s parameter name, a Σ witness, a record or variant
 type's labels).
 
-A multi-parameter function's parameters and the fields of a constructor pattern in a `match` arm
-bind nothing either. `uncurry_params` and `bind_parameters` substitute a projection for each use of
-the name. Both tag each substituted projection `lower.param_proj` at the span of the name the
-parameter or field declares, and keep the channel
+The fields of a constructor pattern in a `match` arm bind nothing either. `bind_parameters`
+substitutes a projection for each use of the name. It tags each substituted projection
+`lower.param_proj` at the span of the name the field declares, and keeps the channel
 [ir.md](ir.md#source-locations-on-substituted-parameter-projections) describes. A constructor's
 fields in a one-field arm and in `N::c(a, b) = v` are binders, and get binding occurrences.
 
@@ -322,7 +321,7 @@ the pattern's `PatternHead::Constructor` reaches through its `decl`.
 | Where | What the occurrence gets |
 |---|---|
 | Lowering, a name the source writes: a binder, an applied occurrence, a label, a tag, a pattern head or an annotation | A `LoweringStep::Leaf` at the span the source writes it at, labelled `lower.image`, from `LoweringContext::occurrence_at`. `AssignmentBindings` and `PrefixStmt::Bind` carry each binder's span to the site that builds its node. |
-| Lowering, a binder or an annotation the source does not write | The leaf of the tag that records its holding node (`tag_source`, `tag_image`, `tag_machinery`, `tag_predicate`), at that tag's span and label, unless the occurrence is already recorded: `__arg_tuple_N`, `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload, a `def`'s polymorphic annotation, the members and checks a module's parameters bind, the element a `for` or comprehension pattern binder takes apart, the name `_` binds. |
+| Lowering, a binder or an annotation the source does not write | The leaf of the tag that records its holding node (`tag_source`, `tag_image`, `tag_machinery`, `tag_predicate`), at that tag's span and label, unless the occurrence is already recorded: `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload, a `def`'s polymorphic annotation, the members and checks a module's parameters bind, the element a `for` or comprehension pattern binder takes apart, the name `_` binds. |
 | `uniquify` | Nothing new. It renames binders in place, so every occurrence survives, and mints none. |
 | A copy of a subtree | A fresh id and a copy row, from `Occurrence::clone`. `subst`'s transport, monomorphization and inlining need no change. |
 | A binder a pass makes | A mint under the open recording, which becomes its parent: `__anf_N`, the reads `mut_read` names, `mut_elim`'s history and writer binders. |

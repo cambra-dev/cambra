@@ -135,37 +135,24 @@ fn generalized_bodies(ty: &Type) -> Type {
 
 /// `codomain`, the codomain of the function `fun`, with `fun`'s references to its binder read
 /// as the name `b`.
-fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::Name) -> Type {
-    let Type::Fun {
-        fun_kind,
-        domain,
-        capabilities,
-        ..
-    } = fun.peel_refinements()
-    else {
+fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::FunBinder) -> Type {
+    let Type::Fun { domain, .. } = fun.peel_refinements() else {
         unreachable!("only a function has a codomain")
     };
-    let renamed = Type::Fun {
-        name: Some(b.clone()),
-        fun_kind: fun_kind.clone(),
-        domain: domain.clone(),
-        codomain: Box::new(codomain.clone()),
-        capabilities: capabilities.clone(),
-    };
-    crate::ccl::subst::open_codomain(&renamed, codomain)
+    crate::ccl::subst::open_at_binder(b, domain, codomain)
 }
 
 /// `ty` with every named function's references to its own binder read by name.
 pub(crate) fn opened_deep(ty: &Type) -> Type {
     match ty {
         Type::Fun {
-            name: Some(b),
+            binder: crate::ccl::FunBinder::Whole(b),
             fun_kind,
             domain,
             codomain,
             capabilities,
         } => Type::Fun {
-            name: Some(b.clone()),
+            binder: crate::ccl::FunBinder::Whole(b.clone()),
             fun_kind: fun_kind.clone(),
             domain: Box::new(opened_deep(domain)),
             codomain: Box::new(opened_deep(&crate::ccl::subst::open_codomain(ty, codomain))),
@@ -212,7 +199,7 @@ pub(crate) fn opened_deep(ty: &Type) -> Type {
 pub(crate) fn closed_deep(ty: &Type) -> Type {
     match ty {
         Type::Fun {
-            name: Some(b),
+            binder: crate::ccl::FunBinder::Whole(b),
             fun_kind,
             domain,
             codomain,
@@ -291,14 +278,14 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
     match (sub, sup.peel_refinements()) {
         (
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 capabilities,
             },
             sup_fun @ Type::Fun {
-                name: sup_name,
+                binder: sup_name,
                 domain: sd,
                 codomain: sc,
                 ..
@@ -320,31 +307,34 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
             // The codomains are aligned with the binder read by name in both: an index would
             // be loose in either alone, and a type a parameter is bound to would carry it to a
             // depth where it reads a different function.
-            match name.clone().or_else(|| sup_name.clone()) {
-                Some(b) => {
-                    let aligned = align_sub(
-                        &codomain_opened_as(sub, codomain, &b),
-                        &codomain_opened_as(sup_fun, sc, &b),
-                    );
-                    if name.is_none() && !crate::ccl::subst::type_free_vars(&aligned).contains(&b) {
-                        Type::Fun {
-                            name: None,
-                            fun_kind: fun_kind.clone(),
-                            domain,
-                            codomain: Box::new(aligned),
-                            capabilities: capabilities.clone(),
-                        }
-                    } else {
-                        Type::pi_kinded(b, *domain, aligned, fun_kind.clone())
-                    }
-                }
-                None => Type::Fun {
-                    name: None,
+            let named = if binder.is_none() { sup_name } else { binder };
+            if named.is_none() {
+                return Type::Fun {
+                    binder: crate::ccl::FunBinder::None,
                     fun_kind: fun_kind.clone(),
                     domain,
                     codomain: Box::new(align_sub(codomain, sc)),
                     capabilities: capabilities.clone(),
-                },
+                };
+            }
+            let b = crate::ccl::subst::named_binder(named);
+            let aligned = align_sub(
+                &codomain_opened_as(sub, codomain, &b),
+                &codomain_opened_as(sup_fun, sc, &b),
+            );
+            // The subtype keeps its binder, read or not; one it lacks is taken only where the
+            // aligned codomain reads it.
+            let b = if binder.is_none() && !crate::ccl::subst::binder_reads(&b, &aligned) {
+                b.unread()
+            } else {
+                b
+            };
+            Type::Fun {
+                codomain: Box::new(crate::ccl::subst::close_at_binder(&b, &aligned)),
+                binder: b,
+                fun_kind: fun_kind.clone(),
+                domain,
+                capabilities: capabilities.clone(),
             }
         }
         // A tuple instantiated at a dependent tuple's components reads the earlier ones as they
@@ -710,7 +700,10 @@ type GeneralizedCache = HashMap<(Type, Vec<crate::ccl::Name>), Type>;
 /// family binders.
 fn type_binders(ty: &Type, out: &mut Vec<crate::ccl::Name>) {
     match ty {
-        Type::Fun { name: Some(n), .. } => out.push(n.clone()),
+        Type::Fun {
+            binder: crate::ccl::FunBinder::Whole(n),
+            ..
+        } => out.push(n.clone()),
         Type::DepTuple(cs) => out.extend(cs.iter().filter_map(|(n, _)| n.clone())),
         Type::Family { binders, .. } => out.extend(binders.iter().filter_map(|(n, _)| n.clone())),
         _ => {}
@@ -816,7 +809,7 @@ fn walk(
             )
         };
         let instance = |codomain: Type| Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: fun_kind.clone(),
             domain: Box::new(argument.ty.clone()),
             codomain: Box::new(codomain),
@@ -1022,7 +1015,7 @@ fn renamed_apart(
 ) -> Type {
     match ty {
         Type::Fun {
-            name: Some(b),
+            binder: crate::ccl::FunBinder::Whole(b),
             fun_kind,
             domain,
             codomain,
@@ -1036,7 +1029,8 @@ fn renamed_apart(
                     fresh
                 }
             };
-            let opened = codomain_opened_as(ty, codomain, &fresh);
+            let opened =
+                codomain_opened_as(ty, codomain, &crate::ccl::FunBinder::Whole(fresh.clone()));
             Type::pi_kinded(
                 fresh,
                 renamed_apart(domain, free, renames),
@@ -1060,7 +1054,7 @@ fn restored_names(ty: &Type, renames: &[(crate::ccl::Name, crate::ccl::Name)]) -
     }
     match ty {
         Type::Fun {
-            name: Some(b),
+            binder: crate::ccl::FunBinder::Whole(b),
             fun_kind,
             domain,
             codomain,
@@ -1075,7 +1069,7 @@ fn restored_names(ty: &Type, renames: &[(crate::ccl::Name, crate::ccl::Name)]) -
                 _ => b.clone(),
             };
             Type::Fun {
-                name: Some(name),
+                binder: crate::ccl::FunBinder::Whole(name),
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(restored_names(domain, renames)),
                 codomain: Box::new(restored_names(codomain, renames)),
@@ -1103,7 +1097,7 @@ fn generalized_go(
             .any(|n| out_of_scope(&n))
     };
     let Type::Fun {
-        name,
+        binder,
         fun_kind,
         domain,
         codomain,
@@ -1150,7 +1144,7 @@ fn generalized_go(
         // its binder, the one place Check's derivation of an application puts them.
         let inner = product_hoisted(generalized(codomain, out_of_scope, at, cache)?);
         let fun = |codomain: Type| Type::Fun {
-            name: name.clone(),
+            binder: binder.clone(),
             fun_kind: fun_kind.clone(),
             domain: domain.clone(),
             codomain: Box::new(codomain),
@@ -1159,7 +1153,7 @@ fn generalized_go(
         return Ok(match inner {
             Type::Poly(p)
                 if p.is_generalized()
-                    && name.as_ref().is_none_or(|b| {
+                    && binder.names().all(|b| {
                         p.params.iter().all(|q| {
                             q.param
                                 .bound
@@ -1413,7 +1407,7 @@ fn index_instances(
 fn binder_domain(ty: &Type, b: &crate::ccl::Name) -> Option<Type> {
     match ty {
         Type::Fun {
-            name: Some(n),
+            binder: crate::ccl::FunBinder::Whole(n),
             domain,
             ..
         } if n == b => return Some((**domain).clone()),
@@ -1761,13 +1755,13 @@ fn drop_facts_naming(
                 )
             }
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 capabilities,
             } => Type::Fun {
-                name: name.clone(),
+                binder: binder.clone(),
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(go(
                     domain,
@@ -1997,9 +1991,10 @@ mod tests {
             unreachable!()
         };
         let held = &app.args[0].term;
-        let crate::ccl::TypedExprNode::Lambda { param, body } = &held.node else {
+        let crate::ccl::TypedExprNode::Lambda { params, body } = &held.node else {
             unreachable!()
         };
+        let param = &params[0];
         let crate::ccl::TypedExprNode::Cast { target, .. } = &body.node else {
             unreachable!()
         };

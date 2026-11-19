@@ -669,7 +669,7 @@ impl Qualifier {
         }
         Ok(Some(Reference {
             name: self.name.child(member),
-            history_param: found.history_param.is_some(),
+            history_param: found.history_param,
         }))
     }
 

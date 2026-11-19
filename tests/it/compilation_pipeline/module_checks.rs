@@ -477,7 +477,7 @@ fn a_checked_module_prints_its_interface() {
             pub Count = {Int where _ > 0}
             pub base: {Int where _ > 0}  # a constant
             pub double: forall (A, B) A => B ∨ Int requires r: Multipliable(A, Int), r::Output <: B
-            pub first: forall (U) {U, U} => U  # callable in a constant
+            pub first: forall (U) (U, U) => U  # callable in a constant
             pub keep: T => T  # callable in a constant
             pub total: Int  # a constant
         "}
@@ -560,7 +560,7 @@ fn a_checked_module_prints_its_nominal_types() {
                 placed(r: Receipt, total: Price)
             pub abstract type Token
             pub abstract type Cents
-            pub Box::or_else: forall (T) {Box(T), T} => T
+            pub Box::or_else: forall (T) (Box(T), T) => T
         "}
     );
 }
@@ -658,7 +658,7 @@ fn a_contract_writes_a_parameter_with_no_kind_by_name() {
             module main
             param T
             pub wrap: T => T  # callable in a constant
-            pub pick: forall (A) {T, A} => A  # callable in a constant
+            pub pick: forall (A) (T, A) => A  # callable in a constant
         "}
     );
 }
@@ -738,7 +738,7 @@ fn a_def_with_a_mut_parameter_is_written_uncurried() {
         interface,
         indoc! {"
             module main
-            pub draw: {Mut(Int, Txn), Int} => {} causes RunTransaction
+            pub draw: (Mut(Int, Txn), Int) => {} causes RunTransaction
             pub reset: Mut(Int, Txn) => {} causes RunTransaction
         "}
     );

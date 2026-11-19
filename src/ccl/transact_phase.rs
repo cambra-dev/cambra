@@ -1276,9 +1276,10 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
             if matches!(function.node, TypedExprNode::Lambda { .. }) =>
         {
             let lambda_id = function.node_id();
-            let TypedExprNode::Lambda { mut param, body } = function.node else {
+            let TypedExprNode::Lambda { params, body } = function.node else {
                 unreachable!("guarded above")
             };
+            let mut param = crate::ccl::into_one_param(params);
             let argument = hoist_onto_spine(*argument, spine, true);
             let body = if nested {
                 refresh_let_binder(&mut param, *body)

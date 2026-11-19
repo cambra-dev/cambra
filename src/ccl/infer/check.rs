@@ -71,6 +71,9 @@ use std::rc::Rc;
 /// refinements still chain. (Previously this gap was papered over by a
 /// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
 pub(super) struct CheckCtx {
+    /// The parameters each call's argument tuple about to be emitted passes its components to
+    /// ([`Typing::pass_arguments`]).
+    arguments: HashMap<NodeId, Vec<Type>>,
     /// The types of the registered data sources, where the caller states them. A projected
     /// source's recorded type is verified against its registered one; without a registry the
     /// recorded type is trusted, as every other leaf's is.
@@ -204,6 +207,7 @@ impl CheckCtx {
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
         Self {
+            arguments: HashMap::new(),
             sources: None,
             schemes: OperatorSchemes::new(),
             level: 0,
@@ -242,6 +246,8 @@ impl CheckCtx {
     fn cache(&self) -> ConstrainCache {
         let mut cache = ConstrainCache::for_derivation(self.mode.derivation());
         cache.seed_context(&self.witness_ctx);
+        let origin = Some(crate::ccl::infer_var::Origin::Node(self.current_node));
+        cache.at(origin, origin);
         cache
     }
 }
@@ -268,6 +274,10 @@ fn without_written_clauses(ty: &mut Type) {
 impl Typing for CheckCtx {
     fn std_trait(&self, named: StdTrait) -> Trait {
         self.instances.std_trait(named)
+    }
+
+    fn reads_argument_lists(&self) -> bool {
+        false
     }
 
     fn pred_memo(&self) -> TermMemo {
@@ -694,6 +704,14 @@ impl Typing for CheckCtx {
         crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body_ty)
     }
 
+    fn pass_arguments(&mut self, tuple: NodeId, params: Vec<Type>) {
+        self.arguments.insert(tuple, params);
+    }
+
+    fn take_arguments(&mut self, tuple: NodeId) -> Option<Vec<Type>> {
+        self.arguments.remove(&tuple)
+    }
+
     fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
         if !crate::ccl::subst::type_free_vars(&body_ty).contains(binder) {
             return body_ty;
@@ -782,14 +800,12 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
         let fun_binder = match t.read_view().as_ref() {
-            Type::Fun { name, .. } => name.clone(),
-            _ => None,
+            Type::Fun { binder, .. } => binder.clone(),
+            _ => crate::ccl::FunBinder::None,
         };
         let (d, c) = self.as_function(t, at)?;
-        Ok((
-            d,
-            crate::ccl::subst::codomain_renamed(fun_binder.as_ref(), binder, &c),
-        ))
+        let c = crate::ccl::subst::codomain_renamed(&fun_binder, &d, binder, &c);
+        Ok((d, c))
     }
 
     fn provide_function(
@@ -869,6 +885,8 @@ impl Typing for CheckCtx {
         arg_ty: &Type,
         argument: &Expr,
         _kind: Option<&crate::ccl::ty::FunKind>,
+        // The function's type settled its parameter list, which the arguments met at emission.
+        _list: Option<usize>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {
         // **One read view for the whole rule.** An application consumes the function's
@@ -891,7 +909,25 @@ impl Typing for CheckCtx {
             other => (std::borrow::Cow::Owned(other), None),
         };
         let (_domain, codomain) = self.as_function(&function, at)?;
-        self.constrain_argument(arg_ty, &function, at)?;
+        // A function of a dependent parameter list takes each argument at its parameter's
+        // type with the earlier parameters at the earlier arguments, as emission related them
+        // (`Typing::apply`); any other takes its argument whole.
+        match parameters_at_arguments(&function, argument) {
+            Some(parameters) => {
+                let arguments: &[Type] = match arg_ty.peel_refinements() {
+                    Type::Tuple(ts) if ts.len() == parameters.len() => ts,
+                    other => unreachable!(
+                        "a call's argument list is the tuple of its {} arguments, got {other}",
+                        parameters.len()
+                    ),
+                };
+                let binders = function.peel_refinements().sum().unwrap_or(&[]).to_vec();
+                for (argument, parameter) in arguments.iter().zip(&parameters) {
+                    self.require_sub_under(argument, &[], parameter, &binders, at)?;
+                }
+            }
+            None => self.constrain_argument(arg_ty, &function, at)?,
+        }
 
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
@@ -901,8 +937,8 @@ impl Typing for CheckCtx {
         // free names when a name-spelled form survived; both discharge to
         // the same argument term.
         let result = match function.as_ref() {
-            Type::Fun { name: Some(b), .. } => {
-                crate::ccl::subst::discharge_codomain(b, argument, &codomain)
+            Type::Fun { binder, .. } => {
+                crate::ccl::subst::discharge_at_binder(binder, argument, &codomain)
             }
             _ => codomain,
         };
@@ -1079,7 +1115,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             _ => expr.ty.clone(),
         },
 
-        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, None, ctx)?,
+        TypedExprNode::Lambda { params, body } => {
+            emit_lambda(params, body, &recorded_ty, None, ctx)?
+        }
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
@@ -1118,6 +1156,11 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         } => emit_mut_decl(binding, init, body, ctx)?,
 
         TypedExprNode::Tuple(elts) => emit_tuple(elts, ctx)?,
+
+        // A call's argument list passes the tuple of its arguments, and the empty one unit;
+        // the call checks it against the callee's parameter list (`emit_apply`).
+        TypedExprNode::Arguments(elts) if elts.is_empty() => Type::Base(BaseType::Unit),
+        TypedExprNode::Arguments(elts) => emit_tuple(elts, ctx)?,
 
         TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
 
@@ -1430,15 +1473,14 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                 });
                 let bound_ty = Type::fun((**base).clone(), body.ty.clone());
                 let mut bound = Expr::throwaway(TypedExprNode::Lambda {
-                    param: TypedBinding {
+                    params: vec![TypedBinding {
                         name: param,
                         occurrence: crate::ccl::Occurrence::PLACEHOLDER,
                         ty: (**base).clone(),
                         user_annotation: None,
                         transparency: BindingTransparency::Transparent,
                         site: None,
-                        role: Default::default(),
-                    },
+                    }],
                     body: Box::new(body),
                 })
                 .with_ty(bound_ty);
@@ -1512,7 +1554,7 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     let ty = crate::ccl::generalize::body(ty);
     let expected = (|| {
         let Type::Fun {
-            name,
+            binder,
             domain,
             codomain,
             ..
@@ -1525,7 +1567,7 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         if domain.peel_refinements().sum().is_none() {
             return Some(((**domain).clone(), (**codomain).clone()));
         }
-        let (boxed, recorded) = match name {
+        let (boxed, recorded) = match binder.whole() {
             Some(boxed) => (boxed, crate::ccl::subst::open_codomain(ty, codomain)),
             // A sum whose every witness is determined projects each to its one candidate, which
             // reads no argument, so the result names no binder (`ty::unbox_type`) and the term
@@ -1636,6 +1678,38 @@ fn check_located_memoized(
     } else {
         Err(ctx.errors)
     }
+}
+
+/// The parameter types of `function`, a function of a dependent parameter list, at the arguments
+/// of `argument`, its call's argument list: each parameter's type with the parameters before it
+/// at the arguments before it. `None` for any other function.
+fn parameters_at_arguments(function: &Type, argument: &Expr) -> Option<Vec<Type>> {
+    let Type::Fun {
+        binder: crate::ccl::FunBinder::Parameters(_),
+        domain,
+        ..
+    } = function.peel_refinements()
+    else {
+        return None;
+    };
+    let Type::DepTuple(components) = domain.peel_refinements() else {
+        return None;
+    };
+    let _mint = provenance::enter(
+        argument.node_id(),
+        "check.argument_list_parameters",
+        provenance::Nature::Machinery,
+    );
+    let passed = crate::ccl::ccl_utils::predicate_term(argument);
+    Some(
+        (0..components.len())
+            .map(|k| {
+                domain
+                    .component_type(k, |j, _| super::context::list_component(&passed, j))
+                    .expect("a component of the parameter list")
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

@@ -64,7 +64,6 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
             },
             empty_payload: false,
         }),
@@ -172,15 +171,14 @@ fn variant_ctor_nested_payload() {
 fn variant_param_accepts_subtype() {
     let param_ty = variant(&[("some", int()), ("none", unit_ty())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
-        param: TypedBinding {
+        params: vec![TypedBinding {
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(Annotation::new(param_ty.clone(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
-        },
+        }],
         body: Box::new(var("v")),
     });
     let arg = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(5));
@@ -195,15 +193,14 @@ fn variant_param_accepts_subtype() {
 fn variant_extra_tag_rejected() {
     let param_ty = variant(&[("some", int())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
-        param: TypedBinding {
+        params: vec![TypedBinding {
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(Annotation::new(param_ty, Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
-        },
+        }],
         body: Box::new(var("v")),
     });
     let arg = TypedExpr::variant_ctor("other", Occurrence::mint(), lit_int(5));
@@ -289,7 +286,6 @@ fn value_ascription_accepts_widening() {
             )),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
         },
         bound_expr: Box::new(TypedExpr::variant_ctor("A", Occurrence::mint(), lit_unit())),
         body: Box::new(var("x")),
@@ -469,15 +465,14 @@ fn match_empty_arms_rejected() {
 #[test]
 fn lambda_returns_variant() {
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
-        param: TypedBinding {
+        params: vec![TypedBinding {
             occurrence: Occurrence::mint(),
             name: "x".into(),
             ty: int(),
             user_annotation: Some(Annotation::new(int(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
-        },
+        }],
         body: Box::new(TypedExpr::variant_ctor(
             "some",
             Occurrence::mint(),
@@ -535,15 +530,14 @@ fn if_returns_variant() {
 fn payload_covariance_accept() {
     let param_ty = variant(&[("a", int()), ("b", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
-        param: TypedBinding {
+        params: vec![TypedBinding {
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(Annotation::new(param_ty.clone(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
-        },
+        }],
         body: Box::new(var("v")),
     });
     let arg = TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(5));
@@ -556,15 +550,14 @@ fn payload_covariance_accept() {
 fn payload_mismatch_reject() {
     let param_ty = variant(&[("a", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
-        param: TypedBinding {
+        params: vec![TypedBinding {
             occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
             user_annotation: Some(Annotation::new(param_ty, Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
-        },
+        }],
         body: Box::new(var("v")),
     });
     let arg = TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(5));

@@ -245,6 +245,71 @@ fn a_function_of_no_parameters(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+/// A function takes its parameter list, and a tuple is one value: a function of a pair takes
+/// the pair, and a parameter list is written as a function type's domain
+/// (`docs/chl-spec.md`, "Parameter lists").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_pair_passed_whole(indoc! {"
+    def sum_of(p):
+        p.0 + p.1
+    pair = (3, 4)
+    sum_of(pair) + sum_of((1, 2))
+"}, Value::Int(10))]
+#[case::a_written_parameter_list(indoc! {"
+    def add(a: Int, b: Int) => Int:
+        a + b
+    f: (Int, Int) => Int = add
+    f(1, 2)
+"}, Value::Int(3))]
+#[case::a_written_empty_list(indoc! {"
+    def zero() => Int:
+        0
+    f: () => Int = zero
+    f() + 1
+"}, Value::Int(1))]
+#[case::a_parameter_list_through_a_parameter(indoc! {"
+    def apply(f: (Int, Int) => Int, a: Int, b: Int) => Int:
+        f(a, b)
+    apply(\\x, y -> x * y, 3, 4)
+"}, Value::Int(12))]
+fn a_parameter_list_is_not_a_tuple(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A call passes exactly as many arguments as its function has parameters, so a tuple does not
+/// spread over a parameter list and a list does not pack into a tuple.
+#[rstest]
+#[case::a_pair_to_two_parameters(indoc! {"
+    def add(a: Int, b: Int) => Int:
+        a + b
+    pair = (1, 2)
+    add(pair)
+"}, "`add` takes 2 arguments, got 1")]
+#[case::two_arguments_to_a_pair(indoc! {"
+    def sum_of(p):
+        p.0 + p.1
+    sum_of(1, 2)
+"}, "`sum_of` takes 1 argument, got 2")]
+#[case::an_argument_to_none(indoc! {"
+    def zero() => Int:
+        0
+    zero(1)
+"}, "`zero` takes 0 arguments, got 1")]
+#[case::two_parameters_where_a_pair_is_taken(indoc! {"
+    def add(a: Int, b: Int) => Int:
+        a + b
+    f: {Int, Int} => Int = add
+    f((1, 2))
+"}, "annotated as {Int, Int} => Int, but inferred as (Int, Int) => Int")]
+#[case::a_list_keying_a_collection(indoc! {"
+    m: (Int, Int) |=> Int = [(1, 2) -> 3]
+    1
+"}, "a collection is keyed by one value, not a parameter list")]
+fn a_call_passes_its_function_s_parameter_list(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
 // A polymorphic UDF applied at two *distinct* argument types in the same
 // program, end-to-end. `x == x` is `∀α. α → Bool`, so the two calls have
 // incompatible domains (Int vs String) — under a monomorphic `let` they would
