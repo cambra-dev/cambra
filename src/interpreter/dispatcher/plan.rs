@@ -583,20 +583,22 @@ fn run_targets(
         let special = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
             // completion; otherwise the scope holds each delivery on the pipelines it reads.
-            (Located::Store { .. }, _) if inherits => Some(Notifies::Items),
+            (Located::Store { .. }, _) if inherits => Some(Notifies::Items { arms: None }),
             _ if inherits => leaves
                 .iter()
                 .all(|leaf| leaf.ordering_path().is_some())
                 .then_some(Notifies::Rounds),
             // A transaction store places the entry before its writer's source, so its items are a
-            // delivery's keys where the writer's source is the source every range under the
-            // writer reads. One whose writer reads the source otherwise, as a concatenation of the
-            // source and a list, takes the arrivals the source's ranges bring, as any other
-            // pipeline does.
-            (Located::Store { .. }, _) => leaves
-                .iter()
-                .all(|leaf| input.domain_extent().as_ref() == Some(&leaf.extent))
-                .then_some(Notifies::Items),
+            // delivery's keys as its writer's source holds them: the source's own positions where
+            // that source is the live source, and over a concatenation those positions under each
+            // arm that reads the source. The arms that read no source come with the first
+            // notification. The items are read off the extents (`store_items`), since a writer
+            // may read its source through requests no push climbs. Any other shape takes the
+            // arrivals the source's ranges bring, as any other pipeline does.
+            (Located::Store { .. }, _) => store_items(&input, leaves).map(|items| {
+                starts.extend(items.statics);
+                Notifies::Items { arms: items.arms }
+            }),
             // A loop's scope runs a round per position the drive emits. Its drive's positions are
             // a delivery's keys where one key reaches the drive's entry as itself, over the
             // source's domain. A source read otherwise, inside a loop nested in this one among
@@ -3014,6 +3016,83 @@ pub(super) fn visit_inputs_checked(
     at
 }
 
+/// Per live range of a transaction store, in order, the tags of a concatenation's arms its
+/// positions stand under ([`store_items`]).
+type ArmTags = Vec<Vec<crate::ccl::FieldKey>>;
+
+/// How a transaction store's live ranges bring its items ([`store_items`]).
+struct StoreItems {
+    /// Per live range, the tags of the concatenation's arms its positions stand under; `None`
+    /// where the input's domain is each range's own and its positions are the items as they are.
+    arms: Option<ArmTags>,
+    /// The items no live range brings, queued with the first notification.
+    statics: Option<TileGuard>,
+}
+
+/// How a transaction store's live ranges `leaves` bring its items, read off its input's tiling
+/// `input`, and `None` where no exact spelling exists: the store then takes the arrivals its
+/// sources' ranges bring, as any pipeline does. Over a union, a leaf's positions stand under every
+/// arm whose extent is the leaf's, and an arm whose extent reads no source is brought whole at the
+/// start, as a concatenation's list arm. An arm of any other extent, such as one over a source no
+/// live range reads, a union nested under a tag, or a map that rekeys the source, has no exact
+/// spelling.
+fn store_items(input: &Tiling, leaves: &[LiveLeaf]) -> Option<StoreItems> {
+    let domain = input.domain_extent()?;
+    if leaves.iter().all(|leaf| leaf.extent == domain) {
+        return Some(StoreItems {
+            arms: None,
+            statics: None,
+        });
+    }
+    let Extent::Union(tags) = &domain else {
+        return None;
+    };
+    let arms: ArmTags = leaves
+        .iter()
+        .map(|leaf| {
+            tags.iter()
+                .filter(|(_, arm)| **arm == leaf.extent)
+                .map(|(tag, _)| tag.clone())
+                .collect()
+        })
+        .collect();
+    if arms.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let mut statics = Vec::new();
+    for (tag, arm) in tags.iter() {
+        if arms.iter().any(|reached| reached.contains(tag)) {
+            continue;
+        }
+        let mut reads_a_source = false;
+        arm.for_each_source(&mut |_| reads_a_source = true);
+        if reads_a_source {
+            return None;
+        }
+        statics.push((tag.clone(), Predicate::True));
+    }
+    let statics = (!statics.is_empty()).then(|| {
+        Projection::admitting(Predicate::tagged(
+            crate::ccl::TagMap::from_arms(statics),
+            false,
+        ))
+        .guard(input)
+    });
+    Some(StoreItems {
+        arms: Some(arms),
+        statics,
+    })
+}
+
+/// Add each source `extent` reads to `sources`, once.
+fn note_sources(extent: &Extent, sources: &mut Vec<LiveSource>) {
+    extent.for_each_source(&mut |source| {
+        if !sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+            sources.push(source.clone());
+        }
+    });
+}
+
 /// How the run notifies a live pipeline of what its sources deliver ([`LivePipeline::poll`]).
 enum Notifies {
     /// Of the region a push of a delivery's keys through the range's consumer brings the
@@ -3023,8 +3102,10 @@ enum Notifies {
     Rounds,
     /// A transaction store: of a delivery's keys as its items. The store has the writer's drive
     /// read its source again ([`Breaker::read_source_again`]): the drive reads its source only
-    /// once told it gained items.
-    Items,
+    /// once told it gained items. `arms` names, per live range in order, the tags of a
+    /// concatenation's arms its positions stand under ([`store_items`]); `None` where the
+    /// positions are the items as they are, as an inherited range's are.
+    Items { arms: Option<ArmTags> },
 }
 
 /// A source pipeline of the run's dispatcher over live sources, and the region of each range's
@@ -3109,7 +3190,7 @@ impl LivePipeline {
         // they gained together, once.
         let mut positions = Predicate::False;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
-        for (holder, leaf, notified) in &mut self.leaves {
+        for (index, (holder, leaf, notified)) in self.leaves.iter_mut().enumerate() {
             let yielded = leaf.extent.complete_region();
             debug_assert!(
                 notified.minus(&yielded).is_false(),
@@ -3137,8 +3218,24 @@ impl LivePipeline {
                         arrivals = arrivals.union(&guard);
                     }
                 }
+                Notifies::Items {
+                    arms: Some(ref arms),
+                } => {
+                    let under: Vec<(crate::ccl::FieldKey, Predicate)> = arms[index]
+                        .iter()
+                        .map(|tag| (tag.clone(), fresh.clone()))
+                        .collect();
+                    arrivals = arrivals.union(
+                        &Projection::admitting(Predicate::tagged(
+                            crate::ccl::TagMap::from_arms(under),
+                            false,
+                        ))
+                        .guard(&self.input),
+                    );
+                    note_sources(&leaf.extent, &mut fresh_sources);
+                }
                 Notifies::Arrivals => {}
-                Notifies::Rounds | Notifies::Items => {
+                Notifies::Rounds | Notifies::Items { arms: None } => {
                     // A round runs once every position before it is complete, so a range read in
                     // rounds must yield a prefix of the positions of the field that orders it. A
                     // transaction store releases each item by its exact key and its drive attempts
@@ -3154,15 +3251,20 @@ impl LivePipeline {
                              ordering field {path:?}: {yielded:?}"
                         );
                     }
-                    leaf.extent.for_each_source(&mut |source| {
-                        if !fresh_sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
-                            fresh_sources.push(source.clone());
-                        }
-                    });
+                    note_sources(&leaf.extent, &mut fresh_sources);
                     positions = positions.union(&fresh);
                 }
             }
             *notified = yielded;
+        }
+        // A store's writer drive reads its source only once told it gained items, before the
+        // notification that has the store step over them.
+        if matches!(self.notifies, Notifies::Items { .. }) {
+            for source in &fresh_sources {
+                reach(self.pipeline, &mut |breaker, _| {
+                    breaker.read_source_again(source)
+                });
+            }
         }
         if complete {
             for region in std::mem::take(&mut self.at_close) {
@@ -3175,13 +3277,6 @@ impl LivePipeline {
             notify_unreleased(dispatcher, execution, reach, self.pipeline, &arrivals);
         }
         if !positions.is_false() {
-            if matches!(self.notifies, Notifies::Items) {
-                for source in &fresh_sources {
-                    reach(self.pipeline, &mut |breaker, _| {
-                        breaker.read_source_again(source)
-                    });
-                }
-            }
             notify_unreleased(
                 dispatcher,
                 execution,
