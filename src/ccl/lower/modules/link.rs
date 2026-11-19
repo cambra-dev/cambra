@@ -10,8 +10,10 @@ use crate::ccl::provenance::NodeId;
 use crate::ccl::{BaseType, BinOpKind, CompareKind, PredicateId, Refinement};
 
 /// The spelling of the placeholder a module's chain holds where the code below
-/// a run of it goes. User code cannot bind a double-underscore name, so no
-/// reference in the module resolves to it.
+/// a run of it goes. While the chain is built, a statement is lowered around it,
+/// where the chain below the statement goes (`lower_around_hole`, in `lower/stmts.rs`).
+/// User code cannot bind a double-underscore name, so no reference in the module
+/// resolves to it.
 pub const MODULE_BODY: &str = "__module_body";
 
 /// The placeholder [`MODULE_BODY`] as an expression.
