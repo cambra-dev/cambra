@@ -3526,6 +3526,13 @@ impl crate::interpreter::dispatcher::RunObserver for PauseAtOnce {
     [p.1 for p in xs]
 "}, "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
       u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]")]
+#[case::a_transaction_over_a_concatenation(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    for r in [x for x in source1()] ++ [5]:
+        with begin():
+            pool := pool - r
+    await_final(pool)
+"}, "80")]
 fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     #[case] source: &str,
     #[case] expected: &str,
@@ -4418,12 +4425,15 @@ fn a_stale_retry_waits_for_a_dependency_its_first_attempt_did_not_read(
 }
 
 /// A transaction store's pipeline is notified of a delivery's keys as the items of its writer's
-/// source, which holds only where that source is the live source itself. A writer over a
-/// concatenation of the live source and a list has positions tagged by the side they come from,
-/// which no delivery names, so the store takes its input whole once the source yields everything:
-/// 100 less the five items and 5.
+/// source, read off the extents of its input and its live ranges. A writer over a concatenation of
+/// the live source and a list has positions tagged by the arm they come from, so each delivery's
+/// keys arrive under the live arm's tag, and the list arm's item with the first notification: 100
+/// less the five items and 5.
 #[rstest_log::rstest]
-fn a_writer_over_a_concatenation_with_a_live_source(#[values(1, usize::MAX)] rows: usize) {
+fn a_writer_over_a_concatenation_with_a_live_source(
+    #[values(two_batches(), an_empty_delivery_then_three())] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
     let (value, planned) = dispatched_live(
         indoc! {"
             out = test_sink()
@@ -4434,15 +4444,113 @@ fn a_writer_over_a_concatenation_with_a_live_source(#[values(1, usize::MAX)] row
             out << await_final(pool)
         "},
         rows,
-        two_batches(),
+        batches,
     );
     assert_eq!(value, Value::Int(100 - 15 - 5));
     assert!(
         planned
             .iter()
             .any(|plan| plan.live && plan.name.starts_with("Commit")),
-        "the store is a live pipeline: {planned:?}"
+        "the store's pipeline takes the live source's deliveries: {planned:?}"
     );
+}
+
+/// A writer over a concatenation whose arms `store_items` has no exact spelling of, or whose arm
+/// over the live source another pipeline computes, commits every item once: 100 less every item
+/// of the concatenation.
+#[rstest_log::rstest]
+#[case::a_union_nested_under_a_tag("ys = [1]", "([x for x in source1()] ++ ys) ++ [2]", 100 - 15 - 1 - 2)]
+#[case::an_arm_computed_inline("ys = [1]", "[x for x in source1()] ++ [y * 10 for y in source1()]", 100 - 15 - 150)]
+#[case::an_arm_a_let_bound_pipeline_computes(
+    "ys = [y * 10 for y in source1()]",
+    "[x for x in source1()] ++ ys",
+    100 - 15 - 150
+)]
+fn a_writer_over_another_concatenation_with_a_live_source(
+    #[case] binding: &str,
+    #[case] concatenation: &str,
+    #[case] expected: i64,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let (value, _) = dispatched_live(
+        &formatdoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            {binding}
+            for r in {concatenation}:
+                with begin():
+                    pool := pool - r
+            out << await_final(pool)
+        "},
+        rows,
+        two_batches(),
+    );
+    assert_eq!(value, Value::Int(expected), "{concatenation}");
+}
+
+/// A transaction writer over a concatenation of a live source and a list commits each item as it
+/// is available, whichever arm comes first: the list's item before the source delivers anything,
+/// then each delivery's items before the next. Two live arms reply to each delivery under both
+/// tags. The replies are keyed by the concatenation's tagged positions; that each item commits
+/// once is the pool's value in `a_writer_over_a_concatenation_with_a_live_source`.
+#[rstest_log::rstest]
+#[case::the_source_first(
+    "[x for x in source1()] ++ [5]",
+    &[
+        "[`1(u0) -> 5]",
+        "[`0(u0) -> 1, `0(u1) -> 2, `1(u0) -> 5]",
+        "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `1(u0) -> 5]",
+        "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 5]",
+    ],
+)]
+#[case::two_live_arms(
+    "[x for x in source1()] ++ [x * 10 for x in source1()]",
+    &[
+        "",
+        "[`0(u0) -> 1, `0(u1) -> 2, `1(u0) -> 10, `1(u1) -> 20]",
+        "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `1(u0) -> 10, `1(u1) -> 20, \
+          `1(u2) -> 30, `1(u3) -> 40]",
+        "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10, \
+          `1(u1) -> 20, `1(u2) -> 30, `1(u3) -> 40, `1(u4) -> 50]",
+    ],
+)]
+#[case::the_list_first(
+    "[5] ++ [x for x in source1()]",
+    &[
+        "[`0(u0) -> 5]",
+        "[`0(u0) -> 5, `1(u0) -> 1, `1(u1) -> 2]",
+        "[`0(u0) -> 5, `1(u0) -> 1, `1(u1) -> 2, `1(u2) -> 3, `1(u3) -> 4]",
+        "[`0(u0) -> 5, `1(u0) -> 1, `1(u1) -> 2, `1(u2) -> 3, `1(u3) -> 4, `1(u4) -> 5]",
+    ],
+)]
+fn a_writer_over_a_concatenation_replies_each_available_item_before_the_source_closes(
+    #[case] items: &str,
+    #[case] expected: &[&str],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = formatdoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in {items}:
+            with begin():
+                pool := pool - r
+                out << r
+    "};
+    let mut written = Vec::new();
+    let (value, _) =
+        dispatched_live_observed(&source, rows, an_empty_delivery_then_three(), |sink, _| {
+            assert!(
+                sink.value().is_err(),
+                "the replies stay open until the source ends"
+            );
+            written.push(
+                sink.written_so_far()
+                    .map(|partial| canonical(&partial))
+                    .unwrap_or_default(),
+            );
+        });
+    written.push(canonical(&value));
+    assert_eq!(written, expected, "{items}");
 }
 
 /// A pipeline notified of a live source's arrivals reads the rows of another pipeline as keys of
