@@ -46,8 +46,9 @@ use crate::{
             Filter, FlattenTupleDomain, IterateExtent, KeyOrder, Lookup, MakeRecord, MapAggregate,
             MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, ReadingSource, Readings,
-            RekeySorted, Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator,
-            VariantIs, VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
+            RekeySorted, Restrict, SelectField, SlotReader, TileOperator, Tiling, Uncurry,
+            UnionOperator, VariantIs, VariantProject, VariantWrap, Version, zip_arms_at,
+            zip_arms_named_at,
         },
         tuple_field,
         uint_of_row,
@@ -447,6 +448,15 @@ pub struct OpConversionContext {
     /// ([`iteration_input`](Self::iteration_input)); empty for a program's first
     /// compilation.
     offer: Offer,
+    /// The fan-outs the offer held, kept past [`release_offer`](Self::release_offer) without
+    /// keeping them alive, so the handover settles on each that another branch still holds
+    /// ([`FanOut::settle_handover`]).
+    offered: Vec<std::rc::Weak<FanOut>>,
+    /// The version the offer was a graph of, held past [`release_offer`](Self::release_offer)
+    /// until the handover settles, so its reader names stay in the fan-outs while the
+    /// replacements subscribe and look their predecessors up by them
+    /// ([`FanOut::alias_readers`]). `None` outside a handover.
+    offered_version: Option<Version>,
     /// What this compilation binds, for the branch that runs it and the version
     /// that replaces it.
     operator_map: OperatorMap,
@@ -558,6 +568,10 @@ pub(crate) struct OpenIteration {
 pub struct OperatorMap {
     /// What the graph holds, by the node it was built from.
     entries: HashMap<NodeId, Recorded>,
+    /// The version this map is the graph of, which names its readers in the fan-outs they read
+    /// ([`FanOut::slot_read_by`], [`FanOut::alias_readers`]). A clone shares it, so the version
+    /// stays held while the branch running it or an offer of it holds a copy.
+    version: Version,
 }
 
 /// What a compilation is offered by the version it replaces: that version's
@@ -632,40 +646,6 @@ impl OperatorMap {
             .iter()
             .flat_map(|fan| fan.source_producers())
             .collect()
-    }
-
-    /// The iteration input of each store in `planned` whose correspondent in
-    /// `previous` is a fan-out this map holds and whose live slots disagree
-    /// ([`FanOut::live_slots_agree`]), by the writer source's node.
-    ///
-    /// A store rebuilt over such an iteration resumes one past the
-    /// intersection of every slot's release, which a lagging slot holds below
-    /// where this map's own reader stopped, so the store would fold the
-    /// positions between a second time. The reload is refused instead, until a
-    /// rebuilt reader resumes from the slot of the reader it replaces
-    /// (`src/ccl/design/program-evolution.md`, "Routes across branches").
-    /// Refused whether or not the store is rebuilt, because whether it is is
-    /// decided at conversion, after the teardown.
-    pub fn disagreeing_kept_iterations(&self, previous: &Expr, planned: &Expr) -> Vec<NodeId> {
-        let sources = writer_sources(planned);
-        if sources.is_empty() {
-            return Vec::new();
-        }
-        let correspondence = Correspondence::of(&crate::ccl::diff::diff(previous, planned));
-        let mut out: Vec<NodeId> = sources
-            .values()
-            .flatten()
-            .map(|source| source.node_id())
-            .filter(|&node| {
-                correspondence
-                    .previous(node)
-                    .and_then(|prev| self.entries.get(&prev))
-                    .is_some_and(|entry| !entry.fan().live_slots_agree())
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
     }
 
     /// The value each mutable variable currently holds, by the identity state is
@@ -1045,12 +1025,12 @@ impl OpConversionContext {
             self.keep_region(term, entry.fan());
             let fan = entry.fan().clone();
             self.record(term.node_id(), entry);
-            return Ok(fan.slot());
+            return Ok(self.slot_read_by(&fan, term));
         }
         let op = convert_impl(term, None, self)?;
         let fan = Rc::new(FanOut::new(op));
         self.record(term.node_id(), Recorded::Operator(fan.clone()));
-        Ok(fan.slot())
+        Ok(self.slot_read_by(&fan, term))
     }
 
     /// Whether the operator behind `bound_expr` may be kept — that is, whether
@@ -1396,7 +1376,10 @@ records one and the only site a `Transact` reaches"
             .then(|| self.correspondent(term))
             .flatten();
         if let Some(kept) = kept {
-            let released = kept.fan().released_position();
+            // The recurrence this one replaces read the kept input through the slot its source
+            // term minted, so that slot's release is where it got to.
+            let predecessor = self.correspondence.previous(node).map(SlotReader::new);
+            let released = predecessor.and_then(|p| kept.fan().released_position_of(p));
             // A recurrence that carries nothing reads its input from the
             // beginning, which a rebuild supplies for a recomputable term. Where
             // it is not recomputable the kept iteration is the whole of what is
@@ -1414,7 +1397,7 @@ records one and the only site a `Transact` reaches"
                 trace!("keeping iteration operator: resumed_after={resumed_after:?}");
                 self.record(node, kept);
                 return Ok(IterationInput {
-                    op: fan.slot(),
+                    op: self.slot_read_by(&fan, term),
                     resumed_after,
                 });
             }
@@ -1423,9 +1406,21 @@ records one and the only site a `Transact` reaches"
         let fan = Rc::new(FanOut::new(op));
         self.record(node, Recorded::Operator(fan.clone()));
         Ok(IterationInput {
-            op: fan.slot(),
+            op: self.slot_read_by(&fan, term),
             resumed_after: fresh_start,
         })
+    }
+
+    /// A slot of `fan` for the reader `reader`. It starts at the release of the slot its
+    /// correspondent read in the version this one replaces, where `fan` holds one
+    /// ([`FanOut::slot_read_by`]).
+    fn slot_read_by(&self, fan: &FanOut, reader: &Expr) -> Box<dyn TileOperator> {
+        let node = reader.node_id();
+        fan.slot_read_by(
+            SlotReader::new(node),
+            self.correspondence.previous(node).map(SlotReader::new),
+            &self.operator_map.version,
+        )
     }
 
     /// Record `entry` under `node` as this compilation's.
@@ -1471,6 +1466,7 @@ records one and the only site a `Transact` reaches"
         }
         let mut below = Vec::new();
         nodes_below(term, &mut below);
+        let mut renamed = HashMap::new();
         for node in below {
             let Some(previous) = self.correspondence.previous(node) else {
                 debug_assert!(
@@ -1480,9 +1476,16 @@ in it has a correspondent",
                 );
                 continue;
             };
+            renamed.insert(previous, node);
             if let Some(entry) = self.offer.operators.entries.get(&previous).cloned() {
                 self.record(node, entry);
             }
+        }
+        // A reader inside the region is kept with it, slot and all, and the version after this
+        // one names it by this version's nodes. The term's own node is no reader inside it: the
+        // slot it keys is read from outside the region, and each version mints that one anew.
+        for fan in self.offer.operators.operators() {
+            fan.alias_readers(&renamed, &self.operator_map.version);
         }
     }
 
@@ -1640,7 +1643,7 @@ in it has a correspondent",
         predecessor: &OperatorMap,
         previous: &Expr,
         planned: &Expr,
-    ) -> Vec<UnreadablePrefix> {
+    ) -> Vec<UnreadableInput> {
         // Diffing two planned trees costs more than the rest of this put together, and
         // only a variable this version adds to a loop that already carries one needs the
         // answer. A reload whose state all carries forward asks for none, so the
@@ -1687,27 +1690,43 @@ in it has a correspondent",
                 // `iteration_input` chooses between. The kept iteration's
                 // release is read from the operator map the reload will offer, which
                 // `previous` is the tree of.
-                let kept = correspondence
+                let prev = correspondence
                     .get_or_init(|| Correspondence::of(&crate::ccl::diff::diff(previous, planned)))
-                    .previous(source.node_id())
-                    .and_then(|prev| predecessor.entries.get(&prev))
-                    .and_then(|entry| entry.fan().released_position());
+                    .previous(source.node_id());
+                let kept_fan = prev.and_then(|prev| {
+                    predecessor
+                        .entries
+                        .get(&prev)
+                        .map(|entry| (entry.fan(), SlotReader::new(prev)))
+                });
+                let kept = kept_fan.and_then(|(fan, reader)| fan.released_position_of(reader));
+                // The predecessor's release is exact, so where it is no prefix of the input the
+                // positions it names are what this loop will not see, holes and all.
+                let region = kept_fan.and_then(|(fan, reader)| {
+                    let released = fan.released_by(reader)?.whole_keys();
+                    let domain = fan.tiling().domain_extent();
+                    released
+                        .as_prefix_in(domain.as_ref())
+                        .is_none()
+                        .then_some(released)
+                });
                 // Where the loop will begin past. A stream index is reported as an element
                 // count; any other domain's positions have no count, so the last one released
                 // is what is reported.
                 let missing = |p: Position| match p.into_value() {
-                    Value::UInt(n) => MissingPrefix::Elements(n + 1),
-                    through => MissingPrefix::Through(through),
+                    Value::UInt(n) => MissingRegion::Elements(n + 1),
+                    through => MissingRegion::Through(through),
                 };
-                let missing = match kept {
-                    Some(released) => Some(missing(released)),
+                let missing = match (region, kept) {
+                    (Some(region), _) => Some(MissingRegion::Region(region)),
+                    (None, Some(released)) => Some(missing(released)),
                     // Read off the input's own domain rather than the store's,
                     // because the two store kinds are told this differently and
                     // both read the same elements. An induction drive is based at
                     // the source's first offered position; a commit drive is
                     // based at `0` and scans up to it. Where the loop begins is
                     // the source's answer either way.
-                    None => source
+                    (None, None) => source
                         .ty
                         .domain()
                         .and_then(|d| source_start(&strip_refinements(&d), self))
@@ -1716,7 +1735,7 @@ in it has a correspondent",
                 let Some(missing) = missing else {
                     continue;
                 };
-                out.extend(fresh.iter().map(|path| UnreadablePrefix {
+                out.extend(fresh.iter().map(|path| UnreadableInput {
                     path: (*path).clone(),
                     missing: missing.clone(),
                 }));
@@ -1742,6 +1761,20 @@ in it has a correspondent",
 the compilation declined outlives it here"
         );
         self.transactional_stores.clear();
+        // Every replacement has subscribed, so the slots the handover retired stop holding
+        // the reclamation intersection back ([`FanOut::settle_handover`]).
+        // So do the slots of a fan-out the offer held and this version did not take, which
+        // another branch may still hold and read.
+        for fan in self.operator_map.operators() {
+            fan.settle_handover();
+        }
+        for fan in std::mem::take(&mut self.offered)
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            fan.settle_handover();
+        }
+        self.offered_version = None;
         std::mem::take(&mut self.operator_map)
     }
 
@@ -1757,6 +1790,14 @@ the compilation declined outlives it here"
     /// so this is what makes them run. What was kept is unaffected: the
     /// compilation that kept it holds its own reference.
     pub fn release_offer(&mut self) {
+        self.offered = self
+            .offer
+            .operators
+            .operators()
+            .iter()
+            .map(Rc::downgrade)
+            .collect();
+        self.offered_version = Some(self.offer.operators.version.clone());
         self.offer = Offer::default();
     }
 
@@ -2158,7 +2199,12 @@ fn convert_impl_inner(
                     && let Some(TypedExprNode::Builtin(Builtin::FinalRead)) =
                         elems.get(2).map(|e| &e.node)
                 {
-                    result = Some(convert_store_settled_read(&read.store, &read.field, ctx)?);
+                    result = Some(convert_store_settled_read(
+                        read.at,
+                        &read.store,
+                        &read.field,
+                        ctx,
+                    )?);
                     rest = &elems[3..];
                 } else {
                     result = Some(convert_nested_store_read(read, ctx)?);
@@ -2225,7 +2271,7 @@ fn convert_impl_inner(
                 unreachable!("guarded above")
             };
             expect_no_input(input, "transactional store read")?;
-            convert_store_read(store_name, field, ctx)
+            convert_store_read(argument, store_name, field, ctx)
         }
 
         // A bare `Transact` never reaches here: `plan_loops` always binds it as
@@ -2708,7 +2754,7 @@ fn convert_impl_inner(
                         .into(),
                 ));
             };
-            convert_store_settled_read(&store_name, &field, ctx)
+            convert_store_settled_read(argument, &store_name, &field, ctx)
         }
 
         // `await_final` is a surface marker: `transact_phase` replaces each occurrence
@@ -2903,7 +2949,7 @@ fn convert_impl_inner(
                     "unrecognised Var({name}) in λ-free CCL"
                 )));
             };
-            let op = binding.fan.slot();
+            let op = ctx.slot_read_by(&binding.fan, expr);
             let depth = binding.depth;
             match binding.kind {
                 // A free binding is a standalone function: under an iteration it is applied
@@ -4995,42 +5041,74 @@ pub enum StateConflict {
 /// author meant is not something the source says. Naming it is what makes the
 /// choice visible until the source can state it — see
 /// [`unreadable_inputs`](OpConversionContext::unreadable_inputs).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnreadablePrefix {
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadableInput {
     /// The variable the loop accumulates into.
     pub path: VarPath,
     /// The positions of its input it will not see.
-    pub missing: MissingPrefix,
+    pub missing: MissingRegion,
 }
 
-/// The prefix of a loop's input a variable will not see.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MissingPrefix {
+/// The positions of a loop's input a variable will not see: a prefix where the
+/// version it replaces released one, and the exact positions it released otherwise.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MissingRegion {
     /// The first `n` elements of a stream indexed from `0`.
     Elements(u64),
     /// Every position through this one, of a domain whose positions are not counted.
     Through(Value),
+    /// The positions this predicate names, which are no prefix of the input.
+    Region(Predicate),
 }
 
-impl std::fmt::Display for UnreadablePrefix {
+impl std::fmt::Display for UnreadableInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.missing {
-            MissingPrefix::Elements(n) => write!(
+            MissingRegion::Elements(n) => write!(
                 f,
                 "{} starts at the value it declares and reads its input from element {n}: the \
                  first {n} were released before this version existed, so they are not in its \
                  value",
                 self.path,
             ),
-            MissingPrefix::Through(through) => write!(
+            MissingRegion::Through(through) => write!(
                 f,
                 "{} starts at the value it declares and reads its input past position \
                  {through}: the positions through it were released before this version \
                  existed, so they are not in its value",
                 self.path,
             ),
+            MissingRegion::Region(region) => write!(
+                f,
+                "{} starts at the value it declares and does not read positions {} of its \
+                 input: they were released before this version existed, so they are not in its \
+                 value",
+                self.path,
+                positions_named(region),
+            ),
         }
     }
+}
+
+/// The positions `region` names, as a reader of a report spells them: `{0, 2}`, a run as
+/// `4 to 7`, and an open end as `9 and above`.
+fn positions_named(region: &Predicate) -> String {
+    use intervalsets::Bounding;
+    let Predicate::Intervals(runs) = region else {
+        return format!("{region:?}");
+    };
+    let named: Vec<String> = runs
+        .intervals()
+        .iter()
+        .map(|run| match (run.lval(), run.rval()) {
+            (Some(first), Some(last)) if first == last => format!("{first}"),
+            (Some(first), Some(last)) => format!("{first} to {last}"),
+            (Some(first), None) => format!("{first} and above"),
+            (None, Some(last)) => format!("{last} and below"),
+            (None, None) => "every position".to_string(),
+        })
+        .collect();
+    format!("{{{}}}", named.join(", "))
 }
 
 impl std::fmt::Display for StateConflict {
@@ -5618,6 +5696,7 @@ fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, Label)> {
 /// they sample: a surface `await_final` on a `Txn` key, and the trailing read of an
 /// induction accumulator.
 fn convert_store_settled_read(
+    reader: &Expr,
     store_name: &Name,
     field: &Label,
     ctx: &mut OpConversionContext,
@@ -5634,7 +5713,12 @@ fn convert_store_settled_read(
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
     Ok(Box::new(StoreFinalRead::per_row_at(
-        fan.slot(),
+        // A scalar read takes the store's value once in each version, so its slot replaces no
+        // reader; a read per row reads the rows its predecessor left.
+        match levels_above {
+            0 => fan.slot(),
+            _ => ctx.slot_read_by(&fan, reader),
+        },
         runtime_key,
         value_extent,
         levels_above,
@@ -5646,6 +5730,7 @@ fn convert_store_settled_read(
 /// [`convert_store_settled_read`], which samples a settled key rather than projecting a
 /// stream for something else to reduce.
 fn convert_store_read(
+    reader: &Expr,
     store_name: &Name,
     field: &Label,
     ctx: &mut OpConversionContext,
@@ -5671,7 +5756,7 @@ fn convert_store_read(
         // appears only at the tick that wrote it.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward, by_item))) => {
             let stream = Box::new(StoreValueStream::new(
-                fan.slot(),
+                ctx.slot_read_by(&fan, reader),
                 runtime_key,
                 value_extent,
                 carry_forward,
@@ -5700,7 +5785,7 @@ fn convert_store_read(
             StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog,
             Some((runtime_key, value_extent, carry_forward, _)),
         ) => Ok(Box::new(StoreDenseRead::new(
-            fan.slot(),
+            ctx.slot_read_by(&fan, reader),
             runtime_key,
             value_extent,
             carry_forward,
@@ -6277,6 +6362,8 @@ fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
 
 /// A read of key `field` of a nested induction store, and the steps after it.
 struct NestedStoreRead<'a> {
+    /// The store variable the read names, which is the reader of the store's fan-out.
+    at: &'a Expr,
     store: Name,
     field: Label,
     steps: Vec<&'a Expr>,
@@ -6289,7 +6376,7 @@ fn convert_nested_store_read(
     read: NestedStoreRead<'_>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let mut op = convert_store_read(&read.store, &read.field, ctx)?;
+    let mut op = convert_store_read(read.at, &read.store, &read.field, ctx)?;
     for step in read.steps {
         op = convert_lifted(step, Some(op), ctx)?;
     }
@@ -6345,6 +6432,7 @@ fn nested_store_read_of<'a>(
             };
             let info = ctx.lookup_store(store)?;
             (info.kind == StoreReadKind::NestedInductionChangelog).then(|| NestedStoreRead {
+                at: hist,
                 store: store.clone(),
                 field: field.clone(),
                 steps: Vec::new(),
