@@ -473,8 +473,8 @@ for direct projections and [Binder-slot resolution](#binder-slot-resolution) for
 
 `coalesce_node` in `infer/solve.rs` resolves children and then the enclosing expression.
 The walk also fills binder slots, visits predicates embedded in types, and replaces generalized
-bindings with their demanded specializations. Application order follows the
-[read-stability contract](#coalesce-ordering-and-read-stability).
+bindings with their demanded specializations. It runs as two passes, one recording on the graph and
+one reading it ([Coalescing in two passes](#coalescing-in-two-passes)).
 
 `resolve_var_type` runs three solver functions:
 
@@ -928,10 +928,10 @@ A walk whose types are dropped pins nothing
 for what the uses supply. The arm-payload site keeps the exception that section states for a
 scrutinee a value reaches.
 
-Pinning before the reads keeps the
-[read-stability contract](#coalesce-ordering-and-read-stability): a pin adds to `𝛼` the type its
-position already reads. The answer is fixed when the pin runs, and a bound recorded afterwards is
-not consulted.
+Pins run in the write pass, before any type is stamped
+([Coalescing in two passes](#coalescing-in-two-passes)): a pin adds to `𝛼` the type its position
+already reads. The answer is fixed when the pin runs, and a bound recorded afterwards is not
+consulted.
 
 The first answer wins. A variable occurring in two positions that read differently is pinned to the
 first answer. The second position then joins two incompatible shapes, and coalescing reports
@@ -1079,49 +1079,35 @@ definition-site clone is shared by. A binder whose scope is not one body, a `mat
 `letrec`'s, takes no placed clone: placing one there panics. A use whose instance reads no such
 binder is specialized at the definition, as before.
 
-#### Coalesce ordering and read stability
+#### Coalescing in two passes
 
-Specialization runs during coalescing so that parents consume specialized child types on their
-first visit. Dependent application can discharge against the clone's resolved predicates without
-a second post-coalesce reconstruction. The use's `expr.ty` must still expose its live bound graph
-for keying and pinning; materializing that slot first would overwrite it. A generalized definition
-calling another generalized definition follows the same recursive walk; the outer clone is pinned
-before its body reaches the inner use.
+Coalescing walks the tree twice (`coalesce_pass`, `Pass` in `infer/solve.rs`).
 
-The live graph is not frozen after emission. Pins can add bounds during specialization.
-`Apply` coalesces its function before its argument so that the function's specialization can
-deposit demands before the argument is read.
+The **write pass** records everything coalescing adds to the graph. It pins each variable a pin
+site pins ([Pin sites](#pin-sites)), and it specializes each use of a generalized binding: the clone
+is freshened, pinned to the use's instantiation, and walked by the write pass in turn, so a
+generalized definition calling another specializes the inner use under the outer clone's pin. It
+also walks the terms the types on each node quote (refinement predicates, a witness projection's
+term, a family's arguments) as trees of their own, so a use inside a filter or a group-by key is
+specialized like any other. It rewrites what must change before anything reads it: a trait
+function's call into a use of the instance's function, an operator into a call, `c ▷
+Iterable::elements` into `c`. It stamps nothing. What it decides for each use (`Plan`) is the
+specialization that serves it, or that its instantiation did not resolve, and the errors it raises
+are reported when the stamp pass reaches their nodes.
 
-The ordering invariant requires specialization not to invalidate types already read by the walk.
-Debug builds log `ReadRecord` snapshots that retain the live variables and their resolved
-results. At the end of a successful coalesce pass, `assert_reads_stable` resolves them against
-the final graph.
+The **stamp pass** is the walk over the graph the write pass leaves. It resolves children before
+the enclosing expression and stamps each node's type, fills binder slots, rebuilds a generalized
+`let` around its specializations, and checks each definition alone after its last use. A use is
+served by the write pass's specialization (`stamp_use`). The first use the pass reaches stamps the
+clone, in the definition's scope, and the clone's errors are held for the uses it serves as before.
+Every read sees the graph the end of inference sees, so a parent reads the types its children were
+stamped with, and no read depends on which pins ran before it.
 
-The verification batch shares complete `compact_type` results by root type and the identities of its
-immutable carriers: quoted terms, settled witness lists, declarations and capabilities. `Type`
-equality omits typed information in those carriers. The cache keeps them alive and distinguishes
-their identities so equal-looking roots cannot substitute a different typed view.
-
-The graph and its scopes stay fixed throughout the batch. Every recorded read still simplifies and
-coalesces its compacted graph and compares the result with its own earlier result. Cached graphs are
-cloned before callers use them, and the cache is discarded when the batch returns or unwinds.
-Specialization uses fresh compactions, because pins can change a root's reachable bounds without
-changing the root type. A nested witness-projection query also uses a fresh walk because its
-recursion guard affects the answer.
-
-The comparison is bounded:
-
-- It checks structural shape, bases, ranges, and other materialized structure.
-- Stamped reads also compare refinement-wrapper depth, not the number of predicates in each set.
-- Underdetermined positions are wildcards; fresh `Infer` identities cannot be compared across
-  resolutions.
-- It does not compare predicate contents as a proof of semantic equality. Scope validity and the
-  post-inference reconciliation checks cover different obligations.
-- `ReadPurpose::Instantiation` excludes refinement-wrapper depth. That preliminary resolution serves
-  channel-domain pairing and error reporting, not the use's final stamped type or its
-  specialization key. The base structure is still checked.
-
-The check is debug-only. The compilation strategy relies on the ordering invariant in all builds.
+Resolving a type copies the terms it quotes, and a substitution acting on one makes a new term.
+The stamp pass rewrites these copies as the write pass rewrites the tree (`rewrites_here`). A use
+in such a copy is served by the specialization of the use it copies: the one with its
+instantiation, or one its key shares. One that neither serves panics: it would need a
+specialization the write pass never made.
 
 #### A name of a generalized binding
 
@@ -1413,8 +1399,8 @@ bindings, including collection-producing UDFs, while preserving `Data` bindings.
 [Collection sharing](optimization.md#collection-sharing) and
 [Exact annotations bound monomorphization](#exact-annotations-bound-monomorphization).
 
-The [coalesce ordering contract](#coalesce-ordering-and-read-stability) explains why specialization
-must precede the parent's materialization in this implementation.
+[Coalescing in two passes](#coalescing-in-two-passes) explains why specialization precedes
+every materialization in this implementation.
 
 #### Refinement representation during specialization
 
@@ -1742,8 +1728,7 @@ the relation debug-asserts that no open variant reaches its left side.
 
 `CompactVariant` retains openness during compaction and materialization, including diagnostic
 types. The rendered `| …` distinguishes an open demand from an exact arm set. Runtime extents
-have no openness marker. The coalesce read-stability check compares the marker, but that check is
-not a proof that every possible materialized expression is closed.
+have no openness marker.
 
 When variant contributions merge, openness remains open only if both contributions are open.
 The tag maps still use polarity-dependent intersection or union. With a mixture of open and closed
@@ -5105,9 +5090,8 @@ shared.
 uses whose functions resolve to different capabilities get separate clones ([Capabilities on every
 expression](#capabilities-on-every-expression)), so a specialization pin relates none
 (`ConstrainCache::without_capabilities`). A pin still adds the clone's function type as a bound of
-the use's variables, whose capabilities then meet the use's at an input, so the walk's
-read-stability check compares types without their capabilities. Nothing after specialization reads
-an effect off a materialized type.
+the use's variables, whose capabilities then meet the use's at an input. Nothing after
+specialization reads an effect off a materialized type.
 
 **Materialization.** Compaction resolves each function position's capabilities
 (`CompactFun::capabilities`). A merge takes the union at a positive position and the intersection at
