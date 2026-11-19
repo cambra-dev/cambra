@@ -104,6 +104,25 @@ every level above the record: a selector pulled at a path leaves the inner loop'
 other fields' cells of the path released, the drive's push names the path, and the selector takes
 its field there.
 
+A breaker that reads an open input again
+([Reading a widened input again](design-dispatcher.md#reading-a-widened-input-again)) completes
+cells beneath rows still open, so its held region carries an arm of cells as well. Taking keys of
+the outermost level out of it keeps the cells beneath every other key: each enclosing path the arm
+names loses the released keys, and an arm named under every path is qualified by the rest
+(`minus_outermost_keys`). The difference is spelled for cells one level beneath the keys, named
+under one qualification and with no `Or`; any other arm reads no single outermost key, and
+`cells_outside_keys` panics on it. So does a release of keys beneath the outermost level:
+
+```
+held      = Or [ Domain(k > 1), Codomain(Record { _0: Qualified { enclosing: k ∈ {0, 1}, here: True }, … }) ]
+released  = Domain(k = 0)
+held − released = Or [ Domain(k > 1), Codomain(Record { _0: Qualified { enclosing: k = 1, here: True }, … }) ]
+```
+
+Whether a release covers a guard needs no difference (`guard_covers`): with an arm of cells, only
+its keys released whole cover, so a key whose every cell is released one arm at a time counts as
+not covered, and a read of it answers nothing.
+
 A round pushes per position, so it needs the difference, where a push at a finish only names the
 breaker's whole held region.
 

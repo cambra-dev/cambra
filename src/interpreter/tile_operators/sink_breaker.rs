@@ -109,6 +109,16 @@ impl SinkBreaker {
 }
 
 impl Breaker for SinkBreaker {
+    /// A consume hands the sink what the answer holds and releases it, so a row is handed once. A
+    /// `main` output that merges its answers and hands them once, at its finish, publishes
+    /// nothing a read before its finish could bring forward.
+    fn reads_open_input(&self) -> bool {
+        match &self.hands {
+            Hands::EachPackage => true,
+            Hands::Main { each_package, .. } => *each_package,
+        }
+    }
+
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
@@ -149,8 +159,7 @@ impl Breaker for SinkBreaker {
             return;
         };
         let mut producer = Self::input(&self.producer);
-        let tiling = producer.tiling().clone();
-        let rest = producer.get(tiling.universal_guard()).closed_over(&tiling);
+        let rest = crate::interpreter::sinks::pull_at_finish(&mut **producer);
         producer.release(rest.to_guard());
         // The packages consumed all the producer holds, so the pull adds no key, except the rows
         // of a loop's rounds where the output reads a loop's scope (`reads_a_loop`).
