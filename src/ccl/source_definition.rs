@@ -35,6 +35,13 @@ impl<S: DataSourceDomainExtentImpl + ?Sized> Clone for SourceDefinition<S> {
         }
     }
 }
+impl<S: DataSourceDomainExtentImpl + ?Sized> SourceDefinition<S> {
+    /// A handle that does not keep the source alive, for a test that checks nothing else does.
+    #[cfg(test)]
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<RwLock<S>> {
+        Arc::downgrade(&self.source)
+    }
+}
 impl<S: DataSourceDomainExtentImpl + ?Sized> std::ops::Deref for SourceDefinition<S> {
     type Target = RwLock<S>;
     fn deref(&self) -> &Self::Target {

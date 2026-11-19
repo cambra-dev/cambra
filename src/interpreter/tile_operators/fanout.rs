@@ -1853,6 +1853,25 @@ impl Breaker for MemoProducer {
 }
 
 impl BreakingProducer for MemoProducer {
+    /// The cache. A memo releases everything it merges, so nothing upstream holds what the cache
+    /// holds.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(
+            self.cached_tile
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        )
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let cached = checkpoint::state_of::<Tile>(&self.name(), state);
+        *self
+            .cached_tile
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = cached;
+    }
+
     /// The region the cached tile states, and what its readers released whole, which they release
     /// only once it is decided. A release of a collection's rows leaves its statement as it was,
     /// but a release of a scalar empties it, so the cache alone no longer states it. A release of

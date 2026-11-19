@@ -933,7 +933,10 @@ transaction store, which consumes one per writer. `consume_impl`, `input_tiling`
 `input_released` name the input (`InputId`). A breaker that other pipelines read is also a producer,
 which answers pulls from that state: `BreakingProducer`, a subtrait of `TileProducer` and `Breaker`,
 adds `complete`, `final_guard`, `morsels`, `pushes_while_consuming` and `entry_placement`,
-the placement of the entry at an input, which a planner sets to that input's pipeline. Its
+the placement of the entry at an input, which a planner sets to that input's pipeline. It also
+adds `checkpoint` and `restore`, which copy the breaker's state out as data and install it into the
+same breaker of a graph compiled again from the same text; a prototype test driver
+(`tile_operators/checkpoint.rs`) is their only caller. Its
 `as_producer` answers itself, and the driver's push after each consume and `Breaker`'s default
 `finish` push through that producer. A sink's breaker is no producer, so its `as_producer` answers
 `None`: no pipeline reads it, and it holds, offers and pushes nothing.

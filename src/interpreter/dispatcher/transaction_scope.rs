@@ -17,6 +17,16 @@ thread_local! {
     pub(crate) static STALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+impl TransactionRun {
+    /// Whether a writer has a request open or a finish begun.
+    #[cfg(test)]
+    pub(crate) fn has_open_request(&self) -> bool {
+        self.writers
+            .iter()
+            .any(|writer| !matches!(writer.attempt, Attempt::Idle))
+    }
+}
+
 pub(crate) struct TransactionRun {
     pub(super) writers: Vec<WriterRun>,
     pub(super) stalls: Stalls,

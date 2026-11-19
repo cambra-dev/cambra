@@ -341,6 +341,25 @@ impl Breaker for AggregateProducer {
 }
 
 impl BreakingProducer for AggregateProducer {
+    /// The accumulator, final or partial: a partial one is the fold of the input already
+    /// released, which nothing upstream holds any more.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(
+            self.accumulator
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        )
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let accumulator = checkpoint::state_of::<Tile>(&self.name(), state);
+        *self
+            .accumulator
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = accumulator;
+    }
+
     /// The accumulator is one value, held once it is final, when the input has been released
     /// whole, and once it holds a value ([`answer`](Self::answer)). A partial accumulator is held
     /// by no guard, so nothing reads it as final.
@@ -573,6 +592,20 @@ impl Breaker for ExtractAggregateProducer {
 }
 
 impl BreakingProducer for ExtractAggregateProducer {
+    /// The extracted value and whether it is complete, which outlives the value's reclamation.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Box::new((state.extracted.clone(), state.complete))
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let (extracted, complete) = checkpoint::state_of::<(Tile, bool)>(&self.name(), state);
+        *self.state.get_mut().unwrap_or_else(PoisonError::into_inner) = ExtractedAggregate {
+            extracted,
+            complete,
+        };
+    }
+
     /// The extracted value, once there is one.
     fn complete(&self) -> TileGuard {
         let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1190,9 +1223,17 @@ impl MapAggregateState {
     }
 }
 
+/// A [`MapAggregateProducer`]'s state as a checkpoint copies it out.
+struct MapAggregateCheckpoint {
+    accumulators: HashMap<Vec<Value>, Tile>,
+    keys_with_nothing_beneath: HashSet<Vec<Value>>,
+    stated: Option<Stated>,
+}
+
 /// What the answers of a map aggregate's input state about completeness: the outermost keys
 /// that are complete, each level's, the folded level's, and the groups that are, over whole
 /// paths.
+#[derive(Clone)]
 struct Stated {
     /// Completion at each enclosing level, outermost first.
     level_predicates: Vec<Predicate>,
@@ -1207,6 +1248,7 @@ struct Stated {
 /// Whether an enclosing level's keys follow the level beneath, and how many keys the answers
 /// held there. Two answers unite it as a merge of their tiles would
 /// ([`merged_follow`](crate::interpreter::tiling::merged_follow)).
+#[derive(Clone)]
 struct Follows {
     follows: KeysFollow,
     keys: usize,
@@ -1424,6 +1466,25 @@ impl Breaker for MapAggregateProducer {
 }
 
 impl BreakingProducer for MapAggregateProducer {
+    /// Every group's accumulator, the keys with nothing beneath, and what the answers stated.
+    /// The kind is the compiled program's.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        Box::new(MapAggregateCheckpoint {
+            accumulators: state.accumulators.clone(),
+            keys_with_nothing_beneath: state.keys_with_nothing_beneath.clone(),
+            stated: state.stated.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let saved = checkpoint::state_of::<MapAggregateCheckpoint>(&self.name(), state);
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.accumulators = saved.accumulators;
+        state.keys_with_nothing_beneath = saved.keys_with_nothing_beneath;
+        state.stated = saved.stated;
+    }
+
     /// It holds an accumulator per group beneath the groups' keys, and what is left of that
     /// after a release beneath them is a region beneath the outermost keys, and a reader's chain
     /// may restate only the outermost keys (`TileProducer::restates`).

@@ -198,7 +198,11 @@ fn run_into(
                 .expect("a `main` output keeps the placement of the entry before its consumer");
             let slot: ProducerSlot = Arc::new(RwLock::new(Some(producer)));
             taken = Some((at, slot.clone()));
-            targets.push((slot, main.clone(), TargetEntry::Main(placement)));
+            targets.push((
+                slot,
+                main.clone(),
+                TargetEntry::Main(placement, Arc::default()),
+            ));
         }
     }
     let returned = MainGivenBackOnUnwind {
@@ -270,6 +274,10 @@ pub trait RunObserver {
     /// No package or finish is claimed and incomplete, and none is claimable. `changed` says
     /// whether the pass notified a pipeline or closed one. `Break` ends the run here.
     fn drained(&mut self, changed: bool) -> ControlFlow<()>;
+    /// A top-level package or finish has returned, so no operator is borrowed, though a loop's
+    /// or a transaction's open request may be. A test that simulates a crash panics here.
+    #[cfg(test)]
+    fn stepped(&mut self) {}
 }
 
 /// [`run_program_into`]'s observer: it calls `on_idle` after a pass that changed nothing and
@@ -328,7 +336,21 @@ impl Targets {
             .main()
             .and_then(|output| output.main_entry.clone())
             .expect("a `main` output keeps the placement of the entry before its consumer");
-        self.0.push((slot, sink, TargetEntry::Main(placement)));
+        self.0
+            .push((slot, sink, TargetEntry::Main(placement, Arc::default())));
+    }
+
+    /// Whether a run over these targets has handed the `main` output its terminal answer: sink
+    /// state a checkpoint keeps beside the sink's release.
+    #[cfg(test)]
+    pub(crate) fn main_handed_terminal(&self) -> Arc<AtomicBool> {
+        self.0
+            .iter()
+            .find_map(|(_, _, entry)| match entry {
+                TargetEntry::Main(_, handed) => Some(handed.clone()),
+                TargetEntry::Sink(_) => None,
+            })
+            .expect("a `main` output")
     }
 
     /// Run the pipelines under every root until `observer` breaks or every live source yields
@@ -342,7 +364,21 @@ impl Targets {
         morsel_rows: usize,
         observer: &mut dyn RunObserver,
     ) -> Result<Ended, Refused> {
-        let ended = run_targets(&self.0, morsel_rows, default_workers(), observer)?;
+        self.run_with_workers(morsel_rows, default_workers(), observer)
+    }
+
+    /// [`run`](Self::run) with `workers` workers instead of [`default_workers`].
+    ///
+    /// # Errors
+    ///
+    /// As [`run_program`].
+    pub(crate) fn run_with_workers(
+        &self,
+        morsel_rows: usize,
+        workers: usize,
+        observer: &mut dyn RunObserver,
+    ) -> Result<Ended, Refused> {
+        let ended = run_targets(&self.0, morsel_rows, workers, observer)?;
         if let Ended::Done(_) = ended {
             complete_sinks(&self.0);
         }
@@ -410,8 +446,12 @@ fn run_targets(
             TargetEntry::Sink(_) => {
                 crate::interpreter::tile_operators::SinkBreaker::new(root.clone(), sink.clone())
             }
-            TargetEntry::Main(_) => {
-                crate::interpreter::tile_operators::SinkBreaker::main(root.clone(), sink.clone())
+            TargetEntry::Main(_, handed_terminal) => {
+                crate::interpreter::tile_operators::SinkBreaker::main(
+                    root.clone(),
+                    sink.clone(),
+                    handed_terminal.clone(),
+                )
             }
         };
         let under = {
@@ -441,7 +481,7 @@ fn run_targets(
                     .unwrap_or_else(PoisonError::into_inner)
                     .input_tiling(InputId::ONLY),
             ),
-            TargetEntry::Main(placement) => placement.set(Some(local)),
+            TargetEntry::Main(placement, _) => placement.set(Some(local)),
         }
     }
     let transactions: Vec<(StoreCell, usize, transaction_scope::WriterRun)> = planner
@@ -628,7 +668,7 @@ fn run_targets(
         .iter()
         .zip(sink_pipelines.iter().zip(&sink_breakers))
     {
-        if let TargetEntry::Main(_) = entry {
+        if let TargetEntry::Main(..) = entry {
             let local = planner.local[*pipeline];
             dispatcher.order(PipelineId(local));
             if reads_a_scope(&members.located, &members.reads, local) {
@@ -802,7 +842,7 @@ fn run_targets(
     // hands one terminal answer.
     if !live.is_empty() {
         for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
-            if let TargetEntry::Main(_) = entry {
+            if let TargetEntry::Main(..) = entry {
                 breaker
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1585,7 +1625,7 @@ impl Execution {
                 dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
             }
         }
-        match self.claim_until_quiescent(dispatcher, reach, workers) {
+        match self.claim_until_quiescent(dispatcher, reach, workers, &mut || {}) {
             Claimed::Done | Claimed::Failed => {}
             Claimed::Quiescent => {
                 panic!("an acyclic run with no pending loop has a pipeline that may finish")
@@ -1598,25 +1638,33 @@ impl Execution {
     /// quiescent: nothing is claimable, no worker can progress, no scope resumes
     /// ([`resume`](Self::resume)), and nothing has changed since the last claim. Both drivers
     /// run their claims through it: [`drive`](Self::drive) over a run with no live source, and
-    /// [`drive_live`] between its polls.
+    /// [`drive_live`] between its polls. It calls `stepped` after each package or finish the
+    /// coordinator runs, when no operator is borrowed.
     fn claim_until_quiescent(
         &self,
         dispatcher: &Dispatcher,
         reach: &mut Reach<'_>,
         workers: &WorkerPool,
+        stepped: &mut dyn FnMut(),
     ) -> Claimed {
         loop {
             match workers.next(dispatcher) {
                 Next::Package(package) if workers.admits(package.pipeline) => {
-                    workers.consume_on_coordinator(dispatcher, package)
+                    workers.consume_on_coordinator(dispatcher, package);
+                    stepped();
                 }
-                Next::Package(package) => self.consume(dispatcher, reach, package),
+                Next::Package(package) => {
+                    self.consume(dispatcher, reach, package);
+                    stepped();
+                }
                 Next::Finish { pipeline } if workers.finishes(pipeline) => {
-                    workers.finish_on_coordinator(dispatcher, pipeline)
+                    workers.finish_on_coordinator(dispatcher, pipeline);
+                    stepped();
                 }
                 Next::Finish { pipeline } => {
                     workers.finishing(pipeline, reach);
-                    self.finish(dispatcher, reach, pipeline)
+                    self.finish(dispatcher, reach, pipeline);
+                    stepped();
                 }
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {
                     dispatcher.wait(generation)
@@ -1685,7 +1733,7 @@ fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     for (_, _, entry) in targets {
         match entry {
             TargetEntry::Sink(consumer) => consumer.unplace(),
-            TargetEntry::Main(placement) => placement.set(None),
+            TargetEntry::Main(placement, _) => placement.set(None),
         }
     }
 }
@@ -1991,7 +2039,10 @@ enum TargetEntry {
     Sink(SinkTarget),
     /// The placement of the entry before a `main` output's consumer
     /// (`CompiledOutput::main_entry`).
-    Main(Placement),
+    ///
+    /// Beside it, whether a run over the output has handed the terminal answer, which every run
+    /// over these targets shares (`SinkBreaker::main`).
+    Main(Placement, Arc<AtomicBool>),
 }
 
 /// What [`run_program`] planned for one pipeline.
@@ -3748,7 +3799,11 @@ fn drive_live(
             changed |= at.poll(dispatcher, execution, reach);
         }
         loop {
-            match execution.claim_until_quiescent(dispatcher, reach, workers) {
+            #[cfg(test)]
+            let mut stepped = || observer.stepped();
+            #[cfg(not(test))]
+            let mut stepped = || {};
+            match execution.claim_until_quiescent(dispatcher, reach, workers, &mut stepped) {
                 Claimed::Done => return true,
                 // A worker's panic failed the run; the pool resumes it once it joins.
                 Claimed::Failed => return false,

@@ -603,6 +603,12 @@ enum Round {
 }
 
 impl InductionRun {
+    /// Whether a request of the loop's scope is open: claimed, and not yet answered by its rounds.
+    #[cfg(test)]
+    pub(crate) fn has_open_request(&self) -> bool {
+        self.request.is_some()
+    }
+
     pub(super) fn new(body: Body, starts: Vec<PipelineId>) -> Self {
         Self {
             body,

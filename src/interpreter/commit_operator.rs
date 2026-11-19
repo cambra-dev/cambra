@@ -130,6 +130,7 @@ pub enum CommitOutcome {
 /// **Allocate-on-validate**: a tick is consumed only by a valid proposal, whatever it
 /// writes, so the timestamp domain is dense and a stale proposal leaves no trace. Validates
 /// the read set with backward validation against each key's changelog.
+#[derive(Clone)]
 pub struct CommitEngine {
     /// The store's value before any change: every key's initial value. Held beside
     /// the changelog rather than at a position of it, because a position-keyed
@@ -977,6 +978,13 @@ impl Breaker for InductionStoreProducer {
         false
     }
 
+    #[cfg(test)]
+    fn has_open_request(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(crate::interpreter::dispatcher::loop_scope::InductionRun::has_open_request)
+    }
+
     /// A loop runs its positions in order, and takes a request none of whose positions is next as
     /// one that only closes positions absent from its source. The store's pipeline and every
     /// pipeline it reads, transitively, therefore publish in position order: each has one package
@@ -1068,6 +1076,55 @@ impl InductionStoreProducer {
 }
 
 impl BreakingProducer for InductionStoreProducer {
+    /// The engines, what the body stated complete, the position a predecessor reached, and whether
+    /// a step has rendered the store. The rendered store is not copied: restore renders it again
+    /// from the engines. The loop's run is run-local.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::new(InductionStoreCheckpoint {
+            resumed_after: self.resumed_after.clone(),
+            complete_rows: state.complete_rows.clone(),
+            engines: state.engines.clone(),
+            opened: state.breaker.snapshot.is_some(),
+            #[cfg(debug_assertions)]
+            stepped_through: state.stepped_through.clone(),
+        })
+    }
+
+    /// Installs the engines and, for a store a step had opened, renders it and publishes the
+    /// rendering through its cyclic fan-out, as a step does, so the operators in its cycle read
+    /// what the store held.
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+            InductionStoreCheckpoint,
+        >(&self.name(), state);
+        self.resumed_after = saved.resumed_after;
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = &mut *guard;
+        state.complete_rows = saved.complete_rows;
+        state.engines = saved.engines;
+        #[cfg(debug_assertions)]
+        {
+            state.stepped_through = saved.stepped_through;
+        }
+        if saved.opened {
+            let tile = self.render_store(state);
+            state
+                .breaker
+                .cycle
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} is its cyclic fan-out's input", self.name()))
+                .publish(&tile);
+            state.breaker.snapshot = Some(tile);
+        }
+    }
+
     /// Everything once the store is terminal. Before it is terminal, the positions the store has
     /// run and decided, which its pushes name as its rounds decide them, so a feed read from the
     /// store streams: a store that resumed its predecessor's run holds none of the positions
@@ -1292,6 +1349,13 @@ impl Breaker for CommitProducer {
         false
     }
 
+    #[cfg(test)]
+    fn has_open_request(&self) -> bool {
+        self.run.as_ref().is_some_and(
+            crate::interpreter::dispatcher::transaction_scope::TransactionRun::has_open_request,
+        )
+    }
+
     /// A transaction's driver holds one item in its live window, the next its source delivers, so
     /// the store's requests arrive in position order: the store's pipeline and every pipeline it
     /// reads, transitively, have one package in flight (`order_inputs_of_ordered_breakers`), as
@@ -1461,6 +1525,58 @@ impl CommitProducer {
 }
 
 impl BreakingProducer for CommitProducer {
+    /// The engine, the seed it has not taken, and per writer whether its last decision went
+    /// stale, how far its stream was consumed and whether it is terminal.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::new(CommitCheckpoint {
+            stale: state.stale.clone(),
+            consumed: state.consumed.clone(),
+            writer_terminal: state.writer_terminal.clone(),
+            seed: state.seed.clone(),
+            engine: state.engine.clone(),
+            opened: state.breaker.snapshot.is_some(),
+            #[cfg(debug_assertions)]
+            reported_closed: state.reported_closed.clone(),
+        })
+    }
+
+    /// Installs the store and, for a store a step had opened, renders it and publishes the
+    /// rendering through its cyclic fan-out, as a step does.
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<CommitCheckpoint>(
+            &self.name(),
+            state,
+        );
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = &mut *guard;
+        state.stale = saved.stale;
+        state.consumed = saved.consumed;
+        state.writer_terminal = saved.writer_terminal;
+        state.seed = saved.seed;
+        state.engine = saved.engine;
+        #[cfg(debug_assertions)]
+        {
+            state.reported_closed = saved.reported_closed;
+        }
+        if saved.opened {
+            let tile = self.render_store(state);
+            state
+                .breaker
+                .cycle
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} is its cyclic fan-out's input", self.name()))
+                .publish(&tile);
+            state.breaker.snapshot = Some(tile);
+        }
+    }
+
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
     /// decided, and a reader of its final value takes it once the store is terminal.
@@ -1577,6 +1693,7 @@ impl CommitProducer {
 /// **Positions are a store's own.** A composite `(enclosing, inner)` position exists only
 /// to tell a flat map which nest a position belongs to; the nesting says it instead, and a
 /// path is the row values down to a store plus a position inside it.
+#[derive(Clone)]
 pub enum Engines {
     /// One store's state, `None` until its seed arrives.
     ///
@@ -2558,6 +2675,19 @@ impl TileOperator for CommitOperator {
     }
 }
 
+/// A [`CommitProducer`]'s state as a checkpoint copies it out.
+struct CommitCheckpoint {
+    stale: Vec<bool>,
+    consumed: Vec<u64>,
+    writer_terminal: Vec<bool>,
+    seed: HashMap<Value, Value>,
+    engine: Option<CommitEngine>,
+    /// Whether a step had rendered the store ([`BreakerState::snapshot`]).
+    opened: bool,
+    #[cfg(debug_assertions)]
+    reported_closed: std::collections::HashSet<Value>,
+}
+
 #[doc(hidden)]
 pub struct CommitProducer {
     base: ProducerBase,
@@ -3448,6 +3578,17 @@ impl TileOperator for InductionStore {
             run: None,
         })
     }
+}
+
+/// An [`InductionStoreProducer`]'s state as a checkpoint copies it out.
+struct InductionStoreCheckpoint {
+    resumed_after: Option<Position>,
+    complete_rows: Vec<Predicate>,
+    engines: Engines,
+    /// Whether a step had rendered the store ([`BreakerState::snapshot`]).
+    opened: bool,
+    #[cfg(debug_assertions)]
+    stepped_through: Option<Path>,
 }
 
 /// An induction store with accumulator state and dispatcher-run control.
@@ -5048,6 +5189,7 @@ impl TileProducer for StoreDenseReadProducer {
 /// side (it says *which* item a reclaimed row belongs to). It is distinct from
 /// `position` there — a retried item occupies several attempt positions — and equal
 /// to it on the induction side, where a row's position *is* its source position.
+#[derive(Clone)]
 struct DriverRow {
     /// The store frontier a transaction attempt's decision reads at ([`F_ATTEMPT_SNAPSHOT`]);
     /// `None` for an induction row, which reads its slots alone.
@@ -5087,6 +5229,7 @@ impl DriverRow {
 
 /// The inner rows of a driver window that sit under one outer row: the rows of positions,
 /// and the enclosing row they are under.
+#[derive(Clone)]
 struct DriverGroup {
     /// The outer row's path, one component per level above the positions; `None` for a
     /// window whose positions have no rows above them.
@@ -5146,7 +5289,33 @@ struct DriverWindow {
     groups: Vec<DriverGroup>,
 }
 
+/// What a [`DriverWindow`] has done, for a checkpoint: the fields a drive's steps change. The
+/// compiled fields stay the new graph's, since an [`Extent`] among them can hold a data source's
+/// handle. The release cursor is left out too: only a release advances it
+/// ([`acknowledge`](DriverWindow::acknowledge)), and recovery replays the releases.
+struct DriverWindowProgress {
+    attempts: u64,
+    highest_pushed: Option<(Option<Path>, Position)>,
+    groups: Vec<DriverGroup>,
+}
+
 impl DriverWindow {
+    /// What the window has done ([`DriverWindowProgress`]).
+    fn progress(&self) -> DriverWindowProgress {
+        DriverWindowProgress {
+            attempts: self.attempts,
+            highest_pushed: self.highest_pushed.clone(),
+            groups: self.groups.clone(),
+        }
+    }
+
+    /// Continue from `progress`, which [`progress`](Self::progress) copied out of the window at
+    /// the same node of a graph compiled from the same text.
+    fn resume(&mut self, progress: DriverWindowProgress) {
+        self.attempts = progress.attempts;
+        self.highest_pushed = progress.highest_pushed;
+        self.groups = progress.groups;
+    }
     /// The values the window holds: each live row's snapshot, item and enclosing
     /// parameter.
     fn held_values(&self) -> usize {
@@ -6003,6 +6172,18 @@ impl DecodedSource {
     }
 }
 
+/// An [`InductionDriverProducer`]'s state as a checkpoint copies it out.
+struct InductionDriverCheckpoint {
+    window: DriverWindowProgress,
+    emitted_through: Option<Path>,
+    source_released_through: Option<Path>,
+    source_fully_released: bool,
+    source_complete: Vec<Predicate>,
+    source_absent: Predicate,
+    reseeded: Option<(Path, Vec<Value>)>,
+    rendered: Tile,
+}
+
 struct InductionDriverProducer {
     base: ProducerBase,
     /// Where the entry in front of the source records a decided push while unplaced.
@@ -6330,6 +6511,45 @@ impl Breaker for InductionDriverProducer {
 }
 
 impl BreakingProducer for InductionDriverProducer {
+    /// The window of emitted rows, the cursors over the source, what the source called complete
+    /// and absent, and the last rendering. The decoded source is a cache of input the drive has
+    /// not released. A drive compiled again reads its source whole at its first step, since
+    /// `subscribe_driver_inputs` records news of everything, so the cache is not copied.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::new(InductionDriverCheckpoint {
+            window: state.window.progress(),
+            emitted_through: state.emitted_through.clone(),
+            source_released_through: state.source_released_through.clone(),
+            source_fully_released: state.source_fully_released,
+            source_complete: state.source_complete.clone(),
+            source_absent: state.source_absent.clone(),
+            reseeded: state.reseeded.clone(),
+            rendered: state.rendered.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+            InductionDriverCheckpoint,
+        >(&self.name(), state);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.window.resume(saved.window);
+        state.emitted_through = saved.emitted_through;
+        state.source_released_through = saved.source_released_through;
+        state.source_fully_released = saved.source_fully_released;
+        state.source_complete = saved.source_complete;
+        state.source_absent = saved.source_absent;
+        state.reseeded = saved.reseeded;
+        state.rendered = saved.rendered;
+    }
+
     /// The region the last step's rendering states.
     fn complete(&self) -> TileGuard {
         let mut state_guard = self
@@ -6899,6 +7119,14 @@ impl TileOperator for TransactDriver {
     }
 }
 
+/// A [`TransactDriverProducer`]'s state as a checkpoint copies it out.
+struct TransactDriverCheckpoint {
+    rendered: Tile,
+    window: DriverWindowProgress,
+    latest_emit: Option<(Position, Position)>,
+    source_released: Predicate,
+}
+
 struct TransactDriverProducer {
     decides: crate::interpreter::dispatcher::CompletionTarget,
     base: ProducerBase,
@@ -7202,6 +7430,37 @@ impl Breaker for TransactDriverProducer {
 }
 
 impl BreakingProducer for TransactDriverProducer {
+    /// The window of attempts, the last emit, the source region released, and the last
+    /// rendering. The decoded source is a cache of input the
+    /// drive has not released, which a drive compiled again reads whole at its first step, as an
+    /// induction drive does.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::new(TransactDriverCheckpoint {
+            rendered: state.rendered.clone(),
+            window: state.window.progress(),
+            latest_emit: state.latest_emit.clone(),
+            source_released: state.source_released.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+            TransactDriverCheckpoint,
+        >(&self.name(), state);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rendered = saved.rendered;
+        state.window.resume(saved.window);
+        state.latest_emit = saved.latest_emit;
+        state.source_released = saved.source_released;
+    }
+
     fn complete(&self) -> TileGuard {
         let mut state_guard = self
             .state
@@ -7877,6 +8136,7 @@ impl TileOperator for TransactWriter {
 /// takes by it. The driver owns the transaction source and acknowledges its items. The writer
 /// names an attempt by the driver position it came from, which is the identity the driver
 /// itself uses.
+#[derive(Clone)]
 struct InFlightProposal {
     /// The store frontier this proposal was built against — the read set is
     /// current iff no read key was overwritten after it.
@@ -7892,6 +8152,14 @@ struct InFlightProposal {
     attempt: Position,
     /// The source position of the attempt's item, as the driver's row states it.
     item: Position,
+}
+
+/// A [`TransactWriterProducer`]'s state as a checkpoint copies it out.
+struct TransactWriterCheckpoint {
+    last_decided_pos: Option<Position>,
+    driver_terminal: bool,
+    committed_base: u64,
+    emitted: Vec<InFlightProposal>,
 }
 
 struct TransactWriterProducer {
@@ -8346,6 +8614,35 @@ impl Breaker for TransactWriterProducer {
 }
 
 impl BreakingProducer for TransactWriterProducer {
+    /// The proposals the store has not released, where the stream's live window starts, the last
+    /// decision acted on, and whether the drive has closed.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Box::new(TransactWriterCheckpoint {
+            last_decided_pos: state.last_decided_pos.clone(),
+            driver_terminal: state.driver_terminal,
+            committed_base: state.committed_base,
+            emitted: state.emitted.clone(),
+        })
+    }
+
+    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+            TransactWriterCheckpoint,
+        >(&self.name(), state);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.last_decided_pos = saved.last_decided_pos;
+        state.driver_terminal = saved.driver_terminal;
+        state.committed_base = saved.committed_base;
+        state.emitted = saved.emitted;
+    }
+
     fn complete(&self) -> TileGuard {
         let mut state_guard = self
             .state

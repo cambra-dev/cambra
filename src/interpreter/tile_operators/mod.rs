@@ -49,6 +49,7 @@ use crate::{
 
 mod aggregate;
 mod breaker_reader;
+pub(crate) mod checkpoint;
 pub(crate) use breaker_reader::share_breaker;
 mod combinators;
 mod cycle_slot;
@@ -1737,6 +1738,13 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
+    /// Whether the breaker is a store whose loop or transaction scope has a request open, whose
+    /// state lives in the run rather than in the store.
+    #[cfg(test)]
+    fn has_open_request(&self) -> bool {
+        false
+    }
+
     /// How many inputs the breaker consumes, each the input of a pipeline of its own: one, but for
     /// a transaction store, which consumes one per writer.
     fn inputs(&self) -> usize {
@@ -1836,6 +1844,33 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// seed, has one per entry. The default answers [`entry_placement`](Self::entry_placement).
     fn entry_placements(&self, input: InputId) -> Vec<crate::interpreter::dispatcher::Placement> {
         self.entry_placement(input).into_iter().collect()
+    }
+
+    /// The breaker's state as data: what a recovered breaker needs to answer every region its
+    /// readers have not released, and nothing a run rebuilds. A test copies it between top-level
+    /// steps, where a loop's or a transaction's request may be open. It holds no
+    /// handle on an operator or a data source, so it carries nothing of the graph it came from
+    /// into another (`checkpoint.rs`).
+    ///
+    /// # Panics
+    ///
+    /// The default panics, so a breaker with no checkpoint fails a recovery loudly.
+    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+        panic!("{} has no checkpoint", self.name())
+    }
+
+    /// Install `state`, which [`checkpoint`](Self::checkpoint) copied out of the breaker at the
+    /// same position of a graph compiled from the same text, into this breaker, which has run
+    /// nothing. It releases none of its inputs: recovery releases them once every breaker holds
+    /// its state. A store publishes its rendering through its cyclic fan-out, as a step does,
+    /// and the release that publication sends the store waits until the store is no longer
+    /// borrowed.
+    ///
+    /// # Panics
+    ///
+    /// The default panics, as [`checkpoint`](Self::checkpoint) does.
+    fn restore(&mut self, _state: Box<dyn std::any::Any + Send>) {
+        panic!("{} has no checkpoint to restore", self.name())
     }
 }
 
