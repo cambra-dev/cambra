@@ -1375,8 +1375,27 @@ fn values_ending_function_blocks(expr: &TypedExpr) -> Vec<NodeId> {
     out
 }
 
-/// One run of inference over `expr`, as [`run_with_params`] describes.
+/// One run of inference over `expr`, as [`run_with_params`] describes. A run that fails before
+/// coalesce settles its tree's capabilities as coalesce does
+/// ([`solve::settle_capabilities`]), so no capability variable leaves it either way.
 fn run_once(
+    expr: &mut Expr,
+    sources: &HashMap<String, Type>,
+    instances: &Rc<solver::traits::InstanceTable>,
+    params: &[ModuleCheckParam],
+    reported: &HashSet<Name>,
+    public: &HashSet<Name>,
+    marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
+) -> Result<Inferred, RunFailure> {
+    let result = attempt_run(expr, sources, instances, params, reported, public, marks);
+    if result.is_err() {
+        solve::settle_capabilities(expr);
+    }
+    result
+}
+
+/// [`run_once`] up to settling a failed run's capabilities.
+fn attempt_run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
