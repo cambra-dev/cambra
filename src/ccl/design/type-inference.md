@@ -2610,6 +2610,12 @@ bound (`Bound::suspended_on`), so compaction applies `σ` to `𝛼`'s content as
 way it applies an edge's substitution. `𝛽`'s telescope is `𝛼`'s with `σ`'s domain removed and the
 names `σ`'s range reads added, and it shares `𝛼`'s kind.
 
+`𝛽` is recorded on `𝛼`, so a later application of the same `σ` finds it, only when a write mints it:
+recording a constraint. A read, a compaction or a materialization (`Solver::read`), keeps the
+suspensions it mints for the rest of the outermost read, so a walk that meets `𝛼[σ]` again reuses
+`𝛽`, which ends a walk through a cycle, and forgets them when it ends. A read then leaves nothing on
+`𝛼`, so what a later read or a freshening finds there does not depend on which reads came before.
+
 A substitution whose binder half names no binder in `𝛼`'s telescope, and which has no witness half,
 leaves `𝛼` unchanged. `𝛼` resolves to types naming its telescope's binders and nothing else
 ([The invariant](#the-invariant)), so the binder half acts on none of them. A telescope does not

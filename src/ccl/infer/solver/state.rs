@@ -187,6 +187,11 @@ pub struct Solver {
     capabilities: VarTable<Capabilities>,
     /// What is recorded on each ordering requirement the run made.
     orderings: Table<OrderableIfRequiredBy, OrderingState>,
+    /// How many reads are in progress ([`Self::read`]).
+    reading: u32,
+    /// The suspensions the reads in progress have minted, by the variable each suspends on
+    /// ([`Self::read`]).
+    pub(crate) read_suspensions: HashMap<InferVarId, Vec<(crate::ccl::subst::Subst, Rc<InferVar>)>>,
     /// What the run records about capabilities beyond each variable's state.
     capability_run: CapabilityRun,
     /// How many facts the run has recorded, by what holds them ([`Revisions`]).
@@ -258,6 +263,8 @@ impl Solver {
             barriers: Table::default(),
             capabilities: Table::default(),
             orderings: Table::default(),
+            reading: 0,
+            read_suspensions: HashMap::new(),
             capability_run: CapabilityRun::default(),
             revisions: Revisions::default(),
             suspended_memberships: SuspendedMemberships::default(),
@@ -314,6 +321,27 @@ impl Solver {
     pub(crate) fn capability_run_mut(&mut self) -> &mut CapabilityRun {
         self.revisions.capability_run += 1;
         &mut self.capability_run
+    }
+
+    /// Run `f` as a read of the graph: a compaction or a materialization. A read may apply a
+    /// substitution to a variable, and so suspend on it ([`crate::ccl::subst::Subst`]'s
+    /// `suspended`). A suspension a read mints serves the rest of the outermost read, so a walk
+    /// that meets it again reuses it, which is what ends a walk through a cycle; when that
+    /// read ends it is forgotten. No later reader or writer finds it on the variable, so what
+    /// a read leaves behind does not depend on which reads came before it.
+    pub(crate) fn read<R>(&mut self, f: impl FnOnce(&mut Solver) -> R) -> R {
+        self.reading += 1;
+        let out = f(self);
+        self.reading -= 1;
+        if self.reading == 0 {
+            self.read_suspensions.clear();
+        }
+        out
+    }
+
+    /// Whether a read is in progress ([`Self::read`]).
+    pub(crate) fn is_reading(&self) -> bool {
+        self.reading > 0
     }
 
     /// This solver's identity.
