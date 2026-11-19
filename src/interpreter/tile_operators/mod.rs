@@ -1290,6 +1290,9 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
             (Ok(_), Err(_)) if names_collection_keys(held) && names_collection_keys(released) => {
                 minus_disjoint_arms(held, released)
             }
+            (Err(_), Ok(_)) if names_collection_keys(held) && names_collection_keys(released) => {
+                minus_outermost_keys(held, released)
+            }
             _ => panic!("the guard algebra has no difference of {held:?} and {released:?}"),
         },
     }
@@ -1326,6 +1329,113 @@ fn minus_disjoint_arms(held: &TileGuard, released: &TileGuard) -> TileGuard {
     left
 }
 
+/// `held`, a guard of a collection's keys with an arm naming cells beneath some keys, less
+/// `released`, a region of the collection's outermost keys. An arm of keys loses them as
+/// projections do ([`guard_minus`]); an arm of cells keeps the cells beneath every other key
+/// ([`cells_outside_keys`]) (`src/interpreter/design-path-projections.md`, "Differences of
+/// nested guards").
+///
+/// # Panics
+///
+/// Where `released` names keys beneath the outermost level, as a release up to a path in a round
+/// does, where an arm of `held` is no projection and no codomain guard, and where
+/// [`cells_outside_keys`] panics.
+fn minus_outermost_keys(held: &TileGuard, released: &TileGuard) -> TileGuard {
+    let keys = match released {
+        TileGuard::Function(FunctionGuard::Domain(keys)) if !keys.qualifies() => keys,
+        _ => panic!(
+            "the guard algebra has no difference of {held:?} and {released:?}: a release of \
+             cells beneath keys is taken out of keys of the outermost level only"
+        ),
+    };
+    let arms = match held {
+        TileGuard::Or(arms) => arms.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let left: Vec<TileGuard> = arms
+        .iter()
+        .map(|arm| match Projection::of(arm) {
+            Ok(_) => guard_minus(arm, released),
+            Err(_) => {
+                assert!(
+                    matches!(arm, TileGuard::Function(FunctionGuard::Codomain(_))),
+                    "the guard algebra has no difference of {held:?} and {released:?}: the arm \
+                     {arm:?} is no projection and no codomain guard"
+                );
+                cells_outside_keys(arm, keys)
+            }
+        })
+        .filter(|arm| !arm.is_empty())
+        .collect();
+    match left.is_empty() {
+        true => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+        false => TileGuard::flatten_or(left),
+    }
+}
+
+/// `cells`, a codomain guard naming cells one level beneath the keys of a collection, less every
+/// cell beneath the outermost keys `keys` admits. There a predicate of a field reads the path of
+/// its row: one qualified by enclosing keys (`Predicate::Qualified`) keeps the keys `keys` does not
+/// admit, and one that names its cells under every key is qualified by every key but those.
+///
+/// # Panics
+///
+/// Where a predicate names cells deeper than one level beneath the keys, is an `Or`, or qualifies
+/// its enclosing keys in turn: the predicate then reads no single outermost key, and this
+/// difference has no spelling of it.
+fn cells_outside_keys(cells: &TileGuard, keys: &Predicate) -> TileGuard {
+    fn beneath(predicate: &Predicate, keys: &Predicate, deep: bool) -> Predicate {
+        let unspelled = || -> ! {
+            panic!(
+                "the guard algebra has no difference of cells named by {predicate:?} and the \
+                 outermost keys {keys:?}: it is spelled one level beneath the keys, under one \
+                 qualification and with no `Or`"
+            )
+        };
+        match predicate {
+            Predicate::False => Predicate::False,
+            _ if deep => unspelled(),
+            Predicate::Qualified { enclosing, here } => {
+                if enclosing.qualifies() || matches!(**enclosing, Predicate::Or(_)) {
+                    unspelled()
+                }
+                Predicate::qualified(enclosing.minus(keys), (**here).clone())
+            }
+            Predicate::Or(_) => unspelled(),
+            here => Predicate::qualified(Predicate::True.minus(keys), here.clone()),
+        }
+    }
+    fn walk(guard: &TileGuard, keys: &Predicate, deep: bool) -> TileGuard {
+        match guard {
+            TileGuard::Scalar(predicate) => TileGuard::Scalar(beneath(predicate, keys, deep)),
+            TileGuard::Aggregation(predicate) => {
+                TileGuard::Aggregation(beneath(predicate, keys, deep))
+            }
+            TileGuard::Record(fields) => TileGuard::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), walk(field, keys, deep)))
+                    .collect(),
+            ),
+            TileGuard::Function(FunctionGuard::Domain(predicate)) => {
+                TileGuard::Function(FunctionGuard::Domain(beneath(predicate, keys, deep)))
+            }
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(inner, keys, true))))
+            }
+            TileGuard::Or(arms) => {
+                TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, keys, deep)).collect())
+            }
+        }
+    }
+    match cells {
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(inner, keys, false))))
+        }
+        other => panic!("cells beneath keys are named by a codomain guard, not {other:?}"),
+    }
+}
+
 /// The keys `released`, a guard of a collection's keys, names whole: its arms that are regions of
 /// keys at any level ([`Projection::of`]), `None` where it has none. Every other arm is a codomain
 /// guard naming cells beneath keys, as a selector releases the fields it does not read
@@ -1356,6 +1466,34 @@ pub(crate) fn keys_released_whole(released: &TileGuard) -> Option<TileGuard> {
         );
     }
     (!keys.is_empty()).then(|| TileGuard::flatten_or(keys))
+}
+
+/// Whether `released` covers all of `held`, both guards of one tiling. Where `released` names
+/// cells beneath some keys besides whole keys ([`keys_released_whole`]), only its whole keys cover:
+/// a key whose every cell `released` names one arm at a time counts as not covered, so a reader
+/// asking whether to read `held` reads it, and the read answers nothing of that key. The guard
+/// algebra has no difference of keys with cells beneath them, which a reader would take to say
+/// which cells of a key remain; it needs none to say whether any key remains.
+pub(crate) fn guard_covers(released: &TileGuard, held: &TileGuard) -> bool {
+    if released.is_universal() || held.is_empty() {
+        return true;
+    }
+    if Projection::of(released).is_ok() || !names_collection_keys(released) {
+        return guard_minus(held, released).is_empty();
+    }
+    keys_released_whole(released).is_some_and(|keys| guard_minus(held, &keys).is_empty())
+}
+
+/// The part of `guard` a projection spells: all of it where a projection does, its arms that name
+/// collection keys where it also holds cells beneath a row ([`keys_released_whole`]), and `None`
+/// where no part is spelled so, as a record whose collection field is complete through some rows.
+pub(crate) fn spelled_part(guard: &TileGuard) -> Option<TileGuard> {
+    if Projection::of(guard).is_ok() {
+        return Some(guard.clone());
+    }
+    names_collection_keys(guard)
+        .then(|| keys_released_whole(guard))
+        .flatten()
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -1533,6 +1671,17 @@ pub trait Breaker {
     /// itself, and a breaker that is no producer, such as a sink's, answers `None`. A breaker
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
+
+    /// Whether a consume over an open input releases only what its answer makes releasable
+    /// (`Tile::to_guard`), so a later package may read the input again for what that answer left
+    /// open. A memo also caches the open keys it read; the next read merges what they gained. A
+    /// dispatched run reads again the input of a pipeline its live
+    /// sources reach widened only where its breaker does (`Dispatcher::notify_again`); any other
+    /// such pipeline reads its input once every source yields everything. A breaker that folds
+    /// or extracts what it is handed, or steps until its guard is released, answers `false`.
+    fn reads_open_input(&self) -> bool {
+        false
+    }
 
     /// Whether the breaker holds a decision it took ahead of its commit and has not settled: a
     /// transaction store's queued decisions and the items it names to decide again. Every step
@@ -3332,7 +3481,7 @@ mod tests {
 
     /// The difference of two guards of a breaker's state, where the algebra can spell it exactly.
     mod guard_difference {
-        use super::super::{TileGuard, guard_minus, keys_released_whole};
+        use super::super::{TileGuard, guard_covers, guard_minus, keys_released_whole};
         use crate::interpreter::{FunctionGuard, Predicate, Value};
         use intervalsets::{Interval, IntervalSet};
         use std::collections::HashMap;
@@ -3520,6 +3669,94 @@ mod tests {
                 ),
                 path(1)
             );
+        }
+
+        /// A held region with cells beneath keys still open, as a breaker over rows whose
+        /// collection field grows completes it, less keys released whole, keeps the cells beneath
+        /// every other key.
+        #[test]
+        fn held_cells_less_released_keys_keep_the_cells_beneath_the_other_keys() {
+            let under = |rows: Predicate| {
+                record_cells(
+                    TileGuard::Scalar(Predicate::qualified(rows.clone(), Predicate::True)),
+                    domain(Predicate::qualified(rows, keys(0, 1))),
+                )
+            };
+            let above_one = Predicate::True.minus(&keys(0, 1));
+            let held = TileGuard::Or(vec![domain(above_one.clone()), under(keys(0, 1))]);
+            assert_eq!(
+                guard_minus(&held, &domain(keys(0, 0))),
+                TileGuard::Or(vec![domain(above_one), under(keys(1, 1))])
+            );
+            assert!(guard_minus(&under(keys(0, 1)), &domain(keys(0, 1))).is_empty());
+        }
+
+        /// Cells named under every key keep those beneath the keys not released.
+        #[test]
+        fn cells_under_every_key_less_released_keys_are_qualified_by_the_rest() {
+            let cells = record_cells(
+                TileGuard::Scalar(Predicate::True),
+                TileGuard::Scalar(Predicate::False),
+            );
+            let held = TileGuard::Or(vec![domain(keys(5, 5)), cells]);
+            let rest = Predicate::True.minus(&keys(0, 0));
+            // An `Or` drops the cells beneath a key another arm names whole (`flatten_or`).
+            assert_eq!(
+                guard_minus(&held, &domain(keys(0, 0))),
+                TileGuard::flatten_or(vec![
+                    domain(keys(5, 5)),
+                    record_cells(
+                        TileGuard::Scalar(Predicate::qualified(rest, Predicate::True)),
+                        TileGuard::Scalar(Predicate::False),
+                    ),
+                ])
+            );
+        }
+
+        /// Cells two levels beneath the keys name paths whose outermost key no predicate reads,
+        /// so the difference with outermost keys panics rather than subtract at the wrong level.
+        #[test]
+        #[should_panic(expected = "spelled one level beneath the keys")]
+        fn cells_two_levels_beneath_the_keys_have_no_difference_with_keys() {
+            let deep = TileGuard::Function(FunctionGuard::Codomain(Box::new(record_cells(
+                TileGuard::Scalar(Predicate::qualified(keys(0, 3), Predicate::True)),
+                TileGuard::Scalar(Predicate::False),
+            ))));
+            let held = TileGuard::Or(vec![
+                domain(keys(5, 5)),
+                record_cells(deep, TileGuard::Scalar(Predicate::False)),
+            ]);
+            guard_minus(&held, &domain(keys(0, 0)));
+        }
+
+        /// A field predicate that is an `Or` of differently qualified arms reads no single
+        /// outermost key, so the difference with outermost keys panics.
+        #[test]
+        #[should_panic(expected = "spelled one level beneath the keys")]
+        fn cells_named_by_an_or_have_no_difference_with_keys() {
+            let either = Predicate::Or(vec![
+                Predicate::qualified(keys(0, 0), keys(0, 4)),
+                Predicate::qualified(keys(1, 1), keys(0, 2)),
+            ]);
+            let held = TileGuard::Or(vec![
+                domain(keys(5, 5)),
+                record_cells(TileGuard::Scalar(Predicate::False), domain(either)),
+            ]);
+            guard_minus(&held, &domain(keys(0, 0)));
+        }
+
+        /// A release with cells beneath keys covers only the keys it names whole.
+        #[test]
+        fn a_release_with_cells_covers_the_keys_it_names_whole() {
+            let cells = record_cells(
+                TileGuard::Scalar(Predicate::qualified(keys(1, 1), Predicate::True)),
+                TileGuard::Scalar(Predicate::False),
+            );
+            let released = TileGuard::Or(vec![domain(keys(0, 0)), cells]);
+            assert!(guard_covers(&released, &domain(keys(0, 0))));
+            assert!(!guard_covers(&released, &domain(keys(0, 1))));
+            assert!(guard_covers(&domain(Predicate::True), &domain(keys(0, 9))));
+            assert!(!guard_covers(&domain(keys(0, 0)), &domain(keys(0, 1))));
         }
 
         /// A release of a field's cells beneath a held path leaves that path's other cells.

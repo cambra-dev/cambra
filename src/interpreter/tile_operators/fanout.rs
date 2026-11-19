@@ -1653,6 +1653,11 @@ fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
 }
 
 impl Breaker for MemoProducer {
+    /// A consume caches the answer and releases what it states ([`MemoProducer::read_input`]).
+    fn reads_open_input(&self) -> bool {
+        true
+    }
+
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller asks
     /// for the pipeline to run. It wakes no consumer: a consuming memo's only reader is the
     /// pipeline the dispatcher pushes to, and what the consume merged reaches it through the
@@ -1663,7 +1668,7 @@ impl Breaker for MemoProducer {
             "{} consumes a guard of its input's tiling: {guard:?}",
             self.name()
         );
-        if guard_minus(&guard, self.input.obsolete_guard()).is_empty() {
+        if guard_covers(self.input.obsolete_guard(), &guard) {
             return;
         }
         let projection = guard.projection_for(self);
