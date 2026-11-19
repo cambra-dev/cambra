@@ -1337,7 +1337,11 @@ fn admits(
     // A check abstains only where the answer reads a part still open: a dense range is decided
     // by the head alone, while equality and subtyping read the whole type. A check runs on a
     // materialized position, predicates included, so what is left open is a variable.
-    let open = mode == Membership::Check && crate::ccl::subst::type_contains_infer(d);
+    let open = mode == Membership::Check
+        && (crate::ccl::subst::type_contains_infer(d)
+            || k.children()
+                .iter()
+                .any(crate::ccl::subst::type_contains_infer));
     match k {
         TypeKind::Family { .. } => {
             unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
@@ -1368,7 +1372,9 @@ pub fn admits_resolved(
     let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
     cache.lctx = cache.lctx.extended(in_scope);
     let id = Subst::id();
-    admits(
+    #[cfg(debug_assertions)]
+    let before = solver.capability_revision();
+    let admitted = admits(
         solver,
         d,
         k,
@@ -1380,7 +1386,42 @@ pub fn admits_resolved(
         scope,
         Membership::Check,
     )
-    .is_ok()
+    .is_ok();
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        solver.capability_revision() == before,
+        "a membership check records nothing on the graph: {d} against {k}"
+    );
+    admitted
+}
+
+/// [`admits`] for a resolved position whose kind is bounded by a type still open, run as
+/// solving: `d <: b` is recorded, which is what determines an unannotated `b`. The write pass
+/// settles these before the stamp pass reads the graph (`src/ccl/design/type-inference.md`,
+/// "Coalescing in two passes"); a failure is left to [`admits_resolved`] to report at the
+/// position.
+pub fn settle_open_membership(
+    solver: &mut Solver,
+    d: &Type,
+    k: &TypeKind,
+    in_scope: &[crate::ccl::ty::Witness],
+    scope: &dyn ScopeEnv,
+) {
+    let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+    cache.lctx = cache.lctx.extended(in_scope);
+    let id = Subst::id();
+    let _ = admits(
+        solver,
+        d,
+        k,
+        &id,
+        &id,
+        d,
+        d,
+        &mut cache,
+        scope,
+        Membership::Solve,
+    );
 }
 
 /// [`admits_resolved`] for a whole resolved kind: whether `k` contains `sub`, run as a check.
@@ -1395,7 +1436,9 @@ pub fn contains_resolved(
     cache.lctx = cache.lctx.extended(in_scope);
     let id = Subst::id();
     let t = Type::Hole;
-    constrain_type_kinds(
+    #[cfg(debug_assertions)]
+    let before = solver.capability_revision();
+    let contained = constrain_type_kinds(
         solver,
         sub,
         k,
@@ -1407,7 +1450,13 @@ pub fn contains_resolved(
         scope,
         Membership::Check,
     )
-    .is_ok()
+    .is_ok();
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        solver.capability_revision() == before,
+        "a containment check records nothing on the graph: {sub} in {k}"
+    );
+    contained
 }
 
 /// Is `t` a witness (a reference or a projection) or an inference variable, refined or not —

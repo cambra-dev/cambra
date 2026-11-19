@@ -1431,6 +1431,7 @@ pub(super) fn coalesce_pass(
         "coalesce scope must be balanced: every frame/shadow pushed during the \
          walk is popped when its binder's subtree completes"
     );
+    settle_open_memberships(solver, &ctx);
     // The write pass's errors are reported where the stamp pass reaches their nodes.
     for error in std::mem::take(&mut ctx.errors) {
         ctx.replay.entry(error.node_id).or_default().push(error);
@@ -2149,10 +2150,11 @@ fn decide_memberships(
         None;
     for (i, mut m) in pending.into_iter().enumerate() {
         coalesce_type_predicates(solver, &mut m.found, level, ctx);
+        let kind = resolved_kind(solver, &m.kind, level, ctx);
         let admitted = crate::ccl::infer::solver::constrain::admits_resolved(
             solver,
             &m.found,
-            &m.kind,
+            &kind,
             &m.witnesses,
             &ResolvingScope(&ctx.binders),
         );
@@ -2182,6 +2184,92 @@ fn decide_memberships(
             let label = label(solver);
             ctx.push_position_error(solver, Some(position), map_coalesce_err(err, &label));
         }
+    }
+}
+
+/// `kind` with each type it holds resolved, predicates included, as a membership's found type
+/// is: a membership decided at materialization compares two types. A bound still a variable
+/// would be constrained rather than read, recording on the graph the stamp pass reads; one
+/// that does not resolve stays as it is, and the check abstains on it
+/// ([`admits_resolved`](crate::ccl::infer::solver::constrain::admits_resolved)).
+fn resolved_kind(
+    solver: &mut Solver,
+    kind: &crate::ccl::ty::TypeKind,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+) -> crate::ccl::ty::TypeKind {
+    let mut resolved = Vec::new();
+    for ty in kind.children() {
+        let mut ty = resolve_var_type(solver, ty).unwrap_or_else(|_| ty.clone());
+        coalesce_type_predicates(solver, &mut ty, level, ctx);
+        resolved.push(ty);
+    }
+    let mut resolved = resolved.into_iter();
+    kind.map_children(|_| {
+        resolved
+            .next()
+            .expect("one resolved type per type the kind holds")
+    })
+}
+
+/// Relate each variable to the bound its membership names wherever that bound is still open, so
+/// the stamp pass reads a graph no membership check writes to.
+///
+/// A membership `𝑑 ∈ SubtypesOf(𝐵)` is the edge `𝑑 <: 𝐵`. Solving defers it while `𝑑` is a
+/// variable, and an annotation hole `𝐵` (`g: Map(_, _) = …`) has no other bound. Each variable
+/// carrying such a membership is materialized, and every membership its materialization collects
+/// whose bound still resolves to an open type is recorded
+/// ([`settle_open_membership`](crate::ccl::infer::solver::constrain::settle_open_membership)). A
+/// recording can open another, so the sweep runs until one records nothing. See
+/// `src/ccl/design/type-inference.md`, "Membership is decided at materialization".
+fn settle_open_memberships(solver: &mut Solver, ctx: &CoalesceCtx) {
+    let mut settled: Vec<(Type, crate::ccl::ty::TypeKind)> = Vec::new();
+    loop {
+        let mut recorded = false;
+        for var in solver.infer_vars().to_vec() {
+            let kinds = var.bounds(solver).type_kinds.clone();
+            if !kinds.iter().any(|k| bound_is_open(solver, k)) {
+                continue;
+            }
+            let (resolved, pending) =
+                crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
+                    resolve_var_type(solver, &Type::Infer(Rc::clone(&var)))
+                });
+            if resolved.is_err() {
+                continue;
+            }
+            for m in pending {
+                if !bound_is_open(solver, &m.kind)
+                    || settled.iter().any(|(f, k)| *f == m.found && *k == m.kind)
+                {
+                    continue;
+                }
+                crate::ccl::infer::solver::constrain::settle_open_membership(
+                    solver,
+                    &m.found,
+                    &m.kind,
+                    &m.witnesses,
+                    &ResolvingScope(&ctx.binders),
+                );
+                settled.push((m.found, m.kind));
+                recorded = true;
+            }
+        }
+        if !recorded {
+            break;
+        }
+    }
+}
+
+/// Whether `kind` bounds its members by a type that does not resolve to a closed type.
+fn bound_is_open(solver: &mut Solver, kind: &crate::ccl::ty::TypeKind) -> bool {
+    match kind {
+        crate::ccl::ty::TypeKind::SubtypesOf(b) => {
+            crate::ccl::subst::type_contains_infer(b)
+                && resolve_var_type(solver, b)
+                    .map_or(true, |b| crate::ccl::subst::type_contains_infer(&b))
+        }
+        _ => false,
     }
 }
 
