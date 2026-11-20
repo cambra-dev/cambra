@@ -945,9 +945,7 @@ impl Printer {
             )),
             // A constructor's observers, as a predicate writes them: `Option`'s by its methods
             // `is_none` and `value`. Another type's constructors have no surface spelling.
-            TypedExprNode::Builtin(Builtin::CtorIs(c))
-                if *c.decl == *crate::ccl::nominal::option() =>
-            {
+            TypedExprNode::Builtin(Builtin::CtorIs(c)) if c.decl.is_option() => {
                 let target = at_least(argument.written(), Prec::Postfix);
                 let is_none = format!("{target}.is_none()");
                 written(if c.ctor == crate::ccl::V_NONE.name() {
@@ -956,9 +954,7 @@ impl Printer {
                     (Prec::Not, format!("not {is_none}"))
                 })
             }
-            TypedExprNode::Builtin(Builtin::CtorPayload(c))
-                if *c.decl == *crate::ccl::nominal::option() =>
-            {
+            TypedExprNode::Builtin(Builtin::CtorPayload(c)) if c.decl.is_option() => {
                 let target = at_least(argument.written(), Prec::Postfix);
                 written((Prec::Postfix, format!("{target}.value()")))
             }
@@ -1197,6 +1193,20 @@ fn project<'a>(
 fn spelling(name: &Name) -> Option<String> {
     let base = name.base();
     (!base.starts_with("__")).then(|| match name.home() {
+        // A member of a name the prelude binds is written through that name, as a module
+        // outside the std root writes it: `Option::some`, not `std::Option::some`.
+        Some(crate::ccl::names::Home::Import(shared))
+            if shared.arguments.is_empty()
+                && let (head, rest) = base.split_once("::").unwrap_or((base, ""))
+                && let Some(bare) =
+                    crate::ccl::load::prelude_name(shared.module.segments(), head) =>
+        {
+            if rest.is_empty() {
+                bare.to_string()
+            } else {
+                format!("{bare}::{rest}")
+            }
+        }
         Some(home) => format!("{home}::{base}"),
         None => base.to_string(),
     })

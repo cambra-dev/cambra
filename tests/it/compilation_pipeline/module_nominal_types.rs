@@ -370,6 +370,30 @@ fn another_module_reaches_only_public_members(#[case] root: &str, #[case] needle
     assert_refused(&program(root, &[("shop", SHOP)]), needle);
 }
 
+/// A module declares associated functions only of the types it declares: one a `use` name
+/// reaches belongs to another module (`docs/chl-spec.md`, "Associated functions and methods").
+#[rstest]
+#[case::associated_function(indoc! {"
+    import shop use Price
+    def Price::tripled(p: Price) => Int:
+        p.extract() * 3
+    1
+"})]
+#[case::impl_block(indoc! {"
+    import shop use Price
+    impl Price:
+        def tripled(self) => Int:
+            self.extract() * 3
+    1
+"})]
+#[timeout(Duration::from_secs(10))]
+fn a_module_declares_no_associated_function_of_another_modules_type(#[case] root: &str) {
+    assert_refused(
+        &program(root, &[("shop", SHOP)]),
+        "`Price` is not a nominal type",
+    );
+}
+
 /// A record payload's labels belong to the declaring module, so another module builds one
 /// with qualified keyword arguments and reads it with a qualified projection.
 #[rstest]

@@ -67,11 +67,11 @@ pub(super) struct Definition {
     pub(super) name: SmolStr,
 }
 
-/// Every resolved use→binder pair in `tree`, in first-visit pre-order, then each of
-/// `resolved`, the names lowering resolved outside the tree.
+/// Every resolved use→binder pair whose use and binder stand in the root file, in first-visit
+/// pre-order through `tree`, then each of `resolved`, the names lowering resolved outside it.
 ///
-/// A use whose binder the source does not write contributes no row, which is how a
-/// use of a compiler-minted binder stays out.
+/// A use whose binder the source does not write contributes no row. A use of a std module's
+/// member resolves into that module's file and contributes no row.
 pub(super) fn definitions(
     tree: &Expr,
     projection: &SourceProjection,
@@ -88,6 +88,8 @@ pub(super) fn definitions(
         def_span: row.target,
         name: row.name.clone(),
     }));
+    let root = sources.root();
+    out.retain(|d| d.use_span.file == root && d.def_span.file == root);
     out
 }
 

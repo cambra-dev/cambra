@@ -53,8 +53,8 @@ use std::collections::HashMap;
 use crate::ccl::names::Uid;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 use crate::ccl::{Expr, Name, OccurrenceOf, PatternHead, Type};
-use crate::chl_parser::SourceMap;
 use crate::chl_parser::ast::Span;
+use crate::chl_parser::{FileId, SourceMap};
 use crate::interpreter::operator_graph::{EdgeKind, EdgeRole, GraphNode, InputEdge, OperatorGraph};
 use smol_str::SmolStr;
 
@@ -536,7 +536,11 @@ pub fn dense_edges(map: &ProvenanceMap<NodeId, NodeId>) -> Vec<(u64, u64)> {
 /// Nodes come out in the graph's own order, which is conversion order and so
 /// deterministic. Attribution is read the same way an expression node's is: the
 /// pane's projection is a fold product like any other.
-fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) -> Vec<OperatorNode> {
+fn build_operator_table(
+    graph: &OperatorGraph,
+    projection: &SourceProjection,
+    file: FileId,
+) -> Vec<OperatorNode> {
     graph
         .nodes()
         .iter()
@@ -569,7 +573,7 @@ fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) ->
                 role,
                 tiling,
                 spans: attribution
-                    .map(|a| wire_spans(&a.spans))
+                    .map(|a| wire_spans(&a.spans, file))
                     .unwrap_or_default(),
                 rewritten: attribution.and_then(rewrite_info),
                 inputs: inputs.iter().map(wire_edge).collect(),
@@ -578,7 +582,9 @@ fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) ->
         .collect()
 }
 
-/// An attribution's spans as they ship: **narrowest first**, deduplicated.
+/// An attribution's spans in `file`, the file the payload shows, as they ship: **narrowest
+/// first**, deduplicated. A span in another file, a std module's, does not ship: the payload
+/// carries one file's text ([`InspectedProgram::build_payload`]).
 ///
 /// Both node shapes carry this channel on the same terms — see
 /// [`IrNode::spans`] and [`OperatorNode::spans`] — so both get it from here.
@@ -586,14 +592,11 @@ fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) ->
 /// the ordering is this function's to establish rather than something the
 /// projection already holds.
 ///
-/// The key is `(width, start, end, file)` rather than width alone, so two spans
-/// of equal width order by position and the payload stays byte-reproducible.
-/// `file` is in it because `dedup` drops only adjacent repeats: two spans of one
-/// extent in different files would otherwise tie, keep the union's order, and
-/// let a repeat of one land on the far side of the other.
-fn wire_spans(spans: &[Span]) -> Vec<Span> {
-    let mut spans = spans.to_vec();
-    spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end, s.file));
+/// The key is `(width, start, end)` rather than width alone, so two spans of equal width order
+/// by position and the payload stays byte-reproducible.
+fn wire_spans(spans: &[Span], file: FileId) -> Vec<Span> {
+    let mut spans: Vec<Span> = spans.iter().copied().filter(|s| s.file == file).collect();
+    spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end));
     spans.dedup();
     spans
 }
@@ -636,6 +639,7 @@ fn occurrence_entry(
     id: NodeId,
     of: OccurrenceOf<'_>,
     projection: &SourceProjection,
+    file: FileId,
     binders: &HashMap<Uid, String>,
 ) -> IrNode {
     let (label, ty) = match of {
@@ -677,7 +681,7 @@ fn occurrence_entry(
     };
     if let Some(attr) = projection.get(&id) {
         node.rewritten = rewrite_info(attr);
-        node.spans = wire_spans(&attr.spans);
+        node.spans = wire_spans(&attr.spans, file);
     }
     node
 }
@@ -698,10 +702,15 @@ fn binder_types(tree: &Expr) -> HashMap<Uid, String> {
     out
 }
 
-fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrNode>) {
+fn build_node_table(
+    expr: &Expr,
+    projection: &SourceProjection,
+    file: FileId,
+) -> (u64, Vec<IrNode>) {
     fn visit(
         expr: &Expr,
         projection: &SourceProjection,
+        file: FileId,
         binders: &HashMap<Uid, String>,
         visited: &mut std::collections::HashSet<NodeId>,
         out: &mut Vec<IrNode>,
@@ -721,7 +730,7 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         };
         if let Some(attr) = projection.get(&id) {
             node.rewritten = rewrite_info(attr);
-            node.spans = wire_spans(&attr.spans);
+            node.spans = wire_spans(&attr.spans, file);
         }
 
         // The entry claims its pre-order slot before its children are walked, so
@@ -732,7 +741,7 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         let mut children = Vec::new();
         for child in expr.child_exprs() {
             children.push(IrChild {
-                id: visit(child, projection, binders, visited, out),
+                id: visit(child, projection, file, binders, visited, out),
                 kind: ChildKind::Value,
             });
         }
@@ -743,7 +752,7 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
             let id = occurrence.id();
             let kind = ChildKind::occurrence(&of);
             if visited.insert(id) {
-                out.push(occurrence_entry(id, of, projection, binders));
+                out.push(occurrence_entry(id, of, projection, file, binders));
             }
             children.push(IrChild {
                 id: id.as_u64(),
@@ -752,7 +761,7 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         });
         for predicate in predicate_children(expr) {
             children.push(IrChild {
-                id: visit(predicate, projection, binders, visited, out),
+                id: visit(predicate, projection, file, binders, visited, out),
                 kind: ChildKind::Predicate,
             });
         }
@@ -764,7 +773,7 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
     let binders = binder_types(expr);
     let mut visited = std::collections::HashSet::new();
     let mut nodes = Vec::new();
-    let root = visit(expr, projection, &binders, &mut visited, &mut nodes);
+    let root = visit(expr, projection, file, &binders, &mut visited, &mut nodes);
     debug_assert_eq!(
         nodes.len(),
         visited.len(),
@@ -790,12 +799,18 @@ impl InspectedProgram<'_> {
     ///   A running program's driver sets `version` to the branch version it
     ///   rendered from.
     ///
-    /// The payload carries one file. A program of several modules has nodes whose
-    /// spans lie in other files, so its payload is the degraded one, with a
-    /// diagnostic saying why, until the source pane shows several files
-    /// (`docs/modules.md`, "Inspector").
+    /// The payload carries one file, the root's. A program of several modules has nodes whose
+    /// spans lie in other files, so its payload is the degraded one, with a diagnostic saying
+    /// why, until the source pane shows several files (`docs/modules.md`, "Inspector"). The
+    /// std root's files do not count: a node from a std module ships without its spans there
+    /// ([`wire_spans`]).
     pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
-        if self.sources().files().count() > 1 {
+        let sources = self.sources();
+        let user_files = sources
+            .files()
+            .filter(|&file| !crate::ccl::load::is_std_file(sources, file))
+            .count();
+        if user_files > 1 {
             return InspectorPayload::degraded(
                 name,
                 self.source_text(),
@@ -835,14 +850,15 @@ impl InspectedProgram<'_> {
             .panes()
             .iter()
             .map(|pane| {
+                let shown = sources.root();
                 let (root, nodes) = match pane.content {
                     PaneContent::Ir(ir) => {
-                        let (root, nodes) = build_node_table(ir, &pane.projection);
+                        let (root, nodes) = build_node_table(ir, &pane.projection, shown);
                         (Some(root), PaneNodes::Ir(nodes))
                     }
                     PaneContent::Operators(graph) => (
                         None,
-                        PaneNodes::Operators(build_operator_table(graph, &pane.projection)),
+                        PaneNodes::Operators(build_operator_table(graph, &pane.projection, shown)),
                     ),
                 };
                 PaneEntry {
@@ -1185,13 +1201,13 @@ mod tests {
         // 99-byte comprehension ahead of the 32-byte record it contains, so
         // `spans[0]` — the one a consumer renders — was the widest.
         assert_eq!(
-            wire_spans(&[span(435, 534), span(436, 468)]),
+            wire_spans(&[span(435, 534), span(436, 468)], file),
             vec![span(436, 468), span(435, 534)],
         );
 
         // Already narrowest-first is left alone.
         assert_eq!(
-            wire_spans(&[span(436, 468), span(435, 534)]),
+            wire_spans(&[span(436, 468), span(435, 534)], file),
             vec![span(436, 468), span(435, 534)],
         );
 
@@ -1199,33 +1215,32 @@ mod tests {
         // whatever order the union produced. `source_shared`'s one multi-span
         // operator node is this case.
         assert_eq!(
-            wire_spans(&[span(348, 355), span(305, 312)]),
+            wire_spans(&[span(348, 355), span(305, 312)], file),
             vec![span(305, 312), span(348, 355)],
         );
 
         // A repeated span is claimed once. The operator table omitted this too.
         assert_eq!(
-            wire_spans(&[span(10, 20), span(10, 20), span(1, 2)]),
+            wire_spans(&[span(10, 20), span(10, 20), span(1, 2)], file),
             vec![span(1, 2), span(10, 20)],
         );
 
         // Adjacent-after-sort is what `dedup` needs, so a duplicate separated
         // by a narrower span still collapses.
         assert_eq!(
-            wire_spans(&[span(10, 20), span(1, 2), span(10, 20)]),
+            wire_spans(&[span(10, 20), span(1, 2), span(10, 20)], file),
             vec![span(1, 2), span(10, 20)],
         );
 
-        assert_eq!(wire_spans(&[]), vec![]);
+        assert_eq!(wire_spans(&[], file), vec![]);
 
-        // Spans of one extent in two files: each ships once, in an order that
-        // does not depend on the union's.
+        // A span in another file, such as a std module's, does not ship.
         let mut sources = SourceMap::default();
         let a = sources.add("a.cambra", "x\n");
-        let b = sources.add("b.cambra", "x\n");
+        let b = sources.add("<std>/b.cambra", "x\n");
         let (in_a, in_b) = (Span::new(a, 0, 1), Span::new(b, 0, 1));
-        assert_eq!(wire_spans(&[in_a, in_b, in_a]), vec![in_a, in_b]);
-        assert_eq!(wire_spans(&[in_b, in_a]), vec![in_a, in_b]);
+        assert_eq!(wire_spans(&[in_a, in_b, in_a], a), vec![in_a]);
+        assert_eq!(wire_spans(&[in_b], a), vec![]);
     }
 
     /// A node's `spans` are exactly the spans its pane's projection records for
