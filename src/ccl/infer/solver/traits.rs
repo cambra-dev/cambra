@@ -2499,9 +2499,10 @@ impl TraitObligation {
             .any(|i| i.accepts_anything_at(pos))
     }
 
-    /// Narrow by a contribution at operand `pos` that names no head, a product, a function,
-    /// a variant or a type parameter, where a candidate takes any type there: the candidates
-    /// that do stay, and so do the assumptions stating that type there.
+    /// Narrow by a contribution at operand `pos` that names no head, where a candidate takes
+    /// any type there: the candidates that do stay, and so do the assumptions stating that type
+    /// there. Such a contribution is a product, a function, a variant, a type parameter, or a
+    /// family parameter applied to terms; `offer` decides which contributions reach this.
     fn narrow_to_variables(
         self: &Rc<Self>,
         pos: u8,
@@ -4645,10 +4646,11 @@ pub enum OperandFailure {
 
 /// What a bound contribution tells a trait about the position it landed on.
 ///
-/// `Unknown` narrows nothing. At an operand position, a `Product`, `NotABase` or `Param`
-/// contribution where a candidate takes any type ([`InstanceHead::Any`]) keeps those
-/// candidates and the assumptions stating that type (`TraitObligation::narrow_to_variables`).
-/// An argument position is narrowed by `TraitObligation::narrow_arg` instead.
+/// `offer` is the one place that picks the narrowing for a contribution. `Unknown` narrows
+/// nothing. At an operand position where a candidate takes any type ([`InstanceHead::Any`]), a
+/// `Product`, `NotABase`, `Param` or `Family` contribution keeps those candidates and the
+/// assumptions stating that type (`TraitObligation::narrow_to_variables`). An argument position
+/// is narrowed by `TraitObligation::narrow_arg` instead.
 pub enum Offered<'a> {
     /// A base leaf, with refinements peeled — the fact narrowing consumes.
     Base(&'a BaseType),
@@ -4670,7 +4672,11 @@ pub enum Offered<'a> {
     /// variant or a function.
     ///
     /// At an operand position where no candidate takes any type, the requirement fails here
-    /// (`TraitObligation::reject`) rather than going unresolved.
+    /// (`TraitObligation::reject`) rather than going unresolved. The exception is a data
+    /// function, which is a structural collection that [`offered`] maps to `NotABase`. For a
+    /// trait that [reads collections](Trait::reads_collections), `offer` sends a structural
+    /// collection to `TraitObligation::narrow_collection` before reading `offered`, and the
+    /// collection rule answers it there.
     NotABase,
     /// A type parameter, inside the definition that declares it. It supports what
     /// its bound supports, and nothing if it has none
