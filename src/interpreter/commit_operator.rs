@@ -4525,10 +4525,13 @@ struct FinalKeyConsumer {
 impl Consumer for FinalKeyConsumer {
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        landing.requiring_final_key(&self.key, |landing| self.downstream.notify(region, landing));
+        let region = &region.view();
+        landing.requiring_final_key(&self.key, |landing| {
+            self.downstream.notify_view(region, landing)
+        });
     }
 }
 

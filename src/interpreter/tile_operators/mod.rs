@@ -421,13 +421,14 @@ impl Consumer for RecordingConsumer {
     /// Delivered notifications record the region; planning probes leave it unchanged.
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
+        let region = &region.view();
         if landing.is_delivery() {
             self.arrivals.record(region);
         }
-        self.downstream.notify(region, landing);
+        self.downstream.notify_view(region, landing);
     }
 }
 
@@ -2376,11 +2377,12 @@ pub(crate) mod test_helpers {
     impl crate::interpreter::Consumer for Readers {
         fn notify(
             &self,
-            region: &Projection,
+            region: &TileGuard,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
+            let region = &region.view();
             for entry in &self.0 {
-                crate::interpreter::Consumer::notify(entry, region, landing);
+                crate::interpreter::Consumer::notify(entry, &region.region_guard(), landing);
             }
         }
     }
@@ -2803,7 +2805,8 @@ pub(crate) mod test_helpers {
     }
 
     impl super::Consumer for RegionLog {
-        fn notify(&self, region: &Projection, _: &mut crate::interpreter::dispatcher::Landing<'_>) {
+        fn notify(&self, region: &TileGuard, _: &mut crate::interpreter::dispatcher::Landing<'_>) {
+            let region = &region.view();
             self.regions
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)

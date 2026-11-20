@@ -479,11 +479,12 @@ impl Consumer for FanOutInput {
     /// mode, within its own pipeline.
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
+        let region = &region.view();
         for c in &self.reader_consumers() {
-            crate::interpreter::notifications::notify_shared(c, region, landing);
+            crate::interpreter::notifications::notify_shared(c, &region.region_guard(), landing);
         }
     }
 }
@@ -4199,7 +4200,7 @@ mod cycle_tests {
         let mut landing = Landing::probe(PipelineId(0));
         crate::interpreter::notifications::notify_shared(
             &own,
-            &Projection::Everything,
+            &Projection::Everything.region_guard(),
             &mut landing,
         );
         let reached: Vec<_> = landing

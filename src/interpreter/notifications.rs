@@ -4,7 +4,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
-use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing};
+use crate::interpreter::{
+    Consumer, DataSourceDomainExtentImpl, Projection, TileGuard, dispatcher::Landing,
+};
 
 // The shared consumers this thread is notifying, by address, which `notify_shared` checks a
 // notification against to find re-entry.
@@ -43,7 +45,7 @@ impl Drop for Notifying {
 /// notification. Two threads can notify one consumer at once.
 pub(crate) fn notify_shared<C: Consumer + ?Sized>(
     shared: &Arc<C>,
-    region: &Projection,
+    region: &TileGuard,
     landing: &mut Landing<'_>,
 ) {
     match Notifying::enter(shared) {
@@ -119,7 +121,8 @@ struct ThroughValues {
 }
 
 impl Consumer for ThroughValues {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         let already_whole = *region == Projection::Everything;
         let region = if landing.is_complete() {
             let guard = crate::interpreter::tiling::through_shared_levels(
@@ -132,9 +135,9 @@ impl Consumer for ThroughValues {
             region.above(self.level)
         };
         if !landing.is_complete() && !already_whole && region == Projection::Everything {
-            landing.widened(|landing| self.downstream.notify(&region, landing));
+            landing.widened(|landing| self.downstream.notify_view(&region, landing));
         } else {
-            self.downstream.notify(&region, landing);
+            self.downstream.notify_view(&region, landing);
         }
     }
 }
@@ -145,12 +148,15 @@ impl Consumer for Widening {
     /// A change widens to every key. A complete region passes as every key where its source is
     /// wholly complete, and not at all otherwise: each output key depends on every input key, so
     /// the path completes only part of what a row depends on.
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         landing.completing_part(|landing| match region {
-            Projection::Everything => self.0.notify(region, landing),
-            _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
+            Projection::Everything => self.0.notify_view(region, landing),
+            _ if landing.is_wholly_complete() => {
+                self.0.notify_view(&Projection::Everything, landing)
+            }
             _ if landing.is_complete() => {}
-            _ => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
+            _ => landing.widened(|landing| self.0.notify_view(&Projection::Everything, landing)),
         });
     }
 }
@@ -168,8 +174,9 @@ pub fn restating_lookup(
 struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.0.notify(region, landing));
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
+        landing.completing_part(|landing| self.0.notify_view(region, landing));
     }
 }
 
@@ -189,8 +196,9 @@ struct Restating(
 );
 
 impl Consumer for Restating {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        self.1.notify(&(self.0)(region), landing);
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
+        self.1.notify_view(&(self.0)(region), landing);
     }
 }
 
@@ -209,10 +217,11 @@ pub fn fielding(
 struct Fielding(smol_str::SmolStr, Vec<smol_str::SmolStr>, Box<dyn Consumer>);
 
 impl Consumer for Fielding {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         if *region != Projection::Nothing {
             let record = Projection::of_field(&self.0, region.clone()).over_fields(&self.1);
-            self.2.notify(&record, landing);
+            self.2.notify_view(&record, landing);
         }
     }
 }
@@ -228,10 +237,11 @@ pub fn selecting_field(name: smol_str::SmolStr, consumer: Box<dyn Consumer>) -> 
 struct SelectingField(smol_str::SmolStr, Box<dyn Consumer>);
 
 impl Consumer for SelectingField {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         let field = region.field(&self.0);
         if field != Projection::Nothing {
-            self.1.notify(&field, landing);
+            self.1.notify_view(&field, landing);
         }
     }
 }
@@ -246,8 +256,9 @@ pub fn tagging(tag: FieldKey, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> 
 struct Tagging(FieldKey, Box<dyn Consumer>);
 
 impl Consumer for Tagging {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        self.1.notify(&region.tagged(&self.0), landing);
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
+        self.1.notify_view(&region.tagged(&self.0), landing);
     }
 }
 
@@ -261,7 +272,7 @@ struct Forwarding {
 impl Consumer for Forwarding {
     /// A push is passed on at once. A push climbs from one breaker to the next, so
     /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
         notify_shared(&self.shared, region, landing);
     }
 }
@@ -300,18 +311,17 @@ impl OneLevelIn {
             match region {
                 Projection::Keys { level, .. } if *level >= self.at => {
                     if landing.is_wholly_complete() {
-                        self.consumer.notify(&Projection::Everything, landing);
+                        self.consumer.notify_view(&Projection::Everything, landing);
                     }
                 }
-                standing => self.consumer.notify(standing, landing),
+                standing => self.consumer.notify_view(standing, landing),
             }
             return;
         }
         match self.restated(region) {
-            Some(restated) => self.consumer.notify(&restated, landing),
-            None => {
-                landing.widened(|landing| self.consumer.notify(&Projection::Everything, landing))
-            }
+            Some(restated) => self.consumer.notify_view(&restated, landing),
+            None => landing
+                .widened(|landing| self.consumer.notify_view(&Projection::Everything, landing)),
         }
     }
 }
@@ -321,7 +331,8 @@ impl Consumer for OneLevelIn {
     /// level `at` passes as every key where its source is wholly complete, and not at all
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries, so the path completes only part of what a row depends on.
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         landing.completing_part(|landing| self.pass_on(region, landing));
     }
 }
@@ -371,17 +382,17 @@ mod tests {
         use crate::interpreter::{BaseType, Extent, Tiling};
         struct Entry;
         impl Consumer for Entry {
-            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
+            fn notify(&self, _: &TileGuard, landing: &mut Landing<'_>) {
                 landing.queue(
                     PipelineId(0),
-                    &crate::interpreter::TileGuard::Scalar(crate::interpreter::Predicate::True),
+                    &TileGuard::Scalar(crate::interpreter::Predicate::True),
                 );
             }
         }
         let output = Tiling::Scalar(Extent::Base(BaseType::Int));
         let consumer = through_values(CurryLevel::OUTERMOST, &output, Box::new(Entry));
         let mut landing = Landing::route();
-        consumer.notify(
+        consumer.notify_view(
             &Projection::admitting(crate::interpreter::Predicate::point(
                 crate::interpreter::Value::UInt(0),
             )),
@@ -402,7 +413,7 @@ mod tests {
         use crate::interpreter::{BaseType, Extent, Predicate, TileGuard, Tiling, Value};
         struct Entry;
         impl Consumer for Entry {
-            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
+            fn notify(&self, _: &TileGuard, landing: &mut Landing<'_>) {
                 landing.queue(PipelineId(0), &TileGuard::Scalar(Predicate::True));
             }
         }
@@ -414,7 +425,7 @@ mod tests {
         let consumer = through_values(CurryLevel::new(1), &output, Box::new(Entry));
         let keeps = |region: Projection| {
             let mut landing = Landing::route();
-            consumer.notify(&region, &mut landing);
+            consumer.notify_view(&region, &mut landing);
             let routes = landing.routes();
             assert_eq!(routes.len(), 1, "{region:?}");
             routes[0].keeps_keys
@@ -432,7 +443,8 @@ mod tests {
         use crate::interpreter::{BaseType, Extent, Predicate, Tiling, Value};
         struct Received(Arc<RwLock<Vec<Projection>>>);
         impl Consumer for Received {
-            fn notify(&self, region: &Projection, _: &mut Landing<'_>) {
+            fn notify(&self, region: &TileGuard, _: &mut Landing<'_>) {
+                let region = &region.view();
                 self.0
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -454,13 +466,13 @@ mod tests {
             CurryLevel::new(1),
             Predicate::qualified(row.clone(), Predicate::point(Value::UInt(7))),
         );
-        consumer.notify(&part, &mut Landing::probe(PipelineId(0)));
-        consumer.notify(&part, &mut Landing::probe_complete(PipelineId(0)));
+        consumer.notify_view(&part, &mut Landing::probe(PipelineId(0)));
+        consumer.notify_view(&part, &mut Landing::probe_complete(PipelineId(0)));
         let whole = Projection::keys_at(
             CurryLevel::new(1),
             Predicate::qualified(row.clone(), Predicate::True),
         );
-        consumer.notify(&whole, &mut Landing::probe_complete(PipelineId(0)));
+        consumer.notify_view(&whole, &mut Landing::probe_complete(PipelineId(0)));
         let outer = Projection::admitting(row);
         assert_eq!(
             *received.read().unwrap_or_else(PoisonError::into_inner),

@@ -2219,7 +2219,11 @@ impl Dispatcher {
             return;
         };
         let mut landing = Landing::new(Target::Change { dispatcher: self }, pipeline);
-        crate::interpreter::notifications::notify_shared(to, &Projection::Everything, &mut landing);
+        crate::interpreter::notifications::notify_shared(
+            to,
+            &Projection::Everything.region_guard(),
+            &mut landing,
+        );
     }
 
     /// Push `complete`, the region of its keys `pipeline`'s breaker has completed, through `to`, its
@@ -2280,7 +2284,11 @@ impl Dispatcher {
             },
             pipeline,
         );
-        crate::interpreter::notifications::notify_shared(to, complete, &mut landing);
+        crate::interpreter::notifications::notify_shared(
+            to,
+            &complete.region_guard(),
+            &mut landing,
+        );
         let Target::Completion { reached, .. } = landing.target else {
             unreachable!("a complete landing stays one");
         };
@@ -2334,7 +2342,11 @@ impl Dispatcher {
                             "pipeline {pipeline} pushes regions of its keys: {why}"
                         ))
                     });
-                    crate::interpreter::notifications::notify_shared(to, &region, &mut landing);
+                    crate::interpreter::notifications::notify_shared(
+                        to,
+                        &region.region_guard(),
+                        &mut landing,
+                    );
                 }
             }
             // A test's push ([`Pushes::push`]) names no consumer and lands in each reader as it is.
@@ -3207,7 +3219,8 @@ pub(crate) fn is_in_a_run() -> bool {
 }
 
 impl Consumer for Entry {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         if let Some(pipeline) = self.pipeline.get()
             && landing.accepts_entry(pipeline)
         {
@@ -3218,7 +3231,7 @@ impl Consumer for Entry {
         }
         if self.pipeline.get().is_none() && landing.is_delivery() && !landing.is_complete() {
             if let Some(inline) = &self.inline {
-                inline.notify(region, landing);
+                inline.notify_view(region, landing);
             }
             return;
         }
@@ -3556,7 +3569,7 @@ pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &C, region: &Proje
         },
         0,
     );
-    consumer.notify(region, &mut landing);
+    consumer.notify_view(region, &mut landing);
 }
 
 /// Each pipeline's breaker, reached for one call at a time: through a handle ([`handles`]), or by

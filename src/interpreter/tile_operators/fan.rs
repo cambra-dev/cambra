@@ -1383,7 +1383,7 @@ mod nested_projection_tests {
             let mut landing = crate::interpreter::dispatcher::Landing::probe_complete(
                 crate::interpreter::dispatcher::PipelineId(0),
             );
-            subscribed(consumer).notify(region, &mut landing);
+            subscribed(consumer).notify_view(region, &mut landing);
         };
         regions
             .write()

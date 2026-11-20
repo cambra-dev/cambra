@@ -599,7 +599,11 @@ impl InductionStoreProducer {
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
         let mut landing = Landing::probe(self.pipeline(drive));
-        crate::interpreter::notifications::notify_shared(&consumer, &region, &mut landing);
+        crate::interpreter::notifications::notify_shared(
+            &consumer,
+            &region.region_guard(),
+            &mut landing,
+        );
         let arrivals = landing.arrivals();
         readers
             .iter()

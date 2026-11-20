@@ -1605,10 +1605,11 @@ struct Boxed(Box<dyn Consumer>);
 impl Consumer for Boxed {
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.0.notify(region, landing);
+        let region = &region.view();
+        self.0.notify_view(region, landing);
     }
 }
 
@@ -1752,11 +1753,12 @@ struct Paths(Vec<Box<dyn Consumer>>);
 impl Consumer for Paths {
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
+        let region = &region.view();
         for path in &self.0 {
-            path.notify(region, landing);
+            path.notify_view(region, landing);
         }
     }
 }
@@ -1764,7 +1766,7 @@ impl Consumer for Paths {
 /// The routes a push of key 0 takes through `consumer` ([`Landing::route`]).
 fn walk(consumer: &dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
     let mut landing = crate::interpreter::dispatcher::Landing::route();
-    consumer.notify(
+    consumer.notify_view(
         &Projection::admitting(Predicate::point(Value::UInt(0))),
         &mut landing,
     );
@@ -1797,12 +1799,13 @@ struct WidensDeliveries(Box<dyn Consumer>);
 impl Consumer for WidensDeliveries {
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
+        let region = &region.view();
         match landing.is_delivery() {
-            true => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
-            false => self.0.notify(region, landing),
+            true => landing.widened(|landing| self.0.notify_view(&Projection::Everything, landing)),
+            false => self.0.notify_view(region, landing),
         }
     }
 }
@@ -2039,16 +2042,17 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
     impl Consumer for Cycle {
         fn notify(
             &self,
-            region: &Projection,
+            region: &TileGuard,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
+            let region = &region.view();
             let back = self
                 .0
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             if let Some(back) = back {
-                back.notify(region, landing);
+                back.notify_view(region, landing);
             }
         }
     }
@@ -2123,10 +2127,11 @@ struct Through(test_helpers::InputConsumer);
 impl Consumer for Through {
     fn notify(
         &self,
-        region: &Projection,
+        region: &TileGuard,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        test_helpers::subscribed(&self.0).notify(region, landing);
+        let region = &region.view();
+        test_helpers::subscribed(&self.0).notify_view(region, landing);
     }
 }
 

@@ -63,19 +63,28 @@ pub trait Consumer: Send + Sync {
     ///
     /// It takes `&self`, so delivery takes no lock on the consumer: state it records sits behind
     /// its own lock or atomic, released before it notifies another consumer.
-    fn notify(&self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
+    ///
+    /// The region is a guard of the notifying producer's output in the spelling no tiling is
+    /// needed for ([`Projection::region_guard`]): a guard of keys, a record guard of fields, the
+    /// domain guard admitting every key for everything.
+    fn notify(&self, _region: &TileGuard, _landing: &mut dispatcher::Landing<'_>) {}
+
+    /// [`notify`](Self::notify) of the region a projection names.
+    fn notify_view(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        self.notify(&region.region_guard(), landing)
+    }
 }
 
 /// A shared consumer is one. Each notification passes the re-entry check ([`notify_shared`]).
 impl<C: Consumer + ?Sized> Consumer for Arc<C> {
-    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut dispatcher::Landing<'_>) {
         notify_shared(self, region, landing)
     }
 }
 
 /// A boxed consumer is one, so it can be shared as a [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
-    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut dispatcher::Landing<'_>) {
         (**self).notify(region, landing)
     }
 }
@@ -83,7 +92,7 @@ impl Consumer for Box<dyn Consumer> {
 /// Blanket implementation: Fn() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
 impl<F: Fn() + Send + Sync> Consumer for F {
-    fn notify(&self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
+    fn notify(&self, _: &TileGuard, landing: &mut dispatcher::Landing<'_>) {
         if landing.is_delivery() {
             self()
         }

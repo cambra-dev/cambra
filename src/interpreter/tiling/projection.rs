@@ -841,6 +841,62 @@ impl TileGuard {
     }
 }
 
+impl TileGuard {
+    /// The projection this guard of a notified region names, the view a restating consumer reads
+    /// it through.
+    ///
+    /// # Panics
+    ///
+    /// For a guard no projection spells: a consumer that restates a region has a restatement only
+    /// of the regions a projection names.
+    ///
+    /// A record guard names the fields it lists and nothing of any other, since a notified region
+    /// carries no field list ([`Projection::region_guard`]), so it is read field by field even
+    /// where every field it lists is whole.
+    pub(crate) fn view(&self) -> Projection {
+        if let TileGuard::Record(fields) = self {
+            return Projection::fields(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.view()))
+                    .collect(),
+                Projection::Nothing,
+            );
+        }
+        Projection::of(self).unwrap_or_else(|why| panic!("a notified region: {why}"))
+    }
+}
+
+impl Projection {
+    /// The guard of this region in the spelling no tiling is needed for, which a notification
+    /// carries: everything as the domain guard admitting every key, nothing as the one admitting
+    /// none, keys as [`collection_guard`](Self::collection_guard) spells them, and fields as a
+    /// record guard of the fields listed.
+    ///
+    /// # Panics
+    ///
+    /// For a projection of fields whose `rest` names some field: without the record's field list
+    /// no record guard names the fields it does not list.
+    pub(crate) fn region_guard(&self) -> TileGuard {
+        match self {
+            Projection::Fields { fields, rest } => {
+                assert!(
+                    **rest == Projection::Nothing,
+                    "{self:?} names fields it does not list, which no guard spells without the \
+                     record's fields"
+                );
+                TileGuard::Record(
+                    fields
+                        .iter()
+                        .map(|(name, field)| (name.clone(), field.region_guard()))
+                        .collect(),
+                )
+            }
+            keys => keys.collection_guard(),
+        }
+    }
+}
+
 impl Tile {
     /// Keep the outermost collection's keys that `keys` admits, each with the value under it,
     /// and state complete only the region the predicate names.

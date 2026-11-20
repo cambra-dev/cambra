@@ -2172,7 +2172,11 @@ pub(super) fn routes_to(
 ) -> Vec<Route> {
     let mut landing = Landing::route();
     for region in regions {
-        crate::interpreter::notifications::notify_shared(consumer, region, &mut landing);
+        crate::interpreter::notifications::notify_shared(
+            consumer,
+            &region.region_guard(),
+            &mut landing,
+        );
     }
     landing
         .routes()
@@ -2217,7 +2221,11 @@ pub(super) fn complete_routes_to(
             .iter()
             .chain(whole.then_some(&Projection::Everything))
         {
-            crate::interpreter::notifications::notify_shared(consumer, region, &mut landing);
+            crate::interpreter::notifications::notify_shared(
+                consumer,
+                &region.region_guard(),
+                &mut landing,
+            );
         }
         routes.extend(landing.routes());
     }
@@ -2233,7 +2241,11 @@ pub(super) fn probe(
     reader: usize,
 ) -> Vec<Arrival> {
     let mut landing = Landing::probe(from);
-    crate::interpreter::notifications::notify_shared(consumer, region, &mut landing);
+    crate::interpreter::notifications::notify_shared(
+        consumer,
+        &region.region_guard(),
+        &mut landing,
+    );
     landing
         .arrivals()
         .into_iter()
@@ -2251,7 +2263,7 @@ pub(super) fn complete_reach(
     let mut landing = Landing::probe_complete(from);
     crate::interpreter::notifications::notify_shared(
         consumer,
-        &Projection::Everything,
+        &Projection::Everything.region_guard(),
         &mut landing,
     );
     landing

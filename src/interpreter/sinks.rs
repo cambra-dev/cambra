@@ -4,7 +4,6 @@
 //! and are used by [`crate::ccl::context`] to wire compiled sink operators into
 //! dispatcher runs.
 
-use crate::interpreter::Projection;
 use std::sync::PoisonError;
 use std::sync::RwLock;
 use std::sync::{
@@ -13,7 +12,9 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 
-use crate::interpreter::{Consumer, DataSink, Predicate, Tile, tile_operators::TileProducer};
+use crate::interpreter::{
+    Consumer, DataSink, Predicate, Tile, TileGuard, tile_operators::TileProducer,
+};
 use crate::interpreter::{
     dispatcher::{Landing, PipelineId, pushed_guard},
     tile_operators::Tiling,
@@ -165,7 +166,8 @@ impl SinkConsumer {
 
 impl Consumer for SinkConsumer {
     /// Cache invalidation executes no sink; output delivery is scheduled by `notify`.
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+    fn notify(&self, region: &TileGuard, landing: &mut Landing<'_>) {
+        let region = &region.view();
         let queued = match &*self.placed.read().unwrap_or_else(PoisonError::into_inner) {
             Some((pipeline, input)) => pushed_guard(region, input).map(|guard| (*pipeline, guard)),
             None => None,
