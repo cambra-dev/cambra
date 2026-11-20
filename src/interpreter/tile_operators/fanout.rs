@@ -1297,15 +1297,15 @@ impl TileProducer for FanOutProducer {
     }
 
     /// A cyclic fan-out reads its input whole ([`get_impl`](Self::get_impl)); any other pulls
-    /// it at the level it is pulled at.
+    /// it at the nearest level at or above the one it is pulled at that the input restates.
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        let cyclic = self
-            .shared()
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .reentrancy
-            .is_some();
-        (!cyclic).then_some(level)
+        let shared = self.shared();
+        let shared = shared.read().unwrap_or_else(PoisonError::into_inner);
+        match (&shared.reentrancy, &shared.producer) {
+            (Some(_), _) => None,
+            (None, Some(Inner::Owned(producer))) => Some(producer.restates().nearest(level)),
+            (None, _) => Some(level),
+        }
     }
 
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
@@ -1376,7 +1376,13 @@ impl TileProducer for FanOutProducer {
                 .as_ref()
                 .expect("a pulled slot is subscribed")
             {
-                Inner::Owned(producer) => producer.get(projection_guard),
+                // The input is pulled at the nearest keys at or above the projection that it
+                // restates, and the answer is cut to the projection below.
+                Inner::Owned(producer) => producer.get(
+                    projection
+                        .restated_by(&producer.restates())
+                        .guard(producer.tiling()),
+                ),
                 Inner::Store(_) => unreachable!("matched above"),
             },
         };
