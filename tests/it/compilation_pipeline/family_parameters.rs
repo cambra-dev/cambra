@@ -932,11 +932,6 @@ fn a_functions_family_parameter_errors_name_what_is_wrong() {
     }
 }
 
-/// TODO(peeled-family-join): wrong diagnosis; the error should read `inferred as K |=> K |=> Int`.
-/// This is the bug that
-/// `a_join_of_family_values_does_not_retain_one_keys_type_through_an_annotated_statement` pins.
-/// A-normalization peels the temporaries of `pick`'s body onto the spine ahead of its result
-/// annotation.
 #[test]
 fn a_join_of_family_values_does_not_retain_one_keys_type() {
     check_compile_error(
@@ -945,16 +940,12 @@ fn a_join_of_family_values_does_not_retain_one_keys_type() {
                 [[(g1 if c else g2) for g2 in g] for g1 in g]
             pick([1, 2], 1 > 0)
         "},
-        "Unsupported: a value that is one type for every `k`, related to a type that reads `k`, \
-         is not compiled yet",
+        "inferred as K |=> K |=> Int",
     );
 }
 
-/// TODO(peeled-family-join): wrong diagnosis. The join's type is `K ⤇ K ⤇ Int`, which does not
-/// meet `r`'s annotation, and the error should report that as `inferred as K |=> K |=> Int`.
-/// The annotated statement continues past its binder, so A-normalization peels its definiens's
-/// temporaries onto the spine ahead of it. With them peeled, inference reports the annotation as
-/// unsupported instead.
+/// `a_join_of_family_values_does_not_retain_one_keys_type` with the join bound by an annotated
+/// statement that continues past its binder.
 #[test]
 fn a_join_of_family_values_does_not_retain_one_keys_type_through_an_annotated_statement() {
     check_compile_error(
@@ -965,8 +956,7 @@ fn a_join_of_family_values_does_not_retain_one_keys_type_through_an_annotated_st
                 s
             pick([1, 2], 1 > 0)
         "},
-        "Unsupported: a value that is one type for every `k`, related to a type that reads `k`, \
-         is not compiled yet",
+        "inferred as K |=> K |=> Int",
     );
 }
 
@@ -1432,16 +1422,11 @@ fn an_inherited_quantified_requirement_passes_through_two_generic_definitions() 
 
 /// A def relying on its parameter type's family bound, inherited or restated, calls another
 /// twice, and each call specializes the callee at the groups' inner collections.
-///
-/// TODO(peeled-family-specialization): false rejection; the program computes 12. This is the bug
-/// `a_family_bound_passes_through_three_generic_definitions_through_an_annotated_statement` pins.
-/// A-normalization peels the temporaries of `total`'s body onto the spine ahead of its `=> Int`
-/// result annotation.
 #[rstest]
 #[case::inherited("")]
 #[case::restated(" requires forall (k: K) V(k) <: _ |=> Int")]
 fn an_inherited_family_bound_passes_through_two_generic_definitions(#[case] clause: &str) {
-    check_compile_error(
+    check_scalar(
         &formatdoc! {"
             {BOUNDED_GROUPS}
             def total(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
@@ -1450,22 +1435,19 @@ fn an_inherited_family_bound_passes_through_two_generic_definitions(#[case] clau
                 total(gs) + total(gs)
             twice(Groups::new([box([1, 2]), box([3])]))
         "},
-        "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
+        Value::Int(12),
     );
 }
 
 /// `an_inherited_family_bound_passes_through_two_generic_definitions` with `total`'s result
 /// bound by an annotated statement.
-///
-/// TODO(peeled-family-specialization): false rejection; the program computes 12. This is the bug
-/// `a_family_bound_passes_through_three_generic_definitions_through_an_annotated_statement` pins.
 #[rstest]
 #[case::inherited("")]
 #[case::restated(" requires forall (k: K) V(k) <: _ |=> Int")]
 fn an_inherited_family_bound_passes_through_two_generic_definitions_through_an_annotated_statement(
     #[case] clause: &str,
 ) {
-    check_compile_error(
+    check_scalar(
         &formatdoc! {"
             {BOUNDED_GROUPS}
             def total(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
@@ -1475,7 +1457,7 @@ fn an_inherited_family_bound_passes_through_two_generic_definitions_through_an_a
                 total(gs) + total(gs)
             twice(Groups::new([box([1, 2]), box([3])]))
         "},
-        "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
+        Value::Int(12),
     );
 }
 
@@ -1522,14 +1504,10 @@ fn a_nominal_type_declaration_refuses_a_context_requirement() {
     );
 }
 
-/// TODO(peeled-family-specialization): false rejection; the program computes 24. This is the bug
-/// `a_family_bound_passes_through_three_generic_definitions_through_an_annotated_statement` pins.
-/// A-normalization peels the temporaries of `total`'s body onto the spine ahead of its `=> Int`
-/// result annotation.
 #[rstest]
 #[timeout(Duration::from_secs(15))]
 fn a_family_bound_passes_through_three_generic_definitions() {
-    check_compile_error(
+    check_scalar(
         indoc! {"
             def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) V(k) <: _ |=> Int:
                 sum([sum([x for x in grp]) for grp in g])
@@ -1539,20 +1517,16 @@ fn a_family_bound_passes_through_three_generic_definitions() {
                 twice(g) + twice(g)
             four([box([1, 2]), box([3])])
         "},
-        "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
+        Value::Int(24),
     );
 }
 
-/// TODO(peeled-family-specialization): false rejection; the program computes 24. `total`'s
-/// annotated statement continues past its binder, so A-normalization peels its definiens's
-/// temporaries onto the spine ahead of it. Specializing `four` at its call then fails the pin of
-/// the clone below the use (`specialize_use` in `src/ccl/infer/solve.rs`). In `four`'s clone, one
-/// data-domain variable holds a different witness binder from each `twice` call, and the
-/// argument's witness cannot equal both.
+/// `a_family_bound_passes_through_three_generic_definitions` with `total`'s result bound by an
+/// annotated statement.
 #[rstest]
 #[timeout(Duration::from_secs(15))]
 fn a_family_bound_passes_through_three_generic_definitions_through_an_annotated_statement() {
-    check_compile_error(
+    check_scalar(
         indoc! {"
             def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) V(k) <: _ |=> Int:
                 s: Int = sum([sum([x for x in grp]) for grp in g])
@@ -1563,7 +1537,7 @@ fn a_family_bound_passes_through_three_generic_definitions_through_an_annotated_
                 twice(g) + twice(g)
             four([box([1, 2]), box([3])])
         "},
-        "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
+        Value::Int(24),
     );
 }
 
