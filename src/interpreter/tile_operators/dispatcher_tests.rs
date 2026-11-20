@@ -1809,11 +1809,14 @@ impl Consumer for WidensDeliveries {
 
 /// Pipeline 1 reading pipeline 0, with the routes the planner walks of `walked` for a push of key
 /// 0 planned as pipeline 0's ([`walk_routes`](crate::interpreter::dispatcher::walk_routes)), and
-/// pipeline 0's breaker pushing `held` through `pushed` once it finishes. With `waits`, pipeline 1
-/// waits for its inputs, so it takes a widened push.
+/// pipeline 0's breaker pushing `held` once it finishes: through `pushed`, or through `walked`
+/// itself, as a planner walks the consumer a push climbs. A route names the consumers on it that
+/// complete part of a row by address ([`PartPath`](crate::interpreter::dispatcher::PartPath)), so
+/// only a push through the walked consumer itself takes a walked route that has one. With
+/// `waits`, pipeline 1 waits for its inputs, so it takes a widened push.
 fn planned_through(
     walked: Box<dyn Consumer>,
-    pushed: Box<dyn Consumer>,
+    pushed: Option<Box<dyn Consumer>>,
     held: TileGuard,
     waits: bool,
 ) -> Dispatcher {
@@ -1833,7 +1836,10 @@ fn planned_through(
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(Boxed(pushed)));
+        .pushing_to(match pushed {
+            Some(pushed) => Arc::new(Boxed(pushed)),
+            None => walked,
+        });
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
             .write()
@@ -1850,7 +1856,7 @@ fn a_push_lands_along_the_route_its_planner_walked() {
     let shared = gated_entry(&ints());
     let dispatcher = planned_through(
         forwarding_consumer_keeping_keys(&shared),
-        forwarding_consumer_keeping_keys(&shared),
+        None,
         keys_between(0, 1),
         false,
     );
@@ -1867,7 +1873,7 @@ fn a_push_of_every_key_lands_unwidened_through_a_widening() {
     let shared = gated_entry(&ints());
     let dispatcher = planned_through(
         forwarding_consumer(&shared),
-        forwarding_consumer(&shared),
+        None,
         ints().universal_guard(),
         false,
     );
@@ -1889,7 +1895,7 @@ fn a_push_along_a_route_its_planner_did_not_walk_fails_the_run() {
     let shared = gated_entry(&ints());
     planned_through(
         Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
-        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
+        None,
         keys_between(0, 1),
         true,
     );
@@ -1906,7 +1912,7 @@ fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
     let shared = gated_entry(&ints());
     planned_through(
         Box::new(|| {}),
-        forwarding_consumer_keeping_keys(&shared),
+        Some(forwarding_consumer_keeping_keys(&shared)),
         keys_between(0, 1),
         false,
     );
@@ -1929,80 +1935,63 @@ fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
     ]);
     let parts: Vec<_> = walk(&paths)
         .into_iter()
-        .map(|route| route.completes_part)
+        .map(|route| !route.part_path.is_empty())
         .collect();
     assert_eq!(parts, [true, false, true]);
 }
 
-/// A read that reaches its reader along a path that drops a decided region and one that keeps it
-/// decides the reader's input only once it is whole: a row reached along both depends on rows the
-/// region does not name. Its decided push of some keys records nothing, where the same push of a
-/// read with no such mark records those keys.
+/// Pipeline 1 reading pipeline 0 along a widening path and a path that keeps keys, each planned
+/// as its own part path ([`Dispatcher::completes_along`]), after pipeline 0's breaker pushes `held`
+/// as complete through both.
 #[cfg(debug_assertions)]
-#[test]
-fn a_read_decided_only_whole_records_no_part() {
-    use crate::interpreter::dispatcher::Completion;
-    let recorded = |whole_only: bool| {
-        let scripted = Scripted::holding(keys_between(0, 1));
-        let shared = gated_entry(&ints());
-
-        let paths = vec![
-            forwarding_consumer(&shared),
-            forwarding_consumer_keeping_keys(&shared),
-        ];
-        scripted
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .base_mut()
-            .pushing_to(Arc::new(Paths(paths)));
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-        dispatcher.wait_for_inputs(PipelineId(1));
-        if whole_only {
-            dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
-        }
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-            scripted
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .finish(InputId::ONLY, pushes)
-        });
-        dispatcher.complete_of(PipelineId(1), PipelineId(0))
-    };
-    assert!(matches!(recorded(true), Completion::Nothing));
-    assert!(matches!(recorded(false), Completion::Region(_)));
-}
-
-/// A read decided only whole still records its whole push: once the pipeline it reads has decided
-/// everything, each path's region is decided, whatever it was restated to on the way.
-#[cfg(debug_assertions)]
-#[test]
-fn a_read_decided_only_whole_records_its_whole_push() {
-    use crate::interpreter::dispatcher::Completion;
-    let scripted = Scripted::holding(ints().universal_guard());
+fn completed_along_two_paths(held: TileGuard) -> Dispatcher {
+    let scripted = Scripted::holding(held);
     let shared = gated_entry(&ints());
-
-    let paths = vec![
+    let paths: SharedConsumer = Arc::new(Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
-    ];
+    ]));
     scripted
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(Arc::new(Paths(paths)));
+        .pushing_to(paths.clone());
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.wait_for_inputs(PipelineId(1));
-    dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
+    for route in walk(&*paths) {
+        dispatcher.completes_along(PipelineId(1), PipelineId(0), route.part_path, None);
+    }
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .finish(InputId::ONLY, pushes)
     });
+    dispatcher
+}
+
+/// A read that reaches its reader along a widening path and a path that keeps keys completes a row
+/// once both paths have: the widening path names nothing complete until its pipeline has completed
+/// every key, so a complete push of some keys completes no row, though the path that keeps keys
+/// records them.
+#[cfg(debug_assertions)]
+#[test]
+fn a_read_along_a_widening_and_a_keeping_path_completes_no_row_of_a_part() {
+    let dispatcher = completed_along_two_paths(keys_between(0, 1));
+    assert!(!dispatcher.input_complete(PipelineId(1), &keys_between(0, 0)));
     assert!(matches!(
         dispatcher.complete_of(PipelineId(1), PipelineId(0)),
-        Completion::Whole
+        crate::interpreter::dispatcher::Completion::Region(_)
     ));
+}
+
+/// Once the pipeline it reads has completed every key, each path's region is complete, whatever
+/// it was restated to on the way, so every row is.
+#[cfg(debug_assertions)]
+#[test]
+fn a_read_along_a_widening_and_a_keeping_path_completes_every_row_once_whole() {
+    let dispatcher = completed_along_two_paths(ints().universal_guard());
+    assert!(dispatcher.input_complete(PipelineId(1), &ints().universal_guard()));
 }
 
 /// A push widened to `Everything` on its way fails the run, since the reader could not tell which

@@ -367,8 +367,14 @@ struct PipelineInfo {
     /// it ([`reaches`](Dispatcher::reaches)).
     reach: Vec<Option<TileGuard>>,
     /// Per pipeline it reads, in the order of its `reads`, whether it completes the input only once
-    /// it is whole ([`completes_whole_only`](Dispatcher::completes_whole_only)).
+    /// it is whole: a read whose completed keys a lookup requires
+    /// ([`require_final_keys`](Dispatcher::require_final_keys)).
     whole_only: Vec<bool>,
+    /// Per read that reaches this pipeline along paths with different part paths, each such path
+    /// and the region of the input it reaches, `None` where it reaches all of it
+    /// ([`completes_along`](Dispatcher::completes_along)). A read with no entry here keeps one
+    /// record of what it completes, whatever path it took.
+    part_paths: Vec<(usize, PartPath, Option<TileGuard>)>,
     required_keys: Vec<Vec<Value>>,
     /// Per pipeline it reads, in the order of its `reads`, the routes a push of that pipeline
     /// takes to its entry, as the planner walked them through the pusher's consumer
@@ -383,9 +389,18 @@ struct PipelineInfo {
 /// to the entry it reaches.
 struct PathMarks {
     widened: bool,
-    completes_part: bool,
+    part_path: PartPath,
     final_key: Option<Value>,
 }
+
+/// The consumers on a push's path that pass a complete region on as part of what a row they reach
+/// depends on, in the order the push climbs them, each by its address
+/// ([`Landing::completing_part`]). Empty for a path whose complete region a row depends on whole.
+///
+/// A read reaching one reader along paths with different part paths completes a row only once
+/// every one of them has: each path's complete region decides its own part of the row, and the
+/// reader joins them ([`Dispatcher::completes_along`]).
+pub(crate) type PartPath = Vec<usize>;
 
 /// The routes a push of one pipeline takes to a reader's entry, as [`Dispatcher::plan_routes`]
 /// records them: those of a change, and those of a complete region.
@@ -424,6 +439,12 @@ struct PipelineState {
     // shared-state-ok: guards naming regions of the pipeline's input, which the complete pushes
     // of its sources grow under the lock; never a tile.
     complete: Mutex<Vec<Completion>>,
+    /// Per read with paths of different part paths ([`PipelineInfo::part_paths`]), what each of
+    /// those paths has completed of the input, by the read's position in `reads`. Locked after
+    /// `complete` where both are.
+    // shared-state-ok: guards naming regions of the pipeline's input, as `complete` holds; never a
+    // tile.
+    part_complete: Mutex<Vec<(usize, PartPath, TileGuard)>>,
     /// How many of the pipeline's packages have been acknowledged.
     acknowledged: AtomicUsize,
     /// Whether this pipeline waits for its loop's round to settle before following its reads, in
@@ -475,6 +496,7 @@ impl PipelineState {
             unfinished: AtomicUsize::new(reads),
             pushed: Mutex::new(None),
             complete: Mutex::new(Vec::new()),
+            part_complete: Mutex::new(Vec::new()),
             acknowledged: AtomicUsize::new(0),
             followers_hold: AtomicU64::new(0),
             held: AtomicBool::new(false),
@@ -597,6 +619,7 @@ impl Dispatcher {
                 opens: false,
                 reach: Vec::new(),
                 whole_only: Vec::new(),
+                part_paths: Vec::new(),
                 required_keys: Vec::new(),
                 routes: None,
                 ingress: None,
@@ -695,6 +718,7 @@ impl Dispatcher {
             opens: false,
             reach: Vec::new(),
             whole_only: Vec::new(),
+            part_paths: Vec::new(),
             required_keys: Vec::new(),
             routes: None,
             ingress: None,
@@ -919,27 +943,6 @@ impl Dispatcher {
         self.infos[pipeline.0].opens = true;
     }
 
-    /// Record that `read`, a pipeline `reader` reads, completes `reader`'s input only once it is
-    /// whole: one path from it completes only part of what a row depends on, and another passes a
-    /// complete region on ([`Landing::completing_part`]), so the union of what they pass names rows
-    /// the other path has not completed. A complete push of it that is not whole records nothing.
-    ///
-    /// # Panics
-    ///
-    /// When `reader` does not read `read`.
-    pub fn completes_whole_only(&mut self, reader: PipelineId, read: PipelineId) {
-        let info = &mut self.infos[reader.0];
-        let at = info
-            .reads
-            .iter()
-            .position(|&r| r == read.0)
-            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
-        if info.whole_only.len() < info.reads.len() {
-            info.whole_only.resize(info.reads.len(), false);
-        }
-        info.whole_only[at] = true;
-    }
-
     /// Whether `source`'s complete push of `guard`, `None` where it is whole, reaches `reader`
     /// around a store's recurrence, which is no read and records nothing: a store's complete push
     /// reaches its own pipelines, and a pipeline of a store reads a sibling only for its seed
@@ -1009,7 +1012,7 @@ impl Dispatcher {
             false => &routes[at].changes,
         };
         routes.iter().any(|route| {
-            route.completes_part == marked.completes_part
+            route.part_path == marked.part_path
                 && route.final_key == marked.final_key
                 && (complete || route.keeps_keys != marked.widened)
         })
@@ -1021,11 +1024,11 @@ impl Dispatcher {
         self.ensure(self.planned_route(from, reader, marked, complete), || {
             format!(
                 "a {} of pipeline {from} reaches pipeline {reader} along a path its planner's \
-                     route walk did not take (widened: {}, completes part: {}, final key: {:?}): \
+                     route walk did not take (widened: {}, part path: {:?}, final key: {:?}): \
                      a consumer on the way passes it on otherwise than the walk",
                 if complete { "complete region" } else { "push" },
                 marked.widened,
-                marked.completes_part,
+                marked.part_path,
                 marked.final_key
             )
         });
@@ -1052,6 +1055,36 @@ impl Dispatcher {
         info.reach[at] = Some(region);
     }
 
+    /// Record that `read`, a pipeline `reader` reads, reaches `reader`'s entry along a path whose
+    /// part path is `part_path` and that reaches `reach` of the input, `None` for all of it. A read
+    /// with paths of more than one part path completes a row once each of its paths that reaches
+    /// the row has completed it ([`PartPath`]).
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`.
+    pub(crate) fn completes_along(
+        &mut self,
+        reader: PipelineId,
+        read: PipelineId,
+        part_path: PartPath,
+        reach: Option<TileGuard>,
+    ) {
+        let info = &mut self.infos[reader.0];
+        let at = info
+            .reads
+            .iter()
+            .position(|&r| r == read.0)
+            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
+        info.part_paths.push((at, part_path, reach));
+    }
+
+    /// [`reads_complete`](Self::reads_complete), for a test.
+    #[cfg(test)]
+    pub(crate) fn input_complete(&self, reader: PipelineId, guard: &TileGuard) -> bool {
+        self.reads_complete(reader.0, guard)
+    }
+
     /// Whether every pipeline `reader` reads has completed what of `guard`, a region of its input,
     /// it reaches ([`reaches`](Self::reaches)).
     fn reads_complete(&self, reader: usize, guard: &TileGuard) -> bool {
@@ -1066,18 +1099,49 @@ impl Dispatcher {
             .complete
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let parts = self.states[reader]
+            .part_complete
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let info = &self.infos[reader];
-        (0..info.reads.len()).fold(guard.clone(), |part, at| {
-            let reach = info.reach.get(at).cloned().flatten();
-            match (complete.get(at).unwrap_or(&Completion::Nothing), reach) {
-                (Completion::Whole, _) => part,
-                (Completion::Region(region), Some(reach)) => {
-                    part.intersect(region).union(&guard_minus(&part, &reach))
-                }
-                (Completion::Region(region), None) => part.intersect(region),
-                (Completion::Nothing, Some(reach)) => guard_minus(&part, &reach),
-                (Completion::Nothing, None) => guard_minus(&part, &part),
+        // The rows of `part` that one record completes: those it names, and those its path does
+        // not reach.
+        let cut = |part: TileGuard, record: &Completion, reach: Option<TileGuard>| match (
+            record, reach,
+        ) {
+            (Completion::Whole, _) => part,
+            (Completion::Region(region), Some(reach)) => {
+                part.intersect(region).union(&guard_minus(&part, &reach))
             }
+            (Completion::Region(region), None) => part.intersect(region),
+            (Completion::Nothing, Some(reach)) => guard_minus(&part, &reach),
+            (Completion::Nothing, None) => guard_minus(&part, &part),
+        };
+        (0..info.reads.len()).fold(guard.clone(), |part, at| {
+            let record = complete.get(at).unwrap_or(&Completion::Nothing);
+            let mut paths = info
+                .part_paths
+                .iter()
+                .filter(|(read, ..)| *read == at)
+                .peekable();
+            if matches!(record, Completion::Whole) || paths.peek().is_none() {
+                return cut(part, record, info.reach.get(at).cloned().flatten());
+            }
+            // A read along paths of different part paths: a row is complete once each path that
+            // reaches it has completed it. The record of the paths that complete rows whole is the
+            // read's own.
+            paths.fold(part, |part, (_, path, reach)| {
+                let record = match path.is_empty() {
+                    true => record.clone(),
+                    false => parts
+                        .iter()
+                        .find(|(read, recorded, _)| *read == at && recorded == path)
+                        .map_or(Completion::Nothing, |(.., region)| {
+                            Completion::Region(region.clone())
+                        }),
+                };
+                cut(part, &record, reach.clone())
+            })
         })
     }
 
@@ -1273,6 +1337,19 @@ impl Dispatcher {
     /// complete region ([`share_pushes`](Self::share_pushes)); or `reader` itself, for the ranges
     /// in its own chain.
     fn record_complete(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
+        self.record_complete_along(reader, source, guard, &PartPath::new());
+    }
+
+    /// [`record_complete`](Self::record_complete) of a complete region that reached the entry
+    /// along a path with the part path `part_path`: where the read has paths of more than one part
+    /// path ([`completes_along`](Self::completes_along)), it grows that path's record.
+    fn record_complete_along(
+        &self,
+        reader: usize,
+        source: usize,
+        guard: Option<&TileGuard>,
+        part_path: &PartPath,
+    ) {
         let reads = &self.infos[reader].reads;
         if self.passes_around_recurrence(reader, source, guard) {
             return;
@@ -1296,8 +1373,28 @@ impl Dispatcher {
                 .collect(),
         };
         let whole_only = &self.infos[reader].whole_only;
+        let part_paths = &self.infos[reader].part_paths;
         for at in slots {
             if guard.is_some() && whole_only.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(guard) = guard
+                && !part_path.is_empty()
+                && part_paths
+                    .iter()
+                    .any(|(read, path, _)| *read == at && path == part_path)
+            {
+                let mut parts = self.states[reader]
+                    .part_complete
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match parts
+                    .iter_mut()
+                    .find(|(read, path, _)| *read == at && path == part_path)
+                {
+                    Some((.., region)) => *region = region.union(guard),
+                    None => parts.push((at, part_path.clone(), guard.clone())),
+                }
                 continue;
             }
             let before = std::mem::take(&mut complete[at]);
@@ -2162,13 +2259,22 @@ impl Dispatcher {
                 .position(|&r| r == source.0)
                 .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, source.0)),
         };
-        self.states[reader.0]
+        let read = self.states[reader.0]
             .complete
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(at)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // What each path of a read with paths of different part paths recorded, which the end-of-run
+        // check reads as recorded by the read.
+        self.states[reader.0]
+            .part_complete
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(read, ..)| *read == at)
+            .fold(read, |read, (.., region)| read.grown(region))
     }
 
     /// Push `morsels`, pushed by `pipeline`, through `to`, its breaker's consumer, one region of
@@ -2622,9 +2728,9 @@ pub struct Landing<'d> {
     target: Target<'d>,
     from: usize,
     widened: bool,
-    /// Whether an operator on the path passes on a complete region that names only part of what a
-    /// row it reaches depends on ([`completing_part`](Self::completing_part)).
-    completes_part: bool,
+    /// The operators on the path that pass on a complete region naming only part of what a row it
+    /// reaches depends on ([`completing_part`](Self::completing_part)).
+    part_path: PartPath,
     /// The key an operator on the path reads only once final
     /// ([`requiring_final_key`](Self::requiring_final_key)).
     final_key: Option<Value>,
@@ -2666,6 +2772,8 @@ pub(crate) struct Arrival {
     pub(crate) pipeline: PipelineId,
     /// The region as a guard of that pipeline's breaker's input.
     pub(crate) guard: TileGuard,
+    /// The operators on its path that pass it on as part of a row ([`PartPath`]).
+    pub(crate) part_path: PartPath,
 }
 
 impl Landing<'_> {
@@ -2698,7 +2806,7 @@ impl Landing<'_> {
             target,
             from,
             widened: false,
-            completes_part: false,
+            part_path: PartPath::new(),
             final_key: None,
         }
     }
@@ -2813,7 +2921,7 @@ impl Landing<'_> {
     pub fn queue(&mut self, reader: PipelineId, guard: &TileGuard) {
         let marked = PathMarks {
             widened: self.widened,
-            completes_part: self.completes_part,
+            part_path: self.part_path.clone(),
             final_key: self.final_key.clone(),
         };
         let dispatcher = match &mut self.target {
@@ -2822,6 +2930,7 @@ impl Landing<'_> {
                 arrivals.push(Arrival {
                     pipeline: reader,
                     guard: guard.clone(),
+                    part_path: self.part_path.clone(),
                 });
                 return;
             }
@@ -2829,7 +2938,7 @@ impl Landing<'_> {
                 routes.push(Route {
                     pipeline: reader,
                     keeps_keys: !self.widened,
-                    completes_part: self.completes_part,
+                    part_path: self.part_path.clone(),
                     final_key: self.final_key.clone(),
                 });
                 return;
@@ -2854,7 +2963,12 @@ impl Landing<'_> {
                 if !*range && !dispatcher.passes_around_recurrence(reader.0, source, guard) {
                     dispatcher.ensure_planned(source, reader.0, &marked, true);
                 }
-                return dispatcher.record_complete(reader.0, source, guard);
+                return dispatcher.record_complete_along(
+                    reader.0,
+                    source,
+                    guard,
+                    &marked.part_path,
+                );
             }
         };
         let (from, r) = (self.from, reader.0);
@@ -2909,11 +3023,13 @@ impl Landing<'_> {
     /// Push on through `push` as a path whose complete region names only part of what a row it
     /// reaches depends on: a widening passes a region that is not whole on as nothing complete,
     /// and a lookup's operand names the rows that read a complete key, whatever their input holds.
-    /// The planner reads it off a route walk ([`Landing::route`]).
-    pub(crate) fn completing_part(&mut self, push: impl FnOnce(&mut Self)) {
-        let was = std::mem::replace(&mut self.completes_part, true);
+    /// The planner reads it off a route walk ([`Landing::route`]). `by` is the consumer passing
+    /// it on, whose address names its part ([`PartPath`]).
+    pub(crate) fn completing_part<C: ?Sized>(&mut self, by: &C, push: impl FnOnce(&mut Self)) {
+        self.part_path
+            .push(std::ptr::from_ref(by).cast::<()>() as usize);
         push(self);
-        self.completes_part = was;
+        self.part_path.pop();
     }
 
     /// Push on through `push` as a path whose reader reads `key` only once it is final. The
@@ -2949,9 +3065,9 @@ pub(crate) struct Route {
     /// Whether every operator on the path keeps the pushing pipeline's keys, restated as its own
     /// or under a tag, so that a push of some keys reaches the entry as those keys.
     pub(crate) keeps_keys: bool,
-    /// Whether the complete region the path passes on names only part of what a row it reaches
-    /// depends on ([`Landing::completing_part`]).
-    pub(crate) completes_part: bool,
+    /// The operators on the path that pass its complete region on as part of what a row it
+    /// reaches depends on ([`PartPath`]).
+    pub(crate) part_path: PartPath,
     pub(crate) final_key: Option<Value>,
 }
 

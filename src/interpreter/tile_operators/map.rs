@@ -1604,7 +1604,7 @@ impl TileProducer for MapResultWithSourceProducer {
 mod nested_projection_tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{
-        ProjectionSpyOp, assert_conforms_beneath, paths_guard, two_levels_of_ints,
+        ProjectionSpyOp, assert_conforms_beneath, two_levels_of_ints,
     };
     use crate::interpreter::{BaseType, Extent, FunctionDef, Predicate, UnaryOpKind, Value};
 

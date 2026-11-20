@@ -153,7 +153,7 @@ impl Consumer for Widening {
     /// wholly complete, and not at all otherwise: each output key depends on every input key, so
     /// the path completes only part of what a row depends on.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| match region {
+        landing.completing_part(self, |landing| match region {
             Projection::Everything => self.0.notify(region, landing),
             _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
             _ if landing.is_complete() => {}
@@ -176,7 +176,7 @@ struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.0.notify(region, landing));
+        landing.completing_part(self, |landing| self.0.notify(region, landing));
     }
 }
 
@@ -329,7 +329,7 @@ impl Consumer for OneLevelIn {
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries, so the path completes only part of what a row depends on.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.pass_on(region, landing));
+        landing.completing_part(self, |landing| self.pass_on(region, landing));
     }
 }
 
@@ -397,7 +397,7 @@ mod tests {
         let reached = landing.routes();
         assert_eq!(reached.len(), 1);
         assert!(!reached[0].keeps_keys);
-        assert!(reached[0].completes_part);
+        assert!(!reached[0].part_path.is_empty());
     }
 
     /// A value replaced beneath the outermost level widens a change only where it names keys of
@@ -712,7 +712,7 @@ impl Consumer for FieldBeneathRows {
         if restated == Projection::Nothing && landing.queues() {
             return;
         }
-        landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+        landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
     }
 }
 
@@ -769,7 +769,7 @@ impl Consumer for WholeValuesAt {
         match restated == *region {
             true => self.1.notify(region, landing),
             // A part decides only part of what the value is computed from.
-            false => landing.completing_part(|landing| self.1.notify(&restated, landing)),
+            false => landing.completing_part(self, |landing| self.1.notify(&restated, landing)),
         }
     }
 }
@@ -976,7 +976,7 @@ impl Consumer for Pairing {
             if landing.queues() && restated == Projection::Nothing {
                 return;
             }
-            landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+            landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
             return;
         }
         // A region beneath a constant's outermost keys names paths inside the values of keys
@@ -1000,18 +1000,20 @@ impl Consumer for Pairing {
             if landing.queues() && restated == Projection::Nothing {
                 return;
             }
-            landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+            landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
             return;
         }
         let Some((pairs, record)) = self.pairs(region, recorded, &delivered) else {
             drop(delivered);
             match self.side {
                 // A constant's region beneath its outermost keys names no key of the pairs.
-                PairingSide::ConstantKeys => landing.completing_part(|landing| {
+                PairingSide::ConstantKeys => landing.completing_part(self, |landing| {
                     landing
                         .widened(|landing| self.consumer.notify(&Projection::Everything, landing))
                 }),
-                _ => self.consumer.notify(region, landing),
+                // A region beneath the pairs is one input's half of those pairs, as every region
+                // this side passes on is.
+                _ => landing.completing_part(self, |landing| self.consumer.notify(region, landing)),
             }
             return;
         };
@@ -1023,6 +1025,6 @@ impl Consumer for Pairing {
             return;
         }
         let restated = Projection::keys_at(self.at, pairs);
-        landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+        landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
     }
 }

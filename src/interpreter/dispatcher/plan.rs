@@ -1778,21 +1778,40 @@ pub(super) fn plan_edges(
                 unreached = true;
                 continue;
             }
-            // A row reached along a path that passes a complete region on and along one that drops
-            // it depends on rows the region does not name, so the read decides it only once whole.
-            if routes.iter().any(|route| route.completes_part)
-                && routes.iter().any(|route| !route.completes_part)
-            {
-                for &shared in read_all
-                    .iter()
-                    .filter(|&&r| pushes_with[r] == pushes_with[read])
-                {
-                    dispatcher.completes_whole_only(PipelineId(reader), PipelineId(shared));
+            // A row reached along paths whose complete regions decide different parts of it is
+            // complete once each of those paths has completed it ([`PartPath`]). Each path reaches
+            // what a push of the read's every key, wholly complete, lands as along it, and all of
+            // the input where that push does not take it.
+            let arrivals = complete_reach(&pusher, PipelineId(read), reader);
+            let mut part_paths: Vec<PartPath> = Vec::new();
+            for route in complete_routes_to(&pusher, &one, reader) {
+                if !part_paths.contains(&route.part_path) {
+                    part_paths.push(route.part_path);
+                }
+            }
+            if part_paths.len() > 1 {
+                for path in part_paths {
+                    let reach = arrivals
+                        .iter()
+                        .filter(|arrival| arrival.part_path == path)
+                        .map(|arrival| arrival.guard.clone())
+                        .reduce(|a, b| a.union(&b));
+                    for &shared in read_all
+                        .iter()
+                        .filter(|&&r| pushes_with[r] == pushes_with[read])
+                    {
+                        dispatcher.completes_along(
+                            PipelineId(reader),
+                            PipelineId(shared),
+                            path.clone(),
+                            reach.clone(),
+                        );
+                    }
                 }
             }
             // A read along a route reaches what a push of its every key, wholly complete, lands
             // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.
-            let region = complete_reach(&pusher, PipelineId(read), reader)
+            let region = arrivals
                 .iter()
                 .fold(input.empty_guard(), |region, arrival| {
                     region.union(&arrival.guard)
