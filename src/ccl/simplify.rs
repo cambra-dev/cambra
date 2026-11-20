@@ -781,13 +781,18 @@ fn over_a_witness(source: &Expr) -> bool {
 /// `⟨id, 𝑓 ▷ const⟩` for a body that maps a collection bound by a `let`. Planning's letrec
 /// recognition reads a history through the unrewritten form, so the rule leaves every other `𝑆`
 /// alone; with `id`, whatever produces the collection stays its own element of the chain.
+///
+/// A curried function of the enclosing value, `curry(𝑔)`, is no history either: lambda
+/// elimination leaves `⟨curry(𝑔), 𝑓 ▷ const⟩` for a loop over the outer element's row whose body
+/// maps each element by `𝑓`, and an `𝑓` that is `id` leaves `𝑆` itself, whatever `𝑆` is.
 fn try_compose_constant_function(expr: &mut Expr) -> bool {
     fn constant_function(left: &Expr) -> Option<(&Expr, &Expr)> {
         let (source, lifted) = as_zip(left)?;
-        if !over_a_witness(source) && !is_id(source) {
+        let f = as_const(lifted)?;
+        if !over_a_witness(source) && !is_id(source) && as_curry(source).is_none() && !is_id(f) {
             return None;
         }
-        Some((source, as_const(lifted)?))
+        Some((source, f))
     }
     try_pairwise_in_compose(
         expr,
