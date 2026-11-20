@@ -305,6 +305,16 @@ fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
     check_compile_error(code, "Nothing determines the type of this expression");
 }
 
+// A map's entry is a key and a value, so an entry of any other width is refused rather than
+// read for its first two components.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::three("map([(1, 10, 100), (2, 20, 200)])")]
+#[case::one("map([(1,), (2,)])")]
+fn a_map_entry_is_a_pair(#[case] code: &str) {
+    check_compile_error(code, "tuples of different widths are different types");
+}
+
 // The re-keying constructors do not accept an empty literal: their key domain is
 // the key morphism's image (`src/ccl/design/collections.md`, "The key domain is the
 // key morphism's image"), and with no elements there is no image, so nothing
