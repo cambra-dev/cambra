@@ -122,8 +122,15 @@ impl Consumer for ThroughValues {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let already_whole = *region == Projection::Everything;
         let region = if landing.is_complete() {
+            // A complete part of some values completes no value this operator reshapes: only the
+            // arms naming whole keys pass.
+            let whole = Projection::any_of(
+                region_arms(region)
+                    .into_iter()
+                    .filter(|arm| !matches!(arm, Projection::Within { .. })),
+            );
             let guard = crate::interpreter::tiling::through_shared_levels(
-                region.collection_guard(),
+                whole.collection_guard(),
                 self.level.index(),
                 &self.output,
             );
@@ -663,6 +670,35 @@ impl FieldBeneathRows {
                 ))
             }
             Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| self.restated(arm))),
+            // A part of the field's values beneath its own keys: those keys are the rows' where they
+            // stand at the rows' level, and keys within the field's values beneath them otherwise.
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } if *level == self.rows => {
+                Projection::within(self.rows, keys.clone(), of_field((**values).clone()))
+            }
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } if *level > self.rows => {
+                let relative = level.index() - self.rows.index() - 1;
+                Projection::any_of(split_beneath_rows(keys, relative).into_iter().map(
+                    |(rows, part)| {
+                        Projection::within(
+                            self.rows,
+                            rows,
+                            of_field(Projection::within(
+                                CurryLevel::new(relative),
+                                part,
+                                (**values).clone(),
+                            )),
+                        )
+                    },
+                ))
+            }
             other => panic!("{other:?} names a part this field's rows have no spelling for"),
         }
     }

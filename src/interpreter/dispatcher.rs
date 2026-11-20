@@ -2403,8 +2403,8 @@ fn unreleased(rows: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<
     if released.is_universal() {
         return None;
     }
-    // Of a finite range of outermost positions, a region past the last names no row, beneath
-    // which a part of every row's values names nothing either.
+    // Of a finite range of outermost positions, a region past the last names no row, nor any
+    // part of a row's values beneath it.
     let rows = match input.domain_extent() {
         Some(Extent::UIntRange(positions)) if !rows.is_universal() => {
             let held = TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
@@ -2418,7 +2418,11 @@ fn unreleased(rows: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<
                 )),
             )));
             match Projection::of(rows) {
-                Ok(region) if region.names_part_of_values() => {
+                Ok(
+                    region @ (Projection::Keys { .. }
+                    | Projection::Within { .. }
+                    | Projection::Or(_)),
+                ) => {
                     let Ok(held) = Projection::of(&held) else {
                         unreachable!("a range of positions is keys")
                     };

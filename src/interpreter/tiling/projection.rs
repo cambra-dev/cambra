@@ -167,6 +167,12 @@ impl Projection {
                 let Tiling::DataFunction { codomain, .. } = tiling.values_at(*level) else {
                     panic!("{self:?} names keys of {level}, and {tiling} has no collection there")
                 };
+                // A part an operator on the way reshaped, as one that drops a record keeps its
+                // input's keys and passes the region on, names at most the values at its keys
+                // whole: spelled as those keys, which names more and so is sound for a push.
+                if !values.fits(codomain) {
+                    return spell(*level, keys);
+                }
                 let inner = guard_beneath_keys(&values.guard(codomain), keys, 0);
                 CurryLevel::new(level.index() + 1).wrap_guard(inner)
             }
@@ -597,6 +603,27 @@ impl Projection {
         }
     }
 
+    /// Whether this projection of some values names only parts `tiling` has: fields of a record it
+    /// is, and keys of a collection it is.
+    fn fits(&self, tiling: &Tiling) -> bool {
+        match (self, tiling) {
+            (Projection::Everything | Projection::Nothing, _) => true,
+            (Projection::Fields { fields, .. }, Tiling::Record(record)) => fields
+                .iter()
+                .all(|(name, part)| record.get(name).is_some_and(|field| part.fits(field))),
+            (Projection::Fields { .. }, _) => false,
+            (Projection::Keys { .. }, Tiling::DataFunction { .. }) => true,
+            (Projection::Within { level, values, .. }, Tiling::DataFunction { .. }) => {
+                match tiling.values_at(*level) {
+                    Tiling::DataFunction { codomain, .. } => values.fits(codomain),
+                    _ => false,
+                }
+            }
+            (Projection::Or(arms), _) => arms.iter().all(|arm| arm.fits(tiling)),
+            _ => false,
+        }
+    }
+
     /// The arms of this projection, which an `Or` holds and any other is one of.
     fn arms(&self) -> Vec<Projection> {
         match self {
@@ -748,27 +775,28 @@ fn split_beneath_keys(paths: &Predicate, relative: usize) -> Vec<(Predicate, Pre
 /// alike, those keys within the part of their values it names. `None` where a field holds more
 /// than a scalar or one collection level, which this reading has no part for.
 fn within_of_cells(node: &TileGuard, level: CurryLevel) -> Option<Projection> {
-    // Per leaf of the values, a field name or none for the values themselves, the pairs of keys
-    // and the part beneath them it names.
-    let mut leaves: Vec<(Option<SmolStr>, bool, Vec<(Predicate, Predicate)>)> = Vec::new();
-    let mut read = |name: Option<SmolStr>, guard: &TileGuard| -> Option<()> {
+    // Per leaf of the values, its field path from the values (empty for the values themselves),
+    // whether it is a collection's keys, and the pairs of keys and the part beneath them it names.
+    type Leaf = (Vec<SmolStr>, bool, Vec<(Predicate, Predicate)>);
+    fn read(path: Vec<SmolStr>, guard: &TileGuard, leaves: &mut Vec<Leaf>) -> Option<()> {
         match guard {
-            TileGuard::Scalar(paths) => leaves.push((name, false, split_beneath_keys(paths, 0))),
+            TileGuard::Scalar(paths) => leaves.push((path, false, split_beneath_keys(paths, 0))),
             TileGuard::Function(FunctionGuard::Domain(paths)) => {
-                leaves.push((name, true, split_beneath_keys(paths, 0)))
+                leaves.push((path, true, split_beneath_keys(paths, 0)))
+            }
+            TileGuard::Record(fields) => {
+                for (name, field) in fields {
+                    let mut deeper = path.clone();
+                    deeper.push(name.clone());
+                    read(deeper, field, leaves)?;
+                }
             }
             _ => return None,
         }
         Some(())
-    };
-    match node {
-        TileGuard::Record(fields) => {
-            for (name, field) in fields {
-                read(Some(name.clone()), field)?;
-            }
-        }
-        scalar => read(None, scalar)?,
     }
+    let mut leaves: Vec<Leaf> = Vec::new();
+    read(Vec::new(), node, &mut leaves)?;
     // The regions of keys every leaf names alike: refine by each leaf's keys in turn.
     let mut regions: Vec<(Predicate, Vec<Projection>)> =
         vec![(Predicate::True, vec![Projection::Nothing; leaves.len()])];
@@ -794,23 +822,37 @@ fn within_of_cells(node: &TileGuard, level: CurryLevel) -> Option<Projection> {
                 .collect();
         }
     }
+    /// The projection of the values the leaves under `prefix` name, field by field.
+    fn values(leaves: &[Leaf], parts: &[Projection], prefix: &[SmolStr]) -> Projection {
+        let under: Vec<usize> = (0..leaves.len())
+            .filter(|&at| leaves[at].0.starts_with(prefix))
+            .collect();
+        if let [at] = under.as_slice()
+            && leaves[*at].0.len() == prefix.len()
+        {
+            return parts[*at].clone();
+        }
+        let mut names: Vec<SmolStr> = under
+            .iter()
+            .filter_map(|&at| leaves[at].0.get(prefix.len()).cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        Projection::fields(
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut deeper = prefix.to_vec();
+                    deeper.push(name.clone());
+                    let part = values(leaves, parts, &deeper);
+                    (name, part)
+                })
+                .collect(),
+            Projection::Nothing,
+        )
+    }
     Some(Projection::any_of(regions.into_iter().map(
-        |(keys, parts)| {
-            let values = match leaves.first().and_then(|(name, _, _)| name.as_ref()) {
-                Some(_) => Projection::fields(
-                    leaves
-                        .iter()
-                        .zip(parts)
-                        .map(|((name, _, _), part)| {
-                            (name.clone().expect("a record's leaves are fields"), part)
-                        })
-                        .collect(),
-                    Projection::Nothing,
-                ),
-                None => parts.into_iter().next().unwrap_or(Projection::Nothing),
-            };
-            Projection::within(level, keys, values)
-        },
+        |(keys, parts)| Projection::within(level, keys, values(&leaves, &parts, &[])),
     )))
 }
 
