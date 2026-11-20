@@ -602,6 +602,140 @@ impl Consumer for SelectingFieldBeneathKeys {
     }
 }
 
+/// `consumer` behind a consumer that forwards a region of a record's field `name`, the record
+/// standing at `level` beneath rows, as that field of the rows it reaches: the rows a region of the
+/// field's keys runs through, within the field `name`'s part, and nothing of the other fields.
+/// `Zip` passes this to each arm, whose rows are the pair's and whose values are one field of it,
+/// so a push on one arm names no part of another arm's field.
+pub fn field_beneath_rows(
+    name: smol_str::SmolStr,
+    level: CurryLevel,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    let rows = level
+        .enclosing()
+        .expect("a field beneath rows stands beneath a level of rows");
+    Box::new(FieldBeneathRows {
+        name,
+        rows,
+        consumer,
+    })
+}
+
+struct FieldBeneathRows {
+    name: smol_str::SmolStr,
+    rows: CurryLevel,
+    consumer: Box<dyn Consumer>,
+}
+
+impl FieldBeneathRows {
+    /// The region of the record's rows `region`, a region of the field's own tiling, names.
+    fn restated(&self, region: &Projection) -> Projection {
+        let of_field = |part: Projection| {
+            Projection::fields(
+                [(self.name.clone(), part)].into_iter().collect(),
+                Projection::Nothing,
+            )
+        };
+        match region {
+            Projection::Nothing => Projection::Nothing,
+            Projection::Everything => Projection::within(
+                self.rows,
+                crate::interpreter::Predicate::True,
+                of_field(Projection::Everything),
+            ),
+            // Keys at or above the rows name the field of every row beneath them.
+            Projection::Keys { level, keys } if *level <= self.rows => Projection::within(
+                self.rows,
+                keys.descend(self.rows.index() - level.index()),
+                of_field(Projection::Everything),
+            ),
+            Projection::Keys { level, keys } => {
+                let relative = level.index() - self.rows.index() - 1;
+                Projection::any_of(split_beneath_rows(keys, relative).into_iter().map(
+                    |(rows, part)| {
+                        Projection::within(
+                            self.rows,
+                            rows,
+                            of_field(Projection::keys_at(CurryLevel::new(relative), part)),
+                        )
+                    },
+                ))
+            }
+            Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| self.restated(arm))),
+            other => panic!("{other:?} names a part this field's rows have no spelling for"),
+        }
+    }
+}
+
+impl Consumer for FieldBeneathRows {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        let restated = self.restated(region);
+        if restated == Projection::Nothing && landing.queues() {
+            return;
+        }
+        self.consumer.notify(&restated, landing);
+    }
+}
+
+/// The pairs of rows and paths beneath them `paths` admits, `paths` being over paths `relative`
+/// levels beneath the rows' level: each arm split into the rows above and the paths beneath them.
+/// An unqualified arm stands beneath every row.
+fn split_beneath_rows(
+    paths: &crate::interpreter::Predicate,
+    relative: usize,
+) -> Vec<(crate::interpreter::Predicate, crate::interpreter::Predicate)> {
+    use crate::interpreter::Predicate;
+    match paths {
+        Predicate::False => Vec::new(),
+        Predicate::Or(arms) => arms
+            .iter()
+            .flat_map(|arm| split_beneath_rows(arm, relative))
+            .collect(),
+        Predicate::Qualified { enclosing, here } if relative == 0 => {
+            vec![((**enclosing).clone(), (**here).clone())]
+        }
+        Predicate::Qualified { enclosing, here } => split_beneath_rows(enclosing, relative - 1)
+            .into_iter()
+            .map(|(rows, above)| (rows, Predicate::qualified(above, (**here).clone())))
+            .collect(),
+        unqualified => vec![(Predicate::True, unqualified.clone())],
+    }
+}
+
+/// `consumer` behind a consumer that forwards a region within the values at `level` as the keys
+/// it stands under, and every other region as it is: an operator that computes each value at
+/// `level` anew from the value there, as `MapResult` applies its function, has its whole value at
+/// a key change where any part of the input's value there does.
+pub fn whole_values_at(level: CurryLevel, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(WholeValuesAt(level, consumer))
+}
+
+struct WholeValuesAt(CurryLevel, Box<dyn Consumer>);
+
+impl WholeValuesAt {
+    fn restated(&self, region: &Projection) -> Projection {
+        match region {
+            Projection::Within { level, keys, .. } if level.index() + 1 >= self.0.index() => {
+                Projection::keys_at(*level, keys.clone())
+            }
+            Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| self.restated(arm))),
+            other => other.clone(),
+        }
+    }
+}
+
+impl Consumer for WholeValuesAt {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        let restated = self.restated(region);
+        match restated == *region {
+            true => self.1.notify(region, landing),
+            // A part decides only part of what the value is computed from.
+            false => landing.completing_part(|landing| self.1.notify(&restated, landing)),
+        }
+    }
+}
+
 /// The arms of `region`, which an `Or` holds and any other region is one of.
 fn region_arms(region: &Projection) -> Vec<Projection> {
     match region {

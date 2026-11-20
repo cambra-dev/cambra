@@ -1650,17 +1650,6 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
-    /// Whether a consume over an open input releases only what its answer makes releasable
-    /// (`Tile::to_guard`), so a later package may read the input again for what that answer left
-    /// open. A memo also caches the open keys it read; the next read merges what they gained. A
-    /// dispatched run reads again the input of a pipeline its live
-    /// sources reach widened only where its breaker does (`Dispatcher::notify_again`); any other
-    /// such pipeline reads its input once every source yields everything. A breaker that folds
-    /// or extracts what it is handed, or steps until its guard is released, answers `false`.
-    fn reads_open_input(&self) -> bool {
-        false
-    }
-
     /// Whether the breaker holds a decision it took ahead of its commit and has not settled: a
     /// transaction store's queued decisions and the items it names to decide again. Every step
     /// commits or takes again each decision it takes (`CommitProducer::commit_ready`), so a

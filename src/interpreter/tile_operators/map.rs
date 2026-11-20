@@ -293,8 +293,19 @@ impl TileOperator for MapResult {
         // `subscribe_forwarding` sends as `Everything`.
         let keeps_keys =
             self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
-        let input_producer =
-            subscribe_forwarding_keeping_keys_if(keeps_keys, &self.input, &shared, cx);
+        // The function computes each value anew from the input's value there, so a part of that
+        // value names the whole value at its key (`whole_values_at`).
+        let input_producer = match keeps_keys {
+            true => self.input.clone().subscribe(
+                self.input.tiling().universal_guard(),
+                crate::interpreter::notifications::whole_values_at(
+                    self.level,
+                    forwarding_consumer_keeping_keys(&shared),
+                ),
+                cx,
+            ),
+            false => subscribe_forwarding(&self.input, &shared, cx),
+        };
         Box::new(MapResultProducer {
             dropped_rows: Default::default(),
             base: ProducerBase::new(

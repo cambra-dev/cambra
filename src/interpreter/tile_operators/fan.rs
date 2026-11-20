@@ -287,20 +287,42 @@ impl TileOperator for Zip {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let consumer =
-            crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
-        let shared = shared_consumer(consumer);
+        // Beneath rows each arm is one field of the pair, so a region of an arm names that field
+        // of the rows it reaches and nothing of another arm's (`field_beneath_rows`). At the
+        // outermost level the pair is one record, whose regions widen.
+        let beneath_rows = self.level != CurryLevel::OUTERMOST;
+        let shared = shared_consumer(match beneath_rows {
+            true => consumer,
+            false => crate::interpreter::notifications::through_values(
+                self.level,
+                self.tiling(),
+                consumer,
+            ),
+        });
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&self.names)
+            // Every arm is pulled at the projection: the arms share the pair's keys.
+            .map(|(input, name)| match beneath_rows {
+                true => input.clone().subscribe(
+                    input.tiling().universal_guard(),
+                    crate::interpreter::notifications::field_beneath_rows(
+                        name.clone(),
+                        self.level,
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                ),
+                false => subscribe_forwarding_keeping_keys(input, &shared, cx),
+            })
+            .collect();
         Box::new(ZipProducer {
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), self.clone(), cx),
             names: self.names.clone(),
             level: self.level,
             state: Mutex::new(ZipState::new(self.inputs.len())),
-            inputs: self
-                .inputs
-                .iter()
-                // Every arm is pulled at the projection: the arms share the pair's keys.
-                .map(|i| subscribe_forwarding_keeping_keys(i, &shared, cx))
-                .collect(),
+            inputs,
         })
     }
 }

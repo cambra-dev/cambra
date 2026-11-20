@@ -329,6 +329,11 @@ impl Projection {
                     Projection::keys_at(enclosing, through_at(keys, *own, enclosing))
                 }
             },
+            // A part of the values at `level`, which the operator computes anew from them, names
+            // the whole value at its keys.
+            Projection::Within {
+                level: own, keys, ..
+            } if own.index() + 1 >= level.index() => Projection::keys_at(*own, keys.clone()),
             other => other.clone(),
         }
     }

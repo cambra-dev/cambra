@@ -840,25 +840,6 @@ fn run_targets(
             }
         }
     }
-    // Over live sources, a reader that waits for its inputs reads all of its input again at each
-    // push that reaches it widened, where its breaker reads an open input, so what such a push
-    // brings is published before the sources close. A `main` output reads an open input only
-    // once it hands each package's answer.
-    if !live.is_empty() {
-        for (pipeline, &takes_arrivals) in arrivals.iter().enumerate() {
-            if dispatcher.infos[pipeline].waits_for_inputs
-                && !takes_arrivals
-                && reads_open_input(&mut reach, PipelineId(pipeline))
-            {
-                let mut input = None;
-                reach(PipelineId(pipeline), &mut |breaker, at| {
-                    input = Some(breaker.input_tiling(at));
-                });
-                let input = input.expect("a reach calls the breaker it reaches");
-                dispatcher.read_again_on_widened_push(PipelineId(pipeline), &input);
-            }
-        }
-    }
     // Initialize every planned breaker before any package executes.
     for pipeline in 0..members.names.len() {
         reach(PipelineId(pipeline), &mut |breaker, _| breaker.begin_run());
@@ -893,43 +874,9 @@ fn run_targets(
         })
         .collect();
     let consuming: Vec<BreakerHandle> = worker_targets.iter().flatten().cloned().collect();
-    // The pool admits no pipeline that is queued reads again, and none such a pipeline reads,
-    // transitively (`src/interpreter/design-dispatcher.md`, "Reading a widened input again"). The
-    // coordinator consumes a read again one at a time and lands the change it pushes. A read again
-    // reads its input whole, and what it reads beneath it reaches it through the regions those
-    // pipelines push, which a worker's packages push keyed rather than widened. The pipelines
-    // queued reads again are the readers that read their input again at a widened push, and the
-    // live pipelines notified of their whole input whose breaker reads an open input
-    // (`LivePipeline`).
-    let mut coordinator_only: Vec<bool> = (0..worker_targets.len())
-        .map(|p| {
-            // A body's pipelines come after the program's, which alone are planned live.
-            dispatcher.infos[p].whole_input.is_some()
-                || (planned
-                    .get(p)
-                    .is_some_and(|planned| planned.live && planned.whole)
-                    && reads_open_input(&mut reach, PipelineId(p)))
-        })
-        .collect();
-    let mut beneath: Vec<usize> = (0..coordinator_only.len())
-        .filter(|&p| coordinator_only[p])
-        .collect();
-    while let Some(p) = beneath.pop() {
-        for &read in &dispatcher.infos[p].reads {
-            if !coordinator_only[read] {
-                coordinator_only[read] = true;
-                beneath.push(read);
-            }
-        }
-    }
     let worker_targets = worker_targets
         .into_iter()
-        .zip(coordinator_only)
-        .map(|(target, coordinator_only)| {
-            target.filter(|handle| {
-                !coordinator_only && chain_restates_parallel_level(handle, &consuming)
-            })
-        })
+        .map(|target| target.filter(|handle| chain_restates_parallel_level(handle, &consuming)))
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
     let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
@@ -3664,7 +3611,6 @@ impl LivePipeline {
         // Several ranges can read one source, so a scope or a store is notified of the positions
         // they gained together, once.
         let mut positions = Predicate::False;
-        let mut delivered = false;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
         for (index, (leaf, notified)) in self.leaves.iter_mut().enumerate() {
             let yielded = leaf.extent.complete_region();
@@ -3689,7 +3635,7 @@ impl LivePipeline {
                         arrivals = arrivals.union(&arrival.guard);
                     }
                 }
-                Notifies::Whole => delivered = true,
+                Notifies::Whole => {}
                 Notifies::Items {
                     arms: Some(ref arms),
                 } => {
@@ -3767,12 +3713,6 @@ impl LivePipeline {
         // that read takes what no read again took, as rows an input that reaches it widened
         // completes after the last delivery.
         if matches!(self.notifies, Notifies::Whole) {
-            if delivered
-                && reads_open_input(reach, self.pipeline)
-                && reads_unreleased(reach, self.pipeline)
-            {
-                dispatcher.notify_again(self.pipeline, &self.input.universal_guard());
-            }
             if complete && reads_unreleased(reach, self.pipeline) {
                 dispatcher.notify(self.pipeline, &self.input.universal_guard());
             }
@@ -3804,15 +3744,6 @@ fn notify_unreleased(
     if let Some(pending) = pending {
         dispatcher.notify(pipeline, &pending);
     }
-}
-
-/// Whether `pipeline`'s breaker reads an open input (`Breaker::reads_open_input`).
-fn reads_open_input(reach: &mut Reach<'_>, pipeline: PipelineId) -> bool {
-    let mut reads_open = false;
-    reach(pipeline, &mut |breaker, _| {
-        reads_open = breaker.reads_open_input();
-    });
-    reads_open
 }
 
 /// Whether the pipeline's input has not released all of itself. A read of a widened pipeline's
