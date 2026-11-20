@@ -1421,7 +1421,10 @@ pub(super) fn coalesce_pass(
     }
     ctx.pass = Pass::Stamp;
     ctx.current_node = expr.node_id();
-    coalesce_node(solver, expr, 0, &mut ctx);
+    // The stamp pass reads the graph the write pass left, and records nothing on it.
+    crate::ccl::infer::solver::compact::reading_fixed_graph(solver, |solver| {
+        coalesce_node(solver, expr, 0, &mut ctx)
+    });
     // A node the stamp pass did not reach keeps its errors.
     let mut unreached: Vec<_> = std::mem::take(&mut ctx.replay)
         .into_values()
