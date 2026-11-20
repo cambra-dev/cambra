@@ -1824,3 +1824,51 @@ fn a_nested_for_over_a_groups_rows() {
 fn a_set_of_key_dependent_elements(#[case] code: &str) {
     check_scalar(code, Value::Int(3));
 }
+
+/// The groups of `big([1, 2, 3, 2])`, which keeps the elements above 1: `2 -> 4`, `3 -> 3`.
+fn groups_of_a_generator() -> Tile {
+    Tile::data_function(
+        ColumnValue::Ints(vec![2, 3]),
+        Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 3]))),
+        Predicate::True,
+        BitSet::new(),
+    )
+}
+
+/// BUG: `groupby` over a generator's result, bound to a name first, panics after `channelize`.
+/// With debug assertions the generator's binding is read by a type nothing binds; without them
+/// the consistency check rejects the tree. The same groups over a comprehension,
+/// `[x for x in [1, 2, 3, 2] if x > 1]`, compile. Remove `should_panic` when fixed.
+#[test]
+#[should_panic(expected = "post-channelize")]
+fn bug_groupby_over_a_bound_generator_result() {
+    check_tile(
+        indoc! {"
+            def big(xs):
+                for x in xs:
+                    if x > 1:
+                        yield x
+            bs = big([1, 2, 3, 2])
+            [sum(g) for g in groupby(bs, \\x -> x)]
+        "},
+        groups_of_a_generator(),
+    );
+}
+
+/// BUG: `groupby` over a generator call written in place is refused by inference: the values
+/// that meet at `groupby`'s argument "have no common type", and the diagnostic cannot print them.
+/// The correct result is [`groups_of_a_generator`]. This pins the refusal, so the test goes red
+/// when it changes; then assert the result with `check_tile`.
+#[test]
+fn bug_groupby_over_a_generator_call_is_refused() {
+    check_compile_error(
+        indoc! {"
+            def big(xs):
+                for x in xs:
+                    if x > 1:
+                        yield x
+            [sum(g) for g in groupby(big([1, 2, 3, 2]), \\x -> x)]
+        "},
+        "The values that meet here have no common type",
+    );
+}
