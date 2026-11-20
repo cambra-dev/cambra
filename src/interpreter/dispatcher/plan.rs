@@ -1708,6 +1708,11 @@ pub(super) fn plan_edges(
             input = Some(breaker.input_tiling(at))
         });
         let input = input.expect("a reach calls the breaker it reaches");
+        dispatcher.consumes_input(PipelineId(reader), input.clone());
+        // An arrival is a region of the entry it reaches, which may stand for another of the
+        // breaker's inputs, as a loop's seed does; it names these rows (`rows_named_in`).
+        let changed = |arrival: Arrival| rows_named_in(&input, &arrival.guard, false);
+        let completed = |arrival: &Arrival| rows_named_in(&input, &arrival.guard, true);
         match kinds[reader] {
             // A nested loop's scope takes the row the scope around it queues it once the pipelines
             // it reads have finished the round, since its rounds pull them, and a store or a
@@ -1750,9 +1755,8 @@ pub(super) fn plan_edges(
             // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.
             let region = complete_reach(&pusher, PipelineId(read), reader)
                 .iter()
-                .fold(input.empty_guard(), |region, arrival| {
-                    region.union(&arrival.guard)
-                });
+                .filter_map(completed)
+                .fold(input.empty_guard(), |region, rows| region.union(&rows));
             for &shared in read_all
                 .iter()
                 .filter(|&&r| pushes_with[r] == pushes_with[read])
@@ -1768,9 +1772,8 @@ pub(super) fn plan_edges(
             }
             let named = probe(&pusher, PipelineId(read), &Projection::Everything, reader)
                 .into_iter()
-                .fold(input.empty_guard(), |names, arrival| {
-                    names.union(&arrival.guard)
-                });
+                .filter_map(changed)
+                .fold(input.empty_guard(), |names, rows| names.union(&rows));
             pushed = Some(match pushed {
                 Some(before) => before.union(&named),
                 None => named,
@@ -1781,10 +1784,11 @@ pub(super) fn plan_edges(
         let left = leaves[reader]
             .iter()
             .flat_map(|(leaf, _)| probe(leaf, PipelineId(read[0]), &Projection::Everything, reader))
-            .fold(input.empty_guard(), |left, arrival| {
+            .filter_map(changed)
+            .fold(input.empty_guard(), |left, rows| {
                 left.union(&match &pushed {
-                    Some(pushed) => guard_minus(&arrival.guard, pushed),
-                    None => arrival.guard,
+                    Some(pushed) => guard_minus(&rows, pushed),
+                    None => rows,
                 })
             });
         // A record of values is read field by field, so a field no push and no range names, whose
@@ -1796,9 +1800,10 @@ pub(super) fn plan_edges(
                 .flat_map(|(leaf, _)| {
                     probe(leaf, PipelineId(read[0]), &Projection::Everything, reader)
                 })
+                .filter_map(changed)
                 .fold(
                     pushed.clone().unwrap_or_else(|| input.empty_guard()),
-                    |named, arrival| named.union(&arrival.guard),
+                    |named, rows| named.union(&rows),
                 ),
         ));
         // A pipeline it reads by pull brings no row of its own, and neither does a reader nothing

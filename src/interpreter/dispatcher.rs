@@ -364,6 +364,11 @@ struct PipelineInfo {
     /// it ([`reaches`](Dispatcher::reaches)).
     reach: Vec<Option<TileGuard>>,
     required_keys: Vec<Vec<Value>>,
+    /// The tiling of the breaker input the pipeline consumes, where a planner set it
+    /// ([`consumes_input`](Dispatcher::consumes_input)). An entry of another of the breaker's
+    /// inputs, as a loop's seed is, lands regions of that input's tiling, which
+    /// [`rows_named`](Dispatcher::rows_named) restates as rows of this one.
+    input: Option<Tiling>,
     /// Per pipeline it reads, in the order of its `reads`, the routes a push of that pipeline
     /// takes to its entry, as the planner walked them through the pusher's consumer
     /// ([`plan_routes`](Dispatcher::plan_routes)); `None` where no planner walked them. A push
@@ -590,6 +595,7 @@ impl Dispatcher {
                 opens: false,
                 reach: Vec::new(),
                 required_keys: Vec::new(),
+                input: None,
                 routes: None,
                 ingress: None,
             })
@@ -686,6 +692,7 @@ impl Dispatcher {
             opens: false,
             reach: Vec::new(),
             required_keys: Vec::new(),
+            input: None,
             routes: None,
             ingress: None,
         });
@@ -1371,6 +1378,22 @@ impl Dispatcher {
         }
         self.advance();
         released
+    }
+
+    /// Record that `pipeline` consumes a breaker input of `input`'s tiling.
+    pub(crate) fn consumes_input(&mut self, pipeline: PipelineId, input: Tiling) {
+        self.infos[pipeline.0].input = Some(input);
+    }
+
+    /// `guard`, a region an entry of `reader` lands, as rows of the input `reader` consumes. A
+    /// region of another of the breaker's inputs, as a loop's seed is, is no region of those rows:
+    /// a change of it changes every row, and its completion completes every row only once it is
+    /// all of that input. `None` where it names no row.
+    fn rows_named(&self, reader: usize, guard: &TileGuard, complete: bool) -> Option<TileGuard> {
+        match &self.infos[reader].input {
+            Some(input) => rows_named_in(input, guard, complete),
+            None => Some(guard.clone()),
+        }
     }
 
     pub(crate) fn require_final_keys(
@@ -2764,7 +2787,10 @@ impl Landing<'_> {
                 // pipeline whose input is the loop's positions. A wholly complete source is, along
                 // whatever its push was restated to on the way, as an arm of a union restates it
                 // under its tag.
-                let guard = (!(*whole || guard.is_universal())).then_some(guard);
+                let Some(rows) = dispatcher.rows_named(reader.0, guard, true) else {
+                    return;
+                };
+                let guard = (!(*whole || rows.is_universal())).then_some(&rows);
                 if !*range && !dispatcher.passes_around_recurrence(reader.0, source, guard) {
                     dispatcher.ensure_planned(source, reader.0, &marked, true);
                 }
@@ -2772,6 +2798,9 @@ impl Landing<'_> {
             }
         };
         let (from, r) = (self.from, reader.0);
+        let Some(guard) = &dispatcher.rows_named(r, guard, false) else {
+            return;
+        };
         dispatcher.state(reader);
         dispatcher.ensure(dispatcher.infos[r].reads.contains(&from), || {
             format!("pipeline {from} pushes to pipeline {r}, which reads it")
@@ -3006,6 +3035,24 @@ impl Consumer for Entry {
             );
             landing.queue(*pipeline, &guard);
         }
+    }
+}
+
+/// `guard`, a region an entry lands, as rows of `input`, the breaker input its pipeline consumes
+/// ([`Dispatcher::rows_named`]): itself where it is a guard of `input`; and where it is a region
+/// of another of the breaker's inputs, every row for a change, every row for a completion of all
+/// of that input, and `None` for a completion of part of it.
+pub(crate) fn rows_named_in(
+    input: &Tiling,
+    guard: &TileGuard,
+    complete: bool,
+) -> Option<TileGuard> {
+    if guard.check_from(input) {
+        return Some(guard.clone());
+    }
+    match (complete, guard.is_universal()) {
+        (false, _) | (true, true) => Some(input.universal_guard()),
+        (true, false) => None,
     }
 }
 

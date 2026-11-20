@@ -74,6 +74,13 @@ complete region that reaches its own pipelines around its recurrence. A consumer
 push along a path its walk did not take fails the run where the push is queued
 (`a_push_along_a_route_its_planner_did_not_walk_fails_the_run`).
 
+A pipeline consumes one breaker input, and an entry lands regions of its own input's tiling. A
+breaker with several inputs, as a loop's scope with its seed, has entries of an input its pipeline
+does not consume. Such a region names the consumed input's rows (`rows_named_in`): a change of it
+changes every row, a completion of all of it completes every row, and a completion of part of it
+completes none. The planner records each pipeline's consumed input (`Dispatcher::consumes_input`)
+and reads arrivals by the same rule.
+
 Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
 before execution consumes anything. Refusals include an unsupported store shape,
 a shared producer without the required fan-out, and a live source whose arrivals cannot reach its
