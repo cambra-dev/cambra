@@ -272,8 +272,8 @@ pub trait RunObserver {
     /// whether the pass notified a pipeline or closed one. `Break` ends the run here.
     fn drained(&mut self, changed: bool) -> ControlFlow<()>;
     /// A top-level package or finish has returned, so no operator is borrowed, though a loop's
-    /// or a transaction's open request may be. A test that simulates a crash panics here.
-    #[cfg(test)]
+    /// or a transaction's open request may be. A durable run checkpoints here
+    /// (`Durability::step`), and a test that simulates a crash panics here.
     fn stepped(&mut self) {}
 }
 
@@ -3692,13 +3692,11 @@ fn drive_live(
             match workers.next(dispatcher) {
                 Next::Package(package) => {
                     execution.consume(dispatcher, reach, package);
-                    #[cfg(test)]
                     observer.stepped();
                 }
                 Next::Finish { pipeline, consumed } => {
                     workers.finishing(pipeline, reach);
                     execution.finish(dispatcher, reach, pipeline, consumed);
-                    #[cfg(test)]
                     observer.stepped();
                 }
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {

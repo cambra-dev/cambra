@@ -965,15 +965,19 @@ is an inventory of what to persist. The in-process reload already hands a succes
 predecessor's producer states through `OperatorMap::handover`, but the handover holds live
 producers. Persisting needs each producer state as data that can be written to stable storage and
 read back. `BreakingProducer::checkpoint` encodes a breaker's state as bytes and
-`BreakingProducer::restore` installs it into a graph compiled again from the same text. A
-prototype in `src/interpreter/tile_operators/checkpoint.rs` copies a breaker after each step that
-changed what it released, so each breaker's copy is of its own moment, and a test recovers from
-those copies after a crash at any step. A transaction drive recovered from an older copy emits its
-next attempt past every attempt its readers released (`TileProducer::reader_released`), since a
-row it emitted again would carry another frontier. A loop's or a transaction's open
-request is not copied: the recovered run rebuilds it from the stores and drives. A constructor's
-tag encodes its declaration as the process's id, so a checkpoint decodes in the process that wrote
-it, and a breaker's only identity across compilations is its position in a walk of the graph.
+`BreakingProducer::restore` installs it into a graph compiled again from the same text.
+
+`src/interpreter/durability/` writes each breaker's checkpoint to a store behind a trait
+(`CheckpointStore`) that hands out a ticket per write and reports the ticket through which writes
+are durable. After each top-level step the run writes a checkpoint of each breaker whose releases
+changed, so each breaker's checkpoint is of its own moment. No release waits for a durable
+checkpoint yet, so a test over an in-memory store whose writes are durable at the end of each step
+recovers after a crash at any step. A transaction drive recovered from an older checkpoint emits its
+next attempt past every attempt its readers released (`TileProducer::reader_released`), since a row
+it emitted again would carry another frontier. A loop's or a transaction's open request is not
+written: the recovered run rebuilds it from the stores and drives. A constructor's tag encodes its
+declaration as the process's id, so a checkpoint decodes in the process that wrote it, and a
+breaker's only identity across compilations is its position in a walk of the graph.
 
 A producer chooses when to checkpoint. Checkpointing once the input it has taken since its last
 checkpoint passes a bound keeps what recovery recomputes for that producer below the bound, which

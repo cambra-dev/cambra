@@ -1604,7 +1604,7 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// needs to answer every region its readers have not released, and nothing a run rebuilds.
     /// It can be taken where a loop's or a transaction's request is open. It holds no handle on
     /// an operator or a data source, so it carries nothing of the graph it came from into another
-    /// (`checkpoint.rs`).
+    /// (`crate::interpreter::durability`).
     ///
     /// # Panics
     ///
