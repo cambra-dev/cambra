@@ -693,13 +693,12 @@ fn run_targets(
                 for leaf in leaves {
                     let one = leaf.probe_region();
                     let routes = routes_to(&leaf.consumer, std::slice::from_ref(&one), pipeline);
+                    // A source whose arrivals reach no entry of the pipeline, as a loop's drive
+                    // reads a source nested in its own, brings it no row, so the pipeline is
+                    // queued every row of its input with the first notification.
                     if routes.is_empty() {
-                        unplace(&planner.placements, targets);
-                        return Err(Refused(format!(
-                            "a live source's arrivals reach no entry of {}, so no package names \
-                             them",
-                            members.names[pipeline]
-                        )));
+                        starts.push(input.universal_guard());
+                        continue;
                     }
                     let arrived = probe(&leaf.consumer, PipelineId(pipeline), &one, pipeline);
                     if !arrived
