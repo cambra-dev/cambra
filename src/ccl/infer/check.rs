@@ -1471,8 +1471,21 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         if domain.peel_refinements().sum().is_none() {
             return Some(((**domain).clone(), (**codomain).clone()));
         }
-        let boxed = name.as_ref()?;
-        let recorded = crate::ccl::subst::open_codomain(ty, codomain);
+        let (boxed, recorded) = match name {
+            Some(boxed) => (boxed, crate::ccl::subst::open_codomain(ty, codomain)),
+            // A sum whose every witness is determined projects each to its one candidate, which
+            // reads no argument, so the result names no binder (`ty::unbox_type`) and the term
+            // below is never read.
+            None if domain
+                .peel_refinements()
+                .sum()?
+                .iter()
+                .all(|w| w.sole_candidate().is_some()) =>
+            {
+                (&Name::elem(), (**codomain).clone())
+            }
+            None => return None,
+        };
         // A reference compared against and rendered, never placed in a tree.
         let term =
             Rc::new(Expr::throwaway(TypedExprNode::Var(boxed.clone())).with_ty((**domain).clone()));
