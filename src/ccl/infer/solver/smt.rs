@@ -308,7 +308,7 @@ impl BinderScope {
     }
 
     /// `f` with `facts` holding, in addition to those already in scope: a `match` arm's
-    /// facts about the value it matched ([`crate::ccl::nominal::typed_arm_facts`]).
+    /// facts about the value it matched ([`crate::ccl::nominal::typed_case_facts`]).
     pub fn assuming<R>(&mut self, facts: Vec<TypedExpr>, f: impl FnOnce(&mut Self) -> R) -> R {
         let depth = self.facts.len();
         self.facts.extend(facts);
