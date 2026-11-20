@@ -5787,6 +5787,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Builtin(_)
         | N::Apply { .. }
         | N::Cast { .. }
+        | N::Member { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
         | N::Lambda { .. }
@@ -5889,6 +5890,25 @@ fn eq_term_modulo_ty_slots_go(
                 target: t2,
             },
         ) => eq_term_modulo_ty_slots_go(v1, v2, pairs) && eq_cast_target_predicates(t1, t2, pairs),
+        // The domain is what the judgment reads, so it compares as a type rather than as a
+        // slot.
+        (
+            N::Member {
+                key: k1,
+                domain: d1,
+                kind: f1,
+            },
+            N::Member {
+                key: k2,
+                domain: d2,
+                kind: f2,
+            },
+        ) => {
+            eq_term_modulo_ty_slots_go(k1, k2, pairs)
+                && d1 == d2
+                && matches!(f1.resolved(), KindPin::Sum(_))
+                    == matches!(f2.resolved(), KindPin::Sum(_))
+        }
         (
             N::BinOp {
                 left: l1,

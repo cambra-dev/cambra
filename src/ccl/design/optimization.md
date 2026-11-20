@@ -194,6 +194,15 @@ reads a nested comprehension's guard off the component of the product domain tha
 arguments stay whole, since the declaration may place one at a domain, as `Groups(K, V) = (k: K)
 |=> V(k)` places `K`.
 
+The phase also rewrites each proven lookup into the application it denotes:
+`match ((𝑐, 𝑘) ▷ lookup?) { Option::some(𝑝) → body }` becomes `let 𝑝 = 𝑘 ▷ 𝑐 in body` when the
+`match` has no other arm and refutes `Option::none` (`apply_proven_lookups`). Inference refutes
+`none` from the lookup's refinement, which states that `𝑘` lies in `𝑐`'s domain, and the phase
+erases that refinement. Where A-normalization bound the lookup to a name with no other use, the
+binding is dropped. The application converts for a collection-valued codomain, and
+`CheckedLookup` carries only a scalar payload
+([The checked lookup's refinement](collections.md#the-checked-lookups-refinement)).
+
 Every type check from this phase through planning runs in `infer::CheckMode::RefinementBlind`,
 which selects `Derivation::RefinementBlind` for the constraint walk. That walk compares refinements
 only inside the domain edge of two data functions, and inside the kind premise between their Σ

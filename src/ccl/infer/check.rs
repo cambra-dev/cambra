@@ -22,8 +22,9 @@ use crate::ccl::{
 use super::emit::{
     emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast, emit_compose,
     emit_copair, emit_disjoint_join, emit_expr_stmt, emit_for, emit_lambda, emit_let, emit_letrec,
-    emit_list, emit_mut_decl, emit_nominal_ctor, emit_proj, emit_record, emit_transact, emit_tuple,
-    emit_unary, emit_variant_ctor, paths_are_canonical, projected_source_type,
+    emit_list, emit_member, emit_mut_decl, emit_nominal_ctor, emit_proj, emit_record,
+    emit_transact, emit_tuple, emit_unary, emit_variant_ctor, paths_are_canonical,
+    projected_source_type,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, TempNames, Typing};
@@ -1083,6 +1084,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, None, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        TypedExprNode::Member { key, .. } => emit_member(key, ctx)?,
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
         TypedExprNode::BinOp { left, op, right } => {

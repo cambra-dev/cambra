@@ -64,8 +64,8 @@ use crate::ccl::symbolic::symbolic;
 use smol_str::SmolStr;
 
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Lit, LogicKind, Name, ProjKey,
-    Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, FunKind, KindPin, Lit, LogicKind,
+    Name, ProjKey, Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
 
 /// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
@@ -1204,8 +1204,8 @@ impl<'a> Encode<'a> {
                 let (int, uint) = (self.expr(int)?, self.expr(uint)?);
                 Ok(self.ctx.eq(int, uint))
             }
-            // `𝑛 ▷ int_to_uint` of a non-negative literal is the `UInt` `𝑛`. A checked lookup's
-            // refinement spells a range's bound this way, since CCL has no `UInt` literal.
+            // `𝑛 ▷ int_to_uint` of a non-negative literal is the `UInt` `𝑛`. CCL has no `UInt`
+            // literal, so a lookup's key at a constant index is spelled this way.
             TypedExprNode::Apply { function, argument }
                 if matches!(function.node, TypedExprNode::Builtin(Builtin::IntToUint))
                     && matches!(argument.node, TypedExprNode::Lit(Lit::Int(n)) if n >= 0) =>
@@ -1273,8 +1273,72 @@ impl<'a> Encode<'a> {
                 }
                 self.binop(*op, left, right, l, r)
             }
+            TypedExprNode::Member { key, domain, kind } => self.member(key, domain, kind),
             _ => Err(unencodable(e)),
         }
+    }
+
+    /// The judgment `key : domain` that `key` is among a collection's keys
+    /// ([`TypedExprNode::Member`]).
+    ///
+    /// For a plain collection the judgment is `key`'s membership in `domain`: the bound of a
+    /// range, and each of `domain`'s predicates stated of `key`. A sum's domain is not exactly
+    /// its keys, so for a sum, and for a kind still open to being one, the judgment is a fresh
+    /// constant that that membership implies. A domain whose membership has no encoding leaves
+    /// the sum's constant unconstrained, and fails the plain collection's judgment.
+    fn member(&mut self, key: &TypedExpr, domain: &Type, kind: &FunKind) -> Result<SExpr, String> {
+        let membership = self.membership_of(key, domain);
+        match kind.resolved() {
+            KindPin::Plain => membership,
+            KindPin::Sum(_) | KindPin::Data | KindPin::Unpinned => {
+                let symbol = format!("v!{}", self.decls.len());
+                let atom = self.ctx.atom(symbol.as_str());
+                self.decls.push(Decl {
+                    symbol,
+                    sort: Sort::Bool,
+                    constrained: true,
+                });
+                if let Ok(membership) = membership {
+                    self.assumptions.push(self.ctx.imp(membership, atom));
+                }
+                Ok(atom)
+            }
+            KindPin::Compute | KindPin::Conflict => Err(format!(
+                "{} judges a key of a function that is not a collection",
+                symbolic(key)
+            )),
+        }
+    }
+
+    /// `key`'s membership in `domain`, as [`member`](Self::member) states it of a plain
+    /// collection's domain.
+    fn membership_of(&mut self, key: &TypedExpr, domain: &Type) -> Result<SExpr, String> {
+        let mut conjuncts = Vec::new();
+        match domain.peel_refinements() {
+            Type::UIntRange(n) => {
+                let key = self.expr(key)?;
+                let bound = self.ctx.numeral(
+                    i64::try_from(*n).map_err(|_| format!("the range 0..{n} exceeds an Int"))?,
+                );
+                conjuncts.push(self.ctx.gte(key, self.ctx.numeral(0)));
+                conjuncts.push(self.ctx.lt(key, bound));
+            }
+            Type::Base(_) | Type::Nominal(..) | Type::Tuple(_) | Type::Record(_) => {}
+            other => return Err(format!("the domain {other} has no membership to state")),
+        }
+        for r in domain.refinements() {
+            if !crate::ccl::subst::free_elem_indices(&r.predicate)
+                .iter()
+                .all(|&up| up == 0)
+            {
+                return Err(format!(
+                    "the domain {domain} has a predicate reading an outer refinement's element"
+                ));
+            }
+            let stated = crate::ccl::subst::discharge_elem(&r.predicate, key);
+            conjuncts.push(self.proposition(&stated)?);
+        }
+        Ok(self.ctx.and_many(conjuncts))
     }
 
     /// `𝑙 == 𝑟` or `𝑙 != 𝑟` for two paths to a product or a nominal value, which have no
@@ -2159,7 +2223,7 @@ mod tests {
         let rhs = [elem_cmp(CompareKind::Greater, var("f"))];
         let opaque = Type::Fun {
             name: None,
-            fun_kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(int()),
             codomain: Box::new(int()),
             capabilities: crate::ccl::capabilities::Capabilities::none(),

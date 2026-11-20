@@ -365,15 +365,14 @@ key is present. The [CHL reference](../../../docs/chl-spec.md#39-subscript-and-a
 owns the spellings.
 
 The call `c(k)` lowers as function application, which requires the key type to be below the
-collection's domain. Unlike `!`, that requirement reaches an unannotated key: in `\i -> xs(i)`,
-`i` is refined by `xs`'s domain, and `\i -> xs[i]!` is rejected because `i`'s type does not entail
-presence.
+collection's domain. `c[k]!` makes the same requirement through the edge its demand emits, so in
+both `\i -> xs(i)` and `\i -> xs[i]!`, `i` is bounded by `xs`'s domain.
 
-A `FullMap(K, V)` parameter's domain is `K` with no refinement, so `present` is `true` for a key of
-type `K` and `m[k]!` is accepted. That typing rule does not construct a value at such a domain. A
-concrete keyed domain requires its own membership evidence; a known source element does not
-currently acquire it automatically. A list's proven lookup accepts a `UInt` key whose refinement
-entails the range bound, such as `xs[int_to_uint(1)]!` over `0..3` (see
+A `FullMap(K, V)` parameter's domain is `K` with no refinement, so a key of type `K` meets it and
+`m[k]!` is accepted. That typing rule does not construct a value at such a domain. A concrete keyed
+domain requires its own membership evidence; a known source element does not currently acquire it
+automatically. A list's proven lookup accepts a `UInt` key whose refinement entails the range
+bound, such as `xs[int_to_uint(1)]!` over `0..3` (see
 [Semantic entailment as a fallback](type-inference.md#semantic-entailment-as-a-fallback)).
 
 ### The checked lookup `𝑐[𝑘]`
@@ -406,34 +405,36 @@ converted to point-free form. A second discharge could produce a different embed
 
 #### The checked lookup's refinement
 
-For `𝑐` typed `{𝐾 | 𝑝} ⤇ {𝑉 | 𝑞}`, the answer of `𝑐[𝑘]` is
-`{Option(𝑉) | (present and not (__elem ▷ ctor_is(Option::none)) and 𝑞[__elem ▷ ctor_payload(Option::some)/__elem]) or (not present and __elem ▷ ctor_is(Option::none))}`,
-where `present` is `𝑝[𝑘/__elem]` (`nominal::lookup_checked_refinement`). The answer is `some`
-exactly when the key is present, and its payload satisfies the codomain's refinements. The
-refinement reads `𝑘` and none of `𝑐`.
+For `𝑐` typed `𝐷 ⤇ 𝑉`, the answer of `𝑐[𝑘]` is
+`{Option(𝑉) | ((𝑘 : 𝐷) and not (__elem ▷ ctor_is(Option::none))) or (not (𝑘 : 𝐷) and __elem ▷ ctor_is(Option::none))}`
+(`nominal::lookup_checked_refinement`). The judgment `𝑘 : 𝐷` is a `Member` node that carries `𝑘`,
+`𝐷`, and `𝑐`'s function kind. Emission reads nothing of `𝑐`'s type to build it, so `𝐷` and the kind
+may still be inference variables. Coalescing resolves `𝐷` with the rest of the predicate.
 
-A range `0..𝑛` carries its bound in its type rather than in a refinement, so for a range domain
-`present` also conjoins `𝑘 < (𝑛 ▷ int_to_uint)`. CCL has no `UInt` literal, and the SMT encoding
-reads `int_to_uint` of a non-negative literal as that literal.
+The judgment states that `𝑘` is a key of `𝑐`. For a plain collection, that holds exactly when `𝑘` is
+a member of `𝐷`. A sum's domain is not exactly its keys, so for a sum a member of `𝐷` is a key and
+nothing more follows. The judgment carries the kind instead of choosing between the two statements
+at emission, because the kind may not be pinned yet.
 
-`present` occurs negated, so a refinement that states part of `𝐾`'s membership is unsound. The rule
-answers a plain `Option` wherever `present` cannot state all of it:
+`!` demands `not (__elem ▷ ctor_is(Option::none))` of its operand. Against this refinement that
+demand is the judgment `𝑘 : 𝐷`, so `constrain_refined` emits it as the edge `type(𝑘) <: 𝐷` rather
+than as an SMT query. The edge waits on `𝐷` like any other edge. It bounds an unannotated key, so
+`\i -> xs[i]!` types `i` at `xs`'s domain. The refinement travels with the answer's type, so
+`r = c[k]; r!` meets the same edge at `r!`.
 
-- `𝐾` is neither a base type nor a range.
-- One of `𝑝`'s predicates reads an element outside its own refinement.
-- `𝑐`'s type is a sum.
-- `𝑐`'s codomain depends on its key.
-- `𝑘` is outside the term fragment (`in_term_fragment`). An unencodable refinement in a query's
-  antecedent fails the query (`smt_undecided_is_mismatch`).
+Every other query reads the judgment through its SMT encoding (`Encode::member`). For a plain
+collection the encoding is `𝐷`'s membership at `𝑘`: the bound of a range `0..𝑛`, and each of `𝐷`'s
+predicates stated of `𝑘`. For a sum, and for a kind not yet pinned, it is a fresh constant that the
+membership implies. A domain whose membership has no encoding fails the plain collection's
+judgment, and the antecedent drops that refinement.
 
-A plain `Option` does not exclude `none`, so `c[k]!` is rejected in each of these cases.
-
-A predicate of `𝑞` that reads an element outside its own refinement is left out of the `some`
-branch. Leaving it out only weakens the answer.
+Refinement erasure rewrites the `match` that `!` inlines to over a lookup into the application
+`𝑘 ▷ 𝑐`, since it erases the refinement the `match` relies on
+([Refinement Erasure](optimization.md#refinement-erasure-cclerase_refinementsrs)).
 
 A check reads the refinement back from the stamp (`Typing::checked_lookup_answer`) for the same
 reason that it reads the payload back. A transparent `let`'s scope exit substitutes the key
-binder's definition into the tree, and that definition need not be in the term fragment.
+binder's definition into the tree, and the substituted refinement would hold a different key term.
 
 #### Runtime readiness and answer shape
 
@@ -476,9 +477,8 @@ values are collections. The checked lookup requires `Equatable(V, V)` of the val
 ([Constructors state what they build](../../../docs/chl-spec.md#constructors-state-what-they-build)),
 so `g[k]!` on a group-by is rejected at every key before membership is considered.
 
-A key whose type names a sum's witness through the sum's value is a member by its type, so applying
-the sum to it type-checks; see [Projecting a sum's witness](#projecting-a-sums-witness). A sum's
-checked lookup answers a plain `Option`, so `c[k]!` on a sum is rejected.
+A key whose type names a sum's witness through the sum's value is a member by its type; see
+[Projecting a sum's witness](#projecting-a-sums-witness).
 
 ## Projecting a sum's witness
 

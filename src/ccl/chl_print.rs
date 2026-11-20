@@ -740,6 +740,12 @@ impl Printer {
                 let r = self.expr_inner(right, env);
                 infix(op, l, r)
             }
+            // The judgment `𝑘 : 𝐷` in the spelling of an annotation, which states the same of a
+            // value.
+            TypedExprNode::Member { key, domain, .. } => {
+                let key = self.expr(key, Prec::Lowest, env);
+                (Prec::Atom, format!("({key}: {})", self.ty(domain)))
+            }
             TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => (
                 Prec::Unary,
                 format!("-{}", self.expr(operand, Prec::Unary, env)),

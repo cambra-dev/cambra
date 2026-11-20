@@ -845,8 +845,10 @@ as the variable's position as well as the suspension's, and an occurrence is rec
 An answer is read off other variables' bounds, and those can stand under binders `𝛼` does not: an
 application's result reads the application's expected binder until its discharge fires. The answer
 keeps only the refinements whose predicates name binders in `𝛼`'s telescope (`within_telescope`),
-because `𝛼` is pinned to it ([The invariant](#the-invariant)). Dropping a refinement only widens
-the pin.
+because `𝛼` is pinned to it ([The invariant](#the-invariant)). Dropping a refinement widens the
+pin. `Option::value`'s `match` needs it: its arm payload is pinned to the call's result, whose
+refinement names the payload through `__arg`, and coalescing does not terminate on that pin. The
+rule is removed once that result no longer reaches the payload.
 
 A bare variable is not an answer. The first answer that resolves fully wins; with none, the first
 answer with an unresolved position inside it does, which is what an upper bound to a partly known

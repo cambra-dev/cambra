@@ -1,6 +1,6 @@
 use indoc::indoc;
 
-use super::helpers::{check_compile_error, check_scalar};
+use super::helpers::{check_compile_error, check_scalar, check_sink, check_sink_error};
 
 use cambra::interpreter::Value;
 
@@ -88,8 +88,7 @@ xs[int_to_uint(1)]! == 2
     )
 }
 
-/// The key `int_to_uint(5)` refutes `xs`'s domain bound, so the checked lookup's refinement
-/// does not exclude `none`, and `!` rejects it.
+/// `!` demands that the key `int_to_uint(5)` lie in `xs`'s domain `0..3`, which it does not.
 #[test]
 fn list_lookup_rejected() {
     check_compile_error(
@@ -97,16 +96,12 @@ fn list_lookup_rejected() {
 xs = [1,2,3]
 xs[int_to_uint(5)]! == 2
         "#},
-        "Type mismatch for this call: expected {Option(‹?1›) where not _.is_none()}, found \
-         {Option(Int) where (int_to_uint(5) < int_to_uint(3) and not _.is_none() or not \
-         int_to_uint(5) < int_to_uint(3) and _.is_none())}",
+        "Type mismatch for this call: expected {UInt where _ < 3}, found {UInt where 5 == _}",
     )
 }
 
-/// A checked lookup's result is refined by whether the key is present:
-/// `{Option(Int) where (k < int_to_uint(3) and not _.is_none()) or (not k < int_to_uint(3) and
-/// _.is_none())}`, with `k < int_to_uint(3)` read off `xs`'s domain `0..3`. `k`'s refinement
-/// entails it, so the result is `some` and `!` accepts it.
+/// A checked lookup's result is refined by the judgment `k : 0..3` on `xs`'s domain, and `!`
+/// demands it of `k`'s type, which `k`'s refinement meets.
 #[test]
 fn a_checked_lookup_at_a_present_key_is_some() {
     check_scalar(
@@ -120,7 +115,7 @@ r!
     )
 }
 
-/// `k`'s refinement refutes `k < 3`, so the result is `none`.
+/// `k`'s refinement refutes the judgment `k : 0..3`, so the result is `none`.
 #[test]
 fn a_checked_lookup_at_an_absent_key_is_none() {
     check_scalar(
@@ -134,7 +129,7 @@ r.is_none()
     )
 }
 
-/// `!` demands `some` of a lookup at an absent key, which its refinement refutes.
+/// `!` demands of a lookup's key that it lie in the domain, which an absent key does not.
 #[test]
 fn unwrapping_a_checked_lookup_at_an_absent_key_is_rejected() {
     check_compile_error(
@@ -144,12 +139,12 @@ k = int_to_uint(3)
 r = xs[k]
 r!
         "#},
-        "found {Option(Int) where (k < int_to_uint(3) and not _.is_none() or not k < int_to_uint(3) and _.is_none())}",
+        "expected {UInt where _ < 3}, found {UInt where 3 == _}",
     )
 }
 
-/// The `some` branch states `xs`'s codomain refinement `_ > 0` of `_.value()`, so the payload of
-/// a lookup at a present key meets it.
+/// The answer's payload is typed at `xs`'s codomain, `{Int where _ > 0}`, so the payload of a
+/// lookup at a present key meets it.
 #[test]
 fn a_checked_lookup_payload_meets_the_codomain_refinement() {
     check_scalar(
@@ -204,41 +199,100 @@ r!
     }
 }
 
-/// A lambda parameter carries no refinement, so `!` rejects a lookup at it: `i < int_to_uint(3)`
-/// is not entailed, although the call passes a present key. Application `xs(i)` refines `i` by
-/// `xs`'s domain, and `!` does not
-/// (`src/ccl/design/collections.md`, "Lookup: membership discharge").
+/// `!` on a lookup at a lambda parameter bounds the parameter by the collection's domain, as
+/// the application `xs(i)` does: `f` is `0..3 ⇒ Int`
+/// (`src/ccl/design/collections.md`, "The checked lookup's refinement").
 #[test]
-fn a_proven_lookup_at_a_lambda_parameter_is_rejected() {
-    check_compile_error(
+fn a_proven_lookup_at_a_lambda_parameter_bounds_the_parameter() {
+    check_scalar(
         indoc! {r#"
             xs = [1, 2, 3]
             f = \i -> xs[i]!
             f(int_to_uint(1))
         "#},
-        "found {Option(Int) where (i < int_to_uint(3) and not _.is_none() or not i < int_to_uint(3) and _.is_none())}",
+        Value::Int(2),
+    )
+}
+
+/// A call of a function holding a proven lookup at its parameter must pass a present key.
+#[test]
+fn a_proven_lookup_at_a_lambda_parameter_rejects_an_absent_key() {
+    check_compile_error(
+        indoc! {r#"
+            xs = [1, 2, 3]
+            f = \i -> xs[i]!
+            f(int_to_uint(5))
+        "#},
+        "expected {UInt where _ < 3}, found {UInt where 5 == _}",
+    )
+}
+
+/// The demand `!` makes waits on the collection's domain, so a proven lookup is accepted into a
+/// collection whose value type is unresolved when the lookup is emitted.
+#[test]
+#[ignore = "TODO: inference does not terminate: the payload variable takes `Option::value`'s dependent result as a bound"]
+fn a_proven_lookup_into_a_mutable_list() {
+    check_sink(
+        indoc! {r#"
+            xs := [1, 2, 3]
+            out = test_sink()
+            out << xs[int_to_uint(1)]!
+        "#},
+        "[() -> 2]",
+    )
+}
+
+/// The inner lookup's collection is the outer lookup's answer, unresolved when the inner one is
+/// emitted.
+#[test]
+#[ignore = "TODO: inference does not terminate: the payload variable takes `Option::value`'s dependent result as a bound"]
+fn a_nested_proven_lookup() {
+    check_sink(
+        indoc! {r#"
+            xss = [[1, 2], [3, 4]]
+            out = test_sink()
+            out << xss[int_to_uint(1)]![int_to_uint(0)]!
+        "#},
+        "[() -> 3]",
+    )
+}
+
+/// A proven lookup whose value is a list, bound before it is consumed. Refinement erasure
+/// rewrites the unwrap of the lookup into the application `int_to_uint(1) ▷ xss`, which converts
+/// for a list-valued codomain.
+#[test]
+fn a_proven_lookup_of_a_row_of_a_list_of_lists() {
+    check_sink(
+        indoc! {r#"
+            xss = [[1, 2], [3, 4]]
+            r = xss[int_to_uint(1)]!
+            out = test_sink()
+            out << sum(r)
+        "#},
+        "[() -> 7]",
     )
 }
 
 // The proven lookups below fail although the key is present. Each test pins the current failure;
 // when a failure is fixed, the test is rewritten to check the value.
 
-/// TODO: Accept a proven lookup into a collection whose domain is unresolved at emission.
+/// TODO: Accept a proven lookup at a literal key of a collection built from its keys.
 ///
-/// A collection whose domain is still an inference variable when the checked lookup is emitted
-/// answers a plain `Option`, which `!` rejects at a present literal key. `map(…)`, `set(…)`, a
-/// comprehension and a filter each have such a domain. A `Map` annotation makes the collection a
-/// sum, whose checked lookup also answers a plain `Option`
-/// (`src/ccl/design/collections.md`, "The checked lookup's refinement").
+/// `!` demands that the key's type lie in the collection's domain, as the application `c(k)`
+/// does, and each of these domains rejects a literal key's singleton. A `map(…)` or `set(…)`
+/// domain states its keys as a list membership, which the solver does not decide. A
+/// comprehension's domain joins with the key's singleton and the join narrows a data domain. A
+/// filter's domain carries the filter's predicate. A `Map` annotation makes the collection a sum,
+/// whose domain is its witness's.
 #[test]
-fn a_proven_lookup_into_a_collection_with_an_unresolved_domain_is_rejected() {
+fn a_proven_lookup_into_a_collection_built_from_its_keys_is_rejected() {
     for (program, found) in [
         (
             indoc! {r#"
                 m = map([1 -> 10, 2 -> 20])
                 m[1]!
             "#},
-            "found Option(Int)",
+            "expected {Int where _ in [1, 2]}, found {Int where _ == 1}",
         ),
         (
             indoc! {r#"
@@ -246,14 +300,14 @@ fn a_proven_lookup_into_a_collection_with_an_unresolved_domain_is_rejected() {
                 k = "b"
                 m[k]!
             "#},
-            "found Option(Int)",
+            "expected {String where _ in [\"a\", \"b\"]}, found {String where _ == \"b\"}",
         ),
         (
             indoc! {r#"
                 s = set([1, 2])
                 s[1]!
             "#},
-            "found Option({})",
+            "expected {Int where _ in [1, 2]}, found {Int where _ == 1}",
         ),
         (
             indoc! {r#"
@@ -261,7 +315,7 @@ fn a_proven_lookup_into_a_collection_with_an_unresolved_domain_is_rejected() {
                 ys = [x + 1 for x in xs]
                 ys[int_to_uint(0)]!
             "#},
-            "found Option(Int)",
+            "Conflicting Domains: UInt vs {UInt where _ < 3}",
         ),
         (
             indoc! {r#"
@@ -269,14 +323,14 @@ fn a_proven_lookup_into_a_collection_with_an_unresolved_domain_is_rejected() {
                 ys = [x for x in xs if x > 1]
                 ys[int_to_uint(1)]!
             "#},
-            "found Option(Int)",
+            "expected {{UInt where 1 == _} where xs[_]! > 1}, found {UInt where 1 == _}",
         ),
         (
             indoc! {r#"
                 m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))
                 m[1]!
             "#},
-            "found Option(Int)",
+            "expected ‹outer keys›, found {Int where _ == 1}",
         ),
     ] {
         check_compile_error(program, found);
@@ -299,22 +353,27 @@ fn a_proven_lookup_under_a_bound_guard_is_rejected() {
                     0
             f(int_to_uint(1))
         "#},
-        "found {Option(Int) where (i < int_to_uint(3) and not _.is_none() or not i < int_to_uint(3) and _.is_none())}",
+        "expected {UInt where _ < 3}, found UInt",
     )
 }
 
 /// TODO: Accept a proven lookup at keys drawn from a list whose every key is present.
 ///
-/// A comprehension variable drawn from a list of keys is typed by the list's value type, `UInt`,
-/// which does not entail `xs`'s bound although every key is below it.
+/// Inference accepts the edge from `i` to `xs`'s domain `0..3`, since each key in the list is
+/// below 3, and then resolves `i` at the list's value type `UInt`, which the post-inference check
+/// rejects. The application `xs(i)` meets the same edge and fails the same way.
 #[test]
-fn a_proven_lookup_at_keys_drawn_from_a_key_list_is_rejected() {
-    check_compile_error(
+#[should_panic(
+    expected = "post-inference produced an invalid tree: [Type mismatch for this call: expected \
+                {UInt where _ < 3}, found UInt"
+)]
+fn a_proven_lookup_at_keys_drawn_from_a_key_list_fails_the_post_inference_check() {
+    check_scalar(
         indoc! {r#"
             xs = [10, 20, 30]
             sum([xs[i]! for i in [int_to_uint(0), int_to_uint(2)]])
         "#},
-        "found {Option(Int) where (i < int_to_uint(3) and not _.is_none() or not i < int_to_uint(3) and _.is_none())}",
+        Value::Int(40),
     )
 }
 
@@ -381,26 +440,6 @@ fn a_proven_lookup_into_a_mutable_list_is_rejected() {
     )
 }
 
-/// TODO: Convert a proven lookup whose value is a list.
-///
-/// A lookup whose value is a list type-checks and fails op-conversion: the checked lookup's
-/// operator takes a collection with scalar values.
-#[test]
-#[should_panic(
-    expected = "needs a collection that tiles either as a one-level function over a \
-                           scalar codomain"
-)]
-fn a_proven_lookup_of_a_row_of_a_list_of_lists_fails_conversion() {
-    check_scalar(
-        indoc! {r#"
-            xss = [[1, 2], [3, 4]]
-            r = xss[int_to_uint(1)]!
-            sum(r)
-        "#},
-        Value::Int(7),
-    )
-}
-
 /// TODO: Keep a proven lookup into a transactional array valid through post-transact.
 ///
 /// A proven lookup into a transactional array inside a block type-checks, and the post-transact
@@ -425,19 +464,18 @@ fn a_proven_lookup_into_a_transactional_array_fails_post_transact() {
     )
 }
 
-/// TODO: Compute a `UInt` sum as a `UInt`, so a proven lookup at one runs.
+/// TODO: Refine a `UInt` sum, so a proven lookup at one is accepted.
 ///
-/// The key `int_to_uint(1) + int_to_uint(1)` is proven present, and the program fails at runtime:
-/// a `UInt` sum is computed as `UInts` where an `Int` is expected. `int_to_uint(1) +
-/// int_to_uint(1)` alone fails the same way.
+/// `int_to_uint(1) + int_to_uint(1)` is typed `UInt`, unrefined, so the key does not lie in
+/// `xs`'s domain `0..3`.
 #[test]
-#[should_panic(expected = "which does not tile as Int")]
-fn a_proven_lookup_at_a_uint_sum_fails_at_runtime() {
-    check_scalar(
+fn a_proven_lookup_at_a_uint_sum_is_rejected() {
+    check_sink_error(
         indoc! {r#"
             xs = [1, 2, 3]
-            xs[int_to_uint(1) + int_to_uint(1)]!
+            out = test_sink()
+            out << xs[int_to_uint(1) + int_to_uint(1)]!
         "#},
-        Value::Int(3),
+        "expected {UInt where _ < 3}, found UInt",
     )
 }

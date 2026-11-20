@@ -1822,6 +1822,9 @@ fn all_binders(expr: &Expr, out: &mut HashSet<Name>) {
 /// residue), so dropping it is value-preserving.
 fn drop_expr_stmts(mut expr: Expr) -> Expr {
     match expr.node {
+        TypedExprNode::Member { .. } => {
+            unreachable!("a Member reached channelize; it stands only in a refinement predicate")
+        }
         TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
             "a Raise or Try reached channelize; exception elimination removes every one"
         ),
@@ -1909,6 +1912,9 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
 /// report the first one left at itself.
 fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
     match &expr.node {
+        TypedExprNode::Member { .. } => {
+            unreachable!("a Member reached channelize; it stands only in a refinement predicate")
+        }
         TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
             "a Raise or Try reached channelize; exception elimination removes every one"
         ),
@@ -2630,6 +2636,11 @@ fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
 fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
     fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
         match &expr.node {
+            TypedExprNode::Member { .. } => {
+                unreachable!(
+                    "a Member reached channelize; it stands only in a refinement predicate"
+                )
+            }
             TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
                 "a Raise or Try reached channelize; exception elimination removes every one"
             ),
@@ -3003,6 +3014,9 @@ fn extract_for_defer_impl(
         site,
     } = expr;
     let node = match node {
+        TypedExprNode::Member { .. } => {
+            unreachable!("a Member reached channelize; it stands only in a refinement predicate")
+        }
         TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
             "a Raise or Try reached channelize; exception elimination removes every one"
         ),

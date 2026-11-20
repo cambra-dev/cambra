@@ -636,6 +636,12 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             })
         }
 
+        TypedExprNode::Member { .. } => {
+            unreachable!(
+                "a Member reached A-normalization; it stands only in a refinement predicate"
+            )
+        }
+
         TypedExprNode::Cast { value, target } => {
             // **The third recognition contract: a refined cast's value is
             // copied into its own target.** `groupby(c, key)` lowers to

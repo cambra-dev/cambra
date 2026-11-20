@@ -2779,6 +2779,26 @@ fn constrain_refined(
     {
         return Ok(());
     }
+    // A demand that an `Option` is `some`, met by a checked lookup's answer, is exactly a
+    // demand that the lookup's key is present. Its requirement is the edge `type(𝑘) <: 𝐷`
+    // rather than a query: the edge waits on `𝐷` like any other, and it bounds an unannotated
+    // key (`src/ccl/design/collections.md`, "The checked lookup's refinement").
+    if !deficit.is_empty()
+        && !range_demand
+        && let Some(member) = lrefs_in_ambient
+            .iter()
+            .find_map(crate::ccl::nominal::presence_judgment)
+        && rrefs_in_ambient
+            .iter()
+            .filter(|r| !lrefs_in_ambient.contains(r) && !guard.contains(r))
+            .all(|r| crate::ccl::nominal::excludes_none(&r.predicate))
+    {
+        let crate::ccl::TypedExprNode::Member { key, domain, .. } = &member.node else {
+            unreachable!("presence_judgment answers a Member node")
+        };
+        constrain_go(&key.ty, domain, &Subst::id(), &Subst::id(), cache, scope)?;
+        return constrain_go(lbase, rbase, sl, sr, cache, scope);
+    }
     if deficit.is_empty() && !range_demand {
         // lhs's explicit layers already supply every refinement rhs requires.
         constrain_go(lbase, rbase, sl, sr, cache, scope)
