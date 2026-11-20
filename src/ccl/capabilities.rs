@@ -1972,6 +1972,13 @@ pub struct CapabilityVarId(pub(crate) u32);
 
 static CAPABILITY_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// The id the next capability variable minted will take: every one already minted has a smaller
+/// one.
+#[cfg(debug_assertions)]
+pub(crate) fn next_capability_var_id() -> CapabilityVarId {
+    CapabilityVarId(CAPABILITY_VAR_COUNTER.load(Ordering::Relaxed))
+}
+
 thread_local! {
     /// How many facts have been written to capability variables on this thread. A resolution
     /// computed at the current count is still the answer.
