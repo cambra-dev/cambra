@@ -356,7 +356,7 @@ struct PlannedSpecialization {
     let_node: NodeId,
     name: Name,
     key: SpecKey,
-    shareable: bool,
+    open: Option<OpenKey>,
     instantiation: Type,
     /// The binder it stands under, with the binders its variables entered, when it is placed
     /// below its definition ([`CoalesceCtx::placed`]).
@@ -522,11 +522,9 @@ struct Specialization {
     /// is what makes the comparison self-consistent (see
     /// `src/ccl/design/type-inference.md`, "Keying a specialization").
     key: SpecKey,
-    /// Whether another use with this key may share it: false for a use whose instantiation
-    /// still held a variable, which the clone's pins answered from that use's own join
-    /// (`src/ccl/design/type-inference.md`, "A use the key does not determine shares no
-    /// clone").
-    shareable: bool,
+    /// What the clone's pins read from the use's context, for an instantiation that leaves
+    /// variables to them; `None` for one that leaves none ([`clone_key`]).
+    open: Option<OpenKey>,
     /// The instantiation of the use that minted this specialization, as it stood before the
     /// pin. A use with this same instantiation, the same variables, is a copy of that use (a
     /// refinement predicate quotes the term it refines by), so the pins answered its join, and
@@ -3904,21 +3902,17 @@ pub(super) fn specialize_use(
     // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
     // than on fresh `Infer` placeholder ids. Inference deliberately tolerates the
     // residue (`Type::Infer`'s invariant); the strict post-inference typecheck rejects it.
-    let key = spec_key(solver, &use_expr.ty);
-    // A use whose instantiation leaves a variable for the clone's pins shares no clone: the
-    // pins give that variable what the join around the use supplies, which the key does not
-    // read, so the key does not determine the clone. The test is the pins' own: nothing
-    // reaches the variable, or, at an output, no value does. See
-    // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
-    let shareable = !crate::ccl::subst::type_contains_infer(&resolved)
-        && !coalesce_positive(solver, &use_expr.ty)
-            .is_ok_and(|values| has_output_variable(&values, true));
+    //
+    // A use whose instantiation leaves variables for the clone's pins also keys on what those
+    // pins read from the use's context ([`clone_key`]).
+    let (key, open) = clone_key(solver, &use_expr.ty, &resolved, ctx);
     // A copy of a use already specialized shares its clone: its instantiation is the same
     // variables, so the clone's pins answered the one join around both. See
-    // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
+    // `src/ccl/design/type-inference.md`, "A use shares the clone its pins answer alike".
     let instantiation = use_expr.ty.clone();
+    let by_key = !open.as_ref().is_some_and(|o| o.unanswered) || ctx.discarding;
     let shares = |s: &Specialization| {
-        s.instantiation == instantiation || (shareable && s.shareable && s.key == key)
+        s.instantiation == instantiation || (by_key && s.key == key && s.open == open)
     };
     // **A use whose instance reads a binder entered between the definition and the use** —
     // a definition applied to a group, whose type reads the group's key — has a
@@ -3955,6 +3949,9 @@ pub(super) fn specialize_use(
             .find(|p| p.frame_name == frame_name && p.binder == *binder && shares(&p.spec))
         {
             let spec = placed.spec.plan;
+            if placed.spec.instantiation != instantiation {
+                pin_answered(solver, open.as_ref(), use_expr.node_id(), ctx);
+            }
             ctx.plan
                 .uses
                 .insert(use_expr.node_id(), UseDecision::Served { spec });
@@ -3973,21 +3970,24 @@ pub(super) fn specialize_use(
         // a trait function, typed at the operands their call states rather than fresh ones.
         #[cfg(debug_assertions)]
         assert!(
-            (shareable && spec.shareable && spec.key == key)
+            (spec.key == key && spec.open == open)
                 || spec.quoted
                 || ctx.in_quoted > 0
                 || (spec.instance_call && instance_call),
             "two uses of `{}` in the tree share the instantiation {instantiation}: \
              inference instantiates each use with fresh variables, and only a refinement \
              predicate's copy of a use may carry them (`src/ccl/design/type-inference.md`, \
-             \"A use the key does not determine shares no clone\")",
+             \"A use shares the clone its pins answer alike\")",
             spec.name.base(),
         );
-        let spec = spec.plan;
+        let (spec, by_instantiation) = (spec.plan, spec.instantiation == instantiation);
         ctx.plan
             .uses
             .insert(use_expr.node_id(), UseDecision::Served { spec });
-        // A hit is *not* re-pinned, and the reason is worth recording because
+        if !by_instantiation {
+            pin_answered(solver, open.as_ref(), use_expr.node_id(), ctx);
+        }
+        // A hit is *not* re-pinned against its clone, and the reason is worth recording because
         // pinning here looks like the obvious way to make the key's faithfulness
         // checked rather than argued. It is not available: a miss pins a
         // *var-laden* clone, so its pin identifies variables, while a hit's
@@ -4421,7 +4421,7 @@ pub(super) fn specialize_use(
         let_node: frame.let_node,
         name: spec_name.clone(),
         key: key.clone(),
-        shareable,
+        open: open.clone(),
         instantiation: instantiation.clone(),
         placement: placement.clone(),
         clone: Some(clone),
@@ -4436,7 +4436,7 @@ pub(super) fn specialize_use(
     });
     let spec = Specialization {
         key,
-        shareable,
+        open,
         instantiation,
         #[cfg(debug_assertions)]
         quoted,
@@ -4466,12 +4466,12 @@ pub(super) fn specialize_use(
     // table write-only (see `src/ccl/design/type-inference.md`,
     // "Keying a specialization").
     debug_assert!(
-        !shareable
+        !by_key
             || frame
                 .specs
                 .iter()
-                .all(|s| !s.shareable || s.key != spec.key),
-        "specialization memo invariant (one shareable entry per distinct key) violated: \
+                .all(|s| s.key != spec.key || s.open != spec.open),
+        "specialization memo invariant (one entry per distinct key) violated: \
          minting a second specialization of `{}` for key {} — the lookup and \
          the insert disagree about what identifies a specialization",
         frame.name,
@@ -4507,6 +4507,146 @@ fn suspend_for_clone(
             .extend(entered.iter().cloned().map(ScopeEntry::Shadow));
     }
     (kept_to, suspended)
+}
+
+/// What decides the clone a use gets, besides an instantiation it shares with a copy of
+/// itself: its [`SpecKey`], and, where its instantiation leaves variables for the clone's
+/// pins, what those pins read from the use's context (`src/ccl/design/type-inference.md`, "A
+/// use shares the clone its pins answer alike").
+///
+/// A variable is left to the pins where nothing reaches it, or, at an output, no value does:
+/// the pins' own test. The second part is then the instantiation as resolved and as the values
+/// reaching it read it, each variable left standing replaced by the type its position gives it
+/// where one is determined ([`accepted_position_type`], the pins' answer), and every other one
+/// numbered in order of occurrence. Two uses with equal parts get clones pinned alike: what
+/// differs between their contexts the pins do not read.
+fn clone_key(
+    solver: &mut Solver,
+    use_ty: &Type,
+    resolved: &Type,
+    ctx: &mut CoalesceCtx,
+) -> (SpecKey, Option<OpenKey>) {
+    let key = spec_key(solver, use_ty);
+    let values = coalesce_positive(solver, use_ty);
+    if !crate::ccl::subst::type_contains_infer(resolved)
+        && !values
+            .as_ref()
+            .is_ok_and(|values| has_output_variable(values, true))
+    {
+        return (key, None);
+    }
+    let mut numbering = OpenNumbering::default();
+    let read = Type::Tuple(vec![
+        numbering.read(solver, resolved, ctx),
+        numbering.read(solver, &values.unwrap_or(Type::Hole), ctx),
+    ]);
+    let open = OpenKey {
+        read,
+        answered: numbering.answered,
+        unanswered: numbering.open,
+    };
+    (key, Some(open))
+}
+
+/// Pin each variable of a use sharing another use's clone that a position determines to that
+/// position's type, as the use's own clone's pins would have: the shared clone was pinned to the
+/// other use's variables, which the key says read alike (`src/ccl/design/type-inference.md`, "A
+/// use shares the clone its pins answer alike").
+fn pin_answered(
+    solver: &mut Solver,
+    open: Option<&OpenKey>,
+    at_use: NodeId,
+    ctx: &mut CoalesceCtx,
+) {
+    let Some(open) = open else {
+        return;
+    };
+    for (var, position) in &open.answered {
+        if let Err(error) = pin_both_ways(solver, position, &Type::Infer(Rc::clone(var))) {
+            ctx.errors.push(LocatedInferError::new(
+                map_constrain_err(solver, error, PIN_LABEL),
+                at_use,
+            ));
+        }
+    }
+}
+
+/// [`clone_key`]'s second part, for a use whose instantiation leaves variables to the clone's
+/// pins.
+#[derive(Clone)]
+struct OpenKey {
+    /// What the pins read from the use's context, the part two uses compare.
+    read: Type,
+    /// Each variable a position determines, with its position's type: a use sharing a clone is
+    /// pinned to these, as its own clone's pins would pin it, so nothing relates it to the use
+    /// the clone was minted for.
+    answered: Vec<(Rc<crate::ccl::infer_var::InferVar>, Type)>,
+    /// Whether some variable no position determines stands in the instantiation. A use with one
+    /// shares a clone only where the walk's types are dropped: elsewhere its own clone would
+    /// leave that variable for the use's later context, which a shared one cannot.
+    unanswered: bool,
+}
+
+impl PartialEq for OpenKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.read == other.read
+    }
+}
+
+/// [`clone_key`]'s reading of the variables an instantiation leaves standing: each one's
+/// position type, or its number.
+#[derive(Default)]
+struct OpenNumbering {
+    read: HashMap<InferVarId, Type>,
+    /// Each variable read as its position's type, with that type: what a use sharing the clone
+    /// is pinned to ([`OpenKey::answered`]).
+    answered: Vec<(Rc<crate::ccl::infer_var::InferVar>, Type)>,
+    /// Whether a variable no position determines was numbered.
+    open: bool,
+}
+
+impl OpenNumbering {
+    fn read(&mut self, solver: &mut Solver, ty: &Type, ctx: &mut CoalesceCtx) -> Type {
+        let mut out = ty.clone();
+        self.replace(solver, &mut out, ctx, true);
+        out
+    }
+
+    /// Replace each variable in `ty`: by its position's type where `answer` and one is
+    /// determined, and by its number otherwise. A position type's own variables are numbered,
+    /// not answered, so the reading ends.
+    fn replace(&mut self, solver: &mut Solver, ty: &mut Type, ctx: &mut CoalesceCtx, answer: bool) {
+        if let Type::Infer(v) = ty {
+            let v = Rc::clone(v);
+            if let Some(read) = self.read.get(&v.uid) {
+                *ty = read.clone();
+                return;
+            }
+            let number = Type::SharedHole(
+                u32::try_from(self.read.len()).expect("fewer than 2^32 variables in one key"),
+            );
+            self.read.insert(v.uid, number.clone());
+            let read = match answer
+                .then(|| accepted_position_type(solver, &v, ctx))
+                .flatten()
+            {
+                Some(position) => {
+                    self.answered.push((Rc::clone(&v), position.clone()));
+                    let mut read = position;
+                    self.replace(solver, &mut read, ctx, false);
+                    read
+                }
+                None => {
+                    self.open = true;
+                    number
+                }
+            };
+            self.read.insert(v.uid, read.clone());
+            *ty = read;
+            return;
+        }
+        ty.walk_children_mut(|child| self.replace(solver, child, ctx, answer));
+    }
 }
 
 /// Undo [`suspend_for_clone`].
@@ -4560,12 +4700,12 @@ fn report_failed_use(
 /// The specialization serving a use the write pass never met: a use in a copy of a predicate,
 /// which resolving a type makes. The copy's use shares the specialization of the use it
 /// copies, which has its instantiation, or which its key shares (`src/ccl/design/
-/// type-inference.md`, "A use the key does not determine shares no clone").
+/// type-inference.md`, "A use shares the clone its pins answer alike").
 fn copied_use_spec(
     solver: &mut Solver,
     use_expr: &Expr,
     frame_idx: usize,
-    ctx: &CoalesceCtx,
+    ctx: &mut CoalesceCtx,
 ) -> usize {
     let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
@@ -4576,34 +4716,30 @@ fn copied_use_spec(
          not this one",
         frame.name,
     );
-    let let_node = frame.let_node;
-    let ours = |s: &&PlannedSpecialization| s.let_node == let_node;
+    let (let_node, name) = (frame.let_node, frame.name.clone());
     if let Some(at) = ctx
         .plan
         .specs
         .iter()
-        .position(|s| ours(&s) && s.instantiation == use_expr.ty)
+        .position(|s| s.let_node == let_node && s.instantiation == use_expr.ty)
     {
         return at;
     }
     let shared = resolve_var_type(solver, &use_expr.ty)
         .ok()
         .and_then(|resolved| {
-            let shareable = !crate::ccl::subst::type_contains_infer(&resolved)
-                && !coalesce_positive(solver, &use_expr.ty)
-                    .is_ok_and(|values| has_output_variable(&values, true));
-            let key = spec_key(solver, &use_expr.ty);
+            let (key, open) = clone_key(solver, &use_expr.ty, &resolved, ctx);
             ctx.plan
                 .specs
                 .iter()
-                .position(|s| ours(&s) && shareable && s.shareable && s.key == key)
+                .position(|s| s.let_node == let_node && s.key == key && s.open == open)
         });
     shared.unwrap_or_else(|| {
         panic!(
             "internal error: a predicate's copy of a use of `{}` needs a specialization the \
              use it copies did not make: its instantiation is not that use's, and its key \
              shares none",
-            frame.name,
+            name,
         )
     })
 }
@@ -4675,7 +4811,7 @@ fn serve_use(
     let planned = &ctx.plan.specs[spec];
     let stamped = Specialization {
         key,
-        shareable: planned.shareable,
+        open: planned.open.clone(),
         instantiation: planned.instantiation.clone(),
         #[cfg(debug_assertions)]
         quoted: planned.quoted,
@@ -5748,6 +5884,34 @@ mod tests {
                  subtree"
             );
         }
+    }
+
+    /// A call graph whose definitions each call the next twice, at the variables the caller
+    /// leaves open, is cloned once per definition: every such use inside a definition checked
+    /// alone reads alike, so its callee's clone is shared (`src/ccl/design/type-inference.md`,
+    /// "A use shares the clone its pins answer alike"). Unshared, each use cloned its callee and
+    /// each clone its own callees, which doubled the clones per level.
+    #[test]
+    fn a_call_graph_used_at_open_variables_clones_once_per_definition() {
+        // `f0 … f{depth}`, each applying its predecessor twice, and a call of the last.
+        let graph = |depth: usize| {
+            let mut s = String::from("f0 = \\x -> x\n");
+            for k in 1..=depth {
+                s.push_str(&format!("f{k} = \\x -> f{p}(f{p}(x))\n", p = k - 1));
+            }
+            s.push_str(&format!("f{depth}(1)\n"));
+            s
+        };
+        // Each level adds the definition's clone at the caller's open variables and its clone
+        // at `Int`.
+        let (shallow, deep) = (inference_clones(&graph(2)), inference_clones(&graph(4)));
+        assert_eq!(
+            deep - shallow,
+            4,
+            "two more levels of the call graph made {} more clones ({shallow} at depth 2, \
+             {deep} at depth 4): uses at open variables are not sharing their callee's clone",
+            deep - shallow,
+        );
     }
 
     /// `x : history := 10 in λ y → body`, inferred, as the type its lambda has.
