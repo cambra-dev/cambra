@@ -435,18 +435,17 @@ impl Breaker for ExtractFinalProducer {
 impl BreakingProducer for ExtractFinalProducer {
     /// The final value once there is one, whether it is complete, and the row at the greatest key
     /// merged so far.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        Box::new((
-            state.final_tile.clone(),
-            state.complete,
-            state.merged.clone(),
-        ))
+        checkpoint::encode(
+            &self.name(),
+            &(&state.final_tile, state.complete, &state.merged),
+        )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+    fn restore(&mut self, state: &[u8]) {
         let (final_tile, complete, merged) =
-            checkpoint::state_of::<(Option<Tile>, bool, Tile)>(&self.name(), state);
+            checkpoint::decode::<(Option<Tile>, bool, Tile)>(&self.name(), state);
         *self.state.get_mut().unwrap_or_else(PoisonError::into_inner) = FinalValueState {
             final_tile,
             complete,

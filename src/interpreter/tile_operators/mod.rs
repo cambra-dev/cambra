@@ -1600,16 +1600,16 @@ pub trait BreakingProducer: TileProducer + Breaker {
         self.entry_placement(input).into_iter().collect()
     }
 
-    /// The breaker's state as data: what a recovered breaker needs to answer every region its
-    /// readers have not released, and nothing a run rebuilds. A test copies it between top-level
-    /// steps, where a loop's or a transaction's request may be open. It holds no
-    /// handle on an operator or a data source, so it carries nothing of the graph it came from
-    /// into another (`checkpoint.rs`).
+    /// The breaker's state encoded as bytes ([`checkpoint::encode`]): what a recovered breaker
+    /// needs to answer every region its readers have not released, and nothing a run rebuilds.
+    /// It can be taken where a loop's or a transaction's request is open. It holds no handle on
+    /// an operator or a data source, so it carries nothing of the graph it came from into another
+    /// (`checkpoint.rs`).
     ///
     /// # Panics
     ///
     /// The default panics, so a breaker with no checkpoint fails a recovery loudly.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         panic!("{} has no checkpoint", self.name())
     }
 
@@ -1623,7 +1623,7 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// # Panics
     ///
     /// The default panics, as [`checkpoint`](Self::checkpoint) does.
-    fn restore(&mut self, _state: Box<dyn std::any::Any + Send>) {
+    fn restore(&mut self, _state: &[u8]) {
         panic!("{} has no checkpoint to restore", self.name())
     }
 }

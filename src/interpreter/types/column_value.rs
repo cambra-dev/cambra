@@ -21,7 +21,7 @@ pub fn bindings_are_list(bindings: &[FuncBinding]) -> bool {
 }
 
 /// A function binding represents a single input-output pair for a function
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FuncBinding {
     pub input: Value,
     pub output: Value,
@@ -58,7 +58,7 @@ fn retain_vec<T>(v: &mut Vec<T>, mask: &[bool]) {
 
 /// Columnar data for vectorized execution.
 /// Each variant holds a typed batch of values produced during interpretation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColumnValue {
     Units(usize),
     Ints(Vec<i64>),
@@ -104,7 +104,7 @@ pub enum ColumnValue {
 /// it. Exposing the two vectors would make that a convention each caller has to
 /// honour; going through the constructors and [`slot_of`](Self::slot_of) makes it a
 /// property of the type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnionArm {
     /// Ascending row positions this arm occupies; parallel to `values`.
     rows: Vec<usize>,

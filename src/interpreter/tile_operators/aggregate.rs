@@ -344,17 +344,18 @@ impl Breaker for AggregateProducer {
 impl BreakingProducer for AggregateProducer {
     /// The accumulator, final or partial: a partial one is the fold of the input already
     /// released, which nothing upstream holds any more.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
-        Box::new(
-            self.accumulator
+    fn checkpoint(&self) -> Vec<u8> {
+        checkpoint::encode(
+            &self.name(),
+            &*self
+                .accumulator
                 .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
+                .unwrap_or_else(PoisonError::into_inner),
         )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let accumulator = checkpoint::state_of::<Tile>(&self.name(), state);
+    fn restore(&mut self, state: &[u8]) {
+        let accumulator = checkpoint::decode::<Tile>(&self.name(), state);
         *self
             .accumulator
             .get_mut()
@@ -586,13 +587,13 @@ impl Breaker for ExtractAggregateProducer {
 
 impl BreakingProducer for ExtractAggregateProducer {
     /// The extracted value and whether it is complete, which outlives the value's reclamation.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        Box::new((state.extracted.clone(), state.complete))
+        checkpoint::encode(&self.name(), &(&state.extracted, state.complete))
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let (extracted, complete) = checkpoint::state_of::<(Tile, bool)>(&self.name(), state);
+    fn restore(&mut self, state: &[u8]) {
+        let (extracted, complete) = checkpoint::decode::<(Tile, bool)>(&self.name(), state);
         *self.state.get_mut().unwrap_or_else(PoisonError::into_inner) = ExtractedAggregate {
             extracted,
             complete,
@@ -1212,6 +1213,7 @@ impl MapAggregateState {
 }
 
 /// A [`MapAggregateProducer`]'s state as a checkpoint copies it out.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct MapAggregateCheckpoint {
     accumulators: HashMap<Vec<Value>, Tile>,
     keys_with_nothing_beneath: HashSet<Vec<Value>>,
@@ -1221,7 +1223,7 @@ struct MapAggregateCheckpoint {
 /// What the answers of a map aggregate's input state about completeness: the outermost keys
 /// that are complete, each level's, the folded level's, and the groups that are, over whole
 /// paths.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Stated {
     /// Completion at each enclosing level, outermost first.
     level_predicates: Vec<Predicate>,
@@ -1236,7 +1238,7 @@ struct Stated {
 /// Whether an enclosing level's keys follow the level beneath, and how many keys the answers
 /// held there. Two answers unite it as a merge of their tiles would
 /// ([`merged_follow`](crate::interpreter::tiling::merged_follow)).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Follows {
     follows: bool,
     keys: usize,
@@ -1440,17 +1442,20 @@ impl Breaker for MapAggregateProducer {
 impl BreakingProducer for MapAggregateProducer {
     /// Every group's accumulator, the keys with nothing beneath, and what the answers stated.
     /// The kind is the compiled program's.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
-        Box::new(MapAggregateCheckpoint {
-            accumulators: state.accumulators.clone(),
-            keys_with_nothing_beneath: state.keys_with_nothing_beneath.clone(),
-            stated: state.stated.clone(),
-        })
+        checkpoint::encode(
+            &self.name(),
+            &MapAggregateCheckpoint {
+                accumulators: state.accumulators.clone(),
+                keys_with_nothing_beneath: state.keys_with_nothing_beneath.clone(),
+                stated: state.stated.clone(),
+            },
+        )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let saved = checkpoint::state_of::<MapAggregateCheckpoint>(&self.name(), state);
+    fn restore(&mut self, state: &[u8]) {
+        let saved = checkpoint::decode::<MapAggregateCheckpoint>(&self.name(), state);
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.accumulators = saved.accumulators;
         state.keys_with_nothing_beneath = saved.keys_with_nothing_beneath;

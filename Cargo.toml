@@ -62,7 +62,7 @@ indoc = "1.0"
 log = "0.4.29"
 env_logger = "0.11.9"
 tiny_http = "0.12"
-bit-set = "0.8.0"
+bit-set = { version = "0.8.0", features = ["serde"] }
 intervalsets = "0.1.0-alpha.2"
 # Pinned to the version `intervalsets` already pulls in, so the tree builds one copy.
 itertools = "0.13"
@@ -75,6 +75,9 @@ stacker = "0.1"
 # in wall-clock, while the gate cost a standing clippy configuration.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Encodes breaker checkpoints (`src/interpreter/tile_operators/checkpoint.rs`): a compact binary
+# serde format that, unlike JSON, takes maps keyed by any value.
+postcard = { version = "1", features = ["use-std"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 # Line tables only: backtraces, profilers and line breakpoints keep `file.rs:line`,

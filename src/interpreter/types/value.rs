@@ -236,8 +236,25 @@ impl std::fmt::Display for FunctionDef {
     }
 }
 
+/// The encoding of [`Value::ComputableFunction`]'s compiled function, which has none: both
+/// directions fail. It stands in the variant's field rather than skipping the variant, because a
+/// skipped variant shifts the indices of the variants after it on decoding and not on encoding.
+mod no_encoding {
+    use serde::{Deserializer, Serializer, de::Error as _, ser::Error as _};
+
+    use super::FunctionDef;
+
+    pub(super) fn serialize<S: Serializer>(_: &FunctionDef, _: S) -> Result<S::Ok, S::Error> {
+        Err(S::Error::custom("a compiled function has no encoding"))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(_: D) -> Result<FunctionDef, D::Error> {
+        Err(D::Error::custom("a compiled function has no encoding"))
+    }
+}
+
 /// Values in CCL
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Int(i64),
     UInt(u64),
@@ -248,7 +265,9 @@ pub enum Value {
     Function(Vec<FuncBinding>),
     /// A record value
     Record(HashMap<SmolStr, Value>),
-    ComputableFunction(FunctionDef),
+    /// A compiled function, which has no encoding: a checkpoint holding one fails to encode
+    /// ([`checkpoint::encode`](crate::interpreter::tile_operators::checkpoint::encode)).
+    ComputableFunction(#[serde(with = "no_encoding")] FunctionDef),
     /// A tagged union value: `tag` names which arm, `inner` is the payload.
     ///
     /// The tag is a [`FieldKey`], not a position, so a union value is
@@ -390,7 +409,7 @@ impl PartialOrd for Value {
 /// orders the way the product's own loop runs. This wrapper is that comparison as an [`Ord`], which is
 /// what an ordered map keyed by position needs. Comparing positions of two different
 /// domains panics, naming the store or stream whose domain is not one domain.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Position(Value);
 
 impl Position {
@@ -458,7 +477,7 @@ impl PartialOrd for Position {
 /// This is **drive order**, which is not the order a release guard reads a path in: a
 /// guard names a region, one arm per level, and asks whether it covers the path
 /// (`TileGuard::covers_path`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct Path(Vec<Value>);
 
 impl Path {

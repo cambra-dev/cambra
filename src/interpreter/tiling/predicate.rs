@@ -161,13 +161,13 @@ fn join_with_any(arm: &Predicate, arms: &[Predicate]) -> Option<(usize, Predicat
 /// General unions can still have different representations of one region;
 /// [`subsumes`](Self::subsumes) tests containment.
 /// See `src/interpreter/design-operators.md`, "Predicate".
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Predicate {
     True,
     False,
     /// An ordered scalar key's admitted values. Never built over records: a record key is
     /// described field by field, as a [`Record`](Self::Record) or a union of them.
-    Intervals(IntervalSet<Value>),
+    Intervals(#[serde(with = "interval_set_encoding")] IntervalSet<Value>),
     /// A componentwise predicate over a record key: the AND of each field's predicate.
     Record(HashMap<SmolStr, Predicate>),
     /// The union of multiple predicates — admits any value accepted by any arm.
@@ -1745,6 +1745,58 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
             }
         }
         other => other,
+    }
+}
+
+/// The encoding of [`Predicate::Intervals`]: each interval as its left and right bound, `None` on
+/// an unbounded side, and a bound as whether it is closed and its value. A set holds no empty
+/// interval, which this cannot spell.
+mod interval_set_encoding {
+    use intervalsets::{Bound, Bounding, Interval, IntervalSet, Side};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::interpreter::Value;
+
+    type Encoded<V> = Vec<(Option<(bool, V)>, Option<(bool, V)>)>;
+
+    pub(super) fn serialize<S: Serializer>(
+        set: &IntervalSet<Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        fn bound(bound: Option<&Bound<Value>>) -> Option<(bool, &Value)> {
+            bound.map(|b| (b.is_closed(), b.value()))
+        }
+        let intervals: Encoded<&Value> = set
+            .intervals()
+            .iter()
+            .map(|interval| (bound(interval.left()), bound(interval.right())))
+            .collect();
+        intervals.serialize(serializer)
+    }
+
+    /// The set as [`serialize`] wrote it. The intervals are already sorted, disjoint and
+    /// normalized, being a set's, so the set is rebuilt without `IntervalSet::new`, which would
+    /// merge or reorder nothing here but checks it again.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<IntervalSet<Value>, D::Error> {
+        let bound = |(closed, value): (bool, Value)| {
+            if closed {
+                Bound::closed(value)
+            } else {
+                Bound::open(value)
+            }
+        };
+        let intervals = Encoded::<Value>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(left, right)| match (left.map(bound), right.map(bound)) {
+                (None, None) => Interval::unbounded(),
+                (Some(left), None) => Interval::new_half_bounded(Side::Left, left),
+                (None, Some(right)) => Interval::new_half_bounded(Side::Right, right),
+                (Some(left), Some(right)) => Interval::new_finite(left, right),
+            })
+            .collect();
+        Ok(IntervalSet::new_unchecked(intervals))
     }
 }
 

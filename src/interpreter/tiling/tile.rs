@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// A materialized data tile produced by a [`TileProducer`](crate::interpreter::tile_operators::TileProducer).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tile {
     /// Scalar cells in enclosing-row order; an empty root column is an unknown scalar.
     Scalar(ColumnValue),
@@ -199,7 +199,7 @@ pub enum Tile {
 /// What a transaction store that takes its writers' decisions ahead of their commits says to one
 /// writer of the decisions it took: see `src/interpreter/design-operators.md`, "Ready transaction
 /// decisions". The writer's drive reads it through the store's recurrence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WriterTakes {
     /// The exact source region whose decisions have committed or stood.
     pub settled: Predicate,

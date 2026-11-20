@@ -117,7 +117,9 @@ pub fn context() -> Rc<NominalDecl> {
 /// takes no context to look it up in.
 ///
 /// [`Value`]: crate::interpreter::Value
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct DeclId(u32);
 
 #[derive(Default)]
