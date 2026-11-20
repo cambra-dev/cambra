@@ -3806,6 +3806,17 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             pool := pool + y
     await_final(pool)
 "}, "100")]
+#[case::a_second_writer_that_never_writes(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    for x in source1():
+        with begin():
+            pool := pool - x
+    for y in source1():
+        with begin():
+            if y > 100:
+                pool := pool + y
+    await_final(pool)
+"}, "85")]
 #[case::a_memo_read_twice(indoc! {"
     xs = source1()
     [x + sum(xs) for x in xs]
@@ -3851,9 +3862,9 @@ fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
 /// A crash the test stops a process at, as an unwind out of [`Persisting::stepped`].
 struct Crashed;
 
-/// A run's observer that persists every breaker whose releases or stated completeness changed
-/// after each step (`Checkpoint::persist`), pauses at every
-/// drained boundary, and crashes after the crash point `crash_after` names.
+/// A run's observer that persists every breaker whose releases changed after each step
+/// (`Checkpoint::persist`), pauses at every drained boundary, and crashes after the crash point
+/// `crash_after` names.
 ///
 /// Every top-level step is a crash point, those inside a loop's or a transaction's open request
 /// included: the recovered run rebuilds the request from the breakers (`checkpoint.rs`).

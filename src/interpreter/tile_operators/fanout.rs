@@ -1546,6 +1546,9 @@ impl TileProducer for FanOutProducer {
             .max(finished);
         shared.positions[index] = shared.positions[index].clone().max(position);
         shared.release_guards[index] = accumulated;
+        if let Some(Inner::Owned(producer)) = shared.producer.as_ref() {
+            producer.reader_released(&obsolete_guard);
+        }
         drop(shared);
         release_shared(&shared_rc);
     }

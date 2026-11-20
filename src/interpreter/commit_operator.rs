@@ -5371,6 +5371,11 @@ impl DriverWindow {
         Position::new(Value::UInt(self.attempts))
     }
 
+    /// Advance the next attempt past `highest`, where it is not already past it.
+    fn skip_attempts_through(&mut self, highest: u64) {
+        self.attempts = self.attempts.max(highest + 1);
+    }
+
     /// Append an inner row at absolute position `position`, under `outer_row`.
     #[allow(clippy::too_many_arguments)]
     fn push(
@@ -7141,6 +7146,7 @@ impl TileOperator for TransactDriver {
                     Some(self.item_positions.clone()),
                 ),
                 latest_emit: None,
+                replaying: true,
                 source_released: self.resumed_from.clone().unwrap_or(Predicate::False),
             }),
         })
@@ -7186,6 +7192,11 @@ struct TransactionDriverState {
     /// is a pure function of that pair, so re-emitting at an unchanged pair would
     /// duplicate a domain position against the body's `Memo`.
     latest_emit: Option<(Position, Position)>,
+    /// Whether the drive has not stepped since it was built or restored. Only then can a
+    /// reader's release name an attempt it has not emitted ([`reader_released`]).
+    ///
+    /// [`reader_released`]: TileProducer::reader_released
+    replaying: bool,
     /// The exact source region released by acknowledgements or decided-absent rows.
     source_released: Predicate,
 }
@@ -7255,6 +7266,7 @@ impl TransactDriverProducer {
 
 impl TransactDriverProducer {
     fn advance(&self, state: &mut TransactionDriverState) -> Tile {
+        state.replaying = false;
         // Read the source after a notification or consuming delivery. Between those arrivals
         // and the drive's own releases its tile does not grow, so the last decode still answers.
         // A release removes what the driver has finished with. The drive
@@ -7492,6 +7504,7 @@ impl BreakingProducer for TransactDriverProducer {
         state.window.resume(saved.window);
         state.latest_emit = saved.latest_emit;
         state.source_released = saved.source_released;
+        state.replaying = true;
     }
 
     fn complete(&self) -> TileGuard {
@@ -7570,6 +7583,45 @@ impl TileProducer for TransactDriverProducer {
 
         if input == "source" {
             state.source_news.record(&Projection::Everything);
+        }
+    }
+
+    /// The next attempt lies past every attempt a reader has released. A row carries the
+    /// store's frontier at its emit. An attempt emitted twice carries two frontiers, and the
+    /// body reads one through its `Memo` while the writer reads the other from the drive, so one
+    /// attempt would be decided from two rows.
+    ///
+    /// A release names an attempt the drive has not emitted only where recovery replays the
+    /// releases its readers made after the drive's latest copy, before the drive's first step.
+    /// The drive then holds no rows: a copy that held rows the readers later superseded would
+    /// read the writer's replayed supersession release as its item's finish
+    /// (`release_impl`), and the assertion below rules that case out rather than handling it.
+    fn reader_released(&self, released: &TileGuard) {
+        let TileGuard::Function(FunctionGuard::Domain(released)) = released else {
+            return;
+        };
+        let Some(Value::UInt(highest)) = released.max_released_position().map(Position::into_value)
+        else {
+            return;
+        };
+        let mut state_guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = &mut *state_guard;
+        if highest >= state.window.attempts {
+            assert!(
+                state.replaying,
+                "a reader releases attempt {highest} of a drive that has emitted {} attempts \
+                 after the drive's first step",
+                state.window.attempts
+            );
+            assert_eq!(
+                state.window.inner_row_count(),
+                0,
+                "a drive skips attempts only from an empty window"
+            );
+            state.window.skip_attempts_through(highest);
         }
     }
 
