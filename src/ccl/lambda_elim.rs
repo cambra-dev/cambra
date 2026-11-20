@@ -1833,7 +1833,9 @@ fn elim_lambda_impl(
         //
         // The operator is the one its instance runs: inference made `String + String`
         // `Concat` when it chose the `Addable` row.
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } => {
             let left = *left;
             let right = *right;
             let fn_ty = operation_type(
@@ -1872,7 +1874,7 @@ fn elim_lambda_impl(
         }
 
         // UnaryOp — desugar to Apply, then apply the application rule.
-        TypedExprNode::UnaryOp(op, inner) => {
+        TypedExprNode::UnaryOp(op, inner, _) => {
             let op_builtin = Builtin::for_unaryop(op);
             let inner = *inner;
             let fn_ty = operation_type(&[&inner], &inner.ty, &body_ty);
@@ -2714,7 +2716,9 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // BinOp (non-Compose): desugar to function application form.
         // `a op b` ≡ `(a, b) ▷ op_fn` — mirrors what `elim_lambda` does for
         // the same pattern inside a lambda body, making the CCL uniform.
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } => {
             let left_elim = elim_lambdas(ctx, *left)?;
             let right_elim = elim_lambdas(ctx, *right)?;
             let tuple_ty = Type::Tuple(vec![left_elim.ty.clone(), right_elim.ty.clone()]);
@@ -2744,7 +2748,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
 
         // UnaryOp: desugar to function application form.
         // `op(x)` ≡ `x ▷ op_fn` — mirrors `elim_lambda`'s treatment.
-        TypedExprNode::UnaryOp(op, inner) => {
+        TypedExprNode::UnaryOp(op, inner, _) => {
             let op_builtin = Builtin::for_unaryop(op);
             let inner_elim = elim_lambdas(ctx, *inner)?;
             let fn_ty = Type::compute_fun_or_hole(&inner_elim.ty, &ty);

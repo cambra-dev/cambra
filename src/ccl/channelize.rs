@@ -2693,7 +2693,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(left, bound, out);
                 rec(right, bound, out);
             }
-            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Aggregate { input: inner, .. } => {
+            TypedExprNode::UnaryOp(_, inner, _) | TypedExprNode::Aggregate { input: inner, .. } => {
                 rec(inner, bound, out);
             }
             TypedExprNode::Tuple(elts)
@@ -3295,7 +3295,13 @@ fn extract_for_defer_impl(
             )?),
             target,
         },
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
+        TypedExprNode::BinOp {
+            left,
+            op,
+            right,
+            obligation,
+        } => TypedExprNode::BinOp {
+            obligation,
             left: Box::new(extract_for_defer(*left, cx, feeds, define, in_inner_scope)?),
             op,
             right: Box::new(extract_for_defer(
@@ -3306,7 +3312,7 @@ fn extract_for_defer_impl(
                 in_inner_scope,
             )?),
         },
-        TypedExprNode::UnaryOp(op, inner) => TypedExprNode::UnaryOp(
+        TypedExprNode::UnaryOp(op, inner, obligation) => TypedExprNode::UnaryOp(
             op,
             Box::new(extract_for_defer(
                 *inner,
@@ -3315,6 +3321,7 @@ fn extract_for_defer_impl(
                 define,
                 in_inner_scope,
             )?),
+            obligation,
         ),
         TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
             input: Box::new(extract_for_defer(

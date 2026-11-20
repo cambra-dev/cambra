@@ -4768,6 +4768,7 @@ mod tests {
                 left: Box::new(tvar(&x, int.clone())),
                 op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
                 right: Box::new(tvar(&i, int.clone())),
+                obligation: Default::default(),
             });
             sum.ty = int.clone();
             let mut write = Expr::mut_write(x.clone(), Occurrence::mint(), sum);

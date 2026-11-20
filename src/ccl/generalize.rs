@@ -1613,6 +1613,7 @@ fn refinements_in_scope(
             left,
             op: BinOpKind::BoolLogic(LogicKind::And),
             right,
+            ..
         } = &e.node
         {
             conjuncts_in_scope(left, out_of_scope, reads_own, out);

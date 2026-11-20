@@ -347,8 +347,9 @@ monomorphic definition's waiting calls wait with the enclosing one's, a failed s
 nothing, and the program's own are refused once emission ends.
 
 Coalescing replaces a waiting call's placeholder with the candidate its selected row reaches,
-before anything reads the node, and the use specializes as any use of a generalized definition
-does. No `Method` node survives inference. A method no type declares is a lowering error pointing at
+before anything reads the node
+([type-inference.md, "A call reads its obligation's answer"](type-inference.md#a-call-reads-its-obligations-answer)),
+and the use specializes as any use of a generalized definition does. No `Method` node survives inference. A method no type declares is a lowering error pointing at
 `(r.f)(…)`, the call of a field's function, and a position, `t.0(…)`, names no method.
 
 ### The compiler-provided `Option`

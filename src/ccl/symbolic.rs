@@ -434,7 +434,9 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             trait_, function, ..
         } => (Precedence::Atom, format!("{trait_}::{function}")),
 
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } => {
             let Binding {
                 own,
                 left: l,
@@ -446,7 +448,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (own, format!("{l} {sym} {r}"))
         }
 
-        TypedExprNode::UnaryOp(op, operand) => match op {
+        TypedExprNode::UnaryOp(op, operand, _) => match op {
             UnaryOpKind::Neg => {
                 let s = format!("-{}", fmt(operand, Precedence::Unary, opts));
                 (Precedence::Unary, s)

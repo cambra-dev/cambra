@@ -366,7 +366,7 @@ pub(super) fn resolve_predicate_types(solver: &mut Solver, ty: &mut Type) {
     fn resolve_expr(solver: &mut Solver, e: &mut TypedExpr) {
         // A collection's `elements` call is the identity, which coalescing drops; the message
         // reads the collection as the program spells it.
-        while let Some(collection) = solve::elements_of_a_collection(solver, e) {
+        while let Some(collection) = solve::elements_of_a_collection(e) {
             *e = collection;
         }
         if let Ok(resolved) = resolve_var_type(solver, &e.ty) {
@@ -1682,11 +1682,13 @@ fn attempt_run(
     // own deposits can determine, so this follows the sweep.
     {
         let mut cache = solver::ConstrainCache::new();
-        if let Err((error, node)) =
-            solver::traits::deliver_resolutions(&mut sub_ctx.solver, &mut cache, |solver, ty| {
-                resolve_var_type(solver, ty).ok()
-            })
-        {
+        let vars = sub_ctx.solver.infer_vars().to_vec();
+        if let Err((error, node)) = solver::traits::deliver_resolutions(
+            &mut sub_ctx.solver,
+            &vars,
+            &mut cache,
+            |solver, ty| resolve_var_type(solver, ty).ok(),
+        ) {
             let failure = cache.take_failure();
             // A loop's positions are the one operand known to reach here
             // (`deliver_resolutions`); anything else is named generically.

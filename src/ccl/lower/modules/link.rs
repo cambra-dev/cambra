@@ -286,7 +286,9 @@ pub(super) fn settle_const_params(
 fn fold(expr: &mut Expr) -> bool {
     let mut changed = false;
     expr.walk_children_mut(|child| changed |= fold(child));
-    if let TypedExprNode::BinOp { left, op, right } = &expr.node
+    if let TypedExprNode::BinOp {
+        left, op, right, ..
+    } = &expr.node
         && let (TypedExprNode::Lit(l), TypedExprNode::Lit(r)) = (&left.node, &right.node)
         && let Some(value) = crate::ccl::constant::fold_binop(*op, l, r)
     {
@@ -294,13 +296,14 @@ fn fold(expr: &mut Expr) -> bool {
         changed = true;
     }
     let negated = match &expr.node {
-        TypedExprNode::UnaryOp(crate::ccl::UnaryOpKind::Neg, operand) => match operand.node {
+        TypedExprNode::UnaryOp(crate::ccl::UnaryOpKind::Neg, operand, _) => match operand.node {
             TypedExprNode::Lit(Lit::Int(n)) => n.checked_neg().map(Lit::Int),
             _ => None,
         },
         TypedExprNode::UnaryOp(
             crate::ccl::UnaryOpKind::Not | crate::ccl::UnaryOpKind::NotRefined,
             operand,
+            _,
         ) => match operand.node {
             TypedExprNode::Lit(Lit::Bool(b)) => Some(Lit::Bool(!b)),
             _ => None,
