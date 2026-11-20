@@ -153,7 +153,7 @@ impl Consumer for Widening {
     /// wholly complete, and not at all otherwise: each output key depends on every input key, so
     /// the path completes only part of what a row depends on.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(self, |landing| match region {
+        landing.completing_part(|landing| match region {
             Projection::Everything => self.0.notify(region, landing),
             _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
             _ if landing.is_complete() => {}
@@ -176,7 +176,7 @@ struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(self, |landing| self.0.notify(region, landing));
+        landing.completing_part(|landing| self.0.notify(region, landing));
     }
 }
 
@@ -329,7 +329,7 @@ impl Consumer for OneLevelIn {
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries, so the path completes only part of what a row depends on.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(self, |landing| self.pass_on(region, landing));
+        landing.completing_part(|landing| self.pass_on(region, landing));
     }
 }
 
@@ -397,7 +397,7 @@ mod tests {
         let reached = landing.routes();
         assert_eq!(reached.len(), 1);
         assert!(!reached[0].keeps_keys);
-        assert!(!reached[0].part_path.is_empty());
+        assert!(reached[0].completes_part);
     }
 
     /// A value replaced beneath the outermost level widens a change only where it names keys of
@@ -705,14 +705,19 @@ impl FieldBeneathRows {
 }
 
 impl Consumer for FieldBeneathRows {
-    /// A complete region of one field completes part of what each row it reaches depends on: the
-    /// row is complete once every field is ([`Landing::completing_part`]).
+    /// A region of one field names that field of each row it reaches, which already says it is
+    /// part of the row, so a complete region is passed on unmarked: the arms of a zip over one
+    /// pipeline receive its complete region in one landing, and the fields they name together
+    /// are the row. A change is marked as completing part ([`Landing::completing_part`]).
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let restated = self.restated(region);
         if restated == Projection::Nothing && landing.queues() {
             return;
         }
-        landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
+        match landing.is_complete() {
+            true => self.consumer.notify(&restated, landing),
+            false => landing.completing_part(|landing| self.consumer.notify(&restated, landing)),
+        }
     }
 }
 
@@ -766,12 +771,24 @@ impl WholeValuesAt {
 impl Consumer for WholeValuesAt {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let restated = self.restated(region);
-        match restated == *region {
-            true => self.1.notify(region, landing),
-            // A part decides only part of what the value is computed from.
-            false => landing.completing_part(self, |landing| self.1.notify(&restated, landing)),
+        match (restated == *region, landing.is_complete()) {
+            (true, _) => self.1.notify(region, landing),
+            // A complete part of the input's value completes none of the value computed from all
+            // of it, so only the region's whole keys are complete.
+            (false, true) => self.1.notify(&whole_keys(region), landing),
+            // A changed part changes the whole value computed from it.
+            (false, false) => landing.completing_part(|landing| self.1.notify(&restated, landing)),
         }
     }
+}
+
+/// The arms of `region` that name whole keys, without its arms within some values.
+fn whole_keys(region: &Projection) -> Projection {
+    Projection::any_of(
+        region_arms(region)
+            .into_iter()
+            .filter(|arm| !arm.names_part_of_values()),
+    )
 }
 
 /// The outermost keys the paths `keys`, `levels` levels beneath them, run through.
@@ -875,9 +892,23 @@ impl Pairing {
     }
 }
 
+impl Pairing {
+    /// Pass `restated` on. A change of one input names pairs whose other half may still change,
+    /// so it completes part of what a pair depends on ([`Landing::completing_part`]). A complete
+    /// region is passed on unmarked: both inputs of a pairing read what one push brings in the
+    /// same landing, so each pair's halves complete together, and halves from different
+    /// pipelines are joined by the reader's record per read.
+    fn pass_on(&self, restated: &Projection, landing: &mut Landing<'_>) {
+        match landing.is_complete() {
+            true => self.consumer.notify(restated, landing),
+            false => landing.completing_part(|landing| self.consumer.notify(restated, landing)),
+        }
+    }
+}
+
 impl Consumer for Pairing {
-    /// A complete region decides only its own input's half of each pair, so the path completes
-    /// part of what a pair depends on ([`Landing::completing_part`]).
+    /// Restates a region of one input as the pairs it reaches ([`Delivered`]), passed on as
+    /// [`pass_on`](Self::pass_on) says.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         // Only a landing that queues packages grows what has been delivered and is cut by it. A
         // completion record states what is decided rather than what arrived, and queues
@@ -976,7 +1007,7 @@ impl Consumer for Pairing {
             if landing.queues() && restated == Projection::Nothing {
                 return;
             }
-            landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
+            self.pass_on(&restated, landing);
             return;
         }
         // A region beneath a constant's outermost keys names paths inside the values of keys
@@ -1000,20 +1031,18 @@ impl Consumer for Pairing {
             if landing.queues() && restated == Projection::Nothing {
                 return;
             }
-            landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
+            self.pass_on(&restated, landing);
             return;
         }
         let Some((pairs, record)) = self.pairs(region, recorded, &delivered) else {
             drop(delivered);
             match self.side {
                 // A constant's region beneath its outermost keys names no key of the pairs.
-                PairingSide::ConstantKeys => landing.completing_part(self, |landing| {
+                PairingSide::ConstantKeys => landing.completing_part(|landing| {
                     landing
                         .widened(|landing| self.consumer.notify(&Projection::Everything, landing))
                 }),
-                // A region beneath the pairs is one input's half of those pairs, as every region
-                // this side passes on is.
-                _ => landing.completing_part(self, |landing| self.consumer.notify(region, landing)),
+                _ => self.consumer.notify(region, landing),
             }
             return;
         };
@@ -1025,6 +1054,6 @@ impl Consumer for Pairing {
             return;
         }
         let restated = Projection::keys_at(self.at, pairs);
-        landing.completing_part(self, |landing| self.consumer.notify(&restated, landing));
+        self.pass_on(&restated, landing);
     }
 }

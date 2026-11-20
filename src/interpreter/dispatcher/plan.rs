@@ -43,9 +43,7 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// Every pipeline that reads another holds the rows its pushes and its start bring until every
 /// pipeline it reads has completed them, and reads each row once ([`Dispatcher::wait_for_inputs`]). A push
 /// brings the rows it names at the reader's entry, restated by the consumers between the two, a
-/// widening one's as every row. A reader reads its input whole ([`Dispatcher::read_whole`]) where
-/// a pipeline it reads pushes along no route to it, which a route walk of the consumers between
-/// them finds ([`routes_to`]), or where no push and no start region names a region of its input. The
+/// widening one's as every row. The
 /// region a push names comes from a probe: the pushing breaker pushes `Everything` through its
 /// consumer, as a push in the run would climb it, and the planner looks at what reaches the
 /// reader's entry ([`Landing::probe`]). So is each range under a reader of pushes (an
@@ -821,7 +819,6 @@ fn run_targets(
             }
         };
         planned[pipeline].live = true;
-        planned[pipeline].whole |= matches!(notifies, Notifies::Whole);
         // A store or a loop's scope steps on the pipelines it reads by pull, so it holds each
         // delivery until they have completed it (`Dispatcher::wait_for_inputs`).
         if matches!(
@@ -1737,8 +1734,8 @@ pub(super) fn plan_edges(
             // finished: a push from beneath stops at the store's entry rather than reach the
             // cycle.
             Consumes::Whole if !arrivals[reader] => {
-                dispatcher.read_whole(PipelineId(reader), &input);
-                planned[reader].whole = true;
+                dispatcher.wait_for_inputs(PipelineId(reader));
+                planned[reader].held = true;
                 continue;
             }
             // A nested loop's scope takes the row the scope around it queues it once the pipelines
@@ -1759,7 +1756,6 @@ pub(super) fn plan_edges(
         // What the pushes of the pipelines it reads name of its input, `None` before any.
         let mut pushed: Option<TileGuard> = None;
         // Whether a pipeline it reads pushes along no route to it, so it reads that one by pull.
-        let mut unreached = false;
         // The breakers whose routes were read, by the record of pushes their pipelines share
         // (`pushes_with`).
         let mut seen: Vec<usize> = Vec::new();
@@ -1775,43 +1771,11 @@ pub(super) fn plan_edges(
                 end_of(PipelineId(read)).unwrap_or_else(|| pushing_end(reach, PipelineId(read)));
             let routes = routes_to(&pusher, &one, reader);
             if routes.is_empty() {
-                unreached = true;
                 continue;
-            }
-            // A row reached along paths whose complete regions decide different parts of it is
-            // complete once each of those paths has completed it ([`PartPath`]). Each path reaches
-            // what a push of the read's every key, wholly complete, lands as along it, and all of
-            // the input where that push does not take it.
-            let arrivals = complete_reach(&pusher, PipelineId(read), reader);
-            let mut part_paths: Vec<PartPath> = Vec::new();
-            for route in complete_routes_to(&pusher, &one, reader) {
-                if !part_paths.contains(&route.part_path) {
-                    part_paths.push(route.part_path);
-                }
-            }
-            if part_paths.len() > 1 {
-                for path in part_paths {
-                    let reach = arrivals
-                        .iter()
-                        .filter(|arrival| arrival.part_path == path)
-                        .map(|arrival| arrival.guard.clone())
-                        .reduce(|a, b| a.union(&b));
-                    for &shared in read_all
-                        .iter()
-                        .filter(|&&r| pushes_with[r] == pushes_with[read])
-                    {
-                        dispatcher.completes_along(
-                            PipelineId(reader),
-                            PipelineId(shared),
-                            path.clone(),
-                            reach.clone(),
-                        );
-                    }
-                }
             }
             // A read along a route reaches what a push of its every key, wholly complete, lands
             // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.
-            let region = arrivals
+            let region = complete_reach(&pusher, PipelineId(read), reader)
                 .iter()
                 .fold(input.empty_guard(), |region, arrival| {
                     region.union(&arrival.guard)
@@ -1869,12 +1833,6 @@ pub(super) fn plan_edges(
         // that takes arrivals is queued its rows as its sources yield them, and any other reads
         // its input whole where a pipeline it reads reaches it by pull, or where nothing else
         // brings it a row.
-        let whole = !arrivals[reader] && (unreached || (pushed.is_none() && left.is_empty()));
-        if whole {
-            dispatcher.read_whole(PipelineId(reader), &input);
-            planned[reader].whole = true;
-            continue;
-        }
         if !planned[reader].held {
             dispatcher.wait_for_inputs(PipelineId(reader));
             planned[reader].held = true;

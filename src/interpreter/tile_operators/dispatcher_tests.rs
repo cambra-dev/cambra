@@ -671,38 +671,6 @@ fn a_package_of_another_tiling_is_refused() {
     );
 }
 
-/// A pipeline that reads its input whole consumes that input in morsels that partition it once
-/// the pipeline it reads finishes, whatever that pipeline pushes: here a guard of a sum, while
-/// the scripted breaker's input answers rows.
-#[test]
-fn a_pipeline_reading_its_input_whole_consumes_it_in_morsels() {
-    let breakers: Vec<BreakerHandle> = vec![
-        aggregate_over(Box::new(Input::over(&source(0..6))), &sum_tiling()),
-        Scripted::holding(ints().universal_guard()),
-    ];
-    let input = breakers[1]
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .input_tiling(InputId::ONLY);
-    wire(&[vec![], vec![0]], &breakers);
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
-    dispatcher.read_whole(PipelineId(1), &input);
-    run(&dispatcher, &breakers);
-    let consumed = consumed_by(&dispatcher.into_events(), 1);
-    assert!(
-        consumed.len() > 1,
-        "the rows in morsels of two: {consumed:?}"
-    );
-    assert_eq!(partition_gap(&input.universal_guard(), &consumed), None);
-}
-
-/// A source starts from its input, so it has no pipeline to read whole after.
-#[test]
-#[should_panic(expected = "pipeline 0 reads its input whole only after a pipeline it reads")]
-fn a_source_read_whole_is_refused() {
-    Dispatcher::new(vec![vec![]], UNBOUNDED).read_whole(PipelineId(0), &ints());
-}
-
 #[test]
 #[should_panic(expected = "cycle")]
 fn pipelines_that_read_each_other_are_refused() {
@@ -1809,14 +1777,11 @@ impl Consumer for WidensDeliveries {
 
 /// Pipeline 1 reading pipeline 0, with the routes the planner walks of `walked` for a push of key
 /// 0 planned as pipeline 0's ([`walk_routes`](crate::interpreter::dispatcher::walk_routes)), and
-/// pipeline 0's breaker pushing `held` once it finishes: through `pushed`, or through `walked`
-/// itself, as a planner walks the consumer a push climbs. A route names the consumers on it that
-/// complete part of a row by address ([`PartPath`](crate::interpreter::dispatcher::PartPath)), so
-/// only a push through the walked consumer itself takes a walked route that has one. With
-/// `waits`, pipeline 1 waits for its inputs, so it takes a widened push.
+/// pipeline 0's breaker pushing `held` through `pushed` once it finishes. With `waits`, pipeline 1
+/// waits for its inputs, so it takes a widened push.
 fn planned_through(
     walked: Box<dyn Consumer>,
-    pushed: Option<Box<dyn Consumer>>,
+    pushed: Box<dyn Consumer>,
     held: TileGuard,
     waits: bool,
 ) -> Dispatcher {
@@ -1836,10 +1801,7 @@ fn planned_through(
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .base_mut()
-        .pushing_to(match pushed {
-            Some(pushed) => Arc::new(Boxed(pushed)),
-            None => walked,
-        });
+        .pushing_to(Arc::new(Boxed(pushed)));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         scripted
             .write()
@@ -1856,7 +1818,7 @@ fn a_push_lands_along_the_route_its_planner_walked() {
     let shared = gated_entry(&ints());
     let dispatcher = planned_through(
         forwarding_consumer_keeping_keys(&shared),
-        None,
+        forwarding_consumer_keeping_keys(&shared),
         keys_between(0, 1),
         false,
     );
@@ -1873,7 +1835,7 @@ fn a_push_of_every_key_lands_unwidened_through_a_widening() {
     let shared = gated_entry(&ints());
     let dispatcher = planned_through(
         forwarding_consumer(&shared),
-        None,
+        forwarding_consumer(&shared),
         ints().universal_guard(),
         false,
     );
@@ -1895,7 +1857,7 @@ fn a_push_along_a_route_its_planner_did_not_walk_fails_the_run() {
     let shared = gated_entry(&ints());
     planned_through(
         Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
-        None,
+        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
         keys_between(0, 1),
         true,
     );
@@ -1912,7 +1874,7 @@ fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
     let shared = gated_entry(&ints());
     planned_through(
         Box::new(|| {}),
-        Some(forwarding_consumer_keeping_keys(&shared)),
+        forwarding_consumer_keeping_keys(&shared),
         keys_between(0, 1),
         false,
     );
@@ -1935,63 +1897,9 @@ fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
     ]);
     let parts: Vec<_> = walk(&paths)
         .into_iter()
-        .map(|route| !route.part_path.is_empty())
+        .map(|route| route.completes_part)
         .collect();
     assert_eq!(parts, [true, false, true]);
-}
-
-/// Pipeline 1 reading pipeline 0 along a widening path and a path that keeps keys, each planned
-/// as its own part path ([`Dispatcher::completes_along`]), after pipeline 0's breaker pushes `held`
-/// as complete through both.
-#[cfg(debug_assertions)]
-fn completed_along_two_paths(held: TileGuard) -> Dispatcher {
-    let scripted = Scripted::holding(held);
-    let shared = gated_entry(&ints());
-    let paths: SharedConsumer = Arc::new(Paths(vec![
-        forwarding_consumer(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-    ]));
-    scripted
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .base_mut()
-        .pushing_to(paths.clone());
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.wait_for_inputs(PipelineId(1));
-    for route in walk(&*paths) {
-        dispatcher.completes_along(PipelineId(1), PipelineId(0), route.part_path, None);
-    }
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .finish(InputId::ONLY, pushes)
-    });
-    dispatcher
-}
-
-/// A read that reaches its reader along a widening path and a path that keeps keys completes a row
-/// once both paths have: the widening path names nothing complete until its pipeline has completed
-/// every key, so a complete push of some keys completes no row, though the path that keeps keys
-/// records them.
-#[cfg(debug_assertions)]
-#[test]
-fn a_read_along_a_widening_and_a_keeping_path_completes_no_row_of_a_part() {
-    let dispatcher = completed_along_two_paths(keys_between(0, 1));
-    assert!(!dispatcher.input_complete(PipelineId(1), &keys_between(0, 0)));
-    assert!(matches!(
-        dispatcher.complete_of(PipelineId(1), PipelineId(0)),
-        crate::interpreter::dispatcher::Completion::Region(_)
-    ));
-}
-
-/// Once the pipeline it reads has completed every key, each path's region is complete, whatever
-/// it was restated to on the way, so every row is.
-#[cfg(debug_assertions)]
-#[test]
-fn a_read_along_a_widening_and_a_keeping_path_completes_every_row_once_whole() {
-    let dispatcher = completed_along_two_paths(ints().universal_guard());
-    assert!(dispatcher.input_complete(PipelineId(1), &ints().universal_guard()));
 }
 
 /// A push widened to `Everything` on its way fails the run, since the reader could not tell which
@@ -2268,40 +2176,4 @@ fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
     assert_eq!(pipeline, PipelineId(0));
     dispatcher.finish(dispatcher.pushes(pipeline));
     assert!(matches!(dispatcher.try_claim(None), Next::Done));
-}
-
-#[test]
-fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
-    let input = ints();
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.read_whole(PipelineId(1), &input);
-    let mut body = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    body.restrict_ingress(PipelineId(1), 0..2);
-    assert_eq!(dispatcher.append_graph(body), 2);
-
-    let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone());
-    *entry
-        .complete_target()
-        .write()
-        .unwrap_or_else(PoisonError::into_inner) = Some((PipelineId(1), input.clone()));
-    let consumer: SharedConsumer = Arc::new(entry);
-
-    for (pusher, expected_reader) in [(0, 1), (2, 3)] {
-        let breaker = Scripted::holding(input.universal_guard());
-        breaker
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .base_mut()
-            .pushing_to(consumer.clone());
-        let mut pushes = dispatcher.pushes(PipelineId(pusher));
-        pushes.push_final(&*breaker.read().unwrap_or_else(PoisonError::into_inner));
-        dispatcher.land(pushes);
-        let Next::Package(package) = dispatcher.try_claim(None) else {
-            panic!("external completeness opens the control, and internal output opens the body")
-        };
-        assert_eq!(package.pipeline, PipelineId(expected_reader));
-        assert_eq!(package.guard, input.universal_guard());
-        dispatcher.acknowledge(package);
-        assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-    }
 }
