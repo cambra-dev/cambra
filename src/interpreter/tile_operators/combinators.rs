@@ -1900,7 +1900,10 @@ impl TileOperator for Product {
         use crate::interpreter::notifications::{
             PairingSide, Partners, nothing_delivered, pairing,
         };
-        let delivered = nothing_delivered();
+        let delivered = nothing_delivered(
+            self.outer.arrives_from_a_source(),
+            self.inner.arrives_from_a_source(),
+        );
         let paired = CurryLevel::new(level.index() + 1);
         let outer = self.outer.clone().subscribe(
             self.outer.tiling().universal_guard(),

@@ -1588,6 +1588,13 @@ impl MemoProducer {
     /// of the input: what the answer states complete, and the keys of `projection` the cache now
     /// states complete.
     fn read_input(&self, guard: TileGuard, projection: &Projection) -> TileGuard {
+        // An input that does not restate the level the read names is read at the nearest level
+        // above that it does: reading more is sound, and the merge keeps what the cache held.
+        let restated = projection.restated_by(&self.input.restates());
+        let guard = match restated == *projection {
+            true => guard,
+            false => restated.guard(self.input.tiling()),
+        };
         let mut input = self.input.get(guard);
         let mut released = input.to_guard();
         input.compact();

@@ -872,7 +872,10 @@ impl TileOperator for MapResultToConst {
                 use crate::interpreter::notifications::{
                     PairingSide, Partners, nothing_delivered, pairing,
                 };
-                let delivered = nothing_delivered();
+                let delivered = nothing_delivered(
+                    self.input.arrives_from_a_source(),
+                    self.constant.arrives_from_a_source(),
+                );
                 let universal = self.constant.tiling().universal_guard();
                 let constant = self.constant.clone().subscribe(
                     universal,

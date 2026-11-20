@@ -985,13 +985,17 @@ mod tests {
             ),
         ];
         for (depth, keys) in regions {
-            let tagged =
-                match Projection::keys_at(CurryLevel::new(depth), keys.clone()).tagged(&tag) {
-                    Projection::Keys { keys, .. } => keys,
-                    Projection::Everything => Predicate::True,
-                    Projection::Nothing => Predicate::False,
-                    Projection::Fields { .. } => unreachable!("a tagged region names keys"),
-                };
+            let tagged = match Projection::keys_at(CurryLevel::new(depth), keys.clone())
+                .tagged(&tag)
+            {
+                Projection::Within { .. } | Projection::Or(_) => panic!(
+                    "this reading has no part of some values: a projection within values or an `Or` reaches it"
+                ),
+                Projection::Keys { keys, .. } => keys,
+                Projection::Everything => Predicate::True,
+                Projection::Nothing => Predicate::False,
+                Projection::Fields { .. } => unreachable!("a tagged region names keys"),
+            };
             assert_eq!(under_arm(&tagged, depth, &tag), keys, "{depth}: {tagged:?}");
             // A tagged union reads its outermost keys as one union predicate.
             if depth == 0 {

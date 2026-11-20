@@ -504,11 +504,17 @@ pub(crate) struct Delivered {
 /// [`Delivered`], shared by the consumers in front of one pairing operator's inputs.
 pub(crate) type SharedDelivered = Arc<std::sync::Mutex<Delivered>>;
 
-/// A [`Delivered`] with nothing delivered yet.
-pub(crate) fn nothing_delivered() -> SharedDelivered {
+/// A [`Delivered`] with nothing delivered yet of a side whose keys arrive from a source, and
+/// everything of a side that reads none, which holds all its keys from the start
+/// ([`TileOperator::arrives_from_a_source`](crate::interpreter::tile_operators::TileOperator::arrives_from_a_source)).
+pub(crate) fn nothing_delivered(rows_arrive: bool, partners_arrive: bool) -> SharedDelivered {
+    let held = |arrive: bool| match arrive {
+        true => crate::interpreter::Predicate::False,
+        false => crate::interpreter::Predicate::True,
+    };
     Arc::new(std::sync::Mutex::new(Delivered {
-        rows: crate::interpreter::Predicate::False,
-        partners: crate::interpreter::Predicate::False,
+        rows: held(rows_arrive),
+        partners: held(partners_arrive),
     }))
 }
 
@@ -559,11 +565,59 @@ struct Pairing {
     consumer: Box<dyn Consumer>,
 }
 
+/// `consumer` behind a consumer that forwards a region of a stream of records as the region of the
+/// selected field `name`: the same keys, and of a region within the records' values the part of
+/// the field `name` ([`Projection::field`]), and nothing for a part naming none of it.
+/// `SelectField` passes this to a stream of records, whose keys are the selected field's.
+pub fn selecting_field_beneath_keys(
+    name: smol_str::SmolStr,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(SelectingFieldBeneathKeys(name, consumer))
+}
+
+struct SelectingFieldBeneathKeys(smol_str::SmolStr, Box<dyn Consumer>);
+
+impl SelectingFieldBeneathKeys {
+    fn restated(&self, region: &Projection) -> Projection {
+        match region {
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } => Projection::within(*level, keys.clone(), values.field(&self.0)),
+            Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| self.restated(arm))),
+            whole => whole.clone(),
+        }
+    }
+}
+
+impl Consumer for SelectingFieldBeneathKeys {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        let restated = self.restated(region);
+        if restated == Projection::Nothing && *region != Projection::Nothing && landing.queues() {
+            return;
+        }
+        self.1.notify(&restated, landing);
+    }
+}
+
+/// The arms of `region`, which an `Or` holds and any other region is one of.
+fn region_arms(region: &Projection) -> Vec<Projection> {
+    match region {
+        Projection::Or(arms) => arms.clone(),
+        single => vec![single.clone()],
+    }
+}
+
 /// `region`'s keys as a predicate over the paths of level `to`, `None` where the region names
 /// keys beneath it. A region above `to` admits every path beneath its keys.
 fn paths_at(region: &Projection, to: CurryLevel) -> Option<crate::interpreter::Predicate> {
     use crate::interpreter::Predicate;
     let (mut level, mut keys) = match region {
+        Projection::Within { .. } | Projection::Or(_) => panic!(
+            "this reading has no part of some values: a projection within values or an `Or` reaches it"
+        ),
         Projection::Everything => return Some(Predicate::True),
         Projection::Nothing => return Some(Predicate::False),
         Projection::Keys { level, keys } => (level.index(), keys.clone()),
@@ -647,6 +701,77 @@ impl Consumer for Pairing {
             .delivered
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // A region within some values, or a union with one: each arm's keys pair as keys do, and
+        // the part of the values it names stands under each pair it announces. A part is new
+        // information under every pair it reaches, so it is announced under every pair whose other
+        // half has arrived, not only under the pairs its keys complete.
+        if region.names_part_of_values() {
+            let mut restated = Vec::new();
+            for arm in region_arms(region) {
+                let (keys_only, values) = match &arm {
+                    Projection::Within {
+                        level,
+                        keys,
+                        values,
+                    } => (
+                        Projection::keys_at(*level, keys.clone()),
+                        Some((**values).clone()),
+                    ),
+                    whole => (whole.clone(), None),
+                };
+                let Some((_, record)) = self.pairs(&keys_only, recorded, &delivered) else {
+                    panic!("{arm:?} names keys beneath what a pairing restates");
+                };
+                let every = self.pairs(&keys_only, false, &delivered);
+                let (rows, partners) = match recorded {
+                    true => (delivered.rows.clone(), delivered.partners.clone()),
+                    false => (
+                        crate::interpreter::Predicate::True,
+                        crate::interpreter::Predicate::True,
+                    ),
+                };
+                if recorded {
+                    record(&mut delivered);
+                }
+                let pairs = match (&values, every) {
+                    (None, _) => {
+                        let (pairs, _) = self
+                            .pairs(&keys_only, false, &Delivered { rows, partners })
+                            .expect("read above");
+                        Projection::keys_at(self.at, pairs)
+                    }
+                    (Some(values), Some((all, _))) => {
+                        let reached = match self.side {
+                            PairingSide::ConstantKeys => {
+                                all.intersect(&crate::interpreter::Predicate::qualified(
+                                    rows,
+                                    crate::interpreter::Predicate::True,
+                                ))
+                            }
+                            PairingSide::Paths => {
+                                all.intersect(&crate::interpreter::Predicate::qualified(
+                                    rows,
+                                    crate::interpreter::Predicate::True,
+                                ))
+                            }
+                            PairingSide::Rows(_) => panic!(
+                                "{arm:?}: a row side names its rows whole, not part of their values"
+                            ),
+                        };
+                        Projection::within(self.at, reached, values.clone())
+                    }
+                    (Some(_), None) => unreachable!("read above"),
+                };
+                restated.push(pairs);
+            }
+            drop(delivered);
+            let restated = Projection::any_of(restated);
+            if landing.queues() && restated == Projection::Nothing {
+                return;
+            }
+            landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+            return;
+        }
         let Some((pairs, record)) = self.pairs(region, recorded, &delivered) else {
             drop(delivered);
             match self.side {

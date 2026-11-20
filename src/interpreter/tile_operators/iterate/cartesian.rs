@@ -129,6 +129,7 @@ impl CartesianIteration {
         for side in &mut self.sides {
             let known = side.tile.to_guard().projection("IterateExtent");
             let known = match known {
+                Projection::Within { .. } | Projection::Or(_) => panic!("this reading has no part of some values: a projection within values or an `Or` reaches it"),
                 Projection::Everything => Predicate::True,
                 Projection::Nothing => Predicate::False,
                 Projection::Keys { keys, .. } => keys,
@@ -175,6 +176,9 @@ impl CartesianIteration {
             }
         }
         let region = match guard.projection("IterateExtent") {
+            Projection::Within { .. } | Projection::Or(_) => panic!(
+                "this reading has no part of some values: a projection within values or an `Or` reaches it"
+            ),
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys { keys, .. } => keys,
@@ -294,6 +298,9 @@ impl CartesianIteration {
 
     fn offer(&self, guard: TileGuard, tiling: &Tiling, obsolete: &TileGuard) -> Tile {
         let region = match guard.projection("IterateExtent") {
+            Projection::Within { .. } | Projection::Or(_) => panic!(
+                "this reading has no part of some values: a projection within values or an `Or` reaches it"
+            ),
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys { keys, .. } => keys,

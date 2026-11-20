@@ -6609,6 +6609,9 @@ impl InductionDriverProducer {
                 .next_delivered(state.emitted_through.as_ref())
                 .cloned()
             && match asked {
+                Projection::Within { .. } | Projection::Or(_) => panic!(
+                    "this reading has no part of some values: a projection within values or an `Or` reaches it"
+                ),
                 Projection::Everything => true,
                 Projection::Nothing => false,
                 Projection::Keys { level, keys } => {

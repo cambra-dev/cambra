@@ -106,6 +106,20 @@ pub trait TileOperator: Send + Sync {
         self.tiling().extent()
     }
 
+    /// Whether any key of this operator's output can arrive while a run polls its sources: an
+    /// iteration over an extent that reads a source, or an operator with such an input. An output
+    /// that reads no source holds all its keys from the start, which a pairing reads as delivered
+    /// (`notifications::Delivered`). A deferred input closes a recurrence and is not read.
+    fn arrives_from_a_source(&self) -> bool {
+        let mut arrives = false;
+        self.visit_inputs(&mut |edge| {
+            if !matches!(edge.kind, EdgeKind::Value { deferred: true }) {
+                arrives |= edge.target.arrives_from_a_source();
+            }
+        });
+        arrives
+    }
+
     /// Return the [`Tiling`] that describes this operator's output shape.
     /// If the operator has unbound arguments, the tiling will be a curried function
     /// from inputs to the output.
@@ -1053,7 +1067,10 @@ mod pull_levels {
     fn pulled_level(guard: &TileGuard) -> Option<Option<CurryLevel>> {
         use crate::interpreter::Projection;
         match Projection::of(guard) {
-            Ok(Projection::Keys { level, .. }) => Some(Some(level)),
+            Ok(Projection::Keys { level, .. } | Projection::Within { level, .. }) => {
+                Some(Some(level))
+            }
+            Ok(or @ Projection::Or(_)) => Some(or.level()),
             // A record of values has no level of keys, so a pull of part of its fields is held to
             // the declaration of a whole read.
             Ok(Projection::Everything | Projection::Fields { .. }) => Some(None),
@@ -1227,7 +1244,19 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
             (Ok(held_keys), Ok(released_keys))
                 if names_collection_keys(held) && names_collection_keys(released) =>
             {
-                held_keys.minus(&released_keys).collection_guard()
+                let left = held_keys.minus(&released_keys);
+                match left.names_part_of_values() {
+                    // Part of some values is spelled over their shape, which the record guards of
+                    // the two guards name field by field.
+                    true => match crate::interpreter::tiling::skeleton(&[held, released]) {
+                        Some(shape) => left.guard(&shape),
+                        None => panic!(
+                            "the guard algebra has no difference of {held:?} and {released:?}: \
+                             they name no one shape"
+                        ),
+                    },
+                    false => left.collection_guard(),
+                }
             }
             (Ok(_), Err(_)) if names_collection_keys(held) && names_collection_keys(released) => {
                 minus_disjoint_arms(held, released)
@@ -1875,6 +1904,14 @@ pub trait TileProducer: Send + Sync {
     /// projection names keys at a level [`restates`](Self::restates) refuses.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&self, projection_guard: TileGuard) -> Tile {
+        // A pull of part of some values, as a record whose collection field is complete through
+        // some rows, pulls the rows holding it: pulling more is sound for a `get`
+        // (`src/interpreter/design-operators.md`, "Projection guards").
+        if let Ok(asked) = Projection::of(&projection_guard)
+            && asked.names_part_of_values()
+        {
+            return self.get(asked.rows().guard(self.tiling()));
+        }
         #[cfg(test)]
         {
             self.base()

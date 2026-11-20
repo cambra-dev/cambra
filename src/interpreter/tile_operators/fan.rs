@@ -1167,7 +1167,10 @@ impl TileOperator for SelectField {
         // the selected field the projection names, whose regions are the selected field's part of
         // the record's.
         let consumer = match self.input.tiling().is_data_function() {
-            true => consumer,
+            true => crate::interpreter::notifications::selecting_field_beneath_keys(
+                self.name.clone(),
+                consumer,
+            ),
             false => {
                 crate::interpreter::notifications::selecting_field(self.name.clone(), consumer)
             }

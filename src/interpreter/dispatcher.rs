@@ -3253,6 +3253,9 @@ impl Consumer for Entry {
 /// universal guard, as a pull of every arm is.
 pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGuard> {
     match region {
+        Projection::Within { .. } | Projection::Or(_) => {
+            Some(region.guard(input).closed_over(input))
+        }
         Projection::Nothing => None,
         Projection::Everything => Some(input.universal_guard()),
         Projection::Keys { .. } => Some(region.guard(input).closed_over(input)),
