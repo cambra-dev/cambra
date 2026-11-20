@@ -155,31 +155,6 @@ impl Consumer for Widening {
     }
 }
 
-/// `consumer` behind a consumer that widens like [`widening`] except for a complete region, which it
-/// passes as `restate` names it: the region of the operator's keys each of whose values the input
-/// region decides. An operator that re-keys its input knows which of its keys an input key
-/// contributes to, as `Uncurry` pairs an outer key with each inner key beneath it, so a complete
-/// region of its input decides that region of its own keys, which [`widening`] would hold back
-/// until the input is wholly complete.
-pub fn widening_restating_complete(
-    restate: fn(&Projection) -> Projection,
-    consumer: Box<dyn Consumer>,
-) -> Box<dyn Consumer> {
-    Box::new(WideningRestatingComplete(restate, consumer))
-}
-
-struct WideningRestatingComplete(fn(&Projection) -> Projection, Box<dyn Consumer>);
-
-impl Consumer for WideningRestatingComplete {
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        match region {
-            Projection::Everything => self.1.notify(region, landing),
-            _ if landing.is_complete() => self.1.notify(&(self.0)(region), landing),
-            _ => landing.widened(|landing| self.1.notify(&Projection::Everything, landing)),
-        }
-    }
-}
-
 /// [`restating`] for a lookup's collection operand: the rows a key of the operand names read that
 /// key and also their input's value, so the complete region it passes names only part of what
 /// those rows depend on ([`Landing::completing_part`]).
@@ -200,7 +175,7 @@ impl Consumer for RestatingLookup {
 
 /// `consumer` behind a consumer that passes each region on as `restate` names it, a change as a
 /// complete region: an operator that keeps its input's keys under another spelling, as `Uncurry`
-/// beneath a standing level names an outer and an inner key as one pair, restates both exactly.
+/// names an outer and an inner key as one pair, restates both exactly.
 pub fn restating(
     restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,

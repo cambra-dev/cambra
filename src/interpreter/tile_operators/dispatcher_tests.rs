@@ -1914,8 +1914,7 @@ fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
 
 /// A route walk records, per path, whether its decided region names only part of what a row
 /// depends on: a widening path's does, and so does a lookup operand's, which names rows by the key they
-/// read whatever their input holds. A path that keeps its keys does not, and neither does an
-/// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
+/// read whatever their input holds. A path that keeps its keys does not.
 #[test]
 fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
     let shared = gated_entry(&ints());
@@ -1923,10 +1922,6 @@ fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
     let paths = Paths(vec![
         forwarding_consumer(&shared),
         forwarding_consumer_keeping_keys(&shared),
-        crate::interpreter::notifications::widening_restating_complete(
-            |region| region.clone(),
-            forwarding_consumer_keeping_keys(&shared),
-        ),
         crate::interpreter::notifications::restating_lookup(
             Box::new(|region| region.clone()),
             forwarding_consumer_keeping_keys(&shared),
@@ -1936,7 +1931,7 @@ fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
         .into_iter()
         .map(|route| route.completes_part)
         .collect();
-    assert_eq!(parts, [true, false, false, true]);
+    assert_eq!(parts, [true, false, true]);
 }
 
 /// A read that reaches its reader along a path that drops a decided region and one that keeps it

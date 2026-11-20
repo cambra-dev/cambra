@@ -693,10 +693,22 @@ fn uncurry_beneath_a_standing_level_forwards_the_region() {
     assert_keeps_without_state(&beneath, 0);
 }
 
-/// Pairing the whole tile re-keys it.
+/// Pairing the whole tile names a region of outer keys as the pairs whose first field they are.
 #[test]
-fn uncurry_at_the_outermost_level_sends_everything() {
-    assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
+fn uncurry_at_the_outermost_level_restates_outer_keys_as_the_pairs_they_head() {
+    let Projection::Keys { keys: outer, .. } = region() else {
+        unreachable!("the region names keys")
+    };
+    let pairs = Projection::admitting(Predicate::Record(HashMap::from([
+        (crate::interpreter::tuple_field(0), outer),
+        (crate::interpreter::tuple_field(1), Predicate::True),
+    ])));
+    let outermost = || uncurry(CurryLevel::OUTERMOST);
+    assert_eq!(received(&outermost, 0, &region()), [pairs]);
+    assert_eq!(
+        received(&outermost, 0, &Projection::Everything),
+        [Projection::Everything]
+    );
 }
 
 fn aggregate() -> Built {

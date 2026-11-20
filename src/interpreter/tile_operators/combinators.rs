@@ -777,20 +777,14 @@ impl TileOperator for Uncurry {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // Beneath standing levels the input's outermost keys are the result's, and a region at or
-        // beneath the paired level names the pairs it heads. Pairing the whole tile re-keys, so a
-        // change widens, and an outer key decides every pair whose first field it is.
+        // Above the paired level the input's keys are the result's, and a region at or beneath it
+        // names the pairs it heads, the outermost level's included: a change of outer keys is a
+        // change of the pairs whose first field they are, and a decided region decides them.
         let level = self.level;
-        let consumer = match level == CurryLevel::OUTERMOST {
-            true => crate::interpreter::notifications::widening_restating_complete(
-                |region| paired(region, CurryLevel::OUTERMOST),
-                consumer,
-            ),
-            false => crate::interpreter::notifications::restating(
-                Box::new(move |region| paired(region, level)),
-                consumer,
-            ),
-        };
+        let consumer = crate::interpreter::notifications::restating(
+            Box::new(move |region| paired(region, level)),
+            consumer,
+        );
         Box::new(UncurryProducer {
             base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling(), self.clone(), cx),
             input: self
