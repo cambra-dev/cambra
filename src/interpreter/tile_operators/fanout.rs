@@ -1430,7 +1430,7 @@ impl MemoProducer {
             );
         }
 
-        input.remove_guarded(self.obsolete_guard().clone());
+        input.remove_guarded(self.reclaimed_guard().clone());
         input.compact();
         let mut cache = self
             .cached_tile
@@ -1558,7 +1558,7 @@ impl BreakingProducer for MemoProducer {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .to_guard();
-        let released = self.obsolete_guard();
+        let released = self.reclaimed_guard();
         if released.is_empty() {
             return stated;
         }

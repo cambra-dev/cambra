@@ -182,9 +182,9 @@ impl TileProducer for ConstantProducer {
         // post-condition forbids.
         let mut tile = if self.tiling().is_data_function() {
             let mut tile = self.operator.tile.clone();
-            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.remove_guarded(self.reclaimed_guard().clone());
             tile
-        } else if self.obsolete_guard().is_universal() {
+        } else if self.reclaimed_guard().is_universal() {
             self.tiling().empty_tile()
         } else {
             self.operator.tile.clone()
@@ -407,7 +407,7 @@ impl TileProducer for VariantWrapProducer {
         // released collection reads as an empty one, which is not the value it was.
         if self.input.tiling().values_at(self.level).holds_a_level() {
             match self.level.enclosing() {
-                None if !tile.is_terminal() || self.obsolete_guard().is_universal() => {
+                None if !tile.is_terminal() || self.reclaimed_guard().is_universal() => {
                     return self.tiling().empty_tile();
                 }
                 None => {}
@@ -719,8 +719,8 @@ impl TileProducer for VariantProjectProducer {
         // Part of a payload released names no part of the scrutinee, so the scrutinee keeps
         // the row and the payload is projected again on the next pull (`release_impl`);
         // what the consumer let go is taken back out here.
-        if !self.obsolete_guard().is_empty() {
-            out.remove_guarded(self.obsolete_guard());
+        if !self.reclaimed_guard().is_empty() {
+            out.remove_guarded(self.reclaimed_guard());
         }
         out.restrict_to(&projection, self.tiling());
         out
@@ -728,7 +728,7 @@ impl TileProducer for VariantProjectProducer {
 
     fn release_impl(&self, obsolete_guard: TileGuard) {
         if !self.input.tiling().is_data_function() {
-            release_bare_scrutinee(&*self.input, &self.obsolete_guard());
+            release_bare_scrutinee(&*self.input, &self.reclaimed_guard());
             return;
         }
         // A **domain** release passes straight through. This producer's output domain is the
@@ -998,8 +998,8 @@ impl TileProducer for VariantIsProducer {
         ));
         // A tag test over a bare union is a column with no keys of its own, which a consumer
         // releases whole; over a stream the cut repeats the input's.
-        if !self.obsolete_guard().is_empty() {
-            tile.remove_guarded(self.obsolete_guard());
+        if !self.reclaimed_guard().is_empty() {
+            tile.remove_guarded(self.reclaimed_guard());
         }
         tile.restrict_to(&projection, self.tiling());
         tile
@@ -1007,7 +1007,7 @@ impl TileProducer for VariantIsProducer {
 
     fn release_impl(&self, obsolete_guard: TileGuard) {
         if !self.input.tiling().is_data_function() {
-            release_bare_scrutinee(&*self.input, &self.obsolete_guard());
+            release_bare_scrutinee(&*self.input, &self.reclaimed_guard());
             return;
         }
         // Every key in is a key out, so a released region of the output names

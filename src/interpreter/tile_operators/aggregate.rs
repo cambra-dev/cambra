@@ -240,7 +240,7 @@ impl TileProducer for AggregateProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        if self.obsolete_guard().is_universal() {
+        if self.reclaimed_guard().is_universal() {
             return self.tiling().empty_tile();
         }
         self.answer()
@@ -274,7 +274,7 @@ impl Breaker for AggregateProducer {
     /// accumulator, and releases the input at what the answer stated.
     fn consume_impl(&self, _: InputId, guard: TileGuard) {
         assert!(guard.check_from(self.input.tiling()));
-        if self.obsolete_guard().is_universal() || guard.is_empty() {
+        if self.reclaimed_guard().is_universal() || guard.is_empty() {
             return;
         }
         let released = self.fold_input(guard);
@@ -317,11 +317,11 @@ impl Breaker for AggregateProducer {
     /// reader would get no value.
     fn finish(&mut self, _input: InputId, pushes: &mut Pushes<'_>) {
         assert!(
-            self.obsolete_guard().is_universal() || self.input.obsolete_guard().is_universal(),
+            self.reclaimed_guard().is_universal() || self.input.obsolete_guard().is_universal(),
             "{} finishes after its input was released whole",
             self.name()
         );
-        if !self.obsolete_guard().is_universal() {
+        if !self.reclaimed_guard().is_universal() {
             let Tile::Aggregation { accumulator, .. } = &*self
                 .accumulator
                 .read()
@@ -569,7 +569,7 @@ impl Breaker for ExtractAggregateProducer {
             self.name()
         );
         if !state.extracted.is_empty()
-            || self.obsolete_guard().is_universal()
+            || self.reclaimed_guard().is_universal()
             || guard.projection(&self.input.name()) == Projection::Nothing
         {
             return;
@@ -1374,7 +1374,7 @@ impl TileProducer for MapAggregateProducer {
         self.state
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .release(&self.obsolete_guard());
+            .release(&self.reclaimed_guard());
         {
             let input_guard = crate::interpreter::tiling::through_shared_levels(
                 guard,
@@ -1399,7 +1399,7 @@ impl Breaker for MapAggregateProducer {
         let released = tile.to_guard();
         tile.compact();
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        let stated = state.fold(&tile, self.tiling(), &self.obsolete_guard());
+        let stated = state.fold(&tile, self.tiling(), &self.reclaimed_guard());
         state.stated = Some(match state.stated.take() {
             Some(before) => before.union(&stated).settled(state.accumulators.keys()),
             None => stated,

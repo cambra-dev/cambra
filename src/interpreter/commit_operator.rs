@@ -1509,6 +1509,10 @@ impl CommitProducer {
 }
 
 impl BreakingProducer for CommitProducer {
+    fn releases_acknowledge(&self) -> bool {
+        true
+    }
+
     /// The engine, the seed it has not taken, and per writer the decisions taken and not committed,
     /// what has settled, what to take again, how far its stream was consumed and whether it is
     /// terminal. A checkpoint between claims can hold queued decisions, which a drained boundary
@@ -4274,8 +4278,8 @@ impl TileProducer for InductionStoreProducer {
             );
         }
         let mut tile = state.breaker.offer();
-        if matches!(state.engines, Engines::Rows(_)) && !self.obsolete_guard().is_empty() {
-            tile.remove_guarded(self.obsolete_guard().clone());
+        if matches!(state.engines, Engines::Rows(_)) && !self.reclaimed_guard().is_empty() {
+            tile.remove_guarded(self.reclaimed_guard().clone());
         }
         tile
     }
@@ -4779,7 +4783,7 @@ impl TileProducer for StoreFinalReadProducer {
         None
     }
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
-        if self.obsolete_guard().is_universal() {
+        if self.reclaimed_guard().is_universal() {
             return self.tiling().empty_tile();
         }
         // A reader can pull some rows, as one that takes rows as they arrive does, so the answer
@@ -4821,7 +4825,7 @@ impl TileProducer for StoreFinalReadProducer {
         // store that ran no position at all, where nothing is decided either.
         let value = store_value_now(&store, &self.key);
         let mut tile = stored_value_tile(value.into_iter().collect(), &self.value_extent);
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.restrict_to(&projection_guard.projection_for(self), self.tiling());
         tile
     }
@@ -5098,7 +5102,7 @@ impl StoreDenseReadProducer {
         // released has to come back off each time: the store keeps a position until every
         // reader is done with it, and handing one back to a reader that already took it is
         // what the release contract forbids.
-        out.remove_guarded(self.obsolete_guard().clone());
+        out.remove_guarded(self.reclaimed_guard().clone());
         out.compact();
         out
     }
@@ -6399,7 +6403,7 @@ impl InductionDriverProducer {
         read_past: &Predicate,
     ) -> Tile {
         let mut tile = state.window.render(done, complete_rows, read_past);
-        tile.remove_guarded(self.obsolete_guard());
+        tile.remove_guarded(self.reclaimed_guard());
         tile
     }
 
@@ -6561,7 +6565,7 @@ impl TileProducer for InductionDriverProducer {
         let state = &mut *state_guard;
 
         let mut tile = state.rendered.clone();
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.restrict_to(&guard.projection_for(self), self.tiling());
         tile
     }
@@ -7599,7 +7603,7 @@ impl TransactDriverProducer {
                 .release(state.source_producer.tiling().universal_guard());
         }
         let mut tile = state.window.render(done, &[], &Predicate::False);
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.compact();
         tile
     }
@@ -7820,7 +7824,7 @@ impl TileProducer for TransactDriverProducer {
 
         let mut tile = state.rendered.clone();
         tile.restrict_to(&guard.projection(&self.name()), self.tiling());
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.compact();
         tile
     }
@@ -8859,6 +8863,10 @@ impl Breaker for TransactWriterProducer {
 }
 
 impl BreakingProducer for TransactWriterProducer {
+    fn releases_acknowledge(&self) -> bool {
+        true
+    }
+
     /// The proposals the store has not released, where the stream's live window starts, the last
     /// decision acted on, and whether the drive has closed.
     fn checkpoint(&self) -> Vec<u8> {
@@ -8974,7 +8982,7 @@ impl TileProducer for TransactWriterProducer {
         // window (`release_impl`), so what it names is withheld here.
         let mut tile = self.render(state);
         tile.restrict_to(&guard.projection(&self.name()), self.tiling());
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.compact();
         tile
     }
@@ -11668,7 +11676,7 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&self, _projection_guard: TileGuard) -> Tile {
-            honoring_release(&self.tile, &self.obsolete_guard())
+            honoring_release(&self.tile, &self.reclaimed_guard())
         }
         fn release_impl(&self, _obsolete_guard: TileGuard) {}
     }
@@ -12550,7 +12558,7 @@ mod tests {
                     .tile
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
-                &self.obsolete_guard(),
+                &self.reclaimed_guard(),
             )
         }
         fn release_impl(&self, _obsolete_guard: TileGuard) {}
@@ -12965,7 +12973,7 @@ mod tests {
                 .gets
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-            if self.obsolete_guard().is_universal() {
+            if self.reclaimed_guard().is_universal() {
                 return self.tiling().empty_tile();
             }
             Tile::Scalar(ColumnValue::single(self.value.clone()))

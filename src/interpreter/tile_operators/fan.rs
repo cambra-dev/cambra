@@ -416,7 +416,7 @@ impl TileProducer for ZipProducer {
                 // key, which is what a path is read against.
                 (!input.tiling().values_at(self.level).holds_a_level()).then(|| {
                     TileGuard::flatten_or(vec![crate::interpreter::tiling::onto_record_field(
-                        self.obsolete_guard().clone(),
+                        self.reclaimed_guard().clone(),
                         self.level.index(),
                         name,
                         input.tiling(),
@@ -736,8 +736,8 @@ impl TileProducer for ZipProducer {
                 }
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
-                if !self.obsolete_guard().is_empty() {
-                    out.remove_guarded(self.obsolete_guard());
+                if !self.reclaimed_guard().is_empty() {
+                    out.remove_guarded(self.reclaimed_guard());
                 }
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
                     state.emitted = state.emitted.union(&Predicate::from_column_value(domain));
@@ -778,7 +778,7 @@ impl TileProducer for ZipProducer {
             _ => self.base.tiling.empty_guard(),
         };
         let whole = TileGuard::flatten_or(vec![whole_pair_rows(
-            self.obsolete_guard().clone(),
+            self.reclaimed_guard().clone(),
             0,
             level,
             &pair,
@@ -1272,7 +1272,7 @@ impl TileProducer for SelectFieldProducer {
         // ([`guard_at_field`]), so it can still hold what this consumer released. The
         // field's own deleted rows are dropped too and reach no consumer, so they are released.
         let dropped = tile.deleted_keys_guard();
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.compact();
         if let Some(dropped) = dropped {
             let at_field = self.at_field(dropped);

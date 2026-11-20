@@ -736,8 +736,8 @@ impl TileProducer for MapResultProducer {
         // Part of an output value released names no part of the input, so the input keeps
         // the row and the value is recomputed on the next pull (`release_impl`); what the
         // consumer let go is taken back out here.
-        if !self.obsolete_guard().is_empty() {
-            out.remove_guarded(self.obsolete_guard());
+        if !self.reclaimed_guard().is_empty() {
+            out.remove_guarded(self.reclaimed_guard());
         }
         // Mapping keeps the input's keys, so the input already answered the projection; the
         // cut states it for an input that answered more.
@@ -1108,7 +1108,7 @@ impl MapResultToConstProducer {
         }
         // Each row is rebuilt from the input and the constant on every pull, so what a
         // consumer has released beneath a row still open comes back unless it is left out.
-        output.remove_guarded(self.obsolete_guard().clone());
+        output.remove_guarded(self.reclaimed_guard().clone());
         output
     }
 }
@@ -1402,7 +1402,7 @@ impl MapResultWithSourceProducer {
         let Some(held) = &mut *held else {
             return everywhere;
         };
-        let released = &self.obsolete_guard();
+        let released = &self.reclaimed_guard();
         let freed = everywhere.union(&held.releasable(released));
         held.reclaim(released, &freed);
         freed
@@ -1518,7 +1518,7 @@ impl TileProducer for MapResultWithSourceProducer {
             }
             held.as_mut()
                 .unwrap()
-                .reclaim(&self.obsolete_guard(), &Predicate::False);
+                .reclaim(&self.reclaimed_guard(), &Predicate::False);
         }
         let source = self.source.read().unwrap_or_else(PoisonError::into_inner);
         let fields = &self.fields;

@@ -861,6 +861,13 @@ pub struct ProducerBase {
     /// For a pipeline breaker, the pipeline the [`Entry`](crate::interpreter::dispatcher::Entry)
     /// at its input queues for, which a planner sets. `None` for every other producer.
     pub(crate) placement: Option<crate::interpreter::dispatcher::Placement>,
+    /// In a durable run, the gate that holds what this producer's consumer releases until a
+    /// checkpoint covering it is durable ([`ReleaseGate`](crate::interpreter::durability::ReleaseGate)).
+    /// `None` outside a durable run, on a producer no breaker or sink reads directly, and on an
+    /// input of a breaker whose releases acknowledge (`BreakingProducer::releases_acknowledge`).
+    // shared-state-ok: the gate is the durable run's record of this producer's pending release,
+    // which its consumer's release and the run's step reach; no operator reads it.
+    pub(crate) release_gate: Option<Arc<crate::interpreter::durability::ReleaseGate>>,
 }
 
 impl ProducerBase {
@@ -884,6 +891,7 @@ impl ProducerBase {
             last_output: RwLock::new(None),
             downstream: None,
             placement: None,
+            release_gate: None,
         }
     }
 
@@ -928,6 +936,7 @@ impl ProducerBase {
             last_output: RwLock::new(None),
             downstream: None,
             placement: Some(crate::interpreter::dispatcher::Placement::default()),
+            release_gate: None,
         }
     }
 }
@@ -1613,6 +1622,14 @@ pub trait BreakingProducer: TileProducer + Breaker {
         panic!("{} has no checkpoint", self.name())
     }
 
+    /// Whether this breaker's releases to its inputs are acknowledgements that its inputs need in
+    /// order to go on within one step: the commit operator's release to a writer acknowledges its
+    /// commit, and a writer's release to its driver finishes a position (`docs/durability.md`,
+    /// "Checkpoints"). A durable run gates no input of such a breaker.
+    fn releases_acknowledge(&self) -> bool {
+        false
+    }
+
     /// Install `state`, which [`checkpoint`](Self::checkpoint) copied out of the breaker at the
     /// same position of a graph compiled from the same text, into this breaker, which has run
     /// nothing. It releases none of its inputs: recovery releases them once every breaker holds
@@ -1625,6 +1642,22 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// The default panics, as [`checkpoint`](Self::checkpoint) does.
     fn restore(&mut self, _state: &[u8]) {
         panic!("{} has no checkpoint to restore", self.name())
+    }
+}
+
+/// Remove from `answer`, a pull's answer of the producer with base `base`, the region the
+/// producer's release gate holds. That region is released for the consumer and not yet reclaimed,
+/// so the producer can still answer it. Its keys leave the answer, deleted ones included, as a
+/// producer that had reclaimed them would answer, so a consumer merging the answer gets no key
+/// twice. A key the producer answered deleted outside the region stays deleted, for the consumer
+/// to release.
+pub(crate) fn cut_held(base: &ProducerBase, answer: &mut Tile) {
+    let Some(gate) = &base.release_gate else {
+        return;
+    };
+    let held = gate.issued();
+    if !held.is_empty() {
+        answer.drop_guarded(held);
     }
 }
 
@@ -1717,9 +1750,21 @@ pub trait TileProducer: Send + Sync {
         format!("{}#{}", base, self.producer_id())
     }
 
-    /// Returns the current obsolete guard for this producer. The producer will
-    /// never return any more data in the guarded region via `get`.
+    /// The region this producer's consumer has released. The producer never returns any more
+    /// data in it via `get`. Where a release gate holds part of it, the producer has not yet
+    /// reclaimed that part ([`reclaimed_guard`](Self::reclaimed_guard)).
     fn obsolete_guard(&self) -> TileGuard {
+        match &self.base().release_gate {
+            Some(gate) => gate.issued(),
+            None => self.reclaimed_guard(),
+        }
+    }
+
+    /// The region this producer has reclaimed: [`obsolete_guard`](Self::obsolete_guard) less what
+    /// a release gate holds. A producer reads its own released region through this one, and a
+    /// consumer reads its input's through `obsolete_guard`, so no producer passes a held region on
+    /// to its input; the `get` wrapper cuts a held region from the answer.
+    fn reclaimed_guard(&self) -> TileGuard {
         self.base()
             .obsolete_guard
             .read()
@@ -1768,6 +1813,7 @@ pub trait TileProducer: Send + Sync {
             );
         }
         let mut result = self.get_impl(projection_guard);
+        cut_held(self.base(), &mut result);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
         if let Some(cells) = self.obsolete_guard().clone().released_cells() {
@@ -1913,6 +1959,10 @@ pub trait TileProducer: Send + Sync {
     /// universal guard once the stored guard is universal, and the normalized argument
     /// otherwise. Native release callbacks must be idempotent. See
     /// `src/interpreter/design-operators.md`, "The release contract".
+    ///
+    /// A producer with a release gate holds the region in the gate instead, and the durable run
+    /// passes it on through [`release_past_gate`](Self::release_past_gate) once a checkpoint
+    /// covering it is durable.
     fn release(&self, guard: TileGuard) {
         assert!(
             guard.check_from(self.tiling()),
@@ -1920,6 +1970,15 @@ pub trait TileProducer: Send + Sync {
             self.tiling()
         );
         let guard = TileGuard::flatten_or(vec![guard]);
+        match &self.base().release_gate {
+            Some(gate) => gate.issue(&guard),
+            None => self.release_past_gate(guard),
+        }
+    }
+
+    /// [`release`](Self::release) without the release gate: what a durable run passes on once a
+    /// checkpoint covering `guard` is durable, and what every release is outside a durable run.
+    fn release_past_gate(&self, guard: TileGuard) {
         let mut obsolete = self
             .base()
             .obsolete_guard

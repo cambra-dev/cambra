@@ -342,7 +342,7 @@ impl TileProducer for IterateExtentProducer {
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         if matches!(&self.iteration, Iteration::Cartesian(_)) {
             let tiling = self.tiling().clone();
-            let obsolete = self.obsolete_guard().clone();
+            let obsolete = self.reclaimed_guard().clone();
             let Iteration::Cartesian(cartesian) = &self.iteration else {
                 unreachable!()
             };
@@ -389,7 +389,7 @@ impl TileProducer for IterateExtentProducer {
 
     fn release_impl(&self, obsolete_guard: TileGuard) {
         let name = self.name();
-        let obsolete = self.obsolete_guard().clone();
+        let obsolete = self.reclaimed_guard().clone();
         match &self.iteration {
             Iteration::Cartesian(cartesian) => cartesian
                 .write()

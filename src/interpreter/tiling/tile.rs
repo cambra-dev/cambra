@@ -1048,6 +1048,74 @@ impl Tile {
         }
     }
 
+    /// [`remove_guarded`](Self::remove_guarded), with the keys `guard` names dropped, deleted or
+    /// not, and every other key kept as it is: a key held deleted outside `guard` stays, deleted,
+    /// so a consumer still reads it in `to_guard`. [`compact`](Self::compact) after
+    /// `remove_guarded` would also drop those.
+    pub fn drop_guarded(&mut self, guard: TileGuard) {
+        let mut marks = self.clone();
+        marks.clear_deleted();
+        marks.remove_guarded(guard.clone());
+        self.remove_guarded(guard);
+        self.drop_keys_deleted_in(&marks);
+    }
+
+    /// Mark no key deleted, at any level.
+    fn clear_deleted(&mut self) {
+        match self {
+            Tile::DataFunction {
+                codomain, deleted, ..
+            } => {
+                deleted.clear();
+                codomain.clear_deleted();
+            }
+            Tile::Record { fields, .. } => fields.values_mut().for_each(Tile::clear_deleted),
+            Tile::Aggregation { accumulator, .. } => accumulator.clear_deleted(),
+            Tile::Scalar(_) | Tile::Store { .. } => {}
+        }
+    }
+
+    /// Drop, at every level, the keys `marks` holds deleted, where `marks` has this tile's keys.
+    ///
+    /// # Panics
+    ///
+    /// Where `marks` does not have this tile's shape.
+    fn drop_keys_deleted_in(&mut self, marks: &Tile) {
+        match (&mut *self, marks) {
+            (
+                Tile::DataFunction { codomain, .. },
+                Tile::DataFunction {
+                    codomain: marked_codomain,
+                    deleted: marked,
+                    ..
+                },
+            ) => {
+                codomain.drop_keys_deleted_in(marked_codomain);
+                if !marked.is_empty() {
+                    let Tile::DataFunction { domain, .. } = &*self else {
+                        unreachable!("matched a collection")
+                    };
+                    let keep: Vec<bool> = (0..domain.len()).map(|k| !marked.contains(k)).collect();
+                    self.retain_keys(&keep);
+                }
+            }
+            (Tile::Record { fields, .. }, Tile::Record { fields: marked, .. }) => {
+                for (name, field) in fields.iter_mut() {
+                    field.drop_keys_deleted_in(&marked[name]);
+                }
+            }
+            (
+                Tile::Aggregation { accumulator, .. },
+                Tile::Aggregation {
+                    accumulator: marked,
+                    ..
+                },
+            ) => accumulator.drop_keys_deleted_in(marked),
+            (Tile::Scalar(_) | Tile::Store { .. }, _) => {}
+            (tile, marks) => panic!("{tile:?} has the shape of {marks:?}"),
+        }
+    }
+
     /// Removes all data in this tile that is specified by the guard.
     /// TODO: the index_at calls here aren't very efficient; we should optmize this by applying the
     /// predicates in a more columnar way.

@@ -3520,58 +3520,70 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 /// complete.
 ///
 /// The recovered source models one of two external systems. Without `retains`, it holds only what
-/// the first run had not released, so a recovered breaker that reads a released position again
-/// finds nothing. With `retains`, it holds everything, as a topic does, so such a breaker counts
-/// the position twice.
+/// the first run had not released, so a recovered breaker that reads a released position again finds
+/// nothing. With `retains`, it holds everything, as a topic does, so such a breaker counts the
+/// position twice.
+///
+/// Each crash point is tried over a store that makes its writes durable after every step, and,
+/// where `lag` is above 1, over one that makes them durable after every `lag`-th step, so a crash
+/// loses the writes of up to `lag - 1` steps and the release gates keep every source position those
+/// writes cover. A case with a transaction or a nested loop has a `lag` of 1, since it does not
+/// recover from a lagging store: a transaction's acknowledging releases pass no gate
+/// (`BreakingProducer::releases_acknowledge`), and an inner loop's store releases to its driver
+/// inside one step (`docs/durability.md`, "Checkpoints").
 #[rstest_log::rstest]
 #[case::a_map(
     "[x * 10 for x in source1()]",
-    "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]"
+    "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]",
+    3
 )]
 #[case::a_filter(
     "[x for x in source1() if x != 2]",
-    "[u0 -> 1, u2 -> 3, u3 -> 4, u4 -> 5]"
+    "[u0 -> 1, u2 -> 3, u3 -> 4, u4 -> 5]",
+    3
 )]
-#[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15")]
-#[case::a_sum("sum(source1())", "15")]
-#[case::a_live_product("sum([x * y for x in source1() for y in source1()])", "225")]
-#[case::a_live_static_product("sum([x * y for x in source1() for y in [10, 20]])", "450")]
+#[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15", 3)]
+#[case::a_sum("sum(source1())", "15", 3)]
+#[case::a_live_product("sum([x * y for x in source1() for y in source1()])", "225", 3)]
+#[case::a_live_static_product("sum([x * y for x in source1() for y in [10, 20]])", "450", 3)]
 #[case::a_static_read(
     "[x + sum([1, 2]) for x in source1()]",
-    "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]"
+    "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]",
+    3
 )]
 #[case::a_live_read(
     "[x + sum(source1()) for x in source1()]",
-    "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]"
+    "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]",
+    3
 )]
 #[case::a_loop(indoc! {"
     total := 0
     for x in source1():
         total += x
     total
-"}, "15")]
+"}, "15", 3)]
 #[case::a_loop_over_a_binding(indoc! {"
     xs = source1()
     total := 0
     for x in xs:
         total += x
     total
-"}, "15")]
+"}, "15", 3)]
 #[case::a_transaction(indoc! {"
     pool: Mut(Int, Txn) := 100
     for x in source1():
         with begin():
             pool := pool - x
     await_final(pool)
-"}, "85")]
+"}, "85", 1)]
 #[case::a_choice_on_a_sum(indoc! {"
     s = sum(source1())
     1 if s > 10 else 0
-"}, "1")]
+"}, "1", 3)]
 #[case::a_choice_per_element(indoc! {"
     s = sum(source1())
     [x if s > 10 else 0 for x in source1()]
-"}, "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]")]
+"}, "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]", 3)]
 #[case::a_reply_per_transaction(indoc! {"
     out: Feed(_)
     pool: Mut(Int, Txn) := 100
@@ -3580,7 +3592,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             pool := pool - x
             out << pool
     out
-"}, "[u0 -> 99, u1 -> 97, u2 -> 94, u3 -> 90, u4 -> 85]")]
+"}, "[u0 -> 99, u1 -> 97, u2 -> 94, u3 -> 90, u4 -> 85]", 1)]
 #[case::a_reply_over_a_concatenation(indoc! {"
     out: Feed(_)
     pool: Mut(Int, Txn) := 100
@@ -3589,7 +3601,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             pool := pool - x
             out << x
     out
-"}, "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10]")]
+"}, "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10]", 1)]
 #[case::a_conditional_write(indoc! {"
     xs = [x for x in source1()]
     total := 0
@@ -3597,7 +3609,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         if x > 2:
             total := x
     total
-"}, "5")]
+"}, "5", 3)]
 #[case::two_writers_on_one_store(indoc! {"
     pool: Mut(Int, Txn) := 100
     for x in source1():
@@ -3607,7 +3619,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         with begin():
             pool := pool + y
     await_final(pool)
-"}, "100")]
+"}, "100", 1)]
 #[case::a_second_writer_that_never_writes(indoc! {"
     pool: Mut(Int, Txn) := 100
     for x in source1():
@@ -3618,41 +3630,45 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             if y > 100:
                 pool := pool + y
     await_final(pool)
-"}, "85")]
+"}, "85", 1)]
 #[case::a_memo_read_twice(indoc! {"
     xs = source1()
     [x + sum(xs) for x in xs]
-"}, "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]")]
+"}, "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]", 3)]
 #[case::a_nested_loop(indoc! {"
     total := 0
     for x in source1():
         for y in [1, 2]:
             total += x * y
     total
-"}, "45")]
+"}, "45", 1)]
 fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     #[case] source: &str,
     #[case] expected: &str,
+    #[case] lag: usize,
     #[values(1, usize::MAX)] rows: usize,
     #[values(false, true)] retains: bool,
 ) {
     assert!(
-        recovers(source, expected, rows, retains, None),
+        recovers(source, expected, rows, retains, lag, None),
         "a run checkpointed at its first pause recovers: {source}"
     );
-    let mut step = 1;
-    while recovers(source, expected, rows, retains, Some(step)) {
-        step += 1;
+    let lags = if lag == 1 { vec![1] } else { vec![1, lag] };
+    for lag in lags {
+        let mut step = 1;
+        while recovers(source, expected, rows, retains, lag, Some(step)) {
+            step += 1;
+        }
+        assert!(step > 1, "a run takes a step: {source}");
     }
-    assert!(step > 1, "a run takes a step: {source}");
 }
 
 /// A crash the test stops a process at, as an unwind out of [`Persisting::stepped`].
 struct Crashed;
 
 /// A durable run's observer: it steps the durability after each step and at each drained
-/// boundary (`Durability::step`), makes the store's writes durable after every step, pauses at
-/// every drained boundary, and crashes after the crash point `crash_after` names.
+/// boundary (`Durability::step`), makes the store's writes durable after every `lag`-th step,
+/// pauses at every drained boundary, and crashes after the crash point `crash_after` names.
 ///
 /// Every top-level step is a crash point, those inside a loop's or a transaction's open request
 /// included: the recovered run rebuilds the request from the breakers (`durability`).
@@ -3660,6 +3676,7 @@ struct Persisting {
     roots: Vec<crate::interpreter::sinks::ProducerSlot>,
     store: std::sync::Arc<crate::interpreter::durability::MemoryStore>,
     durability: crate::interpreter::durability::Durability,
+    lag: usize,
     /// The crash points passed so far.
     steps: usize,
     crash_after: Option<usize>,
@@ -3673,6 +3690,7 @@ impl Persisting {
         roots: Vec<crate::interpreter::sinks::ProducerSlot>,
         store: std::sync::Arc<crate::interpreter::durability::MemoryStore>,
         handed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        lag: usize,
         crash_after: Option<usize>,
     ) -> Self {
         use std::hash::{Hash, Hasher};
@@ -3689,6 +3707,7 @@ impl Persisting {
             roots,
             store,
             durability,
+            lag,
             steps: 0,
             crash_after,
         }
@@ -3703,11 +3722,88 @@ impl crate::interpreter::dispatcher::RunObserver for Persisting {
 
     fn stepped(&mut self) {
         self.durability.step(&self.roots);
-        self.store.flush();
         self.steps += 1;
+        if self.steps.is_multiple_of(self.lag) {
+            self.store.flush();
+        }
         if self.crash_after == Some(self.steps) {
             std::panic::resume_unwind(Box::new(Crashed));
         }
+    }
+}
+
+/// A `main` output's recipient that stands outside the processes of a run and its recoveries:
+/// it hands `answers` each outermost key once, and a value with no keys until it has handed a
+/// terminal one. A recovered run sends again every output its sink had sent and not yet persisted
+/// as released (`docs/durability.md`, "Sinks persist their release"), and the recipient checks
+/// that each output it is sent again holds the value it was handed first.
+#[derive(Default)]
+struct KeepsFirst {
+    answers: std::sync::Arc<MainAnswers>,
+    /// Each key handed, with its value.
+    keys: std::sync::Mutex<std::collections::HashMap<Value, Value>>,
+    /// The terminal value with no keys handed, once there is one.
+    terminal: std::sync::Mutex<Option<crate::interpreter::Tile>>,
+}
+
+impl crate::interpreter::DataSink for KeepsFirst {
+    fn process(&self, tile: &crate::interpreter::Tile) {
+        let mut tile = tile.clone();
+        // A deleted key carries nothing to a recipient, and one beside a live copy of the key
+        // handed earlier would merge as a second copy.
+        tile.compact();
+        if let crate::interpreter::Tile::DataFunction {
+            domain, deleted, ..
+        } = &tile
+        {
+            let values: std::collections::HashMap<Value, Value> =
+                crate::interpreter::test_sink::tile_rows(&tile, 1)
+                    .expect("an answer is a valid tile")
+                    .remove(0)
+                    .as_function()
+                    .iter()
+                    .map(|binding| (binding.input.clone(), binding.output.clone()))
+                    .collect();
+            let mut keys = self.keys.lock().expect("no answer panics");
+            debug_assert!(deleted.is_empty(), "a compacted answer has no deleted key");
+            let fresh: Vec<bool> = (0..domain.len())
+                .map(|at| {
+                    let key = domain.index_at(at);
+                    let value = &values[&key];
+                    match keys.get(&key) {
+                        Some(first) => {
+                            assert_eq!(
+                                first, value,
+                                "a key sent again holds the value handed first"
+                            );
+                            false
+                        }
+                        None => {
+                            keys.insert(key, value.clone());
+                            true
+                        }
+                    }
+                })
+                .collect();
+            tile.retain_keys(&fresh);
+        } else {
+            // An empty answer that is not terminal holds nothing, and the driver prints none.
+            if !is_printed(&tile) {
+                return;
+            }
+            let mut terminal = self.terminal.lock().expect("no answer panics");
+            if let Some(first) = &*terminal {
+                assert_eq!(
+                    *first, tile,
+                    "a terminal answer sent again is the one handed first"
+                );
+                return;
+            }
+            if tile.is_terminal() {
+                *terminal = Some(tile.clone());
+            }
+        }
+        self.answers.process(&tile);
     }
 }
 
@@ -3717,7 +3813,7 @@ fn compiled_over_source1(
     source: &str,
     entries: &[(Value, Value)],
     yielded: crate::interpreter::Predicate,
-    main: &std::sync::Arc<MainAnswers>,
+    main: &std::sync::Arc<dyn crate::interpreter::DataSink>,
 ) -> (
     GlobalContext,
     crate::ccl::SourceDefinition<TestDataSource>,
@@ -3762,22 +3858,29 @@ fn recovers(
     expected: &str,
     rows: usize,
     retains: bool,
+    lag: usize,
     crash_after: Option<usize>,
 ) -> bool {
     use crate::interpreter::dispatcher::Ended;
     use crate::interpreter::durability::MemoryStore;
     let main = std::sync::Arc::new(MainAnswers::default());
+    let recipient: std::sync::Arc<dyn crate::interpreter::DataSink> =
+        std::sync::Arc::new(KeepsFirst {
+            answers: main.clone(),
+            ..KeepsFirst::default()
+        });
     let batches = two_batches();
     let delivered = std::cell::Cell::new(1);
     let (store, released, old_source) = {
         let (_ctx, feed, slot, targets) =
-            compiled_over_source1(source, &batches[0].0, batches[0].1.clone(), &main);
+            compiled_over_source1(source, &batches[0].0, batches[0].1.clone(), &recipient);
         let store = std::sync::Arc::new(MemoryStore::default());
         let mut observer = Persisting::start(
             source,
             vec![slot],
             store.clone(),
             targets.main_handed_terminal(),
+            lag,
             crash_after,
         );
         let run = |observer: &mut Persisting| match targets
@@ -3829,12 +3932,13 @@ fn recovers(
         .filter(|(key, _)| retains || !released.contains(key))
         .collect();
     let (_ctx, feed, slot, targets) =
-        compiled_over_source1(source, &kept, batches[delivered - 1].1.clone(), &main);
+        compiled_over_source1(source, &kept, batches[delivered - 1].1.clone(), &recipient);
     let mut observer = Persisting::start(
         source,
         vec![slot],
         std::sync::Arc::new(store),
         targets.main_handed_terminal(),
+        1,
         None,
     );
     let mut run = || {

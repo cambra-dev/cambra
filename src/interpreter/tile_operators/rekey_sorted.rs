@@ -205,7 +205,7 @@ impl TileProducer for RekeySortedProducer {
         let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state_guard;
 
-        state.output.remove_guarded(self.obsolete_guard().clone());
+        state.output.remove_guarded(self.reclaimed_guard().clone());
         if self
             .base
             .placement
@@ -216,7 +216,7 @@ impl TileProducer for RekeySortedProducer {
         }
         // The accumulated guard, not the increment: a release that closes a gap releases the
         // rows above it that an earlier release named.
-        let released = self.obsolete_guard().clone();
+        let released = self.reclaimed_guard().clone();
         if released.is_universal() {
             return self.input.release(self.input.tiling().universal_guard());
         }
@@ -321,9 +321,9 @@ impl RekeySortedProducer {
         // A released key is complete, so its row had arrived when it was released: a row
         // seen for the first time cannot carry one.
         debug_assert!(
-            arrived
-                .iter()
-                .all(|(key, _)| !self.obsolete_guard().covers_path(std::slice::from_ref(key))),
+            arrived.iter().all(|(key, _)| !self
+                .reclaimed_guard()
+                .covers_path(std::slice::from_ref(key))),
             "a row arrived under a key {} has already released",
             self.name()
         );
@@ -398,7 +398,7 @@ impl RekeySortedProducer {
         };
         let mut out = Tile::data_function(keys, Box::new(values), complete, deleted);
         // The rows above a gap in the released keys, which the input still holds.
-        let released = self.obsolete_guard().clone();
+        let released = self.reclaimed_guard().clone();
         if !released.is_empty() {
             out.remove_guarded(released);
         }
