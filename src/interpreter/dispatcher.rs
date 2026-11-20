@@ -3268,17 +3268,22 @@ fn complete_projection(held: TileGuard, tiling: &Tiling) -> Option<Projection> {
             .collect();
         return Some(Projection::fields(parts, Projection::Nothing).over_fields(fields.keys()));
     }
-    if let (
-        Some(Extent::UIntRange(positions)),
-        TileGuard::Function(FunctionGuard::Domain(region @ Predicate::Intervals(_))),
-    ) = (tiling.domain_extent(), &held)
-    {
-        let covered = region.covers_positions(&positions);
-        if covered {
-            return Some(Projection::Everything);
-        }
+    if names_every_position(&held, tiling) {
+        return Some(Projection::Everything);
     }
     Projection::of(&held).ok()
+}
+
+/// Whether `held`, a guard of `tiling`, names every position of the finite range of positions
+/// `tiling`'s outermost keys range over: it names every key there is, though it is not universal.
+fn names_every_position(held: &TileGuard, tiling: &Tiling) -> bool {
+    matches!(
+        (tiling.domain_extent(), held),
+        (
+            Some(Extent::UIntRange(positions)),
+            TileGuard::Function(FunctionGuard::Domain(region @ Predicate::Intervals(_))),
+        ) if region.covers_positions(&positions)
+    )
 }
 
 /// `input`'s universal guard cut as [`seed_within`] cuts a region: every `rows` keys where the

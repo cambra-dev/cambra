@@ -3868,7 +3868,7 @@ impl InductionStoreProducer {
         // the row has ended, and a release of the row whole then leaves the store no step that
         // would read that.
         for level in (0..state.complete_rows.len().saturating_sub(1)).rev() {
-            let whole = rows_whole_beneath(&state.complete_rows[level + 1]);
+            let whole = state.complete_rows[level + 1].rows_whole_beneath();
             state.complete_rows[level] = state.complete_rows[level].union(&whole);
         }
         // Reading a terminal body stream as "the whole extent is decided" rests on the loop
@@ -6343,25 +6343,6 @@ impl TileProducer for InductionDriverProducer {
     }
 }
 
-/// The rows `beneath`, a statement of the level beneath them, calls complete in full: the
-/// enclosing paths of its arms that admit every key under them.
-fn rows_whole_beneath(beneath: &Predicate) -> Predicate {
-    let arms: Vec<&Predicate> = match beneath {
-        Predicate::Or(arms) => arms.iter().collect(),
-        one => vec![one],
-    };
-    Predicate::union_all(
-        arms.into_iter()
-            .filter_map(|arm| match arm {
-                Predicate::Qualified { enclosing, here } if here.is_true() => {
-                    Some((**enclosing).clone())
-                }
-                _ => None,
-            })
-            .collect(),
-    )
-}
-
 /// The drive of a loop run in rounds is the pipeline breaker a round starts: a package names
 /// the position the round runs, the next its source delivers, and a consume emits it where the
 /// store has decided the position before it. See `src/interpreter/design-dispatcher.md`, "A loop in
@@ -6485,7 +6466,7 @@ impl InductionDriverProducer {
             // that completion only at the deeper level.
             for level in (0..state.source_complete.len().saturating_sub(1)).rev() {
                 state.source_complete[level] = state.source_complete[level]
-                    .union(&rows_whole_beneath(&state.source_complete[level + 1]));
+                    .union(&state.source_complete[level + 1].rows_whole_beneath());
             }
             state.source.terminal |= state
                 .source_complete

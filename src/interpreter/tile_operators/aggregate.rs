@@ -1293,7 +1293,10 @@ impl Stated {
                 })
                 .map(|path| Predicate::exactly(path))
                 .collect(),
-        );
+        )
+        // A group holding no element, as a row past the last of a finite range of rows, is
+        // complete once the elements' statement covers every element under it too.
+        .union(&self.elements.rows_whole_beneath());
         if whole.is_false() {
             return self;
         }

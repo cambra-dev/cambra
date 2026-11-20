@@ -1153,6 +1153,29 @@ impl Predicate {
         Predicate::Intervals(set)
     }
 
+    /// The rows this predicate, a statement of the level beneath them, calls complete in full: the
+    /// enclosing paths of its arms that admit every key under them, and every row where it is
+    /// `True`. A whole child domain closes its
+    /// enclosing row, so a reader uniting statements made at the level beneath reads them there.
+    pub(crate) fn rows_whole_beneath(&self) -> Predicate {
+        let arms: Vec<&Predicate> = match self {
+            Predicate::Or(arms) => arms.iter().collect(),
+            one => vec![one],
+        };
+        Predicate::union_all(
+            arms.into_iter()
+                .filter_map(|arm| match arm {
+                    Predicate::Qualified { enclosing, here } if here.is_true() => {
+                        Some((**enclosing).clone())
+                    }
+                    // An unqualified statement stands under every row.
+                    Predicate::True => Some(Predicate::True),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Whether this predicate admits every position of `positions`, a set of `UInt` positions
     /// whose every run is bounded: the region states every key of a domain whose extent is
     /// `positions` (`Extent::UIntRange`), though it is not `True`.
