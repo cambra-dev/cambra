@@ -882,7 +882,7 @@ pulls.
 | Operator | Input | Notification | Reason |
 | --- | --- | --- | --- |
 | `MapResult` | the input | keeps if applied one level in to a collection, else widens | A keyed input is pulled at the projection; applied at the outermost level or to a scalar, the function's keys are the result's. |
-| `MapResult` | the function operand | widens | Its keys are the values looked up, not the result's keys. |
+| `MapResult` | the function operand | widens, but keeps for a lookup at its rows' own keys | Its keys are the values looked up, not the result's keys. Where the input's values equal the keys of the level above the one the function applies at, a key of the operand names the rows whose last key it is. The input states that equality (`TileOperator::result_correlation`), and a field of record values states it field by field (`TileOperator::field_correlation`), as a `Product` pair's second field equals the key it pairs. |
 | `MapResultToConst` | the input | keeps where the constant applies one level in or deeper to a collection, widens at the outermost level or for a scalar | At the outermost level the constant replaces the whole input, so the output's keys are the constant's. |
 | `MapResultToConst` | the constant | widens | Every row reads all of it. |
 | `MapResultWithSource` | the input | keeps | Pulled at the projection, so its keys are the output's. |

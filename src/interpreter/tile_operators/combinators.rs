@@ -2218,6 +2218,124 @@ mod nested_projection_tests {
 }
 
 #[cfg(test)]
+mod correlation_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        ProjectionSpyOp, ints_by_position, two_levels_of_ints,
+    };
+    use crate::interpreter::tile_operators::{
+        Constant, FanOut, IterateExtent, MapResult, MapResultToConst, MapResultToConstMode, Memo,
+    };
+    use crate::interpreter::{BaseType, Extent, FunctionDef, Value};
+
+    /// Two rows of `Int`, the outer side of a product.
+    fn rows() -> Arc<dyn TileOperator> {
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        Arc::new(ProjectionSpyOp::new(ints_by_position(&[5, 6], true), tiling).0)
+    }
+
+    /// Two levels of `Int`, a collection per row, the inner side of a product of keys.
+    fn groups() -> Arc<dyn TileOperator> {
+        let (tile, tiling) = two_levels_of_ints();
+        Arc::new(ProjectionSpyOp::new(tile, tiling).0)
+    }
+
+    /// Each row's collection of positions `0..2`, whose values are its own keys: a constant
+    /// collection placed beneath the rows.
+    fn positions_beneath_rows() -> Arc<dyn TileOperator> {
+        Arc::new(MapResultToConst::new_at(
+            rows(),
+            Arc::new(IterateExtent::new(Extent::uint_range(2))),
+            MapResultToConstMode::Replace,
+            CurryLevel::new(1),
+        ))
+    }
+
+    /// A pair of keys holds the key it pairs in its second field, the key at the pairing's
+    /// level, and the outer row's value, which equals no key, in its first.
+    #[test]
+    fn a_pair_of_keys_states_its_second_field_as_the_paired_key() {
+        let product = Product::per_row_at(rows(), groups(), CurryLevel::new(1));
+        assert_eq!(
+            product.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+        assert_eq!(product.field_correlation("_0"), None);
+    }
+
+    /// A constant whose values are its own keys, placed as the collection at a level, states
+    /// its values as the keys of that level.
+    #[test]
+    fn a_constant_of_positions_beneath_rows_states_its_values_as_their_keys() {
+        assert_eq!(
+            positions_beneath_rows().result_correlation(),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+
+    /// A pair of values holds the inner side's value in its second field, which equals what the
+    /// inner side's values equal.
+    #[test]
+    fn a_pair_of_values_states_its_second_field_as_the_inner_values() {
+        let product =
+            Product::per_row_values_at(rows(), positions_beneath_rows(), CurryLevel::new(1));
+        assert_eq!(
+            product.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+
+    /// A memo and a fan-out slot answer what their input answers, field by field.
+    #[test]
+    fn a_memo_and_a_slot_pass_a_field_correlation_through() {
+        let product: Arc<dyn TileOperator> =
+            Arc::new(Product::per_row_at(rows(), groups(), CurryLevel::new(1)));
+        let memo: Arc<dyn TileOperator> = Arc::new(Memo::new(product));
+        assert_eq!(
+            memo.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+        let slot = FanOut::new(memo).slot();
+        assert_eq!(
+            slot.field_correlation("_1"),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+
+    /// A function selecting a field of the input's record values answers what that field
+    /// equals: `.1` of a product of keys is the paired key, which a lookup at a row's own key
+    /// reads (`MapResult`, `looked_up_at_keys`).
+    #[test]
+    fn a_selected_field_states_what_the_field_equals() {
+        let product: Arc<dyn TileOperator> =
+            Arc::new(Product::per_row_at(rows(), groups(), CurryLevel::new(1)));
+        let record = Extent::Record(
+            [
+                ("_0".into(), Extent::Base(BaseType::Int)),
+                ("_1".into(), Extent::uint_range(3)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let select = Constant::new(
+            Value::ComputableFunction(FunctionDef::RecordField("_1".into())),
+            Extent::Function {
+                domain: Box::new(record),
+                codomain: Box::new(Extent::uint_range(3)),
+            },
+        );
+        let second = MapResult::new_at(product, Arc::new(select), CurryLevel::new(2));
+        assert_eq!(
+            second.result_correlation(),
+            Some(vec![TilePathStep::Codomain])
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
