@@ -2895,12 +2895,13 @@ impl InferCtx {
     ///
     /// `mismatch` runs after an edge, in two cases: when the edge records an upper bound on a
     /// barrier variable, whose report it renders whether or not the edge holds, and when the
-    /// edge fails. Either way it sees the bounds the edge recorded. A failing edge that also
-    /// recorded a barrier bound builds the error once, for both. A caller whose message shows
-    /// the inferred type as it stood before the edge resolves it first, as
-    /// [`Typing::bind_annotation`] and [`Typing::bind_poly_annotation`] do. Resolving the types
-    /// inside every predicate the inferred type carries is left to `mismatch`: it copies each
-    /// predicate, and nearly every ascription holds and records no barrier bound.
+    /// edge fails. A failing edge that also recorded a barrier bound builds the error once, for
+    /// both. Either way `mismatch` reads the bounds as they stood before the edge, which sets
+    /// aside the bounds of each variable it writes (`Solver::set_aside_bounds`): a failing
+    /// edge can record bounds before it fails, and the message shows the inferred type the
+    /// annotation was compared with (`src/ccl/design/type-inference.md`, "An annotation
+    /// mismatch shows the type before the edge"). Nearly every ascription holds and records no
+    /// barrier bound, so nearly none resolves anything for its message.
     fn reconcile_annotation(
         &mut self,
         inferred: &Type,
@@ -3004,6 +3005,7 @@ impl InferCtx {
             scope_exits: &self.scope_exits,
         };
         self.cache.at(self.here(), self.here());
+        self.solver.set_aside_bounds();
         let result = constrain_subtype_in(
             &mut self.solver,
             inferred,
@@ -3011,6 +3013,8 @@ impl InferCtx {
             &mut self.cache,
             &scope,
         );
+        let mut before = self.solver.bounds_before();
+        let mut mismatch = |solver: &mut Solver| before.read(solver, &mismatch);
         let failed = result.is_err();
         // A value reaching a type chosen outside a binder it reads is refused for that, whatever
         // else the annotation states: the remedy is a family that names the binder. A shape the
@@ -3023,7 +3027,7 @@ impl InferCtx {
             let refused = map_constrain_err(&mut self.solver, err, "annotation");
             self.settle_annotation_edge(true, |_| refused.clone())?;
         }
-        self.settle_annotation_edge(failed, &mismatch)?;
+        self.settle_annotation_edge(failed, &mut mismatch)?;
 
         Ok(ann_simple)
     }
@@ -3033,7 +3037,7 @@ impl InferCtx {
     fn settle_annotation_edge(
         &mut self,
         failed: bool,
-        mismatch: impl Fn(&mut Solver) -> InferError,
+        mut mismatch: impl FnMut(&mut Solver) -> InferError,
     ) -> Result<(), LocatedInferError> {
         if !failed {
             if self.cache.holds_unreported() {
@@ -4759,12 +4763,8 @@ impl Typing for InferCtx {
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
-        // The inferred type is read before the edge, which a failure can leave bounding its
-        // variables by the annotation too. The types inside its predicates are resolved
-        // only on failure, on a copy of each predicate: nearly every ascription holds.
-        let before = super::resolve_var_type(&mut self.solver, inferred).unwrap_or(Type::Hole);
         let mismatch = |solver: &mut Solver| {
-            let mut inferred = before.clone();
+            let mut inferred = super::resolve_var_type(solver, inferred).unwrap_or(Type::Hole);
             super::resolve_predicate_types(solver, &mut inferred);
             InferError::AnnotationMismatch {
                 annotation: Box::new(ann.clone()),
@@ -4782,22 +4782,21 @@ impl Typing for InferCtx {
     ) -> Result<Type, LocatedInferError> {
         // Called at the right-hand side's level, one above the binding's, which is
         // where every variable the right-hand side minted sits.
-        let mismatch = match poly_for_display(&mut self.solver, inferred, self.level - 1) {
+        let level = self.level - 1;
+        let mismatch = |solver: &mut Solver| match poly_for_display(solver, inferred, level) {
             Some(mut shown) => InferError::PolyAnnotationMismatch {
                 inferred: Box::new({
-                    shown.map_types(&mut |t| super::resolve_predicate_types(&mut self.solver, t));
+                    shown.map_types(&mut |t| super::resolve_predicate_types(solver, t));
                     shown
                 }),
                 annotation: Box::new(annotation.clone()),
             },
             None => InferError::AnnotationMismatch {
                 annotation: Box::new(annotation.clone()),
-                inferred: Box::new(coalesce_for_error(&mut self.solver, inferred)),
+                inferred: Box::new(coalesce_for_error(solver, inferred)),
             },
         };
-        // Rendered ahead of the edge: the polymorphic type a mismatch reports is the
-        // definition's, before the failed ascription adds its bounds to it.
-        self.reconcile_annotation(inferred, declared, |_| mismatch.clone())
+        self.reconcile_annotation(inferred, declared, mismatch)
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {
