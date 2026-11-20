@@ -809,6 +809,18 @@ into the graph; they carry no assumptions about which ancestors a query is alrea
 Unknown reads propagate as unknown, and a propagation that does not settle within 64 rounds
 also returns unknown. Either case limits reuse to the same whole substitution.
 
+The stamp pass shares one walk state across every compaction it runs (`FixedGraph`, entered
+through `reading_fixed_graph` in `infer/solver/compact.rs`), so a variable compacts once for the
+pass rather than once per node that reaches it. The pass is one read of a graph no write changes
+([Coalescing in two passes](#coalescing-in-two-passes)): it records on no variable minted before it
+began, which debug builds check, and a substitution reaching a variable suspends on it once for
+the whole read. A memoized result is then a function of its key, and a later compaction reuses it
+as a later position of the same walk does. A result is shared only when its walk produced nothing
+beyond it (`CompactState::impure`). A walk that met a recursive type, reported a join violation,
+widened a candidate, or read a refinement naming a joined binder produced more, or read where it
+stands. Its result serves only the compaction that computed it. A compaction that collects
+contribution origins or capability variables walks on its own.
+
 ##### Cycles of variables
 
 A cycle along one bound chain, with no structural intermediary, makes each variable's result depend
@@ -1156,13 +1168,14 @@ materialization](#membership-is-decided-at-materialization)). It stamps nothing.
 each use (`Plan`) is the specialization that serves it, or that its instantiation did not resolve,
 and the errors it raises are reported when the stamp pass reaches their nodes.
 
-The **stamp pass** is the walk over the graph the write pass leaves. It resolves children before
-the enclosing expression and stamps each node's type, fills binder slots, rebuilds a generalized
-`let` around its specializations, and checks each definition alone after its last use. A use is
-served by the write pass's specialization (`stamp_use`). The first use the pass reaches stamps the
-clone, in the definition's scope, and the clone's errors are held for the uses it serves as before.
-Every read sees the graph the end of inference sees, so a parent reads the types its children were
-stamped with, and no read depends on which pins ran before it.
+The **stamp pass** is the walk over the graph the write pass leaves. It resolves children before the
+enclosing expression and stamps each node's type, fills binder slots, rebuilds a generalized `let`
+around its specializations, and checks each definition alone after its last use. A use is served by
+the write pass's specialization (`stamp_use`). The first use the pass reaches stamps the clone, in
+the definition's scope, and the clone's errors are held for the uses it serves as before. Every read
+sees the graph the end of inference sees, so a parent reads the types its children were stamped
+with, and no read depends on which pins ran before it. The pass is one read of that graph, and its
+compactions share one walk state ([Compaction traversal cost](#compaction-traversal-cost)).
 
 Resolving a type copies the terms it holds, and a substitution acting on one makes a new term.
 The stamp pass rewrites these copies as the write pass rewrites the tree (`rewrites_here`). A use
