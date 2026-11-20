@@ -300,6 +300,7 @@ impl TileOperator for MapResult {
                 self.input.tiling().universal_guard(),
                 crate::interpreter::notifications::whole_values_at(
                     self.level,
+                    self.input.tiling().clone(),
                     forwarding_consumer_keeping_keys(&shared),
                 ),
                 cx,

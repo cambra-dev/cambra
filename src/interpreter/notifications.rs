@@ -750,11 +750,30 @@ fn split_beneath_rows(
 /// it stands under, and every other region as it is: an operator that computes each value at
 /// `level` anew from the value there, as `MapResult` applies its function, has its whole value at
 /// a key change where any part of the input's value there does.
-pub fn whole_values_at(level: CurryLevel, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
-    Box::new(WholeValuesAt(level, consumer))
+///
+/// A value that is a record of fields completes field by field, as a zip's arms complete theirs.
+/// `values` is the tiling of the values at `level`, and the consumer collects the parts completed
+/// so far: a key is complete once every field under it is, at every depth. `input` is the tiling
+/// of the operator's input, whose values at a region's level the region names parts of.
+pub fn whole_values_at(
+    level: CurryLevel,
+    input: crate::interpreter::Tiling,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(WholeValuesAt(
+        level,
+        consumer,
+        input,
+        std::sync::Mutex::new(Projection::Nothing),
+    ))
 }
 
-struct WholeValuesAt(CurryLevel, Box<dyn Consumer>);
+struct WholeValuesAt(
+    CurryLevel,
+    Box<dyn Consumer>,
+    crate::interpreter::Tiling,
+    std::sync::Mutex<Projection>,
+);
 
 impl WholeValuesAt {
     fn restated(&self, region: &Projection) -> Projection {
@@ -766,6 +785,88 @@ impl WholeValuesAt {
             other => other.clone(),
         }
     }
+
+    /// The keys `completed`, the parts completed so far, names complete under every field of
+    /// the values at their level, at every depth ([`keys_whole_beneath`]). With arms at several levels, only the
+    /// arms naming whole keys.
+    fn whole_rows(&self, completed: &Projection) -> Projection {
+        let arms = region_arms(completed);
+        if arms.iter().any(|arm| *arm == Projection::Everything) {
+            return Projection::Everything;
+        }
+        let Some(level) = arms.iter().find_map(Projection::level) else {
+            return Projection::Nothing;
+        };
+        if arms
+            .iter()
+            .any(|arm| arm.level().is_some_and(|own| own != level))
+        {
+            return whole_keys(completed);
+        }
+        // A region within the values at `level` names parts of the values beneath those keys.
+        let Some(values) = self.2.values_at(level).codomain() else {
+            return whole_keys(completed);
+        };
+        Projection::keys_at(level, keys_whole_beneath(&arms, &[], &values))
+    }
+}
+
+/// The keys under which the arms, regions at one level, name every part of the values at `path`
+/// complete, `tiling` being the values' tiling there: for a record, the keys complete under each of
+/// its fields, intersected; otherwise the keys of the arms naming whole keys or the part at `path`
+/// whole.
+fn keys_whole_beneath(
+    arms: &[Projection],
+    path: &[smol_str::SmolStr],
+    tiling: &crate::interpreter::Tiling,
+) -> crate::interpreter::Predicate {
+    use crate::interpreter::{Extent, Predicate, Tiling};
+    // A record's fields complete one by one, whether the record is tiled field by field or is a
+    // scalar whose extent is a record.
+    let fields: Option<Vec<(smol_str::SmolStr, Tiling)>> = match tiling {
+        Tiling::Record(fields) => Some(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), field.clone()))
+                .collect(),
+        ),
+        Tiling::Scalar(Extent::Record(fields)) => Some(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), Tiling::Scalar(field.clone())))
+                .collect(),
+        ),
+        _ => None,
+    };
+    if let Some(fields) = fields {
+        return fields
+            .iter()
+            .map(|(name, field)| {
+                let mut deeper = path.to_vec();
+                deeper.push(name.clone());
+                keys_whole_beneath(arms, &deeper, field)
+            })
+            .reduce(|all, field| all.intersect(&field))
+            .unwrap_or(Predicate::True);
+    }
+    Predicate::union_all(
+        arms.iter()
+            .filter_map(|arm| match arm {
+                Projection::Keys { keys, .. } => Some(keys.clone()),
+                Projection::Within { keys, values, .. } => {
+                    let part = path
+                        .iter()
+                        .fold((**values).clone(), |part, name| match part {
+                            Projection::Everything => Projection::Everything,
+                            Projection::Fields { .. } => part.field(name),
+                            _ => Projection::Nothing,
+                        });
+                    (part == Projection::Everything).then(|| keys.clone())
+                }
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 impl Consumer for WholeValuesAt {
@@ -774,8 +875,18 @@ impl Consumer for WholeValuesAt {
         match (restated == *region, landing.is_complete()) {
             (true, _) => self.1.notify(region, landing),
             // A complete part of the input's value completes none of the value computed from all
-            // of it, so only the region's whole keys are complete.
-            (false, true) => self.1.notify(&whole_keys(region), landing),
+            // of it, so a key is complete once every field under it is. A planner's walk takes
+            // the keys a completion reaches.
+            (false, true) if !landing.records_completion() => self.1.notify(&restated, landing),
+            (false, true) => {
+                let mut completed = self.3.lock().unwrap_or_else(PoisonError::into_inner);
+                *completed = completed.union(region);
+                let whole = self.whole_rows(&completed);
+                drop(completed);
+                if whole != Projection::Nothing {
+                    self.1.notify(&whole, landing);
+                }
+            }
             // A changed part changes the whole value computed from it.
             (false, false) => landing.completing_part(|landing| self.1.notify(&restated, landing)),
         }

@@ -2625,6 +2625,12 @@ impl Landing<'_> {
         matches!(self.target, Target::Queue { .. })
     }
 
+    /// Whether this landing records a complete region a pipeline pushed, rather than a planner's
+    /// walk or a probe of where one would arrive.
+    pub(crate) fn records_completion(&self) -> bool {
+        matches!(self.target, Target::Completion { .. })
+    }
+
     pub(crate) fn is_delivery(&self) -> bool {
         matches!(
             self.target,
