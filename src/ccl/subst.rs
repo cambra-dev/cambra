@@ -5902,6 +5902,7 @@ mod tests {
                 function: "add".into(),
                 operands: vec![row.clone()],
                 assoc: vec![(Assoc::output(), row.clone())],
+                obligation: crate::ccl::expr::CallObligation::default(),
             }),
         ];
         // Simultaneous renames expose a slot visited twice: k must become j, not m.

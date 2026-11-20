@@ -4,6 +4,7 @@
 
 use crate::ccl::Label;
 use crate::ccl::RecordEntry;
+use crate::ccl::expr::CallObligation;
 use crate::ccl::infer::solver::Solver;
 use std::collections::BTreeMap;
 
@@ -105,7 +106,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Lowering builds a `Method` only as an application's function, which
         // `emit_apply` resolves before emitting it, or defers, typing it as the variable
         // the selected method's type flows into ([`defer_method`]).
-        TypedExprNode::Method { deferred, .. } if deferred.is_some() => recorded_ty.clone(),
+        TypedExprNode::Method { obligation, .. } if obligation.get().is_some() => {
+            recorded_ty.clone()
+        }
         TypedExprNode::Method { name, .. } => {
             unreachable!("method `{name}` reached emission outside the application it resolves in")
         }
@@ -114,7 +117,16 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             function,
             operands,
             assoc,
-        } => emit_trait_fn(trait_.clone(), function, operands, assoc, node_id, ctx)?,
+            obligation,
+        } => emit_trait_fn(
+            trait_.clone(),
+            function,
+            operands,
+            assoc,
+            obligation,
+            node_id,
+            ctx,
+        )?,
         TypedExprNode::Lit(lit) => {
             // A literal's type is its singleton, `{Int | __elem == n}`, and the
             // three nodes of that `__elem == n` term are minted *here* — the
@@ -276,14 +288,23 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // instantiable scheme to the shared rule. Cloning releases the `ctx`
         // borrow on the registry so the rule can take `ctx` mutably; schemes
         // are `Rc`-shaped, so the clone is cheap.
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left,
+            op,
+            right,
+            obligation,
+        } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(node_id, *op, left, right, &sig, ctx)?
+            let (ty, placed) = emit_binop(node_id, *op, left, right, &sig, ctx)?;
+            *obligation = placed;
+            ty
         }
 
-        TypedExprNode::UnaryOp(op, inner) => {
+        TypedExprNode::UnaryOp(op, inner, obligation) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(*op, inner, node_id, &sig, ctx)?
+            let (ty, placed) = emit_unary(*op, inner, node_id, &sig, ctx)?;
+            *obligation = placed;
+            ty
         }
 
         TypedExprNode::Aggregate { input, kind } => {
@@ -1563,7 +1584,7 @@ pub(super) fn emit_apply<C: Typing>(
         &|| at.clone(),
     );
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
-        ctx.bind_instance_function_called(function.node_id())?;
+        ctx.bind_instance_function_called(function)?;
     }
     // A call that fails against a generalized definition the definition alone already
     // rejects is the definition's error, reported at the definition rather than at a
@@ -1959,7 +1980,8 @@ fn keyed_access_types(
     ))
 }
 
-/// Record an operator's single obligation and give back its result type.
+/// Record an operator's single obligation and give back its result type, with the obligation
+/// for the operator's node to hold.
 ///
 /// The translation between the two halves of the contract: [`OperatorResult`] is what
 /// the *operator* declares, [`Typing::require_trait`] speaks only of associations.
@@ -1971,7 +1993,7 @@ fn require_single_obligation<C: Typing>(
     operand_exprs: &[&Expr],
     result: &OperatorResult,
     at: &dyn Fn() -> String,
-) -> Result<Type, LocatedInferError> {
+) -> Result<(Type, CallObligation), LocatedInferError> {
     let trait_ = ctx.std_trait(trait_);
     match result {
         OperatorResult::Associated(name, Some(refinement)) => ctx.require_trait_refined(
@@ -1984,25 +2006,28 @@ fn require_single_obligation<C: Typing>(
             at,
         ),
         OperatorResult::Associated(name, None) => {
-            let ty = ctx.require_trait(
+            let (ty, obligation) = ctx.require_trait(
                 trait_,
                 operator_node_id,
                 operand_types,
                 Some(name.clone()),
                 at,
             )?;
-            Ok(ty.expect("an operator asking for an association gets its position back"))
+            let ty = ty.expect("an operator asking for an association gets its position back");
+            Ok((ty, obligation))
         }
         OperatorResult::Fixed(base, refinement) => {
-            ctx.require_trait(trait_, operator_node_id, operand_types, None, at)?;
+            let (_, obligation) =
+                ctx.require_trait(trait_, operator_node_id, operand_types, None, at)?;
             let result = Type::Base(base.clone());
-            Ok(refine_result(
+            let ty = refine_result(
                 ctx.solver(),
                 operator_node_id,
                 *refinement,
                 result,
                 operand_exprs,
-            ))
+            );
+            Ok((ty, obligation))
         }
     }
 }
@@ -2141,21 +2166,22 @@ pub(super) fn emit_binop<C: Typing>(
     right: &mut Expr,
     sig: &OpSignature,
     ctx: &mut C,
-) -> Result<Type, LocatedInferError> {
+) -> Result<(Type, CallObligation), LocatedInferError> {
     let left_ty = emit_value_read(left, ctx)?;
     let right_ty = emit_value_read(right, ctx)?;
     let at = || crate::ccl::chl_print::chl_operator(&op);
     match sig {
         OpSignature::Scheme(scheme, refinement) => {
             let result = apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at)?;
-            Ok(refine_scheme_result(
+            let ty = refine_scheme_result(
                 ctx.solver(),
                 operator_node_id,
                 scheme,
                 result,
                 *refinement,
                 &[left, right],
-            ))
+            );
+            Ok((ty, CallObligation::default()))
         }
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
@@ -2175,7 +2201,7 @@ pub(super) fn emit_unary<C: Typing>(
     operator_node_id: NodeId,
     sig: &OpSignature,
     ctx: &mut C,
-) -> Result<Type, LocatedInferError> {
+) -> Result<(Type, CallObligation), LocatedInferError> {
     let inner_ty = emit_value_read(inner, ctx)?;
     let at = || match op {
         UnaryOpKind::Neg => "`-`".to_string(),
@@ -2185,14 +2211,15 @@ pub(super) fn emit_unary<C: Typing>(
     match sig {
         OpSignature::Scheme(scheme, refinement) => {
             let result = apply_unary_scheme(ctx, scheme, &inner_ty, &at)?;
-            Ok(refine_scheme_result(
+            let ty = refine_scheme_result(
                 ctx.solver(),
                 operator_node_id,
                 scheme,
                 result,
                 *refinement,
                 &[inner],
-            ))
+            );
+            Ok((ty, CallObligation::default()))
         }
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
@@ -4159,8 +4186,9 @@ fn emit_nominal_scrutinee<C: Typing>(
 /// settles for the trait's associated types (`src/ccl/design/type-inference.md`, "Trait
 /// functions").
 ///
-/// The operands are written back into the node's slots, so coalescing reads what each
-/// resolved to and chooses the instance there; the obligation's narrowing is what rejects an
+/// The node holds the obligation, whose answer coalescing carries out
+/// (`src/ccl/design/type-inference.md`, "A call reads its obligation's answer"), and the
+/// operands are written back into its slots. The obligation's narrowing is what rejects an
 /// argument no instance accepts, here or at a use of a generalized definition. An associated
 /// type the trait type states bounds the one the obligation settles, as a requirement's does.
 ///
@@ -4171,6 +4199,7 @@ fn emit_trait_fn(
     function: &str,
     operands: &mut [Type],
     assoc: &mut [(Assoc, Type)],
+    placed: &mut CallObligation,
     node_id: NodeId,
     ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
@@ -4194,14 +4223,7 @@ fn emit_trait_fn(
     // reference to a member does. A call whose argument has not reached it yet is asked again by
     // the application that passes it (`Typing::bind_instance_function_called`).
     bind_selected_instance_function(&obligation, function, operands, ctx)?;
-    ctx.trait_calls.insert(
-        node_id,
-        (
-            std::rc::Rc::clone(&obligation),
-            function.into(),
-            operands.to_vec(),
-        ),
-    );
+    *placed = CallObligation::placed(std::rc::Rc::clone(&obligation));
     for (name, stated) in assoc.iter_mut() {
         let at_name = trait_
             .assocs()
@@ -4509,14 +4531,14 @@ pub(super) fn defer_method(
     let obligation = ctx.require_method(&name, rows, &function_ty, receiver, node)?;
     let TypedExprNode::Method {
         candidates,
-        deferred,
+        obligation: placed,
         ..
     } = &mut function.node
     else {
         unreachable!("`defer_method` is called on a `Method`")
     };
     *candidates = reached;
-    *deferred = Some(obligation);
+    *placed = CallObligation::placed(obligation);
     function.ty = function_ty;
     Ok(())
 }

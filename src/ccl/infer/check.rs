@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements_in};
+use crate::ccl::expr::CallObligation;
 use crate::ccl::infer::solver::Solver;
 use crate::ccl::infer::solver::smt::ScopeEnv;
 use crate::ccl::infer::solver::{
@@ -246,136 +247,9 @@ impl CheckCtx {
         cache.at(origin, origin);
         cache
     }
-}
 
-impl TelescopeWalk for CheckCtx {
-    fn telescope_mut(&mut self) -> &mut Telescope {
-        &mut self.telescope
-    }
-}
-
-/// `ty` with each written clause stating nothing: Check reads no capabilities off an annotation.
-fn without_written_clauses(ty: &mut Type) {
-    if let Type::Fun { capabilities, .. } = ty
-        && matches!(
-            capabilities.repr(),
-            crate::ccl::capabilities::Repr::Written(_)
-        )
-    {
-        *capabilities = crate::ccl::capabilities::Capabilities::none();
-    }
-    ty.walk_children_mut(without_written_clauses);
-}
-
-impl Typing for CheckCtx {
-    fn std_trait(&self, named: StdTrait) -> Trait {
-        self.instances.std_trait(named)
-    }
-
-    fn reads_argument_lists(&self) -> bool {
-        false
-    }
-
-    fn solver(&mut self) -> &mut Solver {
-        &mut self.solver
-    }
-    fn pred_memo(&self) -> TermMemo {
-        self.pred_memo.clone()
-    }
-
-    fn current_node(&self) -> NodeId {
-        self.current_node
-    }
-
-    fn recover(
-        &mut self,
-        error: LocatedInferError,
-        _reads_before: usize,
-    ) -> Result<(), LocatedInferError> {
-        Err(error)
-    }
-
-    fn stand_in(&mut self) {
-        crate::unexpected_error_node!()
-    }
-
-    fn poisoned_reads(&self) -> usize {
-        0
-    }
-
-    fn binds(&self, _: &Name) -> bool {
-        false
-    }
-
-    fn binds_place(&self, _: &Name) -> bool {
-        false
-    }
-
-    fn recoveries(&self) -> usize {
-        0
-    }
-
-    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
-        // Recurse to collect the child's own errors, then hand back its
-        // *recorded* type (not the rule-derived, throwaway-laden one) so the
-        // parent rule reasons about what was actually inferred. `check_node`
-        // never returns `Err` in Check mode (errors accumulate in `self`).
-        check_node(child, self)?;
-        Ok(child.ty.clone())
-    }
-
-    fn fresh(&mut self) -> Type {
-        Type::Infer(crate::ccl::InferVar::fresh_in(
-            &mut self.solver,
-            self.level,
-            &self.telescope,
-        ))
-    }
-
-    fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
-        // `Typing::instantiate` is the operator-scheme path: the template's
-        // variables stand nowhere, so the instantiation takes this position's
-        // telescope. (A let-generalized binding instantiates directly via
-        // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
-        scheme.instantiate_in(&mut self.solver, self.level, &self.telescope)
-    }
-
-    fn normalize(&mut self, ann: &Type) -> Type {
-        // A fully-typed tree carries no `Hole`s, so normalization is the
-        // identity; refinements are kept (as everywhere else). Check reads no capabilities, so
-        // an annotation's written clauses state none here.
-        let mut ann = ann.clone();
-        without_written_clauses(&mut ann);
-        ann
-    }
-
-    fn require_trait_refined(
-        &mut self,
-        trait_: Trait,
-        operator_node_id: NodeId,
-        operand_types: &[&Type],
-        operand_exprs: &[&Expr],
-        assoc: Assoc,
-        refinement: crate::ccl::RefinementTemplate,
-        at: &dyn Fn() -> String,
-    ) -> Result<Type, LocatedInferError> {
-        let base = self
-            .require_trait(trait_, operator_node_id, operand_types, Some(assoc), at)?
-            .expect("an operator asking for an association gets its position back");
-        // A position the rows did not settle is the residue the walls judge, unrefined.
-        if matches!(base, Type::Infer(_)) {
-            return Ok(base);
-        }
-        let _f = provenance::enter(
-            operator_node_id,
-            "check.require_trait",
-            provenance::Nature::Machinery,
-        );
-        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).duplicate()).collect();
-        Ok(refinement.refine(&mut self.solver, base, &args))
-    }
-
-    fn require_trait(
+    /// [`Typing::require_trait`], deciding at once on concrete types.
+    fn require_trait_now(
         &mut self,
         trait_: Trait,
         // Check mints no obligation, so nothing records the node; a product's components are
@@ -489,7 +363,7 @@ impl Typing for CheckCtx {
                             &c[at]
                         })
                         .collect();
-                    self.require_trait(trait_.clone(), _operator_node_id, &at_field, None, at)?;
+                    self.require_trait_now(trait_.clone(), _operator_node_id, &at_field, None, at)?;
                 }
                 return Ok(assoc.map(|_| self.fresh()));
             }
@@ -529,6 +403,148 @@ impl Typing for CheckCtx {
                 Ok(assoc.map(|_| fresh_var(&mut self.solver, self.level)))
             }
         }
+    }
+}
+
+impl TelescopeWalk for CheckCtx {
+    fn telescope_mut(&mut self) -> &mut Telescope {
+        &mut self.telescope
+    }
+}
+
+/// `ty` with each written clause stating nothing: Check reads no capabilities off an annotation.
+fn without_written_clauses(ty: &mut Type) {
+    if let Type::Fun { capabilities, .. } = ty
+        && matches!(
+            capabilities.repr(),
+            crate::ccl::capabilities::Repr::Written(_)
+        )
+    {
+        *capabilities = crate::ccl::capabilities::Capabilities::none();
+    }
+    ty.walk_children_mut(without_written_clauses);
+}
+
+impl Typing for CheckCtx {
+    fn std_trait(&self, named: StdTrait) -> Trait {
+        self.instances.std_trait(named)
+    }
+
+    fn reads_argument_lists(&self) -> bool {
+        false
+    }
+
+    fn solver(&mut self) -> &mut Solver {
+        &mut self.solver
+    }
+
+    fn pred_memo(&self) -> TermMemo {
+        self.pred_memo.clone()
+    }
+
+    fn current_node(&self) -> NodeId {
+        self.current_node
+    }
+
+    fn recover(
+        &mut self,
+        error: LocatedInferError,
+        _reads_before: usize,
+    ) -> Result<(), LocatedInferError> {
+        Err(error)
+    }
+
+    fn stand_in(&mut self) {
+        crate::unexpected_error_node!()
+    }
+
+    fn poisoned_reads(&self) -> usize {
+        0
+    }
+
+    fn binds(&self, _: &Name) -> bool {
+        false
+    }
+
+    fn binds_place(&self, _: &Name) -> bool {
+        false
+    }
+
+    fn recoveries(&self) -> usize {
+        0
+    }
+
+    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
+        // Recurse to collect the child's own errors, then hand back its
+        // *recorded* type (not the rule-derived, throwaway-laden one) so the
+        // parent rule reasons about what was actually inferred. `check_node`
+        // never returns `Err` in Check mode (errors accumulate in `self`).
+        check_node(child, self)?;
+        Ok(child.ty.clone())
+    }
+
+    fn fresh(&mut self) -> Type {
+        Type::Infer(crate::ccl::InferVar::fresh_in(
+            &mut self.solver,
+            self.level,
+            &self.telescope,
+        ))
+    }
+
+    fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
+        // `Typing::instantiate` is the operator-scheme path: the template's
+        // variables stand nowhere, so the instantiation takes this position's
+        // telescope. (A let-generalized binding instantiates directly via
+        // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
+        scheme.instantiate_in(&mut self.solver, self.level, &self.telescope)
+    }
+
+    fn normalize(&mut self, ann: &Type) -> Type {
+        // A fully-typed tree carries no `Hole`s, so normalization is the
+        // identity; refinements are kept (as everywhere else). Check reads no capabilities, so
+        // an annotation's written clauses state none here.
+        let mut ann = ann.clone();
+        without_written_clauses(&mut ann);
+        ann
+    }
+
+    fn require_trait_refined(
+        &mut self,
+        trait_: Trait,
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
+        assoc: Assoc,
+        refinement: crate::ccl::RefinementTemplate,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Type, CallObligation), LocatedInferError> {
+        let base = self
+            .require_trait_now(trait_, operator_node_id, operand_types, Some(assoc), at)?
+            .expect("an operator asking for an association gets its position back");
+        // A position the rows did not settle is the residue the walls judge, unrefined.
+        if matches!(base, Type::Infer(_)) {
+            return Ok((base, CallObligation::default()));
+        }
+        let _f = provenance::enter(
+            operator_node_id,
+            "check.require_trait",
+            provenance::Nature::Machinery,
+        );
+        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).duplicate()).collect();
+        let ty = refinement.refine(&mut self.solver, base, &args);
+        Ok((ty, CallObligation::default()))
+    }
+
+    fn require_trait(
+        &mut self,
+        trait_: Trait,
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        assoc: Option<Assoc>,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Option<Type>, CallObligation), LocatedInferError> {
+        self.require_trait_now(trait_, operator_node_id, operand_types, assoc, at)
+            .map(|ty| (ty, CallObligation::default()))
     }
 
     fn refinement_domain(&self, base: &Type) -> Type {
@@ -1146,14 +1162,16 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } => {
             let sig = ctx.schemes.binop(*op);
-            emit_binop(node_id, *op, left, right, &sig, ctx)?
+            emit_binop(node_id, *op, left, right, &sig, ctx)?.0
         }
 
-        TypedExprNode::UnaryOp(op, inner) => {
+        TypedExprNode::UnaryOp(op, inner, _) => {
             let sig = ctx.schemes.unary(*op);
-            emit_unary(*op, inner, node_id, &sig, ctx)?
+            emit_unary(*op, inner, node_id, &sig, ctx)?.0
         }
 
         TypedExprNode::Aggregate { input, kind } => {

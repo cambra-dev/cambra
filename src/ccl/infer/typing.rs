@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::TermMemo;
+use crate::ccl::expr::CallObligation;
 use crate::ccl::infer::api::RelatedPositions;
 use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::infer::solver::Solver;
@@ -197,6 +198,9 @@ pub(super) trait Typing {
     /// operands are usually still unresolved variables, so it records an obligation
     /// that discharges as bounds arrive. Check runs after inference on concrete
     /// types, so it decides immediately.
+    ///
+    /// Also gives back the obligation recorded, for the operator's node to hold; Check
+    /// records none.
     fn require_trait(
         &mut self,
         trait_: Trait,
@@ -204,7 +208,7 @@ pub(super) trait Typing {
         operand_types: &[&Type],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
-    ) -> Result<Option<Type>, LocatedInferError>;
+    ) -> Result<(Option<Type>, CallObligation), LocatedInferError>;
 
     /// The trait `std` declares as `named`, in the program being typed.
     fn std_trait(&self, named: StdTrait) -> Trait;
@@ -222,7 +226,7 @@ pub(super) trait Typing {
         assoc: Assoc,
         refinement: crate::ccl::RefinementTemplate,
         at: &dyn Fn() -> String,
-    ) -> Result<Type, LocatedInferError>;
+    ) -> Result<(Type, CallObligation), LocatedInferError>;
 
     /// Normalize a user annotation / binder type into a solver-ready `Type`
     /// (holes → fresh vars; refinements kept). See
@@ -615,10 +619,7 @@ pub(super) trait Typing {
     /// call's obligation now selects an instance whose functions are a group being emitted,
     /// emit that function first, so the group binds it before the function calling it
     /// (`src/ccl/design/type-inference.md`, "Trait functions"). Check has no group.
-    fn bind_instance_function_called(
-        &mut self,
-        _function: NodeId,
-    ) -> Result<(), LocatedInferError> {
+    fn bind_instance_function_called(&mut self, _function: &Expr) -> Result<(), LocatedInferError> {
         Ok(())
     }
 

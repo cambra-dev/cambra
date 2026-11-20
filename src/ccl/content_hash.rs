@@ -635,7 +635,7 @@ fn hash_payload<'a>(
             module.hash(h);
         }
         N::BinOp { op, .. } => op.hash(h),
-        N::UnaryOp(kind, _) => kind.hash(h),
+        N::UnaryOp(kind, ..) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
         N::VariantCtor { tag, .. } => tag.hash(h),
         N::NominalCtor { decl, ctor, .. } => {

@@ -432,6 +432,7 @@ pub fn defined_as(solver: &mut Solver, ty: Type, definition: &TypedExpr) -> Type
         ),
         op: BinOpKind::Compare(CompareKind::Equals),
         right: Box::new(definition),
+        obligation: crate::ccl::expr::CallObligation::default(),
     })
     .with_ty(Type::Base(BaseType::Bool));
     Type::refined_one(ty, Refinement::born(std::rc::Rc::new(predicate)))
@@ -444,7 +445,7 @@ fn in_term_fragment(e: &TypedExpr) -> bool {
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_) | Lit::Bool(_)) | TypedExprNode::Var(_) => true,
         TypedExprNode::Apply { .. } => Path::of(e).is_some(),
-        TypedExprNode::UnaryOp(_, operand) => in_term_fragment(operand),
+        TypedExprNode::UnaryOp(_, operand, _) => in_term_fragment(operand),
         TypedExprNode::BinOp { left, right, .. } => {
             in_term_fragment(left) && in_term_fragment(right)
         }
@@ -589,7 +590,7 @@ pub(crate) fn is_term(e: &TypedExpr) -> bool {
         TypedExprNode::Tuple(elems) => elems.iter().all(is_term),
         TypedExprNode::Record(entries) => entries.iter().all(|entry| is_term(&entry.value)),
         TypedExprNode::NominalCtor { payload, .. } => is_term(payload),
-        TypedExprNode::UnaryOp(_, operand) => is_term(operand),
+        TypedExprNode::UnaryOp(_, operand, _) => is_term(operand),
         TypedExprNode::BinOp { left, right, .. } => is_term(left) && is_term(right),
         TypedExprNode::Apply { function, argument } => {
             matches!(
@@ -618,6 +619,7 @@ pub(crate) fn equal_to(term: &TypedExpr) -> Refinement {
         left: Box::new(elem),
         op: BinOpKind::Compare(CompareKind::Equals),
         right: Box::new(term.clone_preserving_ids()),
+        obligation: crate::ccl::expr::CallObligation::default(),
     })
     .with_ty(Type::Base(BaseType::Bool));
     Refinement::born(std::rc::Rc::new(predicate))
@@ -1128,13 +1130,13 @@ impl<'a> Encode<'a> {
     /// through, so an atom the encoding has no rule for costs only itself.
     fn claim(&mut self, solver: &mut Solver, e: &TypedExpr) -> SExpr {
         match &e.node {
-            TypedExprNode::UnaryOp(op, operand) if op.unrefined() == UnaryOpKind::Not => {
+            TypedExprNode::UnaryOp(op, operand, _) if op.unrefined() == UnaryOpKind::Not => {
                 let operand = self.claim(solver, operand);
                 return self.ctx.not(operand);
             }
-            TypedExprNode::BinOp { left, op, right }
-                if matches!(op.unrefined(), BinOpKind::BoolLogic(_)) =>
-            {
+            TypedExprNode::BinOp {
+                left, op, right, ..
+            } if matches!(op.unrefined(), BinOpKind::BoolLogic(_)) => {
                 let (l, r) = (self.claim(solver, left), self.claim(solver, right));
                 return self
                     .binop(*op, left, right, l, r)
@@ -1273,7 +1275,7 @@ impl<'a> Encode<'a> {
                 Some(path) => self.leaf(solver, path, &e.ty),
                 None => Err(unencodable(e)),
             },
-            TypedExprNode::UnaryOp(op, inner) => {
+            TypedExprNode::UnaryOp(op, inner, _) => {
                 let operand = self.expr(solver, inner)?;
                 self.settled_operand(e, inner, operand)?;
                 // `^not` computes what `not` computes, as a binary `^` sibling does.
@@ -1283,7 +1285,9 @@ impl<'a> Encode<'a> {
                     UnaryOpKind::NotRefined => unreachable!("`unrefined` answers no `NotRefined`"),
                 })
             }
-            TypedExprNode::BinOp { left, op, right } => {
+            TypedExprNode::BinOp {
+                left, op, right, ..
+            } => {
                 let (l, r) = (self.expr(solver, left)?, self.expr(solver, right)?);
                 // Equality is the one operation an uninterpreted sort has; the cross-sort
                 // check below rejects comparing it with any other sort.
@@ -1317,7 +1321,10 @@ impl<'a> Encode<'a> {
         solver: &mut Solver,
         e: &TypedExpr,
     ) -> Option<Result<SExpr, String>> {
-        let TypedExprNode::BinOp { left, op, right } = &e.node else {
+        let TypedExprNode::BinOp {
+            left, op, right, ..
+        } = &e.node
+        else {
             return None;
         };
         let negated = match op.unrefined() {
@@ -1437,7 +1444,7 @@ impl<'a> Encode<'a> {
         match &e.node {
             TypedExprNode::Lit(Lit::Int(_)) => Some(SmtSort::Int),
             TypedExprNode::Lit(Lit::Bool(_)) => Some(SmtSort::Bool),
-            TypedExprNode::UnaryOp(op, _) => Some(match op.unrefined() {
+            TypedExprNode::UnaryOp(op, _, _) => Some(match op.unrefined() {
                 UnaryOpKind::Neg => SmtSort::Int,
                 _ => SmtSort::Bool,
             }),
@@ -1652,7 +1659,7 @@ fn unencodable(e: &TypedExpr) -> String {
 fn is_int_literal(e: &TypedExpr) -> bool {
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_)) => true,
-        TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => is_int_literal(operand),
+        TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand, _) => is_int_literal(operand),
         _ => false,
     }
 }

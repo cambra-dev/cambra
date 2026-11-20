@@ -71,7 +71,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Apply { .. } => "Apply".to_string(),
         Cast { .. } => "Cast".to_string(),
         BinOp { op, .. } => format!("BinOp({op:?})"),
-        UnaryOp(op, _) => format!("UnaryOp({op:?})"),
+        UnaryOp(op, ..) => format!("UnaryOp({op:?})"),
         Lambda { params, .. } => format!(
             "Lambda({})",
             params

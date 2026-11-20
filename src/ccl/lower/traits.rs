@@ -136,6 +136,7 @@ fn instance_function(
         function: declared.name.clone(),
         operands: instance.args.clone(),
         assoc: instance.assoc.clone(),
+        obligation: crate::ccl::expr::CallObligation::default(),
     });
     Ok((ctx.tag_image(node, function.span), arity))
 }

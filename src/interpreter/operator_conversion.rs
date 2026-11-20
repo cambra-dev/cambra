@@ -6913,6 +6913,7 @@ mod variant_ctor_tests {
                 left: Box::new(typed(TypedExprNode::Var("p".into()), int_ty.clone())),
                 op: BinOpKind::Compare(CompareKind::Equals),
                 right: Box::new(typed(TypedExprNode::Lit(Lit::Int(0)), int_ty.clone())),
+                obligation: Default::default(),
             },
             Type::Base(CclBase::Bool),
         );
@@ -6921,6 +6922,7 @@ mod variant_ctor_tests {
                 left: Box::new(typed(TypedExprNode::Var("p".into()), int_ty.clone())),
                 op: BinOpKind::Arithmetic(ArithmeticKind::Add),
                 right: Box::new(typed(TypedExprNode::Lit(Lit::Int(1)), int_ty.clone())),
+                obligation: Default::default(),
             },
             int_ty.clone(),
         );
