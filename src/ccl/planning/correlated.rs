@@ -49,6 +49,7 @@ use crate::ccl::TypedExpr;
 use crate::ccl::lambda_elim::strength_over;
 
 use super::predicates::fn_of_bare_predicate;
+use crate::ccl::Duplicate;
 
 /// Emit the filter riding every correlated `curry` site's pair ([`emit_pair_filter`]).
 ///
@@ -198,12 +199,12 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     let keys = match inner_source(g, &inner_domain) {
         Some(source) => {
             // A **recorded copy**: the source stays where it is inside `𝑔`, which applies it
-            // at each element, and this second occurrence re-views it at its domain. `Clone`
-            // re-mints the ids and the frame records the parentage, as entry iteration's kept
-            // collection does.
+            // at each element, and this second occurrence re-views it at its domain. A
+            // duplicate re-mints the ids and the frame records the parentage, as entry
+            // iteration's kept collection does.
             let copy = {
                 let _frame = provenance::copy_frame("planning.correlated_source");
-                source.clone()
+                source.duplicate()
             };
             apply_primitive(
                 copy,
@@ -312,6 +313,7 @@ pub(super) fn keys_family(
     let component = crate::ccl::subst::open_pi_binder(
         &crate::ccl::subst::Mapping::Rename(x.clone()),
         component,
+        crate::ccl::Ids::Fresh,
     );
     // **A projection through the row**: the inner collection is a sum the row holds, whose
     // keys are its own, so the family is that collection unboxed and re-viewed at its keys,
@@ -328,7 +330,7 @@ pub(super) fn keys_family(
         .find_map(|r| {
             r.membership_collection()
                 .filter(|collection| ccl_utils::is_free(&x, collection))
-                .cloned()
+                .map(Duplicate::duplicate)
         })
         .ok_or_else(|| {
             format!(
@@ -442,7 +444,7 @@ fn row_keys_family(
             .ok_or_else(|| format!("a projected value has a sum type, got {}", row.ty))?;
         let term = {
             let _frame = provenance::copy_frame("planning.row_keys_term");
-            (**row).clone()
+            (**row).duplicate()
         };
         let unboxed = Expr::apply(term, Expr::builtin(Builtin::Unbox).with_ty(stamp))
             .with_ty(unboxed_ty.clone());
@@ -565,7 +567,7 @@ fn row_collection(g: &Expr, incoming: &Type, inner_domain: &Type) -> Option<Vec<
         {
             // A recorded copy: the path stays where it is inside `𝑔`.
             let _frame = provenance::copy_frame("planning.correlated_source");
-            return Some(rest.iter().map(|s| (*s).clone()).collect());
+            return Some(rest.iter().map(|s| (*s).duplicate()).collect());
         }
     }
     let mut found = None;
@@ -752,8 +754,11 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
         return Ok(false);
     };
     let a = first_name.clone().unwrap_or_else(|| Name::fresh("__x"));
-    let second =
-        crate::ccl::subst::open_pi_binder(&crate::ccl::subst::Mapping::Rename(a.clone()), second);
+    let second = crate::ccl::subst::open_pi_binder(
+        &crate::ccl::subst::Mapping::Rename(a.clone()),
+        second,
+        crate::ccl::Ids::Fresh,
+    );
     let filters: Vec<Rc<TypedExpr>> = second
         .refinements()
         .iter()

@@ -15,6 +15,7 @@ use cambra::chl_parser::FileId;
 use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
+use crate::ccl::Duplicate;
 use cambra::ccl::{
     Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode, anf,
     ccl_utils::walk_refined_predicates,
@@ -4372,7 +4373,7 @@ mod binder_slot_records_the_bound_at_type {
         fn find(expr: &Expr, name: &str, out: &mut Option<TypedBinding>) {
             expr.walk_binders(|b| {
                 if b.name.base() == name {
-                    *out = Some(b.clone());
+                    *out = Some(b.duplicate());
                 }
             });
             expr.walk_children(|c| find(c, name, out));

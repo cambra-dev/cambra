@@ -6,6 +6,7 @@ use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use super::*;
+use crate::ccl::Duplicate;
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Builtin,
@@ -594,7 +595,7 @@ impl MintedTerm {
                 record(o, c);
             }
         }
-        let copy = self.0.clone();
+        let copy = self.0.duplicate();
         record(&self.0, &copy);
         copy
     }
@@ -625,7 +626,7 @@ fn lower_groupby(
     // refinement predicate — a type slot outside the `walk_children` domain, swept by
     // `tag_predicate` below because `collect_tree_ids` reaches refinement predicates and
     // the lowering fold therefore has to explain them. The `collection` clone is what
-    // makes that load-bearing here: `Clone` freshens, so the clone does not alias an
+    // makes that load-bearing here: `duplicate` freshens, so the copy does not alias an
     // already-tagged main-tree id. Everything on the main tree below is recorded — an
     // unrecorded lowering mint is a `Leak::Unrecorded` at the boundary.
     let bare_pred = Expr::binop(

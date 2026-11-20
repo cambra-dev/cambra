@@ -201,6 +201,7 @@ fn wrap(body: Expr, opaque: Rc<[Name]>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Duplicate;
     use crate::ccl::{BaseType, Lit};
 
     fn opaque_let(name: &Name, body: Expr) -> Expr {
@@ -358,7 +359,7 @@ mod tests {
             panic!("the root stays a tuple");
         };
         let barrier = |e: &Expr| match &body_of(e).node {
-            TypedExprNode::Let { binding, .. } => binding.user_annotation.clone(),
+            TypedExprNode::Let { binding, .. } => binding.user_annotation.duplicate(),
             _ => None,
         };
         assert_ne!(barrier(&items[0]), barrier(&items[1]));

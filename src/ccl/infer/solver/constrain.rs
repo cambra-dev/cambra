@@ -1842,6 +1842,7 @@ fn constrain_go_impl(
                         Some(crate::ccl::subst::open_pi_binder(
                             &crate::ccl::subst::Mapping::Rename(b.clone()),
                             c,
+                            crate::ccl::Ids::Fresh,
                         ))
                     }
                     _ => None,
@@ -2010,25 +2011,29 @@ fn constrain_go_impl(
             constrain_go(lhs, &unnamed, sl, sr, cache, scope)
         }
         (Type::DepTuple(a), Type::DepTuple(b)) if a.len() == b.len() => {
-            let opened = |cs: &[(Option<Name>, Type)], other: &Type| -> Vec<Type> {
-                let closed = cs
-                    .iter()
-                    .enumerate()
-                    .any(|(k, (_, t))| crate::ccl::subst::references_binder_within(t, k as u32));
-                if closed
-                    && (cache.derivation.opens_unconditionally()
-                        || crate::ccl::subst::type_contains_infer(other))
-                {
-                    crate::ccl::subst::open_tuple_components(cs, |j, _| {
-                        let name = cs[j].0.clone().unwrap_or_else(|| {
+            let opened =
+                |cs: &[(Option<Name>, Type)], other: &Type| -> Vec<Type> {
+                    let closed = cs.iter().enumerate().any(|(k, (_, t))| {
+                        crate::ccl::subst::references_binder_within(t, k as u32)
+                    });
+                    if closed
+                        && (cache.derivation.opens_unconditionally()
+                            || crate::ccl::subst::type_contains_infer(other))
+                    {
+                        crate::ccl::subst::open_tuple_components(
+                            cs,
+                            |j, _| {
+                                let name = cs[j].0.clone().unwrap_or_else(|| {
                             panic!("a component a later one reads by index names a binder: {lhs}")
                         });
-                        crate::ccl::subst::Mapping::Rename(name)
-                    })
-                } else {
-                    cs.iter().map(|(_, t)| t.clone()).collect()
-                }
-            };
+                                crate::ccl::subst::Mapping::Rename(name)
+                            },
+                            crate::ccl::Ids::Fresh,
+                        )
+                    } else {
+                        cs.iter().map(|(_, t)| t.clone()).collect()
+                    }
+                };
             let (a_opened, b_opened) = (opened(a, rhs), opened(b, lhs));
             let mut aligned = sl.clone();
             for (k, (t0, t1)) in a_opened.iter().zip(&b_opened).enumerate() {
@@ -2064,9 +2069,11 @@ fn constrain_go_impl(
             let opened = |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
                 let live = cache.derivation.opens_unconditionally()
                     || crate::ccl::subst::type_contains_infer(other);
-                live.then(|| crate::ccl::subst::opened_family_body(binders, body))
-                    .flatten()
-                    .unwrap_or_else(|| body.clone())
+                live.then(|| {
+                    crate::ccl::subst::opened_family_body(binders, body, crate::ccl::Ids::Fresh)
+                })
+                .flatten()
+                .unwrap_or_else(|| body.clone())
             };
             let (a_opened, b_opened) = (opened(a, a_body, rhs), opened(b, b_body, lhs));
             let aligned = a
@@ -2457,7 +2464,7 @@ fn constrain_go_impl(
             // substitution on its side reaches them before it is delivered.
             if let Type::FamilyApp(_) = lhs.peel_refinements() {
                 let into = edge_into_holder(sl, sr);
-                let at = crate::ccl::provenance::preserving_ids(|| into.apply_type(lhs));
+                let at = into.copying(crate::ccl::Ids::Kept).apply_type(lhs);
                 notify_lower(rv, &at, cache)?;
             } else {
                 notify_lower(rv, lhs, cache)?;

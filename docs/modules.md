@@ -124,7 +124,7 @@ Lowering errors are reported once per module, however many runs it has.
 
 Linking creates each run from its module's lowering (`ProgramLowering::create`):
 
-1. **Copy** the chain. `Clone` mints fresh node ids and records each copy for provenance.
+1. **Copy** the chain. `duplicate` mints fresh node ids and records each copy for provenance.
 2. **Create each run it declares**, at its `Run` node, and put its chain there around the rest of
    the module (`ProgramLowering::expand_runs`).
 3. **Uniquify** the copy with the run's home, in a scope that maps each spelling through a

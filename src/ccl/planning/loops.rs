@@ -13,6 +13,7 @@ use crate::ccl::Label;
 use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
+use crate::ccl::Duplicate;
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_TIME, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
@@ -273,7 +274,7 @@ fn view_steps(view: &Expr, h: &Name) -> Option<Vec<Expr>> {
             {
                 flatten(argument, out)
             }
-            _ => out.push(e.clone()),
+            _ => out.push(e.duplicate()),
         }
     }
     let mut steps = Vec::new();
@@ -524,7 +525,7 @@ fn split_decision_compose(
         let TypedExprNode::Tuple(inner_slots) = &argument.node else {
             panic!("letrec recognition: a nested decision's slots are not a tuple");
         };
-        slots = inner_slots.clone();
+        slots = inner_slots.duplicate();
     }
     let source = slots.pop().expect("snapshot carries the source");
     // The writer's parameter is the domain every snapshot slot shares, and the source
@@ -929,7 +930,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
             (n.clone(), read)
         })
         .collect();
-    let body = Subst::discharge_env_in_place(body, &env);
+    let body = Subst::discharge_env_in_place(body, &env, crate::ccl::Ids::Fresh);
     for n in &binding_names {
         assert_eq!(
             count_free(n, &body),
@@ -1483,7 +1484,7 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
             provenance::Nature::Machinery,
         );
         let outer_ty = e.ty.clone();
-        let rest: Vec<Expr> = steps[consumed..].to_vec();
+        let rest: Vec<Expr> = steps[consumed..].iter().map(Duplicate::duplicate).collect();
         let view_ty = view.ty.clone();
         let after = split.map(|(_, after)| after).unwrap_or_default();
         let rewritten = match reads.enclosing {
@@ -1521,7 +1522,7 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
         let replacement: Option<(Expr, usize)> = history_read_replacement(&elts[1..], reads)
             .map(|(read, consumed)| (read, 1 + consumed));
         if let Some((read, covered)) = replacement {
-            let rest: Vec<Expr> = elts[covered..].to_vec();
+            let rest: Vec<Expr> = elts[covered..].iter().map(Duplicate::duplicate).collect();
             let outer_ty = e.ty.clone();
             let inner = if rest.is_empty() {
                 read
@@ -1646,10 +1647,10 @@ fn split_view_tail(e: &Expr) -> Option<(Expr, Vec<Expr>)> {
         return None;
     };
     let view = crate::ccl::ccl_utils::chain_typed(
-        vec![head.clone(), marker.clone()],
+        vec![head.duplicate(), marker.duplicate()],
         Type::fun_like(&head.ty, domain, codomain),
     );
-    Some((view, after.to_vec()))
+    Some((view, after.iter().map(Duplicate::duplicate).collect()))
 }
 
 /// Peel the eliminated form of a parameter-dependent history view, returning the
@@ -1678,8 +1679,8 @@ fn peel_view_steps(e: &Expr, h: &Name) -> Option<Vec<Expr>> {
             _ => return None,
         };
         match &argument.node {
-            TypedExprNode::Compose(mapped) => steps.extend(mapped.iter().cloned()),
-            _ => steps.push((**argument).clone()),
+            TypedExprNode::Compose(mapped) => steps.extend(mapped.iter().map(Duplicate::duplicate)),
+            _ => steps.push((**argument).duplicate()),
         }
         return Some(steps);
     }
@@ -1712,7 +1713,7 @@ fn peel_view_steps(e: &Expr, h: &Name) -> Option<Vec<Expr>> {
         return None;
     }
     let mut steps = peel_view_steps(inner, h)?;
-    steps.push((**step_inner).clone());
+    steps.push((**step_inner).duplicate());
     Some(steps)
 }
 

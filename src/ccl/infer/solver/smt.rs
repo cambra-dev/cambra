@@ -60,6 +60,7 @@ use std::io;
 
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
+use crate::ccl::Duplicate;
 use crate::ccl::symbolic::symbolic;
 use smol_str::SmolStr;
 
@@ -1719,7 +1720,7 @@ mod tests {
         let mut cases: Vec<_> = binops
             .map(|(op, base, l, r)| {
                 assert!(op.is_refined(), "{op:?} is a `^` operator");
-                let at = |op| TypedExpr::binop(l.clone(), op, r.clone());
+                let at = |op| TypedExpr::binop(l.duplicate(), op, r.duplicate());
                 (base, at(op), at(op.unrefined()))
             })
             .collect();
@@ -1811,7 +1812,7 @@ mod tests {
     #[test]
     fn a_free_name_is_universally_quantified() {
         let t = TypedExpr::var(Name::raw("t")).with_ty(int());
-        let lhs = [elem_cmp(CompareKind::Equals, add(t.clone(), lit(3)))];
+        let lhs = [elem_cmp(CompareKind::Equals, add(t.duplicate(), lit(3)))];
         // `__elem == t + 3` gives `__elem > t`, and gives nothing about `__elem`
         // against a constant.
         assert!(smt_sub(&int(), &lhs, &[elem_cmp(CompareKind::Greater, t)], &NoScope).unwrap());

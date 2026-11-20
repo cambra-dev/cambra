@@ -776,6 +776,7 @@ fn assert_all_binders_minted(expr: &Expr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Duplicate;
     use crate::ccl::Occurrence;
     use crate::ccl::lower::{LoweringContext, lower_stmts};
     use crate::ccl::{Expr, Lit, Refinement};

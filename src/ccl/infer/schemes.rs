@@ -515,12 +515,14 @@ pub(super) fn uncurried_value_at_its_tuple(
     let mut env: std::collections::HashMap<crate::ccl::Name, crate::ccl::TypedExpr> =
         std::collections::HashMap::new();
     for (i, (k, component)) in components.iter().enumerate() {
-        let at_earlier = crate::ccl::subst::Subst::discharging(&env).apply_type(component);
+        let at_earlier = crate::ccl::subst::Subst::discharging(&env, crate::ccl::Ids::Fresh)
+            .apply_type(component);
         if let Some(k) = k {
             env.insert(k.clone(), project(i, &at_earlier));
         }
     }
-    let read = crate::ccl::subst::Subst::discharging(&env).apply_type(&value);
+    let read =
+        crate::ccl::subst::Subst::discharging(&env, crate::ccl::Ids::Fresh).apply_type(&value);
     Type::Fun {
         name,
         fun_kind,

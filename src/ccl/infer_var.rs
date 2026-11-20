@@ -174,7 +174,7 @@ pub struct Bound {
 
 /// The memo of a [`Bound`]'s [`render_subst`](Bound::render_subst). A bound's two
 /// substitutions are fixed once it is built, so the composite is too. Empty in a newly built
-/// bound, and filled only where a copy mints its own ids (`provenance::ids_preserved`).
+/// bound, and filled on the first render.
 #[derive(Debug, Clone, Default)]
 pub struct RenderedSubst(std::cell::OnceCell<subst::Subst>);
 
@@ -267,11 +267,6 @@ impl Bound {
     pub fn render_subst(&self) -> subst::Subst {
         if self.self_subst.is_id() {
             return self.ty_subst.clone();
-        }
-        // A composite built while ids are preserved holds nodes that keep their originals' ids,
-        // or throwaways in a debug check, which may not outlive that scope, so it is not kept.
-        if crate::ccl::provenance::ids_preserved() {
-            return subst::Subst::then(&self.ty_subst, &self.holder_inverse());
         }
         self.rendered
             .0
