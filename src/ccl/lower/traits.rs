@@ -831,22 +831,13 @@ fn signature_type(
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     let ty = lower_type_expr(annotation, ctx)?;
-    if mentions_refinement(&ty) {
+    if ty.carries_refinement() {
         return Err(LoweringError::internal(
             annotation.span,
             format!("a refinement in the signature of `{qualified}` is not supported yet"),
         ));
     }
     Ok(ty)
-}
-
-fn mentions_refinement(ty: &Type) -> bool {
-    if matches!(ty, Type::Refinement(..)) {
-        return true;
-    }
-    let mut found = false;
-    ty.walk_children(|c| found |= mentions_refinement(c));
-    found
 }
 
 /// Declare the instance each `instance` block among the module's top-level `stmts`
@@ -1121,7 +1112,7 @@ fn declare_instance(
         if let Err(why) = settle_written_capabilities(&mut ty) {
             return Err(LoweringError::unsupported(a.value.span, why));
         }
-        if mentions_refinement(&ty) {
+        if ty.carries_refinement() {
             return Err(LoweringError::internal(
                 a.value.span,
                 format!(
