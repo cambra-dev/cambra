@@ -1471,8 +1471,7 @@ impl BreakingProducer for CommitProducer {
 
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
-    /// decided, and a reader of its final value takes it once the store is terminal
-    /// (`Dispatcher::read_whole`).
+    /// decided, and a reader of its final value takes it once the store is terminal.
     fn complete(&self) -> TileGuard {
         let mut state_guard = self
             .state

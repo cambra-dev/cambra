@@ -337,7 +337,7 @@ fn a_sum_over_a_list_concatenated_with_a_literal() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Aggregate") && !plan.whole && plan.started),
+            .any(|plan| plan.name.starts_with("Aggregate") && plan.started),
         "the sum reads the memo's pushes and the literal's region: {planned:?}"
     );
 }
@@ -418,7 +418,7 @@ fn a_group_by() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
+            .any(|plan| plan.name.starts_with("Memo") && plan.held),
         "the group-by's memo holds its rows until their inputs complete: {planned:?}"
     );
 }
@@ -436,10 +436,9 @@ fn a_sum_over_two_concatenated_comprehensions() {
     answers(source, "15", &["Memo", "Aggregate"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
-        planned.iter().any(|plan| plan.name.starts_with("Aggregate")
-            && !plan.whole
-            && plan.held
-            && !plan.started),
+        planned
+            .iter()
+            .any(|plan| plan.name.starts_with("Aggregate") && plan.held && !plan.started),
         "the sum reads both arms' pushes: {planned:?}"
     );
 }
@@ -472,8 +471,8 @@ fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
         rows,
     );
     assert!(
-        planned.iter().any(|plan| plan.held) && !planned.iter().any(|plan| plan.whole),
-        "the outer sum holds its rows until their inputs complete, and no pipeline reads its input whole: {planned:?}"
+        planned.iter().any(|plan| plan.held),
+        "the outer sum holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -488,7 +487,7 @@ fn a_sink_reads_the_pushes_of_a_values_output_memo() {
     answers(source, "3", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.held, "{sink:?}");
+    assert!(sink.held, "{sink:?}");
 }
 
 /// The sink of a collection reads the pushes of the collection's output memo.
@@ -502,7 +501,7 @@ fn a_sink_of_a_collection() {
     answers(source, "Function [ 2, 3, 4 ]", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.held, "{sink:?}");
+    assert!(sink.held, "{sink:?}");
 }
 
 /// Two sinks each run as a pipeline of their own, and the program is done once both are.
@@ -664,13 +663,6 @@ fn a_loop_over_a_let_bound_list() {
         out << total
     "};
     answers(source, "6", &["Memo", "InductionRequest", "SinkBreaker"]);
-    let (_, planned) = dispatched(source, 1);
-    assert!(
-        planned
-            .iter()
-            .any(|plan| plan.name.starts_with("InductionRequest") && plan.whole),
-        "the loop's scope reads the list's memo whole: {planned:?}"
-    );
 }
 
 /// A loop's total and a sum both feed the sink.
@@ -707,8 +699,8 @@ fn a_reader_inside_a_loops_scope_waits_for_inputs() {
     let (_, planned) = dispatched(source, 1);
     let inner = rounds(&planned);
     assert!(
-        inner.iter().any(|plan| plan.held) && !inner.iter().any(|plan| plan.whole),
-        "a reader in the outer loop's scope waits_for_inputs, and none reads whole: {planned:?}"
+        inner.iter().any(|plan| plan.held),
+        "a reader in the outer loop's scope waits_for_inputs: {planned:?}"
     );
 }
 
@@ -1737,10 +1729,7 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("InductionRequest")
-                && plan.live
-                && !plan.whole
-                && plan.held),
+            .any(|plan| plan.name.starts_with("InductionRequest") && plan.live && plan.held),
         "the loop's scope takes the deliveries as rounds, waiting for inputs on the `Memo`: {planned:?}"
     );
 }
@@ -2713,7 +2702,7 @@ fn a_loop_over_a_source_completed_in_one_delivery(#[values(1, usize::MAX)] rows:
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("InductionRequest")),
+            .any(|plan| plan.live && plan.name.starts_with("InductionRequest")),
         "the loop's scope is the live source pipeline, read in rounds: {planned:?}"
     );
 }
@@ -2877,7 +2866,7 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     assert!(
         planned
             .iter()
-            .any(|plan| !plan.live && !plan.whole && plan.held && plan.name.starts_with("Memo")),
+            .any(|plan| !plan.live && plan.held && plan.name.starts_with("Memo")),
         "the feed's `Memo` holds its rows until their inputs complete: {planned:?}"
     );
 }
@@ -2907,7 +2896,7 @@ fn a_feed_of_a_map_over_a_live_source(
     #[values(1, usize::MAX)] rows: usize,
 ) {
     let mut written_before_next_delivery = Vec::new();
-    let (value, planned) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+    let (value, _) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
         assert_eq!(
             sink.value(),
             Err(crate::interpreter::SinkReadError::Incomplete),
@@ -2932,10 +2921,6 @@ fn a_feed_of_a_map_over_a_live_source(
         written_before_next_delivery,
         vec![delivered_through(1), delivered_through(3)],
         "each delivery's rows reach the sink before the next, each once"
-    );
-    assert!(
-        planned.iter().any(|plan| plan.live && plan.whole),
-        "a live pipeline reads its input whole: {planned:?}"
     );
 }
 
@@ -3714,7 +3699,7 @@ fn a_map_over_a_live_source_at_main(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("SinkBreaker")),
+            .any(|plan| plan.live && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline is notified of each delivery: {planned:?}"
     );
 }
@@ -3770,10 +3755,9 @@ fn a_filter_over_a_live_source_reading_a_sum(
         "the `main` output is handed the first delivery's rows once the sum is final"
     );
     assert!(
-        planned.iter().any(|plan| plan.live
-            && !plan.whole
-            && plan.held
-            && plan.name.starts_with("SinkBreaker")),
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.held && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline takes arrivals and holds them until their inputs complete: {planned:?}"
     );
 }
@@ -3791,10 +3775,6 @@ fn readers_over_a_live_pipeline_wait_for_inputs(#[values(1, usize::MAX)] rows: u
     "};
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), vec![(0, 15), (1, 30)]);
-    assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
     assert!(
         planned
             .iter()
@@ -3846,10 +3826,6 @@ fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), expected);
     assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
-    assert!(
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
@@ -3893,10 +3869,6 @@ fn a_sum_over_live_rows_carrying_a_constant(
             .any(|plan| plan.live && plan.name.starts_with("Memo")),
         "the source's `Memo` is the live pipeline: {planned:?}"
     );
-    assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
 }
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
@@ -3925,10 +3897,8 @@ fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)
     assert_eq!(written_before_next_delivery, vec![through(1), through(3)]);
     assert_eq!(keyed_ints(&single_value(&value)), through(4));
     assert!(
-        planned
-            .iter()
-            .any(|plan| plan.live && plan.whole && plan.held),
-        "a pipeline over the source reads it whole and holds its rows until their inputs complete: {planned:?}"
+        planned.iter().any(|plan| plan.live && plan.held),
+        "a pipeline over the source holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -4154,10 +4124,9 @@ fn a_store_over_a_live_source_reading_a_pipeline(
     assert_eq!(
         following
             .iter()
-            .map(|plan| match (plan.whole, plan.held) {
-                (true, _) => "whole",
-                (false, true) => "held",
-                (false, false) => "neither",
+            .map(|plan| match plan.held {
+                true => "held",
+                false => "neither",
             })
             .collect::<Vec<_>>(),
         plans,
@@ -4191,7 +4160,7 @@ fn a_writer_over_a_concatenation_with_a_live_source(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("Commit")),
+            .any(|plan| plan.live && plan.name.starts_with("Commit")),
         "the store takes its items as they arrive: {planned:?}"
     );
 }

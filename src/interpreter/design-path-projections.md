@@ -154,8 +154,7 @@ path to a recurrence slot caches positions of later rounds from the store's snap
 again before the store's next step
 ([A store as a breaker](design-operators.md#a-store-as-a-breaker)).
 
-A live source's arrivals are notified as the projection of its keys they restate at the entry of the
-pipeline that stands for the range, at any level, or that pipeline reads its input whole once the
-source yields everything (`LivePipeline::poll`). A feed of a collection read from a live source is
-keyed by the sink's one row, so its arrivals reach the pipeline above the source widened, and that
-pipeline reads its input whole.
+A live source's arrivals are notified as the region they restate at the entry of the pipeline that
+stands for the range, at any level (`LivePipeline::poll`). A feed of a collection read from a live
+source is keyed by the sink's one row, so its arrivals reach the pipeline above the source widened,
+as every key of its input.

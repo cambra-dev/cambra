@@ -644,33 +644,29 @@ fn run_targets(
         });
         let input = input.expect("a reach calls the breaker it reaches");
         let mut starts: Vec<TileGuard> = Vec::new();
-        let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
+        let special = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
             // completion; otherwise the scope holds each delivery on the pipelines it reads.
-            (Located::Store { .. }, _) if inherits => Notifies::Items { arms: None },
-            _ if inherits => match leaves.iter().all(|leaf| leaf.ordering_path().is_some()) {
-                true => Notifies::Rounds,
-                false => Notifies::Whole,
-            },
+            (Located::Store { .. }, _) if inherits => Some(Notifies::Items { arms: None }),
+            _ if inherits => leaves
+                .iter()
+                .all(|leaf| leaf.ordering_path().is_some())
+                .then_some(Notifies::Rounds),
             // A transaction store places the entry before its writer's source, so its items are a
             // delivery's keys as its writer's source holds them: the source's own positions where
             // that source is the live source, and over a concatenation those positions under each
             // arm that reads the source. The arms that read no live source come with the first
             // notification. The items are read off the extents (`store_items`), since a writer
-            // may read its source through requests no push climbs. Any other shape has the store
-            // take its input whole once every source yields everything.
-            (Located::Store { .. }, _) => match store_items(&input, leaves) {
-                Some((arms, statics)) => {
-                    starts.extend(statics);
-                    Notifies::Items { arms }
-                }
-                None => Notifies::Whole,
-            },
+            // may read its source through requests no push climbs. Any other shape takes the
+            // arrivals the source's ranges bring, as any other pipeline does.
+            (Located::Store { .. }, _) => store_items(&input, leaves).map(|(arms, statics)| {
+                starts.extend(statics);
+                Notifies::Items { arms }
+            }),
             // A loop's scope runs a round per position the drive emits. Its drive's positions are
             // a delivery's keys where one key reaches the drive's entry as itself, over the
             // source's domain. A source read otherwise, inside a loop nested in this one among
-            // them, ends the scope's rows only once it yields everything, so the scope then reads
-            // its input whole.
+            // them, brings the arrivals its ranges bring, as for any other pipeline.
             (_, Some(scope)) => {
                 let keys_are_positions = leaves.iter().all(|leaf| {
                     if leaf.ordering_path().is_none() {
@@ -683,19 +679,17 @@ fn run_targets(
                     input.domain_extent().as_ref() == Some(&leaf.extent)
                         && keys_arrive_as_themselves(&routes, &arrived, &one)
                 });
-                match keys_are_positions {
-                    true => Notifies::Rounds,
-                    false => Notifies::Whole,
-                }
+                keys_are_positions.then_some(Notifies::Rounds)
             }
+            _ => None,
+        };
+        let notifies = match special {
+            Some(notifies) => notifies,
             // Any other pipeline: the range's route to the pipeline's entry is read, as a stream
             // edge's is. A path that keeps the range's keys brings an arrival restated as a
-            // projection of the input's keys at any level, notified as it arrives. A path that
-            // widens them names every key of the input, which is final only once the source yields
-            // everything, so the pipeline then reads its whole input once, every range's part of it
-            // included.
-            _ => {
-                let mut notifies = Notifies::Arrivals;
+            // projection of the input's keys at any level, and a path that widens them every key
+            // of the input; either is notified as it arrives.
+            None => {
                 for leaf in leaves {
                     let one = leaf.probe_region();
                     let routes = routes_to(&leaf.consumer, std::slice::from_ref(&one), pipeline);
@@ -708,9 +702,7 @@ fn run_targets(
                         )));
                     }
                     let arrived = probe(&leaf.consumer, PipelineId(pipeline), &one, pipeline);
-                    if routes.iter().any(|route| !route.keeps_keys) {
-                        notifies = Notifies::Whole;
-                    } else if !arrived
+                    if !arrived
                         .iter()
                         .all(|arrival| Projection::of(&arrival.guard).is_ok())
                     {
@@ -723,9 +715,8 @@ fn run_targets(
                     }
                 }
                 // A range of the pipeline's own that no source yields brings its rows once: its
-                // probe's region is queued with the first notification. A range whose route
-                // widens names every key of the input, which the pipeline then reads whole.
-                if matches!(notifies, Notifies::Arrivals) {
+                // probe's region is queued with the first notification.
+                {
                     // What the live ranges bring arrives as their own packages, so a range's start
                     // leaves it out: a static row paired with a source's positions is brought by
                     // the positions as they arrive (`notifications::pairing`).
@@ -742,30 +733,22 @@ fn run_targets(
                         .fold(input.empty_guard(), |region, arrival| {
                             region.union(&arrival.guard)
                         });
-                    for (range, pushes) in &members.leaves[pipeline] {
-                        if routes_to(range, pushes, pipeline)
-                            .iter()
-                            .all(|route| route.keeps_keys)
-                        {
-                            let everything = Projection::Everything;
-                            starts.extend(
-                                probe(range, PipelineId(pipeline), &everything, pipeline)
-                                    .into_iter()
-                                    .map(|arrival| {
-                                        guard_minus(&arrival.guard, &live_region)
-                                            .closed_over(&input)
-                                    })
-                                    .filter(|guard| !guard.is_empty()),
-                            );
-                        } else {
-                            notifies = Notifies::Whole;
-                        }
+                    for (range, _) in &members.leaves[pipeline] {
+                        let everything = Projection::Everything;
+                        starts.extend(
+                            probe(range, PipelineId(pipeline), &everything, pipeline)
+                                .into_iter()
+                                .map(|arrival| {
+                                    guard_minus(&arrival.guard, &live_region).closed_over(&input)
+                                })
+                                .filter(|guard| !guard.is_empty()),
+                        );
                     }
                 }
                 // A pipeline notified of arrivals takes no package but theirs and its ranges', so
                 // a pipeline it reads whose pushes arrive as its own keys brings rows no arrival
                 // names.
-                if matches!(notifies, Notifies::Arrivals) {
+                {
                     let everything = Projection::Everything;
                     // The region of the pipeline's input its live ranges bring.
                     let arrived_region = leaves
@@ -815,7 +798,7 @@ fn run_targets(
                         starts.push(unnamed);
                     }
                 }
-                notifies
+                Notifies::Arrivals
             }
         };
         planned[pipeline].live = true;
@@ -828,9 +811,6 @@ fn run_targets(
         {
             dispatcher.wait_for_inputs(PipelineId(pipeline));
             planned[pipeline].held = true;
-        }
-        if matches!(notifies, Notifies::Whole) {
-            starts.clear();
         }
         live.push(LivePipeline::new(
             PipelineId(pipeline),
@@ -1614,10 +1594,10 @@ impl std::error::Error for Refused {}
 pub(super) enum Consumes {
     /// What the pipelines it reads push, as its edges' probes plan.
     Pushes,
-    /// Its input whole, in order, once every pipeline it reads has finished, or over a live
-    /// source each delivery once they have completed it: a store that steps itself, or a loop's
-    /// scope.
-    Whole,
+    /// What the pipelines it reads push, as for [`Pushes`](Self::Pushes), one package at a time in
+    /// queue order: a store that steps itself decides its positions in order, and a loop's scope
+    /// steps its store in order.
+    InOrder,
     /// One row per round of the scope it runs in, which queues it the row, once every pipeline it
     /// reads is quiescent: the scope of a loop nested in the scope's loop.
     Rounds,
@@ -1669,7 +1649,7 @@ pub(super) fn plan_edges(
     }
     // A store decides its positions in order; a scope steps its store in order.
     for (pipeline, kind) in kinds.iter().enumerate() {
-        if *kind != Consumes::Pushes {
+        if matches!(kind, Consumes::InOrder | Consumes::Rounds) {
             dispatcher.order(PipelineId(pipeline));
         }
     }
@@ -1696,7 +1676,6 @@ pub(super) fn plan_edges(
             #[cfg(test)]
             incremental_claims: 0,
             name: name.clone(),
-            whole: false,
             follows: Vec::new(),
             started: false,
             rounds: Vec::new(),
@@ -1713,7 +1692,7 @@ pub(super) fn plan_edges(
             match kinds[reader] {
                 // A pipeline that pushes takes each delivery, waiting for inputs until the pipelines it reads
                 // have completed it.
-                Consumes::Pushes => {
+                Consumes::Pushes | Consumes::InOrder => {
                     dispatcher.take_arrivals(PipelineId(reader));
                     dispatcher.wait_for_inputs(PipelineId(reader));
                     planned[reader].held = true;
@@ -1721,7 +1700,7 @@ pub(super) fn plan_edges(
                 // A store or a loop's scope over a live source takes each delivery once the
                 // pipelines it reads have completed it, or are quiescent where it follows them
                 // (below), so it reads no row again.
-                Consumes::Rounds | Consumes::Whole => dispatcher.take_arrivals(PipelineId(reader)),
+                Consumes::Rounds => dispatcher.take_arrivals(PipelineId(reader)),
             }
         }
         let mut input = None;
@@ -1730,28 +1709,20 @@ pub(super) fn plan_edges(
         });
         let input = input.expect("a reach calls the breaker it reaches");
         match kinds[reader] {
-            // A store's pipeline reads its input whole once the pipelines beneath its cycle have
-            // finished: a push from beneath stops at the store's entry rather than reach the
-            // cycle.
-            Consumes::Whole if !arrivals[reader] => {
-                dispatcher.wait_for_inputs(PipelineId(reader));
-                planned[reader].held = true;
-                continue;
-            }
             // A nested loop's scope takes the row the scope around it queues it once the pipelines
             // it reads have finished the round, since its rounds pull them, and a store or a
             // loop's scope over a live source takes each delivery so.
             // In the run's dispatcher a store or a loop's scope over a live source holds each
             // delivery on what the pipelines it reads have completed instead (`run_targets`).
-            Consumes::Rounds | Consumes::Whole if opens => continue,
-            Consumes::Rounds | Consumes::Whole => {
+            Consumes::Rounds if opens => continue,
+            Consumes::Rounds => {
                 for &follow in read {
                     dispatcher.follow(PipelineId(reader), PipelineId(follow));
                     planned[reader].follows.push(follow);
                 }
                 continue;
             }
-            Consumes::Pushes => {}
+            Consumes::Pushes | Consumes::InOrder => {}
         }
         // What the pushes of the pipelines it reads name of its input, `None` before any.
         let mut pushed: Option<TileGuard> = None;
@@ -1944,10 +1915,6 @@ pub struct Planned {
     pub incremental_claims: usize,
     /// Its breaker's name.
     pub name: String,
-    /// Whether it reads its input whole: once every pipeline it reads has finished, or, over a live
-    /// source whose arrivals reach it widened or reach no drive of its loop's scope, once every
-    /// live source under it yields everything.
-    pub whole: bool,
     /// The sibling indices this pipeline follows in the reporting tree, taking no push of theirs
     /// ([`Dispatcher::follow`]). The reporting tree retains planning-local indices; execution uses
     /// remapped global pipeline IDs.
@@ -2959,9 +2926,9 @@ impl Planner {
                             "a store that steps itself runs in the run's dispatcher; an induction \
                              store inside a loop's scope is a nested loop's scope"
                         );
-                        Consumes::Whole
+                        Consumes::InOrder
                     }
-                    Located::Scope { .. } if within.is_none() => Consumes::Whole,
+                    Located::Scope { .. } if within.is_none() => Consumes::InOrder,
                     Located::Scope { .. } => Consumes::Rounds,
                     Located::Chain(_) | Located::Sink(_) => Consumes::Pushes,
                 })
@@ -3540,10 +3507,6 @@ enum Notifies {
     /// Of the region a push of a delivery's keys through the range's consumer brings the
     /// pipeline's entry.
     Arrivals,
-    /// Of its whole input once every source it reads yields everything, and, where its breaker
-    /// reads an open input (`Breaker::reads_open_input`), read again after each delivery
-    /// ([`Dispatcher::notify_again`]).
-    Whole,
     /// A loop's scope: of a delivery's keys as the positions of its rounds.
     Rounds,
     /// A transaction store: of a delivery's keys as its items. The store has the writer's drive
@@ -3632,7 +3595,6 @@ impl LivePipeline {
                         arrivals = arrivals.union(&arrival.guard);
                     }
                 }
-                Notifies::Whole => {}
                 Notifies::Items {
                     arms: Some(ref arms),
                 } => {
@@ -3703,17 +3665,6 @@ impl LivePipeline {
                 &Projection::admitting(positions).guard(&self.input),
             );
         }
-        // A delivery reaches a widened pipeline as a change anywhere in its input. A breaker that
-        // reads an open input reads all of it again, releasing what the answer states complete,
-        // which publishes it before the sources close. Every widened pipeline reads its input once
-        // every source yields everything, held until the inputs it waits for have completed it:
-        // that read takes what no read again took, as rows an input that reaches it widened
-        // completes after the last delivery.
-        if matches!(self.notifies, Notifies::Whole) {
-            if complete && reads_unreleased(reach, self.pipeline) {
-                dispatcher.notify(self.pipeline, &self.input.universal_guard());
-            }
-        }
         if complete {
             dispatcher.close(self.pipeline);
             self.closed = true;
@@ -3741,18 +3692,6 @@ fn notify_unreleased(
     if let Some(pending) = pending {
         dispatcher.notify(pipeline, &pending);
     }
-}
-
-/// Whether the pipeline's input has not released all of itself. A read of a widened pipeline's
-/// input asks for everything rather than for what is unreleased: that region can name keys beneath
-/// the outermost or within a record, which a widened operator cannot be pulled at, and a released
-/// key answers nothing.
-fn reads_unreleased(reach: &mut Reach<'_>, pipeline: PipelineId) -> bool {
-    let mut released_whole = false;
-    reach(pipeline, &mut |breaker, at| {
-        released_whole = breaker.input_released(at).is_universal();
-    });
-    !released_whole
 }
 
 /// [`drive`] over a run with source pipelines over live sources (`live`). The other sources

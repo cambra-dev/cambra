@@ -61,10 +61,9 @@ key under every key above it. A record of values stands for a push of all of it 
 pushes, each as that part of the record. It walks them as changes, adding a change of every key, and
 twice as complete regions, of a source not yet wholly complete and of one that is, adding
 `Everything` of the latter (`walk_routes`). The landing records each entry a walk reaches, whether a
-consumer on the way widened the push, and the two marks a consumer sets inside `notify`: the
-consumers on the path that pass a complete region on as only part of what a row depends on, each by
-its address (`Landing::completing_part`, the path's `PartPath`), and a key read only once final
-(`Landing::requiring_final_key`). The dispatcher keeps the routes per read
+consumer on the way widened the push, and the two marks a consumer sets inside `notify`: a complete
+region naming only part of what a row depends on (`Landing::completing_part`), and a key read only
+once final (`Landing::requiring_final_key`). The dispatcher keeps the routes per read
 (`Dispatcher::plan_routes`). A nested loop's drive records its source's complete regions at the
 loop's pipeline; the walks of the body around the loop pass it while they run (`build_scope`).
 
@@ -74,15 +73,6 @@ the same marks (`Landing::queue`). A push that queues nothing is not checked, an
 complete region that reaches its own pipelines around its recurrence. A consumer that delivers a
 push along a path its walk did not take fails the run where the push is queued
 (`a_push_along_a_route_its_planner_did_not_walk_fails_the_run`).
-
-A read records what it completes per part path where it reaches its reader along paths with more
-than one (`Dispatcher::completes_along`); otherwise it keeps one record. Each such path's complete
-region decides its own part of a row: the two sides of a pairing each decide one half of a pair, and
-a widening names nothing until its source has completed every key. A row is complete once every
-path that reaches it has completed it, each path reaching what a push of the read's every key,
-wholly complete, lands as along it (`Dispatcher::complete_part`). The union of the paths' regions
-would name a pair complete once either half is
-(`a_read_along_a_widening_and_a_keeping_path_completes_no_row_of_a_part`).
 
 Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
 before execution consumes anything. Refusals include an unsupported store shape,
