@@ -64,6 +64,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
     use TypedExprNode::*;
     match node {
         Comprehension { .. } => "Comprehension".to_string(),
+        GroupBy { .. } => "GroupBy".to_string(),
         Lit(l) => format!("Lit({l:?})"),
         Var(n) => format!("Var({n})"),
         Builtin(b) => format!("Builtin({b})"),
