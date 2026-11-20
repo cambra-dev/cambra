@@ -2068,8 +2068,9 @@ fn a_totalled_nest_over_a_streamed_source_answers_at_the_close(
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
-/// A collection per row paired against a streamed source keeps each row's values as they
-/// arrive: the first batch's pull holds its element under both rows.
+/// A collection per row paired against a streamed source: each row is a record whose collection
+/// field is part of its value, so a row is published once the whole record is final, at the
+/// source's close, and the first batch's pull holds no row.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
 fn a_collection_per_row_over_a_streamed_source() {
@@ -2088,7 +2089,7 @@ fn a_collection_per_row_over_a_streamed_source() {
     };
     assert_eq!(
         collections(each[0].clone()),
-        vec![1, 2],
+        Vec::<i64>::new(),
         "after the first batch"
     );
     assert_eq!(

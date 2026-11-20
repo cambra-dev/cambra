@@ -765,15 +765,12 @@ impl InductionStoreProducer {
         work
     }
 
-    /// Step the store after the round's body and held pushes have settled.
+    /// Step the store after the round's body and held pushes have settled. The store steps the
+    /// positions of the round its input has decided; a closing round over positions not decided
+    /// yet leaves them unreleased, and the request's completion holds them
+    /// (`Dispatcher::hold_unreleased`).
     fn step_round(&mut self, guard: &TileGuard) {
         self.consume_impl(InputId::ONLY, guard.clone());
-        assert!(
-            self.final_guard().is_universal()
-                || guard_minus(guard, &self.input_released(InputId::ONLY)).is_empty(),
-            "{}'s step in the round of {guard:?} decides it",
-            self.name()
-        );
     }
 }
 

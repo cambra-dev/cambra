@@ -856,9 +856,16 @@ trait SteppedStore: BreakingProducer {
     fn input_released_in_state(&self, state: &mut Self::State, input: InputId) -> TileGuard;
     fn inputs_in_state(&self, state: &mut Self::State) -> usize;
     fn read_cycle_inputs(&self, state: &mut Self::State, cycle: &Cycle);
+    /// Open the store where it can open, and answer whether it is open: a transaction store opens
+    /// once its whole seed has arrived, and steps nothing before.
+    fn opened(&self, _state: &mut Self::State) -> bool {
+        true
+    }
 }
 
-/// Step `store` until its input `input` has released `guard`. Before each step the store has the
+/// Step `store` until its input `input` has released `guard`, or until a step changes neither the
+/// store nor its input's release: the next position `guard` names is not decided yet, and the rest
+/// of `guard` stays unreleased until a later consume. Before each step the store has the
 /// operators inside its cycle read again ([`SteppedStore::read_cycle_inputs`]), and after it publishes the
 /// snapshot a re-entrant pull reads. The first consume opens the store with a step, so a pull
 /// answers from the snapshot from then on, whatever the morsel names.
@@ -871,9 +878,7 @@ trait SteppedStore: BreakingProducer {
 /// # Panics
 ///
 /// For a store that is no cyclic fan-out's input, whose cycle no step can read again or publish
-/// to, and for a step that changes neither the store nor its input's release: the positions
-/// `guard` names have not arrived, and a store is queued a morsel only once its input can release
-/// it.
+/// to.
 fn consume_store<S: SteppedStore>(
     store: &S,
     state: &mut S::State,
@@ -886,6 +891,10 @@ fn consume_store<S: SteppedStore>(
             S::STORE
         )
     });
+    // A store not yet open steps nothing, and the package stays unreleased until it is.
+    if !store.opened(state) {
+        return;
+    }
     let step = |state: &mut S::State| {
         store.read_cycle_inputs(state, &cycle);
         let tile = store.step_store(state, input);
@@ -904,12 +913,13 @@ fn consume_store<S: SteppedStore>(
         let tile = step(state);
         let progressed = S::breaker(state).snapshot.as_ref() != Some(&tile)
             || store.input_released_in_state(state, input) != released;
-        assert!(
-            progressed,
-            "{} is consumed only for positions its input releases: {guard:?} names positions beyond {released:?}, which a step does not reach",
-            S::STORE
-        );
         S::breaker_mut(state).snapshot = Some(tile);
+        // A position its input has not decided yet stops the steps: the package's rest stays
+        // unreleased, and the dispatcher holds it until it is decided
+        // (`Dispatcher::hold_unreleased`).
+        if !progressed {
+            return;
+        }
     }
 }
 
@@ -1245,6 +1255,9 @@ impl SteppedStore for CommitProducer {
     }
     fn read_cycle_inputs(&self, state: &mut Self::State, cycle: &Cycle) {
         CommitProducer::read_cycle_inputs(self, state, cycle);
+    }
+    fn opened(&self, state: &mut Self::State) -> bool {
+        self.open_store(state)
     }
     fn step_store(&self, state: &mut Self::State, input: InputId) -> Tile {
         match self.writer_of(input) {

@@ -183,12 +183,18 @@ fn a_store_short_of_terminal_at_its_finish_panics() {
     });
 }
 
-/// A morsel whose positions have not arrived panics: no step of the store reaches them.
+/// A morsel whose positions have not arrived steps nothing: the store steps only the positions its
+/// input has decided, and the morsel stays unreleased.
 #[test]
-#[should_panic(expected = "is consumed only for positions its input releases")]
-fn a_morsel_whose_positions_have_not_arrived_panics() {
+fn a_morsel_whose_positions_have_not_arrived_steps_nothing() {
     let compiled = Compiled::over_an_empty_source(OVER_A_SOURCE);
-    compiled.breaker(|store| store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0)));
+    compiled.breaker(|store| {
+        store.consume_in_pipeline(InputId::ONLY, keys_between(0, 0));
+        assert!(
+            !guard_minus(&keys_between(0, 0), &store.input_released(InputId::ONLY)).is_empty(),
+            "the morsel stays unreleased"
+        );
+    });
 }
 
 /// Two writers of one transaction store, each drawing its items from the pool: writer 0 takes 10

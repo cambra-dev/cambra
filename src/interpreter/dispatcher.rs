@@ -369,10 +369,6 @@ struct PipelineInfo {
     /// inputs, as a loop's seed is, lands regions of that input's tiling, which
     /// [`rows_named`](Dispatcher::rows_named) restates as rows of this one.
     input: Option<Tiling>,
-    /// Whether it steps only on input its reads have decided, as a store or a loop's scope steps
-    /// its positions: a push then waits for its rows to complete, where any other reader reads a
-    /// row on each change ([`queue_changed`](Dispatcher::queue_changed)).
-    steps_on_decided: bool,
     /// Per pipeline it reads, in the order of its `reads`, the routes a push of that pipeline
     /// takes to its entry, as the planner walked them through the pusher's consumer
     /// ([`plan_routes`](Dispatcher::plan_routes)); `None` where no planner walked them. A push
@@ -600,7 +596,6 @@ impl Dispatcher {
                 reach: Vec::new(),
                 required_keys: Vec::new(),
                 input: None,
-                steps_on_decided: false,
                 routes: None,
                 ingress: None,
             })
@@ -698,7 +693,6 @@ impl Dispatcher {
             reach: Vec::new(),
             required_keys: Vec::new(),
             input: None,
-            steps_on_decided: false,
             routes: None,
             ingress: None,
         });
@@ -1078,49 +1072,6 @@ impl Dispatcher {
     /// push, only what no push or queue brought before is new. What the caller queues is queued
     /// whole (`again`): a loop's closing round has each inner pipeline read its row again, which
     /// then states the row complete.
-    /// Queue the rows `guard`, a change a push brings `reader`, names: those not queued before,
-    /// and those it holds waiting ([`hold_unreleased`](Self::hold_unreleased)). A reader reads a
-    /// row on each change and releases what its answer states final, so a row decided in part
-    /// reaches the reader as it changes; what stays unreleased waits for the next change or for
-    /// its inputs to complete it.
-    fn queue_changed(&self, reader: usize, guard: &TileGuard) {
-        let mut queue_state = self.states[reader]
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut released = match &queue_state.region {
-            Some(queued) => guard_minus(guard, queued),
-            None => guard.clone(),
-        };
-        if let Some(waiting) = &queue_state.waiting_region {
-            released = guard_minus(&released, waiting);
-        }
-        let held = std::mem::take(&mut queue_state.waiting_for_inputs);
-        queue_state.waiting_region = None;
-        for morsel in held {
-            let changed = morsel.guard.intersect(guard);
-            let rest = self.closed(reader, guard_minus(&morsel.guard, &changed));
-            released = released.union(&changed);
-            if !rest.is_empty() {
-                queue_state.wait_for_inputs(WaitingInput {
-                    guard: rest,
-                    splits: morsel.splits,
-                });
-            }
-        }
-        if released.is_empty() {
-            return;
-        }
-        let queue = &self.states[reader].queue;
-        let appended = queue.append_unqueued_locked(&mut queue_state, &released);
-        self.ensure(appended, || {
-            format!(
-                "pipeline {reader} receives packages before the last pipeline it reads finishes"
-            )
-        });
-    }
-
     fn queue_or_wait_for_inputs(&self, reader: usize, guard: &TileGuard, again: bool) {
         let mut queue_state = self.states[reader]
             .queue
@@ -1168,43 +1119,6 @@ impl Dispatcher {
     /// Append the waiting morsels whose inputs are now complete to the reader’s
     /// queue ([`wait_for_inputs`](Self::wait_for_inputs)). A complete push lands before the pushing pipeline counts its
     /// finish toward `reader`'s close, so `reader`'s queue is open.
-    /// Hold `unreleased`, the part of a package `pipeline` consumed that its breaker's input has
-    /// not released, until the pipelines it reads have completed it, and take it again then. A
-    /// notification names keys, and what of a row is final is stated in the tile the breaker
-    /// pulls, so a breaker releases only the part of a row decided so far, and reads the rest of
-    /// the row again once it is decided. The part the reads have completed already is not held:
-    /// a breaker that leaves it unreleased releases it at its finish.
-    pub(crate) fn hold_unreleased(
-        &self,
-        pipeline: PipelineId,
-        unreleased: &TileGuard,
-        input: &Tiling,
-    ) {
-        let reader = pipeline.0;
-        if unreleased.is_empty() || !self.infos[reader].waits_for_inputs {
-            return;
-        }
-        // Closed over the input, since a difference of keys can name keys the input has none of,
-        // as those under a tag a union does not have.
-        let pending =
-            guard_minus(unreleased, &self.complete_part(reader, unreleased)).closed_over(input);
-        if pending.is_empty() {
-            return;
-        }
-        let mut queue_state = self.states[reader]
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(queued) = queue_state.region.take() {
-            queue_state.region = Some(guard_minus(&queued, &pending));
-        }
-        queue_state.wait_for_inputs(WaitingInput {
-            guard: pending,
-            splits: true,
-        });
-    }
-
     fn queue_ready_inputs(&self, reader: usize) {
         let mut queue_state = self.states[reader]
             .queue
@@ -1474,11 +1388,6 @@ impl Dispatcher {
             Some(input) => guard.closed_over(input),
             None => guard,
         }
-    }
-
-    /// Record that `pipeline` steps only on input its reads have decided.
-    pub(crate) fn steps_on_decided(&mut self, pipeline: PipelineId) {
-        self.infos[pipeline.0].steps_on_decided = true;
     }
 
     /// Record that `pipeline` consumes a breaker input of `input`'s tiling.
@@ -2921,10 +2830,7 @@ impl Landing<'_> {
         if info.waits_for_inputs {
             if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
                 dispatcher.ensure_planned(from, r, &marked, false);
-                match info.steps_on_decided {
-                    true => dispatcher.queue_or_wait_for_inputs(r, guard, false),
-                    false => dispatcher.queue_changed(r, guard),
-                }
+                dispatcher.queue_or_wait_for_inputs(r, guard, false);
             }
             return;
         }
@@ -3216,7 +3122,14 @@ fn complete_projection(held: TileGuard, tiling: &Tiling) -> Option<Projection> {
     if names_every_position(&held, tiling) {
         return Some(Projection::Everything);
     }
-    Projection::of(&held).ok()
+    // Rows whose whole value is complete, at any level; a part of a value completes no row.
+    Projection::of(&held).ok().map(|held| match held {
+        Projection::Or(arms) => {
+            Projection::any_of(arms.into_iter().filter(|arm| !arm.names_part_of_values()))
+        }
+        Projection::Within { .. } => Projection::Nothing,
+        whole => whole,
+    })
 }
 
 /// Whether `held`, a guard of `tiling`, names every position of the finite range of positions
@@ -3574,11 +3487,6 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
         );
 
         breaker.consume_impl(input, package.guard.clone());
-        dispatcher.hold_unreleased(
-            package.pipeline,
-            &guard_minus(&package.guard, &breaker.input_released(input)).closed_over(&tiling),
-            &tiling,
-        );
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
         {

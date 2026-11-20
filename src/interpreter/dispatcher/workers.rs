@@ -158,13 +158,6 @@ impl WorkerPool {
                 package.guard
             );
             breaker.consume_impl(InputId::ONLY, package.guard.clone());
-            let tiling = breaker.input_tiling(InputId::ONLY);
-            dispatcher.hold_unreleased(
-                pipeline,
-                &guard_minus(&package.guard, &breaker.input_released(InputId::ONLY))
-                    .closed_over(&tiling),
-                &tiling,
-            );
         }
         // Exclusive, so the push sees no consume between the merge of its rows and the release of
         // its input, which the readers it wakes rely on. A breaker that publishes only at its

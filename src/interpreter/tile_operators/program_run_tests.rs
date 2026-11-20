@@ -4908,35 +4908,6 @@ fn canonical(value: &Value) -> String {
         "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]",
     ],
 )]
-#[case::collection_in_a_tuple_row(
-    "out << [(x, [y * x for y in source1()]) for x in [1, 2]]",
-    &[
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
-    ],
-)]
-#[case::a_bound_tuple_row(
-    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
-    &[
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
-    ],
-)]
-#[case::the_collection_field_of_a_bound_tuple_row(
-    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.1 for p in xs]",
-    &[
-        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
-        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
-        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
-          u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]",
-    ],
-)]
 fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
     #[case] body: &str,
     #[case] expected: &[&str],
@@ -4959,6 +4930,46 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
         });
     written.push(canonical(&single_value(&value)));
     assert_eq!(written, expected, "{body}");
+}
+
+/// A row whose value is a record decides its fields together: a collection in one of its fields
+/// is part of the record, and a record row is published once its whole value is final. A sink
+/// over rows whose collection field grows with a live source therefore holds nothing at each idle
+/// and writes the rows whole once the source closes.
+#[rstest_log::rstest]
+#[case::collection_in_a_tuple_row(
+    "out << [(x, [y * x for y in source1()]) for x in [1, 2]]",
+    "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
+      u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]"
+)]
+#[case::a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
+    "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
+      u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]"
+)]
+#[case::the_collection_field_of_a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.1 for p in xs]",
+    "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+      u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]"
+)]
+fn a_sink_over_live_tuple_rows_writes_them_once_the_source_closes(
+    #[case] body: &str,
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(1, 4)] workers: usize,
+) {
+    let source = format!("out = test_sink()\n{body}\n");
+    let (value, _) =
+        dispatched_live_observed_on(&source, rows, workers, three_batches(), |sink, _| {
+            assert!(
+                matches!(
+                    sink.written_so_far(),
+                    Err(crate::interpreter::test_sink::SinkReadError::NothingWritten)
+                ),
+                "{body}: no record row is whole before the source closes"
+            );
+        });
+    assert_eq!(canonical(&single_value(&value)), expected, "{body}");
 }
 
 /// A loop over a map literal inside another loop: the inner loop's `MapAggregate` reads a
