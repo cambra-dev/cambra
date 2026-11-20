@@ -7,7 +7,8 @@
 //! source span survives into the post-channelize span index. The loop adds a
 //! second feed site, so the two sites also fan in to one channel during
 //! channelization. Both structures — `channelize.defer_lift` and
-//! `channelize.cluster` — are pinned by the `defer_lift` snapshot fixture.
+//! `channelize.cluster` — reach the inspector's wire, which
+//! `tests/it/inspector_wire.rs` asserts.
 
 use super::common::expect_scalar;
 

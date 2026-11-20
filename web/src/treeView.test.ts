@@ -7,10 +7,10 @@
 import { describe, expect, it } from "vitest";
 
 import { resolvedTypeTooltip, serializeTree } from "./treeView";
-import { allNodes, fixture, irPaneById } from "./__fixtures__/helpers";
+import { allNodes, dumped, fixture, irPaneById } from "./__fixtures__/helpers";
 import type { IrChild, IrNode, OccurrenceKind } from "./types";
 
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
+const listMinJson = dumped("list_min");
 
 describe("resolvedTypeTooltip", () => {
   it("renders a single resolved type", () => {
@@ -159,7 +159,7 @@ describe("serializeTree", () => {
     expect(serializeTree(1, table(node("A", "Int", 1)))).not.toMatch(/\n$/);
   });
 
-  it("reaches every node of a golden fixture's table, and invents none", () => {
+  it("reaches every node of a gallery program's table, and invents none", () => {
     // Catches a dropped subtree, which the hand-built cases above cannot. Line
     // count is not the node count — a shared node gets a row per position that
     // reaches it — so the check is on the id set the rows name. `allNodes`

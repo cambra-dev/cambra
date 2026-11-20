@@ -1,5 +1,5 @@
 // Unit tests for main.ts's pure helpers (byte/line/col math, span formatting)
-// and a jsdom degraded-render test over the `failed` fixture.
+// and a jsdom degraded-render test over `type_error`'s payload.
 //
 // Importing main.ts runs its `void main()` auto-invocation, which is guarded on
 // `document.getElementById("app")`. The unit-test DOM has no `#app`, so the
@@ -28,11 +28,11 @@ import { LiveStore } from "./liveStore";
 import type { Snapshot } from "./types";
 import { Store } from "./store";
 import { isIrPane } from "./types";
-import { fixture, stubLayout } from "./__fixtures__/helpers";
+import { dumped, fixture, stubLayout } from "./__fixtures__/helpers";
 
-import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
-import failedJson from "./__fixtures__/failed.snapshot.json";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
+const arithmeticJson = dumped("udf_closure");
+const failedJson = dumped("type_error");
+const listMinJson = dumped("list_min");
 
 describe("byteLineStarts / lineCol (byte offsets)", () => {
   it("records the byte offset of each line start (ASCII)", () => {
@@ -338,7 +338,7 @@ describe("following a reload", () => {
     const paneId = store.sourceAnchorPaneId!;
     const ids = [...store.indicesFor(paneId)!.nodeById.keys()];
     const nodeId = ids.find((id) => store.operatorsFor(id).length > 0 && tagSpan(store, id) !== null);
-    if (nodeId === undefined) throw new Error("the fixture pins nothing");
+    if (nodeId === undefined) throw new Error("the payload pins nothing");
     const lineStarts = byteLineStarts(store.snapshot.source.text);
     live.inspect(tagLabel(store, nodeId, lineStarts), nodeId, store.operatorsFor(nodeId), tagSpan(store, nodeId));
     return nodeId;
@@ -402,7 +402,7 @@ describe("the header's values badge", () => {
   const badges = (root: HTMLElement) =>
     Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
 
-  // A payload a run produced: every committed fixture is version 0.
+  // A payload a run produced: a dump is version 0.
   const ran = (): Snapshot => {
     const snap = fixture(arithmeticJson);
     return { ...snap, meta: { ...snap.meta, version: 1 } };

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // View-integration test (the one that would have caught Bug 1). Mounts the REAL
-// SourceView + per-pane TreeViews over a golden fixture, then drives the shared
+// SourceView + per-pane TreeViews over a gallery program's payload, then drives the shared
 // selection in both directions and asserts the cross-link reaches the DOM:
 //   - a tree-node selection -> source span highlight (.cm-sel-node) + tree row
 //   - a source selection      -> every tree pane highlights its node
@@ -22,12 +22,12 @@ import { TreeView, serializeTree } from "./treeView";
 
 import { serializeOperatorGraph } from "./operatorView";
 
-import { fixture, irPaneById, operatorPaneById, stubLayout, theNode } from "./__fixtures__/helpers";
+import { dumped, fixture, irPaneById, operatorPaneById, stubLayout, theNode } from "./__fixtures__/helpers";
 import { isIrPane } from "./types";
 import type { Snapshot } from "./types";
 
-import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
+const arithmeticJson = dumped("udf_closure");
+const listMinJson = dumped("list_min");
 
 const listMin = fixture(listMinJson);
 const arithmetic = fixture(arithmeticJson);
@@ -148,8 +148,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
   });
 
   it("draws only the clicked pane's span strongly when panes disagree on extent", () => {
-    // The behaviour `txn_multi_read` exposed and no committed fixture covers:
-    // the panes disagree about how much source a node claims, so reading every
+    // The behaviour `txn_multi_read` exposed: the panes disagree about how much source a node claims, so reading every
     // pane's anchor as primary drew the widest of them strongly and a click
     // anywhere inside it looked the same. Widening one downstream twin
     // reproduces the disagreement over a real payload.
@@ -177,8 +176,6 @@ describe("view integration: cross-pane source<->tree linking", () => {
     expect(strong).toBe("1");
     expect(light).toBe(", 2");
   });
-
-
 
   it("says so in a pane that holds no part of the selection", () => {
     // `ExprStmt` is rewritten away by channelize, so a click on a statement has

@@ -1,7 +1,7 @@
 // Unit tests for the PURE source-interaction decision logic extracted from the
 // CodeMirror closures (`hoverPayloadAt`, `resolveSourceClick`). jsdom cannot do
 // CM geometry (`posAtCoords`), so we drive bytes directly off known node spans /
-// a use-site from the golden fixtures, over a real Store's anchor `Indices`.
+// a use-site from the gallery programs' payloads, over a real Store's anchor `Indices`.
 //
 // These cover the README "Interactions" headline gestures: hover-for-type,
 // plain-click-selects-node, and Ctrl/Cmd-click-goto-definition. The production
@@ -12,11 +12,11 @@ import { describe, expect, it } from "vitest";
 import { Store } from "./store";
 import { flattenHighlights, hoverPayloadAt, resolveSourceClick } from "./sourceView";
 
-import { fixture, irPaneById, theNode } from "./__fixtures__/helpers";
+import { dumped, fixture, irPaneById, theNode } from "./__fixtures__/helpers";
 import type { Indices } from "./indices";
 
-import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
+const arithmeticJson = dumped("udf_closure");
+const listMinJson = dumped("list_min");
 
 const arithmetic = fixture(arithmeticJson);
 const listMin = fixture(listMinJson);
