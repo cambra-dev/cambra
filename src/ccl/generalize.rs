@@ -1281,8 +1281,9 @@ fn quantified(
         }
         // The part read at other values of its indices is the family applied there: an
         // application's result reads the part at the argument, `__args.0`, where the function
-        // it applies reads it at its own binder.
-        for args in index_instances(&body, &indices, &own) {
+        // it applies reads it at its own binder. Each occurrence is found by matching the part,
+        // its indices holes, and confirmed by equality as `abstract_deep` replaces it.
+        for args in family_arguments(&body, &group, &indices, &own, out_of_scope) {
             let instance = crate::ccl::subst::discharge_binders(&indices, &group, &args);
             if instance == group {
                 continue;
@@ -1307,89 +1308,188 @@ fn quantified(
     })))
 }
 
-/// The argument lists a family over `indices` may be read at in `body`: for each index, every
-/// term `body` quotes that reads one of the type's own binders `own` through projections only,
-/// as `__args.0` does, and has the index's type. A part read at such a term is the family applied
-/// there ([`quantified`]).
-fn index_instances(
+/// Every argument list `body` reads `part` at: each place in `body`, the terms it quotes
+/// included, where a type stands that is `part` with each of `indices` replaced by a term reading
+/// only the type's own binders `own` and names in scope, those terms in the order of `indices`. A part read there is the family over `indices` applied to them
+/// ([`quantified`]).
+///
+/// Found by matching `part` against each type in `body`, every read of an index a hole the match
+/// fills with the term at that place. The match only lines the two types up: the caller confirms
+/// an occurrence by comparing `part` with the terms put in for its indices to what stands there.
+fn family_arguments(
     body: &Type,
+    part: &Type,
     indices: &[crate::ccl::Name],
     own: &[crate::ccl::Name],
+    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
 ) -> Vec<Vec<Rc<crate::ccl::TypedExpr>>> {
-    fn own_path(e: &crate::ccl::TypedExpr, own: &[crate::ccl::Name]) -> bool {
-        match &e.node {
-            crate::ccl::TypedExprNode::Var(n) => own.contains(n),
-            crate::ccl::TypedExprNode::Apply { function, argument } => {
-                matches!(function.node, crate::ccl::TypedExprNode::Proj(_))
-                    && own_path(argument, own)
-            }
-            _ => false,
+    use crate::ccl::TypedExpr;
+    type Holes = Vec<Option<Rc<TypedExpr>>>;
+    // The ways `actual` lines up with `pattern`, each extending `holes`.
+    fn match_type(
+        pattern: &Type,
+        actual: &Type,
+        holes: Holes,
+        indices: &[crate::ccl::Name],
+    ) -> Vec<Holes> {
+        if std::mem::discriminant(pattern) != std::mem::discriminant(actual) {
+            return Vec::new();
         }
-    }
-    fn collect(
-        e: &crate::ccl::TypedExpr,
-        own: &[crate::ccl::Name],
-        out: &mut Vec<crate::ccl::TypedExpr>,
-    ) {
-        if own_path(e, own) {
-            if !out.iter().any(|o| o == e) {
-                out.push(e.clone());
+        let mut ways = vec![holes];
+        // A refinement set is unordered, so each of the part's refinements may line up with any
+        // of the type's: equality decides which pairing the type is.
+        if let (Type::Refinement(_, pr), Type::Refinement(_, ar)) = (pattern, actual) {
+            for p in pr.iter() {
+                ways = ways
+                    .into_iter()
+                    .flat_map(|w| {
+                        ar.iter()
+                            .flat_map(|a| {
+                                match_term(&p.predicate, &a.predicate, w.clone(), indices)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
             }
-            return;
         }
-        e.walk_children(|c| collect(c, own, out));
+        let pq: Vec<_> = pattern.quoted_terms().collect();
+        let aq: Vec<_> = actual.quoted_terms().collect();
+        if pq.len() != aq.len() {
+            return Vec::new();
+        }
+        for (p, a) in pq.into_iter().zip(aq) {
+            ways = ways
+                .into_iter()
+                .flat_map(|w| match_term(p, a, w, indices))
+                .collect();
+        }
+        let mut pc = Vec::new();
+        pattern.walk_children(|c| pc.push(c));
+        let mut ac = Vec::new();
+        actual.walk_children(|c| ac.push(c));
+        if pc.len() != ac.len() {
+            return Vec::new();
+        }
+        for (p, a) in pc.into_iter().zip(ac) {
+            ways = ways
+                .into_iter()
+                .flat_map(|w| match_type(p, a, w, indices))
+                .collect();
+        }
+        ways
     }
-    // A path's root reads one of the type's own binders, so it takes the type that binder
-    // states in `body`, which reads the parts already abstracted, rather than the type the
-    // quoted copy carried.
-    fn retype_root(e: &mut crate::ccl::TypedExpr, body: &Type) {
-        match &mut e.node {
-            crate::ccl::TypedExprNode::Var(n) => {
-                if let Some(ty) = binder_domain(body, n) {
-                    e.ty = ty;
+    // A term is compared without its type slots, as a quoted term is
+    // ([`crate::ccl::ty::eq_term_modulo_ty_slots`]).
+    fn match_term(
+        pattern: &TypedExpr,
+        actual: &TypedExpr,
+        mut holes: Holes,
+        indices: &[crate::ccl::Name],
+    ) -> Vec<Holes> {
+        if let crate::ccl::TypedExprNode::Var(n) = &pattern.node
+            && let Some(i) = indices.iter().position(|b| b == n)
+        {
+            match &holes[i] {
+                Some(t) if !crate::ccl::ty::eq_term_modulo_ty_slots(t, actual) => {
+                    return Vec::new();
                 }
+                Some(_) => {}
+                None => holes[i] = Some(Rc::new(actual.clone())),
             }
-            crate::ccl::TypedExprNode::Apply { argument, .. } => retype_root(argument, body),
-            _ => {}
+            return vec![holes];
+        }
+        if std::mem::discriminant(&pattern.node) != std::mem::discriminant(&actual.node) {
+            return Vec::new();
+        }
+        if let (crate::ccl::TypedExprNode::Var(p), crate::ccl::TypedExprNode::Var(a)) =
+            (&pattern.node, &actual.node)
+            && p != a
+        {
+            return Vec::new();
+        }
+        let mut pc = Vec::new();
+        pattern.walk_children(|c| pc.push(c));
+        let mut ac = Vec::new();
+        actual.walk_children(|c| ac.push(c));
+        if pc.len() != ac.len() {
+            return Vec::new();
+        }
+        let mut ways = vec![holes];
+        for (p, a) in pc.into_iter().zip(ac) {
+            ways = ways
+                .into_iter()
+                .flat_map(|w| match_term(p, a, w, indices))
+                .collect();
+        }
+        ways
+    }
+    fn visit_type(
+        t: &Type,
+        part: &Type,
+        indices: &[crate::ccl::Name],
+        out: &mut Vec<Vec<Rc<TypedExpr>>>,
+    ) {
+        for holes in match_type(part, t, vec![None; indices.len()], indices) {
+            if let Some(args) = holes.into_iter().collect::<Option<Vec<_>>>()
+                && !out.iter().any(|o| {
+                    o.iter()
+                        .zip(&args)
+                        .all(|(x, y)| crate::ccl::ty::eq_term_modulo_ty_slots(x, y))
+                })
+            {
+                out.push(args);
+            }
+        }
+        if let Type::Refinement(_, refinements) = t {
+            for r in refinements.iter() {
+                visit_term(&r.predicate, part, indices, out);
+            }
+        }
+        for q in t.quoted_terms() {
+            visit_term(q, part, indices, out);
+        }
+        t.walk_children(|c| visit_type(c, part, indices, out));
+    }
+    fn visit_term(
+        e: &TypedExpr,
+        part: &Type,
+        indices: &[crate::ccl::Name],
+        out: &mut Vec<Vec<Rc<TypedExpr>>>,
+    ) {
+        e.walk_type_slots(|t| visit_type(t, part, indices, out));
+        e.walk_children(|c| visit_term(c, part, indices, out));
+    }
+    // The arguments are copies of terms `body` quotes, which the caller places in the generalized
+    // type beside the originals.
+    let _copy = crate::ccl::provenance::copy_frame("generalize.family_arguments");
+    let mut out = Vec::new();
+    visit_type(body, part, indices, &mut out);
+    // An argument stands where the family is read, so its value reads only the type's own binders
+    // and names in scope: a term reading a binder out of scope is no place the generalized type
+    // can name. Its type slots are left out, as the match leaves them out.
+    out.retain(|args| {
+        args.iter().all(|a| {
+            crate::ccl::ccl_utils::free_names_in_value(a)
+                .iter()
+                .all(|n| own.contains(n) || !out_of_scope(n))
+        })
+    });
+    // A read of one of the type's own binders takes the type that binder states in `body`, which
+    // reads the parts already abstracted, rather than the type the quoted copy carried.
+    fn retype_binders(e: &mut TypedExpr, body: &Type) {
+        if let crate::ccl::TypedExprNode::Var(n) = &e.node
+            && let Some(ty) = binder_domain(body, n)
+        {
+            e.ty = ty;
+        }
+        e.walk_children_mut(|c| retype_binders(c, body));
+    }
+    for args in &mut out {
+        for a in args {
+            retype_binders(Rc::make_mut(a), body);
         }
     }
-    // The paths are copies of terms `body` quotes, which the instances below place in the
-    // generalized type beside the originals.
-    let _copy = crate::ccl::provenance::copy_frame("generalize.index_instances");
-    let mut paths = Vec::new();
-    body.walk_quoted_terms(&mut |q| collect(q, own, &mut paths));
-    for path in &mut paths {
-        retype_root(path, body);
-    }
-    let per_index: Vec<Vec<Rc<crate::ccl::TypedExpr>>> = indices
-        .iter()
-        .map(|b| {
-            let domain = binder_domain(body, b);
-            paths
-                .iter()
-                .filter(|p| !matches!(&p.node, crate::ccl::TypedExprNode::Var(n) if n == b))
-                .filter(|p| {
-                    domain
-                        .as_ref()
-                        .is_some_and(|d| p.ty.peel_refinements() == d.peel_refinements())
-                })
-                .map(|p| Rc::new(p.clone()))
-                .collect()
-        })
-        .collect();
-    // Every combination of one term per index.
-    per_index.iter().fold(vec![Vec::new()], |lists, terms| {
-        lists
-            .iter()
-            .flat_map(|list| {
-                terms.iter().map(move |t| {
-                    let mut next = list.clone();
-                    next.push(Rc::clone(t));
-                    next
-                })
-            })
-            .collect()
-    })
+    out
 }
 
 /// The type `ty` gives its binder `b`: a function's domain, a dependent tuple's component, or a
