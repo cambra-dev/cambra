@@ -571,7 +571,7 @@ impl Refusals {
                 self.expr(left);
                 self.expr(right);
             }
-            ChlExpr::UnaryOp { operand, .. } => self.expr(operand),
+            ChlExpr::UnaryOp { operand, .. } | ChlExpr::Unwrap(operand) => self.expr(operand),
             ChlExpr::BoolOp { operands, .. } => {
                 for operand in operands {
                     self.expr(operand);

@@ -354,21 +354,71 @@ does. No `Method` node survives inference. A method no type declares is a loweri
 ### The compiler-provided `Option`
 
 `Option(T)` is a `NominalDecl` the compiler provides (`nominal::option`) at the path `std::Option`,
-with the constructors `none` and `some(T)`, the method `is_none`, and no source. Its constructor
-names are the tags the runtime builds when it answers a checked lookup (`V_NONE`, `V_SOME`), so a
-lookup's answer is a value of it. `LoweringContext::nominal_type` answers it for the name `Option`
-after the module's own declarations, and `Type::option_of` builds an application of it.
+with the constructors `none` and `some(T)`, the methods `is_none`, `value` and `unwrap_or`, and no
+source. Its constructor names are the tags the runtime builds when it answers a checked lookup
+(`V_NONE`, `V_SOME`), so a lookup's answer is a value of it. `LoweringContext::nominal_type`
+answers it for the name `Option` after the module's own declarations, and `Type::option_of` builds
+an application of it.
 
 A member of `Option` is bound only where the module names it: a reference records it
-(`member_reference`), and `bind_constructors` binds the recorded ones, `is_none` as
-`λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }` (`bind_is_none`). A
-method call names every type that declares its method, because inference picks the candidate
-from the receiver's type, so any `.is_none()` call binds `Option::is_none`, even one whose
-receiver is a type declaring its own `is_none`. A module that names no member lowers as it would
-without the declaration. Its
-identity is its path, so every compilation, and every version of a reloaded program, names the
-same type. Its spans are empty, and lowering refuses the programs that would point a diagnostic at
-one: a declaration named `Option`, and an associated function of it.
+(`member_reference`), and `bind_constructors` binds the recorded ones. Each is an ordinary `match`:
+
+- `is_none` is `λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }`
+  (`bind_is_none`).
+- `value`, which `x!` calls (`lower_unwrap`), is
+  `λ 𝑜 : {Option(𝑇) | not (__elem ▷ ctor_is(Option::none))} → match 𝑜 { Option::some(𝑣) → 𝑣 }`
+  (`bind_value`). The parameter's refinement rules out `none`, so the `match` has no arm for it
+  (`type-inference.md`, [Unreachable arms](type-inference.md#unreachable-arms)).
+- `unwrap_or` is `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`,
+  polymorphic over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃` (`bind_unwrap_or`). The payload and the default
+  each have their own parameter, so a call does not equate their types. Only the result's
+  parameter lies above both.
+
+The refinements of `value`'s and `unwrap_or`'s results are the ones their `match` derives
+(`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). A method call names every type
+that declares its method, because inference picks the candidate from the receiver's type, so any
+`.is_none()` call binds `Option::is_none`, even one whose receiver is a type declaring its own
+`is_none`. A module that names no member lowers as it would without the declaration. Its identity
+is its path, so every compilation, and every version of a reloaded program, names the same type.
+Its spans are empty, and lowering refuses the programs that would point a diagnostic at one: a
+declaration named `Option`, and an associated function of it.
+
+### A constructed value states its constructor and payload
+
+Two builtins observe a value of any nominal type `N` in a refinement predicate:
+`ctor_is(N::c) : N(𝑃…) ⇒ Bool`, whether `c` built the value, and `ctor_payload(N::c) : N(𝑃…) ⇒ 𝑃ᶜ`,
+the argument `c` took. Neither is executed. The solver reads them as the value's constructor tag
+and as the path to its payload (`type-inference.md`,
+[A nominal value is reached through its tag and payloads](type-inference.md#a-nominal-value-is-reached-through-its-tag-and-payloads)).
+`ctor_payload` states nothing of a value another constructor built.
+
+`emit_nominal_ctor` refines each value it builds of a type that states its constructors
+(`nominal::states_constructors`) by `__elem ▷ ctor_is(N::c)` and, for a constructor that takes an
+argument, `(__elem ▷ ctor_payload(N::c)) == 𝑎` (`nominal::ctor_refinements`). `Option` alone
+states its constructors. The encoding, the arm facts and the coverage proof of a `match` hold for
+every nominal type (`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). Trait
+selection and the passes after inlining do not yet read a refined value of any other type. The
+argument `𝑎` is stated only when it is a term (`smt::is_term`), as the arm facts and a `match`'s
+derived refinement state only terms: any other argument would copy a program into the type. The
+solver drops what it cannot read of a term, as it drops any antecedent outside its fragment.
+
+The payload is stated with `==`, which is `Equatable`'s, and a predicate can become a term
+(`compile_refinement_predicates`). `Option(T)` therefore requires `Equatable(T, T)`
+(`nominal::record_option_requirements`). The compiler's trait table records the clause when it
+builds `Equatable`, since that table's `Option` instance names the declaration. A constructor states
+its declaration's clause, so every call of `Option::some` is checked against it. A checked lookup
+builds an `Option(V)` without a constructor, and `emit_lookup_checked` requires `Equatable(V, V)`.
+`Unit` has an `Equatable` instance, which a `Set`'s lookup, answering `Option(Unit)`, needs. The
+requirement ties lookup to `Equatable`; a statement of the payload that needs no instance would lift
+it.
+
+In a refinement predicate, `Option`'s methods `is_none` and `value` read as `ctor_is(Option::none)`
+and `ctor_payload(Option::some)` (`predicate_reading`). The reading takes the place of the method's
+candidate in the call's `Method` node, so the call resolves by its receiver's type as any method
+call does, and another type's method of the same name changes nothing. A path to either function,
+`Option::is_none(_)`, reads the same (`predicate_reference`). `ctor_payload` has no domain
+refinement, so `_.value() == 3` is a predicate about any `Option`, where a call of `value` outside a
+predicate demands a `some`.
 
 ---
 

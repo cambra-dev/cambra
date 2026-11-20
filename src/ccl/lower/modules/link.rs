@@ -312,6 +312,7 @@ fn fold(expr: &mut Expr) -> bool {
     if let TypedExprNode::Case {
         scrutinee: None,
         branches,
+        ..
     } = &mut expr.node
     {
         while branches.len() > 1

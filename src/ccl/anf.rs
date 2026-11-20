@@ -360,6 +360,7 @@ fn short_circuits_as_branches(e: &mut Expr) {
                 body: otherwise,
             },
         ],
+        refuted: Vec::new(),
     };
 }
 
@@ -913,6 +914,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } => {
             // The scrutinee is **not** named. A `match` on a dependent result
             // — `match c[k]:` — carries the key's discharge in its own type,
@@ -938,6 +940,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
                 rebuild(TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    refuted,
                 }),
             )
         }
@@ -1270,6 +1273,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
         TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } => {
             let (binds, scrutinee) = match scrutinee {
                 Some(scrutinee) => {
@@ -1291,6 +1295,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
                 rebuild(TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    refuted,
                 }),
             )
         }
@@ -1656,11 +1661,13 @@ mod tests {
         let case = Expr::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(scrutinee.clone())),
             branches: vec![branch],
+            refuted: Vec::new(),
         });
         let out = run(case);
         let TypedExprNode::Case {
             scrutinee: out_scrutinee,
             branches,
+            ..
         } = out.node
         else {
             panic!("expected the Case with no Let around it");

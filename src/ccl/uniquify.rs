@@ -446,6 +446,7 @@ impl Uniquifier {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } => {
                 if let Some(s) = scrutinee {
                     self.expr(s);

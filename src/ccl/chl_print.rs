@@ -801,6 +801,7 @@ impl Printer {
             TypedExprNode::Case {
                 scrutinee: None,
                 branches,
+                refuted,
             } if let [then, otherwise] = branches.as_slice()
                 && then.pattern.is_none()
                 && otherwise.pattern.is_none()
@@ -850,6 +851,26 @@ impl Printer {
                 let mut inner = env.clone();
                 inner.push((&param.name, argument, env.len()));
                 self.expr_inner(body, &inner)
+            }
+            // A method call inference has not resolved yet, as a predicate lowers one:
+            // `𝑥.m(𝑎…)`, its argument the receiver or the tuple of the receiver and the rest.
+            TypedExprNode::Method { name, args, .. } => {
+                let (receiver, rest) = match (&argument.node, *args) {
+                    (_, 0) => (argument, &[][..]),
+                    (TypedExprNode::Tuple(parts), _) if parts.len() == args + 1 => {
+                        (&parts[0], &parts[1..])
+                    }
+                    _ => return (Prec::Atom, NOT_PRINTABLE.to_string()),
+                };
+                let target = self.expr(receiver, Prec::Postfix, env);
+                let rest: Vec<String> = rest
+                    .iter()
+                    .map(|a| self.expr(a, Prec::Lowest, env))
+                    .collect();
+                (
+                    Prec::Postfix,
+                    format!("{target}.{name}({})", rest.join(", ")),
+                )
             }
             TypedExprNode::Apply {
                 function: contains,
@@ -922,6 +943,28 @@ impl Printer {
                 Prec::Not,
                 format!("not {}", at_least(argument.written(), Prec::Not)),
             )),
+            // A constructor's observers, as a predicate writes them: `Option`'s by its methods
+            // `is_none` and `value`. Another type's constructors have no surface spelling.
+            TypedExprNode::Builtin(Builtin::CtorIs(c))
+                if *c.decl == *crate::ccl::nominal::option() =>
+            {
+                let target = at_least(argument.written(), Prec::Postfix);
+                let is_none = format!("{target}.is_none()");
+                written(if c.ctor == crate::ccl::V_NONE.name() {
+                    (Prec::Postfix, is_none)
+                } else {
+                    (Prec::Not, format!("not {is_none}"))
+                })
+            }
+            TypedExprNode::Builtin(Builtin::CtorPayload(c))
+                if *c.decl == *crate::ccl::nominal::option() =>
+            {
+                let target = at_least(argument.written(), Prec::Postfix);
+                written((Prec::Postfix, format!("{target}.value()")))
+            }
+            TypedExprNode::Builtin(Builtin::CtorIs(_) | Builtin::CtorPayload(_)) => {
+                written((Prec::Atom, NOT_PRINTABLE.to_string()))
+            }
             TypedExprNode::Proj(key) => match (argument, key) {
                 (Val::Tuple(mut parts), ProjKey::Index(i)) if *i < parts.len() => {
                     Some(parts.swap_remove(*i))
@@ -1244,6 +1287,15 @@ mod tests {
     #[case("{a: Int, b: Bool}", "{a: Int, b: Bool}")]
     #[case("{`a{Int} | `b}", "{`a{Int} | `b}")]
     #[case("Option(Int)", "Option(Int)")]
+    #[case("{Option(Int) where _.is_none()}", "{Option(Int) where _.is_none()}")]
+    #[case(
+        "{Option(Int) where not _.is_none()}",
+        "{Option(Int) where not _.is_none()}"
+    )]
+    #[case(
+        "{Option(Int) where _.value() == 3}",
+        "{Option(Int) where _.value() == 3}"
+    )]
     #[case("{Int where _ > 0}", "{Int where _ > 0}")]
     #[case("{Int where _ > 0 and _ < 10}", "{Int where _ > 0 and _ < 10}")]
     // Two refinements of one base are one set, written nested in a fixed order.

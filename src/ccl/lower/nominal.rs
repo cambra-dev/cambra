@@ -31,7 +31,7 @@ use crate::ccl::{
     Expr, FieldKey, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding,
     TypedExprNode,
 };
-use crate::ccl::{V_NONE, V_SOME};
+use crate::ccl::{Label, V_NONE, V_SOME};
 use crate::chl_parser::ast::{
     AnnotationMode, ArmPattern, Clause, ConstructorPattern, Expr as ChlExpr, ImplBlock,
     KindAnnotation, MatchArm, Param, QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt,
@@ -876,6 +876,7 @@ pub(in crate::ccl::lower) fn predicate_term(
                         body: otherwise,
                     },
                 ],
+                refuted: Vec::new(),
             })
         }
         _ => unreachable!("a predicate holds `{term}`"),
@@ -1554,6 +1555,8 @@ pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
         acc = match decl.ctor(&name) {
             Some(ctor) => bind_constructor(&decl, ctor, acc, ctx),
             None if name == IS_NONE => bind_is_none(&decl, acc, ctx),
+            None if name == VALUE => bind_value(&decl, acc, ctx),
+            None if name == UNWRAP_OR => bind_unwrap_or(&decl, acc, ctx),
             None => unreachable!("`{}` provides no function `{name}`", decl.name),
         };
     }
@@ -1701,6 +1704,177 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     )
 }
 
+/// The method `Option::unwrap_or` that the compiler provides with `Option`.
+const UNWRAP_OR: &str = "unwrap_or";
+
+/// The method `Option::value` that the compiler provides with `Option`, and that `x!` calls.
+const VALUE: &str = "value";
+
+/// `x!`: the payload of `x`, an `Option` proven `some` (`docs/chl-spec.md`, "Subscript and
+/// unwrap syntax \[Decided\]"). It applies `Option::value` ([`bind_value`]), whose
+/// parameter's refinement is the proof `x`'s type owes.
+pub(super) fn lower_unwrap(
+    target: &Spanned<ChlExpr>,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let target = super::lower_expr(target, ctx)?;
+    if matches!(target.node, TypedExprNode::Error) {
+        return Ok(target);
+    }
+    let option = crate::ccl::nominal::option();
+    let binding = member_reference(&option, VALUE, ctx);
+    let function = ctx.tag_image(Expr::var(binding), span);
+    Ok(Expr::apply(target, function))
+}
+
+/// `Option`'s constructor `ctor`.
+fn option_ctor(decl: &Rc<NominalDecl>, ctor: Label) -> crate::ccl::CtorRef {
+    crate::ccl::CtorRef {
+        decl: Rc::clone(decl),
+        ctor: ctor.name().into(),
+    }
+}
+
+/// `match scrutinee { Option::some(𝑣) → 𝑣; Option::none → none }`, or with no `none` arm when
+/// `none` is `None`.
+fn match_option(
+    decl: &Rc<NominalDecl>,
+    scrutinee: Expr,
+    none: Option<Expr>,
+    span: Span,
+    label: crate::ccl::provenance::RewriteLabel,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let payload = ctx.fresh_ignored_payload();
+    let some_body = ctx.tag_machinery(Expr::var(payload.as_str()), span, label);
+    let mut arms = vec![(
+        V_SOME,
+        TypedBinding::new_unannotated(payload, Occurrence::mint()),
+        false,
+        some_body,
+    )];
+    if let Some(none) = none {
+        let ignored = ctx.fresh_ignored_payload();
+        arms.push((
+            V_NONE,
+            TypedBinding::new_unannotated(ignored, Occurrence::mint()),
+            true,
+            none,
+        ));
+    }
+    let arms = arms
+        .into_iter()
+        .map(|(tag, binding, empty_payload, body)| crate::ccl::Branch {
+            pattern: Some(Pattern {
+                head: PatternHead::Constructor {
+                    decl: Rc::clone(decl),
+                    ctor: tag.name().into(),
+                },
+                head_occurrence: Occurrence::mint(),
+                binding,
+                empty_payload,
+            }),
+            guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, label),
+            body,
+        })
+        .collect();
+    ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label)
+}
+
+/// `Option::value`, the method `x!` calls:
+/// `λ 𝑜 : {Option(𝑇) | not (__elem ▷ ctor_is(Option::none))} → match 𝑜 { Option::some(𝑣) → 𝑣 }`.
+///
+/// The `match` has no arm for `none`: the parameter's refinement rules it out, which
+/// inference proves (`src/ccl/design/type-inference.md`, "Arm facts"). Its result is
+/// `{𝑇 | 𝑜 ▷ ctor_is(Option::some) and __elem == 𝑜 ▷ ctor_payload(Option::some)}`, which the
+/// `match` derives.
+fn bind_value(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
+    use crate::ccl::UnaryOpKind;
+    let label = "lower.option_value";
+    let span = decl.span;
+    let arg = "__value_arg";
+    let option_ty = decl
+        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
+    let Type::Nominal(_, args) = &option_ty else {
+        unreachable!("a declaration applied to its parameters is a nominal type")
+    };
+    let elem = Expr::var(Name::elem()).with_ty(option_ty.clone());
+    let is_none = crate::ccl::nominal::ctor_is(elem, &option_ctor(decl, V_NONE), args);
+    let excludes_none =
+        Expr::unary(UnaryOpKind::Not, is_none).with_ty(Type::Base(crate::ccl::BaseType::Bool));
+    ctx.tag_predicate(&excludes_none, span, label);
+    let param_ty = Type::refined_one(
+        option_ty.clone(),
+        crate::ccl::Refinement::born(Rc::new(excludes_none)),
+    );
+    let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
+    let case = match_option(decl, scrutinee, None, span, label, ctx);
+    let name = member_binding(decl, VALUE);
+    let binder = Occurrence::mint();
+    bind_function(
+        decl, name, binder, arg, param_ty, case, acc, span, label, ctx,
+    )
+}
+
+/// `Option::unwrap_or`, the function
+/// `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, polymorphic
+/// over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃`.
+///
+/// The option's payload and the default each have their own parameter, so a call does not
+/// equate their types. Only the result's parameter, `𝑇₃`, lies above both. The result's
+/// refinement is the one the `match` derives, `(𝑝.0 ▷ ctor_is(Option::some) and __elem ==
+/// 𝑝.0 ▷ ctor_payload(Option::some)) or (𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`.
+fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
+    let label = "lower.option_unwrap_or";
+    let span = decl.span;
+    let arg = "__unwrap_or_arg";
+    debug_assert!(
+        !decl.has_family_params(),
+        "`Option`'s one type parameter is not a family, so `Option(𝑇₁)` is its application"
+    );
+    let result = TypeParam::declared("T3");
+    let below_result = |spelling: &str| {
+        PolyParam::with_bound(
+            TypeParam::declared(spelling),
+            Some(Type::Param(Rc::clone(&result))),
+            None,
+        )
+    };
+    let params = vec![
+        PolyParam::with_bound(Rc::clone(&result), None, None),
+        below_result("T1"),
+        below_result("T2"),
+    ];
+    let [t1, t2] = [&params[1], &params[2]].map(|p| Type::Param(Rc::clone(&p.param)));
+    let param_ty = Type::Tuple(vec![Type::Nominal(Rc::clone(decl), vec![t1]), t2]);
+    let component = |i: usize, ctx: &mut LoweringContext| {
+        let read = Expr::apply(
+            ctx.tag_machinery(Expr::var(arg), span, label),
+            ctx.tag_machinery(Expr::proj_index(i), span, label),
+        );
+        ctx.tag_machinery(read, span, label)
+    };
+    let scrutinee = component(0, ctx);
+    let default = component(1, ctx);
+    let case = match_option(decl, scrutinee, Some(default), span, label, ctx);
+    let name = member_binding(decl, UNWRAP_OR);
+    let binder = Occurrence::mint();
+    bind_function_over(
+        params,
+        Vec::new(),
+        name,
+        binder,
+        arg,
+        param_ty,
+        case,
+        acc,
+        span,
+        label,
+        ctx,
+    )
+}
+
 /// The name a reference to `decl`'s member `name` reads, recording the member as used when
 /// the compiler provides `decl`.
 fn member_reference(decl: &Rc<NominalDecl>, name: &str, ctx: &mut LoweringContext) -> String {
@@ -1713,17 +1887,40 @@ fn member_reference(decl: &Rc<NominalDecl>, name: &str, ctx: &mut LoweringContex
     binding
 }
 
-/// The associated functions the compiler provides with its declarations.
-fn builtin_functions() -> [AssociatedFunction; 1] {
+/// The associated functions the compiler provides with its declarations: `Option`'s methods
+/// `is_none`, `value` and `unwrap_or`.
+fn builtin_functions() -> [AssociatedFunction; 3] {
     let option = crate::ccl::nominal::option();
     let span = option.span;
-    [AssociatedFunction {
-        decl: option,
-        name: SmolStr::new_static(IS_NONE),
-        arity: 1,
+    let method = |name: &'static str, arity: usize| AssociatedFunction {
+        decl: Rc::clone(&option),
+        name: SmolStr::new_static(name),
+        arity,
         is_method: true,
         span,
-    }]
+    };
+    [method(IS_NONE, 1), method(VALUE, 1), method(UNWRAP_OR, 2)]
+}
+
+/// The reading a refinement predicate gives `decl`'s method `method`, where the method is one of
+/// `Option`'s observers: `is_none` reads `ctor_is(Option::none)`, and `value` reads
+/// `ctor_payload(Option::some)`. A method call (`_.is_none()`) and a path (`Option::is_none(_)`,
+/// [`predicate_reference`]) read the same.
+///
+/// The method's function is what a call of it computes, and the refinement encoding reads
+/// neither function. The reading is what the encoding reads (`src/ccl/infer/solver/smt.rs`,
+/// "Nominal values"). It takes the candidate's place, so the call resolves by its receiver's
+/// type as any method call does. Unlike `value`, `ctor_payload` has no domain refinement: it
+/// states nothing of a `none`, and `_.value() == 3` is a predicate about any `Option`.
+fn predicate_reading(decl: &Rc<NominalDecl>, method: &str) -> Option<crate::ccl::Builtin> {
+    if **decl != *crate::ccl::nominal::option() {
+        return None;
+    }
+    match method {
+        IS_NONE => Some(crate::ccl::Builtin::CtorIs(option_ctor(decl, V_NONE))),
+        VALUE => Some(crate::ccl::Builtin::CtorPayload(option_ctor(decl, V_SOME))),
+        _ => None,
+    }
 }
 
 /// `N::extract`, the function `λ n → match n: case N::new(r): r` that the
@@ -1785,6 +1982,43 @@ fn bind_function(
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
+    // A constructor states the declaration's `requires` clause, so a call is checked
+    // against it at its own types, and `extract` assumes it.
+    let (params, requires) = match decl.requirements() {
+        Some(r) => (r.params.clone(), r.requires.clone()),
+        None => (
+            decl.params
+                .iter()
+                .map(|p| PolyParam {
+                    param: Rc::clone(p),
+                    kind: TypeKind::Type,
+                    bound_at: None,
+                })
+                .collect(),
+            Vec::new(),
+        ),
+    };
+    bind_function_over(
+        params, requires, name, binder, arg, param_ty, value, acc, span, label, ctx,
+    )
+}
+
+/// `let name = λ arg : param_ty → value in acc`, polymorphic over `params` under `requires`
+/// when there are any parameters. `binder` is the occurrence of `name` in the binding.
+#[allow(clippy::too_many_arguments)]
+fn bind_function_over(
+    params: Vec<PolyParam>,
+    requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+    name: String,
+    binder: Occurrence,
+    arg: &str,
+    param_ty: Type,
+    value: Expr,
+    acc: Expr,
+    span: Span,
+    label: crate::ccl::provenance::RewriteLabel,
+    ctx: &mut LoweringContext,
+) -> Expr {
     // The function and its parameter are the compiler's own, so their occurrences record
     // where the function is tagged, as does `binder` unless the caller recorded it.
     let mut function = Expr::lambda(arg, Occurrence::mint(), Type::Hole, value);
@@ -1792,25 +2026,9 @@ fn bind_function(
         param.declare(Annotation::new(param_ty, Occurrence::mint()));
     }
     let function = ctx.tag_machinery(function, span, label);
-    let binding = if decl.params.is_empty() {
+    let binding = if params.is_empty() {
         Expr::let_bind(name, binder, function, acc)
     } else {
-        // A constructor states the declaration's `requires` clause, so a call is checked
-        // against it at its own types, and `extract` assumes it.
-        let (params, requires) = match decl.requirements() {
-            Some(r) => (r.params.clone(), r.requires.clone()),
-            None => (
-                decl.params
-                    .iter()
-                    .map(|p| PolyParam {
-                        param: Rc::clone(p),
-                        kind: TypeKind::Type,
-                        bound_at: None,
-                    })
-                    .collect(),
-                Vec::new(),
-            ),
-        };
         let poly = Type::Poly(Rc::new(PolyType {
             params,
             requires,
@@ -2094,8 +2312,22 @@ pub(super) fn lower_member(
             let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "lower.nominal_ctor_unit");
             Ok(Expr::nominal_ctor(named.decl, q.name.node.as_str(), unit))
         }
-        _ => Ok(Expr::var(named.reference(&q.name.node, ctx))),
+        _ => Ok(predicate_reference(&named.decl, &q.name, ctx)
+            .unwrap_or_else(|| Expr::var(named.reference(&q.name.node, ctx)))),
     }
+}
+
+/// The reading a refinement predicate gives a reference to `decl`'s member `name`, written
+/// `Option::is_none` rather than as a method call: the same reading [`lower_method_call`] gives
+/// `_.is_none()` ([`predicate_reading`]). `None` outside a predicate, and for a member with no
+/// reading.
+fn predicate_reference(
+    decl: &Rc<NominalDecl>,
+    name: &Spanned<SmolStr>,
+    ctx: &mut LoweringContext,
+) -> Option<Expr> {
+    let reading = predicate_reading(decl, &name.node).filter(|_| ctx.in_refinement_predicate)?;
+    Some(ctx.tag_image(Expr::builtin(reading), name.span))
 }
 
 /// Lower a call of a name qualified by a type, `Shape::circle(1)`.
@@ -2128,10 +2360,18 @@ pub(super) fn lower_member_call(
                 args.len()
             ),
         )),
-        _ => {
-            let binding = named.reference(name, ctx);
-            super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
-        }
+        _ => match predicate_reference(decl, &q.name, ctx) {
+            Some(reading) => {
+                let [arg] = args else {
+                    unreachable!("a member with a predicate reading takes one argument")
+                };
+                Ok(Expr::apply(super::lower_expr(arg, ctx)?, reading))
+            }
+            None => {
+                let binding = named.reference(name, ctx);
+                super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
+            }
+        },
     }
 }
 
@@ -2149,12 +2389,9 @@ pub(super) fn refuse_nested(span: Span, decl: &TypeDecl) -> LoweringError {
 
 /// The nominal type a `match`'s constructor arms name, once each arm is checked against
 /// it: every arm names a constructor of that one type and binds one name per declared
-/// parameter, and without a `case _:` every constructor has an arm
-/// (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
+/// parameter (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
 pub(super) fn constructor_arms_type(
-    match_span: Span,
     arms: &[MatchArm],
-    has_default: bool,
     ctx: &LoweringContext,
 ) -> Result<Rc<NominalDecl>, LoweringError> {
     let mut found: Option<Rc<NominalDecl>> = None;
@@ -2179,34 +2416,10 @@ pub(super) fn constructor_arms_type(
         }
         check_binders(&decl, pattern)?;
     }
+    // A constructor no arm names is checked by inference, which proves its arm unreachable
+    // from what the scrutinee's type states (`src/ccl/design/type-inference.md`, "Unreachable
+    // arms").
     let decl = found.expect("`constructor_arms_type` is called with a constructor arm");
-    if !has_default {
-        let named: HashSet<&str> = arms
-            .iter()
-            .filter_map(|a| match &a.pattern {
-                Some(ArmPattern::Constructor(p)) => Some(p.ctor.node.as_str()),
-                _ => None,
-            })
-            .collect();
-        let missing: Vec<String> = decl
-            .body()
-            .ctors
-            .iter()
-            .filter(|c| !named.contains(c.name.as_str()))
-            .map(|c| format!("`{}::{}`", decl.name, c.name))
-            .collect();
-        if !missing.is_empty() {
-            return Err(LoweringError::unsupported(
-                match_span,
-                format!(
-                    "`match` over `{}` has no arm for {}; each constructor is handled by an \
-                     arm, or `case _:` covers the rest",
-                    decl.name,
-                    missing.join(", ")
-                ),
-            ));
-        }
-    }
     Ok(decl)
 }
 
@@ -2877,6 +3090,19 @@ pub(super) fn lower_method_call(
     let candidates = owners
         .into_iter()
         .map(|(decl, params, qualifier)| {
+            let reading = ctx
+                .in_refinement_predicate
+                .then(|| predicate_reading(&decl, &method.node))
+                .flatten();
+            if let Some(reading) = reading {
+                let function = ctx.tag_image(Expr::builtin(reading), method.span);
+                return MethodCandidate {
+                    decl,
+                    params,
+                    function,
+                    copy: false,
+                };
+            }
             let binding = match qualifier {
                 None => member_reference(&decl, &method.node, ctx),
                 Some(qualifier) => {

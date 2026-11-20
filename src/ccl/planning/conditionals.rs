@@ -363,6 +363,7 @@ fn is_value_case(expr: &Expr) -> bool {
         TypedExprNode::Case {
             scrutinee: None,
             branches,
+            ..
         } if branches.iter().all(|b| b.pattern.is_none())
     )
 }
@@ -950,6 +951,7 @@ mod tests {
                     body: Expr::new(TypedExprNode::Var(Name::from("zs"))).with_ty(coll.clone()),
                 },
             ],
+            refuted: Vec::new(),
         })
         .with_ty(coll.clone());
         let ty = Type::refined_one(

@@ -675,17 +675,18 @@ fn products_are_equatable_componentwise() {
     );
 }
 
-/// `unit` is comparable to nothing, because the interpreter cannot compare units —
-/// an out-of-table *base*, rejected by ordinary narrowing rather than by the
-/// composite rule above.
+/// `unit` is `Equatable`, since a `Set`'s checked lookup answers `Option(unit)`, and `Option(T)`
+/// requires `Equatable(T, T)`. It has no order, an out-of-table base for `Orderable`, rejected by
+/// ordinary narrowing rather than by the composite rule above.
 #[test]
 fn a_base_outside_the_table_is_rejected() {
-    let errs = infer_program_err("() == ()");
+    assert_eq!(infer_program("() == ()").to_string(), "Bool");
+    let errs = infer_program_err("() < ()");
     assert!(
         errs.iter().any(
-            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Equatable")
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Orderable")
         ),
-        "expected NoTraitInstance for Equatable, got {errs:?}"
+        "expected NoTraitInstance for Orderable, got {errs:?}"
     );
 }
 
@@ -2026,8 +2027,8 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
 }
 
 /// A bare key does not establish membership in a group-by's present-key domain.
-/// Checked lookup can type a dependent result, but a collection-valued streamed answer
-/// still fails operator conversion. The pipeline regression is
+/// A checked lookup of a group is rejected too, since a collection has no `Equatable` instance,
+/// which `Option(V)` requires of `V`. The pipeline regression is
 /// `a_group_valued_lookup_is_rejected_by_name`.
 /// See `src/ccl/design/collections.md`, "Lookup: membership discharge".
 #[test]
@@ -6346,18 +6347,20 @@ fn a_checked_lookup_is_not_an_application() {
     );
 }
 
-/// Inference substitutes the lookup key into the group's dependent predicate.
-/// This does not test execution: `a_group_valued_lookup_is_rejected_by_name` covers the
-/// later operator-conversion rejection of a streamed collection-valued answer.
+/// Inference substitutes the lookup key into the group's dependent predicate. The answer, a
+/// group, has no `Equatable` instance, which `Option(V)` requires of `V`, so the lookup is
+/// rejected, and the rejection names the group's type at the key
+/// (`a_group_valued_lookup_is_rejected_by_name`).
 #[test]
 fn a_key_dependent_lookup_discharges_the_key_binder() {
-    assert_eq!(
-        infer_program(indoc::indoc! {r#"
-            g = groupby([1, 2, 3], \x -> x)
-            g[1]"#})
-        .to_string(),
-        "Option(({0..3 | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int))",
-        "the group's predicate must name the key it was looked up at"
+    let errs = infer_program_err(indoc::indoc! {r#"
+        g = groupby([1, 2, 3], \x -> x)
+        g[1]"#});
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|m| m.contains("Equatable") && m.contains("[1, 2, 3][_]! == 1}")),
+        "the group's predicate must name the key it was looked up at, got {errs:?}"
     );
 }
 

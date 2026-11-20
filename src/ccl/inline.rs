@@ -441,6 +441,7 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             scrutinee.as_ref().is_some_and(|s| is_let_bound(name, s))
                 || branches.iter().any(|b| {
@@ -995,6 +996,35 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
     } = expr;
 
     let new_node = match node {
+        // Each arm is walked under its facts about the value it matched, which a call's
+        // discharge inside the arm reads (`src/ccl/design/type-inference.md`, "Arm facts").
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+            refuted,
+        } => {
+            let scrutinee = scrutinee.map(|s| Box::new(inline_impl(*s, scope, channels)));
+            let facts = match scrutinee.as_deref() {
+                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                None => vec![Vec::new(); branches.len()],
+            };
+            let branches = branches
+                .into_iter()
+                .zip(facts)
+                .map(|(b, facts)| {
+                    scope.assuming(facts, |scope| crate::ccl::Branch {
+                        pattern: b.pattern,
+                        guard: inline_impl(b.guard, scope, channels),
+                        body: inline_impl(b.body, scope, channels),
+                    })
+                })
+                .collect();
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+                refuted,
+            }
+        }
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -1626,6 +1656,36 @@ fn inline_and_beta_reduce(
         site,
     } = expr;
     let new_node = match node {
+        // Each arm is walked under its facts about the value it matched, which a call's
+        // discharge inside the arm reads (`src/ccl/design/type-inference.md`, "Arm facts").
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+            refuted,
+        } => {
+            let scrutinee =
+                scrutinee.map(|s| Box::new(inline_and_beta_reduce(*s, name, lambda, scope, memo)));
+            let facts = match scrutinee.as_deref() {
+                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                None => vec![Vec::new(); branches.len()],
+            };
+            let branches = branches
+                .into_iter()
+                .zip(facts)
+                .map(|(b, facts)| {
+                    scope.assuming(facts, |scope| crate::ccl::Branch {
+                        pattern: b.pattern,
+                        guard: inline_and_beta_reduce(b.guard, name, lambda, scope, memo),
+                        body: inline_and_beta_reduce(b.body, name, lambda, scope, memo),
+                    })
+                })
+                .collect();
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+                refuted,
+            }
+        }
         TypedExprNode::Lambda { param, body } => {
             if &param.name == name {
                 // shadowed — stop substituting inside
@@ -1763,7 +1823,7 @@ fn beta_reduce(
     // path, and a release build proceeding past it would miscompile to
     // wrong results rather than fail.
     assert!(
-        refinement_discharged_by(&argument.ty, &param.ty, scope),
+        refinement_discharged_by(&argument, &param.ty, scope),
         "inline: outer lambda for `{callee}` has parameter type {} which the \
              argument type {} does not entail; beta reduction would silently drop \
              the precondition. This needs a `restrict` lift, not a substitution.",
@@ -1974,7 +2034,8 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 ///
 /// Anything subtler than both is exactly what should trip the assert and get a real
 /// `restrict` lift.
-fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type, scope: &dyn ScopeEnv) -> bool {
+fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeEnv) -> bool {
+    let arg_ty = &argument.ty;
     if param_ty.refinements().is_empty() {
         return true;
     }
@@ -2002,6 +2063,11 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type, scope: &dyn ScopeEnv
 
     if demanded.iter().all(|d| supplied.contains(d)) {
         return true;
+    }
+    // An argument that is a path is the value it reads, which is what links the argument to
+    // the facts in scope about that path: `o` inside `case Option::some(v):` of a `match o`.
+    if crate::ccl::infer::solver::smt::is_path(argument) {
+        supplied.push(crate::ccl::infer::solver::smt::equal_to(argument));
     }
     // The base the query runs over is the argument's value, so the `Mut` stamp comes
     // off here for the reason it does above.

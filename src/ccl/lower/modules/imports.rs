@@ -540,7 +540,9 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
         }
         ChlExpr::Subscript { target, index, .. } => each(&mut [&**target, &**index].into_iter()),
         ChlExpr::BinOp { left, right, .. } => each(&mut [&**left, &**right].into_iter()),
-        ChlExpr::UnaryOp { operand, .. } => each(&mut std::iter::once(&**operand)),
+        ChlExpr::UnaryOp { operand, .. } | ChlExpr::Unwrap(operand) => {
+            each(&mut std::iter::once(&**operand))
+        }
         ChlExpr::BoolOp { operands, .. } => each(&mut operands.iter()),
         ChlExpr::Compare {
             left, comparators, ..

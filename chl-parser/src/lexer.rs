@@ -281,9 +281,9 @@ pub enum Token {
     LBracket,
     #[token("]")]
     RBracket,
-    /// The proven-lookup suffix, accepted only directly after a `]` (`c[k]!`,
-    /// `docs/chl-spec.md`, "3.9 Subscript and attribute access"). `!=` lexes as
-    /// one token, so `c[k]! == v` needs the space.
+    /// The postfix unwrap `x!`, and directly after a `]` the proven lookup `c[k]!`
+    /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access"). `!=` lexes as
+    /// one token, so `x! == v` needs the space.
     #[token("!")]
     Bang,
     #[token("{")]

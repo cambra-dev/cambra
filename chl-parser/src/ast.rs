@@ -1194,6 +1194,11 @@ pub enum Expr {
         checked: bool,
     },
 
+    /// Unwrap: `target!` — the payload of an `Option` proven to be `Option::some`
+    /// (`docs/chl-spec.md`, "Subscript and unwrap syntax \[Decided\]"). `c[k]!` directly
+    /// after a subscript is the proven lookup [`Expr::Subscript`] instead.
+    Unwrap(Box<Spanned<Expr>>),
+
     /// Attribute access: `target.attr` — a record field by **name** (`r.age`) or a
     /// tuple position by **index** (`t.0`, whose digits are held here verbatim).
     ///

@@ -955,6 +955,40 @@ pub enum Builtin {
     ///
     /// [`TypedExprNode::Reading`]: crate::ccl::TypedExprNode::Reading
     Reading(Reading),
+    /// `ctor_is(N::c) : N(𝑃…) ⇒ Bool` — whether a value of the nominal type `N` was built by
+    /// its constructor `c`. The refinement encoding reads it as a comparison of the value's
+    /// constructor tag (`src/ccl/infer/solver/smt.rs`, "Nominal values").
+    ///
+    /// **Never executed.** It appears only in refinement predicates: the one a constructor
+    /// states of the value it builds ([`crate::ccl::nominal::ctor_refinements`]), and those
+    /// whose `.is_none()` resolves to `Option`'s reading of it.
+    CtorIs(CtorRef),
+    /// `ctor_payload(N::c) : N(𝑃…) ⇒ 𝑃ᶜ` — the payload of a value of `N` built by `c`, the
+    /// argument the constructor took. It states nothing of a value another constructor built.
+    ///
+    /// **Never executed**, for the reason [`Self::CtorIs`] is not.
+    CtorPayload(CtorRef),
+}
+
+/// A constructor of a nominal type, as [`Builtin::CtorIs`] and [`Builtin::CtorPayload`] name
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CtorRef {
+    pub decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    pub ctor: SmolStr,
+}
+
+impl CtorRef {
+    /// The constructor's position in its declaration: the value of the constructor tag the
+    /// refinement encoding gives a value it built.
+    pub fn index(&self) -> usize {
+        self.decl.ctor_index(&self.ctor).unwrap_or_else(|| {
+            panic!(
+                "`{}` declares no constructor `{}`",
+                self.decl.name, self.ctor
+            )
+        })
+    }
 }
 
 /// One reading: which kind, and the site of the call
@@ -1068,6 +1102,8 @@ impl Builtin {
             Self::IntToUint => "int_to_uint",
             Self::IntEqUint => "int_eq_uint",
             Self::Reading(_) => "reading",
+            Self::CtorIs(_) => "ctor_is",
+            Self::CtorPayload(_) => "ctor_payload",
         }
     }
 

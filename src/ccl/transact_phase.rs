@@ -958,6 +958,7 @@ impl Snapshot<'_> {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } if contains_begin_in(branches) => {
                 // The tests run where the branch stands; a write in any arm comes after them.
                 let in_arms: HashSet<Name> = branches
@@ -1061,6 +1062,7 @@ fn site_reads(body: &Expr) -> HashSet<Name> {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } if contains_begin_in(branches) => {
                 if let Some(s) = scrutinee {
                     out.extend(free_names_in_value(s));
@@ -1233,6 +1235,7 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
                 TypedExprNode::Case {
                     scrutinee: None,
                     branches,
+                    refuted: Vec::new(),
                 },
             )
             .with_ty(e.ty);
@@ -1241,6 +1244,7 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
         TypedExprNode::Case {
             scrutinee: None,
             branches,
+            refuted,
         } => {
             // The first guard is evaluated whenever the guard is: on the spine.
             let mut branches = branches;
@@ -1260,6 +1264,7 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
                 node: TypedExprNode::Case {
                     scrutinee: None,
                     branches,
+                    refuted,
                 },
                 ..e
             }
@@ -1396,6 +1401,7 @@ fn write_off_a_spine(expr: &Expr) -> Option<(NodeId, NodeId)> {
         let TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } = &e.node
         else {
             unreachable!("called on a `Case`")
@@ -2091,6 +2097,7 @@ fn strip(
         let TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } = node
         else {
             unreachable!("guarded above")
@@ -2147,6 +2154,7 @@ fn strip(
             node: TypedExprNode::Case {
                 scrutinee,
                 branches,
+                refuted,
             },
             ty,
             user_annotation,
@@ -2247,6 +2255,7 @@ pub fn refuse_valued_blocks_reading_their_loop(
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } => {
                 let mut tested = scrutinee
                     .as_ref()
@@ -2540,6 +2549,7 @@ pub fn refuse_conditional_sites(
                 TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    ..
                 } => {
                     let scrutinee_reads = match scrutinee {
                         Some(s) => {

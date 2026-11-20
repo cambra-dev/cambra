@@ -321,6 +321,41 @@ pub(super) trait Typing {
     where
         Self: Sized;
 
+    /// Run `f` with `facts` holding in the scope, in addition to those already there: what a
+    /// refinement query under them assumes ([`ScopeEnv::facts`]). A `match` arm's facts about
+    /// the value it matched are the case (`src/ccl/design/type-inference.md`, "Arm facts").
+    ///
+    /// [`ScopeEnv::facts`]: crate::ccl::infer::solver::smt::ScopeEnv::facts
+    fn assuming<R>(&mut self, facts: Vec<Expr>, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized;
+
+    /// Run `f` with every read of `name` typed at its type refined by `refinements`: a
+    /// `match` arm's narrowing of the value it matched (`src/ccl/design/type-inference.md`,
+    /// "Arm facts"). Check reads the type inference recorded on each read, so it narrows
+    /// nothing itself.
+    fn narrowing<R>(
+        &mut self,
+        name: &Name,
+        refinements: Vec<crate::ccl::Refinement>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized,
+    {
+        let _ = (name, refinements);
+        f(self)
+    }
+
+    /// Whether the scope's binders and facts, with `facts` added, are contradictory: whether
+    /// no value reaches a position where `facts` hold. An arm of a `match` the value's
+    /// refinement rules out is such a position (`src/ccl/design/type-inference.md`,
+    /// "Unreachable arms").
+    ///
+    /// `recorded` is whether the `Case` records the arm as refuted. A derivation that decides
+    /// no refinement answers it in place of a proof.
+    fn refutes(&mut self, facts: Vec<Expr>, recorded: bool) -> bool;
+
     /// `ty`, a morphism reached with an input of type `incoming`, instantiated for it where
     /// it is a generalized type (`src/ccl/design/type-parameters.md`, "Generalized types").
     /// Emission runs before any pass lifts a use, so it meets none.

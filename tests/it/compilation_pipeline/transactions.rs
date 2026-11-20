@@ -374,6 +374,24 @@ fn a_binding_read_inside_a_match_arm_that_ignores_its_payload() {
     check_sink(source, "[11, 22, 33, 44]");
 }
 
+/// A fed value whose type reads the loop variable, `r ^+ a`. The transaction stores the row
+/// outside the writer, where the loop variable is not bound, so the stored type keeps no
+/// refinement that reads it.
+#[test]
+fn a_fed_value_refined_by_the_loop_variable() {
+    let source = indoc! {r#"
+        m: Mut(Int, Txn) := 0
+        out = test_sink()
+        for r in [1, 2, 3, 4]:
+            with begin():
+                a = r * 10
+                b = r ^+ a
+                m := b
+                out << b
+    "#};
+    check_sink(source, "[11, 22, 33, 44]");
+}
+
 // ---------------------------------------------------------------------------
 // Multiple variables in one transaction + read-your-writes (multi-key mutable variable)
 // ---------------------------------------------------------------------------

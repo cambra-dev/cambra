@@ -927,9 +927,8 @@ fn try_compose_with_strength(expr: &mut Expr) -> bool {
 /// the flat merge relies on not happening.
 ///
 /// Only a compose *element* is in scope. A projection nested inside a `zip` (the
-/// outer-binder arm `⟨id, s ≫ variant_project(c)⟩ ≫ eᵢ`) is not one, and
-/// needs no guard: that arm reads the zipped pair, so it is never constant and
-/// there is nothing for const-reduce to collapse.
+/// outer-binder arm `⟨id, s ≫ variant_project(c)⟩ ≫ eᵢ`) is not one; [`narrows_keys`]
+/// finds it there.
 fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::Apply { function, .. } => is_builtin(function, Builtin::FilterValues),
@@ -1036,6 +1035,8 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::NotFn
         | Builtin::IntToUint
         | Builtin::IntEqUint
+        | Builtin::CtorIs(_)
+        | Builtin::CtorPayload(_)
         | Builtin::VariantWrap(_)
         | Builtin::VariantIs(_)
         | Builtin::Reading(_)
@@ -1142,15 +1143,17 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         // A `left ≫ const(g)` collapses to `const(g)` carrying `left`'s *type*
-        // domain — sound only when `left` is a pure reshaping, which is exactly what
-        // `narrows_domain_irrecoverably` rules out.
+        // domain — sound only when `left` keeps every key, which `narrows_keys` rules
+        // on. An outer-binder arm `⟨id, 𝑠 ≫ variant_project(𝑐)⟩ ≫ 𝑒` whose `𝑒` reads only
+        // the pair's first half simplifies to `⟨id, 𝑠 ≫ variant_project(𝑐)⟩ ≫ const(𝑔)`, and
+        // the `zip` is the arm's gate.
         //
         // A dependent `const(g)`, `(𝑘: 𝐾) ⇒ 𝐶[𝑘]`, is constant in value but not in type: its
         // codomain reads the input `left` delivers, and the rest of the chain speaks that
         // input by `𝑘`'s name. Collapsed, nothing would bind `𝑘`, so it stays a step.
         |left, right| {
             as_const(right).is_some()
-                && !narrows_domain_irrecoverably(left)
+                && !narrows_keys(left)
                 && !keys_only_in_the_data(left)
                 && !crate::ccl::subst::is_dependent(&right.ty)
         },
@@ -1737,12 +1740,14 @@ fn try_apply_zip(expr: &mut Expr) -> bool {
 /// Apply of a constant-valued function: `⟨𝑥, ℎ ≫ const⟩ ≫ apply  ⟹  ℎ`
 ///
 /// `ℎ ≫ const` sends each input to the function constantly `ℎ`'s value there, so applying it
-/// to anything gives that value.
+/// to anything gives that value. The rule drops `𝑥`, so it does not fire where `𝑥` drops keys
+/// ([`narrows_keys`]): the pair holds only the keys `𝑥` holds.
 fn try_apply_constant_valued(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| {
             is_builtin(right, Builtin::Apply)
+                && as_zip(left).is_some_and(|(x, _)| !narrows_keys(x))
                 && as_zip(left).is_some_and(|(_, m)| {
                     matches!(&m.node, TypedExprNode::Compose(elts)
                         if elts.len() >= 2 && elts.last().is_some_and(|c| is_builtin(c, Builtin::Const)))

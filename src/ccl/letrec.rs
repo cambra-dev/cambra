@@ -335,6 +335,7 @@ fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             if let Some(s) = scrutinee {
                 collect_noncausal_refs(s, live, out);

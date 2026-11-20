@@ -678,8 +678,10 @@ fn hash_payload<'a>(
         N::Case {
             scrutinee,
             branches,
+            refuted,
         } => {
             scrutinee.is_some().hash(h);
+            refuted.hash(h);
             branches.len().hash(h);
             for br in branches {
                 match &br.pattern {

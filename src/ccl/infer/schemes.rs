@@ -453,6 +453,10 @@ impl OperatorSchemes {
             Builtin::CollectionContains => &self.collection_contains,
             Builtin::Uncurry(n) => return Some(Cow::Owned(uncurry_scheme(n))),
             Builtin::FinalOrDefault => &self.final_or_default,
+            Builtin::CtorIs(ctor) => return ctor_observer_scheme(&ctor, false).map(Cow::Owned),
+            Builtin::CtorPayload(ctor) => {
+                return ctor_observer_scheme(&ctor, true).map(Cow::Owned);
+            }
             Builtin::GetPrevSeq => &self.get_prev_seq,
             Builtin::GetPrevTxn => &self.get_prev_txn,
             Builtin::AwaitFinal => &self.await_final,
@@ -545,6 +549,30 @@ pub(super) fn uncurried_value_at_its_tuple(
 /// collections over the inner keys). A function over a dependent tuple binds the tuple and not
 /// its components' names, so the result reads `𝜈` through the tuple's projections, which emission
 /// puts in at each use ([`uncurried_value_at_its_tuple`]).
+/// `∀𝑃…. N(𝑃…) ⇒ Bool` for [`Builtin::CtorIs`], or `∀𝑃…. N(𝑃…) ⇒ 𝑃ᶜ` for
+/// [`Builtin::CtorPayload`], `𝑃ᶜ` the payload the constructor takes. `None` for a declaration
+/// with a family parameter, whose argument is no variable: such a node keeps its stamped type.
+fn ctor_observer_scheme(ctor: &crate::ccl::CtorRef, payload: bool) -> Option<PolyScheme> {
+    if ctor.decl.has_family_params() {
+        return None;
+    }
+    let args: Vec<Type> = ctor
+        .decl
+        .params
+        .iter()
+        .map(|_| fresh_var(BODY_LEVEL))
+        .collect();
+    let result = if payload {
+        ctor.payload_at(&args)
+    } else {
+        prim(BaseType::Bool)
+    };
+    Some(PolyScheme::poly(
+        SCHEME_LEVEL,
+        fun(Type::Nominal(std::rc::Rc::clone(&ctor.decl), args), result),
+    ))
+}
+
 fn uncurry_scheme(n: usize) -> PolyScheme {
     assert!(
         n >= 2,

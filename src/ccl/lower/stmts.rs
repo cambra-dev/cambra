@@ -4678,6 +4678,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         ChlExpr::List(_) => "a list",
         ChlExpr::Record(_) => "a record value",
         ChlExpr::Subscript { .. } => "a subscript",
+        ChlExpr::Unwrap(_) => "an unwrap",
         ChlExpr::Attribute { .. } => "a field access",
         ChlExpr::IfExp { .. } => "a conditional expression",
         ChlExpr::ListComp(_) | ChlExpr::GenExp(_) => "a comprehension",
@@ -5957,12 +5958,7 @@ pub(super) fn lower_match_over(
     }
     // The type constructor arms name, checked against the arms before anything lowers.
     let nominal = if constructor_arms > 0 {
-        Some(nominal::constructor_arms_type(
-            match_span,
-            arms,
-            defaults == 1,
-            ctx,
-        )?)
+        Some(nominal::constructor_arms_type(arms, ctx)?)
     } else {
         None
     };
@@ -6071,6 +6067,7 @@ pub(super) fn lower_match_over(
         Expr::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(scrutinee_expr)),
             branches,
+            refuted: Vec::new(),
         }),
         match_span,
     ))
@@ -6167,6 +6164,7 @@ pub(super) fn lower_if(
         Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: out_branches,
+            refuted: Vec::new(),
         }),
         if_span,
     ))

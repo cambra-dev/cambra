@@ -141,6 +141,13 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
             r @ (ColumnValue::Records(_) | ColumnValue::Union(_)),
             ColumnValue::Bools(o),
         ) => o.extend(order_rows(op, l, r)),
+        // There is one unit, so units are equal row by row.
+        (
+            BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),
+            ColumnValue::Units(l),
+            ColumnValue::Units(r),
+            ColumnValue::Bools(o),
+        ) => o.extend(std::iter::repeat_n(op == CompareKind::Equals, (*l).min(*r))),
         // A nominal value compares by value: constructor, then argument.
         (
             BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),

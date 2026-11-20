@@ -478,6 +478,7 @@ fn lower_tx_if(
         Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: out_branches,
+            refuted: Vec::new(),
         }),
         guard_span,
     ))

@@ -424,6 +424,7 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
         TypedExprNode::Case {
             scrutinee,
             branches,
+            ..
         } => {
             if let Some(scrutinee) = scrutinee {
                 **scrutinee = operand(std::mem::take(scrutinee), muts, open, minted);

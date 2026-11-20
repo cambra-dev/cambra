@@ -423,6 +423,7 @@ fn value_match(o: &TypedBinding, arms: Vec<(Label, TypedBinding, Expr)>, result:
                 body,
             })
             .collect(),
+        refuted: Vec::new(),
     })
     .with_ty(result.clone())
 }
@@ -459,6 +460,7 @@ fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result:
             let TypedExprNode::Case {
                 scrutinee,
                 branches,
+                refuted,
             } = value.node
             else {
                 unreachable!("`branch_constructors` answers only for a `Case`")
@@ -486,6 +488,7 @@ fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result:
                 .rebuild(TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    refuted,
                 })
                 .with_ty(result);
         }
@@ -685,6 +688,7 @@ fn statement(e: Expr) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } => kept
             .rebuild(TypedExprNode::Case {
                 scrutinee,
@@ -695,6 +699,7 @@ fn statement(e: Expr) -> Expr {
                         ..b
                     })
                     .collect(),
+                refuted,
             })
             .with_ty(ty),
         node => kept.rebuild(node).with_ty(ty),
@@ -969,7 +974,8 @@ impl Cx {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
-            } => self.elim_case(kept, scrutinee, branches, &ty, arms),
+                refuted,
+            } => self.elim_case(kept, scrutinee, branches, refuted, &ty, arms),
             TypedExprNode::MutDecl {
                 binding: b,
                 init,
@@ -1202,6 +1208,7 @@ impl Cx {
                                 body: otherwise,
                             },
                         ],
+                        refuted: Vec::new(),
                     })
                     .with_ty(ty);
                 self.elim(case, arms)
@@ -1256,6 +1263,7 @@ impl Cx {
         kept: Kept,
         scrutinee: Option<Box<Expr>>,
         branches: Vec<Branch>,
+        refuted: Vec<Label>,
         ty: &Type,
         arms: &Arms,
     ) -> Elim {
@@ -1278,6 +1286,7 @@ impl Cx {
             let inner = Expr::new(TypedExprNode::Case {
                 scrutinee: None,
                 branches: inner,
+                refuted: Vec::new(),
             })
             .with_ty(ty.clone());
             let split = Expr::let_in(c, first.guard, inner).with_ty(ty.clone());
@@ -1292,6 +1301,7 @@ impl Cx {
                 kept.rebuild(TypedExprNode::Case {
                     scrutinee: None,
                     branches,
+                    refuted: Vec::new(),
                 })
                 .with_ty(ty.clone())
             };
@@ -1343,6 +1353,7 @@ impl Cx {
             .rebuild(TypedExprNode::Case {
                 scrutinee,
                 branches,
+                refuted,
             })
             .with_ty(result.clone());
         match matched {
@@ -1876,6 +1887,7 @@ impl Cx {
                         body: dropped_value(),
                     },
                 ],
+                refuted: Vec::new(),
             })
             .with_ty(kept_ty.clone()),
         )];

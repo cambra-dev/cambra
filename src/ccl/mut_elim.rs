@@ -434,6 +434,7 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             mut branches,
+            refuted,
         } if some_branch_writes(&branches) => {
             for br in branches.iter_mut() {
                 let body = std::mem::take(&mut br.body);
@@ -446,6 +447,7 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
                 node: TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    refuted,
                 },
                 ty,
                 ..branch
@@ -1021,6 +1023,7 @@ fn bind_writing_first_slot(e: &mut Expr, spine: Spine) -> Option<Expr> {
             TypedExprNode::Case {
                 scrutinee: None,
                 branches,
+                ..
             } => branches.first_mut().map(|b| &mut b.guard),
             _ => None,
         }
@@ -1077,6 +1080,7 @@ fn assert_writes_on_spines(e: &Expr, spine: Spine) {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } => {
                 if let Some(scrutinee) = scrutinee {
                     value(scrutinee, spine);
@@ -1363,6 +1367,7 @@ fn end_with(body: Expr, end: &dyn Fn(Expr) -> Expr, ty: &Type) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             mut branches,
+            refuted,
         } if branches
             .iter()
             .any(|b| holds_loop(&b.body) || writes(&b.body)) =>
@@ -1375,6 +1380,7 @@ fn end_with(body: Expr, end: &dyn Fn(Expr) -> Expr, ty: &Type) -> Expr {
                 node: TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    refuted,
                 },
                 ty: ty.clone(),
                 ..body
@@ -3044,6 +3050,7 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             branches,
+            refuted,
         } => {
             let branches = branches
                 .into_iter()
@@ -3058,6 +3065,7 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
                 TypedExprNode::Case {
                     scrutinee,
                     branches,
+                    refuted,
                 },
             )
             .with_ty(expr.ty);
@@ -3500,6 +3508,7 @@ impl<'a> WriterWalk<'a> {
                     TypedExprNode::Case {
                         scrutinee: None,
                         branches,
+                        ..
                     } => {
                         self.walk_case(branches, kept, None);
                         self.walk_chain(*body, kept)
@@ -3716,6 +3725,7 @@ impl<'a> WriterWalk<'a> {
             TypedExprNode::Case {
                 scrutinee: Some(_),
                 branches,
+                ..
             } => (true, branches.iter().any(|b| b.pattern.is_none())),
             _ => (false, false),
         };
@@ -3953,6 +3963,7 @@ impl<'a> WriterWalk<'a> {
             let mut merged = Expr::new(TypedExprNode::Case {
                 scrutinee: None,
                 branches,
+                refuted: Vec::new(),
             });
             // The variable's value type, as the write set states it: a refinement every value
             // of the variable carries holds of the merge, where the join of the arms' own
@@ -3986,6 +3997,7 @@ impl<'a> WriterWalk<'a> {
             Expr::new(TypedExprNode::Case {
                 scrutinee: None,
                 branches,
+                refuted: Vec::new(),
             })
             .with_ty(ty),
         )
@@ -4154,6 +4166,7 @@ impl<'a> WriterWalk<'a> {
         let merged = Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches,
+            refuted: Vec::new(),
         })
         .with_ty(tuple_ty.clone());
         let merge = binding(Name::fresh("__merge"), tuple_ty.clone());
@@ -4255,7 +4268,15 @@ impl<'a> WriterWalk<'a> {
     /// builds, under `kept` as [`sink_prefix`] places it. Each variable the writer writes
     /// fires on the disjunction of the paths it is written on, with what it holds where the
     /// walk ends, and is `` `idle `` elsewhere.
-    pub(crate) fn body(self, kept: Vec<Kept>, param: WriterParam) -> (Expr, Vec<FeedSite>) {
+    pub(crate) fn body(mut self, kept: Vec<Kept>, param: WriterParam) -> (Expr, Vec<FeedSite>) {
+        // A row fed here is stored outside the writer, where no name the block reads is bound,
+        // so its type holds of every value the block's names take: a refinement of the value
+        // that reads a name does not.
+        for f in &mut self.feeds {
+            if f.levels == 0 {
+                f.ty = without_value_refinements_reading_names(&f.ty);
+            }
+        }
         let paths = per_variable(self.written);
         let writes: Vec<(Label, Expr, Expr, Type)> = self
             .writes
@@ -4307,6 +4328,35 @@ impl<'a> WriterWalk<'a> {
             Expr::lambda(param.name, Occurrence::mint(), param.ty, decision),
             self.feeds,
         )
+    }
+}
+
+/// `ty` without each refinement of a value that reads a name other than the value's own: the
+/// type of the value at every value the names take. A refinement of a collection's domain is
+/// kept, since a fed row's keys may depend on the loop variable.
+fn without_value_refinements_reading_names(ty: &Type) -> Type {
+    match ty {
+        Type::Refinement(base, refinements) => {
+            let kept: Vec<crate::ccl::Refinement> = refinements
+                .iter()
+                .filter(|r| {
+                    crate::ccl::ccl_utils::free_names(&r.predicate)
+                        .iter()
+                        .all(Name::is_elem)
+                })
+                .cloned()
+                .collect();
+            Type::refined(
+                without_value_refinements_reading_names(base),
+                kept.into_iter().collect(),
+            )
+        }
+        Type::Fun { .. } => ty.clone(),
+        _ => {
+            let mut ty = ty.clone();
+            ty.walk_children_mut(|child| *child = without_value_refinements_reading_names(child));
+            ty
+        }
     }
 }
 
@@ -4383,6 +4433,7 @@ fn gated_feed(fire: Expr, feed: Expr) -> Expr {
                 body: unit,
             },
         ],
+        refuted: Vec::new(),
     });
     case.ty = unit_ty;
     case
@@ -4539,6 +4590,7 @@ fn conjoin_path(pi: &Expr, path: &Expr) -> Expr {
                 body: bool_lit(false),
             },
         ],
+        refuted: Vec::new(),
     })
     .with_ty(Type::Base(BaseType::Bool))
 }
@@ -4997,7 +5049,7 @@ mod tests {
         let both = conjoin_path(&g, &h);
         assert!(matches!(
             &both.node,
-            TypedExprNode::Case { scrutinee: None, branches }
+            TypedExprNode::Case { scrutinee: None, branches , .. }
                 if matches!(branches.as_slice(), [first, rest]
                     if is_var(&first.guard, &g_name)
                         && is_var(&first.body, &h_name)

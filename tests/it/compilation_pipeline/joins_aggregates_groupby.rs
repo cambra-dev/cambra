@@ -1140,13 +1140,11 @@ fn record_types_in_two_field_orders_compare(#[case] right: &str) {
 }
 
 /// A group-by's groups are themselves collections, so a checked lookup on one would carry
-/// a collection as its `Option::some` payload — which nothing materializes.
+/// a collection as its `Option::some` payload.
 ///
-/// Rejected at **op-conversion**, not by the typing rule: the answer's *type* is fine, the
-/// key binder having discharged to the key
-/// (`tests/it/type_check.rs`'s `a_key_dependent_lookup_discharges_the_key_binder`), and it is
-/// the tiling that has no shape for it. The pipeline test earns its place beside the typing
-/// one: this is the whole program failing, and at the layer that owns the reason.
+/// Rejected by inference: `Option(V)` requires `Equatable(V, V)`, and a collection has no
+/// `Equatable` instance. The key binder still discharges to the key in the answer's type, as the
+/// rejection shows (`tests/it/type_check.rs`'s `a_key_dependent_lookup_discharges_the_key_binder`).
 #[test]
 fn a_group_valued_lookup_is_rejected_by_name() {
     check_compile_error(
@@ -1158,7 +1156,7 @@ fn a_group_valued_lookup_is_rejected_by_name() {
                 case Option::none:
                     0
         "#},
-        "A collection-valued codomain is the usual reason",
+        "No Equatable instance for the value a checked lookup answers",
     );
 }
 

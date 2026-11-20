@@ -455,6 +455,7 @@ impl Walk {
                 self.expr(right);
             }
             Expr::UnaryOp { operand, .. } => self.expr(operand),
+            Expr::Unwrap(target) => self.expr(target),
             Expr::BoolOp { operands, .. } => operands.iter().for_each(|o| self.expr(o)),
             Expr::Compare {
                 left, comparators, ..

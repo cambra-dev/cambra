@@ -11,6 +11,10 @@
 //! instead: a predicate reads one by projection, and the [`Path`] that read
 //! addresses is what an SMT constant is minted for.
 //!
+//! A value of a nominal type has no sort of its own either, and is reached through two kinds
+//! of [`Key`] ("Nominal values" below): its constructor tag and the payload of each
+//! constructor.
+//!
 //! The fragment is over **surface-syntax** predicate shapes: a variable, a field
 //! read, a literal, a unary or a binary operator, and the `Int`/`UInt` equality
 //! `(𝑎, 𝑏) ▷ int_eq_uint` ([`Encode::expr`]). `lambda_elim`
@@ -19,6 +23,28 @@
 //! is encodable, and every check from there on decides its deficits structurally.
 //! The reach of the fallback is therefore inference and [`crate::ccl::inline`], not
 //! the whole pipeline.
+//!
+//! # Nominal values
+//!
+//! A value `𝑜` of a nominal type `N` with `𝑛` constructors is two kinds of path:
+//!
+//! - `𝑜.#tag`, a constant at `0..𝑛`: the position of the constructor that built `𝑜`. The range
+//!   alone states that each value has exactly one constructor. `𝑜 ▷ ctor_is(N::c)` encodes as
+//!   `𝑜.#tag == 𝑖`, for `𝑖` the position of `c`.
+//! - `𝑜.c`, the payload `c` took, at the payload's own type: `𝑜 ▷ ctor_payload(N::c)`. A record
+//!   payload, a nested nominal value or a `UInt` payload is then a path like any other.
+//!
+//! What the payload's type states holds only of a value `c` built. Every assumption the types
+//! along a path through `𝑜.c` carry, and the sort constraint of a constant on it, is assumed
+//! under `𝑜.#tag == 𝑖`. Otherwise an `Option({Int | false})` would make `none` contradictory.
+//!
+//! # Antecedents outside the fragment
+//!
+//! An antecedent the encoding cannot translate weakens the query rather than defeating it.
+//! Each atom of an lhs refinement, of an assumption and of a fact ([`ScopeEnv::facts`]) that has
+//! no encoding is a fresh `Bool` constant, universally quantified like every other constant: an
+//! entailment that holds for every truth value of the atom holds for its actual one. A goal
+//! that has no encoding is an [`SmtError::Encoding`].
 //!
 //! `smt_sub` answers `false` for one reason: the solver found a model of
 //! `⋀lhs ∧ ¬⋀rhs`, a value of the base satisfying every lhs predicate and
@@ -35,6 +61,8 @@ use std::io;
 use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
 use crate::ccl::symbolic::symbolic;
+use smol_str::SmolStr;
+
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Lit, LogicKind, Name, ProjKey,
     Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
@@ -113,22 +141,27 @@ pub enum Sort {
     UIntRange(u64),
     /// A sort reached by the solver's own spelling for it, carrying no constraint
     /// of its own. `String` is the case: z3's built-in string sort, used here as a
-    /// sort name. This reaches a built-in sort and not an uninterpreted one,
-    /// which would need a `declare-sort` command that nothing here emits.
+    /// sort name. This reaches a built-in sort; [`Sort::Uninterpreted`] is the one
+    /// a query declares.
     Named(String),
+    /// The sort of an unsolved inference variable: an uninterpreted sort, one per variable,
+    /// which [`run`] declares with `declare-sort`. A value of it has equality and nothing
+    /// else, so a term ordering it, computing with it or using it as a proposition has no
+    /// encoding ([`Encode::expr`]).
+    Uninterpreted(String),
 }
 
 impl Sort {
     /// Declare a constant of the given sort, and assert any relevant
     /// constraint (such as that the constant is `>= 0`, for a
     /// `UInt`).
-    fn declare(self, sym: String, ctx: &mut Context) -> Result<(), SmtError> {
+    fn declare(self, sym: String, constrained: bool, ctx: &mut Context) -> Result<(), SmtError> {
         let sym_atom = ctx.atom(sym.clone());
-        let constraint = self.membership(sym_atom, ctx);
+        let constraint = self.membership(sym_atom, ctx).filter(|_| constrained);
         let sort_atom = match self {
             Self::Bool => ctx.bool_sort(),
             Self::Int | Self::UInt | Self::UIntRange(_) => ctx.int_sort(),
-            Self::Named(s) => ctx.atom(s),
+            Self::Named(s) | Self::Uninterpreted(s) => ctx.atom(s),
         };
         ctx.declare_const(sym, sort_atom)
             .map_err(exchange_failure)?;
@@ -143,7 +176,7 @@ impl Sort {
     fn membership(&self, x: SExpr, ctx: &Context) -> Option<SExpr> {
         let non_neg = ctx.gte(x, ctx.numeral(0));
         match self {
-            Self::Bool | Self::Int | Self::Named(_) => None,
+            Self::Bool | Self::Int | Self::Named(_) | Self::Uninterpreted(_) => None,
             Self::UInt => Some(non_neg),
             Self::UIntRange(n) => Some(ctx.and(non_neg, ctx.lt(x, ctx.numeral(*n)))),
         }
@@ -173,6 +206,12 @@ pub trait ScopeEnv {
     /// variable and answering means resolving it — there is no settled `Type` in
     /// the scope to hand out a borrow of.
     fn binder_type(&self, name: &Name) -> Option<Type>;
+    /// What the scope knows beyond its binders' types: `Bool` terms over the names it binds,
+    /// each of which holds wherever the query runs. A `match` arm's facts about the value it
+    /// matched are the case (`src/ccl/design/type-inference.md`, "Arm facts").
+    fn facts(&self) -> Vec<TypedExpr> {
+        Vec::new()
+    }
     /// Whether a subtyping comparison carrying this environment decides a
     /// refinement deficit structurally, without raising a query at all.
     ///
@@ -194,11 +233,14 @@ pub trait ScopeEnv {
 ///
 /// An opaque binder's type is kept past its scope: a type lifted past the binder keeps its name.
 /// A binder a walk does not track (a loop target, a pattern binder, a `letrec` group) contributes
-/// no assumption, which only weakens a query.
+/// no assumption, which only weakens a query. A `match` arm's facts are tracked
+/// ([`BinderScope::assuming`]).
 #[derive(Default)]
 pub struct BinderScope {
     frames: Vec<Frame>,
     opaque_binders: HashMap<Name, Type>,
+    /// The facts in scope ([`ScopeEnv::facts`]), innermost last.
+    facts: Vec<TypedExpr>,
 }
 
 /// One binder in a [`BinderScope`]: the type it is bound at, and for a transparent `let` the
@@ -265,6 +307,32 @@ impl BinderScope {
         out
     }
 
+    /// `f` with `facts` holding, in addition to those already in scope: a `match` arm's
+    /// facts about the value it matched ([`crate::ccl::nominal::typed_case_facts`]).
+    pub fn assuming<R>(&mut self, facts: Vec<TypedExpr>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let depth = self.facts.len();
+        self.facts.extend(facts);
+        let out = f(self);
+        self.facts.truncate(depth);
+        out
+    }
+
+    /// The number of facts in scope, for [`Self::truncate_facts`].
+    pub fn facts_len(&self) -> usize {
+        self.facts.len()
+    }
+
+    /// Add `facts` to those in scope, until [`Self::truncate_facts`] removes them: for a walk
+    /// whose recursion does not run inside [`Self::assuming`]'s closure.
+    pub fn extend_facts(&mut self, facts: Vec<TypedExpr>) {
+        self.facts.extend(facts);
+    }
+
+    /// Keep only the first `depth` facts in scope.
+    pub fn truncate_facts(&mut self, depth: usize) {
+        self.facts.truncate(depth);
+    }
+
     /// `f` under a `let`'s binder ([`Self::push_let`]).
     pub fn under_let<R>(
         &mut self,
@@ -288,6 +356,12 @@ impl ScopeEnv for BinderScope {
             .map(Frame::assumed)
             .or_else(|| self.opaque_binders.get(name))
             .cloned()
+    }
+    fn facts(&self) -> Vec<TypedExpr> {
+        self.facts
+            .iter()
+            .map(TypedExpr::clone_preserving_ids)
+            .collect()
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -371,8 +445,29 @@ fn in_term_fragment(e: &TypedExpr) -> bool {
 struct Path {
     /// The name the reads start from.
     root: Name,
-    /// The projections, in reading order: `x.a.b` keys `[a, b]`.
-    keys: Vec<ProjKey>,
+    /// The reads, in reading order: `x.a.b` keys `[a, b]`.
+    keys: Vec<Key>,
+}
+
+/// One read along a [`Path`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Key {
+    /// A field or position of a product.
+    Proj(ProjKey),
+    /// The constructor tag of a nominal value ("Nominal values").
+    Tag,
+    /// The payload of the named constructor of a nominal value ("Nominal values").
+    Payload(SmolStr),
+}
+
+impl std::fmt::Display for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Key::Proj(key) => write!(f, "{key}"),
+            Key::Tag => f.write_str("#tag"),
+            Key::Payload(ctor) => f.write_str(ctor),
+        }
+    }
 }
 
 impl Path {
@@ -404,16 +499,36 @@ impl Path {
             TypedExprNode::Var(name) => Some(Path::root(name.clone())),
             // A field or position read is `Apply(Proj(k), r)`, so a chain of them
             // is a chain of `Apply`s and the keys accumulate innermost-first.
-            TypedExprNode::Apply { function, argument } => match &function.node {
-                TypedExprNode::Proj(key) => {
-                    let mut path = Path::of(argument)?;
-                    path.keys.push(key.clone());
-                    Some(path)
+            TypedExprNode::Apply { function, argument } => {
+                if let TypedExprNode::Proj(key) = &function.node
+                    && let Some(component) = literal_component(argument, key)
+                {
+                    return Path::of(component);
                 }
-                _ => None,
-            },
+                if let TypedExprNode::Builtin(Builtin::CtorPayload(c)) = &function.node
+                    && let TypedExprNode::NominalCtor { ctor, payload, .. } = &argument.node
+                    && *ctor == c.ctor
+                {
+                    return Path::of(payload);
+                }
+                let key = match &function.node {
+                    TypedExprNode::Proj(key) => Key::Proj(key.clone()),
+                    TypedExprNode::Builtin(Builtin::CtorPayload(c)) => Key::Payload(c.ctor.clone()),
+                    _ => return None,
+                };
+                let mut path = Path::of(argument)?;
+                path.keys.push(key);
+                Some(path)
+            }
             _ => None,
         }
+    }
+
+    /// This path read once more through `key`.
+    fn then(&self, key: Key) -> Path {
+        let mut path = self.clone();
+        path.keys.push(key);
+        path
     }
 }
 
@@ -427,16 +542,94 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// The type at `key` of a product, or `None` when `ty` is not a product carrying
-/// it. A refinement layer states a fact about the product as a whole and addresses
-/// no field, so the walk peels through it.
-fn field_type(ty: &Type, key: &ProjKey) -> Option<Type> {
+/// The component `key` reads of `product`, where `product` is a tuple or record literal: a read
+/// of `(𝑎, 𝑏).0` is a read of `𝑎`. A path reads through a constructor's payload the same way:
+/// `N::c(𝑎) ▷ ctor_payload(N::c)` is `𝑎` ([`Path::of`]). Inlining writes an argument tuple where the function read its
+/// parameter, so this is what keeps a path a path through a call that was inlined.
+fn literal_component<'e>(product: &'e TypedExpr, key: &ProjKey) -> Option<&'e TypedExpr> {
+    match (&product.node, key) {
+        (TypedExprNode::Tuple(elems), ProjKey::Index(i)) => elems.get(*i),
+        (TypedExprNode::Record(entries), ProjKey::Field(name)) => entries
+            .iter()
+            .find(|entry| entry.label == *name)
+            .map(|entry| &entry.value),
+        _ => None,
+    }
+}
+
+/// Whether `e` is a term a type may state: a name, a literal, a tuple or record of terms, a
+/// constructor applied to a term, a field or position read, an operator, or a constructor's
+/// observer applied to a term.
+///
+/// The grammar is closed under substituting a term for a name, which is what inlining does to a
+/// type a call's argument reaches, so whether a term qualifies does not change between the type
+/// inference records and the type a later check derives. It is wider than what the encoding
+/// reads ([`in_term_fragment`]): the encoding drops what it cannot read of an antecedent.
+pub(crate) fn is_term(e: &TypedExpr) -> bool {
+    match &e.node {
+        TypedExprNode::Var(_) | TypedExprNode::Lit(_) => true,
+        TypedExprNode::Tuple(elems) => elems.iter().all(is_term),
+        TypedExprNode::Record(entries) => entries.iter().all(|entry| is_term(&entry.value)),
+        TypedExprNode::NominalCtor { payload, .. } => is_term(payload),
+        TypedExprNode::UnaryOp(_, operand) => is_term(operand),
+        TypedExprNode::BinOp { left, right, .. } => is_term(left) && is_term(right),
+        TypedExprNode::Apply { function, argument } => {
+            matches!(
+                function.node,
+                TypedExprNode::Proj(_)
+                    | TypedExprNode::Builtin(Builtin::CtorIs(_) | Builtin::CtorPayload(_))
+            ) && is_term(argument)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` addresses a value through a name: the name, read through zero or more fields,
+/// positions and constructor payloads. A fact or a derived refinement states something of such
+/// a term only, since only a path names a value a scope can read.
+pub(crate) fn is_path(e: &TypedExpr) -> bool {
+    Path::of(e).is_some()
+}
+
+/// `__elem == term`: the refinement that strengthens a term's type to the term's own value.
+/// What a query reads of it is through `term`'s paths, so it links the query's subject to what
+/// the scope states of them.
+pub(crate) fn equal_to(term: &TypedExpr) -> Refinement {
+    let elem = TypedExpr::throwaway(TypedExprNode::Var(Name::elem())).with_ty(term.ty.clone());
+    let predicate = TypedExpr::throwaway(TypedExprNode::BinOp {
+        left: Box::new(elem),
+        op: BinOpKind::Compare(CompareKind::Equals),
+        right: Box::new(term.clone_preserving_ids()),
+    })
+    .with_ty(Type::Base(BaseType::Bool));
+    Refinement::born(std::rc::Rc::new(predicate))
+}
+
+/// The type at `key` of a product or a nominal value, or `None` when `ty` carries no such
+/// read. A refinement layer states a fact about the value as a whole and addresses no part
+/// of it, so the walk peels through it.
+///
+/// A constructor's payload is read at the declaration's own payload type, refinements
+/// included: what [`Encode::assume_along`] assumes of it, under the constructor's tag.
+fn field_type(ty: &Type, key: &Key) -> Option<Type> {
     match (ty.peel_refinements(), key) {
-        (Type::Record(fields), ProjKey::Field(name)) => fields
+        (Type::Record(fields), Key::Proj(ProjKey::Field(name))) => fields
             .iter()
             .find(|(field, _)| field == name)
             .map(|(_, ty)| ty.clone()),
-        (Type::Tuple(elems), ProjKey::Index(i)) => elems.get(*i).cloned(),
+        (Type::Tuple(elems), Key::Proj(ProjKey::Index(i))) => elems.get(*i).cloned(),
+        (Type::Nominal(decl, _), Key::Tag) => Some(Type::UIntRange(decl.ctor_count() as u64)),
+        (Type::Nominal(decl, args), Key::Payload(ctor)) => {
+            Some(decl.instantiate(&decl.ctor(ctor)?.destructured(), args))
+        }
+        _ => None,
+    }
+}
+
+/// The position of the constructor `ctor` of the nominal type `ty`.
+fn ctor_position(ty: &Type, ctor: &str) -> Option<usize> {
+    match ty.peel_refinements() {
+        Type::Nominal(decl, _) => decl.ctor_index(ctor),
         _ => None,
     }
 }
@@ -510,6 +703,49 @@ pub fn smt_sub_at(
     with_solver(|ctx| check(ctx, base, Some(target), lhs, &[], rhs, scope))
 }
 
+/// Whether `scope`'s binders and facts are contradictory: whether `Γ` entails `false`.
+///
+/// `Ok(true)` is the solver's proof that no value reaches a position under `scope`. What `Γ`
+/// holds is demand-driven, as in every query: the facts are translated first, and the types of
+/// the names they read join `Γ` as they are read.
+pub fn refuted(scope: &dyn ScopeEnv) -> Result<bool, SmtError> {
+    let goal = TypedExpr::throwaway(TypedExprNode::Lit(Lit::Bool(false)))
+        .with_ty(Type::Base(BaseType::Bool));
+    let goal = Refinement::born(std::rc::Rc::new(goal));
+    let base = Type::Base(BaseType::Bool);
+    with_solver(|ctx| {
+        check(
+            ctx,
+            &base,
+            None,
+            &[],
+            &[],
+            std::slice::from_ref(&goal),
+            scope,
+        )
+    })
+}
+
+/// `inner` with `facts` added to the ones it holds.
+pub struct WithFacts<'a> {
+    pub inner: &'a dyn ScopeEnv,
+    pub facts: &'a [TypedExpr],
+}
+
+impl ScopeEnv for WithFacts<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.inner.binder_type(name)
+    }
+    fn facts(&self) -> Vec<TypedExpr> {
+        let mut facts = self.inner.facts();
+        facts.extend(self.facts.iter().map(TypedExpr::clone_preserving_ids));
+        facts
+    }
+    fn is_skip_smt(&self) -> bool {
+        self.inner.is_skip_smt()
+    }
+}
+
 /// One query: build it, then run it inside a `push`/`pop` scope so the constants
 /// it declares and the formula it asserts leave no trace for the next query.
 fn check(
@@ -542,14 +778,25 @@ fn check(
 }
 
 /// The whole exchange: declare the query's constants, assert it, ask.
-fn run(
-    ctx: &mut Context,
-    decls: Vec<(String, Sort)>,
-    formula: SExpr,
-) -> Result<Response, SmtError> {
-    for (sym, sort) in decls {
-        log::debug!("declare {sym} at {sort:?}");
-        sort.declare(sym, ctx)?;
+fn run(ctx: &mut Context, decls: Vec<Decl>, formula: SExpr) -> Result<Response, SmtError> {
+    let mut declared_sorts = HashSet::new();
+    for decl in &decls {
+        if let Sort::Uninterpreted(name) = &decl.sort
+            && declared_sorts.insert(name.clone())
+        {
+            log::debug!("declare-sort {name}");
+            ctx.declare_sort(name.as_str(), 0)
+                .map_err(exchange_failure)?;
+        }
+    }
+    for Decl {
+        symbol,
+        sort,
+        constrained,
+    } in decls
+    {
+        log::debug!("declare {symbol} at {sort:?}");
+        sort.declare(symbol, constrained, ctx)?;
     }
     log::debug!("check {}", ctx.display(formula));
     ctx.assert(formula).map_err(exchange_failure)?;
@@ -568,6 +815,36 @@ fn exchange_failure(err: io::Error) -> SmtError {
     } else {
         SmtError::Process { message }
     }
+}
+
+/// The SMT sort a [`Sort`] declares its constants at: every integral sort is SMT `Int`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SmtSort {
+    Bool,
+    Int,
+    Named(String),
+    Uninterpreted(String),
+}
+
+impl SmtSort {
+    fn of(sort: &Sort) -> Self {
+        match sort {
+            Sort::Bool => SmtSort::Bool,
+            Sort::Int | Sort::UInt | Sort::UIntRange(_) => SmtSort::Int,
+            Sort::Named(name) => SmtSort::Named(name.clone()),
+            Sort::Uninterpreted(name) => SmtSort::Uninterpreted(name.clone()),
+        }
+    }
+}
+
+/// One constant a query declares.
+struct Decl {
+    symbol: String,
+    sort: Sort,
+    /// Whether the sort's constraint ([`Sort::membership`]) is asserted with the declaration.
+    /// A constant on a path through a constructor's payload is not: the constraint is an
+    /// assumption under the constructor's tag ("Nominal values").
+    constrained: bool,
 }
 
 /// Translation from a refinement predicate to an s-expression, plus the constant
@@ -598,8 +875,11 @@ struct Encode<'a> {
     /// refinement mentioning the value it rides must not send the walk back
     /// through it.
     assumed: HashSet<Path>,
-    /// `(symbol, sort)` per entry of `vars`, in declaration order.
-    decls: Vec<(String, Sort)>,
+    /// One per entry of `vars`, and one per atom [`Encode::claim`] abstracted, in declaration
+    /// order.
+    decls: Vec<Decl>,
+    /// The SMT sort of each constant declared so far, for [`Encode::smt_sort_of`].
+    constant_sorts: HashMap<SExpr, SmtSort>,
     /// `Γ`: what the scope claims about the leaves met so far, in the order they
     /// were met. Collected as translation goes rather than up front, because a
     /// leaf is only known to be part of the query once a predicate reads it.
@@ -616,6 +896,7 @@ impl<'a> Encode<'a> {
             vars: HashMap::new(),
             assumed: HashSet::new(),
             decls: Vec::new(),
+            constant_sorts: HashMap::new(),
             assumptions: Vec::new(),
         }
     }
@@ -630,8 +911,12 @@ impl<'a> Encode<'a> {
         rhs: &[Refinement],
     ) -> Result<SExpr, SmtError> {
         self.declare_subject(lhs, rhs)?;
-        let mut conjuncts = self.conjuncts(lhs)?;
+        let mut conjuncts: Vec<SExpr> = lhs.iter().map(|r| self.claim(&r.predicate)).collect();
         conjuncts.extend(self.antecedent(assumed));
+        for fact in self.scope.facts() {
+            let fact = self.claim(&fact);
+            self.assumptions.push(fact);
+        }
         let mut goals = self.conjuncts(rhs)?;
         if let Some(target) = target {
             goals.extend(self.target_membership(target, lhs, rhs)?);
@@ -682,7 +967,7 @@ impl<'a> Encode<'a> {
     /// the base rather than from whatever a predicate's occurrence of `__elem`
     /// happens to be typed at.
     ///
-    /// A product base declares nothing: it has no sort, and a predicate reaches
+    /// A product or nominal base declares nothing: it has no sort, and a predicate reaches
     /// its scalars by projection, so each such path is declared where it is read
     /// ([`Encode::leaf`]). A base that is neither defeats every predicate about it,
     /// so the first body reports it rather than each one failing on its own mention.
@@ -694,7 +979,7 @@ impl<'a> Encode<'a> {
             }
             None if matches!(
                 self.base.peel_refinements(),
-                Type::Record(_) | Type::Tuple(_)
+                Type::Record(_) | Type::Tuple(_) | Type::Nominal(..)
             ) =>
             {
                 Ok(())
@@ -729,10 +1014,55 @@ impl<'a> Encode<'a> {
             if !self.assumed.insert(prefix.clone()) {
                 continue;
             }
-            if let Some(ty) = self.path_type(&prefix) {
-                self.assume_refinements(&prefix, &ty);
+            let Some(ty) = self.path_type(&prefix) else {
+                continue;
+            };
+            // A prefix whose guard has no encoding assumes nothing: its refinements hold only
+            // under that guard, and assuming them bare is unsound ("Nominal values").
+            let Ok(guard) = self.payload_guard(&prefix) else {
+                continue;
+            };
+            let start = self.assumptions.len();
+            self.assume_refinements(&prefix, &ty);
+            if let Some(guard) = guard {
+                for assumption in &mut self.assumptions[start..] {
+                    *assumption = self.ctx.imp(guard, *assumption);
+                }
             }
         }
+    }
+
+    /// The condition under which what the types along `path` state holds: for each
+    /// constructor payload `path` reads through, that its value's tag is that constructor's
+    /// ("Nominal values"). `Ok(None)` for a path that reads through no payload. `Err` when a
+    /// payload's value has no constructor tag to state the condition on.
+    fn payload_guard(&mut self, path: &Path) -> Result<Option<SExpr>, String> {
+        let mut guards = Vec::new();
+        for (i, key) in path.keys.iter().enumerate() {
+            let Key::Payload(ctor) = key else {
+                continue;
+            };
+            let value = Path {
+                root: path.root.clone(),
+                keys: path.keys[..i].to_vec(),
+            };
+            let position = self
+                .path_type(&value)
+                .and_then(|ty| ctor_position(&ty, ctor))
+                .ok_or_else(|| format!("{value} has no constructor `{ctor}`"))?;
+            let tag = self.tag(value)?;
+            guards.push(self.ctx.eq(tag, self.ctx.numeral(position)));
+        }
+        Ok((!guards.is_empty()).then(|| self.ctx.and_many(guards)))
+    }
+
+    /// The constant for the constructor tag of the nominal value at `value`.
+    fn tag(&mut self, value: Path) -> Result<SExpr, String> {
+        let tag = value.then(Key::Tag);
+        let ty = self
+            .path_type(&tag)
+            .ok_or_else(|| format!("{value} is not a value of a nominal type"))?;
+        self.leaf_at(tag, &ty)
     }
 
     /// Record what the type at `path` claims about it: each refinement that type
@@ -750,11 +1080,45 @@ impl<'a> Encode<'a> {
     fn assume_refinements(&mut self, path: &Path, ty: &Type) {
         let enclosing = self.subject.replace(path.clone());
         for r in ty.refinements() {
-            if let Ok(e) = self.expr(&r.predicate) {
-                self.assumptions.push(e);
-            }
+            let e = self.claim(&r.predicate);
+            self.assumptions.push(e);
         }
         self.subject = enclosing;
+    }
+
+    /// A `Bool` term that the query assumes, with each atom outside the fragment a fresh
+    /// constant ("Antecedents outside the fragment"). The logical connectives are read
+    /// through, so an atom the encoding has no rule for costs only itself.
+    fn claim(&mut self, e: &TypedExpr) -> SExpr {
+        match &e.node {
+            TypedExprNode::UnaryOp(op, operand) if op.unrefined() == UnaryOpKind::Not => {
+                let operand = self.claim(operand);
+                return self.ctx.not(operand);
+            }
+            TypedExprNode::BinOp { left, op, right }
+                if matches!(op.unrefined(), BinOpKind::BoolLogic(_)) =>
+            {
+                let (l, r) = (self.claim(left), self.claim(right));
+                return self
+                    .binop(*op, left, right, l, r)
+                    .expect("a logical connective has an encoding");
+            }
+            _ => {}
+        }
+        match self.proposition(e) {
+            Ok(encoded) => encoded,
+            Err(message) => {
+                log::debug!("abstracting an antecedent atom: {message}");
+                let symbol = format!("v!{}", self.decls.len());
+                let atom = self.ctx.atom(symbol.as_str());
+                self.decls.push(Decl {
+                    symbol,
+                    sort: Sort::Bool,
+                    constrained: true,
+                });
+                atom
+            }
+        }
     }
 
     /// One s-expression per refinement. [`Encode::expr`] reports the part it
@@ -771,7 +1135,7 @@ impl<'a> Encode<'a> {
             .filter_map(|r| {
                 let (vars, assumed) = (self.vars.clone(), self.assumed.clone());
                 let (decls, assumptions) = (self.decls.len(), self.assumptions.len());
-                let encoded = self.expr(&r.predicate);
+                let encoded = self.proposition(&r.predicate);
                 if encoded.is_err() {
                     self.vars = vars;
                     self.assumed = assumed;
@@ -786,7 +1150,7 @@ impl<'a> Encode<'a> {
     fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<SExpr>, SmtError> {
         refs.iter()
             .map(|r| {
-                self.expr(&r.predicate)
+                self.proposition(&r.predicate)
                     .map_err(|message| SmtError::Encoding {
                         body: r.clone(),
                         message,
@@ -808,6 +1172,7 @@ impl<'a> Encode<'a> {
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
             Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
             Type::History { .. } => self.sort(ty.history_parts()?.1),
+            Type::Infer(var) => Some(Sort::Uninterpreted(format!("T!{}", var.uid))),
             _ => None,
         }
     }
@@ -815,6 +1180,9 @@ impl<'a> Encode<'a> {
     /// A predicate term as an s-expression, or a description of the part with no
     /// encoding. The caller pairs that description with the body it came from.
     fn expr(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
+        if let Some(equal) = self.structural_equality(e) {
+            return equal;
+        }
         match &e.node {
             TypedExprNode::Lit(Lit::Int(n)) => Ok(self.numeral(*n)),
             TypedExprNode::Lit(Lit::Bool(b)) => Ok(if *b {
@@ -836,15 +1204,37 @@ impl<'a> Encode<'a> {
                 let (int, uint) = (self.expr(int)?, self.expr(uint)?);
                 Ok(self.ctx.eq(int, uint))
             }
-            // A name, or a field read through one: both address a leaf of the value
-            // the root denotes, and the path is what names that leaf. An `Apply`
-            // that is not a projection chain addresses no leaf and falls through.
+            // Which constructor built a nominal value: its tag ("Nominal values").
+            TypedExprNode::Apply { function, argument }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::CtorIs(_))) =>
+            {
+                let TypedExprNode::Builtin(Builtin::CtorIs(c)) = &function.node else {
+                    unreachable!("the guard matched `ctor_is`")
+                };
+                // A constructor term states which constructor built it.
+                if let TypedExprNode::NominalCtor { ctor, .. } = &argument.node {
+                    return Ok(if *ctor == c.ctor {
+                        self.ctx.true_()
+                    } else {
+                        self.ctx.false_()
+                    });
+                }
+                let value = Path::of(argument).ok_or_else(|| unencodable(e))?;
+                let value = self.reroot(value);
+                let tag = self.tag(value)?;
+                Ok(self.ctx.eq(tag, self.ctx.numeral(c.index())))
+            }
+            // A name, or a read through one: a field, a position or a constructor's payload.
+            // Each addresses a leaf of the value the root denotes, and the path is what names
+            // that leaf. An `Apply` that is not such a chain addresses no leaf and falls
+            // through.
             TypedExprNode::Var(_) | TypedExprNode::Apply { .. } => match Path::of(e) {
                 Some(path) => self.leaf(path, &e.ty),
                 None => Err(unencodable(e)),
             },
-            TypedExprNode::UnaryOp(op, operand) => {
-                let operand = self.expr(operand)?;
+            TypedExprNode::UnaryOp(op, inner) => {
+                let operand = self.expr(inner)?;
+                self.settled_operand(e, inner, operand)?;
                 // `^not` computes what `not` computes, as a binary `^` sibling does.
                 Ok(match op.unrefined() {
                     UnaryOpKind::Neg => self.ctx.negate(operand),
@@ -854,9 +1244,153 @@ impl<'a> Encode<'a> {
             }
             TypedExprNode::BinOp { left, op, right } => {
                 let (l, r) = (self.expr(left)?, self.expr(right)?);
+                // Equality is the one operation an uninterpreted sort has; the cross-sort
+                // check below rejects comparing it with any other sort.
+                if !matches!(
+                    op.unrefined(),
+                    BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals)
+                ) {
+                    self.settled_operand(e, left, l)?;
+                    self.settled_operand(e, right, r)?;
+                }
+                if let BinOpKind::Compare(_) = op.unrefined()
+                    && let (Some(ls), Some(rs)) =
+                        (self.smt_sort_of(left, l), self.smt_sort_of(right, r))
+                    && ls != rs
+                {
+                    return Err(format!(
+                        "{} compares an SMT {ls:?} with an SMT {rs:?}",
+                        symbolic(e)
+                    ));
+                }
                 self.binop(*op, left, right, l, r)
             }
             _ => Err(unencodable(e)),
+        }
+    }
+
+    /// `𝑙 == 𝑟` or `𝑙 != 𝑟` for two paths to a product or a nominal value, which have no
+    /// sort: equal reads at every leaf ([`Encode::paths_equal`]). `None` for any other term.
+    fn structural_equality(&mut self, e: &TypedExpr) -> Option<Result<SExpr, String>> {
+        let TypedExprNode::BinOp { left, op, right } = &e.node else {
+            return None;
+        };
+        let negated = match op.unrefined() {
+            BinOpKind::Compare(CompareKind::Equals) => false,
+            BinOpKind::Compare(CompareKind::NotEquals) => true,
+            _ => return None,
+        };
+        let (l, r) = (Path::of(left)?, Path::of(right)?);
+        let (l, r) = (self.reroot(l), self.reroot(r));
+        let ty = self.path_type(&l).or_else(|| self.path_type(&r))?;
+        if !matches!(
+            ty.peel_refinements(),
+            Type::Record(_) | Type::Tuple(_) | Type::Nominal(..)
+        ) {
+            return None;
+        }
+        Some(self.paths_equal(&l, &r, &ty).map(
+            |equal| {
+                if negated { self.ctx.not(equal) } else { equal }
+            },
+        ))
+    }
+
+    /// That the values at the paths `l` and `r`, both of type `ty`, are equal: a product's
+    /// components pairwise, a nominal value's tags and, under each tag, that constructor's
+    /// payloads, and a scalar's constants. Lowering refuses a declaration that reaches itself
+    /// through its constructors, so the recursion ends.
+    fn paths_equal(&mut self, l: &Path, r: &Path, ty: &Type) -> Result<SExpr, String> {
+        let components: Vec<(Key, Type)> = match ty.peel_refinements() {
+            Type::Record(fields) => fields
+                .iter()
+                .map(|(name, ty)| (Key::Proj(ProjKey::Field(name.clone())), ty.clone()))
+                .collect(),
+            Type::Tuple(elems) => elems
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| (Key::Proj(ProjKey::Index(i)), ty.clone()))
+                .collect(),
+            Type::Nominal(decl, args) => {
+                let (lt, rt) = (self.tag(l.clone())?, self.tag(r.clone())?);
+                let mut conjuncts = vec![self.ctx.eq(lt, rt)];
+                for (position, ctor) in decl.body().ctors.iter().enumerate() {
+                    if ctor.params.is_empty() {
+                        continue;
+                    }
+                    let key = Key::Payload(ctor.name.clone());
+                    let payload = decl.instantiate(&ctor.destructured(), args);
+                    let equal = self.paths_equal(&l.then(key.clone()), &r.then(key), &payload)?;
+                    let built = self.ctx.eq(lt, self.ctx.numeral(position));
+                    conjuncts.push(self.ctx.imp(built, equal));
+                }
+                return Ok(self.ctx.and_many(conjuncts));
+            }
+            // Each leaf takes its sort from its own path, so an unsolved variable on one side
+            // can sort a leaf whose counterpart is settled.
+            _ => {
+                let (lv, rv) = (self.leaf_at(l.clone(), ty)?, self.leaf_at(r.clone(), ty)?);
+                let (ls, rs) = (&self.constant_sorts[&lv], &self.constant_sorts[&rv]);
+                if ls != rs {
+                    return Err(format!(
+                        "{l} == {r} compares an SMT {ls:?} with an SMT {rs:?}"
+                    ));
+                }
+                return Ok(self.ctx.eq(lv, rv));
+            }
+        };
+        let mut conjuncts = vec![self.ctx.true_()];
+        for (key, ty) in components {
+            conjuncts.push(self.paths_equal(&l.then(key.clone()), &r.then(key), &ty)?);
+        }
+        Ok(self.ctx.and_many(conjuncts))
+    }
+
+    /// `Err` when `operand`, encoded as `encoded`, is a value of an unsolved variable's
+    /// uninterpreted sort, which `term` orders, computes with or reads as a proposition.
+    fn settled_operand(
+        &self,
+        term: &TypedExpr,
+        operand: &TypedExpr,
+        encoded: SExpr,
+    ) -> Result<(), String> {
+        match self.smt_sort_of(operand, encoded) {
+            Some(SmtSort::Uninterpreted(_)) => Err(format!(
+                "{} reads {}, whose type is unsolved, as more than a value with equality",
+                symbolic(term),
+                symbolic(operand)
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Encode::expr`] for a term in a proposition's position: a refinement body or an
+    /// operand of a logical connective.
+    fn proposition(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
+        let encoded = self.expr(e)?;
+        self.settled_operand(e, e, encoded)?;
+        Ok(encoded)
+    }
+
+    /// The SMT sort of `encoded`, the encoding of `e`, where it is known: a declared constant's,
+    /// or a literal's or an operator's.
+    fn smt_sort_of(&self, e: &TypedExpr, encoded: SExpr) -> Option<SmtSort> {
+        if let Some(sort) = self.constant_sorts.get(&encoded) {
+            return Some(sort.clone());
+        }
+        match &e.node {
+            TypedExprNode::Lit(Lit::Int(_)) => Some(SmtSort::Int),
+            TypedExprNode::Lit(Lit::Bool(_)) => Some(SmtSort::Bool),
+            TypedExprNode::UnaryOp(op, _) => Some(match op.unrefined() {
+                UnaryOpKind::Neg => SmtSort::Int,
+                _ => SmtSort::Bool,
+            }),
+            TypedExprNode::BinOp { op, .. } => match op.unrefined() {
+                BinOpKind::Arithmetic(_) => Some(SmtSort::Int),
+                BinOpKind::Compare(_) | BinOpKind::BoolLogic(_) => Some(SmtSort::Bool),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -933,13 +1467,27 @@ impl<'a> Encode<'a> {
     /// often an unresolved variable. A path type with no sort falls
     /// back to the slot and assumes nothing, on the same footing as a path nothing
     /// settles: declaring the leaf is what the surrounding predicate needs, and the
-    /// assumption is the part that can be dropped.
+    /// assumption is the part that can be dropped. A path type that is an unsolved
+    /// variable falls back the same way when the slot is settled, since the slot's sort
+    /// says more than an uninterpreted one; when neither is settled, the path's
+    /// variable gives the leaf its sort ([`Sort::Uninterpreted`]).
     fn leaf(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
         let path = self.reroot(path);
+        self.leaf_at(path, ty)
+    }
+
+    /// [`Encode::leaf`] for a path already in the query's frame ([`Encode::reroot`]).
+    fn leaf_at(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
         if let Some(e) = self.vars.get(&path) {
             return Ok(*e);
         }
-        match self.path_type(&path).and_then(|bound| self.sort(&bound)) {
+        let settled = |sort: &Sort| !matches!(sort, Sort::Uninterpreted(_));
+        let path_sort = self.path_type(&path).and_then(|bound| self.sort(&bound));
+        let path_sort = match path_sort {
+            Some(sort) if !settled(&sort) && self.sort(ty).is_some_and(|s| settled(&s)) => None,
+            other => other,
+        };
+        match path_sort {
             Some(sort) => {
                 // Declared before the types along the path are read, so a scope
                 // whose binders reference each other terminates rather than
@@ -1008,11 +1556,32 @@ impl<'a> Encode<'a> {
     /// The symbol is positional rather than the path's spelling: a [`Name`]'s
     /// identity is not its spelling (two `Unique`s share a `base`), and a spelling
     /// need not be a legal SMT-LIB symbol.
+    ///
+    /// A constant on a path through a constructor's payload is in its sort only under that
+    /// constructor's tag ("Nominal values"), so its sort constraint joins `Γ` guarded.
     fn declare(&mut self, path: Path, sort: Sort) -> SExpr {
-        let sym = format!("v!{}", self.decls.len());
-        let e = self.ctx.atom(sym.as_str());
-        self.decls.push((sym, sort));
-        self.vars.insert(path, e);
+        let symbol = format!("v!{}", self.decls.len());
+        let e = self.ctx.atom(symbol.as_str());
+        let constrained = !path.keys.iter().any(|k| matches!(k, Key::Payload(_)));
+        let membership = sort.membership(e, self.ctx);
+        self.decls.push(Decl {
+            symbol,
+            sort,
+            constrained,
+        });
+        self.vars.insert(path.clone(), e);
+        self.constant_sorts.insert(
+            e,
+            SmtSort::of(&self.decls.last().expect("pushed above").sort),
+        );
+        // A path through a payload always has a guard; one with no encoding leaves the
+        // constant outside its sort rather than asserting membership bare.
+        if !constrained
+            && let Some(membership) = membership
+            && let Ok(Some(guard)) = self.payload_guard(&path)
+        {
+            self.assumptions.push(self.ctx.imp(guard, membership));
+        }
         e
     }
 }
@@ -1257,40 +1826,106 @@ mod tests {
         );
     }
 
-    /// The encoder does not typecheck what it sends, so a `String` base under an
-    /// integer comparison reaches the solver and comes back as a reply the
-    /// exchange cannot use. The claim is the variant — a misencoding on this side
-    /// rather than a verdict — and not the solver's wording, which is z3's to
-    /// change.
+    /// A comparison of a `String` with an integer has no encoding: the encoder refuses operands
+    /// of two SMT sorts rather than sending the solver a query it rejects.
     #[test]
-    fn the_solver_will_error_on_type_errors() {
+    fn a_comparison_across_sorts_is_not_encoded() {
         let refs = [elem_cmp(CompareKind::Equals, lit(5))];
         let err = smt_sub(&Type::Base(BaseType::String), &refs, &refs, &NoScope).unwrap_err();
         assert!(
-            matches!(&err, SmtError::SolverError { .. }),
-            "expected a SolverError, got: {err:?}"
+            matches!(&err, SmtError::Encoding { .. }),
+            "expected an encoding error, got: {err:?}"
         );
     }
 
-    /// A term the encoding does not cover bails the whole query, including the
-    /// conjuncts around it that would have sufficed on their own, and names the
-    /// body it came from rather than the query.
+    /// `__elem ⊙ x`, both at the unsolved variable `var`.
+    fn unsolved_cmp(var: &Type, op: CompareKind) -> Refinement {
+        Refinement::born(Rc::new(
+            TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(var.clone()),
+                BinOpKind::Compare(op),
+                TypedExpr::var(Name::raw("x")).with_ty(var.clone()),
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        ))
+    }
+
+    /// A value of an unsolved variable's type encodes at an uninterpreted sort, where
+    /// equality is decided.
+    #[test]
+    fn an_unsolved_variable_has_equality() {
+        let var = Type::Infer(crate::ccl::InferVar::fresh(1));
+        let scope = scoped("x", var.clone());
+        let equal = [unsolved_cmp(&var, CompareKind::Equals)];
+        let unequal = [unsolved_cmp(&var, CompareKind::NotEquals)];
+        assert!(smt_sub(&var, &equal, &equal, &scope).unwrap());
+        assert!(!smt_sub(&var, &equal, &unequal, &scope).unwrap());
+    }
+
+    /// An uninterpreted sort has no order, and no value of it compares with an `Int`.
+    #[test]
+    fn an_unsolved_variable_has_no_order_and_no_integer() {
+        let var = Type::Infer(crate::ccl::InferVar::fresh(1));
+        let scope = scoped("x", var.clone());
+        let ordered = [unsolved_cmp(&var, CompareKind::Less)];
+        let err = smt_sub(&var, &[], &ordered, &scope).unwrap_err();
+        assert!(
+            matches!(&err, SmtError::Encoding { .. }),
+            "expected an encoding error, got: {err:?}"
+        );
+        let integer = [Refinement::born(Rc::new(
+            TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(var.clone()),
+                BinOpKind::Compare(CompareKind::Equals),
+                lit(3),
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        ))];
+        let err = smt_sub(&var, &[], &integer, &scope).unwrap_err();
+        assert!(
+            matches!(&err, SmtError::Encoding { .. }),
+            "expected an encoding error, got: {err:?}"
+        );
+    }
+
+    /// A goal term the encoding does not cover bails the whole query, and names the body it
+    /// came from rather than the query.
     #[test]
     fn an_unencodable_term_is_not_an_answer() {
+        let opaque = TypedExpr::lit(Lit::String("s".into())).with_ty(Type::Base(BaseType::String));
+        let rhs = [
+            elem_cmp(CompareKind::GreaterOrEq, lit(1)),
+            elem_cmp(CompareKind::Equals, opaque),
+        ];
+        match smt_sub(
+            &int(),
+            &[elem_cmp(CompareKind::Equals, lit(5))],
+            &rhs,
+            &NoScope,
+        ) {
+            Err(SmtError::Encoding { body, .. }) => assert_eq!(body, rhs[1]),
+            other => panic!("expected an encoding error: {other:?}"),
+        }
+    }
+
+    /// An antecedent atom the encoding does not cover is a fresh `Bool`, so the conjuncts
+    /// around it still decide the query.
+    #[test]
+    fn an_unencodable_antecedent_atom_is_abstracted() {
         let opaque = TypedExpr::lit(Lit::String("s".into())).with_ty(Type::Base(BaseType::String));
         let lhs = [
             elem_cmp(CompareKind::Equals, lit(5)),
             elem_cmp(CompareKind::Equals, opaque),
         ];
-        match smt_sub(
-            &int(),
-            &lhs,
-            &[elem_cmp(CompareKind::GreaterOrEq, lit(1))],
-            &NoScope,
-        ) {
-            Err(SmtError::Encoding { body, .. }) => assert_eq!(body, lhs[1]),
-            other => panic!("expected an encoding error: {other:?}"),
-        }
+        let goal = |n| [elem_cmp(CompareKind::GreaterOrEq, lit(n))];
+        assert!(matches!(
+            smt_sub(&int(), &lhs, &goal(1), &NoScope),
+            Ok(true)
+        ));
+        assert!(matches!(
+            smt_sub(&int(), &lhs, &goal(6), &NoScope),
+            Ok(false)
+        ));
     }
 
     /// An operator outside the fragment reports the term it sits in. `//` is
@@ -1303,11 +1938,10 @@ mod tests {
             lit(2),
         )
         .with_ty(int());
-        let lhs = [elem_cmp(CompareKind::Equals, quotient)];
         let err = smt_sub(
             &int(),
-            &lhs,
             &[elem_cmp(CompareKind::GreaterOrEq, lit(0))],
+            &[elem_cmp(CompareKind::Equals, quotient)],
             &NoScope,
         )
         .unwrap_err();

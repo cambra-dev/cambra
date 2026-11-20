@@ -543,6 +543,11 @@ pub enum TypedExprNode {
         scrutinee: Option<Box<TypedExpr>>,
         /// Ordered list of branches.
         branches: Vec<Branch>,
+        /// The tags of the constructors that no arm names and that inference proved the
+        /// scrutinee never carries (`src/ccl/design/type-inference.md`, "Unreachable arms").
+        /// Empty for a `Case` whose arms name no constructors. A refinement-blind check, and
+        /// lambda elimination's coverage assertion, read this set in place of a proof.
+        refuted: Vec<Label>,
     },
 
     /// `raise value`: the exception `value`, which ends the path it stands on
@@ -2043,6 +2048,7 @@ impl TypedExpr {
         Self::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(scrutinee)),
             branches,
+            refuted: Vec::new(),
         })
     }
 }
@@ -2146,6 +2152,7 @@ impl TypedExpr {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } => {
                 if let Some(s) = scrutinee {
                     f(s.as_ref());
@@ -2363,6 +2370,7 @@ impl TypedExpr {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
+                ..
             } => {
                 if let Some(s) = scrutinee {
                     f(s.as_mut());

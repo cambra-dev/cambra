@@ -6812,6 +6812,7 @@ mod variant_ctor_tests {
                     guard: bool_true(),
                     body: arm_body,
                 }],
+                refuted: Vec::new(),
             },
             out_rec_ty.clone(),
         );
@@ -6958,6 +6959,7 @@ mod variant_ctor_tests {
                         body: abort_body,
                     },
                 ],
+                refuted: Vec::new(),
             },
             variant_ty.clone(),
         );
