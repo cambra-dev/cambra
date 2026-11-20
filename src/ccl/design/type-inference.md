@@ -2871,7 +2871,9 @@ resolutions, would never match.
 
 `opaque_output::run` leaves a lambda unwrapped in two cases. Its body binds no opaque variable, or
 its body is `let 𝑦 : 𝑇 = body in 𝑦` with a concrete user annotation `𝑇`, the lowering of a `=> 𝑇`
-output annotation. A concrete annotation holds no `_`, inference variable, or barrier variable at
+output annotation. A-normalization peels the temporaries `body` hoists onto the spine ahead of that
+`let`, and `opaque_output::annotated_result` recognizes it behind them; `𝑇` names none of them. A
+concrete annotation holds no `_`, inference variable, or barrier variable at
 any depth. An annotation holding one leaves part of the codomain to inference, so the lambda is
 wrapped around the annotated `let` (`dont_discharge_opaques_out_of_fun_bodies_with_a_hole_codomain`
 in `tests/it/compilation_pipeline/type_annotations.rs`). An annotated `let` with any other

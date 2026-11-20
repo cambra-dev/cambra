@@ -19,10 +19,12 @@
 //!
 //! - **Its body is an annotated `let` whose continuation is its own binder and
 //!   whose annotation is concrete**, `let 𝑦 : 𝑇 = body in 𝑦` where `𝑇` holds no
-//!   position left to inference: a `=> 𝑇` output annotation's lowering. `𝑇`
-//!   states the whole type the result is read at. An annotation holding a `_`
-//!   leaves part of that type to inference, which can read an opaque binder
-//!   into it, so the lambda is wrapped around the annotated `let`. An annotated
+//!   position left to inference: a `=> 𝑇` output annotation's lowering, found
+//!   behind the temporaries [`crate::ccl::anf`] peels ahead of it
+//!   ([`annotated_result`]). `𝑇` states the whole type the result is read at.
+//!   An annotation holding a `_` leaves part of that type to inference, which
+//!   can read an opaque binder into it, so the lambda is wrapped around the
+//!   annotated `let`. An annotated
 //!   `let` with any other continuation annotates only its definiens, so the
 //!   lambda is wrapped.
 //! - **Its body binds no opaque variable.** The search stops at a nested lambda,
@@ -68,9 +70,9 @@ fn rewrite(mut expr: Expr) -> Expr {
 /// [`OUTPUT_BINDER`](crate::ccl::lower::OUTPUT_BINDER), to [`Name::output`], so a lambda's
 /// result is read through one binder whichever bound it, and [`output_body`] reads both.
 fn adopt_lowered_result(body: &mut Expr) {
-    if !is_annotated_result(body) {
+    let Some(body) = annotated_result_mut(body) else {
         return;
-    }
+    };
     let TypedExprNode::Let {
         binding,
         body: tail,
@@ -91,24 +93,54 @@ fn adopt_lowered_result(body: &mut Expr) {
     *read = output;
 }
 
-/// Whether `expr` is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇`.
+/// The `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇` that `expr` ends in
+/// after a run of [ANF temporaries](Name::is_anf_temp), or `None` when `expr`
+/// has no such shape.
 ///
-/// [`crate::ccl::anf`] keeps this shape at a lambda's tail, which is what lets
-/// this pass find a `=> 𝑇` annotation there.
-pub fn is_annotated_result(expr: &Expr) -> bool {
-    matches!(
-        &expr.node,
-        TypedExprNode::Let { binding, body, .. }
-            if binding.user_annotation.is_some()
-                && matches!(&body.node, TypedExprNode::Var(n) if *n == binding.name)
-    )
+/// A `=> 𝑇` output annotation lowers to this `let` as the outermost term of a
+/// lambda body, and [`crate::ccl::anf`] peels the temporaries its definiens
+/// hoists onto the spine ahead of it. `𝑇` was written before those temporaries
+/// existed, so it names none of them, and the lambda's result is read at `𝑇`
+/// with or without them in scope.
+pub fn annotated_result(mut expr: &Expr) -> Option<&Expr> {
+    loop {
+        match &expr.node {
+            TypedExprNode::Let { binding, body, .. } if binding.name.is_anf_temp() => expr = body,
+            TypedExprNode::Let { binding, body, .. }
+                if binding.user_annotation.is_some()
+                    && matches!(&body.node, TypedExprNode::Var(n) if *n == binding.name) =>
+            {
+                return Some(expr);
+            }
+            _ => return None,
+        }
+    }
 }
 
-/// Whether `expr` is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇` that
-/// holds no position left to inference.
+/// [`annotated_result`] by mutable reference.
+pub fn annotated_result_mut(expr: &mut Expr) -> Option<&mut Expr> {
+    let mut expr = expr;
+    while let TypedExprNode::Let { binding, .. } = &expr.node
+        && binding.name.is_anf_temp()
+    {
+        let TypedExprNode::Let { body, .. } = &mut expr.node else {
+            unreachable!("matched immediately above")
+        };
+        expr = body;
+    }
+    annotated_result(expr).is_some().then_some(expr)
+}
+
+/// Whether `expr` ends in an annotated result ([`annotated_result`]).
+pub fn is_annotated_result(expr: &Expr) -> bool {
+    annotated_result(expr).is_some()
+}
+
+/// Whether `expr` ends in an annotated result ([`annotated_result`]) whose
+/// annotation holds no position left to inference.
 fn has_concrete_result_annotation(expr: &Expr) -> bool {
-    match &expr.node {
-        TypedExprNode::Let { binding, .. } if is_annotated_result(expr) => {
+    match annotated_result(expr).map(|e| &e.node) {
+        Some(TypedExprNode::Let { binding, .. }) => {
             binding.annotation_ty().is_some_and(is_concrete)
         }
         _ => false,

@@ -2754,3 +2754,45 @@ f(Option::some(1)) == f(Option::none)
         "Type mismatch for this call: expected {Option(Int) where not _.is_none()}, found {Option(",
     )
 }
+
+#[test]
+fn anf_puts_lets_on_the_spine() {
+    check_scalar(
+        indoc! {r#"
+f = \x -> x ^+ x
+v: {Int where _ == 6} = f(1) ^+ f(2)
+v
+        "#},
+        Value::Int(6),
+    )
+}
+
+/// A function body's annotated `let` is peeled like the program's: the hoisted calls are in scope
+/// at the annotation's check with their own refined types.
+#[test]
+fn anf_puts_lets_on_the_spine_in_a_function_body() {
+    check_scalar(
+        indoc! {r#"
+f = \x -> x ^+ x
+def g(y: Int):
+    v: {Int where _ == 6} = f(1) ^+ f(2)
+    v
+g(0)
+        "#},
+        Value::Int(6),
+    )
+}
+
+/// An output annotation is checked with the hoisted calls ahead of it on the spine.
+#[test]
+fn anf_puts_lets_on_the_spine_ahead_of_an_output_annotation() {
+    check_scalar(
+        indoc! {r#"
+f = \x -> x ^+ x
+def g(y: Int) => {Int where _ == 6}:
+    f(1) ^+ f(2)
+g(0)
+        "#},
+        Value::Int(6),
+    )
+}

@@ -60,14 +60,17 @@
 //! copies its definition into the type. So every chain is peeled and re-sealed
 //! one level out.
 //!
-//! **An annotated result keeps its chain in its definiens.** In `let 𝑦 : 𝑇 =
-//! body in 𝑦`, the shape a `=> 𝑇` output annotation lowers to, the binder is
-//! bound at `𝑇` rather than at its definiens, so no type names a binder sealed
-//! inside `body` and nothing needs peeling. Peeling would also move the chain
-//! ahead of the annotation, and [`crate::ccl::opaque_output`] recognizes the
-//! annotation only as the outermost term of a lambda body
-//! ([`crate::ccl::opaque_output::is_annotated_result`]). The `Lambda` arm of
-//! [`normalize`] asserts the shape survives.
+//! **An annotated `let` is peeled too.** Inference checks an annotation `𝑇`
+//! against its definiens's type. A transparent binder left in the definiens is
+//! discharged into that type, so a hoisted call `1 ▷ 𝑓` reaches the check as a
+//! term the solver reads nothing from. Peeled onto the spine, the binder is in
+//! scope at the check with its own refined type. A `=> 𝑇` output annotation
+//! lowers to `let 𝑦 : 𝑇 = body in 𝑦` as the outermost term of a lambda body,
+//! and is peeled the same way. `𝑇` names none of the temporaries peeled ahead of
+//! it, so moving them changes no type, and
+//! [`crate::ccl::opaque_output::annotated_result`] recognizes the annotation
+//! behind them. The `Lambda` arm of [`normalize_node`] asserts the shape
+//! survives.
 //!
 //! A **handle** position holds the variable rather than its value, so the
 //! mention there is not a read and stays where it stands
@@ -456,11 +459,9 @@ fn rebuilt_as(
 
 /// [`normalize`] of a `let`. A read sealed in the definiens moves ahead of the `let`
 /// ([`peel`]): the binding's type is refined by its definiens, and a read binder sealed inside
-/// it is opaque, so the type would name a binder out of scope at every use. An annotated
-/// result is bound at its annotation, so its chain stays in the definiens (module docs).
+/// it is opaque, so the type would name a binder out of scope at every use.
 fn normalize_let(e: Expr, muts: &Muts) -> Expr {
     let id = e.node_id();
-    let annotated_result = is_annotated_result(&e);
     let Expr {
         node:
             TypedExprNode::Let {
@@ -477,11 +478,7 @@ fn normalize_let(e: Expr, muts: &Muts) -> Expr {
         unreachable!("`normalize` dispatches only a `let` here")
     };
     let bound_expr = normalize(*bound_expr, muts);
-    let (binds, bound_expr) = if annotated_result {
-        (Vec::new(), bound_expr)
-    } else {
-        peel(bound_expr)
-    };
+    let (binds, bound_expr) = peel(bound_expr);
     let body = normalize(*body, muts);
     let_chain(
         binds,
@@ -629,8 +626,8 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             let body = normalize(*body, &inner);
             debug_assert!(
                 !annotated || is_annotated_result(&body),
-                "anf: a lambda body's output annotation must stay its outermost term, \
-                 got a {}",
+                "anf: a lambda body's output annotation must stay its outermost term \
+                 after the temporaries peeled ahead of it, got a {}",
                 body.node.kind_name()
             );
             rebuild(TypedExprNode::Lambda {
@@ -1598,10 +1595,10 @@ mod tests {
     }
 
     /// `λ p → let y : Int = (x, x ▷ f) in y`: the read of `x` is named ahead of
-    /// the call inside `y`'s definiens, and the annotated `let` stays the
-    /// lambda body's outermost term.
+    /// the call, both are peeled onto the spine ahead of `y`, and the annotated
+    /// `let` is the lambda body's term after them.
     #[test]
-    fn a_read_stays_inside_an_annotated_result() {
+    fn a_read_is_peeled_ahead_of_an_annotated_result() {
         let x = Name::fresh("x");
         let y = Name::fresh("y");
         let call = Expr::apply(Expr::var(x.clone()), var("f"));
@@ -1626,16 +1623,19 @@ mod tests {
         };
         assert!(
             is_annotated_result(body),
-            "the annotation stays outermost: {}",
+            "the annotation follows the peeled temporaries: {}",
             symbolic(body)
         );
-        let TypedExprNode::Let { bound_expr, .. } = &body.node else {
-            unreachable!("an annotated result is a Let")
-        };
-        let s = symbolic(bound_expr);
+        let s = symbolic(body);
+        let annotated =
+            crate::ccl::opaque_output::annotated_result(body).expect("the annotated let survives");
+        assert!(
+            symbolic(annotated).starts_with("let y = (__anf, __anf)"),
+            "the definiens is atomic: {s}"
+        );
         assert!(
             s.contains("__anf = x") && s.find("= x").unwrap() < s.find("▷ f").unwrap(),
-            "the read is named ahead of the call, inside the definiens: {s}"
+            "the read is named ahead of the call, both ahead of the annotation: {s}"
         );
     }
 
