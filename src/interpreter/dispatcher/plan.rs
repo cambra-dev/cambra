@@ -9,6 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
+use super::partitioned::Partitioned;
 use super::workers::{Claimed, WorkerPool};
 use super::*;
 use crate::ccl::context::CompiledProgram;
@@ -915,15 +916,21 @@ fn run_targets(
                     && reads_open_input(&mut reach, PipelineId(p)))
         })
         .collect();
+    // Each pipeline queued reads again shares an exclusion domain with every pipeline it reads,
+    // transitively, so no read of it is in flight while a pipeline beneath it lands a change.
+    let mut domains = ExclusionDomains::singletons(serial_only.len());
     let mut beneath: Vec<usize> = (0..serial_only.len()).filter(|&p| serial_only[p]).collect();
     while let Some(p) = beneath.pop() {
         for &read in &dispatcher.infos[p].reads {
+            domains.join(p, read);
             if !serial_only[read] {
                 serial_only[read] = true;
                 beneath.push(read);
             }
         }
     }
+    execution.join_scopes(&mut domains);
+    let serial_only_count = serial_only.len();
     let worker_targets = worker_targets
         .into_iter()
         .zip(serial_only)
@@ -933,9 +940,48 @@ fn run_targets(
         })
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
-    let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
+    let partitioned = Partitioned::new(worker_targets, execution.bodies_by_pipeline());
+    // With one thread nothing runs at once, and the coordinator consumes every package as serial
+    // work.
+    let parallel: Vec<bool> = (0..serial_only_count)
+        .map(|p| workers > 1 && partitioned.has(PipelineId(p)))
+        .collect();
+    // A pipeline that is not partitioned shares a domain with every pipeline it reads: its consume
+    // reads what their claims are still changing, and the input it releases counts on none of them
+    // running beside it. A partitioned pipeline's packages hold no domain, and its finish is
+    // claimable only once every pipeline it reads has finished.
+    for (pipeline, &parallel) in parallel.iter().enumerate() {
+        if !parallel {
+            for read in dispatcher.infos[pipeline].reads.clone() {
+                domains.join(pipeline, read);
+            }
+        }
+    }
+    // A pipeline that follows another waits for it to be quiescent before it takes a package, and
+    // the pipelines a live source delivers to take each delivery in pipeline order: neither
+    // ordering is a read, so each joins its pipelines' domains.
+    for pipeline in 0..parallel.len() {
+        for follow in dispatcher.infos[pipeline].follows.clone() {
+            domains.join(pipeline, follow);
+        }
+    }
+    let delivered: Vec<usize> = live
+        .iter()
+        .map(|at| at.pipeline.0)
+        .chain((0..parallel.len()).filter(|&p| dispatcher.infos[p].arrivals))
+        .collect();
+    for pair in delivered.windows(2) {
+        domains.join(pair[0], pair[1]);
+    }
+    // With one thread no two claims run at once, so the claims hold no domain.
+    if workers > 1 {
+        let d = domains.done();
+        dispatcher.set_domains(&d, &parallel);
+    }
+    let workers = WorkerPool::new(workers);
+    let coordinator_index = workers.coordinator();
     let done = thread::scope(|scope| {
-        let threads = workers.spawn(scope, &dispatcher, &execution, root_reach);
+        let threads = workers.spawn(scope, &dispatcher, &execution, &partitioned, root_reach);
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
         // coordinator can go on to panic over the state the worker left.
         let coordinator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -943,9 +989,8 @@ fn run_targets(
             let _coordinator = dispatcher.worker();
             in_a_run(|| {
                 // A range over a static extent has completed every key from the start. Its
-                // landing is the run's control, which runs under the serial lock: the workers
-                // already claim serial work.
-                let serial = workers.serial();
+                // landing is the run's control: the workers already claim serial work.
+                let control = dispatcher.begin_control();
                 for (pipeline, ranges) in members.leaves.iter().enumerate() {
                     for (range, _) in ranges {
                         dispatcher.land_range_complete(
@@ -955,17 +1000,18 @@ fn run_targets(
                         );
                     }
                 }
-                drop(serial);
+                drop(control);
                 match live.is_empty() {
                     true => {
-                        execution.drive(&dispatcher, &mut reach, &workers);
+                        execution.drive(&dispatcher, &mut reach, &partitioned, coordinator_index);
                         true
                     }
                     false => drive_live(
                         &dispatcher,
                         &mut reach,
                         &execution,
-                        &workers,
+                        &partitioned,
+                        coordinator_index,
                         &mut live,
                         observer,
                     ),
@@ -984,8 +1030,7 @@ fn run_targets(
         done
     });
     #[cfg(test)]
-    workers.report(&mut planned, &execution.owners());
-    drop(workers);
+    partitioned.report(&mut planned, &execution.owners());
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
     // complete by each of its sources all that a push of the source's every key lands as at its
     // entry. A run that pauses stops at a drained boundary before its end, and checks nothing.
@@ -1434,6 +1479,36 @@ impl Execution {
         bodies
     }
 
+    /// Put each scope's request, step and body in one exclusion domain, and the scopes of one
+    /// store in one: their serial claims take the store's blocking `write`, and a round's request,
+    /// step and finish follow each other in the scope's state, which no other lock orders.
+    fn join_scopes(&self, domains: &mut ExclusionDomains) {
+        for (pipelines, step, scope) in &self.bodies {
+            domains.join(scope.0, step.0);
+            for pipeline in pipelines.clone() {
+                domains.join(scope.0, pipeline);
+            }
+        }
+        let stores: Vec<(usize, &StoreCell)> = self
+            .handlers
+            .iter()
+            .enumerate()
+            .filter_map(|(pipeline, handler)| match handler {
+                Handler::Request(Scope::Loop(store) | Scope::Writer { store, .. }) => {
+                    Some((pipeline, store))
+                }
+                _ => None,
+            })
+            .collect();
+        for (i, &(a, store)) in stores.iter().enumerate() {
+            for &(b, other) in &stores[i + 1..] {
+                if Arc::ptr_eq(store, other) {
+                    domains.join(a, b);
+                }
+            }
+        }
+    }
+
     /// Per pipeline, whether it is a scope's step.
     fn steps(&self) -> Vec<bool> {
         self.handlers
@@ -1506,6 +1581,42 @@ impl Execution {
         self.hold_followers(dispatcher);
     }
 
+    /// Run `next`, a claim this thread took: a partitioned pipeline's package through its shared
+    /// breaker, and serial work through the pipeline's handler, ending the serial claim after.
+    /// A package of a partitioned pipeline becomes the thread's `preferred` pipeline, so it takes
+    /// that pipeline's next package first; serial work keeps the claims in pipeline order.
+    pub(super) fn run(
+        &self,
+        dispatcher: &Dispatcher,
+        reach: &mut Reach<'_>,
+        partitioned: &Partitioned,
+        next: Next,
+        preferred: &mut Option<PipelineId>,
+        worker: usize,
+    ) -> Claimed {
+        match next {
+            Next::Package(package) if dispatcher.is_partitioned(package.pipeline) => {
+                *preferred = Some(package.pipeline);
+                partitioned.consume(dispatcher, package, worker);
+            }
+            Next::Package(package) => {
+                *preferred = None;
+                let pipeline = package.pipeline;
+                self.consume(dispatcher, reach, package);
+                dispatcher.end_serial_claim(pipeline, false);
+            }
+            Next::Finish { pipeline, consumed } => {
+                partitioned.finishing(pipeline, reach);
+                self.finish(dispatcher, reach, pipeline, consumed);
+                dispatcher.end_serial_claim(pipeline, true);
+            }
+            Next::Wait(generation) => return Claimed::Wait(generation),
+            Next::Done => return Claimed::Done,
+            Next::Failed => return Claimed::Failed,
+        }
+        Claimed::Ran
+    }
+
     /// Assert what [`RunObserver::drained`] promises: no claim is in flight. A pause discards what
     /// one would leave (`src/interpreter/design-dispatcher.md`, "Pause and reload").
     #[cfg(debug_assertions)]
@@ -1555,8 +1666,14 @@ impl Execution {
         push_held(dispatcher, reach, pipelines);
     }
 
-    fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, workers: &WorkerPool) {
-        let serial = workers.serial();
+    fn drive(
+        &self,
+        dispatcher: &Dispatcher,
+        reach: &mut Reach<'_>,
+        partitioned: &Partitioned,
+        coordinator: usize,
+    ) {
+        let control = dispatcher.begin_control();
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
                 let mut input = None;
@@ -1564,7 +1681,7 @@ impl Execution {
                     input = Some(breaker.input_tiling(at))
                 });
                 let input = input.expect("a planned source has a breaker input");
-                workers.start_source(
+                partitioned.start_source(
                     dispatcher,
                     PipelineId(pipeline),
                     &input,
@@ -1572,16 +1689,26 @@ impl Execution {
                 );
             }
         }
-        drop(serial);
+        drop(control);
         let mut preferred = None;
-        let coordinator = workers.coordinator();
         loop {
-            match workers.run_next(dispatcher, self, reach, &mut preferred, coordinator) {
+            let next = dispatcher.try_claim(preferred);
+            match self.run(
+                dispatcher,
+                reach,
+                partitioned,
+                next,
+                &mut preferred,
+                coordinator,
+            ) {
                 Claimed::Ran => {}
                 Claimed::Wait(generation) => {
-                    let serial = workers.serial();
-                    if workers.may_progress(dispatcher) {
-                        drop(serial);
+                    let control = dispatcher.begin_control();
+                    if dispatcher.serial_claimable(&control) {
+                        continue;
+                    }
+                    if dispatcher.partitioned_may_progress(&control) {
+                        drop(control);
                         dispatcher.wait(generation);
                     } else if !self.resume(dispatcher, reach)
                         && !dispatcher.changed_since(&generation)
@@ -1593,6 +1720,52 @@ impl Execution {
                 Claimed::Done | Claimed::Failed => return,
             }
         }
+    }
+}
+
+/// The run's pipelines partitioned into exclusion domains while planning merges them, as a
+/// union-find: at most one claim of a domain's serial work runs at a time
+/// ([`Dispatcher::set_domains`]). See `src/interpreter/design-dispatcher.md`, "Exclusion domains".
+struct ExclusionDomains {
+    parent: Vec<usize>,
+}
+
+impl ExclusionDomains {
+    /// `pipelines` domains of one pipeline each.
+    fn singletons(pipelines: usize) -> Self {
+        Self {
+            parent: (0..pipelines).collect(),
+        }
+    }
+
+    fn root(&mut self, mut pipeline: usize) -> usize {
+        while self.parent[pipeline] != pipeline {
+            self.parent[pipeline] = self.parent[self.parent[pipeline]];
+            pipeline = self.parent[pipeline];
+        }
+        pipeline
+    }
+
+    /// Put `a` and `b` in one domain.
+    fn join(&mut self, a: usize, b: usize) {
+        let (a, b) = (self.root(a), self.root(b));
+        self.parent[a.max(b)] = a.min(b);
+    }
+
+    /// Per pipeline, its domain, numbered from 0.
+    fn done(mut self) -> Vec<usize> {
+        let mut number = vec![usize::MAX; self.parent.len()];
+        let mut count = 0;
+        (0..self.parent.len())
+            .map(|pipeline| {
+                let root = self.root(pipeline);
+                if number[root] == usize::MAX {
+                    number[root] = count;
+                    count += 1;
+                }
+                number[root]
+            })
+            .collect()
     }
 }
 
@@ -3327,7 +3500,7 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
 
 /// Whether every operator the chain under `breaker` pulls restates the keys of the breaker's
 /// [`Breaker::parallel_level`](crate::interpreter::tile_operators::Breaker::parallel_level). The
-/// worker pool seeds a partitioned pipeline at that level (`WorkerPool::start_source`), and the
+/// run seeds a partitioned pipeline at that level (`Partitioned::start_source`), and the
 /// level answers for the breaker's immediate input only: an operator deeper in the chain can
 /// refuse the keys its consumer restates. `true` for a breaker with no parallel level.
 fn chain_restates_parallel_level(breaker: &BreakerHandle, consuming: &[BreakerHandle]) -> bool {
@@ -3709,11 +3882,12 @@ fn drive_live(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
     execution: &Execution,
-    workers: &WorkerPool,
+    partitioned: &Partitioned,
+    coordinator: usize,
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
-    let serial = workers.serial();
+    let control = dispatcher.begin_control();
     for (pipeline, info) in dispatcher.infos.iter().take(execution.roots).enumerate() {
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
             let mut input = None;
@@ -3727,11 +3901,10 @@ fn drive_live(
     // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
     // and the run has no finish before its sources close, so each pushes what it holds first.
     execution.push_held(dispatcher, reach);
-    drop(serial);
+    drop(control);
     let mut preferred = None;
-    let coordinator = workers.coordinator();
     loop {
-        let serial = workers.serial();
+        let control = dispatcher.begin_control();
         let mut sources: Vec<LiveSource> = Vec::new();
         for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
             leaf.extent.for_each_source(&mut |source| {
@@ -3751,14 +3924,25 @@ fn drive_live(
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, reach);
         }
-        drop(serial);
+        drop(control);
         loop {
-            match workers.run_next(dispatcher, execution, reach, &mut preferred, coordinator) {
+            let next = dispatcher.try_claim(preferred);
+            match execution.run(
+                dispatcher,
+                reach,
+                partitioned,
+                next,
+                &mut preferred,
+                coordinator,
+            ) {
                 Claimed::Ran => {}
                 Claimed::Wait(generation) => {
-                    let serial = workers.serial();
-                    if workers.may_progress(dispatcher) {
-                        drop(serial);
+                    let control = dispatcher.begin_control();
+                    if dispatcher.serial_claimable(&control) {
+                        continue;
+                    }
+                    if dispatcher.partitioned_may_progress(&control) {
+                        drop(control);
                         dispatcher.wait(generation);
                         continue;
                     }
@@ -3811,6 +3995,17 @@ mod tests {
     use crate::interpreter::tile_operators::{
         MemoProducer, ProducerBase, TileProducer, impl_producer_base,
     };
+
+    /// Joins are transitive, the domains are numbered densely in the order of their first
+    /// pipeline, and a pipeline joined to none keeps a domain of its own.
+    #[test]
+    fn exclusion_domains_join_transitively_and_number_densely() {
+        let mut domains = ExclusionDomains::singletons(6);
+        domains.join(4, 1);
+        domains.join(1, 3);
+        domains.join(5, 2);
+        assert_eq!(domains.done(), [0, 1, 2, 1, 1, 2]);
+    }
 
     /// A record range over a source field yields a prefix where that field's yield is every
     /// position at or below one, whatever its other fields hold.

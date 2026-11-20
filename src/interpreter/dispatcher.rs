@@ -36,6 +36,7 @@ use crate::interpreter::{
 };
 
 pub(crate) mod loop_scope;
+mod partitioned;
 mod plan;
 pub(crate) mod transaction_scope;
 mod workers;
@@ -90,6 +91,20 @@ pub enum Next {
 /// The count of the dispatcher's changes that can make a claim succeed, as a claim observed it.
 #[cfg_attr(test, derive(Debug))]
 pub struct Generation(u64);
+
+/// The run's control ([`Dispatcher::begin_control`]): while it lives no serial claim runs.
+pub(crate) struct Control<'a>(&'a Dispatcher);
+
+impl Drop for Control<'_> {
+    fn drop(&mut self) {
+        self.0.controlling.store(false, Ordering::SeqCst);
+        // A claimant the control turned away waits on a generation from before. One that is turned
+        // away records it before it reads the control, so this swap sees what it recorded.
+        if self.0.refused.swap(false, Ordering::SeqCst) {
+            self.0.advance();
+        }
+    }
+}
 
 /// A pipeline's follower hold, read before a publication pass ([`Dispatcher::followers_hold`]).
 pub(crate) struct FollowersHold(u64);
@@ -412,6 +427,12 @@ struct PipelineInfo {
     /// again ([`read_again_on_widened_push`](Dispatcher::read_again_on_widened_push)), and `None`
     /// where it does not.
     whole_input: Option<TileGuard>,
+    /// The exclusion domain its serial work belongs to: every claim of its finish, and of its
+    /// packages unless it is `partitioned`. `None` where it belongs to none, as before
+    /// [`set_domains`](Dispatcher::set_domains).
+    domain: Option<usize>,
+    /// Whether several of its packages run at once, holding no domain.
+    partitioned: bool,
 }
 
 /// What the operators on a push's path have marked it with ([`Landing`]), as a push carries them
@@ -541,6 +562,20 @@ pub struct Dispatcher {
     failed: AtomicBool,
     /// Set by [`Dispatcher::stop_claims`]: every claim answers [`Next::Done`].
     stopped: AtomicBool,
+    /// Per exclusion domain, whether a claim of its serial work holds it
+    /// ([`set_domains`](Dispatcher::set_domains)).
+    busy: Vec<AtomicBool>,
+    /// How many claims hold a domain, or are taking one: the control waits for none.
+    holding: AtomicUsize,
+    /// Set where a claim skipped a domain another claim held. A claim that puts its domain back
+    /// having handed nothing out wakes the claimants where it is set: the one that skipped the
+    /// domain may have skipped a package the holder had passed already.
+    skipped: AtomicBool,
+    /// Set from [`begin_control`](Dispatcher::begin_control) to its end: no claim takes a domain.
+    controlling: AtomicBool,
+    /// Set where a claim found the control set and took no domain: the control's end wakes the
+    /// claimants where it is set.
+    refused: AtomicBool,
     /// Advances at every change that can make a claim succeed or end the run: an append, a close,
     /// an acknowledgement that frees an ordered pipeline's next package, completes a queue or
     /// returns credit to a limited source, a finish, and a failure.
@@ -636,6 +671,8 @@ impl Dispatcher {
                 routes: None,
                 ingress: None,
                 whole_input: None,
+                domain: None,
+                partitioned: false,
             })
             .collect();
         let states = infos
@@ -649,6 +686,11 @@ impl Dispatcher {
             states,
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            busy: Vec::new(),
+            holding: AtomicUsize::new(0),
+            skipped: AtomicBool::new(false),
+            controlling: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             sleepers: AtomicUsize::new(0),
             sleep: Mutex::new(()),
@@ -735,7 +777,13 @@ impl Dispatcher {
             routes: None,
             ingress: None,
             whole_input: None,
+            domain: None,
+            partitioned: false,
         });
+        debug_assert!(
+            self.busy.is_empty(),
+            "pipelines are added before the domains are set"
+        );
         *self.unfinished.get_mut() += 1;
         PipelineId(pipeline)
     }
@@ -1354,7 +1402,7 @@ impl Dispatcher {
     /// are not held.
     ///
     /// Quiescence is read before the hold. A worker holds a body's followers before it
-    /// acknowledges the body's package (`WorkerPool::consume`), so a quiescence that sees the
+    /// acknowledges the body's package (`Partitioned::consume`), so a quiescence that sees the
     /// acknowledgement also sees the hold. Read the other way round, a hold taken between the two
     /// reads goes unseen.
     fn takes_from(&self, pipeline: usize) -> bool {
@@ -1563,10 +1611,10 @@ impl Dispatcher {
             .expect("a pipeline that reads its input again knows its input");
         let queue = &self.states[reader].queue;
         let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // A pipeline that is queued reads again and every pipeline it reads run as serial work,
-        // which claims and runs one package at a time under one lock (`WorkerPool::run_next`), so
-        // a change reaches a reader while no read of that reader is consumed, and two reads of
-        // one open row never run at once.
+        // A pipeline that is queued reads again and every pipeline it reads run as serial work in
+        // one exclusion domain, which runs one claim at a time (`Dispatcher::try_claim`), so a
+        // change reaches a reader while no read of that reader is consumed, and two reads of one
+        // open row never run at once.
         debug_assert!(
             !state
                 .in_flight
@@ -1590,6 +1638,210 @@ impl Dispatcher {
     /// its positions ascending.
     pub fn order(&mut self, pipeline: PipelineId) {
         self.infos[pipeline.0].ordered = true;
+    }
+
+    /// Put each pipeline in the exclusion domain `domain_of` names, numbered from 0, and mark the
+    /// `partitioned` ones. A claim of a domain's serial work holds the domain until
+    /// [`end_serial_claim`](Self::end_serial_claim), and no other claim of it is handed out
+    /// meanwhile; a partitioned pipeline's packages hold none. See
+    /// `src/interpreter/design-dispatcher.md`, "Exclusion domains".
+    ///
+    /// # Panics
+    ///
+    /// When `domain_of` or `partitioned` does not name every pipeline.
+    pub(crate) fn set_domains(&mut self, domain_of: &[usize], partitioned: &[bool]) {
+        assert_eq!(
+            domain_of.len(),
+            self.infos.len(),
+            "every pipeline has a domain"
+        );
+        assert_eq!(
+            partitioned.len(),
+            self.infos.len(),
+            "every pipeline is or is not partitioned"
+        );
+        for (info, (&domain, &partitioned)) in
+            self.infos.iter_mut().zip(domain_of.iter().zip(partitioned))
+        {
+            info.domain = Some(domain);
+            info.partitioned = partitioned;
+        }
+        let count = domain_of.iter().max().map_or(0, |&max| max + 1);
+        self.busy = (0..count).map(|_| AtomicBool::new(false)).collect();
+    }
+
+    /// Whether several packages of `pipeline` run at once, holding no domain.
+    pub(crate) fn is_partitioned(&self, pipeline: PipelineId) -> bool {
+        self.infos[pipeline.0].partitioned
+    }
+
+    /// The domain a claim of `pipeline`'s package, or of its finish where `finish`, holds.
+    fn domain_of_claim(&self, pipeline: usize, finish: bool) -> Option<usize> {
+        let info = &self.infos[pipeline];
+        info.domain.filter(|_| finish || !info.partitioned)
+    }
+
+    /// Take `domain` for a claim, unless the control is set or another claim holds it.
+    ///
+    /// A claim turned away records why before it reads the state that turned it away, so the
+    /// thread that changes that state sees the record and wakes the claimants: the control's end
+    /// reads `refused`, and a put-back reads `skipped` ([`put_back_domain`](Self::put_back_domain)).
+    /// A claim counts itself in `holding` only past the control's first read, so `holding` is zero
+    /// whenever the control is set and no serial claim runs.
+    fn take_domain(&self, domain: usize) -> bool {
+        if self.controlling.load(Ordering::SeqCst) {
+            self.refused.store(true, Ordering::SeqCst);
+            if self.controlling.load(Ordering::SeqCst) {
+                return false;
+            }
+        }
+        self.holding.fetch_add(1, Ordering::SeqCst);
+        if self.controlling.load(Ordering::SeqCst) {
+            self.refused.store(true, Ordering::SeqCst);
+            self.leave_holding();
+            return false;
+        }
+        let take = || {
+            self.busy[domain]
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        };
+        if take() {
+            return true;
+        }
+        // Recorded, then tried once more: a holder that put the domain back before the record
+        // left it free for this try; one that puts it back after sees the record.
+        self.skipped.store(true, Ordering::SeqCst);
+        if take() {
+            return true;
+        }
+        self.leave_holding();
+        false
+    }
+
+    /// Release `domain`, taken by a claim that handed nothing out. Nothing changed, so it wakes
+    /// the claimants only where one skipped a held domain, or the control waits.
+    fn put_back_domain(&self, domain: usize) {
+        let held = self.busy[domain].swap(false, Ordering::SeqCst);
+        debug_assert!(held, "a claim puts back domain {domain}, which it took");
+        if self.skipped.swap(false, Ordering::SeqCst) {
+            self.advance();
+        }
+        self.leave_holding();
+    }
+
+    /// Count one claim fewer holding a domain. The last one wakes a control that waits for none.
+    fn leave_holding(&self) {
+        let before = self.holding.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(
+            before > 0,
+            "a claim leaves a domain it counted itself holding"
+        );
+        let last = before == 1;
+        if last && self.controlling.load(Ordering::SeqCst) {
+            self.advance();
+        }
+    }
+
+    /// Whether a claim of `pipeline` may hand out a package, read before it takes the pipeline's
+    /// domain: a claimant takes no domain for a pipeline with nothing ready, so it keeps no other
+    /// claimant from one that has something.
+    fn has_ready(&self, pipeline: usize) -> bool {
+        let state = &self.states[pipeline];
+        if state.held.load(Ordering::SeqCst) {
+            return false;
+        }
+        let admits = {
+            let queue = state
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            !queue.ready.is_empty()
+                && !(self.infos[pipeline].ordered && !queue.in_flight.is_empty())
+        };
+        // As `Queue::claim` asks, after the queue's own tests.
+        admits && self.takes_from(pipeline)
+    }
+
+    /// Whether `pipeline` may begin its finish, read before a claim takes its domain, as
+    /// [`ready_to_finish`](Self::ready_to_finish) without the test's transition hook.
+    fn may_finish(&self, pipeline: usize) -> bool {
+        let state = &self.states[pipeline];
+        let reserved = state.queue.reserved.load(Ordering::Acquire);
+        !state.held.load(Ordering::SeqCst)
+            && state.phase.load() == Phase::Running
+            && reserved & CLOSED != 0
+            && state.acknowledged.load(Ordering::Acquire) == reserved & !CLOSED
+    }
+
+    /// End the serial claim of `pipeline`: a package of a pipeline that is not partitioned, or a
+    /// finish, once its handler has run. Releases the claim's domain and wakes the claimants. A
+    /// scope may keep the claimed package in flight past this, as a loop's open request; the
+    /// domain is the claim's, not the package's.
+    pub(crate) fn end_serial_claim(&self, pipeline: PipelineId, finish: bool) {
+        let Some(domain) = self.domain_of_claim(pipeline.0, finish) else {
+            return;
+        };
+        let held = self.busy[domain].swap(false, Ordering::SeqCst);
+        debug_assert!(
+            held,
+            "pipeline {} ends a claim of domain {domain}, which it holds",
+            pipeline.0
+        );
+        let before = self.holding.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(
+            before > 0,
+            "a serial claim ends counted as holding its domain"
+        );
+        // Wakes the claimants that skipped the domain, and a control that waits for none.
+        self.advance();
+    }
+
+    /// Stop handing out serial claims, and wait until none runs: the run's control, which changes
+    /// what every domain's claims read. Partitioned packages go on. Returns at once after a
+    /// failure. [`Control`] ends it when dropped.
+    pub(crate) fn begin_control(&self) -> Control<'_> {
+        let was = self.controlling.swap(true, Ordering::SeqCst);
+        debug_assert!(!was, "one thread runs the control at a time");
+        loop {
+            let generation = self.generation();
+            if self.holding.load(Ordering::SeqCst) == 0 || self.failed.load(Ordering::SeqCst) {
+                return Control(self);
+            }
+            self.wait(generation);
+        }
+    }
+
+    /// Whether serial work is claimable: a package of a pipeline that is not partitioned, or a
+    /// finish. A claim that found its domain held answers [`Next::Wait`] although such work is
+    /// claimable; the control asks this before it decides that nothing is, since the resume pass
+    /// and the stall check run only once no claim may change the run.
+    pub(crate) fn serial_claimable(&self, _control: &Control<'_>) -> bool {
+        (0..self.infos.len()).any(|p| {
+            (self.domain_of_claim(p, false).is_some() && self.has_ready(p))
+                || (self.infos[p].domain.is_some() && self.may_finish(p))
+        })
+    }
+
+    /// Whether a package of a partitioned pipeline is in flight or claimable: a claimant may still
+    /// change the run beside the control. Read before [`changed_since`](Self::changed_since), it
+    /// misses no package: one that becomes claimable after it advances the generation.
+    pub(crate) fn partitioned_may_progress(&self, _control: &Control<'_>) -> bool {
+        (0..self.infos.len())
+            .filter(|&p| self.infos[p].partitioned)
+            .any(|p| {
+                let queue = self.states[p]
+                    .queue
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                // With nothing in flight, an ordered pipeline claims as any other does.
+                !queue.in_flight.is_empty()
+                    || (!queue.ready.is_empty()
+                        && !self.states[p].held.load(Ordering::SeqCst)
+                        && self.takes_from(p))
+            })
     }
 
     /// Mark `pipelines` as the pipelines of one breaker, each consuming an input of its own: their
@@ -1970,20 +2222,12 @@ impl Dispatcher {
     /// exactly one claim does so for each pipeline. Otherwise it answers [`Next::Done`] once every
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
+    ///
+    /// After [`set_domains`](Self::set_domains), a claim of a domain's serial work holds the domain:
+    /// the caller ends it with [`end_serial_claim`](Self::end_serial_claim) once the claim's
+    /// handler returns, and no other claim of the domain is handed out until then. A package of a
+    /// partitioned pipeline holds none.
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_where(preferred, &|_| true, true)
-    }
-
-    /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
-    /// and to no finish where `finishes` is false: a claimant that runs only some breakers, as a
-    /// thread of the pool claims partitioned packages apart from serial work. After
-    /// [`stop_claims`](Self::stop_claims) it answers [`Next::Done`].
-    pub(crate) fn try_claim_where(
-        &self,
-        preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: bool,
-    ) -> Next {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
         let generation = self.generation.load(Ordering::SeqCst);
@@ -1997,20 +2241,41 @@ impl Dispatcher {
         if let Some(preferred) = preferred {
             self.state(preferred);
         }
-        let scan = preferred.map(|p| p.0).into_iter().chain(0..count);
-        if let Some(package) = scan
-            .filter(|&p| takes(PipelineId(p)))
-            .find_map(|p| self.claim_from(p))
-        {
-            return Next::Package(package);
+        // A pipeline whose domain another claim holds is skipped: that claim's end advances the
+        // generation.
+        // Partitioned packages first, then serial packages, each in pipeline order: a partitioned
+        // package runs beside any serial claim, so a claimant takes one before it takes a domain.
+        let partitioned = |&p: &usize| self.infos[p].partitioned;
+        let scan = preferred
+            .map(|p| p.0)
+            .into_iter()
+            .chain((0..count).filter(partitioned))
+            .chain((0..count).filter(|p| !partitioned(p)));
+        for p in scan {
+            let domain = self.domain_of_claim(p, false);
+            if domain.is_some_and(|domain| !self.has_ready(p) || !self.take_domain(domain)) {
+                continue;
+            }
+            if let Some(package) = self.claim_from(p) {
+                return Next::Package(package);
+            }
+            if let Some(domain) = domain {
+                self.put_back_domain(domain);
+            }
         }
-        for p in (0..count).filter(|_| finishes) {
-            let begun = self.try_begin_finish(p);
-            if begun {
+        for p in 0..count {
+            let domain = self.domain_of_claim(p, true);
+            if domain.is_some_and(|domain| !self.may_finish(p) || !self.take_domain(domain)) {
+                continue;
+            }
+            if self.try_begin_finish(p) {
                 return Next::Finish {
                     pipeline: PipelineId(p),
                     consumed: self.states[p].queue.region(),
                 };
+            }
+            if let Some(domain) = domain {
+                self.put_back_domain(domain);
             }
         }
         if self.unfinished.load(Ordering::Acquire) == 0 {
@@ -2030,25 +2295,9 @@ impl Dispatcher {
         }
     }
 
-    /// Whether a package of a pipeline `takes` admits is in flight, or claimable now: a claimant
-    /// restricted to those pipelines may still change the run. Read before
-    /// [`changed_since`](Self::changed_since), it misses no package: one that becomes claimable
-    /// after it advances the generation.
-    pub(crate) fn may_claim_where(&self, takes: &dyn Fn(PipelineId) -> bool) -> bool {
-        (0..self.infos.len())
-            .filter(|&p| takes(PipelineId(p)))
-            .any(|p| {
-                let queue = self.states[p]
-                    .queue
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                // With nothing in flight, an ordered pipeline claims as any other does.
-                !queue.in_flight.is_empty()
-                    || (!queue.ready.is_empty()
-                        && !self.states[p].held.load(Ordering::SeqCst)
-                        && self.takes_from(p))
-            })
+    /// The generation as it stands: a [`wait`](Self::wait) on it returns at the next change.
+    fn generation(&self) -> Generation {
+        Generation(self.generation.load(Ordering::SeqCst))
     }
 
     /// Whether the generation has advanced past `generation`: something changed that can make a
@@ -4184,6 +4433,117 @@ mod tests {
         assert_eq!(consumed, Some(keys_between(0, 4095)));
         dispatcher.finish(dispatcher.pushes(pipeline));
         assert!(matches!(dispatcher.try_claim(None), Next::Done));
+    }
+
+    /// Two sources in one exclusion domain: a claim of one holds the domain, so the other's ready
+    /// package is not handed out until the first claim ends.
+    #[test]
+    fn a_serial_claim_holds_its_domain_until_it_ends() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], usize::MAX).unrecorded();
+        dispatcher.set_domains(&[0, 0], &[false, false]);
+        dispatcher.notify(PipelineId(0), &keys_between(0, 0));
+        dispatcher.notify(PipelineId(1), &keys_between(0, 0));
+        let Next::Package(first) = dispatcher.try_claim(None) else {
+            panic!("the first source's package is claimable")
+        };
+        assert_eq!(first.pipeline, PipelineId(0));
+        assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+        dispatcher.acknowledge(first);
+        assert!(
+            matches!(dispatcher.try_claim(None), Next::Wait(_)),
+            "an acknowledgement does not end the claim"
+        );
+        dispatcher.end_serial_claim(PipelineId(0), false);
+        let Next::Package(second) = dispatcher.try_claim(None) else {
+            panic!("the second source's package is claimable once the first claim ends")
+        };
+        assert_eq!(second.pipeline, PipelineId(1));
+    }
+
+    /// A partitioned pipeline's packages hold no domain, so its domain's other pipelines claim
+    /// beside them; its finish holds the domain as serial work does.
+    #[test]
+    fn a_partitioned_package_holds_no_domain_and_its_finish_does() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], usize::MAX).unrecorded();
+        dispatcher.set_domains(&[0, 0], &[true, false]);
+        dispatcher.notify(PipelineId(0), &keys_between(0, 0));
+        dispatcher.notify(PipelineId(1), &keys_between(0, 0));
+        let Next::Package(partitioned) = dispatcher.try_claim(None) else {
+            panic!("the partitioned source's package is claimable")
+        };
+        assert_eq!(partitioned.pipeline, PipelineId(0));
+        let Next::Package(serial) = dispatcher.try_claim(None) else {
+            panic!("the serial source claims beside a partitioned package")
+        };
+        assert_eq!(serial.pipeline, PipelineId(1));
+        dispatcher.acknowledge(partitioned);
+        dispatcher.acknowledge(serial);
+        dispatcher.end_serial_claim(PipelineId(1), false);
+        dispatcher.close(PipelineId(0));
+        dispatcher.close(PipelineId(1));
+        let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+            panic!("the partitioned source finishes")
+        };
+        assert_eq!(pipeline, PipelineId(0));
+        assert!(
+            matches!(dispatcher.try_claim(None), Next::Wait(_)),
+            "a finish holds its domain"
+        );
+        dispatcher.finish(dispatcher.pushes(pipeline));
+        dispatcher.end_serial_claim(pipeline, true);
+        assert!(matches!(
+            dispatcher.try_claim(None),
+            Next::Finish {
+                pipeline: PipelineId(1),
+                ..
+            }
+        ));
+    }
+
+    /// The control waits for the serial claim that runs, and hands out no serial claim while it
+    /// lasts; its end lets the claims go on.
+    #[test]
+    fn the_control_waits_for_serial_claims_and_holds_back_new_ones() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::sync::atomic::AtomicBool;
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], usize::MAX).unrecorded();
+        dispatcher.set_domains(&[0, 1], &[false, false]);
+        dispatcher.notify(PipelineId(0), &keys_between(0, 0));
+        let Next::Package(running) = dispatcher.try_claim(None) else {
+            panic!("the first source's package is claimable")
+        };
+        let controlled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let control = scope.spawn(|| {
+                let control = dispatcher.begin_control();
+                controlled.store(true, Ordering::SeqCst);
+                dispatcher.notify(PipelineId(1), &keys_between(0, 0));
+                assert!(
+                    matches!(dispatcher.try_claim(None), Next::Wait(_)),
+                    "no serial claim is handed out under the control"
+                );
+                drop(control);
+            });
+            assert!(
+                !controlled.load(Ordering::SeqCst),
+                "the control waits for the running claim"
+            );
+            dispatcher.acknowledge(running);
+            dispatcher.end_serial_claim(PipelineId(0), false);
+            control.join().unwrap();
+        });
+        assert!(matches!(
+            dispatcher.try_claim(None),
+            Next::Package(WorkPackage {
+                pipeline: PipelineId(1),
+                ..
+            })
+        ));
     }
 
     /// A package claimed and not acknowledged, and a finish claimed and not completed, are each in
