@@ -1024,7 +1024,14 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
         {
             continue;
         }
-        if let Some(prev) = seen.iter().find(|p| **p != d) {
+        // Compaction's rule, so the solver and the merge never answer this differently.
+        let disagree = |p: &Type| {
+            super::compact::data_domains_disagree(
+                &super::compact::compact_type(p).term,
+                &super::compact::compact_type(&d).term,
+            )
+        };
+        if let Some(prev) = seen.iter().find(|p| disagree(p)) {
             return Some((prev.clone(), d));
         }
         if !seen.contains(&d) {
@@ -3696,6 +3703,21 @@ mod tests {
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
     };
+
+    /// A plain tuple and the dependent tuple of the same components, which reads no component,
+    /// are two types and one data domain, so collections over them are not distinct.
+    #[test]
+    fn collections_over_redundant_plain_and_dependent_tuples_share_a_data_domain() {
+        let components = || vec![Type::UIntRange(2), Type::UIntRange(3)];
+        let plain = Type::Tuple(components());
+        let dependent = Type::DepTuple(components().into_iter().map(|t| (None, t)).collect());
+        assert_ne!(plain, dependent);
+        let lows = vec![
+            Bound::conc(Type::data_fun(plain, Type::Base(BaseType::Int))),
+            Bound::conc(Type::data_fun(dependent, Type::Base(BaseType::Int))),
+        ];
+        assert!(distinct_data_domains(&lows).is_none());
+    }
 
     #[test]
     fn monomorphic_functions_keep_their_kind_at_the_bindings_level() {
