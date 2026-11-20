@@ -1224,10 +1224,8 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
                 .collect(),
         ),
         _ => match (Projection::of(held), Projection::of(released)) {
-            (Ok(held_keys), Ok(released_keys))
-                if names_collection_keys(held) && names_collection_keys(released) =>
-            {
-                held_keys.minus(&released_keys).collection_guard()
+            (Ok(_), Ok(_)) if names_collection_keys(held) && names_collection_keys(released) => {
+                held.keys_minus(released)
             }
             (Ok(_), Err(_)) if names_collection_keys(held) && names_collection_keys(released) => {
                 minus_disjoint_arms(held, released)

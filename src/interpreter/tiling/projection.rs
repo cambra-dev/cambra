@@ -90,9 +90,34 @@ impl Projection {
             TileGuard::Or(arms) => arms.as_slice(),
             single => std::slice::from_ref(single),
         };
-        arms.iter().try_fold(Projection::Nothing, |all, arm| {
-            Ok(all.union(&Projection::of_arm(arm, guard)?))
-        })
+        let projections = arms
+            .iter()
+            .map(|arm| Projection::of_arm(arm, guard))
+            .collect::<Result<Vec<_>, String>>()?;
+        if projections
+            .iter()
+            .any(|arm| matches!(arm, Projection::Fields { .. }))
+        {
+            return Ok(projections
+                .iter()
+                .fold(Projection::Nothing, |all, arm| all.union(arm)));
+        }
+        // The key arms' union at the deepest of their levels, a key of a level above naming every
+        // path beneath it.
+        let deepest = projections
+            .iter()
+            .filter_map(Projection::level)
+            .max()
+            .unwrap_or(CurryLevel::OUTERMOST);
+        let keys = projections.iter().fold(Predicate::False, |all, arm| {
+            all.union(&match arm {
+                Projection::Everything => Predicate::True,
+                Projection::Nothing => Predicate::False,
+                Projection::Keys { level, keys } => keys.descend(deepest.index() - level.index()),
+                Projection::Fields { .. } => unreachable!("fields are combined above"),
+            })
+        });
+        Ok(Projection::keys_at(deepest, keys))
     }
 
     /// The projection one arm of `guard` names: a domain guard, at the level the codomain guards
@@ -324,8 +349,7 @@ impl Projection {
         if self.either_names_fields(other) {
             return self.field_by_field(other, Projection::intersect);
         }
-        let level = self.deepest(other);
-        Projection::keys_at(level, self.at(level).intersect(&other.at(level)))
+        Projection::of_keys(&self.collection_guard().intersect(&other.collection_guard()))
     }
 
     /// What `self` names that `other` does not: the region still unread after a read at `other`.
@@ -333,8 +357,10 @@ impl Projection {
         if self.either_names_fields(other) {
             return self.field_by_field(other, Projection::minus);
         }
-        let level = self.deepest(other);
-        Projection::keys_at(level, self.at(level).minus(&other.at(level)))
+        Projection::of_keys(&crate::interpreter::tile_operators::guard_minus(
+            &self.collection_guard(),
+            &other.collection_guard(),
+        ))
     }
 
     /// The projection naming what either names: the region a memo has read or must read
@@ -343,37 +369,7 @@ impl Projection {
         if self.either_names_fields(other) {
             return self.field_by_field(other, Projection::union);
         }
-        let level = self.deepest(other);
-        Projection::keys_at(level, self.at(level).union(&other.at(level)))
-    }
-
-    /// The deeper of the levels `self` and `other` name keys of, the outermost where neither
-    /// names keys.
-    fn deepest(&self, other: &Projection) -> CurryLevel {
-        [self.level(), other.level()]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(CurryLevel::OUTERMOST)
-    }
-
-    /// This projection as the paths of `level` it names, `level` being at or beneath its own:
-    /// a key of a level above names every path beneath it.
-    fn at(&self, level: CurryLevel) -> Predicate {
-        match self {
-            Projection::Everything => Predicate::True,
-            Projection::Nothing => Predicate::False,
-            Projection::Keys { level: own, keys } => {
-                let beneath = level
-                    .index()
-                    .checked_sub(own.index())
-                    .unwrap_or_else(|| panic!("{self:?} is read at {level}, above its own level"));
-                keys.descend(beneath)
-            }
-            Projection::Fields { .. } => {
-                panic!("{self:?} names the fields of a record, which has no level of keys")
-            }
-        }
+        Projection::of_keys(&self.collection_guard().union(&other.collection_guard()))
     }
 
     /// The region of a tagged union that `self`, a region of the union's arm under `tag`, names:
@@ -728,6 +724,40 @@ impl TileGuard {
             true => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
             false => TileGuard::flatten_or(arms.iter().map(KeyArm::guard).collect()),
         }
+    }
+
+    /// This guard of keys less `released`, a guard of keys too, exactly: both read at the deeper of
+    /// their levels, a key of a level above naming every path beneath it, and the difference of
+    /// those paths normalized as [`Projection::keys_at`] normalizes keys.
+    ///
+    /// # Panics
+    ///
+    /// For a guard that is no guard of keys.
+    pub(crate) fn keys_minus(&self, released: &TileGuard) -> TileGuard {
+        let arms = |guard: &TileGuard| {
+            guard
+                .key_arms()
+                .unwrap_or_else(|why| panic!("{why}"))
+                .into_iter()
+                .filter_map(KeyArm::normalized)
+                .collect::<Vec<_>>()
+        };
+        let (held, released) = (arms(self), arms(released));
+        let deepest = held
+            .iter()
+            .chain(&released)
+            .map(|arm| arm.level)
+            .max()
+            .unwrap_or(CurryLevel::OUTERMOST);
+        let at = |arms: &[KeyArm]| {
+            arms.iter().fold(Predicate::False, |all, arm| {
+                all.union(&arm.keys.descend(deepest.index() - arm.level.index()))
+            })
+        };
+        TileGuard::of_key_arms([KeyArm {
+            level: deepest,
+            keys: at(&held).minus(&at(&released)),
+        }])
     }
 
     /// The keys above `level` this guard of keys names, for an operator whose input lacks `level`,
