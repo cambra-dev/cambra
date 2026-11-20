@@ -60,14 +60,23 @@
 //! copies its definition into the type. So every chain is peeled and re-sealed
 //! one level out.
 //!
-//! **An annotated result keeps its chain in its definiens.** In `let 𝑦 : 𝑇 =
-//! body in 𝑦`, the shape a `=> 𝑇` output annotation lowers to, the binder is
-//! bound at `𝑇` rather than at its definiens, so no type names a binder sealed
-//! inside `body` and nothing needs peeling. Peeling would also move the chain
-//! ahead of the annotation, and [`crate::ccl::opaque_output`] recognizes the
-//! annotation only as the outermost term of a lambda body
-//! ([`crate::ccl::opaque_output::is_annotated_result`]). The `Lambda` arm of
-//! [`normalize`] asserts the shape survives.
+//! **A lambda body's output annotation keeps its chain in its definiens.** A
+//! `=> 𝑇` output annotation lowers to `let 𝑦 : 𝑇 = body in 𝑦` as the outermost
+//! term of a lambda body. Its binder is bound at `𝑇` rather than at its
+//! definiens, so no type names a binder sealed inside `body`, and nothing needs
+//! peeling. Peeling would also move the chain ahead of the annotation, and
+//! [`crate::ccl::opaque_output`] recognizes the annotation only as the outermost
+//! term of a lambda body ([`crate::ccl::opaque_output::is_annotated_result`]).
+//! The `Lambda` arm of [`normalize_node`] keeps the chain and asserts the shape
+//! survives.
+//!
+//! The same shape anywhere else is peeled. A program whose last statement is
+//! `𝑦 : 𝑇 = body` followed by `𝑦` also lowers to `let 𝑦 : 𝑇 = body in 𝑦`, and
+//! inference checks `𝑇` against the definiens's type. A transparent binder
+//! left in the definiens is discharged into that type, so a hoisted call
+//! `1 ▷ 𝑓` reaches the check as a term the solver reads nothing from. Peeled
+//! onto the spine, the binder is in scope at the check with its own refined
+//! type.
 //!
 //! A **handle** position holds the variable rather than its value, so the
 //! mention there is not a read and stays where it stands
@@ -431,7 +440,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
     // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || match &e.node {
-        TypedExprNode::Let { .. } => normalize_let(e, muts),
+        TypedExprNode::Let { .. } => normalize_let(e, muts, false),
         TypedExprNode::ExprStmt { .. } => normalize_expr_stmt(e, muts),
         _ => normalize_node(e, muts),
     })
@@ -456,11 +465,18 @@ fn rebuilt_as(
 
 /// [`normalize`] of a `let`. A read sealed in the definiens moves ahead of the `let`
 /// ([`peel`]): the binding's type is refined by its definiens, and a read binder sealed inside
-/// it is opaque, so the type would name a binder out of scope at every use. An annotated
-/// result is bound at its annotation, so its chain stays in the definiens (module docs).
-fn normalize_let(e: Expr, muts: &Muts) -> Expr {
+/// it is opaque, so the type would name a binder out of scope at every use.
+///
+/// `output` is true only for a lambda body's output annotation, which the `Lambda` arm of
+/// [`normalize_node`] recognizes. That `let` is bound at its annotation, so its chain stays in
+/// the definiens (module docs).
+fn normalize_let(e: Expr, muts: &Muts, output: bool) -> Expr {
+    debug_assert!(
+        !output || is_annotated_result(&e),
+        "anf: an output annotation is `let 𝑦 : 𝑇 = body in 𝑦`, got a {}",
+        e.node.kind_name()
+    );
     let id = e.node_id();
-    let annotated_result = is_annotated_result(&e);
     let Expr {
         node:
             TypedExprNode::Let {
@@ -477,7 +493,7 @@ fn normalize_let(e: Expr, muts: &Muts) -> Expr {
         unreachable!("`normalize` dispatches only a `let` here")
     };
     let bound_expr = normalize(*bound_expr, muts);
-    let (binds, bound_expr) = if annotated_result {
+    let (binds, bound_expr) = if output {
         (Vec::new(), bound_expr)
     } else {
         peel(bound_expr)
@@ -626,7 +642,11 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
         TypedExprNode::Lambda { param, body } => {
             let inner = under_param(muts, &param);
             let annotated = is_annotated_result(&body);
-            let body = normalize(*body, &inner);
+            let body = if annotated {
+                normalize_let(*body, &inner, true)
+            } else {
+                normalize(*body, &inner)
+            };
             debug_assert!(
                 !annotated || is_annotated_result(&body),
                 "anf: a lambda body's output annotation must stay its outermost term, \

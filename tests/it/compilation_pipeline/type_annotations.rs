@@ -2754,3 +2754,15 @@ f(Option::some(1)) == f(Option::none)
         "Type mismatch for this call: expected {Option(Int) where not _.is_none()}, found {Option(",
     )
 }
+
+#[test]
+fn anf_puts_lets_on_the_spine() {
+    check_scalar(
+        indoc! {r#"
+f = \x -> x ^+ x
+v: {Int where _ == 6} = f(1) ^+ f(2)
+v
+        "#},
+        Value::Int(6),
+    )
+}
