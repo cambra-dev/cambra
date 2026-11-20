@@ -1893,21 +1893,41 @@ impl TileOperator for Product {
             .enclosing()
             .unwrap_or_else(|| unreachable!("the paired level is beneath a row"));
         let empty_level = self.tiling().values_at(level).empty_at_no_rows();
-        let outer_consumer = forwarding_consumer_keeping_keys(&shared);
-        let outer_consumer = crate::interpreter::notifications::through_values(
-            CurryLevel::new(level.index() + 1),
-            self.tiling(),
-            outer_consumer,
+        // A pair exists once its row has reached the outer side and the pair the inner side, so
+        // each side's delta is restated as the pairs it completes with what the other side has
+        // delivered (`notifications::Delivered`): a row reaching the outer side names only the
+        // pairs the inner side already holds under it.
+        use crate::interpreter::notifications::{
+            PairingSide, Partners, nothing_delivered, pairing,
+        };
+        let delivered = nothing_delivered();
+        let paired = CurryLevel::new(level.index() + 1);
+        let outer = self.outer.clone().subscribe(
+            self.outer.tiling().universal_guard(),
+            pairing(
+                PairingSide::Rows(Partners::Paths),
+                paired,
+                delivered.clone(),
+                forwarding_consumer_keeping_keys(&shared),
+            ),
+            cx,
         );
-        let outer =
-            self.outer
-                .clone()
-                .subscribe(self.outer.tiling().universal_guard(), outer_consumer, cx);
+        let inner_universal = self.inner.tiling().universal_guard();
+        let inner = self.inner.clone().subscribe(
+            inner_universal,
+            pairing(
+                PairingSide::Paths,
+                paired,
+                delivered,
+                forwarding_consumer_keeping_keys(&shared),
+            ),
+            cx,
+        );
         Box::new(ProductProducer {
             base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling(), self.clone(), cx),
             // Both sides are pulled at the projection, aligned row for row.
             outer,
-            inner: subscribe_forwarding_keeping_keys(&self.inner, &shared, cx),
+            inner,
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),

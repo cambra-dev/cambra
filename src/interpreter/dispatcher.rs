@@ -2804,6 +2804,12 @@ impl Landing<'_> {
         }
     }
 
+    /// Whether this landing queues packages: a delivery that is no completion record
+    /// ([`Target::Completion`]).
+    pub(crate) fn queues(&self) -> bool {
+        matches!(self.target, Target::Queue { .. } | Target::Change { .. })
+    }
+
     pub(crate) fn is_delivery(&self) -> bool {
         matches!(
             self.target,

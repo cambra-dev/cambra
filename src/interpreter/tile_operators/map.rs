@@ -861,15 +861,46 @@ impl TileOperator for MapResultToConst {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
-        let constant_producer = subscribe_forwarding(&self.constant, &shared, cx);
-        // The constant is read whole, since every row reads all of it, so its notification
-        // widens; the input is pulled at the projection.
-        let input_consumer = forwarding_consumer_keeping_keys(&shared);
-        let input_consumer = crate::interpreter::notifications::through_values(
-            self.level,
-            self.tiling(),
-            input_consumer,
-        );
+        // Beneath the outermost level a collection constant pairs every row with each of its
+        // keys, so each input's delta is restated as the pairs it creates with what the other
+        // input has delivered (`notifications::Delivered`). At the outermost level the constant
+        // replaces the input, and a scalar constant has no keys: its notification widens.
+        let (constant_producer, input_consumer) = match self.level != CurryLevel::OUTERMOST
+            && self.constant.tiling().is_data_function()
+        {
+            true => {
+                use crate::interpreter::notifications::{
+                    PairingSide, Partners, nothing_delivered, pairing,
+                };
+                let delivered = nothing_delivered();
+                let universal = self.constant.tiling().universal_guard();
+                let constant = self.constant.clone().subscribe(
+                    universal,
+                    pairing(
+                        PairingSide::ConstantKeys,
+                        self.level,
+                        delivered.clone(),
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                );
+                let input = pairing(
+                    PairingSide::Rows(Partners::ConstantKeys),
+                    self.level,
+                    delivered,
+                    forwarding_consumer_keeping_keys(&shared),
+                );
+                (constant, input)
+            }
+            false => (
+                subscribe_forwarding(&self.constant, &shared, cx),
+                crate::interpreter::notifications::through_values(
+                    self.level,
+                    self.tiling(),
+                    forwarding_consumer_keeping_keys(&shared),
+                ),
+            ),
+        };
         let input_producer =
             self.input
                 .clone()
@@ -967,9 +998,14 @@ impl TileProducer for MapResultToConstProducer {
         visit("constant", &mut *self.constant);
     }
 
-    /// It keeps its input's keys above its level and computes the values beneath it.
+    /// It keeps its input's keys above its level and computes the values beneath it. Beneath
+    /// the outermost level a collection constant's keys stand at its level under every row, so
+    /// it restates those too: the input is pulled at the rows and the answer cut.
     fn restates(&self) -> Restates {
-        Restates::Above(self.level)
+        match self.level != CurryLevel::OUTERMOST && self.constant.tiling().is_data_function() {
+            true => Restates::Above(CurryLevel::new(self.level.index() + 1)),
+            false => Restates::Above(self.level),
+        }
     }
 
     /// The constant is read whole, since every row reads all of it.
@@ -1030,7 +1066,7 @@ impl MapResultToConstProducer {
         // at the outermost level the constant replaces the whole input, so the output's keys are
         // the constant's and the projection names none of the input's.
         let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
-            true => projection.guard(&i_tiling),
+            true => projection.above(self.level).guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);

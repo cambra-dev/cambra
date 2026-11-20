@@ -484,3 +484,189 @@ mod tests {
         );
     }
 }
+
+/// What each input of a pairing operator has delivered, which its notifications restate a delta
+/// against: the rows a pair hangs under, and what pairs them with those rows.
+///
+/// A pairing operator's output path `(𝑟, 𝑘)` exists once both its halves have arrived, so a
+/// delivery on one input creates exactly the pairs of its delta with what the other input has
+/// delivered: Δ𝑅 × 𝐾 ∪ 𝑅 × Δ𝐾. Each pair is announced once, by the delivery that completes
+/// it, so no announcement names a pair before both halves exist. `rows` admits paths of the
+/// level above the pairs; `partners` admits the constant's keys for a broadcast
+/// ([`Partners::ConstantKeys`]) and the pairs' own paths for a row-aligned pairing
+/// ([`Partners::Paths`]). Both grow only on a delivery ([`Landing::is_delivery`]): a planner's
+/// walk restates as though every partner had arrived, so the route it reads keeps keys.
+pub(crate) struct Delivered {
+    rows: crate::interpreter::Predicate,
+    partners: crate::interpreter::Predicate,
+}
+
+/// [`Delivered`], shared by the consumers in front of one pairing operator's inputs.
+pub(crate) type SharedDelivered = Arc<std::sync::Mutex<Delivered>>;
+
+/// A [`Delivered`] with nothing delivered yet.
+pub(crate) fn nothing_delivered() -> SharedDelivered {
+    Arc::new(std::sync::Mutex::new(Delivered {
+        rows: crate::interpreter::Predicate::False,
+        partners: crate::interpreter::Predicate::False,
+    }))
+}
+
+/// What a pairing's partner side holds ([`Delivered::partners`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Partners {
+    /// The keys of a constant broadcast beneath every row (`MapResultToConst`): a pair is a
+    /// row with one constant key, so the pairs are every delivered row by every delivered key.
+    ConstantKeys,
+    /// The pairs' own paths, delivered by a side aligned with the rows (`Product`'s inner side):
+    /// a pair exists where that side holds it and the row side has delivered its row.
+    Paths,
+}
+
+/// Which input of a pairing a consumer sits in front of.
+#[derive(Clone, Copy)]
+pub(crate) enum PairingSide {
+    /// The rows: a region of rows announces those rows' pairs with the partners delivered.
+    Rows(Partners),
+    /// A constant's keys (`Partners::ConstantKeys`): a region of keys announces every
+    /// delivered row's pair with them. A region beneath the constant's outermost keys widens.
+    ConstantKeys,
+    /// The aligned side's pairs (`Partners::Paths`): a region of pairs announces those whose
+    /// row has been delivered. A region beneath the pairs passes on as it is.
+    Paths,
+}
+
+/// `consumer` behind a consumer that restates a delta of one input of a pairing operator as the
+/// pairs it creates, at level `at` ([`Delivered`]).
+pub(crate) fn pairing(
+    side: PairingSide,
+    at: CurryLevel,
+    delivered: SharedDelivered,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Pairing {
+        side,
+        at,
+        delivered,
+        consumer,
+    })
+}
+
+struct Pairing {
+    side: PairingSide,
+    at: CurryLevel,
+    delivered: SharedDelivered,
+    consumer: Box<dyn Consumer>,
+}
+
+/// `region`'s keys as a predicate over the paths of level `to`, `None` where the region names
+/// keys beneath it. A region above `to` admits every path beneath its keys.
+fn paths_at(region: &Projection, to: CurryLevel) -> Option<crate::interpreter::Predicate> {
+    use crate::interpreter::Predicate;
+    let (mut level, mut keys) = match region {
+        Projection::Everything => return Some(Predicate::True),
+        Projection::Nothing => return Some(Predicate::False),
+        Projection::Keys { level, keys } => (level.index(), keys.clone()),
+        // A region of a record's fields names no keys of the rows.
+        Projection::Fields { .. } => return None,
+    };
+    if level > to.index() {
+        return None;
+    }
+    while level < to.index() {
+        keys = Predicate::qualified(keys, Predicate::True);
+        level += 1;
+    }
+    Some(keys)
+}
+
+impl Pairing {
+    /// The pairs `region` creates and what it adds to [`Delivered`], `None` where the region
+    /// names keys beneath what the side restates. `recorded` says the region is a delivery.
+    fn pairs(
+        &self,
+        region: &Projection,
+        recorded: bool,
+        delivered: &Delivered,
+    ) -> Option<(
+        crate::interpreter::Predicate,
+        Box<dyn FnOnce(&mut Delivered)>,
+    )> {
+        use crate::interpreter::Predicate;
+        let rows_level = self
+            .at
+            .enclosing()
+            .expect("a pairing pairs beneath a level of rows");
+        let (rows, partners) = match recorded {
+            true => (delivered.rows.clone(), delivered.partners.clone()),
+            false => (Predicate::True, Predicate::True),
+        };
+        Some(match self.side {
+            PairingSide::Rows(against) => {
+                let delta = paths_at(&region.above(self.at), rows_level)?;
+                let pairs = match against {
+                    Partners::ConstantKeys => Predicate::qualified(delta.clone(), partners),
+                    Partners::Paths => {
+                        Predicate::qualified(delta.clone(), Predicate::True).intersect(&partners)
+                    }
+                };
+                let record: Box<dyn FnOnce(&mut Delivered)> =
+                    Box::new(move |seen| seen.rows = seen.rows.union(&delta));
+                (pairs, record)
+            }
+            PairingSide::ConstantKeys => {
+                let delta = paths_at(region, CurryLevel::OUTERMOST)?;
+                let pairs = Predicate::qualified(rows, delta.clone());
+                let record: Box<dyn FnOnce(&mut Delivered)> =
+                    Box::new(move |seen| seen.partners = seen.partners.union(&delta));
+                (pairs, record)
+            }
+            PairingSide::Paths => {
+                let delta = paths_at(region, self.at)?;
+                let pairs = delta.intersect(&Predicate::qualified(rows, Predicate::True));
+                let record: Box<dyn FnOnce(&mut Delivered)> =
+                    Box::new(move |seen| seen.partners = seen.partners.union(&delta));
+                (pairs, record)
+            }
+        })
+    }
+}
+
+impl Consumer for Pairing {
+    /// A complete region decides only its own input's half of each pair, so the path completes
+    /// part of what a pair depends on ([`Landing::completing_part`]).
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        // Only a landing that queues packages grows what has been delivered and is cut by it. A
+        // completion record states what is decided rather than what arrived, and queues
+        // nothing, so it takes every pair the region decides ([`Landing::queues`]).
+        let recorded = landing.queues();
+        // The pairs are read and the delta recorded under one lock, so of two deliveries on
+        // different threads the later one announces each pair they complete, and once. The lock
+        // is released before the region is passed on.
+        let mut delivered = self
+            .delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some((pairs, record)) = self.pairs(region, recorded, &delivered) else {
+            drop(delivered);
+            match self.side {
+                // A constant's region beneath its outermost keys names no key of the pairs.
+                PairingSide::ConstantKeys => landing.completing_part(|landing| {
+                    landing
+                        .widened(|landing| self.consumer.notify(&Projection::Everything, landing))
+                }),
+                _ => self.consumer.notify(region, landing),
+            }
+            return;
+        };
+        if recorded {
+            record(&mut delivered);
+        }
+        drop(delivered);
+        if landing.queues() && pairs.is_false() {
+            return;
+        }
+        let restated = Projection::keys_at(self.at, pairs);
+        landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+    }
+}
