@@ -644,6 +644,7 @@ fn run_targets(
         });
         let input = input.expect("a reach calls the breaker it reaches");
         let mut starts: Vec<TileGuard> = Vec::new();
+        let mut at_close: Vec<TileGuard> = Vec::new();
         let special = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
             // completion; otherwise the scope holds each delivery on the pipelines it reads.
@@ -694,10 +695,11 @@ fn run_targets(
                     let one = leaf.probe_region();
                     let routes = routes_to(&leaf.consumer, std::slice::from_ref(&one), pipeline);
                     // A source whose arrivals reach no entry of the pipeline, as a loop's drive
-                    // reads a source nested in its own, brings it no row, so the pipeline is
-                    // queued every row of its input with the first notification.
+                    // reads a source nested in its own, brings it no row as it arrives, so the
+                    // pipeline is queued every row of its input once every source yields
+                    // everything.
                     if routes.is_empty() {
-                        starts.push(input.universal_guard());
+                        at_close.push(input.universal_guard());
                         continue;
                     }
                     let arrived = probe(&leaf.consumer, PipelineId(pipeline), &one, pipeline);
@@ -817,6 +819,7 @@ fn run_targets(
             notifies,
             input,
             starts,
+            at_close,
         ));
     }
     for (reader, read) in reads_as_keys {
@@ -3546,6 +3549,10 @@ struct LivePipeline {
     /// The regions the pipeline's own ranges bring, which no live source yields and no arrival
     /// names: notified with the first poll, and empty after.
     starts: Vec<TileGuard>,
+    /// The regions a source brings whose arrivals reach no entry of the pipeline, as a loop's
+    /// drive reads a source nested in its own: nothing tells the pipeline of them as they arrive,
+    /// so they are notified once every source yields everything.
+    at_close: Vec<TileGuard>,
     announced: TileGuard,
     closed: bool,
 }
@@ -3557,8 +3564,10 @@ impl LivePipeline {
         notifies: Notifies,
         input: Tiling,
         starts: Vec<TileGuard>,
+        at_close: Vec<TileGuard>,
     ) -> Self {
         Self {
+            at_close,
             pipeline,
             leaves: leaves
                 .into_iter()
@@ -3668,6 +3677,11 @@ impl LivePipeline {
                 reach(self.pipeline, &mut |breaker, _| {
                     breaker.read_source_again(source)
                 });
+            }
+        }
+        if complete {
+            for region in std::mem::take(&mut self.at_close) {
+                arrivals = arrivals.union(&region);
             }
         }
         let fresh = guard_minus(&arrivals, &self.announced);
