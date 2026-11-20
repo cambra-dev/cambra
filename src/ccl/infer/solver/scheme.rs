@@ -1185,15 +1185,8 @@ pub fn freshen_above(
                         .fold(site.clone(), |t, n| t.extended(cache.binder_name(&n)))
                 }
                 None => match &cache.use_telescope {
-                    Some(site) => {
-                        let mut inside: Vec<_> = tv.telescope.iter().cloned().collect();
-                        inside.reverse();
-                        site.rescoped(|_| false, inside)
-                    }
-                    None if cache.entered_binders.is_empty() => tv.telescope.clone(),
-                    None => tv
-                        .telescope
-                        .rescoped(|_| false, cache.entered_binders.iter().cloned()),
+                    Some(site) => site.entered_from(&tv.telescope),
+                    None => tv.telescope.entered(cache.entered_binders.iter().cloned()),
                 },
             };
             let v = InferVar::fresh_over(solver, new_level, &telescope, fun_kind);
