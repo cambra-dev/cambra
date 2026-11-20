@@ -5215,7 +5215,8 @@ fn a_writing_block_in_a_branch(#[case] code: &str, #[case] expected: i64) {
 }
 
 /// A block reads its loop's accumulator as the accumulator stands where the block does, before
-/// the writes later in the iteration, between two of them, or after them all.
+/// the writes later in the iteration, between two of them, or after them all. A read in a block
+/// that writes the accumulator itself stands between the block's writes.
 #[rstest]
 #[case::before_its_write(indoc! {"
     n := 0
@@ -5247,11 +5248,142 @@ fn a_writing_block_in_a_branch(#[case] code: &str, #[case] expected: i64) {
         with begin():
             pool := pool - n
 "}, 90)]
+#[case::before_its_write_in_the_block(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        with begin():
+            pool := pool - n
+            n := n + r
+"}, 96)]
+#[case::before_and_after_its_write_in_the_block(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        with begin():
+            pool := pool - n
+            n := n + r
+            pool := pool - n * 2
+"}, 76)]
+#[case::between_its_write_in_the_block_and_a_later_write(indoc! {"
+    n := 0
+    for r in [1, 2, 3]:
+        with begin():
+            n := n + r
+            pool := pool - n
+        n := n + 10
+"}, 60)]
 fn a_block_reads_its_loops_accumulator_where_it_stands(#[case] code: &str, #[case] expected: i64) {
     check_scalar(
         &format!("pool: Mut(Int, Txn) := 100\n{code}\nawait_final(pool)\n"),
         Value::Int(expected),
     );
+}
+
+/// A block reads its loop's accumulator where it stands when a function call the loop makes
+/// writes the accumulator, before the call, after it, or between it and a later write.
+#[rstest]
+#[case::after_the_call(indoc! {"
+    c := 0
+    for r in [1, 2, 3]:
+        y = bump(c)
+        with begin():
+            pool := pool - c
+"}, 94)]
+#[case::before_the_call(indoc! {"
+    c := 0
+    for r in [1, 2, 3]:
+        with begin():
+            pool := pool - c
+        y = bump(c)
+"}, 97)]
+#[case::between_the_call_and_a_later_write(indoc! {"
+    c := 0
+    for r in [1, 2, 3]:
+        y = bump(c)
+        with begin():
+            pool := pool - c
+        c := c + 100
+"}, -206)]
+fn a_block_reads_an_accumulator_a_call_writes_where_it_stands(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    let bump = indoc! {"
+        def bump(p: Mut(Int)):
+            p := p + 1
+            p * 10
+    "};
+    check_scalar(
+        &format!("{bump}pool: Mut(Int, Txn) := 100\n{code}\nawait_final(pool)\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block reads an accumulator where it stands when a block writes the accumulator later in the
+/// iteration: a later block, or the block itself between two reads.
+#[rstest]
+#[case::written_by_a_later_block(indoc! {"
+    cnt := 0
+    a: Mut(Int, Txn) := 0
+    b: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        with begin():
+            a := a + cnt
+        with begin():
+            b := b + cnt
+            cnt := cnt + 1
+    await_final(a) * 100 + await_final(b)
+"}, 303)]
+#[case::written_between_two_reads_in_the_block(indoc! {"
+    cnt := 0
+    a: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        with begin():
+            a := a + cnt
+            cnt := cnt + 1
+            a := a + cnt * 100
+    await_final(a)
+"}, 603)]
+fn a_block_reads_an_accumulator_a_block_writes_where_it_stands(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A reply fed inside a block reads a loop-body binding and an accumulator where the block
+/// stands.
+#[rstest]
+#[case::a_loop_body_binding(indoc! {"
+    out = test_sink()
+    n: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        y = x * 10
+        with begin():
+            n := n + y
+            out << n + y
+"}, "[60, 50, 80]")]
+#[case::an_accumulator_written_after_the_block(indoc! {"
+    out = test_sink()
+    cnt := 0
+    a: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        with begin():
+            a := a + cnt
+            out << cnt
+        cnt := cnt + 1
+"}, "[0, 1, 2]")]
+#[case::an_accumulator_the_block_writes_after_the_reply(indoc! {"
+    out = test_sink()
+    cnt := 0
+    a: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        with begin():
+            a := a + cnt
+            out << cnt
+            cnt := cnt + 1
+"}, "[0, 1, 2]")]
+fn a_reply_in_a_block_reads_where_the_block_stands(#[case] code: &str, #[case] expected: &str) {
+    check_sink(code, expected);
 }
 
 /// A block in value position in a branch: its value is read where the block stands, at the

@@ -1372,6 +1372,23 @@ read, `𝑛′` declared around the loop, and the read renamed to `𝑛′`. `�
 nowhere else, so its view holds the value at the read, before the loop's later writes, between two
 of them, or after them all.
 
+A block that writes the accumulator itself takes the snapshot inside the block, just before the
+read. A read in a block sees the writes the block makes before it and none made after it, in the
+block or later in the iteration:
+
+```
+n := 0
+for r in [1, 2, 3]:
+    with begin():
+        n := n + r          # n is 1, 13, 26
+        pool := pool - n    # reads 1, 13, 26
+    n := n + 10             # n is 11, 23, 36 at the end of each iteration
+```
+
+Without the snapshot the read would see 11, 23, 36. A read that only feeds one of the block's
+writes of a loop variable, such as the `n` in `n := n + r`, needs no snapshot: `partition_block`
+moves that write out of the block, onto the loop just after it, and the read moves with it.
+
 The one engine subtlety is **driving** that broadcast to convergence. The final's `StoreFinalRead`
 is empty until the sibling loop's `InductionStore` drains (one position per body pull), and nothing
 external re-pulls the writer: the store's own convergence loop stops once the commit frontier
