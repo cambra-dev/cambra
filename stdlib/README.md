@@ -20,7 +20,7 @@ and `src/std.cambra` is `std`, the core module. `tests/` holds the programs that
 
 | Module | File | Used by | Holds |
 | -- | -- | -- | -- |
-| `std` | [src/std.cambra](src/std.cambra) | the prelude | `Option` with its methods `is_none`, `value` and `unwrap_or`, and the traits operators, loops and aggregates require, with their `@Builtin` instances for base types |
+| `std` | [src/std.cambra](src/std.cambra) | the prelude | `Option` with its methods `is_none`, `value` and `unwrap_or`, `Set`, `Map`, `FullMap`, and the traits and instances used by operators, loops, aggregates and subscripts |
 | `std::random` | [src/std/random.cambra](src/std/random.cambra) | `import std::random` | `next()`, a random `Int` read once per position |
 | `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, `alarms`, durations, and conversions to integer counts and Unix time |
 
@@ -34,9 +34,9 @@ and `src/std.cambra` is `std`, the core module. `tests/` holds the programs that
   language's own constructs answer or require, such as `Option` and `Addable`. The prelude imports
   them, so they read bare.
 - **`@Builtin` marks what the compiler implements.** The declaration states the member's type,
-  and the compiler supplies what CHL cannot state: a trait's answers beyond its instances, and an
-  instance's primitives ([9.16 The std root](../docs/chl-spec.md#916-the-std-root)). Only a std
-  module declares one, and only `std` a `@Builtin` trait or instance.
+  and the compiler supplies a representation, a trait rule, or an instance implementation
+  ([9.16 The std root](../docs/chl-spec.md#916-the-std-root)). Only a std module declares one,
+  and only `std` a `@Builtin` type, trait or instance.
 - **Every other module holds one concept, named by a noun:** `time`, `http`. A module's members
   read qualified, `time::now()`, so a member does not repeat the module's name: `time::alarms`, not
   `time::time_alarms`.

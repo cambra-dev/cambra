@@ -114,7 +114,9 @@ an instance per value. A family parameter's bound is a family itself:
   (`subst::family_bound_at`, `constrain_go`'s family-bound arm). A meet of the application and a
   type above that applied bound is the application. Otherwise, at a join or a meet with any other
   contribution, including an application of the family at other terms, the application is
-  widened to that applied bound (`relate_params_by_bounds`), as a bounded parameter is below.
+  widened to that applied bound (`relate_params_by_bounds`), as a bounded parameter is below. An
+  elimination on the edge reaches the bound, as it reaches a type parameter's (`eliminate_at`), so
+  a sum flows into a bound `_ |=> U`.
 - **Instantiating the scheme bounds the family's variable** at its own binders
   (`subst::family_at_names`), among the bounds each use checks, and so does each specialization
   clone of the definition (`specialize_use`).

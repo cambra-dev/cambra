@@ -24,7 +24,7 @@ A term quoted in a type, such as a predicate, a projection's term or a family's 
 own binders named, and two such terms compare with their interior binders paired by position
 ([Interior term binders stay named, and compare by position](type-inference.md#interior-term-binders-stay-named-and-compare-by-position)).
 
-`List`, `Set`, `Map` and `Collection` annotations are sums over a kind
+`List` and `Collection` are sums. The nominal `Set` and `Map` hold sums in their private constructors
 ([The six collection types](collections.md#the-six-collection-types)).
 
 ## What binds where

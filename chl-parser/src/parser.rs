@@ -1704,9 +1704,17 @@ where
             )
             .then_ignore(just(Token::Newline))
             .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
-            .then(choice((trait_stmt.clone(), impl_stmt.clone())))
+            .then(choice((
+                trait_stmt.clone(),
+                impl_stmt.clone(),
+                type_stmt.clone(),
+            )))
             .validate(|((builtin, keyword), stmt), e, emitter| {
                 let node = match stmt.node {
+                    Stmt::TypeDecl(mut decl) => {
+                        decl.builtin = Some(builtin);
+                        Stmt::TypeDecl(decl)
+                    }
                     Stmt::TraitDecl(mut decl) => {
                         decl.builtin = Some(builtin);
                         Stmt::TraitDecl(decl)
@@ -1718,8 +1726,8 @@ where
                     other => {
                         emitter.emit(Rich::custom(
                             builtin,
-                            "`@Builtin` decorates a `trait` or an `instance`; an `impl` block's \
-                             functions are written in CHL",
+                            "`@Builtin` decorates a `type`, a `trait` or an `instance`; an \
+                             `impl` block's functions are written in CHL",
                         ));
                         other
                     }
@@ -2025,6 +2033,8 @@ where
             )
             .then_ignore(just(Token::Dedent))
             .map(TypeDeclBody::Constructors),
+        // A `@Builtin` type has no body; lowering refuses one that is not `@Builtin`.
+        just(Token::Newline).to(TypeDeclBody::Builtin),
     ))
     .boxed();
     // A parameter with its kind, `T: K`, a family parameter's a kind arrow,
@@ -2052,6 +2062,7 @@ where
         .ignore_then(binder())
         .then(
             type_decl_param
+                .clone()
                 .separated_by(just(Token::Comma))
                 .at_least(1)
                 .allow_trailing()
@@ -2090,6 +2101,7 @@ where
                     params,
                     requires,
                     body,
+                    builtin: None,
                 }),
             )
         })
@@ -2251,22 +2263,24 @@ where
     // types an instance is for, spelled as a requirement is. A head with no block is an
     // instance of a trait with no functions, `instance Equatable(Money, Money)`. An
     // instance's type variables are declared before its head,
-    // `instance forall (T) Area(Two(T))`; each is a capitalized name.
+    // `instance forall (T) Area(Two(T))`; each is a capitalized name, and a family over a
+    // value declares its kind, `V: K => Type`.
     let instance_vars = just(Token::Forall)
         .ignore_then(
-            binder()
-                .validate(|name, _, emitter| {
-                    if !is_type_name(&name.node) {
+            type_decl_param
+                .clone()
+                .validate(|param, _, emitter| {
+                    if !is_type_name(&param.name) {
                         emitter.emit(Rich::custom(
-                            name.span,
+                            param.name_span,
                             format!(
                                 "type variable `{}` begins with a lowercase letter; it names \
                              a type, so it is capitalized",
-                                name.node
+                                param.name
                             ),
                         ));
                     }
-                    name
+                    param
                 })
                 .separated_by(just(Token::Comma))
                 .at_least(1)
@@ -4291,7 +4305,7 @@ mod tests {
         assert!(
             errors.iter().any(|e| e
                 .to_string()
-                .contains("`@Builtin` decorates a `trait` or an `instance`")),
+                .contains("`@Builtin` decorates a `type`, a `trait` or an `instance`")),
             "{errors:?}"
         );
     }

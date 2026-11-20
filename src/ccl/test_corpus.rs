@@ -68,7 +68,7 @@ pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
         ),
         (
             "group_by",
-            "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]\n"
+            "[sum(x) for _ -> x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]\n"
                 .to_string(),
         ),
         (

@@ -441,7 +441,7 @@ fn a_collection_keyed_by_strings() {
             (region="east", amount=3),
         ]
         out = test_sink()
-        out << [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
+        out << [sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)]
     "#});
     let Value::Function(fed) = v.expect("a value") else {
         panic!("a collection");

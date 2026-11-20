@@ -608,7 +608,8 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 /// - a projection out of a tuple or record former reads the component;
 /// - a `match` over a constructor's value reads the arm it selects ([`known_constructor`]); a
 ///   variant projection reads as the one-arm `match` it compiles ([`projection_as_match`]), and
-///   `𝑥 ▷ variant_wrap(𝑡)` as the constructor `` `𝑡(𝑥) ``.
+///   `𝑥 ▷ variant_wrap(𝑡)` as the constructor `` `𝑡(𝑥) ``;
+/// - a key read of `𝑚 ▷ map_domain` is the key, and of `𝑚 ▷ entries` the key beside `𝑚` at it.
 ///
 /// The result is compared without type slots. Read-back keeps a collection's domain filter as
 /// a cast, since its keys are part of its value; other type slots ride along as metadata.
@@ -814,6 +815,11 @@ fn reduce_application(
                 } else {
                     mapped
                 })
+            }
+            // A collection's entries hold each key beside its value.
+            TypedExprNode::Builtin(Builtin::Entries) => {
+                let value = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+                Some(Expr::throwaway(TypedExprNode::Tuple(vec![a(), value])).with_ty(ty.clone()))
             }
             // `zip` fans its input out to each component, of a tuple or of a record.
             TypedExprNode::Builtin(Builtin::Zip) => {
@@ -4119,6 +4125,40 @@ mod tests {
         assert!(
             disjoint_join_gap(&[leg("s", "some"), leg("t", "none")])
                 .is_some_and(|gap| gap.contains("different scrutinees"))
+        );
+    }
+
+    #[test]
+    fn nested_projections_distinguish_legs_at_any_shared_scrutinee() {
+        let leg = |outer: &str, lookup: &str, inner: &str| {
+            Expr::compose(vec![
+                Expr::var("s"),
+                Expr::builtin(Builtin::VariantProject(FieldKey::Name(outer.into()))),
+                Expr::var(lookup),
+                Expr::builtin(Builtin::VariantProject(FieldKey::Name(inner.into()))),
+            ])
+        };
+        assert_eq!(
+            disjoint_join_gap(&[leg("rep", "lookup", "some"), leg("rep", "lookup", "none")]),
+            None
+        );
+        assert_eq!(
+            disjoint_join_gap(&[
+                leg("left", "lookup", "some"),
+                leg("right", "lookup", "some")
+            ]),
+            None
+        );
+        assert!(
+            disjoint_join_gap(&[leg("rep", "lookup", "some"), leg("rep", "lookup", "some"),])
+                .is_some()
+        );
+        assert!(
+            disjoint_join_gap(&[
+                leg("rep", "one_lookup", "some"),
+                leg("rep", "another_lookup", "none"),
+            ])
+            .is_some()
         );
     }
 

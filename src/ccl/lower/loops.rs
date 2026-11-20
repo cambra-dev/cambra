@@ -208,15 +208,16 @@ pub(super) fn lower_generator_for(
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
             lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
         })?;
-        Ok(tagged_for_loop(
-            iter_var,
-            target.span,
-            source,
-            for_body,
-            for_span,
-            ctx,
-        ))
+        let inner = tagged_for_loop(iter_var, target.span, source, for_body, for_span, ctx);
+        Ok(loop_statement(inner, for_span, ctx))
     }
+}
+
+/// Discard a feed-only loop's mapped value. The collection carries its feeds, while a loop
+/// in statement position has a Unit value, including where a guard's other arm is Unit.
+fn loop_statement(inner: Expr, span: Span, ctx: &mut LoweringContext) -> Expr {
+    let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "lower.loop_unit");
+    ctx.tag_machinery(Expr::expr_stmt(inner, unit), span, "lower.stmt_seq")
 }
 
 /// Build the `Compose([source, Lambda(iter_var, body)])` loop encoding (the
@@ -475,6 +476,24 @@ fn lower_for_body_stmts(
     // A loop body is a block, so it declares its own type aliases.
     with_block_type_aliases(stmts, ctx, |ctx| {
         lower_for_body_stmts_scoped(stmts, defer_name, mutation_scope, frame_introduced, ctx)
+    })
+}
+
+/// A conditional branch discards a terminal loop's driver collection. Keeping the driver
+/// inside an ordinary loop nest preserves its positional structure for read naming.
+fn lower_for_branch_stmts(
+    stmts: &[Spanned<ChlStmt>],
+    defer_name: Option<&str>,
+    mutation_scope: &HashSet<String>,
+    frame_introduced: HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let body = lower_for_body_stmts(stmts, defer_name, mutation_scope, frame_introduced, ctx)?;
+    Ok(match contributing_stmts(stmts).next_back() {
+        Some((_, last)) if matches!(last.node, ChlStmt::For { .. }) => {
+            loop_statement(body, last.span, ctx)
+        }
+        _ => body,
     })
 }
 
@@ -874,7 +893,7 @@ fn lower_for_body_stmt(
                 let cond = lower_expr(&branch.cond, ctx)?;
                 // Same frame: pass through mutation_scope and frame_introduced
                 // unchanged so the iter_var remains shadowable inside the guard.
-                let arm = lower_for_body_stmts(
+                let arm = lower_for_branch_stmts(
                     &branch.body,
                     defer_name,
                     mutation_scope,
@@ -894,7 +913,7 @@ fn lower_for_body_stmt(
             // `Machinery` (last tag wins) — so only the `Unit` synthesized to
             // stand in for a missing `else` is tagged.
             let fallthrough = match else_body {
-                Some(else_body) => lower_for_body_stmts(
+                Some(else_body) => lower_for_branch_stmts(
                     else_body,
                     defer_name,
                     mutation_scope,
@@ -967,7 +986,7 @@ fn lower_for_body_stmt(
             mutation_scope,
             ctx,
             |body, scope, ctx| {
-                lower_for_body_stmts(body, defer_name, scope, frame_introduced.clone(), ctx)
+                lower_for_branch_stmts(body, defer_name, scope, frame_introduced.clone(), ctx)
             },
         ),
         // A `with begin():` transaction as a *generator* loop-body terminal is a
@@ -2103,7 +2122,7 @@ mod tests {
             cross_filtered"#},
         indoc::indoc! {r#"
             let cross_filtered : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
-            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
+            in __arg_tuple_1.0 ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); unit; true → unit }); __result_0
             in cross_filtered"#}
     )]
     // Let-binding in generator body: y is a fresh local per iteration.

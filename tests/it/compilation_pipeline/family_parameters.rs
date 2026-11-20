@@ -37,10 +37,10 @@ const SUM_GROUPS: &str = indoc! {"
 #[test]
 fn a_family_parameter_carries_a_dependent_payload() {
     for value in [
-        r"gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))",
-        r"gs: Groups(_, _) = Groups::new(groupby([1, 2, 3], \x -> x > 1))",
-        r"gs: Groups(_, \k -> _ |=> Int) = Groups::new(groupby([1, 2, 3], \x -> x > 1))",
-        r"gs: Groups(_, \k: _ -> _ |=> Int) = Groups::new(groupby([1, 2, 3], \x -> x > 1))",
+        r"gs = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])",
+        r"gs: Groups(_, _) = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])",
+        r"gs: Groups(_, \k -> _ |=> Int) = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])",
+        r"gs: Groups(_, \k: _ -> _ |=> Int) = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])",
     ] {
         check_scalar(&format!("{GROUPS}{value}\n{SUM_GROUPS}"), Value::Int(6));
     }
@@ -52,7 +52,7 @@ fn a_parameter_after_a_family_parameter() {
     check_scalar(
         indoc! {r#"
             type P(K, V: K => Type, W) = {(k: K) |=> V(k), W}
-            p = P::new((groupby([1, 2, 3], \x -> x > 1), 10))
+            p = P::new(([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)], 10))
             match p:
                 case P::new(pair):
                     sum([sum(grp) for grp in pair.0]) + pair.1
@@ -69,7 +69,7 @@ fn a_family_parameter_is_passed_on() {
             "{GROUPS}{}",
             indoc! {r#"
                 type Outer(K, V: K => Type) = Groups(K, V)
-                o = Outer::new(Groups::new(groupby([1, 2, 3], \x -> x > 1)))
+                o = Outer::new(Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)]))
                 match o:
                     case Outer::new(gs):
                         match gs:
@@ -90,7 +90,7 @@ fn a_family_parameter_is_a_full_map_s_value_type() {
             g = G::new(groupby([1, 2, 3], \x -> x > 1))
             match g:
                 case G::new(m):
-                    sum([sum(grp) for grp in m])
+                    sum([sum(grp) for _ -> grp in m])
         "#},
         Value::Int(6),
     );
@@ -104,7 +104,7 @@ fn a_family_parameter_of_a_type_with_several_constructors() {
             type Grouped(K, V: K => Type):
                 some((k: K) |=> V(k))
                 empty
-            m = Grouped::some(groupby([1, 2, 3], \x -> x > 1))
+            m = Grouped::some([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
             match m:
                 case Grouped::some(g):
                     sum([sum(grp) for grp in g])
@@ -122,7 +122,7 @@ fn two_applications_relate_their_families() {
         &format!(
             "{GROUPS}{}{SUM_GROUPS}",
             indoc! {r#"
-                a: Groups(_, _) = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                a: Groups(_, _) = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
                 gs: Groups(_, _) = a
             "#}
         ),
@@ -166,7 +166,7 @@ fn a_parameter_of_a_type_with_a_family_parameter() {
                         match gs:
                             case Groups::new(g):
                                 sum([sum(grp) for grp in g])
-                    t(Groups::new(groupby([1, 2, 3], \x -> x > 1)))
+                    t(Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)]))
                 "#}
             ),
             Value::Int(6),
@@ -180,7 +180,7 @@ fn a_full_map_takes_a_written_family() {
     check_scalar(
         indoc! {r#"
             g: FullMap(_, \k -> _ |=> Int) = groupby([1, 2, 3], \x -> x > 1)
-            sum([sum(grp) for grp in g])
+            sum([sum(grp) for _ -> grp in g])
         "#},
         Value::Int(6),
     );
@@ -192,13 +192,13 @@ fn a_full_map_takes_a_written_family() {
 fn a_function_type_names_its_domain_s_value_in_an_annotation() {
     for program in [
         indoc! {r#"
-            g: (k: _) |=> (_ |=> Int) = groupby([1, 2, 3], \x -> x > 1)
+            g: (k: _) |=> (_ |=> Int) = [grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)]
             sum([sum(grp) for grp in g])
         "#},
         indoc! {r#"
             def f(g: (k: _) |=> (_ |=> Int)) => Int:
                 sum([sum(grp) for grp in g])
-            f(groupby([1, 2, 3], \x -> x > 1))
+            f([grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)])
         "#},
     ] {
         check_scalar(program, Value::Int(6));
@@ -241,7 +241,7 @@ fn a_constant_family_s_holes_read_no_binder(#[case] groups: &str) {
         &format!(
             "{groups}{}",
             indoc! {r#"
-                gs: Groups(_, _ |=> Int) = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                gs: Groups(_, _ |=> Int) = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
                 1
             "#}
         ),
@@ -258,8 +258,8 @@ fn a_constant_family_s_holes_read_no_binder(#[case] groups: &str) {
 #[case::in_one_declaration(
     indoc! {r#"
         type Two(K, V: K => Type) = {(k: K) |=> V(k), (j: K) |=> V(j)}
-        g = groupby([1, 2, 3], \x -> x > 1)
-        h = groupby([1, 2, 3], \x -> x > 1)
+        g = [grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)]
+        h = [grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)]
         t = Two::new((g, h))
         match t:
             case Two::new(p):
@@ -271,8 +271,8 @@ fn a_constant_family_s_holes_read_no_binder(#[case] groups: &str) {
     indoc! {r#"
         type G2(K, V: K => Type) = (k: K) |=> V(k)
         type Pair(K, V: K => Type) = {G2(K, V), G2(K, V)}
-        g = groupby([1, 2, 3], \x -> x > 1)
-        h = groupby([1, 2, 3], \x -> x > 1)
+        g = [grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)]
+        h = [grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)]
         t = Pair::new((G2::new(g), G2::new(h)))
         match t:
             case Pair::new(p):
@@ -292,8 +292,8 @@ fn a_family_applied_at_two_sites_over_two_domains_is_refused() {
     check_compile_error(
         indoc! {r#"
             type Two(K, V: K => Type) = {(k: K) |=> V(k), (j: K) |=> V(j)}
-            g = groupby([1, 2, 3], \x -> x > 1)
-            h = groupby([1, 2, 3, 4], \x -> x > 1)
+            g = [grp for _ -> grp in groupby([1, 2, 3], \x -> x > 1)]
+            h = [grp for _ -> grp in groupby([1, 2, 3, 4], \x -> x > 1)]
             t = Two::new((g, h))
             1
         "#},
@@ -314,7 +314,7 @@ fn an_annotation_mismatch_writes_the_inferred_family() {
         check_compile_error(
             &indoc::formatdoc!(
                 r#"
-                    {GROUPS}gs: {annotation} = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                    {GROUPS}gs: {annotation} = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
                     {then}"#
             ),
             "inferred as Groups({Bool where _ in [1 > 1, 2 > 1, 3 > 1]}, \\k: {Bool where _ in \
@@ -489,7 +489,7 @@ fn a_kind_naming_its_value_is_the_kind_without_the_name() {
             "{GROUPS}{}",
             indoc! {r#"
                 type Named(K, V: (k: K) => Type) = Groups(K, V)
-                n = Named::new(Groups::new(groupby([1, 2, 3], \x -> x > 1)))
+                n = Named::new(Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)]))
                 match n:
                     case Named::new(gs):
                         match gs:
@@ -510,11 +510,11 @@ fn a_nested_group_by_is_a_family() {
         &format!(
             "{GROUPS}{}",
             indoc! {r#"
-                nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+                nested = [groupby(grp, \x -> x > 3) for _ -> grp in groupby([1, 2, 3, 4], \x -> x > 2)]
                 gs = Groups::new(nested)
                 match gs:
                     case Groups::new(n):
-                        sum([sum([sum(inner) for inner in outer]) for outer in n])
+                        sum([sum([sum(inner) for _ -> inner in outer]) for outer in n])
             "#}
         ),
         Value::Int(10),
@@ -532,7 +532,7 @@ fn a_method_a_family_type_does_not_declare_names_the_type() {
                 type Price = Int
                 def Price::cents(self) => Int:
                     self.extract()
-                gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                gs = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
                 gs.cents()
             "#}
         ),
@@ -549,14 +549,14 @@ fn a_value_differing_with_a_binder_does_not_fit_a_plain_parameter() {
         (
             indoc! {r#"
                 type M(K, V) = (k: K) |=> V
-                M::new(groupby([1, 2, 3], \x -> x > 1))
+                M::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
             "#},
             "`V` is one type for every `k`, and the value given for it differs with `k`",
         ),
         (
             indoc! {r#"
                 type M(K, V) = K |=> V
-                M::new(groupby([1, 2, 3], \x -> x > 1))
+                M::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
             "#},
             "`V` is one type for every key of the collection it is part of",
         ),
@@ -571,7 +571,7 @@ fn a_value_differing_with_a_binder_does_not_fit_a_plain_parameter() {
         (
             indoc! {r#"
                 type Pairs(A, B, V: {A, B} => Type) = (a: A) |=> (b: B) |=> V(a, b)
-                nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+                nested = [[g for _ -> g in groupby(grp, \x -> x > 3)] for _ -> grp in groupby([1, 2, 3, 4], \x -> x > 2)]
                 Pairs::new(nested)
             "#},
             "`B` is one type for every `a`, and the value given for it differs with `a`",
@@ -589,7 +589,7 @@ fn a_function_takes_a_family_parameter() {
         indoc! {r#"
             def same(K, V: K => Type, g: FullMap(K, V)) => FullMap(K, V):
                 g
-            sum([sum(grp) for grp in same(groupby([1, 2, 3], \x -> x > 1))])
+            sum([sum(grp) for _ -> grp in same(groupby([1, 2, 3], \x -> x > 1))])
         "#},
         Value::Int(6),
     );
@@ -599,7 +599,7 @@ fn a_function_takes_a_family_parameter() {
             indoc! {r#"
                 def first(K, V: K => Type, a: Groups(K, V), b: Groups(K, V)) => Groups(K, V):
                     a
-                g = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                g = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
                 gs = first(g, g)
             "#}
         ),
@@ -614,7 +614,7 @@ fn a_polymorphic_type_takes_a_family_parameter() {
         &format!(
             "{GROUPS}{}{SUM_GROUPS}",
             indoc! {r#"
-                wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) = \g -> Groups::new(g)
+                wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) = \g -> Groups::new([grp for _ -> grp in g])
                 gs = wrap(groupby([1, 2, 3], \x -> x > 1))
             "#}
         ),
@@ -627,11 +627,11 @@ fn a_polymorphic_type_takes_a_family_parameter() {
 #[rstest]
 #[case::kind(
     r"wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) = \g -> 1",
-    r"annotated as forall (K, V: K => Type) ((k: K) |=> V(k)) => Groups(K, \k: K -> V(k))"
+    r"annotated as forall (K, V: K => Type) FullMap(K, \k: K -> V(k)) => Groups(K, \k: K -> V(k))"
 )]
 #[case::bound(
     r"wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) requires forall (k: K) V(k) <: _ |=> Int = \g -> 1",
-    r"annotated as forall (K, V: K => Type) ((k: K) |=> V(k)) => Groups(K, \k: K -> V(k)) requires forall (k: K) V(k) <: _ |=> Int"
+    r"annotated as forall (K, V: K => Type) FullMap(K, \k: K -> V(k)) => Groups(K, \k: K -> V(k)) requires forall (k: K) V(k) <: _ |=> Int"
 )]
 fn a_polymorphic_type_writes_its_family_parameter_s_kind(
     #[case] annotation: &str,
@@ -663,7 +663,7 @@ fn values_at_two_keys_join_at_the_family_s_bound(
 ) {
     check_scalar(
         &formatdoc! {"
-            def pick(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) {bound}:
+            def pick(K, V: K => Type, g: (k: K) |=> V(k), c: Bool) => Int requires forall (k: K) {bound}:
                 {body}
             pick({map}, 1 > 0)
         "},
@@ -676,7 +676,7 @@ fn values_at_two_keys_join_at_the_family_s_bound(
 fn values_at_two_keys_of_an_unbounded_family_have_no_common_type() {
     check_compile_error(
         indoc! {"
-            def pick(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int:
+            def pick(K, V: K => Type, g: (k: K) |=> V(k), c: Bool) => Int:
                 pairs = [[(g1 if c else g2) for g2 in g] for g1 in g]
                 1
             pick([1, 2], 1 > 0)
@@ -692,7 +692,7 @@ fn a_family_parameter_is_opaque_in_its_function() {
     check_compile_error(
         indoc! {r#"
             def total(K, V: K => Type, g: FullMap(K, V)) => Int:
-                sum([sum(grp) for grp in g])
+                sum([sum(grp) for _ -> grp in g])
             total(groupby([1, 2, 3], \x -> x > 1))
         "#},
         "Expected a function, found V(k)",
@@ -707,7 +707,7 @@ fn a_family_parameter_is_opaque_in_its_function() {
 #[case::one_call(
     indoc! {r#"
         def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
-            sum([sum(grp) for grp in g])
+            sum([sum(grp) for _ -> grp in g])
         total(groupby([1, 2, 3], \x -> x > 1))
     "#},
     6
@@ -715,7 +715,7 @@ fn a_family_parameter_is_opaque_in_its_function() {
 #[case::two_calls_over_different_keys(
     indoc! {r#"
         def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
-            sum([sum(grp) for grp in g])
+            sum([sum(grp) for _ -> grp in g])
         total(groupby([1, 2, 3], \x -> x > 1)) + total(groupby([10, 20, 30, 40], \x -> x // 20))
     "#},
     106
@@ -723,7 +723,7 @@ fn a_family_parameter_is_opaque_in_its_function() {
 #[case::in_a_group(
     indoc! {r#"
         def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (V(k) <: _ |=> Int):
-            sum([sum(grp) for grp in g])
+            sum([sum(grp) for _ -> grp in g])
         total(groupby([1, 2, 3], \x -> x > 1))
     "#},
     6
@@ -731,14 +731,14 @@ fn a_family_parameter_is_opaque_in_its_function() {
 #[case::a_kind_naming_its_value(
     indoc! {r#"
         def total(K, V: (k: K) => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
-            sum([sum(grp) for grp in g])
+            sum([sum(grp) for _ -> grp in g])
         total(groupby([1, 2, 3], \x -> x > 1))
     "#},
     6
 )]
 #[case::a_polymorphic_annotation(
     indoc! {r#"
-        total: forall (K, V: K => Type) FullMap(K, V) => Int requires forall (k: K) V(k) <: _ |=> Int = \g -> sum([sum(grp) for grp in g])
+        total: forall (K, V: K => Type) FullMap(K, V) => Int requires forall (k: K) V(k) <: _ |=> Int = \g -> sum([sum(grp) for _ -> grp in g])
         total(groupby([1, 2, 3], \x -> x > 1)) + total(groupby([4, 5], \x -> x > 4))
     "#},
     15
@@ -746,7 +746,7 @@ fn a_family_parameter_is_opaque_in_its_function() {
 #[case::two_families_in_one_group(
     indoc! {r#"
         def total(K, V: K => Type, W: K => Type, g: FullMap(K, V), h: FullMap(K, W)) => Int requires forall (k: K) (V(k) <: _ |=> Int, W(k) <: _ |=> Int):
-            sum([sum(grp) for grp in g]) + sum([sum(grp) for grp in h])
+            sum([sum(grp) for _ -> grp in g]) + sum([sum(grp) for _ -> grp in h])
         g = groupby([1, 2, 3], \x -> x > 1)
         total(g, g)
     "#},
@@ -770,7 +770,7 @@ fn a_value_outside_a_family_parameter_s_bound_is_refused() {
     check_compile_error(
         indoc! {r#"
             def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
-                sum([sum(grp) for grp in g])
+                sum([sum(grp) for _ -> grp in g])
             total(groupby(["a", "bb"], \x -> x == "a"))
         "#},
         "expected Int, found String",
@@ -787,7 +787,7 @@ fn a_family_parameter_ends_with_its_function() {
                 g
             def keep(V, x: V) => V:
                 x
-            keep(1) + sum([sum(grp) for grp in same(groupby([1, 2, 3], \x -> x > 1))])
+            keep(1) + sum([sum(grp) for _ -> grp in same(groupby([1, 2, 3], \x -> x > 1))])
         "#},
         Value::Int(7),
     );
@@ -932,18 +932,6 @@ fn a_functions_family_parameter_errors_name_what_is_wrong() {
     }
 }
 
-#[test]
-fn a_join_of_family_values_does_not_retain_one_keys_type() {
-    check_compile_error(
-        indoc! {"
-            def pick(K, V: K => Type, g: (k: K) |=> V(k), c: Bool) => (k: K) |=> (j: K) |=> V(k) requires forall (k: K) V(k) <: Int:
-                [[(g1 if c else g2) for g2 in g] for g1 in g]
-            pick([1, 2], 1 > 0)
-        "},
-        "inferred as K |=> K |=> Int",
-    );
-}
-
 /// A nominal type a module makes `Iterable`, whose `Elements` is the list it wraps.
 const BAG: &str = indoc! {"
     type Bag = List(Int)
@@ -964,7 +952,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 #[rstest]
 #[case::a_nominal_type_s_instance(
     indoc! {"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum([x for x in grp]) for grp in g])
     "},
     &format!("total({BAGS})"),
@@ -972,7 +960,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 )]
 #[case::an_unnamed_requirement(
     indoc! {"
-        def count(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) Iterable(V(k)):
+        def count(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) Iterable(V(k)):
             sum([sum([1 for x in grp]) for grp in g])
     "},
     &format!("count({BAGS})"),
@@ -980,17 +968,17 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 )]
 #[case::a_structural_collection(
     indoc! {"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum([x for x in grp]) for grp in g])
     "},
-    r"total(groupby([1, 2, 3], \x -> x > 1))",
+    r"total([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])",
     6
 )]
 #[case::a_use_under_the_requirement(
     indoc! {"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum([x for x in grp]) for grp in g])
-        def twice(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def twice(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             total(g) + total(g)
     "},
     &format!("twice({BAGS})"),
@@ -998,7 +986,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 )]
 #[case::a_built_in_trait(
     indoc! {"
-        def double(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (a: Addable(V(k), V(k)), a::Output <: Int):
+        def double(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (a: Addable(V(k), V(k)), a::Output <: Int):
             sum([x + x for x in g])
     "},
     "double([1, 2, 3])",
@@ -1014,7 +1002,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 )]
 #[case::under_a_bound_on_the_family_s_values(
     indoc! {"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (V(k) <: Bag, i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (V(k) <: Bag, i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum([x for x in grp]) for grp in g])
     "},
     &format!("total({BAGS})"),
@@ -1027,7 +1015,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
             Elements = List(Bag)
             def elements(b):
                 b.extract()
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Bag):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Bag):
             sum([sum([sum(b.extract()) for b in grp]) for grp in g])
     "},
     "total([Bags::new(box([Bag::new(box([1, 2]))])), Bags::new(box([Bag::new(box([3]))]))])",
@@ -1035,7 +1023,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 )]
 #[case::read_in_a_lambda(
     indoc! {r"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([(\y -> sum([x for x in grp]) + y)(1) for grp in g])
     "},
     &format!("total({BAGS})"),
@@ -1043,7 +1031,7 @@ const BAGS: &str = "[Bag::new(box([1, 2])), Bag::new(box([3]))]";
 )]
 #[case::one_group_reached_through_both_arms(
     indoc! {"
-        def total(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum([x for x in (grp if c else grp)]) for grp in g])
     "},
     &format!("total({BAGS}, 1 > 0)"),
@@ -1100,7 +1088,7 @@ fn a_trait_requirement_under_forall_holds_at_every_value(
 #[case::a_value_with_no_instance(
     indoc! {"
         type Bag = List(Int)
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum([x for x in grp]) for grp in g])
         total([Bag::new(box([1, 2])), Bag::new(box([3]))])
     "},
@@ -1108,15 +1096,15 @@ fn a_trait_requirement_under_forall_holds_at_every_value(
 )]
 #[case::a_body_using_another_trait(
     indoc! {r"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) Equatable(V(k), V(k)):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) Equatable(V(k), V(k)):
             sum([sum([x for x in grp]) for grp in g])
-        total(groupby([1, 2, 3], \x -> x > 1))
+        total([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
     "},
     "No requirement states that `V` is Iterable"
 )]
 #[case::an_instance_read_outside_its_forall(
     indoc! {r"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
             sum([sum(i::elements(grp)) for grp in g])
         1
     "},
@@ -1129,7 +1117,7 @@ fn a_trait_requirement_under_forall_holds_at_every_value(
             Elements = List(Bag)
             def elements(b):
                 b.extract()
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (i: Iterable(V(k))):
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) (i: Iterable(V(k))):
             sum([sum([sum(b.extract()) for b in grp]) for grp in g])
         total([Bags::new(box([Bag::new(box([1, 2]))])), Bags::new(box([Bag::new(box([3]))]))])
     "}),
@@ -1146,7 +1134,7 @@ fn a_requirement_under_forall_errors_name_what_is_wrong(#[case] code: &str, #[ca
 /// Groups at two keys meeting where the body iterates them: values of a family at two
 /// different keys have no common type but the bound on its values.
 const TWO_GROUPS: &str = indoc! {"
-    def pick(K, V: K => Type, g: FullMap(K, V), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
+    def pick(K, V: K => Type, g: (k: K) |=> V(k), c: Bool) => Int requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int):
         sum([sum([sum([x for x in (g1 if c else g2)]) for g2 in g]) for g1 in g])
     pick([Bag::new(box([1, 2])), Bag::new(box([3]))], 1 > 0)
 "};
@@ -1182,11 +1170,11 @@ fn a_polymorphic_type_writes_a_trait_requirement_under_forall() {
 
 /// A loop over a family's value iterates the bound on its values, a sum among them.
 #[rstest]
-#[case::a_group_by(r"total(groupby([1, 2, 3], \x -> x > 1))", 6)]
+#[case::a_group_by(r"total([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])", 6)]
 #[case::sums(r"total([box([1, 2]), box([3])])", 6)]
 fn a_loop_over_a_family_s_value_reads_its_bound(#[case] call: &str, #[case] expected: i64) {
     let def = indoc! {"
-        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+        def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) V(k) <: _ |=> Int:
             sum([sum([x for x in grp]) for grp in g])
     "};
     check_scalar(&format!("{def}{call}\n"), Value::Int(expected));
@@ -1200,7 +1188,7 @@ fn a_loop_over_a_family_s_value_reads_its_bound(#[case] call: &str, #[case] expe
 fn an_element_of_a_family_s_value_is_typed_through_its_bound(#[case] bound: &str) {
     check_scalar(
         &formatdoc! {"
-            def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: {bound}:
+            def total(K, V: K => Type, g: (k: K) |=> V(k)) => Int requires forall (k: K) V(k) <: {bound}:
                 sum([sum([b + 1 for b in grp]) for grp in g])
             total([box([1, 2]), box([3])])
         "},
@@ -1222,7 +1210,7 @@ const ITERABLE_GROUPS: &str = "type Groups(K, V: K => Type) requires forall (k: 
 #[case::a_constructor_call(
     BOUNDED_GROUPS,
     indoc! {r"
-        gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+        gs = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
         match gs:
             case Groups::new(g):
                 sum([sum(grp) for grp in g])
@@ -1232,7 +1220,7 @@ const ITERABLE_GROUPS: &str = "type Groups(K, V: K => Type) requires forall (k: 
 #[case::an_annotation(
     BOUNDED_GROUPS,
     indoc! {r"
-        gs: Groups(_, _) = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+        gs: Groups(_, _) = Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
         match gs:
             case Groups::new(g):
                 sum([sum(grp) for grp in g])
@@ -1246,7 +1234,7 @@ const ITERABLE_GROUPS: &str = "type Groups(K, V: K => Type) requires forall (k: 
             match gs:
                 case Groups::new(g):
                     sum([sum([x for x in grp]) for grp in g])
-        total(Groups::new(groupby([1, 2, 3], \x -> x > 1)))
+        total(Groups::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)]))
     "},
     6
 )]
@@ -1281,7 +1269,7 @@ fn a_type_declaration_s_requirements_hold_at_every_application(
 #[rstest]
 #[case::a_constructor_call_outside_the_bound(
     BOUNDED_GROUPS,
-    r#"Groups::new(groupby(["a", "bb"], \x -> x == "a"))"#,
+    r#"Groups::new([g for _ -> g in groupby(["a", "bb"], \x -> x == "a")])"#,
     "expected Int, found String"
 )]
 #[case::a_constructor_call_with_no_instance(
@@ -1302,7 +1290,7 @@ fn a_type_declaration_s_requirements_hold_at_every_application(
 )]
 #[case::a_let_annotation_outside_the_bound(
     BOUNDED_GROUPS,
-    r#"gs: Groups(Bool, \k -> _ |=> String) = Groups::new(groupby(["a"], \x -> x == "a"))"#,
+    r#"gs: Groups(Bool, \k -> _ |=> String) = Groups::new([g for _ -> g in groupby(["a"], \x -> x == "a")])"#,
     "`Groups(Bool, _ |=> String)` passes `V` a family whose values are not below the bound"
 )]
 #[case::an_annotation_with_no_instance(
@@ -1366,6 +1354,18 @@ fn quantified_satisfiability_preserves_repeated_family_applications() {
         "};
         check_compile_error(&code, "no instance of `Apart` accepts");
     }
+}
+
+#[test]
+fn a_join_of_family_values_does_not_retain_one_keys_type() {
+    check_compile_error(
+        indoc! {"
+            def pick(K, V: K => Type, g: (k: K) |=> V(k), c: Bool) => (k: K) |=> (j: K) |=> V(k) requires forall (k: K) V(k) <: Int:
+                [[(g1 if c else g2) for g2 in g] for g1 in g]
+            pick([1, 2], 1 > 0)
+        "},
+        "inferred as K |=> K |=> Int",
+    );
 }
 
 #[test]
