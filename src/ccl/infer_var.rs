@@ -1132,6 +1132,7 @@ impl InferVar {
 
     /// The bounds, for recording more.
     pub fn bounds_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut InferBounds {
+        solver.note_bounds_write(self);
         &mut solver.infer_state_mut(self).bounds
     }
 

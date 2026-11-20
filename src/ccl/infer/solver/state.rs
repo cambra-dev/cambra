@@ -19,7 +19,7 @@ use crate::ccl::capabilities::{
     CapabilityRun, CapabilityState, CapabilityVar, OrderableIfRequiredBy, OrderingState,
 };
 use crate::ccl::infer_var::{
-    BarrierState, BarrierVar, InferState, InferVar, InferVarId, SuspendedMemberships,
+    BarrierState, BarrierVar, InferBounds, InferState, InferVar, InferVarId, SuspendedMemberships,
 };
 use crate::ccl::ty::{FunKindState, FunKindVar};
 
@@ -167,6 +167,56 @@ impl<H: Handle, S: Default> Table<H, S> {
             _ => self.foreign.entry(handle.key()).or_default(),
         }
     }
+
+    /// Where `handle`'s state is held.
+    fn slot(&self, solver: SolverId, handle: &H) -> Slot {
+        match handle.home() {
+            Some(home) if home.solver == solver => Slot::Owned(home.slot),
+            _ => Slot::Foreign(handle.key()),
+        }
+    }
+
+    fn at_slot_mut(&mut self, slot: Slot) -> &mut S {
+        match slot {
+            Slot::Owned(slot) => &mut self.owned[slot as usize],
+            Slot::Foreign(key) => self.foreign.entry(key).or_default(),
+        }
+    }
+}
+
+/// Where a [`Table`] holds a handle's state: an owned slot, or a foreign handle's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot {
+    Owned(u32),
+    Foreign(u32),
+}
+
+/// The bounds each inference variable an edge wrote held before the edge
+/// ([`Solver::set_aside_bounds`]): what a message about the edge reads, where a failed edge
+/// leaves bounds it recorded before failing (`src/ccl/design/type-inference.md`, "An
+/// annotation mismatch shows the type before the edge").
+pub(crate) struct BoundsBefore(HashMap<Slot, InferBounds>);
+
+impl BoundsBefore {
+    /// `read` run with each variable's bounds as they stood before the edge; the bounds recorded
+    /// since are back in place when it returns.
+    pub(crate) fn read<R>(
+        &mut self,
+        solver: &mut Solver,
+        read: impl FnOnce(&mut Solver) -> R,
+    ) -> R {
+        self.swap(solver);
+        let result = read(solver);
+        self.swap(solver);
+        result
+    }
+
+    fn swap(&mut self, solver: &mut Solver) {
+        for (slot, bounds) in &mut self.0 {
+            std::mem::swap(&mut solver.infer.at_slot_mut(*slot).bounds, bounds);
+        }
+        solver.revisions.infer += 1;
+    }
 }
 
 /// One typing run's state: every variable's recorded facts, and the facts that belong to the
@@ -236,6 +286,9 @@ pub struct Solver {
     /// ([`crate::ccl::infer::solver::traits::Held`]), which
     /// [`crate::ccl::infer::solver::traits::settle_held_answers`] deposits.
     pub(crate) held_answers: Vec<Rc<crate::ccl::infer::solver::traits::TraitObligation>>,
+    /// While an edge sets bounds aside ([`Self::set_aside_bounds`]), each variable's bounds as
+    /// they stood before the edge first wrote them.
+    bounds_before: Option<HashMap<Slot, InferBounds>>,
 }
 
 impl Default for Solver {
@@ -274,6 +327,42 @@ impl Solver {
             #[cfg(debug_assertions)]
             dropped: Default::default(),
             held_answers: Vec::new(),
+            bounds_before: None,
+        }
+    }
+
+    /// Keep each inference variable's bounds as they stand now, for the variables written until
+    /// [`bounds_before`](Self::bounds_before) hands them back.
+    pub(crate) fn set_aside_bounds(&mut self) {
+        assert!(
+            self.bounds_before.replace(HashMap::new()).is_none(),
+            "one edge at a time sets bounds aside"
+        );
+    }
+
+    /// The bounds kept since [`set_aside_bounds`](Self::set_aside_bounds), which stops keeping
+    /// them.
+    pub(crate) fn bounds_before(&mut self) -> BoundsBefore {
+        BoundsBefore(
+            self.bounds_before
+                .take()
+                .expect("bounds are handed back only after they were set aside"),
+        )
+    }
+
+    /// Before `var`'s bounds are written: keep them as they stand, the first time while bounds
+    /// are set aside.
+    pub(crate) fn note_bounds_write(&mut self, var: &InferVar) {
+        let Some(kept) = &self.bounds_before else {
+            return;
+        };
+        let slot = self.infer.slot(self.id, var);
+        if kept.contains_key(&slot) {
+            return;
+        }
+        let bounds = self.infer.get(self.id, var).bounds.clone();
+        if let Some(kept) = &mut self.bounds_before {
+            kept.insert(slot, bounds);
         }
     }
 
