@@ -958,6 +958,11 @@ impl FanOutSlot {
 impl TileOperator for FanOutSlot {
     impl_operator_base!();
 
+    /// A slot's record fields equal what its shared input's do.
+    fn field_correlation(&self, field: &str) -> Option<Vec<TilePathStep>> {
+        self.hold.with_input(|op| op.field_correlation(field))
+    }
+
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         self.hold.with_input(|op| visit(share(op)));
     }
@@ -1521,6 +1526,11 @@ impl Memo {
 
 impl TileOperator for Memo {
     impl_operator_base!();
+
+    /// A memo's record fields equal what its input's do.
+    fn field_correlation(&self, field: &str) -> Option<Vec<TilePathStep>> {
+        self.input.field_correlation(field)
+    }
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));

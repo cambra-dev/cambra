@@ -209,6 +209,13 @@ pub trait TileOperator: Send + Sync {
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
         None
     }
+
+    /// [`result_correlation`](Self::result_correlation) of field `field` of a result that is a
+    /// record: the part of the domain that field equals. A [`Product`] pair's second field is
+    /// the key it pairs, for example.
+    fn field_correlation(&self, _field: &str) -> Option<Vec<TilePathStep>> {
+        None
+    }
 }
 
 /// Per-display-name instance counters, shared across all producer types.

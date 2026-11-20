@@ -1876,6 +1876,18 @@ fn level_beneath(tiling: &Tiling, at: usize, domain: Extent, codomain: Tiling) -
 impl TileOperator for Product {
     impl_operator_base!();
 
+    /// A pair's second field holds the key it pairs, or the inner side's value under it, which
+    /// equals what the inner side's values equal: the inner side is aligned with the pairs.
+    fn field_correlation(&self, field: &str) -> Option<Vec<TilePathStep>> {
+        if field != tuple_field(1).as_str() {
+            return None;
+        }
+        match self.second {
+            Paired::Key => Some(vec![TilePathStep::Codomain; self.paired.index()]),
+            Paired::Value => self.inner.result_correlation(),
+        }
+    }
+
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("outer", &*self.outer));
         visit(value("inner", &*self.inner));

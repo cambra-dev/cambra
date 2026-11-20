@@ -321,6 +321,13 @@ impl TileOperator for MapResult {
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        // A function selecting a field of record values answers what that field equals, as a
+        // product pair's second field equals the key it pairs.
+        if let Some([TilePathStep::Record(field)]) = self.function.result_correlation().as_deref()
+            && let Some(correlation) = self.input.field_correlation(field)
+        {
+            return Some(correlation);
+        }
         if let Some(mut input_corr) = self.input.result_correlation()
             && let Some(transform) = self.function.result_correlation()
         {
@@ -858,6 +865,17 @@ impl MapResultToConst {
 
 impl TileOperator for MapResultToConst {
     impl_operator_base!();
+
+    /// The constant replaces the collection at `level`, so its own keys are that level's keys,
+    /// and what its values equal is shifted down to that level.
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        let MapResultToConstMode::Replace = self.mode else {
+            return None;
+        };
+        let mut correlation = vec![TilePathStep::Codomain; self.level.index()];
+        correlation.extend(self.constant.result_correlation()?);
+        Some(correlation)
+    }
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
