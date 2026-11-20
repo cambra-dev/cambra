@@ -527,7 +527,7 @@ impl TileProducer for ConverseProducer {
                 }
                 TileGuard::Function(FunctionGuard::Domain(_)) => false,
                 TileGuard::Scalar(_) => false,
-                TileGuard::Record(_) | TileGuard::Aggregation(_) => true,
+                TileGuard::Record(_) | TileGuard::Union(_) | TileGuard::Aggregation(_) => true,
             }
         }
         assert!(

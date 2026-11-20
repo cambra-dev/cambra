@@ -770,6 +770,11 @@ fn cut_statements(
                 cut_statements(field, depth, level, keys, whole, beneath.clone());
             }
         }
+        Tile::Union(arms) => {
+            for (_, arm) in arms.iter_mut() {
+                cut_statements(&mut arm.tile, depth, level, keys, whole, beneath.clone());
+            }
+        }
         _ => {}
     }
 }
