@@ -1051,15 +1051,13 @@ fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
                 reads.remove(&param.name);
                 Some(reads)
             }
-            crate::ccl::TypedExprNode::Let { binding, .. }
-                if crate::ccl::opaque_output::is_annotated_result(expr) =>
-            {
-                binding
+            _ => match crate::ccl::opaque_output::annotated_result(expr).map(|e| &e.node) {
+                Some(crate::ccl::TypedExprNode::Let { binding, .. }) => binding
                     .annotation_ty()
                     .filter(|ty| complete(ty))
-                    .map(crate::ccl::subst::type_free_vars)
-            }
-            _ => None,
+                    .map(crate::ccl::subst::type_free_vars),
+                _ => None,
+            },
         }
     }
     fn walk(
@@ -1231,11 +1229,24 @@ pub(crate) fn stand_in_for_recovered(
         if let TypedExprNode::Lambda { body, .. } = &mut part.node {
             stand_in_body(body);
         } else if crate::ccl::opaque_output::is_annotated_result(part) {
-            let TypedExprNode::Let { bound_expr, .. } = &mut part.node else {
-                unreachable!()
-            };
-            bound_expr.node = TypedExprNode::Error;
-            bound_expr.ty = Type::Hole;
+            // The temporaries peeled ahead of the annotation belong to the omitted body.
+            let mut statement = part;
+            loop {
+                let TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body,
+                } = &mut statement.node
+                else {
+                    unreachable!("an annotated result is a chain of lets")
+                };
+                bound_expr.node = TypedExprNode::Error;
+                bound_expr.ty = Type::Hole;
+                if !binding.name.is_anf_temp() {
+                    break;
+                }
+                statement = body;
+            }
         } else {
             part.node = TypedExprNode::Error;
             part.ty = Type::Hole;
