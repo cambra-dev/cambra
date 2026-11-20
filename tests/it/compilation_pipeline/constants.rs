@@ -686,7 +686,7 @@ const ORDERS: &str = indoc! {"
     const param max_order: Int
     pub type Amount = {Int where _ <= max_order}
     pub type Order:
-        placed(Amount)
+        pub placed(Amount)
     pub def total(o: Order) => Int:
         match o:
             case Order::placed(a):
@@ -698,7 +698,7 @@ const ORDERS_RUN: &str = indoc! {"
     const param max_order: Int
     pub type Amount = {Int where _ <= max_order}
     pub type Order:
-        placed(Amount)
+        pub placed(Amount)
     pub def total(o: Order) => Int:
         match o:
             case Order::placed(a):
