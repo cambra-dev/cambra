@@ -2403,7 +2403,33 @@ fn unreleased(rows: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<
     if released.is_universal() {
         return None;
     }
-    nonempty(guard_minus(rows, released).closed_over(input))
+    // Of a finite range of outermost positions, a region past the last names no row, beneath
+    // which a part of every row's values names nothing either.
+    let rows = match input.domain_extent() {
+        Some(Extent::UIntRange(positions)) if !rows.is_universal() => {
+            let held = TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+                intervalsets::IntervalSet::from_iter(positions.intervals().iter().filter_map(
+                    |run| {
+                        Some(intervalsets::Interval::closed(
+                            Value::UInt(*run.lval()?),
+                            Value::UInt(*run.rval()?),
+                        ))
+                    },
+                )),
+            )));
+            match Projection::of(rows) {
+                Ok(region) if region.names_part_of_values() => {
+                    let Ok(held) = Projection::of(&held) else {
+                        unreachable!("a range of positions is keys")
+                    };
+                    region.intersect(&held).guard(input)
+                }
+                _ => rows.clone(),
+            }
+        }
+        _ => rows.clone(),
+    };
+    nonempty(guard_minus(&rows, released).closed_over(input))
 }
 
 /// Whether no pipeline reaches itself through what it reads.

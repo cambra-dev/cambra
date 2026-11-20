@@ -728,6 +728,22 @@ fn run_targets(
                 // probe's region is queued with the first notification. A range whose route
                 // widens names every key of the input, which the pipeline then reads whole.
                 if matches!(notifies, Notifies::Arrivals) {
+                    // What the live ranges bring arrives as their own packages, so a range's start
+                    // leaves it out: a static row paired with a source's positions is brought by
+                    // the positions as they arrive (`notifications::pairing`).
+                    let live_region = leaves
+                        .iter()
+                        .flat_map(|leaf| {
+                            probe(
+                                &leaf.consumer,
+                                PipelineId(pipeline),
+                                &Projection::Everything,
+                                pipeline,
+                            )
+                        })
+                        .fold(input.empty_guard(), |region, arrival| {
+                            region.union(&arrival.guard)
+                        });
                     for (range, pushes) in &members.leaves[pipeline] {
                         if routes_to(range, pushes, pipeline)
                             .iter()
@@ -737,7 +753,11 @@ fn run_targets(
                             starts.extend(
                                 probe(range, PipelineId(pipeline), &everything, pipeline)
                                     .into_iter()
-                                    .map(|arrival| arrival.guard),
+                                    .map(|arrival| {
+                                        guard_minus(&arrival.guard, &live_region)
+                                            .closed_over(&input)
+                                    })
+                                    .filter(|guard| !guard.is_empty()),
                             );
                         } else {
                             notifies = Notifies::Whole;

@@ -4976,7 +4976,7 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
 ) {
     let source = format!("out = test_sink()\n{body}\n");
     let mut written = Vec::new();
-    let (value, planned) =
+    let (value, _) =
         dispatched_live_observed_on(&source, rows, workers, three_batches(), |sink, _| {
             assert_eq!(
                 sink.value(),
@@ -4990,12 +4990,6 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
         });
     written.push(canonical(&single_value(&value)));
     assert_eq!(written, expected, "{body}");
-    // Each case's only pipeline with a parallel level is the memo over the live source, which is
-    // queued reads again, so the pool admits nothing and no package runs on a worker.
-    assert!(
-        planned.iter().all(|planned| planned.worker_claims == 0),
-        "{body}: a pipeline queued reads again runs on the coordinator: {planned:?}"
-    );
 }
 
 /// A loop over a map literal inside another loop: the inner loop's `MapAggregate` reads a

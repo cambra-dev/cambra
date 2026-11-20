@@ -736,6 +736,23 @@ impl Consumer for WholeValuesAt {
     }
 }
 
+/// The outermost keys the paths `keys`, `levels` levels beneath them, run through.
+fn outermost_keys(
+    keys: &crate::interpreter::Predicate,
+    levels: usize,
+) -> crate::interpreter::Predicate {
+    use crate::interpreter::Predicate;
+    match keys {
+        _ if levels == 0 => keys.clone(),
+        Predicate::Or(arms) => arms
+            .iter()
+            .map(|arm| outermost_keys(arm, levels))
+            .fold(Predicate::False, |all, arm| all.union(&arm)),
+        Predicate::Qualified { enclosing, .. } => outermost_keys(enclosing, levels - 1),
+        _ => Predicate::True,
+    }
+}
+
 /// The arms of `region`, which an `Or` holds and any other region is one of.
 fn region_arms(region: &Projection) -> Vec<Projection> {
     match region {
@@ -900,6 +917,30 @@ impl Consumer for Pairing {
             }
             drop(delivered);
             let restated = Projection::any_of(restated);
+            if landing.queues() && restated == Projection::Nothing {
+                return;
+            }
+            landing.completing_part(|landing| self.consumer.notify(&restated, landing));
+            return;
+        }
+        // A region beneath a constant's outermost keys names paths inside the values of keys
+        // that have already arrived, beneath every row: the same paths under each delivered row,
+        // `level` levels further down, and its outermost keys as delivered.
+        if let (PairingSide::ConstantKeys, Projection::Keys { level, keys }) = (self.side, region)
+            && *level > CurryLevel::OUTERMOST
+        {
+            let rows = match recorded {
+                true => delivered.rows.clone(),
+                false => crate::interpreter::Predicate::True,
+            };
+            if recorded {
+                let outermost = outermost_keys(keys, level.index());
+                delivered.partners = delivered.partners.union(&outermost);
+            }
+            drop(delivered);
+            let paths = crate::interpreter::tiling::beneath_keys(keys, &rows, level.index());
+            let restated =
+                Projection::keys_at(CurryLevel::new(self.at.index() + level.index()), paths);
             if landing.queues() && restated == Projection::Nothing {
                 return;
             }

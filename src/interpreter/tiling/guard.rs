@@ -834,10 +834,10 @@ impl TileGuard {
     /// arm adds up to the universal guard. An arm whose payload is itself union-keyed is whole
     /// only where its payload predicate is `True`.
     ///
-    /// An arm naming keys beneath the outermost collection is dropped where it names no key of
-    /// its level's extent, a finite range of positions: the paths of a row past its last
-    /// position, which a difference of nested guards leaves (`guard_minus`). A guard every arm of
-    /// which is dropped is the empty guard. Any other guard is answered as it is.
+    /// An arm naming keys of a collection level is dropped where it names no key of its level's
+    /// extent, a finite range of positions: keys past the last position, which a difference of
+    /// guards leaves (`guard_minus`) and no row can hold. A guard every arm of which is dropped is
+    /// the empty guard. Any other guard is answered as it is.
     pub fn closed_over(self, tiling: &Tiling) -> TileGuard {
         self.closed_over_tags(tiling).closed_over_levels(tiling)
     }
@@ -1013,7 +1013,8 @@ fn names_no_key_of_its_level(arm: &TileGuard, tiling: &Tiling, depth: usize) -> 
         TileGuard::Function(FunctionGuard::Codomain(inner)) => tiling
             .codomain()
             .is_some_and(|codomain| names_no_key_of_its_level(inner, &codomain, depth + 1)),
-        TileGuard::Function(FunctionGuard::Domain(keys)) if depth > 0 => {
+        TileGuard::Function(FunctionGuard::Domain(keys)) => {
+            let _ = depth;
             match tiling.domain_extent() {
                 Some(Extent::UIntRange(positions)) => keys
                     .intersect(&Predicate::intervals(IntervalSet::from_iter(

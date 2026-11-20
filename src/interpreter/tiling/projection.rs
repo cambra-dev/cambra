@@ -816,7 +816,7 @@ fn within_of_cells(node: &TileGuard, level: CurryLevel) -> Option<Projection> {
 
 /// `paths`, a predicate over paths `relative` levels beneath keys of some level, read beneath the
 /// keys `keys` admits: the same paths with those keys above them.
-fn beneath_keys(paths: &Predicate, keys: &Predicate, relative: usize) -> Predicate {
+pub(crate) fn beneath_keys(paths: &Predicate, keys: &Predicate, relative: usize) -> Predicate {
     match paths {
         Predicate::False => Predicate::False,
         Predicate::Or(arms) => arms
