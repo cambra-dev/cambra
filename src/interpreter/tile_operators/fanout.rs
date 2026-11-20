@@ -1858,17 +1858,18 @@ impl Breaker for MemoProducer {
 impl BreakingProducer for MemoProducer {
     /// The cache. A memo releases everything it merges, so nothing upstream holds what the cache
     /// holds.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
-        Box::new(
-            self.cached_tile
+    fn checkpoint(&self) -> Vec<u8> {
+        checkpoint::encode(
+            &self.name(),
+            &*self
+                .cached_tile
                 .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
+                .unwrap_or_else(PoisonError::into_inner),
         )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let cached = checkpoint::state_of::<Tile>(&self.name(), state);
+    fn restore(&mut self, state: &[u8]) {
+        let cached = checkpoint::decode::<Tile>(&self.name(), state);
         *self
             .cached_tile
             .get_mut()

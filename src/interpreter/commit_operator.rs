@@ -130,7 +130,7 @@ pub enum CommitOutcome {
 /// **Allocate-on-validate**: a tick is consumed only by a valid proposal, whatever it
 /// writes, so the timestamp domain is dense and a stale proposal leaves no trace. Validates
 /// the read set with backward validation against each key's changelog.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitEngine {
     /// The store's value before any change: every key's initial value. Held beside
     /// the changelog rather than at a position of it, because a position-keyed
@@ -1072,26 +1072,29 @@ impl BreakingProducer for InductionStoreProducer {
     /// The engines, what the body stated complete, the position a predecessor reached, and whether
     /// a step has rendered the store. The rendered store is not copied: restore renders it again
     /// from the engines. The loop's run is run-local.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Box::new(InductionStoreCheckpoint {
-            resumed_after: self.resumed_after.clone(),
-            complete_rows: state.complete_rows.clone(),
-            engines: state.engines.clone(),
-            opened: state.breaker.snapshot.is_some(),
-            #[cfg(debug_assertions)]
-            stepped_through: state.stepped_through.clone(),
-        })
+        crate::interpreter::tile_operators::checkpoint::encode(
+            &self.name(),
+            &InductionStoreCheckpoint {
+                resumed_after: self.resumed_after.clone(),
+                complete_rows: state.complete_rows.clone(),
+                engines: state.engines.clone(),
+                opened: state.breaker.snapshot.is_some(),
+                #[cfg(debug_assertions)]
+                stepped_through: state.stepped_through.clone(),
+            },
+        )
     }
 
     /// Installs the engines and, for a store a step had opened, renders it and publishes the
     /// rendering through its cyclic fan-out, as a step does, so the operators in its cycle read
     /// what the store held.
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+    fn restore(&mut self, state: &[u8]) {
+        let saved = crate::interpreter::tile_operators::checkpoint::decode::<
             InductionStoreCheckpoint,
         >(&self.name(), state);
         self.resumed_after = saved.resumed_after;
@@ -1513,27 +1516,30 @@ impl CommitProducer {
 impl BreakingProducer for CommitProducer {
     /// The engine, the seed it has not taken, and per writer whether its last decision went
     /// stale, how far its stream was consumed and whether it is terminal.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Box::new(CommitCheckpoint {
-            stale: state.stale.clone(),
-            consumed: state.consumed.clone(),
-            writer_terminal: state.writer_terminal.clone(),
-            seed: state.seed.clone(),
-            engine: state.engine.clone(),
-            opened: state.breaker.snapshot.is_some(),
-            #[cfg(debug_assertions)]
-            reported_closed: state.reported_closed.clone(),
-        })
+        crate::interpreter::tile_operators::checkpoint::encode(
+            &self.name(),
+            &CommitCheckpoint {
+                stale: state.stale.clone(),
+                consumed: state.consumed.clone(),
+                writer_terminal: state.writer_terminal.clone(),
+                seed: state.seed.clone(),
+                engine: state.engine.clone(),
+                opened: state.breaker.snapshot.is_some(),
+                #[cfg(debug_assertions)]
+                reported_closed: state.reported_closed.clone(),
+            },
+        )
     }
 
     /// Installs the store and, for a store a step had opened, renders it and publishes the
     /// rendering through its cyclic fan-out, as a step does.
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<CommitCheckpoint>(
+    fn restore(&mut self, state: &[u8]) {
+        let saved = crate::interpreter::tile_operators::checkpoint::decode::<CommitCheckpoint>(
             &self.name(),
             state,
         );
@@ -1679,7 +1685,7 @@ impl CommitProducer {
 /// **Positions are a store's own.** A composite `(enclosing, inner)` position exists only
 /// to tell a flat map which nest a position belongs to; the nesting says it instead, and a
 /// path is the row values down to a store plus a position inside it.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Engines {
     /// One store's state, `None` until its seed arrives.
     ///
@@ -2662,6 +2668,7 @@ impl TileOperator for CommitOperator {
 }
 
 /// A [`CommitProducer`]'s state as a checkpoint copies it out.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CommitCheckpoint {
     stale: Vec<bool>,
     consumed: Vec<u64>,
@@ -3567,6 +3574,7 @@ impl TileOperator for InductionStore {
 }
 
 /// An [`InductionStoreProducer`]'s state as a checkpoint copies it out.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct InductionStoreCheckpoint {
     resumed_after: Option<Position>,
     complete_rows: Vec<Predicate>,
@@ -5190,7 +5198,7 @@ impl TileProducer for StoreDenseReadProducer {
 /// side (it says *which* item a reclaimed row belongs to). It is distinct from
 /// `position` there — a retried item occupies several attempt positions — and equal
 /// to it on the induction side, where a row's position *is* its source position.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DriverRow {
     /// The store frontier a transaction attempt's decision reads at ([`F_ATTEMPT_SNAPSHOT`]);
     /// `None` for an induction row, which reads its slots alone.
@@ -5230,7 +5238,7 @@ impl DriverRow {
 
 /// The inner rows of a driver window that sit under one outer row: the rows of positions,
 /// and the enclosing row they are under.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DriverGroup {
     /// The outer row's path, one component per level above the positions; `None` for a
     /// window whose positions have no rows above them.
@@ -5294,6 +5302,7 @@ struct DriverWindow {
 /// compiled fields stay the new graph's, since an [`Extent`] among them can hold a data source's
 /// handle. The release cursor is left out too: only a release advances it
 /// ([`acknowledge`](DriverWindow::acknowledge)), and recovery replays the releases.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DriverWindowProgress {
     attempts: u64,
     highest_pushed: Option<(Option<Path>, Position)>,
@@ -6180,6 +6189,7 @@ impl DecodedSource {
 }
 
 /// An [`InductionDriverProducer`]'s state as a checkpoint copies it out.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct InductionDriverCheckpoint {
     window: DriverWindowProgress,
     emitted_through: Option<Path>,
@@ -6546,25 +6556,28 @@ impl BreakingProducer for InductionDriverProducer {
     /// and absent, and the last rendering. The decoded source is a cache of input the drive has
     /// not released. A drive compiled again reads its source whole at its first step, since
     /// `subscribe_driver_inputs` records news of everything, so the cache is not copied.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Box::new(InductionDriverCheckpoint {
-            window: state.window.progress(),
-            emitted_through: state.emitted_through.clone(),
-            source_released_through: state.source_released_through.clone(),
-            source_fully_released: state.source_fully_released,
-            source_complete: state.source_complete.clone(),
-            source_absent: state.source_absent.clone(),
-            reseeded: state.reseeded.clone(),
-            rendered: state.rendered.clone(),
-        })
+        crate::interpreter::tile_operators::checkpoint::encode(
+            &self.name(),
+            &InductionDriverCheckpoint {
+                window: state.window.progress(),
+                emitted_through: state.emitted_through.clone(),
+                source_released_through: state.source_released_through.clone(),
+                source_fully_released: state.source_fully_released,
+                source_complete: state.source_complete.clone(),
+                source_absent: state.source_absent.clone(),
+                reseeded: state.reseeded.clone(),
+                rendered: state.rendered.clone(),
+            },
+        )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+    fn restore(&mut self, state: &[u8]) {
+        let saved = crate::interpreter::tile_operators::checkpoint::decode::<
             InductionDriverCheckpoint,
         >(&self.name(), state);
         let state = self
@@ -7154,6 +7167,7 @@ impl TileOperator for TransactDriver {
 }
 
 /// A [`TransactDriverProducer`]'s state as a checkpoint copies it out.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TransactDriverCheckpoint {
     /// Whether the source said it adds nothing more ([`DecodedSource::terminal`]).
     source_terminal: bool,
@@ -7477,22 +7491,25 @@ impl BreakingProducer for TransactDriverProducer {
     /// cache of input the drive has not released, which a drive compiled again reads whole at its
     /// first step, as an induction drive does. A drive that released its source whole pulls it no
     /// more ([`advance`](Self::advance)), so only the copy keeps that the source ended.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Box::new(TransactDriverCheckpoint {
-            source_terminal: state.source.terminal,
-            rendered: state.rendered.clone(),
-            window: state.window.progress(),
-            latest_emit: state.latest_emit.clone(),
-            source_released: state.source_released.clone(),
-        })
+        crate::interpreter::tile_operators::checkpoint::encode(
+            &self.name(),
+            &TransactDriverCheckpoint {
+                source_terminal: state.source.terminal,
+                rendered: state.rendered.clone(),
+                window: state.window.progress(),
+                latest_emit: state.latest_emit.clone(),
+                source_released: state.source_released.clone(),
+            },
+        )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+    fn restore(&mut self, state: &[u8]) {
+        let saved = crate::interpreter::tile_operators::checkpoint::decode::<
             TransactDriverCheckpoint,
         >(&self.name(), state);
         let state = self
@@ -8221,7 +8238,7 @@ impl TileOperator for TransactWriter {
 /// takes by it. The driver owns the transaction source and acknowledges its items. The writer
 /// names an attempt by the driver position it came from, which is the identity the driver
 /// itself uses.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InFlightProposal {
     /// The store frontier this proposal was built against — the read set is
     /// current iff no read key was overwritten after it.
@@ -8240,6 +8257,7 @@ struct InFlightProposal {
 }
 
 /// A [`TransactWriterProducer`]'s state as a checkpoint copies it out.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TransactWriterCheckpoint {
     last_decided_pos: Option<Position>,
     driver_terminal: bool,
@@ -8701,21 +8719,24 @@ impl Breaker for TransactWriterProducer {
 impl BreakingProducer for TransactWriterProducer {
     /// The proposals the store has not released, where the stream's live window starts, the last
     /// decision acted on, and whether the drive has closed.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Box::new(TransactWriterCheckpoint {
-            last_decided_pos: state.last_decided_pos.clone(),
-            driver_terminal: state.driver_terminal,
-            committed_base: state.committed_base,
-            emitted: state.emitted.clone(),
-        })
+        crate::interpreter::tile_operators::checkpoint::encode(
+            &self.name(),
+            &TransactWriterCheckpoint {
+                last_decided_pos: state.last_decided_pos.clone(),
+                driver_terminal: state.driver_terminal,
+                committed_base: state.committed_base,
+                emitted: state.emitted.clone(),
+            },
+        )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
-        let saved = crate::interpreter::tile_operators::checkpoint::state_of::<
+    fn restore(&mut self, state: &[u8]) {
+        let saved = crate::interpreter::tile_operators::checkpoint::decode::<
             TransactWriterCheckpoint,
         >(&self.name(), state);
         let state = self

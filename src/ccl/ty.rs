@@ -51,7 +51,9 @@ impl std::hash::Hash for ChanLevel {
 /// `Name` for named-field records. Compaction keeps both in one keyed slot, with a
 /// tuple's width beside it, and the tuple-vs-record distinction is materialized at
 /// coalesce time.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum FieldKey {
     /// Positional field (tuple index).
     Index(usize),
@@ -99,7 +101,7 @@ impl fmt::Display for FieldKey {
 /// domain of the union-of-restricts fan-out) the degenerate case of the same
 /// structure, so named and positional sums share one representation — mirroring
 /// [`Type::Variant`], which already keys on [`FieldKey`] for both.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TagMap<T>(Vec<(FieldKey, T)>);
 
 impl<T> TagMap<T> {

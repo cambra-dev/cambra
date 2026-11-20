@@ -152,6 +152,7 @@ struct RekeySortedProducer {
     // through `&self` on any worker thread; no other operator holds it.
     state: Mutex<RekeyState>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct RekeyState {
     output: Tile,
     /// Position-to-key mappings above the consumed input prefix, in position order. These
@@ -466,20 +467,23 @@ impl Breaker for RekeySortedProducer {
 impl BreakingProducer for RekeySortedProducer {
     /// The output, the rows held above a gap, the keys called complete, and the input consumed and
     /// released.
-    fn checkpoint(&self) -> Box<dyn std::any::Any + Send> {
+    fn checkpoint(&self) -> Vec<u8> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        Box::new(RekeyState {
-            output: state.output.clone(),
-            held: state.held.clone(),
-            complete: state.complete.clone(),
-            released_through: state.released_through.clone(),
-            consumed: state.consumed.clone(),
-        })
+        checkpoint::encode(
+            &self.name(),
+            &RekeyState {
+                output: state.output.clone(),
+                held: state.held.clone(),
+                complete: state.complete.clone(),
+                released_through: state.released_through.clone(),
+                consumed: state.consumed.clone(),
+            },
+        )
     }
 
-    fn restore(&mut self, state: Box<dyn std::any::Any + Send>) {
+    fn restore(&mut self, state: &[u8]) {
         *self.state.get_mut().unwrap_or_else(PoisonError::into_inner) =
-            checkpoint::state_of::<RekeyState>(&self.name(), state);
+            checkpoint::decode::<RekeyState>(&self.name(), state);
     }
 
     fn complete(&self) -> TileGuard {
@@ -508,7 +512,7 @@ impl BreakingProducer for RekeySortedProducer {
 }
 
 /// The keys a [`RekeySortedProducer`] has called complete.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum Complete {
     /// Under [`KeyOrder::Rising`], every key through the highest complete one, `None` before
     /// any.

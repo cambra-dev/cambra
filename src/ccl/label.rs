@@ -280,6 +280,28 @@ impl Label {
     }
 }
 
+/// A label encodes as its [`runtime_key`](Label::runtime_key) and a constructor's declaration,
+/// which the key leaves out. The declaration is the process's [`DeclId`], so a label of a
+/// constructor decodes to the same one only in the process that encoded it.
+///
+/// [`DeclId`]: crate::ccl::nominal::DeclId
+impl serde::Serialize for Label {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.runtime_key(), self.decl()).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Label {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (key, decl) =
+            <(SmolStr, Option<crate::ccl::nominal::DeclId>)>::deserialize(deserializer)?;
+        Ok(match decl {
+            Some(decl) => Label::in_decl(decl, key),
+            None => Label::from_runtime_key(&key),
+        })
+    }
+}
+
 /// Assert that `name` holds no `::`, which keeps two labels from sharing a run-time
 /// key ([`Label::runtime_key`]).
 fn debug_assert_spelling(name: &str) {
