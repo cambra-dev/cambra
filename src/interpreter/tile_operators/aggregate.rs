@@ -510,7 +510,10 @@ impl TileProducer for ExtractAggregateProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        state.extracted.clone()
+        // An extracted record of values is pulled at a part of it as any record is.
+        let mut tile = state.extracted.clone();
+        tile.restrict_to(&projection, self.tiling());
+        tile
     }
 
     fn release_impl(&self, obsolete_guard: TileGuard) {

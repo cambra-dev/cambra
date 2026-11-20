@@ -1,6 +1,10 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
+use std::collections::BTreeMap;
+
+use smol_str::SmolStr;
+
 use crate::ccl::{FieldKey, TagMap};
 #[cfg(test)]
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
@@ -12,10 +16,11 @@ use std::sync::PoisonError;
 
 /// The part of a producer's tile that a `get` asks for.
 ///
-/// A projection guard is any [`TileGuard`], and a projection is the three shapes a pipeline
-/// cuts a tile with: everything, nothing, and the keys of one collection level that a predicate
-/// admits. Anything else is a gap the producer reports rather than answers with a smaller region
-/// (`src/interpreter/design-operators.md`, "Guard operations are exact").
+/// A projection guard is any [`TileGuard`], and a projection is the shapes a pipeline cuts a
+/// tile with: everything, nothing, the keys of one collection level that a predicate admits, and
+/// a projection per field of a record of values. Anything else is a gap the producer reports
+/// rather than answers with a smaller region (`src/interpreter/design-operators.md`, "Guard
+/// operations are exact").
 #[derive(Clone, Debug, PartialEq)]
 pub enum Projection {
     /// The producer's whole tile.
@@ -30,6 +35,16 @@ pub enum Projection {
     /// path. `keys` is neither `True` nor `False`, and is not every key beneath some keys of the
     /// level above, which that level spells ([`Projection::keys_at`]).
     Keys { level: CurryLevel, keys: Predicate },
+    /// A record of values, each field's part named by its own projection: `fields` for the fields
+    /// it lists, and `rest` for every field it does not. A record has no keys, so this is how a
+    /// region of a record names part of it.
+    ///
+    /// Construct through [`Projection::fields`]: no listed field's projection equals `rest`, and
+    /// at least one field is listed.
+    Fields {
+        fields: BTreeMap<SmolStr, Projection>,
+        rest: Box<Projection>,
+    },
 }
 
 /// `keys`, admitting paths whose last key stands at `depth` beneath an arm of a tagged union, as
@@ -83,6 +98,13 @@ impl Projection {
     /// The projection one arm of `guard` names: a domain guard, at the level the codomain guards
     /// around it step to.
     fn of_arm(arm: &TileGuard, guard: &TileGuard) -> Result<Self, String> {
+        if let TileGuard::Record(fields) = arm {
+            let fields = fields
+                .iter()
+                .map(|(name, field)| Ok((name.clone(), Projection::of(field)?)))
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            return Ok(Projection::fields(fields, Projection::Nothing));
+        }
         let mut level = 0;
         let mut node = arm;
         while let TileGuard::Function(FunctionGuard::Codomain(inner)) = node {
@@ -100,8 +122,8 @@ impl Projection {
                 Ok(Projection::keys_at(CurryLevel::new(level), keys.clone()))
             }
             _ => Err(format!(
-                "a projection guard is everything, nothing or the keys of a collection level, \
-                 got {guard:?}"
+                "a projection guard is everything, nothing, the keys of a collection level or a \
+                 projection per field of a record of values, got {guard:?}"
             )),
         }
     }
@@ -116,6 +138,21 @@ impl Projection {
             Projection::Everything => tiling.universal_guard(),
             Projection::Nothing => tiling.empty_guard(),
             Projection::Keys { level, keys } => spell(*level, keys),
+            Projection::Fields { fields: listed, .. } => {
+                let Tiling::Record(fields) = tiling else {
+                    panic!("{self:?} names the fields of a record, and {tiling} is none")
+                };
+                debug_assert!(
+                    listed.keys().all(|name| fields.contains_key(name)),
+                    "{self:?} names only fields of {tiling}"
+                );
+                TileGuard::Record(
+                    fields
+                        .iter()
+                        .map(|(name, field)| (name.clone(), self.field(name).guard(field)))
+                        .collect(),
+                )
+            }
         }
     }
 
@@ -126,7 +163,106 @@ impl Projection {
             Projection::Everything => TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
             Projection::Nothing => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
             Projection::Keys { level, keys } => spell(*level, keys),
+            Projection::Fields { .. } => {
+                panic!("{self:?} names the fields of a record, which is no collection")
+            }
         }
+    }
+
+    /// The projection of a record of values naming `fields` per listed field and `rest` for every
+    /// other field, normalized: a listed field whose projection is `rest` is dropped, and with no
+    /// field listed it is `rest`. It knows no field list, so a projection naming every field of the
+    /// record whole is not [`Everything`](Self::Everything); [`over_fields`](Self::over_fields)
+    /// normalizes against the record's fields.
+    pub(crate) fn fields(fields: BTreeMap<SmolStr, Projection>, rest: Projection) -> Projection {
+        let fields: BTreeMap<_, _> = fields
+            .into_iter()
+            .filter(|(_, field)| *field != rest)
+            .collect();
+        match fields.is_empty() {
+            true => rest,
+            false => Projection::Fields {
+                fields,
+                rest: Box::new(rest),
+            },
+        }
+    }
+
+    /// The projection of a record of values naming `field` of the field `name` and nothing of
+    /// any other field.
+    pub(crate) fn of_field(name: &str, field: Projection) -> Projection {
+        Projection::fields(BTreeMap::from([(name.into(), field)]), Projection::Nothing)
+    }
+
+    /// This projection of a record of values whose fields are `names`, normalized against them:
+    /// [`Everything`](Self::Everything) where it names every field whole and
+    /// [`Nothing`](Self::Nothing) where it names none of any.
+    pub(crate) fn over_fields<'a>(
+        self,
+        names: impl IntoIterator<Item = &'a SmolStr>,
+    ) -> Projection {
+        let Projection::Fields { .. } = self else {
+            return self;
+        };
+        let parts: Vec<Projection> = names.into_iter().map(|name| self.field(name)).collect();
+        if parts.iter().all(|part| *part == Projection::Everything) {
+            Projection::Everything
+        } else if parts.iter().all(|part| *part == Projection::Nothing) {
+            Projection::Nothing
+        } else {
+            self
+        }
+    }
+
+    /// The part of the field `name` this projection of a record of values names.
+    ///
+    /// # Panics
+    ///
+    /// For a projection of keys, which no record of values is pulled at.
+    pub(crate) fn field(&self, name: &str) -> Projection {
+        match self {
+            Projection::Everything | Projection::Nothing => self.clone(),
+            Projection::Fields { fields, rest } => fields
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| (**rest).clone()),
+            Projection::Keys { .. } => {
+                panic!("{self:?} names keys, and a record of values has none")
+            }
+        }
+    }
+
+    /// `op` applied field by field to two projections of one record of values, either of which
+    /// may be everything or nothing.
+    fn field_by_field(
+        &self,
+        other: &Projection,
+        op: impl Fn(&Projection, &Projection) -> Projection,
+    ) -> Projection {
+        let rest = |projection: &Projection| match projection {
+            Projection::Fields { rest, .. } => (**rest).clone(),
+            whole => whole.clone(),
+        };
+        let listed = |projection: &Projection| match projection {
+            Projection::Fields { fields, .. } => fields.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let mut names = listed(self);
+        names.extend(listed(other));
+        let fields = names
+            .into_iter()
+            .map(|name| {
+                let field = op(&self.field(&name), &other.field(&name));
+                (name, field)
+            })
+            .collect();
+        Projection::fields(fields, op(&rest(self), &rest(other)))
+    }
+
+    /// Whether either of `self` and `other` names fields of a record of values: their union,
+    /// intersection and difference then go field by field.
+    fn either_names_fields(&self, other: &Projection) -> bool {
+        matches!(self, Projection::Fields { .. }) || matches!(other, Projection::Fields { .. })
     }
 
     /// The keys above `level` that this projection names, for an operator whose input lacks
@@ -178,12 +314,18 @@ impl Projection {
 
     /// The projection of `self` within `other`: what both name.
     pub fn intersect(&self, other: &Projection) -> Projection {
+        if self.either_names_fields(other) {
+            return self.field_by_field(other, Projection::intersect);
+        }
         let level = self.deepest(other);
         Projection::keys_at(level, self.at(level).intersect(&other.at(level)))
     }
 
     /// What `self` names that `other` does not: the region still unread after a read at `other`.
     pub fn minus(&self, other: &Projection) -> Projection {
+        if self.either_names_fields(other) {
+            return self.field_by_field(other, Projection::minus);
+        }
         let level = self.deepest(other);
         Projection::keys_at(level, self.at(level).minus(&other.at(level)))
     }
@@ -191,6 +333,9 @@ impl Projection {
     /// The projection naming what either names: the region a memo has read or must read
     /// again.
     pub fn union(&self, other: &Projection) -> Projection {
+        if self.either_names_fields(other) {
+            return self.field_by_field(other, Projection::union);
+        }
         let level = self.deepest(other);
         Projection::keys_at(level, self.at(level).union(&other.at(level)))
     }
@@ -218,6 +363,9 @@ impl Projection {
                     .unwrap_or_else(|| panic!("{self:?} is read at {level}, above its own level"));
                 keys.descend(beneath)
             }
+            Projection::Fields { .. } => {
+                panic!("{self:?} names the fields of a record, which has no level of keys")
+            }
         }
     }
 
@@ -230,6 +378,9 @@ impl Projection {
             Projection::Everything => Projection::admitting(tagged_at(&Predicate::True, 0, tag)),
             Projection::Keys { level, keys } => {
                 Projection::keys_at(*level, tagged_at(keys, level.index(), tag))
+            }
+            Projection::Fields { .. } => {
+                panic!("{self:?} names the fields of a record, which is no arm of a tagged union")
             }
         }
     }
@@ -592,6 +743,7 @@ impl Tile {
     fn cells_within(&self, projection: &Projection) -> Result<(), String> {
         match projection {
             Projection::Everything => Ok(()),
+            Projection::Fields { .. } => self.each_field_within(projection, Tile::cells_within),
             Projection::Nothing => {
                 let mut live = self.clone();
                 live.compact();
@@ -652,9 +804,15 @@ impl Tile {
         projection: &Projection,
         tiling: Option<&Tiling>,
     ) -> Result<(), String> {
+        if let Projection::Fields { .. } = projection {
+            return self.each_field_within(projection, |field, projection| {
+                field.statements_within(projection, None)
+            });
+        }
         let stated = self.stated_completeness();
         let allowed = match projection {
             Projection::Everything => return Ok(()),
+            Projection::Fields { .. } => unreachable!("a projection of fields returned above"),
             Projection::Nothing => vec![Predicate::False; stated.len()],
             Projection::Keys { level, keys } => {
                 let mut cut = self.clone();
@@ -683,6 +841,20 @@ impl Tile {
                 "it states {outside:?} complete, which the projection omits"
             )),
         }
+    }
+
+    /// `check` of each field of this record of values against the part of it `projection` names.
+    fn each_field_within(
+        &self,
+        projection: &Projection,
+        check: impl Fn(&Tile, &Projection) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let Tile::Record { fields, .. } = self else {
+            return Err("it is not a record, so it has no fields to project".into());
+        };
+        fields.iter().try_for_each(|(name, field)| {
+            check(field, &projection.field(name)).map_err(|why| format!("its field {name}: {why}"))
+        })
     }
 
     /// The completeness each collection level of this tile states, outermost first and a record's
@@ -729,6 +901,15 @@ impl Tile {
             Projection::Everything => {}
             Projection::Nothing => *self = tiling.empty_tile(),
             Projection::Keys { level, keys } => self.restrict_to_paths(*level, keys),
+            Projection::Fields { .. } => {
+                let (Tile::Record { fields, .. }, Tiling::Record(tilings)) = (&mut *self, tiling)
+                else {
+                    panic!("{projection:?} cuts a record of values, got {tiling}")
+                };
+                for (name, field) in fields.iter_mut() {
+                    field.restrict_to(&projection.field(name), &tilings[name]);
+                }
+            }
         }
     }
 }
@@ -932,7 +1113,71 @@ mod tests {
                 let deeper = path.len() - 1 - level.index();
                 keys.descend(deeper).contains_path(&path)
             }
+            Projection::Fields { .. } => unreachable!("a path of keys is no record's field"),
         }
+    }
+
+    fn field_of_keys(name: &str, k: u64) -> Projection {
+        Projection::of_field(name, Projection::admitting(key(k)))
+    }
+
+    /// The union, intersection and difference of projections of a record of values go field by
+    /// field, every field a projection does not list standing as its `rest`.
+    #[test]
+    fn projections_of_fields_combine_field_by_field() {
+        let a = field_of_keys("a", 1);
+        let b = field_of_keys("b", 2);
+        let both = a.union(&b);
+        assert_eq!(both.field("a"), Projection::admitting(key(1)));
+        assert_eq!(both.field("b"), Projection::admitting(key(2)));
+        assert_eq!(both.field("c"), Projection::Nothing);
+        assert_eq!(both.intersect(&a), a);
+        assert_eq!(both.minus(&a), b);
+        assert_eq!(a.intersect(&b), Projection::Nothing);
+        let rest = Projection::Everything.minus(&a);
+        assert_eq!(
+            rest.field("a"),
+            Projection::Everything.minus(&Projection::admitting(key(1)))
+        );
+        assert_eq!(rest.field("b"), Projection::Everything);
+        assert_eq!(rest.union(&a), Projection::Everything);
+    }
+
+    /// The algebra knows no field list, so a projection naming every field whole, or none of any,
+    /// is normalized against the record's fields.
+    #[test]
+    fn a_projection_naming_every_field_is_normalized_against_the_fields() {
+        let names = [SmolStr::new("a"), SmolStr::new("b")];
+        let every = Projection::of_field("a", Projection::Everything)
+            .union(&Projection::of_field("b", Projection::Everything));
+        assert_ne!(every, Projection::Everything);
+        assert_eq!(every.clone().over_fields(&names), Projection::Everything);
+        let none = Projection::Everything.minus(&every);
+        assert_eq!(none.over_fields(&names), Projection::Nothing);
+        let one = field_of_keys("a", 1);
+        assert_eq!(one.clone().over_fields(&names), one);
+    }
+
+    /// A projection of fields spells a record guard naming each field of the tiling, and that
+    /// guard names it back.
+    #[test]
+    fn a_projection_of_fields_round_trips_through_its_record_guard() {
+        let ints = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let tiling = Tiling::Record(
+            [(SmolStr::new("a"), ints.clone()), (SmolStr::new("b"), ints)]
+                .into_iter()
+                .collect(),
+        );
+        let projection = field_of_keys("a", 1);
+        let guard = projection.guard(&tiling);
+        let TileGuard::Record(fields) = &guard else {
+            panic!("a record's guard names its fields: {guard:?}")
+        };
+        assert!(fields["b"].is_empty(), "{guard:?}");
+        assert_eq!(Projection::of(&guard), Ok(projection));
     }
 
     /// Every key beneath an outermost key is that key, so the level above spells it.

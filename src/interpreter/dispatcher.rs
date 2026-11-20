@@ -3250,14 +3250,48 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
         Projection::Nothing => None,
         Projection::Everything => Some(input.universal_guard()),
         Projection::Keys { .. } => Some(region.guard(input).closed_over(input)),
+        // Each field is closed over its own tiling, as a push of that field alone would be.
+        Projection::Fields { .. } => {
+            let Tiling::Record(fields) = input else {
+                panic!("{region:?} names the fields of a record, and {input} is none")
+            };
+            Some(TileGuard::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| {
+                        let part = pushed_guard(&region.field(name), field)
+                            .unwrap_or_else(|| field.empty_guard());
+                        (name.clone(), part)
+                    })
+                    .collect(),
+            ))
+        }
     }
 }
 
 /// `held`, a breaker's complete region of its output `tiling`, as a projection: every key where it
 /// names every position of the finite range of positions the output's outermost keys range over,
+/// each field of a record of values closed so and the record whole where every field is,
 /// as a store or an aggregate under a loop of positions `0..n` states the positions it completed,
 /// which `TileGuard::closed_over` leaves as they are. `None` where no projection spells it.
 fn complete_projection(held: TileGuard, tiling: &Tiling) -> Option<Projection> {
+    // A record of values is complete field by field, each field as its own tiling closes it, and
+    // whole where every field is.
+    if let (Tiling::Record(fields), TileGuard::Record(held)) = (tiling, &held) {
+        // A field no projection spells is pushed as nothing complete, which keeps the other fields'
+        // completeness.
+        let parts = fields
+            .iter()
+            .map(|(name, field)| {
+                let part = held
+                    .get(name)
+                    .and_then(|guard| complete_projection(guard.clone(), field))
+                    .unwrap_or(Projection::Nothing);
+                (name.clone(), part)
+            })
+            .collect();
+        return Some(Projection::fields(parts, Projection::Nothing).over_fields(fields.keys()));
+    }
     if let (
         Some(Extent::UIntRange(positions)),
         TileGuard::Function(FunctionGuard::Domain(region @ Predicate::Intervals(_))),

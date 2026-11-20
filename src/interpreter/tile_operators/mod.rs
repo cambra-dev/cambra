@@ -1054,7 +1054,9 @@ mod pull_levels {
         use crate::interpreter::Projection;
         match Projection::of(guard) {
             Ok(Projection::Keys { level, .. }) => Some(Some(level)),
-            Ok(Projection::Everything) => Some(None),
+            // A record of values has no level of keys, so a pull of part of its fields is held to
+            // the declaration of a whole read.
+            Ok(Projection::Everything | Projection::Fields { .. }) => Some(None),
             Ok(Projection::Nothing) | Err(_) => None,
         }
     }
@@ -1555,7 +1557,8 @@ pub(crate) fn partition_gap(guard: &TileGuard, morsels: &[TileGuard]) -> Option<
 }
 
 /// The projection of a pull of a producer whose output is one value, which has no keys to project:
-/// all of it or none. `what` completes "`name` ..." in the panic: "is one accumulator".
+/// all of it, none, or a part of each field of a record of values, which the producer cuts its
+/// answer to. `what` completes "`name` ..." in the panic: "is one accumulator".
 ///
 /// # Panics
 ///

@@ -57,15 +57,15 @@ Operators without their own pipeline read their inputs inside a scheduled pipeli
 A route is what `Consumer::notify` does to a push. The planner walks each read's pushing consumer
 with a routing landing (`Landing::route`) over the regions `pushes_of` builds from the pusher's
 output: at each collection level the path of one key per level, and beneath the outermost level one
-key under every key above it. It walks them as changes, adding a change of every key, and twice as
-complete regions, of a source not yet wholly complete and of one that is, adding `Everything` of the
-latter (`walk_routes`). The
-landing records each entry a walk reaches, whether a consumer on the way widened the push, and the
-two marks a consumer sets inside `notify`: a complete region naming only part of what a row depends
-on (`Landing::completing_part`), and a key read only once final (`Landing::requiring_final_key`).
-The dispatcher keeps the routes per read (`Dispatcher::plan_routes`). A nested loop's drive records
-its source's complete regions at the loop's pipeline; the walks of the body around the loop pass it
-while they run (`build_scope`).
+key under every key above it. A record of values stands for a push of all of it and for its fields'
+pushes, each as that part of the record. It walks them as changes, adding a change of every key, and
+twice as complete regions, of a source not yet wholly complete and of one that is, adding
+`Everything` of the latter (`walk_routes`). The landing records each entry a walk reaches, whether a
+consumer on the way widened the push, and the two marks a consumer sets inside `notify`: a complete
+region naming only part of what a row depends on (`Landing::completing_part`), and a key read only
+once final (`Landing::requiring_final_key`). The dispatcher keeps the routes per read
+(`Dispatcher::plan_routes`). A nested loop's drive records its source's complete regions at the
+loop's pipeline; the walks of the body around the loop pass it while they run (`build_scope`).
 
 Each package the dispatcher queues must match a change route with the same marks, widened exactly
 as the package's push is, and each complete region a read records must match a complete route with
@@ -85,6 +85,10 @@ whole closes with nothing queued (`Dispatcher::start_source`). A live source ann
 extent, including previously yielded regions when a run starts. The pipeline queues only what its
 breaker's input has not released. Subsequent polls announce additional progress. Several appearances
 of one source do not turn one delivered position into several loop requests.
+
+A record of values is read field by field, so a pipeline whose input is one is queued, at the
+start, each field that no push, arrival or range names (`unnamed_fields`): such a field holds values
+its own chain computes, as a constant does, and nothing else reads it.
 
 A route that preserves source positions can admit them as they arrive. A route that widens them
 reads its whole input again after each delivery and once more after the source closes ([Reading a

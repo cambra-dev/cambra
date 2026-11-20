@@ -311,16 +311,17 @@ impl TileProducer for ExtractFinalProducer {
         let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state_guard;
 
-        if projection_of_one_value(&self.name(), "extracts one final value", &guard)
-            == Projection::Nothing
-            || self.obsolete_guard().is_universal()
-        {
+        let projection = projection_of_one_value(&self.name(), "extracts one final value", &guard);
+        if projection == Projection::Nothing || self.obsolete_guard().is_universal() {
             return self.tiling().empty_tile();
         }
-        state
+        // A final record of values is pulled at a part of it as any record is.
+        let mut tile = state
             .final_tile
             .clone()
-            .unwrap_or_else(|| self.tiling().empty_tile())
+            .unwrap_or_else(|| self.tiling().empty_tile());
+        tile.restrict_to(&projection, self.tiling());
+        tile
     }
 
     fn release_impl(&self, obsolete_guard: TileGuard) {

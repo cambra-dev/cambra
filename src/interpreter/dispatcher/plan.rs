@@ -758,6 +758,8 @@ fn run_targets(
                         .fold(input.empty_guard(), |region, arrival| {
                             region.union(&arrival.guard)
                         });
+                    // What the arrivals, the pushes of the pipelines it reads and its ranges name.
+                    let mut named = arrived_region.clone();
                     for &read in &members.reads[pipeline] {
                         let (pusher, keyed, pushed) = end_of(PipelineId(read))
                             .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
@@ -782,6 +784,17 @@ fn run_targets(
                         if as_keys {
                             reads_as_keys.push((pipeline, read));
                         }
+                        named = probe(&pusher, PipelineId(read), &everything, pipeline)
+                            .into_iter()
+                            .fold(named, |named, arrival| named.union(&arrival.guard));
+                    }
+                    // A record of values is read field by field, so a field nothing above names,
+                    // whose values its own chain computes as a constant's are, is read once at the
+                    // start.
+                    let named = starts.iter().fold(named, |named, start| named.union(start));
+                    let unnamed = unnamed_fields(&input, named);
+                    if !unnamed.is_empty() {
+                        starts.push(unnamed);
                     }
                 }
                 notifies
@@ -1851,6 +1864,20 @@ pub(super) fn plan_edges(
                     None => arrival.guard,
                 })
             });
+        // A record of values is read field by field, so a field no push and no range names, whose
+        // values its own chain computes as a constant's are, is read once at the start.
+        let left = left.union(&unnamed_fields(
+            &input,
+            leaves[reader]
+                .iter()
+                .flat_map(|(leaf, _)| {
+                    probe(leaf, PipelineId(read[0]), &Projection::Everything, reader)
+                })
+                .fold(
+                    pushed.clone().unwrap_or_else(|| input.empty_guard()),
+                    |named, arrival| named.union(&arrival.guard),
+                ),
+        ));
         // Every reader holds the rows its pushes and its start bring until the pipelines it
         // reads have completed them, and reads each row once ([`Dispatcher::wait_for_inputs`]). A pipeline
         // that takes arrivals is queued its rows as its sources yield them, and any other reads
@@ -1872,6 +1899,28 @@ pub(super) fn plan_edges(
         }
     }
     (dispatcher, planned, starts)
+}
+
+/// The fields of `input`, a record of values, that `named` names none of, as a guard of `input`:
+/// empty for any other tiling. `named` unions the regions arrivals, pushes and ranges bring, each a
+/// projection's guard ([`probe`]).
+///
+/// # Panics
+///
+/// Where `input` is a record and `named` names no projection, which the guard algebra's union of
+/// projections of fields never makes.
+fn unnamed_fields(input: &Tiling, named: TileGuard) -> TileGuard {
+    let Tiling::Record(fields) = input else {
+        return input.empty_guard();
+    };
+    let named = Projection::of(&named)
+        .unwrap_or_else(|why| panic!("what reaches a record's entry is a projection: {why}"));
+    let unnamed: std::collections::BTreeMap<_, _> = fields
+        .keys()
+        .filter(|name| named.field(name) == Projection::Nothing)
+        .map(|name| (name.clone(), Projection::Everything))
+        .collect();
+    Projection::fields(unnamed, Projection::Nothing).guard(input)
 }
 
 /// The regions [`plan_edges`] finds that no push names, each with the pipeline it is queued to at
@@ -2025,8 +2074,20 @@ fn keys_arrive_as_themselves(routes: &[Route], arrived: &[Arrival], one: &Projec
 /// per level down to it, and beneath the outermost level also one key of that level under every
 /// key above it, each once per arm where a level's keys are a union. The walk ends at a level whose
 /// keys are functions, which no key stands for, and a tiling with no level before such a one stands
-/// for one push of `Everything`.
+/// for one push of `Everything`. A record of values stands for a push of all of it and, per field,
+/// the pushes of that field as that part of the record ([`Projection::of_field`]).
 pub(super) fn pushes_of(output: &Tiling) -> Vec<Projection> {
+    if let Tiling::Record(fields) = output {
+        let mut pushes = vec![Projection::Everything];
+        for (name, field) in fields {
+            pushes.extend(
+                pushes_of(field)
+                    .into_iter()
+                    .map(|push| Projection::of_field(name, push)),
+            );
+        }
+        return pushes;
+    }
     /// A key of each arm of `extent`, `None` where no key stands for its values.
     fn keys(extent: &Extent) -> Option<Vec<Value>> {
         Some(match extent {

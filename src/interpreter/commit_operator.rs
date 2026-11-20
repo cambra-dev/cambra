@@ -6614,6 +6614,9 @@ impl InductionDriverProducer {
                 Projection::Keys { level, keys } => {
                     level.index() + 1 == pos.len() && keys.contains_path(&pos)
                 }
+                Projection::Fields { .. } => {
+                    unreachable!("a drive's positions are keys, not the fields of a record")
+                }
             }
         {
             // **The reseed.** A position whose enclosing components differ from the last

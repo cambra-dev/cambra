@@ -194,6 +194,48 @@ impl Consumer for Restating {
     }
 }
 
+/// `consumer` behind a consumer that forwards each region of the field `name` of a record of
+/// values whose fields are `names` as that part of the record ([`Projection::of_field`],
+/// normalized by [`Projection::over_fields`]): `MakeRecord` passes this to each operand, since a
+/// record of values has no keys and its fields' regions name it field by field.
+pub fn fielding(
+    name: smol_str::SmolStr,
+    names: Vec<smol_str::SmolStr>,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Fielding(name, names, consumer))
+}
+
+struct Fielding(smol_str::SmolStr, Vec<smol_str::SmolStr>, Box<dyn Consumer>);
+
+impl Consumer for Fielding {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        if *region != Projection::Nothing {
+            let record = Projection::of_field(&self.0, region.clone()).over_fields(&self.1);
+            self.2.notify(&record, landing);
+        }
+    }
+}
+
+/// `consumer` behind a consumer that forwards the part of each region of a record of values that
+/// names its field `name` ([`Projection::field`]), and nothing for a region naming none of it:
+/// `SelectField` passes this to a record of values, whose other fields' regions say nothing of
+/// the selected one.
+pub fn selecting_field(name: smol_str::SmolStr, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(SelectingField(name, consumer))
+}
+
+struct SelectingField(smol_str::SmolStr, Box<dyn Consumer>);
+
+impl Consumer for SelectingField {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        let field = region.field(&self.0);
+        if field != Projection::Nothing {
+            self.1.notify(&field, landing);
+        }
+    }
+}
+
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
 /// ([`Projection::tagged`]): an arm of a tagged union passes this to the arm's input, since
 /// the union's outermost keys are each arm's keys under the arm's tag.

@@ -523,16 +523,38 @@ fn select_field_forwards_the_region_of_a_stream_of_records() {
     assert_keeps_without_state(&a_stream_of_records, 0);
 }
 
-/// A product of collections is read whole and its field cut, so a region of one collection's keys
-/// is not a region of the field's.
+fn a_product_of_collections() -> Built {
+    select_field(Tiling::Record(
+        [(SmolStr::new("a"), ints()), (SmolStr::new("b"), ints())]
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// A region of the selected field of a record of values is the field's own region, and a region
+/// of another field names none of it.
 #[test]
-fn select_field_over_a_product_of_collections_sends_everything() {
-    let product = || {
-        select_field(Tiling::Record(
-            [(SmolStr::new("a"), ints())].into_iter().collect(),
-        ))
-    };
-    assert_widens(&product, 0);
+fn select_field_over_a_product_of_collections_forwards_the_part_of_its_field() {
+    assert_eq!(
+        received(
+            &a_product_of_collections,
+            0,
+            &Projection::of_field("a", region())
+        ),
+        [region()]
+    );
+    assert_eq!(
+        received(
+            &a_product_of_collections,
+            0,
+            &Projection::of_field("b", region())
+        ),
+        []
+    );
+    assert_eq!(
+        received(&a_product_of_collections, 0, &Projection::Everything),
+        [Projection::Everything]
+    );
 }
 
 fn variant_wrap(input: Tiling, level: CurryLevel) -> Built {
@@ -861,19 +883,18 @@ fn make_record() -> Built {
     (Arc::new(op), vec![first, second])
 }
 
-/// A record of values has no keys of its own.
+/// A record of values has no keys of its own, so a region of a field names that field of it.
 #[test]
-fn make_record_sends_everything_for_a_region_of_either_field() {
-    assert_widens(&make_record, 0);
-    assert_widens(&make_record, 1);
-}
-
-#[test]
-fn make_record_sends_everything_for_a_later_region() {
-    assert_eq!(
-        received(&make_record, 1, &another_region()),
-        [Projection::Everything]
-    );
+fn make_record_names_a_region_of_a_field_as_that_part_of_the_record() {
+    for (field, name) in [(0, "_0"), (1, "_1")] {
+        for sent in [region(), another_region(), Projection::Everything] {
+            assert_eq!(
+                received(&make_record, field, &sent),
+                [Projection::of_field(name, sent.clone())],
+                "{sent:?}"
+            );
+        }
+    }
 }
 
 /// Every key is answered against all of the collection.

@@ -132,6 +132,9 @@ impl CartesianIteration {
                 Projection::Everything => Predicate::True,
                 Projection::Nothing => Predicate::False,
                 Projection::Keys { keys, .. } => keys,
+                Projection::Fields { .. } => {
+                    unreachable!("an extent's keys are no record of values")
+                }
             }
             .union(&side.released);
             let pending = Predicate::True.minus(&known);
@@ -175,6 +178,7 @@ impl CartesianIteration {
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys { keys, .. } => keys,
+            Projection::Fields { .. } => unreachable!("an extent's keys are no record of values"),
         };
         let fields: HashMap<_, _> = self
             .sides
@@ -293,6 +297,7 @@ impl CartesianIteration {
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys { keys, .. } => keys,
+            Projection::Fields { .. } => unreachable!("an extent's keys are no record of values"),
         };
         let pending = Projection::admitting(region.minus(&obsolete.whole_keys())).guard(tiling);
         let keys = self.keys(&pending, tiling);

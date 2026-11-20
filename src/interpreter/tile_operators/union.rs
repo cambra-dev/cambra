@@ -990,6 +990,7 @@ mod tests {
                     Projection::Keys { keys, .. } => keys,
                     Projection::Everything => Predicate::True,
                     Projection::Nothing => Predicate::False,
+                    Projection::Fields { .. } => unreachable!("a tagged region names keys"),
                 };
             assert_eq!(under_arm(&tagged, depth, &tag), keys, "{depth}: {tagged:?}");
             // A tagged union reads its outermost keys as one union predicate.
