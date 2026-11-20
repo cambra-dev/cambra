@@ -91,7 +91,7 @@ impl Writer {
 
 /// An operator as a diagnostic names it: its CHL spelling, in backticks.
 pub fn chl_operator(op: &BinOpKind) -> String {
-    format!("`{}`", binop_text(op))
+    format!("`{}`", op.chl_sym())
 }
 
 /// Whether two types have the same diagnostic text, including any descriptions that hide
@@ -1109,7 +1109,7 @@ fn infix(op: &BinOpKind, l: (Prec, String), r: (Prec, String)) -> (Prec, String)
     }
     let (own, lmin, rmin) = binop_prec(op);
     let (l, r) = (at_least(l, lmin), at_least(r, rmin));
-    (own, format!("{l} {} {r}", binop_text(op)))
+    (own, format!("{l} {} {r}", op.chl_sym()))
 }
 
 impl Prec {
@@ -1157,16 +1157,6 @@ fn unary_text(op: UnaryOpKind) -> &'static str {
     match op {
         UnaryOpKind::NotRefined => "^not",
         _ => "not",
-    }
-}
-
-/// An operator's CHL spelling: [`BinOpKind::sym`], except xor, which CHL writes `^`, and
-/// string concatenation, which it writes `+`.
-fn binop_text(op: &BinOpKind) -> &'static str {
-    match op {
-        BinOpKind::BoolLogic(crate::ccl::LogicKind::Xor) => "^",
-        BinOpKind::Concat => "+",
-        _ => op.sym(),
     }
 }
 
