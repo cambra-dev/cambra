@@ -1089,14 +1089,14 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
 ///   in each leg ([`ProjectedTag`]). A leg that projects a tag the scrutinee's closed type does
 ///   not carry holds no row, and the legs beside it need no tag of their own.
 pub(crate) fn disjoint_join_gap(legs: &[Expr]) -> Option<String> {
-    let projections: Vec<Option<ProjectedTag<'_>>> = legs.iter().map(projected_tag).collect();
+    let projections: Vec<Vec<ProjectedTag<'_>>> = legs.iter().map(projected_tags).collect();
     let live: Vec<usize> = (0..legs.len())
-        .filter(|&i| !projections[i].as_ref().is_some_and(|p| p.absent))
+        .filter(|&i| !projections[i].iter().any(|p| p.absent))
         .collect();
     if live.len() <= 1 {
         return None;
     }
-    let projected = live.iter().all(|&i| projections[i].is_some());
+    let projected = live.iter().all(|&i| !projections[i].is_empty());
     let projection_gap = projected
         .then(|| projection_gap(&projections, &live))
         .flatten();
@@ -1108,32 +1108,40 @@ pub(crate) fn disjoint_join_gap(legs: &[Expr]) -> Option<String> {
     Some(projection_gap.unwrap_or(gate_gap))
 }
 
-/// Why the live legs, each of which projects a tag, project no distinct tags of one scrutinee.
-fn projection_gap(projections: &[Option<ProjectedTag<'_>>], live: &[usize]) -> Option<String> {
-    let first = projections[live[0]]
-        .as_ref()
-        .expect("every live leg projects");
-    let mut tags: Vec<&FieldKey> = Vec::with_capacity(live.len());
-    for &i in live {
-        let projection = projections[i].as_ref().expect("every live leg projects");
-        let same_scrutinee = projection.scrutinee.len() == first.scrutinee.len()
-            && projection
-                .scrutinee
+/// Why the live legs, each of which projects some tag, project no distinct tags of one
+/// scrutinee: `None` when a projection of the first live leg has a projection of its scrutinee
+/// in every other live leg, each of a tag no leg before it projects.
+fn projection_gap(projections: &[Vec<ProjectedTag<'_>>], live: &[usize]) -> Option<String> {
+    let same_scrutinee = |a: &ProjectedTag<'_>, b: &ProjectedTag<'_>| {
+        a.scrutinee.len() == b.scrutinee.len()
+            && a.scrutinee
                 .iter()
-                .zip(&first.scrutinee)
-                .all(|(a, b)| crate::ccl::eq_term_modulo_ty_slots(a, b));
-        if !same_scrutinee {
-            return Some(format!(
-                "legs {} and {i} project tags of different scrutinees",
-                live[0]
-            ));
+                .zip(&b.scrutinee)
+                .all(|(a, b)| crate::ccl::eq_term_modulo_ty_slots(a, b))
+    };
+    let gap_at = |first: &ProjectedTag<'_>| -> Option<String> {
+        let mut tags: Vec<&FieldKey> = vec![first.tag];
+        for &i in &live[1..] {
+            let mut of_scrutinee = projections[i]
+                .iter()
+                .filter(|p| same_scrutinee(p, first))
+                .peekable();
+            if of_scrutinee.peek().is_none() {
+                return Some(format!(
+                    "legs {} and {i} project tags of different scrutinees",
+                    live[0]
+                ));
+            }
+            let Some(fresh) = of_scrutinee.find(|p| !tags.contains(&p.tag)) else {
+                return Some(format!("two legs project the tag {:?}", first.tag));
+            };
+            tags.push(fresh.tag);
         }
-        if tags.contains(&projection.tag) {
-            return Some(format!("two legs project the tag {:?}", projection.tag));
-        }
-        tags.push(projection.tag);
-    }
-    None
+        None
+    };
+    let mut gaps = projections[live[0]].iter().map(gap_at);
+    let first_gap = gaps.next().expect("every live leg projects")?;
+    gaps.all(|gap| gap.is_some()).then_some(first_gap)
 }
 
 /// Why the gates of the live legs do not each exclude the others.
@@ -1238,7 +1246,7 @@ fn excludes(negating: &[Expr], negated: &[Expr]) -> bool {
     })
 }
 
-/// The tag a leg of a scrutinee-`Case`'s fan-out projects, the steps that compute its
+/// A tag a leg of a scrutinee-`Case`'s fan-out projects, the steps that compute its
 /// scrutinee, and whether the scrutinee's closed type carries no such tag.
 struct ProjectedTag<'e> {
     scrutinee: Vec<&'e Expr>,
@@ -1246,63 +1254,58 @@ struct ProjectedTag<'e> {
     absent: bool,
 }
 
-/// The [`ProjectedTag`] of `leg`; `None` for a leg that projects no tag. A projection narrows
-/// the whole leg from a step of its composition or from a component of a `zip` that is one,
-/// since a `zip` inner-joins its components on their keys: the arm that reads the outer binder,
-/// `⟨id, 𝑠 ≫ variant_project(𝑐)⟩ ≫ 𝑒`, keeps only the keys tagged `𝑐`. The steps before such
-/// a `zip` are part of the scrutinee, since the component reads what they computed. Planning's
-/// `iterate` only narrows the keys and changes no value, so it does not change which tag a key
-/// carries, and it is no part of one.
-fn projected_tag(leg: &Expr) -> Option<ProjectedTag<'_>> {
+/// Every [`ProjectedTag`] of `leg`, outermost first; empty for a leg that projects no tag.
+///
+/// Each projection narrows the whole leg, from a step of its composition or from a component of
+/// a `zip` that is one, since a `zip` inner-joins its components on their keys: the arm that
+/// reads the outer binder, `⟨id, 𝑠 ≫ variant_project(𝑐)⟩ ≫ 𝑒`, keeps only the keys tagged `𝑐`.
+/// The steps before such a `zip` are part of the scrutinee, since the component reads what they
+/// computed. A leg holds the projections of every `match` it is nested in: `o!` inside the
+/// `some` arm of `match o` projects `o ≫ variant_project(some)` both as the outer arm's `zip`
+/// component and as the inner `match`'s scrutinee, which reads `o` again after that `zip`.
+/// Planning's `iterate` only narrows the keys and changes no value, so it does not change which
+/// tag a key carries, and it is no part of one.
+fn projected_tags(leg: &Expr) -> Vec<ProjectedTag<'_>> {
     let steps = composed(leg);
-    if let Some(found) = tag_in(steps) {
-        return Some(found);
-    }
-    steps.iter().enumerate().find_map(|(at, step)| {
-        let TypedExprNode::Apply { argument, function } = &step.node else {
-            return None;
-        };
-        if !matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) {
-            return None;
-        }
-        let TypedExprNode::Tuple(parts) = &argument.node else {
-            return None;
-        };
-        let mut found = parts.iter().find_map(projected_tag)?;
-        found
-            .scrutinee
-            .splice(0..0, steps[..at].iter().filter(|step| !is_iterate(step)));
-        Some(found)
-    })
-}
-
-/// The first `variant_project` among `steps`, with the steps before it.
-fn tag_in<'e>(steps: &'e [Expr]) -> Option<ProjectedTag<'e>> {
-    let at = steps.iter().position(|step| {
-        matches!(
-            step.node,
-            TypedExprNode::Builtin(Builtin::VariantProject(_))
-        )
-    })?;
-    let TypedExprNode::Builtin(Builtin::VariantProject(tag)) = &steps[at].node else {
-        unreachable!("found as a variant projection")
-    };
-    let absent = steps[at].ty.domain().is_some_and(|scrutinee| {
-        match strip_refinements(&scrutinee).structure().as_ref() {
-            Type::Variant(arms, crate::ccl::Openness::Closed) => {
-                arms.iter().all(|(arm, _)| arm != tag)
-            }
-            _ => false,
-        }
-    });
-    Some(ProjectedTag {
-        scrutinee: steps[..at]
+    let prefix = |at: usize| -> Vec<&Expr> {
+        steps[..at]
             .iter()
             .filter(|step| !is_iterate(step))
-            .collect(),
-        tag,
-        absent,
-    })
+            .collect()
+    };
+    let mut found = Vec::new();
+    for (at, step) in steps.iter().enumerate() {
+        match &step.node {
+            TypedExprNode::Builtin(Builtin::VariantProject(tag)) => {
+                let absent = step.ty.domain().is_some_and(|scrutinee| {
+                    match strip_refinements(&scrutinee).structure().as_ref() {
+                        Type::Variant(arms, crate::ccl::Openness::Closed) => {
+                            arms.iter().all(|(arm, _)| arm != tag)
+                        }
+                        _ => false,
+                    }
+                });
+                found.push(ProjectedTag {
+                    scrutinee: prefix(at),
+                    tag,
+                    absent,
+                });
+            }
+            TypedExprNode::Apply { argument, function }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) =>
+            {
+                let TypedExprNode::Tuple(parts) = &argument.node else {
+                    continue;
+                };
+                for mut inner in parts.iter().flat_map(projected_tags) {
+                    inner.scrutinee.splice(0..0, prefix(at));
+                    found.push(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// The steps of `e`: its own where it is a composition, and `e` alone otherwise.
@@ -1770,7 +1773,7 @@ fn is_trailing_nested_case(b: &Branch) -> bool {
         && matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))
         && matches!(
             &b.body.node,
-            TypedExprNode::Case { scrutinee: None, branches , refuted, }
+            TypedExprNode::Case { scrutinee: None, branches, .. }
                 if branches.iter().all(|ib| ib.pattern.is_none())
         )
 }

@@ -620,8 +620,8 @@ fn a_top_level_binder_is_assumed_at_its_own_type() {
 }
 
 /// The same, with the binder's singleton on its inference variable's bounds
-/// rather than on the node. Unresolved it has no SMT sort, so the scope resolves
-/// the scheme body before reading it as a fact.
+/// rather than on the node. Unresolved, the variable encodes at an uninterpreted sort that
+/// carries none of its bounds, so the scope resolves the scheme body before reading it as a fact.
 #[test]
 fn a_top_level_binder_whose_singleton_needs_resolving() {
     check_scalar(
@@ -2011,16 +2011,11 @@ f1(-5)
     )
 }
 
-/// TODO: solve relevant base types before running an SMT check, and
-/// provide a better error message when an SMT check can't run.
-///
-/// The failure message this test pins is unhelpful: it looks like the
-/// quoted types do match, and should pass an SMT check. What's really
-/// happening is that the SMT check is refusing to run at all because
-/// `x`'s base type (and thus SMT encoding sort) is not yet known when
-/// the SMT check is called for.
+/// `x`'s base type is unsolved when the annotation on `f` is checked, so the solver reads `x`
+/// at an uninterpreted sort, where `x == x` holds. The annotation is met, and the call that
+/// passes `-5` is what fails.
 #[test]
-fn unsettled_base_type_auto_fails_smt_check() {
+fn an_unsettled_base_type_is_checked_at_an_uninterpreted_sort() {
     check_compile_error(
         indoc! {r#"
 def f(x) => ({Int where _ > 0} => Int):
@@ -2030,7 +2025,7 @@ def f(x) => ({Int where _ > 0} => Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "Annotation mismatch: annotated as {Int where _ > 0} => Int, but inferred as {Int where _ > 0 and x == x} => {Int where _ == 1}",
+        "Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == -5}",
     )
 }
 
@@ -2295,9 +2290,10 @@ fn a_data_function_type_is_no_value() {
 /// produces a value with type `{Option(T) where _.is_none()}`, with
 /// no constraint on `_.value()` in that case.
 ///
-/// The `o.unwrap_or(w)` method, for `o: Option(T1)` and `w: T2`,
-/// produces a value with refinement `{T3 where if (o.is_none()) then
-/// (_ == w) else (_ == o.value())}`, where `T1 <: T3` and `T2 <: T3`.
+/// The `o.unwrap_or(w)` method, for `o: Option(T1)` and `w: T2`, is a `match` over `o`, and
+/// produces a value with the refinement that `match` derives from its arms, `{T3 where (not
+/// o.is_none() and _ == o.value()) or (o.is_none() and _ == w)}`, where `T1 <: T3` and
+/// `T2 <: T3`.
 #[test]
 fn unwrap_or_follows_the_option_constructor() {
     check_scalar(
@@ -2410,6 +2406,15 @@ x1 == 1
         o!
     f(Option::some(4))
 "}, Value::Int(4))]
+// A path names the same function a method call does, and a predicate reads it the same.
+#[case::is_none_by_path(indoc! {"
+    y: {Option(Int) where not Option::is_none(_)} = Option::some(3)
+    y!
+"}, Value::Int(3))]
+#[case::value_by_path(indoc! {"
+    y: {Option(Int) where Option::value(_) == 3} = Option::some(3)
+    y.is_none()
+"}, Value::Bool(false))]
 fn an_option_meets_a_predicate_written_with_its_methods(
     #[case] code: &str,
     #[case] expected: Value,
@@ -2442,6 +2447,14 @@ fn an_option_meets_a_predicate_written_with_its_methods(
     "},
     "Type mismatch for this call: expected {Option(Int) where not _.is_none()}, found {Option(",
 )]
+// The derived refinement prints `Option`'s constructor tests as the method a predicate writes.
+#[case::derived_refinement_printed(
+    indoc! {"
+        x: {Int where _ == 5} = Option::some(1).unwrap_or(2)
+        x
+    "},
+    "not Option::some(1).is_none() and _ == Option::some(1).value()",
+)]
 fn an_option_violating_a_predicate_written_with_its_methods(
     #[case] code: &str,
     #[case] needle: &str,
@@ -2451,8 +2464,8 @@ fn an_option_violating_a_predicate_written_with_its_methods(
 
 /// `unwrap_or` of an `Option::some` whose payload is computed. The result's refinement reads
 /// `Option::some(a + 1)`, which `lambda_elim` rewrites to `Option::some((a, 1) ▷ add)`; the
-/// constructor rule still reads `option_value == (a, 1) ▷ add` off it, so the re-derived type
-/// matches the recorded one.
+/// constructor rule still reads `__elem ▷ ctor_payload(Option::some) == (a, 1) ▷ add` off it, so
+/// the re-derived type matches the recorded one.
 #[test]
 fn unwrap_or_of_some_of_a_computed_value() {
     check_scalar(
@@ -2466,7 +2479,7 @@ fn unwrap_or_of_some_of_a_computed_value() {
 }
 
 /// `Option::some(b)` with `b` computed rather than literal. Its type carries
-/// `__elem ▷ option_value == b`, which `lambda_elim` rewrites point-free.
+/// `__elem ▷ ctor_payload(Option::some) == b`, which `lambda_elim` rewrites point-free.
 #[rstest]
 #[case::is_none(
     indoc! {"
@@ -2507,8 +2520,8 @@ fn refined_add_of_a_computed_value_in_a_comprehension() {
     );
 }
 
-/// `!` applied twice. The outer `Option::unwrap`'s parameter is refined
-/// `not __elem ▷ option_is_none`, which the inner `!`'s result type entails.
+/// `!` applied twice. The outer `Option::value`'s parameter is refined
+/// `not (__elem ▷ ctor_is(Option::none))`, which the inner `!`'s result type entails.
 #[test]
 fn unwrap_of_an_unwrap() {
     check_scalar(
@@ -2534,28 +2547,69 @@ fn unwrap_of_an_annotated_option() {
 
 /// `!` and `unwrap_or` in a comprehension's element.
 #[rstest]
-#[case::unwrap(indoc! {"
-    xs = [1, 2]
-    sum([Option::some(x)! for x in xs])
-"})]
-#[case::unwrap_or(indoc! {"
-    xs = [1, 2]
-    sum([Option::some(x).unwrap_or(0) for x in xs])
-"})]
+#[case::unwrap(
+    indoc! {"
+        xs = [1, 2]
+        sum([Option::some(x)! for x in xs])
+    "},
+    3
+)]
+#[case::unwrap_or(
+    indoc! {"
+        xs = [1, 2]
+        sum([Option::some(x).unwrap_or(0) for x in xs])
+    "},
+    3
+)]
 // The `match` `unwrap_or` is, written out. Its `none` arm reads only the outer binder, and its
 // leg keeps the gate that restricts it to the `none` positions.
-#[case::written_out(indoc! {"
-    def f(o, d):
-        match o:
-            case Option::some(v):
-                v
-            case Option::none:
-                d
-    xs = [1, 2]
-    sum([f(Option::some(x), 0) for x in xs])
-"})]
-fn unwrap_in_a_comprehension(#[case] code: &str) {
-    check_scalar(code, Value::Int(3));
+#[case::written_out(
+    indoc! {"
+        def f(o, d):
+            match o:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    d
+        xs = [1, 2]
+        sum([f(Option::some(x), 0) for x in xs])
+    "},
+    3
+)]
+// `o!` inside the arm that proves `o` is `some`: a one-arm `match o` nested in the outer `some`
+// arm, whose leg projects the outer arm's tag before the inner one's.
+#[case::in_an_arm(
+    indoc! {"
+        def f(o: Option(Int)) => Int:
+            match o:
+                case Option::some(v):
+                    o! + v
+                case Option::none:
+                    0
+        sum([f(Option::some(x)) for x in [1, 2]])
+    "},
+    6
+)]
+#[case::in_an_arm_of_mixed_options(
+    indoc! {"
+        def f(o: Option(Int)) => Int:
+            match o:
+                case Option::some(v):
+                    o! + v
+                case Option::none:
+                    10
+        def g(x: Int) => Option(Int):
+            r = if x > 1:
+                    Option::some(x)
+                else:
+                    Option::none
+            r
+        sum([f(g(x)) for x in [1, 2, 3]])
+    "},
+    20
+)]
+fn unwrap_in_a_comprehension(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
 
 /// A constructor states its payload whatever the payload's type. The refinement encoding reads
@@ -2566,10 +2620,28 @@ fn unwrap_in_a_comprehension(#[case] code: &str) {
     x.is_none()
 "#})]
 #[case::record("Option::some((a=1)).is_none()")]
-#[case::list("Option::some([1, 2]).is_none()")]
 #[case::tuple("Option::some((1, 2)).is_none()")]
 fn a_payload_outside_the_encoding(#[case] code: &str) {
     check_scalar(code, Value::Bool(false));
+}
+
+/// `Option(T)` requires `Equatable(T, T)`, which a constructor states, so `Option::some` of a
+/// payload with no `Equatable` instance is rejected where it is called.
+#[rstest]
+#[case::list("Option::some([1, 2]).is_none()")]
+#[case::nominal(indoc! {"
+    type W:
+        w(Int)
+    Option::some(W::w(1)).is_none()
+"})]
+fn a_payload_with_no_equatable_instance(#[case] code: &str) {
+    check_compile_error(code, "No Equatable instance for this call");
+}
+
+/// `unit` is `Equatable`, which `Option(unit)`, a `Set`'s checked lookup, requires.
+#[test]
+fn unit_equals_unit() {
+    check_scalar("() == ()", Value::Bool(true));
 }
 
 /// `!` of a `String` payload.
@@ -2585,20 +2657,29 @@ fn unwrap_of_a_string_payload() {
 }
 
 /// An arm knows which constructor built the value it matched, so `o!` holds in the `some` arm.
-#[test]
-fn unwrap_in_the_arm_that_matched_some() {
-    check_scalar(
-        indoc! {"
-            def f(o: Option(Int)) => Int:
-                match o:
-                    case Option::some(v):
-                        o!
-                    case Option::none:
-                        0
-            f(Option::some(4))
-        "},
-        Value::Int(4),
-    );
+/// A default arm knows which constructors the arms before it name did not build it, so `o!`
+/// holds in a `case _:` after `case Option::none:`.
+#[rstest]
+#[case::some_arm(indoc! {"
+    def f(o: Option(Int)) => Int:
+        match o:
+            case Option::some(v):
+                o!
+            case Option::none:
+                0
+    f(Option::some(4))
+"})]
+#[case::default_arm(indoc! {"
+    def f(o: Option(Int)) => Int:
+        match o:
+            case Option::none:
+                0
+            case _:
+                o!
+    f(Option::some(4))
+"})]
+fn unwrap_in_the_arm_that_matched_some(#[case] code: &str) {
+    check_scalar(code, Value::Int(4));
 }
 
 /// A `match` needs no arm for a constructor the scrutinee's refinement rules out.

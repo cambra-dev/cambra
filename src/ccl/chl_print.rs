@@ -944,19 +944,26 @@ impl Printer {
                 format!("not {}", at_least(argument.written(), Prec::Not)),
             )),
             // A constructor's observers, as a predicate writes them: `Option`'s by its methods
-            // `is_none` and `value`.
-            TypedExprNode::Builtin(Builtin::CtorIs(c)) => {
+            // `is_none` and `value`. Another type's constructors have no surface spelling.
+            TypedExprNode::Builtin(Builtin::CtorIs(c))
+                if *c.decl == *crate::ccl::nominal::option() =>
+            {
                 let target = at_least(argument.written(), Prec::Postfix);
-                written((Prec::Postfix, format!("{target}.is_{}()", c.ctor)))
-            }
-            TypedExprNode::Builtin(Builtin::CtorPayload(c)) => {
-                let target = at_least(argument.written(), Prec::Postfix);
-                let read = if *c.decl == *crate::ccl::nominal::option() {
-                    "value".to_string()
+                let is_none = format!("{target}.is_none()");
+                written(if c.ctor == crate::ccl::V_NONE.name() {
+                    (Prec::Postfix, is_none)
                 } else {
-                    format!("{}_payload", c.ctor)
-                };
-                written((Prec::Postfix, format!("{target}.{read}()")))
+                    (Prec::Not, format!("not {is_none}"))
+                })
+            }
+            TypedExprNode::Builtin(Builtin::CtorPayload(c))
+                if *c.decl == *crate::ccl::nominal::option() =>
+            {
+                let target = at_least(argument.written(), Prec::Postfix);
+                written((Prec::Postfix, format!("{target}.value()")))
+            }
+            TypedExprNode::Builtin(Builtin::CtorIs(_) | Builtin::CtorPayload(_)) => {
+                written((Prec::Atom, NOT_PRINTABLE.to_string()))
             }
             TypedExprNode::Proj(key) => match (argument, key) {
                 (Val::Tuple(mut parts), ProjKey::Index(i)) if *i < parts.len() => {

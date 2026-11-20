@@ -141,9 +141,14 @@ pub enum Sort {
     UIntRange(u64),
     /// A sort reached by the solver's own spelling for it, carrying no constraint
     /// of its own. `String` is the case: z3's built-in string sort, used here as a
-    /// sort name. This reaches a built-in sort and not an uninterpreted one,
-    /// which would need a `declare-sort` command that nothing here emits.
+    /// sort name. This reaches a built-in sort; [`Sort::Uninterpreted`] is the one
+    /// a query declares.
     Named(String),
+    /// The sort of an unsolved inference variable: an uninterpreted sort, one per variable,
+    /// which [`run`] declares with `declare-sort`. A value of it has equality and nothing
+    /// else, so a term ordering it, computing with it or using it as a proposition has no
+    /// encoding ([`Encode::expr`]).
+    Uninterpreted(String),
 }
 
 impl Sort {
@@ -156,7 +161,7 @@ impl Sort {
         let sort_atom = match self {
             Self::Bool => ctx.bool_sort(),
             Self::Int | Self::UInt | Self::UIntRange(_) => ctx.int_sort(),
-            Self::Named(s) => ctx.atom(s),
+            Self::Named(s) | Self::Uninterpreted(s) => ctx.atom(s),
         };
         ctx.declare_const(sym, sort_atom)
             .map_err(exchange_failure)?;
@@ -171,7 +176,7 @@ impl Sort {
     fn membership(&self, x: SExpr, ctx: &Context) -> Option<SExpr> {
         let non_neg = ctx.gte(x, ctx.numeral(0));
         match self {
-            Self::Bool | Self::Int | Self::Named(_) => None,
+            Self::Bool | Self::Int | Self::Named(_) | Self::Uninterpreted(_) => None,
             Self::UInt => Some(non_neg),
             Self::UIntRange(n) => Some(ctx.and(non_neg, ctx.lt(x, ctx.numeral(*n)))),
         }
@@ -774,6 +779,16 @@ fn check(
 
 /// The whole exchange: declare the query's constants, assert it, ask.
 fn run(ctx: &mut Context, decls: Vec<Decl>, formula: SExpr) -> Result<Response, SmtError> {
+    let mut declared_sorts = HashSet::new();
+    for decl in &decls {
+        if let Sort::Uninterpreted(name) = &decl.sort
+            && declared_sorts.insert(name.clone())
+        {
+            log::debug!("declare-sort {name}");
+            ctx.declare_sort(name.as_str(), 0)
+                .map_err(exchange_failure)?;
+        }
+    }
     for Decl {
         symbol,
         sort,
@@ -808,6 +823,7 @@ enum SmtSort {
     Bool,
     Int,
     Named(String),
+    Uninterpreted(String),
 }
 
 impl SmtSort {
@@ -816,6 +832,7 @@ impl SmtSort {
             Sort::Bool => SmtSort::Bool,
             Sort::Int | Sort::UInt | Sort::UIntRange(_) => SmtSort::Int,
             Sort::Named(name) => SmtSort::Named(name.clone()),
+            Sort::Uninterpreted(name) => SmtSort::Uninterpreted(name.clone()),
         }
     }
 }
@@ -1088,7 +1105,7 @@ impl<'a> Encode<'a> {
             }
             _ => {}
         }
-        match self.expr(e) {
+        match self.proposition(e) {
             Ok(encoded) => encoded,
             Err(message) => {
                 log::debug!("abstracting an antecedent atom: {message}");
@@ -1118,7 +1135,7 @@ impl<'a> Encode<'a> {
             .filter_map(|r| {
                 let (vars, assumed) = (self.vars.clone(), self.assumed.clone());
                 let (decls, assumptions) = (self.decls.len(), self.assumptions.len());
-                let encoded = self.expr(&r.predicate);
+                let encoded = self.proposition(&r.predicate);
                 if encoded.is_err() {
                     self.vars = vars;
                     self.assumed = assumed;
@@ -1133,7 +1150,7 @@ impl<'a> Encode<'a> {
     fn conjuncts(&mut self, refs: &[Refinement]) -> Result<Vec<SExpr>, SmtError> {
         refs.iter()
             .map(|r| {
-                self.expr(&r.predicate)
+                self.proposition(&r.predicate)
                     .map_err(|message| SmtError::Encoding {
                         body: r.clone(),
                         message,
@@ -1155,6 +1172,7 @@ impl<'a> Encode<'a> {
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
             Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
             Type::History { .. } => self.sort(ty.history_parts()?.1),
+            Type::Infer(var) => Some(Sort::Uninterpreted(format!("T!{}", var.uid))),
             _ => None,
         }
     }
@@ -1214,8 +1232,9 @@ impl<'a> Encode<'a> {
                 Some(path) => self.leaf(path, &e.ty),
                 None => Err(unencodable(e)),
             },
-            TypedExprNode::UnaryOp(op, operand) => {
-                let operand = self.expr(operand)?;
+            TypedExprNode::UnaryOp(op, inner) => {
+                let operand = self.expr(inner)?;
+                self.settled_operand(e, inner, operand)?;
                 // `^not` computes what `not` computes, as a binary `^` sibling does.
                 Ok(match op.unrefined() {
                     UnaryOpKind::Neg => self.ctx.negate(operand),
@@ -1225,6 +1244,15 @@ impl<'a> Encode<'a> {
             }
             TypedExprNode::BinOp { left, op, right } => {
                 let (l, r) = (self.expr(left)?, self.expr(right)?);
+                // Equality is the one operation an uninterpreted sort has; the cross-sort
+                // check below rejects comparing it with any other sort.
+                if !matches!(
+                    op.unrefined(),
+                    BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals)
+                ) {
+                    self.settled_operand(e, left, l)?;
+                    self.settled_operand(e, right, r)?;
+                }
                 if let BinOpKind::Compare(_) = op.unrefined()
                     && let (Some(ls), Some(rs)) =
                         (self.smt_sort_of(left, l), self.smt_sort_of(right, r))
@@ -1298,8 +1326,16 @@ impl<'a> Encode<'a> {
                 }
                 return Ok(self.ctx.and_many(conjuncts));
             }
+            // Each leaf takes its sort from its own path, so an unsolved variable on one side
+            // can sort a leaf whose counterpart is settled.
             _ => {
                 let (lv, rv) = (self.leaf_at(l.clone(), ty)?, self.leaf_at(r.clone(), ty)?);
+                let (ls, rs) = (&self.constant_sorts[&lv], &self.constant_sorts[&rv]);
+                if ls != rs {
+                    return Err(format!(
+                        "{l} == {r} compares an SMT {ls:?} with an SMT {rs:?}"
+                    ));
+                }
                 return Ok(self.ctx.eq(lv, rv));
             }
         };
@@ -1308,6 +1344,32 @@ impl<'a> Encode<'a> {
             conjuncts.push(self.paths_equal(&l.then(key.clone()), &r.then(key), &ty)?);
         }
         Ok(self.ctx.and_many(conjuncts))
+    }
+
+    /// `Err` when `operand`, encoded as `encoded`, is a value of an unsolved variable's
+    /// uninterpreted sort, which `term` orders, computes with or reads as a proposition.
+    fn settled_operand(
+        &self,
+        term: &TypedExpr,
+        operand: &TypedExpr,
+        encoded: SExpr,
+    ) -> Result<(), String> {
+        match self.smt_sort_of(operand, encoded) {
+            Some(SmtSort::Uninterpreted(_)) => Err(format!(
+                "{} reads {}, whose type is unsolved, as more than a value with equality",
+                symbolic(term),
+                symbolic(operand)
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Encode::expr`] for a term in a proposition's position: a refinement body or an
+    /// operand of a logical connective.
+    fn proposition(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
+        let encoded = self.expr(e)?;
+        self.settled_operand(e, e, encoded)?;
+        Ok(encoded)
     }
 
     /// The SMT sort of `encoded`, the encoding of `e`, where it is known: a declared constant's,
@@ -1405,7 +1467,10 @@ impl<'a> Encode<'a> {
     /// often an unresolved variable. A path type with no sort falls
     /// back to the slot and assumes nothing, on the same footing as a path nothing
     /// settles: declaring the leaf is what the surrounding predicate needs, and the
-    /// assumption is the part that can be dropped.
+    /// assumption is the part that can be dropped. A path type that is an unsolved
+    /// variable falls back the same way when the slot is settled, since the slot's sort
+    /// says more than an uninterpreted one; when neither is settled, the path's
+    /// variable gives the leaf its sort ([`Sort::Uninterpreted`]).
     fn leaf(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
         let path = self.reroot(path);
         self.leaf_at(path, ty)
@@ -1416,7 +1481,13 @@ impl<'a> Encode<'a> {
         if let Some(e) = self.vars.get(&path) {
             return Ok(*e);
         }
-        match self.path_type(&path).and_then(|bound| self.sort(&bound)) {
+        let settled = |sort: &Sort| !matches!(sort, Sort::Uninterpreted(_));
+        let path_sort = self.path_type(&path).and_then(|bound| self.sort(&bound));
+        let path_sort = match path_sort {
+            Some(sort) if !settled(&sort) && self.sort(ty).is_some_and(|s| settled(&s)) => None,
+            other => other,
+        };
+        match path_sort {
             Some(sort) => {
                 // Declared before the types along the path are read, so a scope
                 // whose binders reference each other terminates rather than
@@ -1761,6 +1832,56 @@ mod tests {
     fn a_comparison_across_sorts_is_not_encoded() {
         let refs = [elem_cmp(CompareKind::Equals, lit(5))];
         let err = smt_sub(&Type::Base(BaseType::String), &refs, &refs, &NoScope).unwrap_err();
+        assert!(
+            matches!(&err, SmtError::Encoding { .. }),
+            "expected an encoding error, got: {err:?}"
+        );
+    }
+
+    /// `__elem ⊙ x`, both at the unsolved variable `var`.
+    fn unsolved_cmp(var: &Type, op: CompareKind) -> Refinement {
+        Refinement::born(Rc::new(
+            TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(var.clone()),
+                BinOpKind::Compare(op),
+                TypedExpr::var(Name::raw("x")).with_ty(var.clone()),
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        ))
+    }
+
+    /// A value of an unsolved variable's type encodes at an uninterpreted sort, where
+    /// equality is decided.
+    #[test]
+    fn an_unsolved_variable_has_equality() {
+        let var = Type::Infer(crate::ccl::InferVar::fresh(1));
+        let scope = scoped("x", var.clone());
+        let equal = [unsolved_cmp(&var, CompareKind::Equals)];
+        let unequal = [unsolved_cmp(&var, CompareKind::NotEquals)];
+        assert!(smt_sub(&var, &equal, &equal, &scope).unwrap());
+        assert!(!smt_sub(&var, &equal, &unequal, &scope).unwrap());
+    }
+
+    /// An uninterpreted sort has no order, and no value of it compares with an `Int`.
+    #[test]
+    fn an_unsolved_variable_has_no_order_and_no_integer() {
+        let var = Type::Infer(crate::ccl::InferVar::fresh(1));
+        let scope = scoped("x", var.clone());
+        let ordered = [unsolved_cmp(&var, CompareKind::Less)];
+        let err = smt_sub(&var, &[], &ordered, &scope).unwrap_err();
+        assert!(
+            matches!(&err, SmtError::Encoding { .. }),
+            "expected an encoding error, got: {err:?}"
+        );
+        let integer = [Refinement::born(Rc::new(
+            TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(var.clone()),
+                BinOpKind::Compare(CompareKind::Equals),
+                lit(3),
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        ))];
+        let err = smt_sub(&var, &[], &integer, &scope).unwrap_err();
         assert!(
             matches!(&err, SmtError::Encoding { .. }),
             "expected an encoding error, got: {err:?}"

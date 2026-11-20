@@ -1004,13 +1004,14 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             refuted,
         } => {
             let scrutinee = scrutinee.map(|s| Box::new(inline_impl(*s, scope, channels)));
+            let facts = match scrutinee.as_deref() {
+                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                None => vec![Vec::new(); branches.len()],
+            };
             let branches = branches
                 .into_iter()
-                .map(|b| {
-                    let facts = match (scrutinee.as_deref(), &b.pattern) {
-                        (Some(s), Some(p)) => crate::ccl::nominal::typed_arm_facts(s, p),
-                        _ => Vec::new(),
-                    };
+                .zip(facts)
+                .map(|(b, facts)| {
                     scope.assuming(facts, |scope| crate::ccl::Branch {
                         pattern: b.pattern,
                         guard: inline_impl(b.guard, scope, channels),
@@ -1664,13 +1665,14 @@ fn inline_and_beta_reduce(
         } => {
             let scrutinee =
                 scrutinee.map(|s| Box::new(inline_and_beta_reduce(*s, name, lambda, scope, memo)));
+            let facts = match scrutinee.as_deref() {
+                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                None => vec![Vec::new(); branches.len()],
+            };
             let branches = branches
                 .into_iter()
-                .map(|b| {
-                    let facts = match (scrutinee.as_deref(), &b.pattern) {
-                        (Some(s), Some(p)) => crate::ccl::nominal::typed_arm_facts(s, p),
-                        _ => Vec::new(),
-                    };
+                .zip(facts)
+                .map(|(b, facts)| {
                     scope.assuming(facts, |scope| crate::ccl::Branch {
                         pattern: b.pattern,
                         guard: inline_and_beta_reduce(b.guard, name, lambda, scope, memo),

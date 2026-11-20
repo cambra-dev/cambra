@@ -379,6 +379,8 @@ impl CompilerTraits {
         // `UInt` row is unreachable for `**` while that holds.
         let exponentiable = arithmetic("Exponentiable", Some("pow"))
             .build(numeric(ArithmeticKind::Pow), &mut instances);
+        // `Unit` is equal to itself, as a `Set`'s checked lookup answers `Option(Unit)`, which
+        // `Option`'s clause requires it of. It has no order.
         let equatable = OperatorTrait {
             name: "Equatable",
             operands: &binary,
@@ -387,7 +389,15 @@ impl CompilerTraits {
             products: ProductReading::AnyProduct,
             requires: Vec::new(),
         }
-        .build(comparison(), &mut instances);
+        .build(
+            {
+                let mut rows = comparison();
+                rows.push((vec![BaseType::Unit, BaseType::Unit], None, None));
+                rows
+            },
+            &mut instances,
+        );
+        crate::ccl::nominal::record_option_requirements(&equatable);
         // `Option(T)` compares by value where `T` does, its constructor and then its payload.
         // `Option` is the compiler's, so this instance is too: no module may declare it
         // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]").

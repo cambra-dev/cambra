@@ -65,8 +65,57 @@ fn option_declaration() -> Rc<NominalDecl> {
 /// Its method `is_none` is built by lowering (`bind_is_none` in `src/ccl/lower/nominal.rs`).
 /// The interpreter declares the same members (`collect_types` in `chl-interp/src/eval.rs`),
 /// and `option_values` in `tests/it/differential_interp.rs` checks that the two agree.
+///
+/// Its `requires` clause ([`record_option_requirements`]) names `Equatable`, whose instance
+/// table names this declaration, so the clause is recorded by the table's build, which this
+/// forces.
 pub fn option() -> Rc<NominalDecl> {
-    OPTION_DECL.with(Rc::clone)
+    let decl = OPTION_DECL.with(Rc::clone);
+    if decl.requirements.get().is_none() {
+        crate::ccl::infer::solver::traits::Trait::equatable();
+    }
+    debug_assert!(
+        decl.requirements.get().is_some(),
+        "building the compiler's traits records `Option`'s requirements"
+    );
+    decl
+}
+
+/// Record `Option(T)`'s `requires` clause, `Equatable(T, T)`, given `equatable`, the trait of
+/// `==`. The compiler's trait table calls this as it builds `Equatable`, before it names
+/// `Option` ([`option`]).
+///
+/// A constructor states its payload with `==` ([`ctor_refinements`]), and a predicate can become
+/// a term, so `Option::some`'s precise type is well-typed only where its payload has an
+/// `Equatable` instance. A constructor states its declaration's clause, so every call is checked
+/// against it, and a checked lookup, which builds an `Option(V)` without a constructor, requires
+/// the same of `V` (`emit_lookup_checked` in `src/ccl/infer/emit.rs`).
+///
+/// TODO: find a statement of the payload that needs no instance. The clause exists only because
+/// the payload fact is spelled with `==`, and it ties every lookup to `Equatable`.
+pub(crate) fn record_option_requirements(equatable: &crate::ccl::infer::solver::traits::Trait) {
+    OPTION_DECL.with(|decl| {
+        let [t] = decl.params.as_slice() else {
+            unreachable!("`Option` declares one type parameter")
+        };
+        let t_ty = Type::Param(Rc::clone(t));
+        decl.set_requirements(DeclRequirements {
+            params: vec![crate::ccl::ty::PolyParam {
+                param: Rc::clone(t),
+                kind: TypeKind::Type,
+                bound_at: None,
+            }],
+            requires: vec![Rc::new(crate::ccl::ty::TraitRequirement {
+                trait_: equatable.clone(),
+                args: vec![t_ty.clone(), t_ty],
+                terms: Vec::new(),
+                effect_assoc: Vec::new(),
+                assoc: Vec::new(),
+                binders: Vec::new(),
+                at: None,
+            })],
+        });
+    });
 }
 
 /// The names of the two types bounding the variables that stand for clauses: every effect is
@@ -243,8 +292,12 @@ fn observe(
 /// `__elem ▷ ctor_is(N::c)`, and `(__elem ▷ ctor_payload(N::c)) == argument` for a constructor
 /// that takes an argument (`docs/chl-spec.md`, "Constructors state what they build").
 ///
-/// The argument is stated whatever its form. What the refinement encoding cannot read of it,
-/// it drops, as it drops any assumption outside its fragment.
+/// The argument is stated only where it is a term ([`is_term`]), as [`arm_facts`] states the
+/// scrutinee: any other argument would copy a program into the type. Of a term the refinement
+/// encoding cannot read, it drops what it cannot read, as it drops any assumption outside its
+/// fragment.
+///
+/// [`is_term`]: crate::ccl::infer::solver::smt::is_term
 pub fn ctor_refinements(
     ctor: &CtorRef,
     args: &[Type],
@@ -260,7 +313,7 @@ pub fn ctor_refinements(
         .decl
         .ctor(&ctor.ctor)
         .is_some_and(|c| !c.params.is_empty());
-    if takes_argument {
+    if takes_argument && crate::ccl::infer::solver::smt::is_term(&argument) {
         refinements.push(born(
             TypedExpr::binop(
                 ctor_payload(elem(), ctor, args),
@@ -328,31 +381,77 @@ pub fn arm_facts(
     Some(facts)
 }
 
-/// [`arm_facts`] for the arm of a typed `match` whose pattern is `pattern`, the declaration's
-/// arguments read off `scrutinee`'s type. Empty for an arm that names no constructor, and for a
-/// scrutinee whose type is no application of the declaration the pattern names.
+/// What the default arm of a `match` over `scrutinee`, a value of `decl` at `args`, knows of
+/// the value it matched: that no constructor in `named` built it, `not (scrutinee ▷
+/// ctor_is(N::c))` for each `c` in `named`, the constructors the arms before it name
+/// (`src/ccl/design/type-inference.md`, "Arm facts").
+///
+/// `None` when `scrutinee` is not a term, as for [`arm_facts`]. A `match` arm has no guard, so an
+/// arm before the default one rejects only the values its constructor did not build.
+pub fn default_arm_facts(
+    scrutinee: &crate::ccl::TypedExpr,
+    decl: &Rc<NominalDecl>,
+    args: &[Type],
+    named: &[SmolStr],
+) -> Option<Vec<crate::ccl::TypedExpr>> {
+    use crate::ccl::{TypedExpr, UnaryOpKind};
+    named
+        .iter()
+        .map(|ctor| {
+            let is = arm_facts(scrutinee, decl, args, ctor, None)?.swap_remove(0);
+            Some(TypedExpr::unary(UnaryOpKind::Not, is).with_ty(Type::Base(BaseType::Bool)))
+        })
+        .collect()
+}
+
+/// The facts of each of `branches`, the arms of a typed `match` over `scrutinee`: [`arm_facts`]
+/// for an arm that names a constructor, and [`default_arm_facts`] for a default arm. Empty for
+/// every arm when `scrutinee`'s type is no application of the declaration the patterns name.
 ///
 /// For a pass walking a tree inference typed, so the facts' nodes are machinery of the
 /// scrutinee they read.
-pub fn typed_arm_facts(
+pub fn typed_case_facts(
     scrutinee: &crate::ccl::TypedExpr,
-    pattern: &crate::ccl::Pattern,
-) -> Vec<crate::ccl::TypedExpr> {
-    let crate::ccl::PatternHead::Constructor { decl, ctor } = &pattern.head else {
-        return Vec::new();
+    branches: &[crate::ccl::Branch],
+) -> Vec<Vec<crate::ccl::TypedExpr>> {
+    let none = || vec![Vec::new(); branches.len()];
+    let Some(decl) = branches
+        .iter()
+        .find_map(|b| match &b.pattern.as_ref()?.head {
+            crate::ccl::PatternHead::Constructor { decl, .. } => Some(decl),
+            crate::ccl::PatternHead::Tag(_) => None,
+        })
+    else {
+        return none();
     };
     let Type::Nominal(scrutinee_decl, args) = scrutinee.ty.peel_refinements() else {
-        return Vec::new();
+        return none();
     };
     if scrutinee_decl != decl {
-        return Vec::new();
+        return none();
     }
     let _g = crate::ccl::provenance::enter(
         scrutinee.node_id(),
         "arm_facts",
         crate::ccl::provenance::Nature::Machinery,
     );
-    arm_facts(scrutinee, decl, args, ctor, Some(&pattern.binding)).unwrap_or_default()
+    let mut named = Vec::new();
+    branches
+        .iter()
+        .map(|b| {
+            let facts = match &b.pattern {
+                Some(pattern) => {
+                    let crate::ccl::PatternHead::Constructor { ctor, .. } = &pattern.head else {
+                        unreachable!("a `Case` names constructors of one nominal type or tags only")
+                    };
+                    named.push(ctor.clone());
+                    arm_facts(scrutinee, decl, args, ctor, Some(&pattern.binding))
+                }
+                None => default_arm_facts(scrutinee, decl, args, &named),
+            };
+            facts.unwrap_or_default()
+        })
+        .collect()
 }
 
 impl CtorRef {

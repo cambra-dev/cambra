@@ -363,7 +363,8 @@ fn is_value_case(expr: &Expr) -> bool {
         TypedExprNode::Case {
             scrutinee: None,
             branches,
-         refuted, } if branches.iter().all(|b| b.pattern.is_none())
+            ..
+        } if branches.iter().all(|b| b.pattern.is_none())
     )
 }
 

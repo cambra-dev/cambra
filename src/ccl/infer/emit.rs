@@ -1475,6 +1475,15 @@ fn emit_lookup_checked<C: Typing>(
         &|| "checked lookup key".to_string(),
         ctx,
     )?;
+    // `Option(V)` requires `Equatable(V, V)`, which no constructor call checks here
+    // (`crate::ccl::nominal::record_option_requirements`).
+    ctx.require_trait(
+        Trait::equatable(),
+        function.node_id(),
+        &[&at_key, &at_key],
+        None,
+        &|| "the value a checked lookup answers".to_string(),
+    )?;
     let result = Type::option_of(at_key);
     // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
     // passes read a consistent type off the node. The domain is the pair the operator is
@@ -3498,6 +3507,8 @@ pub(super) fn emit_case<C: Typing>(
     // Mutable-variable arms contribute values, not handles. Writable-argument validation
     // still examines the argument node; selecting a value here does not create an alias.
     let result_ty = ctx.fresh();
+    // The constructors the arms so far name, which a default arm knows did not build the value.
+    let mut named = Vec::new();
     for b in branches.iter_mut() {
         let scope_info = b
             .pattern
@@ -3508,11 +3519,17 @@ pub(super) fn emit_case<C: Typing>(
                 let PatternHead::Constructor { ctor, .. } = &p.head else {
                     unreachable!("a `Case` names constructors of one nominal type or tags only")
                 };
+                named.push(ctor.clone());
                 let _g = arm_facts_recording(scrut);
                 crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, Some(&p.binding))
                     .unwrap_or_default()
             }
-            _ => Vec::new(),
+            (Some((scrut, decl, args)), None) => {
+                let _g = arm_facts_recording(scrut);
+                crate::ccl::nominal::default_arm_facts(scrut, decl, args, &named)
+                    .unwrap_or_default()
+            }
+            (None, _) => Vec::new(),
         };
         let narrowing = matched
             .as_ref()
@@ -3591,8 +3608,10 @@ fn arm_facts_recording(scrut: &Expr) -> crate::ccl::provenance::RecordingGuard {
 /// type would copy a program into it, and an arm that writes or feeds is no term, which keeps
 /// the refinement off the `match`es the mutability phases rewrite into guards.
 ///
-/// [`is_term`]: crate::ccl::infer::solver::smt::is_term `None` when the
-/// scrutinee is no path a fact names.
+/// `None` also when the scrutinee is no term, which [`arm_facts`] states no fact of.
+///
+/// [`is_term`]: crate::ccl::infer::solver::smt::is_term
+/// [`arm_facts`]: crate::ccl::nominal::arm_facts
 fn derived_case_refinement(
     scrut: &Expr,
     decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
@@ -3600,7 +3619,7 @@ fn derived_case_refinement(
     branches: &[Branch],
     result_ty: &Type,
 ) -> Option<Refinement> {
-    use crate::ccl::{BinOpKind, CompareKind, LogicKind, UnaryOpKind};
+    use crate::ccl::{BinOpKind, CompareKind, LogicKind};
     let bool_ty = Type::Base(BaseType::Bool);
     let and = |l: Expr, r: Expr| {
         Expr::binop(l, BinOpKind::BoolLogic(LogicKind::And), r).with_ty(bool_ty.clone())
@@ -3635,18 +3654,10 @@ fn derived_case_refinement(
                 (std::mem::take(&mut facts), body)
             }
             // A default arm: no named constructor built the value.
-            None => {
-                let facts = named
-                    .iter()
-                    .map(|ctor| {
-                        let is = crate::ccl::nominal::arm_facts(scrut, decl, args, ctor, None)
-                            .expect("the scrutinee is a path, as the named arms found")
-                            .swap_remove(0);
-                        Expr::unary(UnaryOpKind::Not, is).with_ty(bool_ty.clone())
-                    })
-                    .collect();
-                (facts, b.body.clone_preserving_ids())
-            }
+            None => (
+                crate::ccl::nominal::default_arm_facts(scrut, decl, args, &named)?,
+                b.body.clone_preserving_ids(),
+            ),
         };
         if !crate::ccl::infer::solver::smt::is_term(&body) {
             return None;

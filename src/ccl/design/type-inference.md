@@ -1885,6 +1885,19 @@ call is inlined. A constructor term reads the same way: `N::c(𝑎) ▷ ctor_pay
 
 A comparison whose operands encode at two SMT sorts, a `String` and an `Int`, has no encoding.
 
+##### An unsolved variable is an uninterpreted sort
+
+A path whose type is an unsolved inference variable `?𝑛` encodes at an uninterpreted sort, one
+per variable (`Sort::Uninterpreted`), which the query declares with `declare-sort`. A value of
+that sort has equality and no other operation. A term that orders it, computes with it or uses it as
+a proposition has no encoding, and so does a comparison of it with a value of another sort.
+`x == x` holds at `?𝑛`. `_.value() == 3` about an `Option(?𝑛)` has no encoding, since `3` is an
+`Int`.
+
+A settled type wins over a variable. A path whose own type is a variable takes the reading
+node's sort when that sort is not uninterpreted (`Encode::leaf_at`). Two paths compared leaf by
+leaf (`Encode::paths_equal`) have no encoding when a pair of their leaves encodes at two sorts.
+
 ##### The scope a query runs in
 
 `ScopeEnv` looks up a free name's bound type. A supported path uses that type's sort and contributes
@@ -1920,8 +1933,10 @@ this prevents an unrelated contradictory binder from proving an otherwise unsupp
 which holds wherever the query runs. A `match` arm's facts are the case
 ([Arm facts](#arm-facts)). Every query assumes them.
 
-Emission does not instantiate a generalized binder merely to create an SMT assumption. Unresolved
-or unsupported types provide no usable sort.
+Emission does not instantiate a generalized binder merely to create an SMT assumption. An
+unsupported type provides no usable sort. An unresolved one provides an uninterpreted sort
+([An unsolved variable is an uninterpreted sort](#an-unsolved-variable-is-an-uninterpreted-sort)),
+which carries none of the facts its bounds hold.
 
 An antecedent outside the fragment weakens the query rather than defeating it. Each atom of an lhs
 refinement, of a scope assumption or of a fact that has no encoding becomes a fresh `Bool` constant
@@ -4157,9 +4172,10 @@ narrowing or deposit assumes them. So a trait rejecting a variant is what these 
 and not a judgement that such types are incomparable.
 
 The compiler's rows mirror the interpreter's primitives (`apply_binop_column`, in
-`src/interpreter/binop.rs`), so a program inference accepts is one the interpreter can run: there
-is no `Unit` row, since the interpreter compares no units, and no cross-base row, since `Int` and
-`UInt` never join.
+`src/interpreter/binop.rs`), so a program inference accepts is one the interpreter can run.
+`Equatable` has a `Unit` row, which `Option(Unit)` requires (`nominal-types.md`,
+[A constructed value states its constructor and payload](nominal-types.md#a-constructed-value-states-its-constructor-and-payload)),
+and `Orderable` has none. There is no cross-base row, since `Int` and `UInt` never join.
 
 A nominal head names no one type, so the requirement sweep deposits nothing for
 it ([Requirements are read together, once](#requirements-are-read-together-once)), and a pin never
@@ -5112,8 +5128,12 @@ not a write-through handle; this does not relax the restriction on writable argu
 An arm of a `match` naming the constructors of a nominal type `N` knows which constructor built
 the value it matched. For a scrutinee `𝑠` that is a term (`smt::is_term`), the arm
 `case N::c(𝑣):` holds two **arm facts** (`nominal::arm_facts`): `𝑠 ▷ ctor_is(N::c)`, and
-`(𝑠 ▷ ctor_payload(N::c)) == 𝑣` when `c` takes an argument. A scrutinee that is no term cannot
-be restated without copying a program into a type, and its arms hold none. The term grammar is
+`(𝑠 ▷ ctor_payload(N::c)) == 𝑣` when `c` takes an argument. A default arm `case _:` holds
+`not (𝑠 ▷ ctor_is(N::c))` for each constructor `c` that an arm before it names
+(`nominal::default_arm_facts`). A `match` arm has no guard, so an arm before the default one
+rejects exactly the values its constructor did not build. A scrutinee that is no term cannot be
+restated without copying a program into a type, and its arms hold none. Passes after inference
+read each arm's facts off the typed `Case` (`nominal::typed_case_facts`). The term grammar is
 closed under substitution, so a scrutinee that a `let`'s discharge or an inlined call rewrites,
 `o` to `Option::some(r)`, keeps its facts.
 
@@ -5137,8 +5157,8 @@ its arms of each arm's facts and `__elem == body`, the pattern's binder read as 
 binds (`derived_case_refinement`). `Option::unwrap_or` is
 `match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, and its result is refined by
 `(𝑝.0 ▷ ctor_is(Option::some) and __elem == 𝑝.0 ▷ ctor_payload(Option::some)) or
-(𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`. A default arm contributes the negation of each
-named arm's tag. A `match` with an arm whose body is not a term (`smt::is_term`) states nothing
+(𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`. A default arm contributes its arm facts, the
+negation of each tag an arm before it names. A `match` with an arm whose body is not a term (`smt::is_term`) states nothing
 of its result: copying an arbitrary body into a type would copy a program into it. An arm that
 writes or feeds is no term, so the refinement stays off the `match`es the mutability phases rewrite
 into guards (`tag_case_to_guard_case`), whose re-derived type would lack it. The term grammar is

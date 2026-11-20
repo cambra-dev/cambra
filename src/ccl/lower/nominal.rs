@@ -1902,9 +1902,10 @@ fn builtin_functions() -> [AssociatedFunction; 3] {
     [method(IS_NONE, 1), method(VALUE, 1), method(UNWRAP_OR, 2)]
 }
 
-/// The reading a refinement predicate gives a call of `decl`'s method `method`, where the
-/// method is one of `Option`'s observers: `is_none` reads `ctor_is(Option::none)`, and `value`
-/// reads `ctor_payload(Option::some)`.
+/// The reading a refinement predicate gives `decl`'s method `method`, where the method is one of
+/// `Option`'s observers: `is_none` reads `ctor_is(Option::none)`, and `value` reads
+/// `ctor_payload(Option::some)`. A method call (`_.is_none()`) and a path (`Option::is_none(_)`,
+/// [`predicate_reference`]) read the same.
 ///
 /// The method's function is what a call of it computes, and the refinement encoding reads
 /// neither function. The reading is what the encoding reads (`src/ccl/infer/solver/smt.rs`,
@@ -2311,8 +2312,22 @@ pub(super) fn lower_member(
             let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "lower.nominal_ctor_unit");
             Ok(Expr::nominal_ctor(named.decl, q.name.node.as_str(), unit))
         }
-        _ => Ok(Expr::var(named.reference(&q.name.node, ctx))),
+        _ => Ok(predicate_reference(&named.decl, &q.name, ctx)
+            .unwrap_or_else(|| Expr::var(named.reference(&q.name.node, ctx)))),
     }
+}
+
+/// The reading a refinement predicate gives a reference to `decl`'s member `name`, written
+/// `Option::is_none` rather than as a method call: the same reading [`lower_method_call`] gives
+/// `_.is_none()` ([`predicate_reading`]). `None` outside a predicate, and for a member with no
+/// reading.
+fn predicate_reference(
+    decl: &Rc<NominalDecl>,
+    name: &Spanned<SmolStr>,
+    ctx: &mut LoweringContext,
+) -> Option<Expr> {
+    let reading = predicate_reading(decl, &name.node).filter(|_| ctx.in_refinement_predicate)?;
+    Some(ctx.tag_image(Expr::builtin(reading), name.span))
 }
 
 /// Lower a call of a name qualified by a type, `Shape::circle(1)`.
@@ -2345,10 +2360,18 @@ pub(super) fn lower_member_call(
                 args.len()
             ),
         )),
-        _ => {
-            let binding = named.reference(name, ctx);
-            super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
-        }
+        _ => match predicate_reference(decl, &q.name, ctx) {
+            Some(reading) => {
+                let [arg] = args else {
+                    unreachable!("a member with a predicate reading takes one argument")
+                };
+                Ok(Expr::apply(super::lower_expr(arg, ctx)?, reading))
+            }
+            None => {
+                let binding = named.reference(name, ctx);
+                super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
+            }
+        },
     }
 }
 

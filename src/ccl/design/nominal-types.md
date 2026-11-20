@@ -398,14 +398,25 @@ argument, `(__elem ▷ ctor_payload(N::c)) == 𝑎` (`nominal::ctor_refinements`
 states its constructors. The encoding, the arm facts and the coverage proof of a `match` hold for
 every nominal type (`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). Trait
 selection and the passes after inlining do not yet read a refined value of any other type. The
-argument `𝑎` is stated whatever its form. The solver drops what it cannot read of it, as it drops
-any antecedent outside its fragment, so a constructor's type does not depend on how its argument is
-written.
+argument `𝑎` is stated only when it is a term (`smt::is_term`), as the arm facts and a `match`'s
+derived refinement state only terms: any other argument would copy a program into the type. The
+solver drops what it cannot read of a term, as it drops any antecedent outside its fragment.
+
+The payload is stated with `==`, which is `Equatable`'s, and a predicate can become a term
+(`compile_refinement_predicates`). `Option(T)` therefore requires `Equatable(T, T)`
+(`nominal::record_option_requirements`). The compiler's trait table records the clause when it
+builds `Equatable`, since that table's `Option` instance names the declaration. A constructor states
+its declaration's clause, so every call of `Option::some` is checked against it. A checked lookup
+builds an `Option(V)` without a constructor, and `emit_lookup_checked` requires `Equatable(V, V)`.
+`Unit` has an `Equatable` instance, which a `Set`'s lookup, answering `Option(Unit)`, needs. The
+requirement ties lookup to `Equatable`; a statement of the payload that needs no instance would lift
+it.
 
 In a refinement predicate, `Option`'s methods `is_none` and `value` read as `ctor_is(Option::none)`
 and `ctor_payload(Option::some)` (`predicate_reading`). The reading takes the place of the method's
 candidate in the call's `Method` node, so the call resolves by its receiver's type as any method
-call does, and another type's method of the same name changes nothing. `ctor_payload` has no domain
+call does, and another type's method of the same name changes nothing. A path to either function,
+`Option::is_none(_)`, reads the same (`predicate_reference`). `ctor_payload` has no domain
 refinement, so `_.value() == 3` is a predicate about any `Option`, where a call of `value` outside a
 predicate demands a `some`.
 

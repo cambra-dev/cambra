@@ -580,14 +580,14 @@ pub enum InferError {
     },
     /// The expression kind is not yet handled by this inference pass.
     Unsupported(String),
-    /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
-    ///
-    /// Lowering never produces a 0-branch `Case`; this indicates a malformed
-    /// AST constructed outside the normal lowering path.
     /// A `match` over a value of a nominal type `ty` with no arm for the constructors `ctors`,
     /// whose arms the value's refinement does not rule out (`src/ccl/design/type-inference.md`,
     /// "Unreachable arms").
     UnhandledConstructors { ty: String, ctors: Vec<String> },
+    /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
+    ///
+    /// Lowering never produces a 0-branch `Case`; this indicates a malformed
+    /// AST constructed outside the normal lowering path.
     EmptyCase {
         /// The empty case expression written in CCL. Omitted from the message; retained
         /// excluded by [`Self::same_defect`].

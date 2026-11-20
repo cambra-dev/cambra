@@ -2571,16 +2571,16 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 coalesce_node(s, level, ctx);
             }
             assert_pinned_tags_are_unreachable(scrutinee.as_deref(), &pinned_tags);
-            for b in branches.iter_mut() {
+            // An arm knows which constructor built the value it matched, and a default arm
+            // which ones did not (`src/ccl/design/type-inference.md`, "Arm facts").
+            let case_facts = match scrutinee.as_deref() {
+                Some(s) => crate::ccl::nominal::typed_case_facts(s, branches),
+                None => vec![Vec::new(); branches.len()],
+            };
+            for (b, facts) in branches.iter_mut().zip(case_facts) {
                 // A pattern's payload binding scopes the branch's guard and
                 // body, shadowing an outer generalized binding of its name.
                 let pattern_name = b.pattern.as_ref().map(|p| p.binding.name.clone());
-                // An arm knows which constructor built the value it matched
-                // (`src/ccl/design/type-inference.md`, "Arm facts").
-                let facts = match (scrutinee.as_deref(), &b.pattern) {
-                    (Some(s), Some(p)) => crate::ccl::nominal::typed_arm_facts(s, p),
-                    _ => Vec::new(),
-                };
                 let depth = ctx.binders.facts_len();
                 ctx.binders.extend_facts(facts);
                 with_shadows(ctx, pattern_name.clone(), |ctx| {

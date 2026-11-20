@@ -958,7 +958,7 @@ impl Snapshot<'_> {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
-                refuted,
+                ..
             } if contains_begin_in(branches) => {
                 // The tests run where the branch stands; a write in any arm comes after them.
                 let in_arms: HashSet<Name> = branches
@@ -1062,7 +1062,7 @@ fn site_reads(body: &Expr) -> HashSet<Name> {
             TypedExprNode::Case {
                 scrutinee,
                 branches,
-                refuted,
+                ..
             } if contains_begin_in(branches) => {
                 if let Some(s) = scrutinee {
                     out.extend(free_names_in_value(s));

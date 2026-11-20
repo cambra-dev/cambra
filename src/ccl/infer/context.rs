@@ -73,12 +73,14 @@ pub(super) struct Binding {
 /// [`value_type`](super::solve::value_type), which reports what a value has made
 /// of the slot and never what a use demanded of it. `x = 2 ^+ 1` is the case: the
 /// literal's own singleton is on the node, but the sum's is on the variable's
-/// bounds, and unresolved it has no SMT sort at all.
+/// bounds. Unresolved, the variable encodes at an uninterpreted sort, which
+/// carries none of those bounds.
 ///
 /// The quantified variables of a generalized binder's scheme stay
-/// uninstantiated — there is no use site here to instantiate them at. A polytype
-/// has no SMT sort, so [`smt_sub`](super::solver::smt::smt_sub) drops it rather
-/// than assuming anything wrong about it.
+/// uninstantiated, because there is no use site here to instantiate them at. A
+/// quantified variable encodes at an uninterpreted sort, so
+/// [`smt_sub`](super::solver::smt::smt_sub) assumes nothing of the value beyond
+/// equality and the refinements its type states.
 impl ScopeEnv for ScopeStack<Name, Binding> {
     fn binder_type(&self, name: &Name) -> Option<Type> {
         value_type(&self.lookup(name)?.scheme.body)
