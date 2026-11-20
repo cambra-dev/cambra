@@ -705,12 +705,14 @@ impl FieldBeneathRows {
 }
 
 impl Consumer for FieldBeneathRows {
+    /// A complete region of one field completes part of what each row it reaches depends on: the
+    /// row is complete once every field is ([`Landing::completing_part`]).
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let restated = self.restated(region);
         if restated == Projection::Nothing && landing.queues() {
             return;
         }
-        self.consumer.notify(&restated, landing);
+        landing.completing_part(|landing| self.consumer.notify(&restated, landing));
     }
 }
 
