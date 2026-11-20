@@ -460,8 +460,16 @@ impl Projection {
     /// [`Everything`](Self::Everything) is every key under the tag, and no key under another.
     pub fn tagged(&self, tag: &FieldKey) -> Projection {
         match self {
-            Projection::Within { .. } | Projection::Or(_) => panic!(
-                "this reading has no part of some values: a projection within values or an `Or` reaches it"
+            Projection::Or(arms) => Projection::any_of(arms.iter().map(|arm| arm.tagged(tag))),
+            // The tag stands on the keys, so the part of the values beneath them is unchanged.
+            Projection::Within {
+                level,
+                keys,
+                values,
+            } => Projection::within(
+                *level,
+                tagged_at(keys, level.index(), tag),
+                (**values).clone(),
             ),
             Projection::Nothing => Projection::Nothing,
             Projection::Everything => Projection::admitting(tagged_at(&Predicate::True, 0, tag)),
