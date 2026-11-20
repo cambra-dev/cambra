@@ -4188,9 +4188,7 @@ pub(super) fn specialize_use(
     // A variable minted for one of the binding's own parameters has no original whose scope it
     // could inherit, so it stands where the clone does: where the definition stands, under the
     // binders the placement enters.
-    let param_telescope = frame
-        .telescope
-        .rescoped(|_| false, entered_binders.iter().cloned());
+    let param_telescope = frame.telescope.entered(entered_binders.iter().cloned());
     let mut fresh = FreshenCache {
         own_params: Some(Rc::clone(&frame.own_params)),
         param_telescope: Some(param_telescope),
