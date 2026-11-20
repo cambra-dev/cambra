@@ -1598,7 +1598,11 @@ mod tests {
         let two_up = Predicate::qualified(qualified, one);
         assert!(Projection::of(&codomain(domain(two_up))).is_err());
         let scalar = codomain(TileGuard::Scalar(under(key(0), Predicate::True)));
-        assert!(Projection::of(&scalar).is_err());
+        assert_eq!(
+            Projection::of(&scalar),
+            Ok(Projection::admitting(key(0))),
+            "a scalar beneath a key is that key's whole value"
+        );
     }
 
     /// `Above` admits the outermost keys and the levels above its own, and refuses its own level

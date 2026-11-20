@@ -1366,8 +1366,8 @@ mod nested_projection_tests {
     }
 
     /// A `Zip` pairing beneath its outermost level passes what an arm notifies through
-    /// `through_values`: a change of an inner row reaches its consumer as that row's group, and a
-    /// complete region passes only the groups it names whole. `through_values` itself is tested in
+    /// `through_values`: a change of an inner row reaches its consumer as that row's group,  and a
+    /// complete region completes the same part. `through_values` itself is tested in
     /// `notifications.rs`; this pins that the `Zip` subscribes its arms through it. Forwarded
     /// unchanged, an inner row's region names keys beneath the pair, which are no keys of the
     /// `Zip` (`a_tuple_of_a_fold_and_a_collection_the_filter_empties_for_some_groups`).
@@ -1400,8 +1400,12 @@ mod nested_projection_tests {
         notify_input(&left_consumer, &row);
         assert_eq!(
             *regions.read().unwrap_or_else(PoisonError::into_inner),
-            std::slice::from_ref(&group),
-            "a change of a row names its group"
+            [Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(0)),
+                Projection::of_field("a", Projection::of_path(&[Value::UInt(1)])),
+            )],
+            "a change of a row names that row of its group's arm"
         );
 
         let complete = |consumer: &InputConsumer, region: &Projection| {
@@ -1417,8 +1421,12 @@ mod nested_projection_tests {
         complete(&left_consumer, &row);
         assert_eq!(
             *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [Projection::Nothing],
-            "a complete row of a group completes no group"
+            [Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(0)),
+                Projection::of_field("a", Projection::of_path(&[Value::UInt(1)])),
+            )],
+            "a complete row of a group completes that part of the group, not the group"
         );
         regions
             .write()
@@ -1427,8 +1435,12 @@ mod nested_projection_tests {
         complete(&left_consumer, &group);
         assert_eq!(
             *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [group],
-            "a complete group completes the pair's group"
+            [Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(0)),
+                Projection::of_field("a", Projection::Everything),
+            )],
+            "a complete group of one arm completes that arm's field of the pair's group"
         );
     }
 

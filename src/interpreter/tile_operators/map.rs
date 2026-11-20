@@ -1675,10 +1675,9 @@ mod nested_projection_tests {
     }
 
     /// A collection constant that replaces each row's collection holds the keys beneath the row,
-    /// so a projection of them names nothing of the input.
+    /// so a pull of some of them pulls the rows holding them and answers the cut of those rows.
     #[test]
-    #[should_panic(expected = "restates the outermost keys and the keys above level 1")]
-    fn a_constant_refuses_a_projection_of_the_keys_it_replaces() {
+    fn a_constant_answers_a_projection_of_the_keys_it_replaces_from_their_rows() {
         use crate::interpreter::tile_operators::test_helpers::ints_by_position;
         let constant_tiling = Tiling::data_function(Extent::uint_range(2), Tiling::Scalar(int()));
         let map = Arc::new(MapResultToConst::new_at(
@@ -1690,14 +1689,17 @@ mod nested_projection_tests {
             MapResultToConstMode::Replace,
             CurryLevel::new(1),
         ));
-        let guard = map.tiling().universal_guard();
-        let producer = map
-            .clone()
-            .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
-        producer.get(paths_guard(Predicate::qualified(
-            Predicate::point(Value::UInt(0)),
-            Predicate::point(Value::UInt(1)),
-        )));
+        let tiling = map.tiling();
+        let mut producer = map.clone().subscribe(
+            tiling.universal_guard(),
+            Box::new(|| {}),
+            &mut SubscribeContext::new(),
+        );
+        let projection = Projection::of_path(&[Value::UInt(0), Value::UInt(1)]);
+        let actual = producer.read_in_pipeline(projection.guard(&tiling));
+        let mut expected = producer.read_in_pipeline(tiling.universal_guard());
+        expected.restrict_to(&projection, &tiling);
+        assert_eq!(actual, expected);
     }
 }
 

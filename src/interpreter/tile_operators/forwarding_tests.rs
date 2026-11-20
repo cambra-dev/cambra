@@ -9,7 +9,9 @@ use std::sync::PoisonError;
 
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
-use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, SubscribeContext, Tiling};
+use crate::interpreter::{
+    BaseType, CurryLevel, Extent, Predicate, Projection, SubscribeContext, Tiling,
+};
 
 /// An operator and the consumers it installed on its inputs, which a test notifies through.
 type Built = (Arc<dyn TileOperator>, Vec<InputConsumer>);
@@ -231,15 +233,35 @@ fn zip() -> Built {
     (Arc::new(op), vec![first, second])
 }
 
+/// The region of arm `name`'s rows `keys` admits, as a zip beneath rows restates it: those rows,
+/// within the arm's field alone.
+fn zip_field(name: &str, keys: Predicate) -> Projection {
+    Projection::within(
+        CurryLevel::OUTERMOST,
+        keys,
+        Projection::of_field(name, Projection::Everything),
+    )
+}
+
+/// Each arm of a zip beneath rows is one field of them, so a region of an arm's rows names that
+/// field of the rows and nothing of the other arm's.
 #[test]
-fn zip_forwards_the_region_of_its_first_arm() {
-    assert_keeps(&zip, 0);
+fn zip_forwards_the_region_of_its_first_arm_as_that_field() {
+    assert_eq!(
+        received(&zip, 0, &region()),
+        [zip_field("_0", keys_of(&region()))]
+    );
 }
 
 #[test]
-fn zip_forwards_the_region_of_its_second_arm_without_state() {
-    assert_keeps(&zip, 1);
-    assert_keeps_without_state(&zip, 1);
+fn zip_forwards_the_region_of_its_second_arm_as_that_field_without_state() {
+    for sent in [region(), Projection::Everything, another_region()] {
+        assert_eq!(
+            received(&zip, 1, &sent),
+            [zip_field("_1", keys_of(&sent))],
+            "{sent:?}"
+        );
+    }
 }
 
 fn product() -> Built {
@@ -305,6 +327,7 @@ fn under_arm(arm: usize, keys: Predicate) -> Projection {
 /// The keys of a region of the test streams.
 fn keys_of(region: &Projection) -> Predicate {
     match region {
+        Projection::Everything => Predicate::True,
         Projection::Keys { keys, .. } => keys.clone(),
         other => panic!("a region of keys: {other:?}"),
     }
@@ -973,8 +996,8 @@ fn a_fan_out_passes_each_notification_to_its_readers() {
     );
 }
 
-/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each: a memo
-/// above it marks both regions dirty.
+/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each as that
+/// arm's field of the rows: a memo above it marks both regions dirty.
 #[test]
 fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     let (operator, inputs) = zip();
@@ -991,7 +1014,10 @@ fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     notify_input(&inputs[1], &another_region());
     assert_eq!(
         *regions.write().unwrap_or_else(PoisonError::into_inner),
-        [region(), another_region()]
+        [
+            zip_field("_0", keys_of(&region())),
+            zip_field("_1", keys_of(&another_region()))
+        ]
     );
 }
 
