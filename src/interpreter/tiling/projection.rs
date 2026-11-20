@@ -156,6 +156,15 @@ impl Projection {
         }
     }
 
+    /// The guard this projection names where it is keys, and a record guard of its fields where it
+    /// names fields, for [`TileGuard::refused_by`]: a record guard is refused by no declaration.
+    fn guard_of_keys(&self) -> TileGuard {
+        match self {
+            Projection::Fields { .. } => TileGuard::Record(Default::default()),
+            keys => keys.collection_guard(),
+        }
+    }
+
     /// The guard this projection names for a collection, whose universal guard is the domain
     /// guard admitting every key ([`guard`](Self::guard) where no tiling is at hand).
     pub(crate) fn collection_guard(&self) -> TileGuard {
@@ -273,13 +282,10 @@ impl Projection {
     /// more is sound for a `get`.
     pub fn above(&self, level: CurryLevel) -> Projection {
         match self {
-            Projection::Keys { level: own, keys } if *own >= level => match level.enclosing() {
-                None => Projection::Everything,
-                Some(enclosing) => {
-                    Projection::keys_at(enclosing, through_at(keys, *own, enclosing))
-                }
-            },
-            other => other.clone(),
+            Projection::Keys { level: own, .. } if *own >= level => {
+                Projection::of_keys(&self.collection_guard().keys_above(level))
+            }
+            unaffected => unaffected.clone(),
         }
     }
 
@@ -291,17 +297,18 @@ impl Projection {
     /// An operator whose input does not restate the level this projection names pulls the
     /// input there and cuts its answer after; pulling more is sound for a `get`.
     pub fn restated_by(&self, restates: &Restates) -> Projection {
-        let Some(own) = self.level() else {
-            return self.clone();
-        };
-        let restated = restates.nearest(own);
-        let mut pulled = self.clone();
-        while let Some(level) = pulled.level()
-            && level > restated
-        {
-            pulled = pulled.above(level);
+        match self {
+            Projection::Keys { level, .. } if restates.refuses(*level) => {
+                Projection::of_keys(&self.collection_guard().keys_restated_by(restates))
+            }
+            unaffected => unaffected.clone(),
         }
-        pulled
+    }
+
+    /// The projection a guard of keys names, which every guard the key operations on
+    /// [`TileGuard`] answer is.
+    fn of_keys(guard: &TileGuard) -> Projection {
+        Projection::of(guard).unwrap_or_else(|why| unreachable!("a guard of keys: {why}"))
     }
 
     /// The level whose keys this projection names, `None` for everything and nothing.
@@ -374,10 +381,8 @@ impl Projection {
     /// [`Everything`](Self::Everything) is every key under the tag, and no key under another.
     pub fn tagged(&self, tag: &FieldKey) -> Projection {
         match self {
-            Projection::Nothing => Projection::Nothing,
-            Projection::Everything => Projection::admitting(tagged_at(&Predicate::True, 0, tag)),
-            Projection::Keys { level, keys } => {
-                Projection::keys_at(*level, tagged_at(keys, level.index(), tag))
+            keys @ (Projection::Nothing | Projection::Everything | Projection::Keys { .. }) => {
+                Projection::of_keys(&keys.collection_guard().keys_tagged(tag))
             }
             Projection::Fields { .. } => {
                 panic!("{self:?} names the fields of a record, which is no arm of a tagged union")
@@ -630,9 +635,7 @@ impl TileGuard {
         producer: impl Fn() -> String,
     ) -> Projection {
         let projection = Projection::of(self).unwrap_or_else(|why| panic!("{}: {why}", producer()));
-        if let Some(level) = projection.level()
-            && restates.refuses(level)
-        {
+        if let Some(level) = projection.guard_of_keys().refused_level(restates) {
             let producer = producer();
             panic!(
                 "{producer}: a projection guard names keys at {level}, and {producer} restates \
@@ -640,6 +643,171 @@ impl TileGuard {
             );
         }
         projection
+    }
+}
+
+/// One arm of a guard of keys: the keys `keys` admits at `level`, a domain guard beneath `level`
+/// codomain guards.
+struct KeyArm {
+    level: CurryLevel,
+    keys: Predicate,
+}
+
+impl KeyArm {
+    /// The arm normalized as [`Projection::keys_at`] normalizes keys: at the shallowest level it
+    /// is every key beneath, `None` where it admits nothing, and a level with no key arm above it
+    /// where it admits every key.
+    fn normalized(self) -> Option<KeyArm> {
+        let KeyArm {
+            mut level,
+            mut keys,
+        } = self;
+        loop {
+            if keys.is_false() {
+                return None;
+            }
+            if keys.is_true() {
+                return Some(KeyArm {
+                    level: CurryLevel::OUTERMOST,
+                    keys: Predicate::True,
+                });
+            }
+            match (level.enclosing(), every_key_beneath(&keys)) {
+                (Some(above), Some(whole)) => (level, keys) = (above, whole),
+                _ => return Some(KeyArm { level, keys }),
+            }
+        }
+    }
+
+    fn guard(&self) -> TileGuard {
+        spell(self.level, &self.keys)
+    }
+}
+
+impl TileGuard {
+    /// This guard's arms as keys of collection levels, or why one arm is no such arm: a domain
+    /// guard beneath codomain guards, whose keys name enclosing paths no deeper than it steps.
+    fn key_arms(&self) -> Result<Vec<KeyArm>, String> {
+        let arms = match self {
+            TileGuard::Or(arms) => arms.as_slice(),
+            single => std::slice::from_ref(single),
+        };
+        arms.iter()
+            .map(|arm| {
+                let mut level = 0;
+                let mut node = arm;
+                while let TileGuard::Function(FunctionGuard::Codomain(inner)) = node {
+                    level += 1;
+                    node = inner;
+                }
+                match node {
+                    TileGuard::Function(FunctionGuard::Domain(keys))
+                        if qualifying_levels(keys) <= level =>
+                    {
+                        Ok(KeyArm {
+                            level: CurryLevel::new(level),
+                            keys: keys.clone(),
+                        })
+                    }
+                    _ => Err(format!(
+                        "a guard of keys is domain guards beneath codomain guards, got {self:?}"
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    /// The guard of `arms`, normalized, their union where there are several; the domain guard
+    /// admitting nothing where there are none.
+    fn of_key_arms(arms: impl IntoIterator<Item = KeyArm>) -> TileGuard {
+        let arms: Vec<KeyArm> = arms.into_iter().filter_map(KeyArm::normalized).collect();
+        if arms.iter().any(|arm| arm.keys.is_true()) {
+            return TileGuard::Function(FunctionGuard::Domain(Predicate::True));
+        }
+        match arms.is_empty() {
+            true => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+            false => TileGuard::flatten_or(arms.iter().map(KeyArm::guard).collect()),
+        }
+    }
+
+    /// The keys above `level` this guard of keys names, for an operator whose input lacks `level`,
+    /// as [`Projection::above`] gives them: an arm at or beneath `level` becomes the keys its paths
+    /// run through just above `level`, or every key where `level` is the outermost. A record guard
+    /// and any other shape are left as they are.
+    pub(crate) fn keys_above(&self, level: CurryLevel) -> TileGuard {
+        let Ok(arms) = self.key_arms() else {
+            return self.clone();
+        };
+        TileGuard::of_key_arms(arms.into_iter().map(|arm| match level.enclosing() {
+            _ if arm.level < level => arm,
+            None => KeyArm {
+                level: CurryLevel::OUTERMOST,
+                keys: Predicate::True,
+            },
+            Some(enclosing) => KeyArm {
+                level: enclosing,
+                keys: through_at(&arm.keys, arm.level, enclosing),
+            },
+        }))
+    }
+
+    /// This guard of keys restated at the levels `restates` admits, as [`Projection::restated_by`]
+    /// restates a projection: each arm at a level `restates` refuses becomes the keys its paths run
+    /// through at the nearest level above it that `restates` admits.
+    pub(crate) fn keys_restated_by(&self, restates: &Restates) -> TileGuard {
+        let Ok(arms) = self.key_arms() else {
+            return self.clone();
+        };
+        TileGuard::of_key_arms(arms.into_iter().filter_map(KeyArm::normalized).map(|arm| {
+            let nearest = restates.nearest(arm.level);
+            match nearest == arm.level {
+                true => arm,
+                false => KeyArm {
+                    level: nearest,
+                    keys: through_at(&arm.keys, arm.level, nearest),
+                },
+            }
+        }))
+    }
+
+    /// The guard of a tagged union naming what this guard of the union's arm under `tag` names,
+    /// as [`Projection::tagged`] restates a projection: the same paths with their outermost key
+    /// under the tag.
+    ///
+    /// # Panics
+    ///
+    /// For a guard that is no guard of keys.
+    pub(crate) fn keys_tagged(&self, tag: &FieldKey) -> TileGuard {
+        let arms = self
+            .key_arms()
+            .unwrap_or_else(|why| panic!("{why}: a tagged union's arm is a collection"));
+        TileGuard::of_key_arms(
+            arms.into_iter()
+                .filter_map(KeyArm::normalized)
+                .map(|arm| KeyArm {
+                    keys: tagged_at(&arm.keys, arm.level.index(), tag),
+                    level: arm.level,
+                }),
+        )
+    }
+
+    /// The level of an arm of this guard that names keys `restates` refuses, as
+    /// [`TileGuard::projection_for`] refuses a pull; `None` for a record guard at the root, and
+    /// for a guard every arm of which names keys at a level `restates` admits.
+    ///
+    /// # Panics
+    ///
+    /// For a guard that is no record guard and no guard of keys.
+    pub(crate) fn refused_level(&self, restates: &Restates) -> Option<CurryLevel> {
+        if matches!(self, TileGuard::Record(_)) {
+            return None;
+        }
+        self.key_arms()
+            .unwrap_or_else(|why| panic!("{why}"))
+            .into_iter()
+            .filter_map(KeyArm::normalized)
+            .find(|arm| !arm.keys.is_true() && restates.refuses(arm.level))
+            .map(|arm| arm.level)
     }
 }
 
@@ -1100,6 +1268,152 @@ mod tests {
         Projection::Keys {
             level: CurryLevel::new(1),
             keys,
+        }
+    }
+
+    /// Every path of keys `0..3` through `depth + 1` levels.
+    fn paths(depth: usize) -> Vec<Vec<u64>> {
+        (0..=depth).fold(vec![Vec::new()], |paths, _| {
+            paths
+                .into_iter()
+                .flat_map(|path| {
+                    (0..3).map(move |k| {
+                        let mut longer = path.clone();
+                        longer.push(k);
+                        longer
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Whether the guard of keys `guard` names the path `path` whole: an arm at or above the
+    /// path's level admits its prefix at the arm's level.
+    fn guard_names(guard: &TileGuard, path: &[u64]) -> bool {
+        let path: Vec<Value> = path.iter().map(|k| Value::UInt(*k)).collect();
+        guard.key_arms().unwrap().iter().any(|arm| {
+            arm.level.index() < path.len() && arm.keys.contains_path(&path[..=arm.level.index()])
+        })
+    }
+
+    /// Whether the guard of keys `guard` names some path through `path`, at its level or beneath
+    /// it within keys `0..3` and three levels.
+    fn guard_touches(guard: &TileGuard, path: &[u64]) -> bool {
+        (path.len() - 1..3).any(|depth| {
+            paths(depth)
+                .iter()
+                .any(|longer| longer.starts_with(path) && guard_names(guard, longer))
+        })
+    }
+
+    /// Guards of keys at the outermost level and one and two levels in, alone and together.
+    fn sample_guards() -> Vec<TileGuard> {
+        let arms = [
+            domain(positions(0, 1)),
+            domain(key(2)),
+            codomain(domain(under(key(0), positions(1, 2)))),
+            codomain(domain(under(positions(1, 2), key(0)))),
+            codomain(domain(key(1))),
+            codomain(codomain(domain(under(under(key(1), key(2)), key(0))))),
+        ];
+        let mut guards: Vec<TileGuard> = arms.to_vec();
+        for (i, a) in arms.iter().enumerate() {
+            for b in &arms[i + 1..] {
+                guards.push(TileGuard::flatten_or(vec![a.clone(), b.clone()]));
+            }
+        }
+        guards
+    }
+
+    /// A guard's `keys_above(𝑙)` names a key of the level above `𝑙` exactly where the guard names
+    /// some path through it, leaves no arm at or beneath `𝑙`, and is every key where `𝑙` is the
+    /// outermost and the guard names anything.
+    #[test]
+    fn keys_above_names_the_keys_the_paths_run_through() {
+        for guard in sample_guards() {
+            let any = paths(0).iter().any(|path| guard_touches(&guard, path));
+            for level in 0..3 {
+                let above = guard.keys_above(CurryLevel::new(level));
+                match level.checked_sub(1) {
+                    None => assert_eq!(above.is_universal(), any, "{guard:?}: {above:?}"),
+                    Some(rows) => {
+                        for path in paths(rows) {
+                            assert_eq!(
+                                guard_names(&above, &path),
+                                guard_touches(&guard, &path),
+                                "{guard:?} above {level} at {path:?}: {above:?}"
+                            );
+                        }
+                        for arm in above.key_arms().unwrap() {
+                            assert!(
+                                arm.level.index() < level,
+                                "{guard:?} above {level}: {above:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `keys_restated_by` is `keys_above` at the first level a declaration refuses, and the guard
+    /// itself under a declaration that refuses none.
+    #[test]
+    fn keys_restated_by_is_keys_above_the_first_refused_level() {
+        let declarations = [
+            (Restates::Outermost, Some(1)),
+            (Restates::Above(CurryLevel::new(1)), Some(1)),
+            (Restates::Above(CurryLevel::new(2)), Some(2)),
+            (Restates::Every, None),
+        ];
+        for guard in sample_guards() {
+            for (restates, refused) in &declarations {
+                let restated = guard.keys_restated_by(restates);
+                let expected = match refused {
+                    Some(level) => guard.keys_above(CurryLevel::new(*level)),
+                    None => guard.clone(),
+                };
+                assert!(
+                    restated.subsumes(&expected) && expected.subsumes(&restated),
+                    "{guard:?} restated by {restates}: {restated:?}, expected {expected:?}"
+                );
+                assert_eq!(restated.refused_level(restates), None, "{restated:?}");
+            }
+        }
+    }
+
+    /// `keys_tagged` names the tagged path of each path the guard names, and no path under another
+    /// tag.
+    #[test]
+    fn keys_tagged_names_each_path_under_the_tag() {
+        let tag = FieldKey::Name("t".into());
+        let other = FieldKey::Name("u".into());
+        for guard in sample_guards() {
+            let tagged = guard.keys_tagged(&tag);
+            for depth in 0..3 {
+                for path in paths(depth) {
+                    let under = |tag: &FieldKey| {
+                        let mut values: Vec<Value> = path.iter().map(|k| Value::UInt(*k)).collect();
+                        values[0] = Value::Union {
+                            tag: tag.clone(),
+                            inner: Box::new(values[0].clone()),
+                        };
+                        tagged.key_arms().unwrap().iter().any(|arm| {
+                            arm.level.index() < values.len()
+                                && arm.keys.contains_path(&values[..=arm.level.index()])
+                        })
+                    };
+                    assert_eq!(
+                        under(&tag),
+                        guard_names(&guard, &path),
+                        "{guard:?} at {path:?}: {tagged:?}"
+                    );
+                    assert!(
+                        !under(&other),
+                        "{guard:?} at {path:?} under another tag: {tagged:?}"
+                    );
+                }
+            }
         }
     }
 
