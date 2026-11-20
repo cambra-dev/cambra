@@ -152,16 +152,6 @@ pub fn symbolic(expr: &Expr) -> String {
     fmt(expr, Precedence::Lowest, &SymbolicOpts::default())
 }
 
-/// [`symbolic`], with a statement (`let`, `letrec`, `x := …`, …) rendered without its
-/// continuation: the node a diagnostic blames, not the rest of the program after it.
-pub fn symbolic_head(expr: &Expr) -> String {
-    let opts = SymbolicOpts::default();
-    match statement_head(expr, &opts) {
-        Some((head, _)) => head,
-        None => fmt(expr, Precedence::Lowest, &opts),
-    }
-}
-
 /// Render a CCL expression as a symbolic string.
 pub fn symbolic_typed(expr: &Expr) -> String {
     fmt(
