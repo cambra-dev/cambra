@@ -774,7 +774,7 @@ held for `x`, read once when the replacement takes over ([chl-spec, "8.8
 
 ```python
 # v1
-qty: Mut(Map(String, Int), Txn) := Map::empty
+qty: Mut(Map(String, Int), Txn) := empty_map()
 
 # v2
 @LoadFrom(qty)
