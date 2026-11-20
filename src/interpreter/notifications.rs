@@ -890,6 +890,24 @@ impl Consumer for Pairing {
             .delivered
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // A row side's values are no part of the pairs' values the pairing spells, so a part of a
+        // row's values is restated through the whole row: a change names the row's pairs whole,
+        // which names more than changed, and a complete part completes no pair.
+        let whole_rows;
+        let region = match (self.side, region.names_part_of_values()) {
+            (PairingSide::Rows(_), true) => {
+                whole_rows = match landing.is_complete() {
+                    false => region.rows(),
+                    true => Projection::any_of(
+                        region_arms(region)
+                            .into_iter()
+                            .filter(|arm| !arm.names_part_of_values()),
+                    ),
+                };
+                &whole_rows
+            }
+            _ => region,
+        };
         // A region within some values, or a union with one: each arm's keys pair as keys do, and
         // the part of the values it names stands under each pair it announces. A part is new
         // information under every pair it reaches, so it is announced under every pair whose other
