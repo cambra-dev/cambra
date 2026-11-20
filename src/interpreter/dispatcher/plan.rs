@@ -1727,6 +1727,7 @@ pub(super) fn plan_edges(
         // What the pushes of the pipelines it reads name of its input, `None` before any.
         let mut pushed: Option<TileGuard> = None;
         // Whether a pipeline it reads pushes along no route to it, so it reads that one by pull.
+        let mut unreached = false;
         // The breakers whose routes were read, by the record of pushes their pipelines share
         // (`pushes_with`).
         let mut seen: Vec<usize> = Vec::new();
@@ -1742,6 +1743,7 @@ pub(super) fn plan_edges(
                 end_of(PipelineId(read)).unwrap_or_else(|| pushing_end(reach, PipelineId(read)));
             let routes = routes_to(&pusher, &one, reader);
             if routes.is_empty() {
+                unreached = true;
                 continue;
             }
             // A read along a route reaches what a push of its every key, wholly complete, lands
@@ -1799,18 +1801,30 @@ pub(super) fn plan_edges(
                     |named, arrival| named.union(&arrival.guard),
                 ),
         ));
+        // A pipeline it reads by pull brings no row of its own, and neither does a reader nothing
+        // pushes to and no range reaches, so such a reader is queued every row of its input at
+        // the start.
+        let left = match !arrivals[reader] && (unreached || (pushed.is_none() && left.is_empty())) {
+            true => input.universal_guard(),
+            false => left,
+        };
         // Every reader holds the rows its pushes and its start bring until the pipelines it
-        // reads have completed them, and reads each row once ([`Dispatcher::wait_for_inputs`]). A pipeline
-        // that takes arrivals is queued its rows as its sources yield them, and any other reads
-        // its input whole where a pipeline it reads reaches it by pull, or where nothing else
-        // brings it a row.
+        // reads have completed them, and reads each row once ([`Dispatcher::wait_for_inputs`]). A
+        // pipeline that takes arrivals is queued its rows as its sources yield them, and any other
+        // is queued at the start the rows no push brings, one package per morsel as a source's
+        // input is ([`seed_within`]): a breaker that steps once per package, as a transaction's
+        // drive emits one item per step, takes one step per morsel.
         if !planned[reader].held {
             dispatcher.wait_for_inputs(PipelineId(reader));
             planned[reader].held = true;
         }
         if !arrivals[reader] && !left.is_empty() {
             planned[reader].started = true;
-            starts.push((PipelineId(reader), left));
+            starts.extend(
+                seed_within(&input, &left, dispatcher.morsel_rows)
+                    .into_iter()
+                    .map(|morsel| (PipelineId(reader), morsel)),
+            );
         }
     }
     (dispatcher, planned, starts)
