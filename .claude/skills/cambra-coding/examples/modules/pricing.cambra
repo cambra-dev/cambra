@@ -1,0 +1,9 @@
+# A shareable module: its top level reads nothing from outside the program and leaves no state or
+# output behind, so other modules `import` it. One evaluation serves every import that passes the
+# same arguments.
+
+# `pub` exports a member; everything else is private to this file.
+pub type Money = Int
+
+pub def Money::plus_fee(self, fee: Int) => Money:
+    Money::new(self.extract() + fee)

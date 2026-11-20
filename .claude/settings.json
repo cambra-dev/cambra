@@ -105,6 +105,12 @@
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/prose-check.py\" 2>/dev/null || true",
             "timeout": 10,
             "statusMessage": "Checking prose"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/chl-skill-check.py\" 2>/dev/null || true",
+            "timeout": 10,
+            "statusMessage": "Checking for CHL surface changes"
           }
         ]
       }
