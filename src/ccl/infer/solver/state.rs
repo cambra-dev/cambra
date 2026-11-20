@@ -208,6 +208,14 @@ pub struct Solver {
     /// The variables whose sums are being read, so a cycle through them answers no
     /// (`compact`'s `projects_a_uint_range`).
     pub(crate) reading_sums: std::collections::HashSet<InferVarId>,
+    /// The compactions of the graph the stamp pass reads, shared by every compaction it runs
+    /// ([`crate::ccl::infer::solver::compact::reading_fixed_graph`]). `None` outside that read,
+    /// and while one compaction holds it.
+    pub(crate) fixed_graph: Option<Box<crate::ccl::infer::solver::compact::FixedGraph>>,
+    /// How many inference variables there were when the fixed graph's read began: no write
+    /// reaches one of them until it ends.
+    #[cfg(debug_assertions)]
+    fixed_below: Option<u32>,
     /// Every watch the run has established, the audit trail
     /// [`crate::ccl::infer::solver::traits::verify_narrowing_is_complete`] checks.
     #[cfg(debug_assertions)]
@@ -256,6 +264,9 @@ impl Solver {
             derivations: Default::default(),
             pending_memberships: Vec::new(),
             reading_sums: Default::default(),
+            fixed_graph: None,
+            #[cfg(debug_assertions)]
+            fixed_below: None,
             #[cfg(debug_assertions)]
             watch_log: Vec::new(),
             #[cfg(debug_assertions)]
@@ -320,6 +331,24 @@ impl Solver {
             self.read_suspensions.clear();
         }
         out
+    }
+
+    /// Mark every inference variable minted so far as fixed: until [`Self::unfix_graph`], none
+    /// is recorded on, which debug builds check.
+    pub(crate) fn fix_graph(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.fixed_below =
+                Some(u32::try_from(self.infer.handles.len()).expect("a slot fits in a `u32`"));
+        }
+    }
+
+    /// End [`Self::fix_graph`].
+    pub(crate) fn unfix_graph(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.fixed_below = None;
+        }
     }
 
     /// Whether a read is in progress ([`Self::read`]).
@@ -395,6 +424,15 @@ impl Solver {
     /// What has been recorded on `var`, for recording more ([`Revisions`]).
     pub(crate) fn infer_state_mut(&mut self, var: &InferVar) -> &mut InferState {
         self.reach(format_args!("?{}", var.uid));
+        #[cfg(debug_assertions)]
+        if let (Some(below), Some(home)) = (self.fixed_below, var.home()) {
+            assert!(
+                home.solver != self.id || home.slot >= below,
+                "internal error: ?{} is recorded on while the stamp pass reads the graph, which \
+                 no write reaches until it ends",
+                var.uid
+            );
+        }
         self.revisions.infer += 1;
         self.infer.get_mut(self.id, var)
     }

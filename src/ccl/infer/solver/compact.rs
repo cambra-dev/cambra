@@ -2426,6 +2426,37 @@ fn compact_type_with(
     solver.read(|solver| compact_type_reading(solver, ty, collapse, capability_vars, origins))
 }
 
+/// The walk state every [`compact_type`] in a [`reading_fixed_graph`] shares.
+///
+/// The graph is fixed while that read lasts: no variable it holds is recorded on, and a
+/// substitution reaching one suspends on it once for the whole read ([`Solver::read`]). So a
+/// variable's memoized value is a function of its key, and one compaction serves every later
+/// one that reaches the variable, as it serves the rest of its own walk. A value is shared only
+/// where it is all the walk below produced. A walk that met a recursive type, reported a join
+/// violation, widened a candidate or read a refinement naming a joined binder produced more, or
+/// read where it stands; such a value serves only its own compaction
+/// ([`CompactState::impure`]).
+pub(crate) struct FixedGraph(CompactState);
+
+/// Run `f` as one read of a graph it does not change, every [`compact_type`] in it sharing one
+/// walk state ([`FixedGraph`]): the stamp pass (`src/ccl/design/type-inference.md`,
+/// "Coalescing in two passes"). Debug builds check that `f` records on no variable minted
+/// before it began.
+pub(crate) fn reading_fixed_graph<R>(solver: &mut Solver, f: impl FnOnce(&mut Solver) -> R) -> R {
+    solver.read(|solver| {
+        assert!(
+            solver.fixed_graph.is_none(),
+            "a fixed graph is read by one pass at a time"
+        );
+        solver.fix_graph();
+        solver.fixed_graph = Some(Box::new(FixedGraph(CompactState::new(true))));
+        let out = f(solver);
+        solver.fixed_graph = None;
+        solver.unfix_graph();
+        out
+    })
+}
+
 /// [`compact_type_with`] inside its read ([`Solver::read`]).
 fn compact_type_reading(
     solver: &mut Solver,
@@ -2434,6 +2465,22 @@ fn compact_type_reading(
     capability_vars: bool,
     origins: bool,
 ) -> CompactGraph {
+    // A compaction that collects nothing beyond the type reads through the shared state. One
+    // run while another holds it walks on its own.
+    if collapse
+        && !capability_vars
+        && !origins
+        && let Some(mut fixed) = solver.fixed_graph.take()
+    {
+        let term = compact_walk(solver, ty, &mut fixed.0);
+        let (rec_vars, join_violations) = fixed.0.finish_walk();
+        solver.fixed_graph = Some(fixed);
+        return CompactGraph {
+            term,
+            rec_vars,
+            join_violations,
+        };
+    }
     let mut st = CompactState::new(collapse);
     st.capability_vars = capability_vars;
     st.origins = origins;
@@ -2442,21 +2489,27 @@ fn compact_type_reading(
             solver,
         )));
     }
+    let term = compact_walk(solver, ty, &mut st);
+    CompactGraph {
+        term,
+        rec_vars: st.rec_vars,
+        join_violations: st.join_violations,
+    }
+}
+
+/// One compaction's walk of `ty` from its root.
+fn compact_walk(solver: &mut Solver, ty: &Type, st: &mut CompactState) -> CompactType {
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
     let term = crate::ccl::subst::with_transport_memo(|| {
-        compact_go(solver, ty, true, &Subst::id(), Position::default(), &mut st)
+        compact_go(solver, ty, true, &Subst::id(), Position::default(), st)
     });
     debug_assert!(
         refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
         "a position carrying content must carry a refinement slot: only a hole and a \
          bare variable leave it absent"
     );
-    CompactGraph {
-        term,
-        rec_vars: st.rec_vars,
-        join_violations: st.join_violations,
-    }
+    term
 }
 
 /// Whether every position in `ct` that carries content also carries a refinement
@@ -3042,6 +3095,8 @@ pub(super) const COMPONENT_ROUNDS: usize = 64;
 struct Memoized {
     ty: CompactType,
     index: usize,
+    /// Whether the value is all the walk below produced ([`CompactState::impure`]).
+    pure: bool,
 }
 
 /// [`CompactState::consulted`]'s key: the variable, the polarity, whether the walk is at the
@@ -3137,9 +3192,47 @@ struct CompactState {
     /// The graph is fixed during this walk, and eligibility is independent of the incoming
     /// substitution, so revisits reuse the decision without splitting its morphism again.
     own_bounds: HashMap<(InferVarId, bool), Rc<Vec<bool>>>,
+    /// How many times the walk has produced more than a value: a recursive placeholder or its
+    /// bound, a join violation, a widened candidate, a refinement naming a joined binder, or a
+    /// reuse of a value whose walk did. A memoized value whose walk left the count unchanged is
+    /// pure, a function of its key alone, and outlives its walk ([`FixedGraph`]).
+    impure: u64,
+    /// The memo entries this walk made that are not pure, which [`Self::finish_walk`] drops.
+    impure_entries: Vec<(MemoKey, Option<Subst>)>,
 }
 
 impl CompactState {
+    /// End one compaction's walk in a state a later one continues: take what it reported, and
+    /// drop the memoized values only it may read.
+    fn finish_walk(&mut self) -> (BTreeMap<InferVarId, CompactType>, Vec<JoinViolation>) {
+        debug_assert!(
+            self.barriers_in_process.is_empty()
+                && self.candidate_widened.is_none()
+                && self.data_domain_depth == 0
+                && self.join_entries.is_empty()
+                && self.scope.enclosing().is_empty(),
+            "a compaction's walk ends where it began"
+        );
+        for (key, under) in self.impure_entries.drain(..) {
+            match under {
+                None => {
+                    self.memo.remove(&key);
+                }
+                Some(subst) => {
+                    if let Some(entries) = self.memo_under.get_mut(&key) {
+                        entries.retain(|(s, _)| *s != subst);
+                    }
+                }
+            }
+        }
+        self.recursive.clear();
+        self.barrier_recursive.clear();
+        (
+            std::mem::take(&mut self.rec_vars),
+            std::mem::take(&mut self.join_violations),
+        )
+    }
+
     fn own_bound_flags(
         &mut self,
         solver: &mut Solver,
@@ -3186,6 +3279,8 @@ impl CompactState {
             join_violations: Vec::new(),
             own_content: Default::default(),
             own_bounds: HashMap::new(),
+            impure: 0,
+            impure_entries: Vec::new(),
         }
     }
 }
@@ -3233,6 +3328,7 @@ fn join_barrier_lowers(
     st: &mut CompactState,
 ) -> (CompactType, Vec<Name>) {
     if st.barriers_in_process.contains(&barrier.uid) {
+        st.impure += 1;
         let placeholder = *st
             .barrier_recursive
             .entry(barrier.uid)
@@ -3254,6 +3350,7 @@ fn join_barrier_lowers(
     joined.resolve_barrier_refinements(Variance::Covariant, &barrier.opaque, &mut escaped);
     st.barriers_in_process.remove(&barrier.uid);
     if let Some(rec_uid) = st.barrier_recursive.remove(&barrier.uid) {
+        st.impure += 1;
         st.rec_vars.insert(rec_uid, joined);
         return (CompactType::from_var(rec_uid), escaped);
     }
@@ -3862,6 +3959,9 @@ fn compact_go_inner(
                 // reported; a term at the key does not answer it, since a parameter is not
                 // the key. Data domains and polarity are counted from the bound whose values
                 // are joined ([`CompactState::join_entries`]).
+                if subst_acc.joins_refinement(r) {
+                    st.impure += 1;
+                }
                 let joined = subst_acc.joined_over_in(&r.predicate);
                 let entries = || {
                     joined
@@ -4262,6 +4362,9 @@ fn compact_go_inner(
             if let Some(done) = memoized
                 && st.components.reuse(done.index)
             {
+                if !done.pure {
+                    st.impure += 1;
+                }
                 return done.ty.clone();
             }
             // A chain that returns to the position it started from meets the variable as one
@@ -4283,6 +4386,7 @@ fn compact_go_inner(
                     .find(|k| st.components.expanding(k))
             {
                 st.components.recursive_edge(&on_path);
+                st.impure += 1;
                 // Real recursive cycle: mint a fresh UID to mark this slot.
                 // We need only the identifier here — the cycle is surfaced
                 // by `coalesce_compact` as a `RecursiveType` error before
@@ -4295,6 +4399,7 @@ fn compact_go_inner(
                     .or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
+            let impure_before = st.impure;
             let (bound, index, complete) = loop {
                 st.components.enter(key);
                 let bound = expand_variable(solver, state, pol, subst_acc, pos, st);
@@ -4313,14 +4418,23 @@ fn compact_go_inner(
             // variable and emit a reference.
             if let Some(rec_uid) = st.recursive.get(&(uid, pol)) {
                 let rec_uid = *rec_uid;
+                st.impure += 1;
                 st.rec_vars.insert(rec_uid, bound);
                 return CompactType::from_var(rec_uid);
             }
             if complete && (memoizable || memoizable_under) {
+                let pure = st.impure == impure_before;
                 let done = Memoized {
                     ty: bound.clone(),
                     index,
+                    pure,
                 };
+                if !pure {
+                    st.impure_entries.push((
+                        memo_key.clone(),
+                        memoizable_under.then(|| subst_acc.clone()),
+                    ));
+                }
                 if memoizable {
                     st.memo.insert(memo_key, done);
                 } else {
