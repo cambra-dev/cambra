@@ -2222,6 +2222,21 @@ The [key timing and precision limits](#key-timing-and-precision-limits) also app
 Freshening copies a bounded parameter's obligations, so every instantiated argument is checked
 against its bound rather than relying on a check performed once at the definition.
 
+#### An annotation mismatch shows the type before the edge
+
+An ascription is the edge `inferred <: annotation`. An `AnnotationMismatch` shows the inferred type
+the annotation was compared with, so its message reads the bounds as they stood before that edge.
+A failing edge can record bounds before it fails: `x: Feed(String)` over a feed of another element
+type pushes `String` onto the element's variable first, and read after the edge the message says
+the feed was inferred as `Feed(String)`.
+
+The edge sets aside the bounds of each variable it writes (`Solver::set_aside_bounds`). Every write
+goes through `InferVar::bounds_mut`, which keeps a variable's bounds the first time the edge writes
+them. The message is rendered with the kept bounds swapped in and the edge's swapped back out after
+(`BoundsBefore::read`). It is rendered only when the edge fails or records a barrier bound, so an
+ascription that holds resolves nothing for its message. Only bounds are set aside: a function kind
+the edge pins, or an obligation it narrows, stays as the edge left it.
+
 ### Flowing In: normalizing annotations
 
 `normalize_annotation` consumes `ccl::Type`; it does not translate into a separate solver language.
