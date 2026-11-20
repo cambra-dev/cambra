@@ -389,6 +389,25 @@ pub enum TypedExprNode {
         target: Type,
     },
 
+    /// The judgment `key : domain` that a key is among a collection's keys, as a `Bool`.
+    /// It appears only in a refinement predicate: the checked lookup's answer
+    /// (`src/ccl/design/collections.md`, "The checked lookup's refinement").
+    ///
+    /// `domain` is the collection's domain type and may be an inference variable while
+    /// inference runs; nothing reads the collection's type when the node is built. `kind` is
+    /// the collection's function kind. For a plain collection the judgment is exactly
+    /// `key`'s membership in `domain`. A sum's domain is not exactly its keys, so for a sum
+    /// membership in `domain` implies the judgment and nothing more. The SMT encoding reads
+    /// both once they resolve (`Encode::member`).
+    Member {
+        /// The key the judgment is about.
+        key: Box<TypedExpr>,
+        /// The collection's domain.
+        domain: Type,
+        /// The collection's function kind.
+        kind: FunKind,
+    },
+
     /// A comprehension kept in surface form: `[element for … if …]`, one
     /// [`Generator`] per `for` clause, each holding the guards that follow it.
     ///
@@ -1103,6 +1122,7 @@ impl TypedExprNode {
             TypedExprNode::Builtin(_) => "Builtin",
             TypedExprNode::Apply { .. } => "Apply",
             TypedExprNode::Cast { .. } => "Cast",
+            TypedExprNode::Member { .. } => "Member",
             TypedExprNode::Comprehension { .. } => "Comprehension",
             TypedExprNode::BinOp { .. } => "BinOp",
             TypedExprNode::UnaryOp { .. } => "UnaryOp",
@@ -2119,6 +2139,7 @@ impl TypedExpr {
                 f(argument.as_ref());
             }
             TypedExprNode::Cast { value, .. } => f(value.as_ref()),
+            TypedExprNode::Member { key, .. } => f(key.as_ref()),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_ref());
                 f(right.as_ref());
@@ -2333,6 +2354,7 @@ impl TypedExpr {
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
             TypedExprNode::Cast { value, .. } => f(value.as_mut()),
+            TypedExprNode::Member { key, .. } => f(key.as_mut()),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_mut());
                 f(right.as_mut());
@@ -2480,6 +2502,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
+            | TypedExprNode::Member { .. }
             | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
@@ -2567,6 +2590,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
+            | TypedExprNode::Member { .. }
             | TypedExprNode::Realized { .. }
             | TypedExprNode::Comprehension { .. }
             | TypedExprNode::BinOp { .. }
@@ -2640,6 +2664,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
+            | TypedExprNode::Member { .. }
             | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
@@ -2744,9 +2769,9 @@ impl TypedExpr {
             f(annotation);
         }
         match &self.node {
-            TypedExprNode::Cast { target, .. } | TypedExprNode::Feed { row: target, .. } => {
-                f(target)
-            }
+            TypedExprNode::Cast { target, .. }
+            | TypedExprNode::Feed { row: target, .. }
+            | TypedExprNode::Member { domain: target, .. } => f(target),
             TypedExprNode::LetType { ty, .. } => ty.walk_types(&mut f),
             TypedExprNode::Run { types, .. } => types.iter().for_each(|(_, _, ty)| f(ty)),
             TypedExprNode::Try { handlers, .. } => handlers.iter().for_each(|h| f(&h.catches)),
@@ -2789,9 +2814,9 @@ impl TypedExpr {
             f(annotation);
         }
         match &mut self.node {
-            TypedExprNode::Cast { target, .. } | TypedExprNode::Feed { row: target, .. } => {
-                f(target)
-            }
+            TypedExprNode::Cast { target, .. }
+            | TypedExprNode::Feed { row: target, .. }
+            | TypedExprNode::Member { domain: target, .. } => f(target),
             TypedExprNode::LetType { ty, .. } => ty.walk_types_mut(&mut f),
             TypedExprNode::Run { types, .. } => types.iter_mut().for_each(|(_, _, ty)| f(ty)),
             TypedExprNode::Try { handlers, .. } => {

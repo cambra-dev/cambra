@@ -258,6 +258,18 @@ pub(crate) fn check_sink(code: &str, expected: &str) {
     }
 }
 
+/// Check that the compiler rejects `code`, which writes to the test sink `out`, with an error
+/// containing `fragment`.
+pub(crate) fn check_sink_error(code: &str, fragment: &str) {
+    match crate::it::differential::run_compiled(code) {
+        crate::it::differential::Compiled::Rejected(errors) => assert!(
+            errors.contains(fragment),
+            "expected an error containing {fragment:?}; got: {errors}\n  program:\n{code}"
+        ),
+        other => panic!("the program was not rejected: {other}\n  program:\n{code}"),
+    }
+}
+
 /// Check that the compiler produces an expected error on a program.
 /// Use this for negative tests and for program features that have
 /// only been partially implemented.

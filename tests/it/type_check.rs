@@ -1930,16 +1930,19 @@ fn full_map_lookup_needs_no_presence_proof() {
         "((Int ⤇ Int) ⇒ (Int ⤇ Int))",
         "the annotation is a data function, not a sum"
     );
-    // The lookup yields the value type outright. An `Option` here would mean the
-    // membership question was asked, which is exactly what totality removes.
+    // The checked lookup's refinement reads its presence off the domain, which is all of
+    // `Int`, so `!` accepts it, and the result is the value type, refined by the lookup.
     assert_eq!(
         infer_program(&indoc::formatdoc!(
             r#"
             {f}    m[1]!
             f"#
         ))
+        .codomain()
+        .expect("f is a function")
+        .peel_refinements()
         .to_string(),
-        "((Int ⤇ Int) ⇒ Int)"
+        "Int"
     );
     // Total does not mean unchecked: the key still has to be a key.
     assert!(
@@ -1998,6 +2001,10 @@ fn full_map_annotations_are_satisfiable() {
 /// membership evidence required by proven lookup. This records missing functionality.
 /// See `src/ccl/design/collections.md`,
 /// "Prerequisite: the proof has to survive being consumed".
+///
+/// The rejection is reported before membership arises. A group-by's values are collections,
+/// and the checked lookup `g[𝑘]` requires `Equatable(𝑉, 𝑉)` of the values
+/// (`docs/chl-spec.md`, "Constructors state what they build"), so it is rejected at every key.
 #[test]
 fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     for program in [
@@ -2019,9 +2026,8 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
         assert!(
             errs.iter()
                 .map(|e| format!("{e:?}"))
-                .any(|m| m.contains("where _ in ")),
-            "the rejection must name the present-key domain the key fails to carry, \
-             got {errs:?} for {program}"
+                .any(|m| m.contains("No Equatable instance for the value a checked lookup answers")),
+            "the checked lookup on a group-by must be rejected, got {errs:?} for {program}"
         );
     }
 }
@@ -6262,12 +6268,10 @@ fn total_subscript_demands_a_provable_index() {
 /// `[…]` means **collection lookup only**, and `.0` / `.name` mean projection — disjoint
 /// spellings, so lowering never has to guess which operation a subscript was.
 ///
-/// The **proven** form does not type-check for a range domain: an `Array(3, 𝑇)`'s domain is
-/// the range `0..3`, which relates only by equality, so no integer carries the membership
-/// proof a total lookup needs and there is no refinement for the checked form to relax
-/// either (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What this pins
-/// is that the *rejection* is uniform — `xs[0]`, `xs[i]` and `xs(0)` are one operation and
-/// fail alike — so none of them is quietly reinterpreted as projection.
+/// A list's domain is the range `0..3`, whose base is `UInt`, so an `Int` key is no key of it.
+/// `xs[0]!`, `xs[i]!` and `xs(0)` each reject an `Int` key as a lookup key rather than reading it
+/// as a projection. A `UInt` key below the length is accepted
+/// (`list_lookup_proven` in `tests/it/compilation_pipeline/lookups.rs`).
 #[test]
 fn subscript_is_lookup_and_dot_is_projection() {
     // Projection: both keys, on the shapes that have them.
@@ -6301,8 +6305,8 @@ fn subscript_is_lookup_and_dot_is_projection() {
         "a tuple has no domain to look up in"
     );
 
-    // BUG: these valid lookups should have type Int and evaluate to 10. All three spellings
-    // fail the same undischarged-membership edge. Replace rejection with success when fixed.
+    // The checked lookup expects a `UInt` key and application expects `{UInt where _ < 3}`;
+    // both find the `Int` key.
     for program in [
         indoc::indoc! {r#"
             xs = [10, 20, 30]
@@ -6315,9 +6319,10 @@ fn subscript_is_lookup_and_dot_is_projection() {
             xs = [10, 20, 30]
             xs(0)"#},
     ] {
+        let errs = infer_program_err(program);
         assert!(
-            !infer_program_err(program).is_empty(),
-            "BUG pin: valid range lookup now succeeds; replace this rejection assertion: {program}"
+            format!("{errs:?}").contains("found Int"),
+            "an Int key must be rejected as a list's key: {program} gave {errs:?}"
         );
     }
 }
@@ -6330,7 +6335,9 @@ fn a_checked_lookup_is_not_an_application() {
     let m = "m = map([(1, 10), (2, 20)])\n";
     // A key that is certainly absent still type-checks: presence is not a typing question.
     assert_eq!(
-        infer_program(&format!("{m}m[9]")).to_string(),
+        infer_program(&format!("{m}m[9]"))
+            .peel_refinements()
+            .to_string(),
         "Option(Int)"
     );
     // The proven form is the pair to it, and it still demands the membership its domain
@@ -6404,6 +6411,7 @@ fn checked_lookup_boundaries() {
             f"#})
         .codomain()
         .expect("f is a function")
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );
@@ -6418,6 +6426,7 @@ fn checked_lookup_on_a_set_is_membership_as_a_value() {
         infer_program(indoc::indoc! {r#"
             s = set([1, 2, 3])
             s[1]"#})
+        .peel_refinements()
         .to_string(),
         "Option(Unit)"
     );
@@ -6445,6 +6454,7 @@ fn a_product_keys_a_collection() {
             m = map([((1, 2), 10), ((3, 4), 20)])
             m[(1, 2)]
         "#})
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );
@@ -6453,6 +6463,7 @@ fn a_product_keys_a_collection() {
             m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
             m[(a=1, b=2)]
         "#})
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );
@@ -6461,6 +6472,7 @@ fn a_product_keys_a_collection() {
             s = set([(1, 2), (3, 4)])
             s[(1, 2)]
         "#})
+        .peel_refinements()
         .to_string(),
         "Option(Unit)"
     );
@@ -6496,6 +6508,7 @@ fn checked_lookup_on_a_map_answers_an_option_of_the_value() {
         infer_program(indoc::indoc! {r#"
             m = map([(1, 10), (2, 20)])
             m[1]"#})
+        .peel_refinements()
         .to_string(),
         "Option(Int)"
     );

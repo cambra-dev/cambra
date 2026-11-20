@@ -1868,7 +1868,8 @@ fn rows_whose_keys_vary_with_a_binder_have_no_join(#[case] code: &str, #[case] b
 /// A function whose parameter's refinement varies with a joined binder has no join either: the
 /// join of the functions accepts only what each accepts, and dropping the refinement would narrow
 /// the parameter rather than widen it (`src/ccl/design/type-inference.md`, "A contribution
-/// crosses the binders after its target").
+/// crosses the binders after its target"). Applying `xs` refines `i` by `xs`'s domain, which
+/// reads `r`.
 #[test]
 fn functions_whose_parameter_varies_with_a_binder_have_no_join() {
     check_compile_error(
@@ -1876,7 +1877,7 @@ fn functions_whose_parameter_varies_with_a_binder_have_no_join() {
             o: Feed(_)
             for r in [1, 2]:
                 xs = [v for v in [1, 2, 3] if v > r]
-                o << (\i -> xs[i]!)
+                o << (\i -> xs(i))
             o
         "#},
         "The parameter of a function written to a feed or mutable variable depends on `r`",

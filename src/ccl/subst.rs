@@ -1980,6 +1980,13 @@ impl Subst {
                 target: self.apply_type(target),
             },
 
+            // The domain is a type slot `map_children` cannot reach, as a cast's target is.
+            Member { key, domain, kind } => Member {
+                key: Box::new(self.apply_expr(key)),
+                domain: self.apply_type(domain),
+                kind: kind.clone(),
+            },
+
             // The target name is a *use* of the defer-handle binder (these
             // nodes exist only pre-channelize; transport runs during inference,
             // but the uniform engine handles them for the pre-inference
@@ -3308,6 +3315,16 @@ pub fn shift_elems(t: &TypedExpr, by: u32) -> TypedExpr {
             .collect(),
     )
     .apply_expr(t)
+}
+
+/// `predicate`, a refinement's predicate, stated of `term` rather than of the refinement's
+/// element: `predicate[term/__elem]`.
+pub fn discharge_elem(predicate: &TypedExpr, term: &TypedExpr) -> TypedExpr {
+    Subst::of_binders(BTreeMap::from([(
+        Name::elem(),
+        Mapping::Discharge(Rc::new(term.clone_preserving_ids())),
+    )]))
+    .apply_expr(predicate)
 }
 
 /// The binders the inference variables in `e`'s type slots may resolve to types naming, at

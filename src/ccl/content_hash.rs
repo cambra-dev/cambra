@@ -615,6 +615,12 @@ fn hash_payload<'a>(
                 hash_type(target, env, wenv, free, h);
             }
         }
+        // The judgment's content beyond its key is the domain it reads and whether that
+        // domain is exactly the collection's keys.
+        N::Member { domain, kind, .. } => {
+            hash_type(domain, env, wenv, free, h);
+            matches!(kind.resolved(), crate::ccl::KindPin::Sum(_)).hash(h);
+        }
         // A type alias's content is its spelling and the type it names; its body is
         // its one child.
         N::LetType { name, ty, .. } => {

@@ -408,6 +408,8 @@ The payload is stated with `==`, which is `Equatable`'s, and a predicate can bec
 builds `Equatable`, since that table's `Option` instance names the declaration. A constructor states
 its declaration's clause, so every call of `Option::some` is checked against it. A checked lookup
 builds an `Option(V)` without a constructor, and `emit_lookup_checked` requires `Equatable(V, V)`.
+The lookup's answer states whether its key is present through `ctor_is` and the judgment `𝑘 : 𝐷`
+([The checked lookup's refinement](collections.md#the-checked-lookups-refinement)).
 `Unit` has an `Equatable` instance, which a `Set`'s lookup, answering `Option(Unit)`, needs. The
 requirement ties lookup to `Equatable`; a statement of the payload that needs no instance would lift
 it.

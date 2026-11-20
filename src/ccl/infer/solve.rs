@@ -1388,6 +1388,40 @@ fn position_type(
     let mut question = PositionQuestion::default();
     let full = position_type_go(v, index, &mut question, &mut partial);
     full.or(partial)
+        .map(|answer| within_telescope(&answer, &v.telescope))
+}
+
+/// `ty` without the refinements that read a term binder outside `telescope`.
+///
+/// TODO: Remove this once `Option::value`'s result no longer reaches the payload it unwraps.
+/// The arm payload of the `match` in `Option::value` is pinned to its position when no value
+/// reaches it, and that position is read off the call's result,
+/// `{𝑇 | __arg ▷ ctor_is(Option::some) and __elem == __arg ▷ ctor_payload(Option::some)}`, under
+/// the call's argument binder `__arg`. Pinned with that refinement, the payload's type names a
+/// term whose own type holds the payload, and coalescing never terminates. `def f(m: FullMap(Int,
+/// Int)): m[1]!` reaches it (`full_map_lookup_needs_no_presence_proof`), as does every proven
+/// lookup whose collection's value no constructor builds. A variable resolves to a type naming
+/// its telescope's binders and nothing else (`src/ccl/design/type-inference.md`, "The
+/// invariant"), so a refinement reading another binder is dropped, which widens the pin.
+fn within_telescope(ty: &Type, telescope: &crate::ccl::infer_var::Telescope) -> Type {
+    match ty {
+        Type::Refinement(base, rs) => Type::refined(
+            within_telescope(base, telescope),
+            rs.iter()
+                .filter(|r| {
+                    crate::ccl::subst::refinement_free_vars(r)
+                        .iter()
+                        .all(|n| telescope.contains(n))
+                })
+                .cloned()
+                .collect(),
+        ),
+        _ => {
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = within_telescope(c, telescope));
+            out
+        }
+    }
 }
 
 /// What one [`position_type`] question has learned so far.
@@ -2338,6 +2372,18 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // both slots.
         TypedExprNode::Cast { value, .. } => {
             coalesce_node(value, level, ctx);
+        }
+        // The domain is a type slot the `expr.ty` walk does not reach, so it resolves here.
+        TypedExprNode::Member { key, domain, .. } => {
+            coalesce_node(key, level, ctx);
+            match resolve_var_type(domain) {
+                Ok(resolved) => *domain = resolved,
+                Err(err) => {
+                    let ty = domain.clone();
+                    ctx.push_type_error(&ty, map_coalesce_err(err, "a lookup's key domain"));
+                }
+            }
+            coalesce_type_predicates(domain, level, ctx);
         }
         TypedExprNode::BinOp { left, right, .. } => {
             coalesce_node(left, level, ctx);

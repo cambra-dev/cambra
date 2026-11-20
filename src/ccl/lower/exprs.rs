@@ -734,36 +734,32 @@ fn present_key_domain(
     Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
-/// Lower `target[index]!` as application and `target[index]` as checked lookup.
-/// Neither spelling projects a product; projection uses `.` regardless of the index's shape.
+/// Lower the checked lookup `target[index]` to `(target, index) ▷ lookup?`. It does not
+/// project a product; projection uses `.` regardless of the index's shape. The proven lookup
+/// `target[index]!` is the unwrap of this term.
 /// See `docs/chl-spec.md`, "3.9 Subscript and attribute access".
 pub(super) fn lower_subscript(
     target: &Spanned<ChlExpr>,
     index: &Spanned<ChlExpr>,
-    checked: bool,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let collection = lower_expr(target, ctx)?;
     let key = lower_expr(index, ctx)?;
-    if checked {
-        // Pair collection and key so point-free conversion can treat lookup as a morphism
-        // from a zip. Record both manufactured nodes; the caller tags the Apply root.
-        // See `src/ccl/design/provenance.md`, "The recorder".
-        let op = ctx.tag_machinery(
-            Expr::builtin(Builtin::LookupChecked),
-            span,
-            "lower.lookup_checked",
-        );
-        let pair = ctx.tag_machinery(
-            Expr::tuple(vec![collection, key]),
-            span,
-            "lower.lookup_checked.pair",
-        );
-        return Ok(Expr::apply(pair, op));
-    }
-    // Evaluate the finite function at the point.
-    Ok(Expr::apply(key, collection))
+    // Pair collection and key so point-free conversion can treat lookup as a morphism
+    // from a zip. Record both manufactured nodes; the caller tags the Apply root.
+    // See `src/ccl/design/provenance.md`, "The recorder".
+    let op = ctx.tag_machinery(
+        Expr::builtin(Builtin::LookupChecked),
+        span,
+        "lower.lookup_checked",
+    );
+    let pair = ctx.tag_machinery(
+        Expr::tuple(vec![collection, key]),
+        span,
+        "lower.lookup_checked.pair",
+    );
+    Ok(Expr::apply(pair, op))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only

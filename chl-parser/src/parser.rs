@@ -795,8 +795,7 @@ where
                 };
                 Box::new(idx)
             })
-            .then(just(Token::Bang).or_not())
-            .map(|(idx, bang)| PostfixOp::Subscript(idx, bang.is_none()))
+            .map(PostfixOp::Subscript)
             .boxed();
         // `.name` or `.0` — one operation, projecting a field keyed by name or by
         // position. A positional key is spelled as an integer literal because an
@@ -830,8 +829,8 @@ where
             .map(|(qualifier, name)| PostfixOp::Attribute(name, qualifier))
             .boxed();
 
-        // `!` after anything but a subscript unwraps an `Option`; after a subscript the
-        // subscript parser above has already taken it as the proven lookup.
+        // `!` unwraps an `Option`, including the one a checked lookup answers: `c[k]!` is
+        // `(c[k])!`.
         let unwrap = just(Token::Bang).to(PostfixOp::Unwrap);
 
         let postfix = atom
@@ -846,10 +845,9 @@ where
                             args,
                         },
                         PostfixOp::Unwrap => Expr::Unwrap(Box::new(target)),
-                        PostfixOp::Subscript(index, checked) => Expr::Subscript {
+                        PostfixOp::Subscript(index) => Expr::Subscript {
                             target: Box::new(target),
                             index,
-                            checked,
                         },
                         PostfixOp::Attribute(attr, attr_qualifier) => Expr::Attribute {
                             target: Box::new(target),
@@ -1372,14 +1370,11 @@ enum CallArg {
 #[derive(Clone)]
 enum PostfixOp {
     Call(Vec<Spanned<Expr>>),
-    /// A subscript, plus whether it is checked: `true` for `c[k]`, `false` for the proven
-    /// form `c[k]!`.
-    Subscript(Box<Spanned<Expr>>, bool),
+    Subscript(Box<Spanned<Expr>>),
     /// A field key and the qualifier of its label.
     Attribute(Spanned<SmolStr>, Vec<Spanned<SmolStr>>),
     /// `.m(args)`: the method's name, its path's qualifier, and the arguments.
     MethodCall(Spanned<SmolStr>, Vec<Spanned<SmolStr>>, Vec<Spanned<Expr>>),
-    /// `!` after anything but a subscript.
     Unwrap,
 }
 
@@ -3787,15 +3782,10 @@ fn expr_to_assign_target(spanned: Spanned<Expr>) -> Result<Spanned<AssignTarget>
             }
             AssignTarget::Tuple(out)
         }
-        // `m[k]` in target position. The proven form is refused here rather than at
-        // lowering: `m[k]! := v` asks for a proof that `k` is present before the
-        // write, and a write establishes presence rather than reading it, so there
-        // is nothing for the `!` to mean.
-        Expr::Subscript {
-            target,
-            index,
-            checked: true,
-        } => AssignTarget::Subscript { target, index },
+        // `m[k]` in target position. `m[k]! := v` is an unwrap, which is no target: a write
+        // establishes presence rather than reading it, so there is nothing for the `!` to
+        // mean.
+        Expr::Subscript { target, index } => AssignTarget::Subscript { target, index },
         Expr::Qualified(q) => AssignTarget::Qualified(q),
         // `Price::new(r)`: a call of a name qualified by a type, whose arguments are the
         // binders a constructor pattern takes.
@@ -4748,10 +4738,13 @@ mod tests {
     #[test]
     fn call_and_subscript_and_attr() {
         let e = parse_e("f(x)[0]!.name").node;
-        // f(x)[0]!.name = Attribute(Subscript(Call(Name(f), [Name(x)]), 0, false), "name")
+        // f(x)[0]!.name = Attribute(Unwrap(Subscript(Call(Name(f), [Name(x)]), 0)), "name")
         match e {
             Expr::Attribute { target, attr, .. } => {
                 assert_eq!(attr.as_str(), "name");
+                let Expr::Unwrap(target) = target.node else {
+                    panic!("expected an unwrap");
+                };
                 assert!(matches!(target.node, Expr::Subscript { .. }));
             }
             other => panic!("expected Attribute, got {other:?}"),
@@ -5103,35 +5096,34 @@ mod tests {
         }
     }
 
-    /// `c[k]` is the checked lookup and `c[k]!` the proven one (`docs/chl-spec.md`, "3.9
-    /// Subscript and attribute access").
+    /// `c[k]!` is the unwrap of the checked lookup `c[k]`, the same tree as `(c[k])!`
+    /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
     #[test]
-    fn a_bang_after_a_subscript_makes_it_proven() {
-        for (src, checked) in [("c[k]", true), ("c[k]!", false)] {
-            match parse_e(src).node {
-                Expr::Subscript { checked: c, .. } => assert_eq!(c, checked, "{src}"),
-                other => panic!("expected a subscript for {src}, got {other:?}"),
-            }
+    fn a_bang_after_a_subscript_unwraps_the_checked_lookup() {
+        for src in ["c[k]!", "(c[k])!"] {
+            let Expr::Unwrap(target) = parse_e(src).node else {
+                panic!("expected an unwrap for {src}");
+            };
+            assert!(matches!(target.node, Expr::Subscript { .. }), "{src}");
         }
     }
 
-    /// The proven form chains like any postfix: `c[i]![j]!.x` is three postfixes.
+    /// The proven lookup chains like any postfix: `c[i]![j]!.x` is five postfixes.
     #[test]
     fn a_proven_subscript_chains() {
         let Expr::Attribute { target, .. } = parse_e("c[i]![j]!.x").node else {
             panic!("expected an attribute");
         };
-        let Expr::Subscript {
-            target, checked, ..
-        } = target.node
-        else {
+        let Expr::Unwrap(target) = target.node else {
+            panic!("expected the outer unwrap");
+        };
+        let Expr::Subscript { target, .. } = target.node else {
             panic!("expected the outer subscript");
         };
-        assert!(!checked);
-        assert!(matches!(
-            target.node,
-            Expr::Subscript { checked: false, .. }
-        ));
+        let Expr::Unwrap(target) = target.node else {
+            panic!("expected the inner unwrap");
+        };
+        assert!(matches!(target.node, Expr::Subscript { .. }));
     }
 
     /// `!=` is one token, so `c[k]!= v` is a checked lookup compared with `v`.
@@ -5140,11 +5132,10 @@ mod tests {
         let Expr::Compare { left, .. } = parse_e("c[k]!= v").node else {
             panic!("expected a comparison");
         };
-        assert!(matches!(left.node, Expr::Subscript { checked: true, .. }));
+        assert!(matches!(left.node, Expr::Subscript { .. }));
     }
 
-    /// `!` after anything but a subscript unwraps it, binding as tightly as the other
-    /// postfix operations.
+    /// `!` unwraps any postfix operand, binding as tightly as the other postfix operations.
     #[test]
     fn a_bang_after_a_non_subscript_is_an_unwrap() {
         for src in ["x!", "f(x)!", "r.a!"] {
@@ -5159,8 +5150,8 @@ mod tests {
     #[test]
     fn proven_subscript_is_not_an_assign_target() {
         // `m[k]! := v` asks for `k`'s presence before a write. A write is what makes
-        // a key present, so the proven form has nothing to mean on the left and is
-        // refused in target position rather than at lowering.
+        // a key present, so the unwrap has nothing to mean on the left and is refused in
+        // target position rather than at lowering.
         let r = parse_mod("m[k]! := 1\n");
         assert!(
             !r.errors.is_empty(),
@@ -5587,7 +5578,7 @@ mod tests {
             "#});
         match &m.body[0].node {
             Stmt::Match { scrutinee, arms } => {
-                assert!(matches!(scrutinee.node, Expr::Subscript { .. }));
+                assert!(matches!(scrutinee.node, Expr::Unwrap(_)));
                 assert_eq!(arms.len(), 1);
                 assert_eq!(arms[0].body.len(), 2);
             }

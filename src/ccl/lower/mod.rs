@@ -30,7 +30,7 @@
 //! | Record values `(field=expr, ...)` | [`TypedExprNode::Record`] |
 //! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
 //! | Positional access `t.0` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Index`]`)` |
-//! | Proven collection lookup `c[k]!` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
+//! | Checked collection lookup `c[k]` | [`TypedExprNode::Apply`] of [`crate::ccl::Builtin::LookupChecked`] to the pair `(c, k)`; `c[k]!` unwraps it |
 //! | The outputs of a program that binds a sink | a [`TypedExprNode::Record`] at the tail of the root `Let*` chain |
 //!
 //! `src/ccl/design/lowering.md`, "Lowering — CHL to CCL" specifies functions,
@@ -1702,11 +1702,7 @@ fn lower_expr_inner(
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::tuple(items?))
         }
-        ChlExpr::Subscript {
-            target,
-            index,
-            checked,
-        } => lower_subscript(target, index, *checked, expr.span, ctx),
+        ChlExpr::Subscript { target, index } => lower_subscript(target, index, expr.span, ctx),
         ChlExpr::Unwrap(target) => nominal::lower_unwrap(target, expr.span, ctx),
         // Record value `(name=expr, ...)`. Lowered to a `Record` constructor:
         // `(x=1, y="foo")` becomes `Record([("x", Lit(1)), ("y", Lit("foo"))])`.

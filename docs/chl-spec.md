@@ -1226,11 +1226,9 @@ when absent. For a set, the value is unit. Presence can be established before th
 absence requires the final domain. A live feed with no final domain may never answer an absent-key
 lookup.
 
-The `!` operator can be used with lookup (as `c[k]!`) to return a non-option-wrapped value,
-requiring a proof that `k` is in the domain of `c`.  A `FullMap(K, V)` accepts a key of type `K`; a
-refined present-key domain instead requires membership in that refinement. Proven lookup does not
-define an absent-key runtime result. `!` can be used generally as a postfix operator to unwrap
-`Option` when it can be proven that it is an `Option::some`.
+Postfix `!` unwraps an `Option` proven to be `Option::some`. The proven lookup `c[k]!` is `(c[k])!`,
+`!` applied to the checked lookup, so it is accepted where the refinement on `c[k]` excludes
+`Option::none` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
 
 #### Subscript and unwrap syntax [Decided]
 
@@ -2429,10 +2427,9 @@ marked one carries its status per "How to read this document".)
   entry pairs that `map([…])` re-keys.
 - `FullMap(K, V)` — *total*-map type (§6.3): every value of `K` is a key. `K` is the finite domain
   of keys present in what built the map, and only `groupby` builds one, so a lookup always finds
-  its key. Today the proven lookup `m[k]!` answers `V`, and the key's type is its proof. Under
-  [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) the checked
-  lookup `m[k]` answers `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at
-  the call.
+  its key. The checked lookup `m[k]` answers `{Option(V) where not _.is_none()}`, so `m[k]!`
+  answers `V` with no proof at the call
+  ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
 - `Time` — a position in the commit order (**[Tentative]**). A transaction's time is one, which
   `txn::now()` answers for a transaction named `txn` (**[Decided]**, §8.7).
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one

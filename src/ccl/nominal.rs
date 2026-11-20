@@ -469,6 +469,94 @@ impl CtorRef {
     }
 }
 
+/// The refinement the checked lookup `𝑐[key]` answers an `Option(payload)` at:
+/// `((key : 𝐷) and not (__elem ▷ ctor_is(Option::none))) or (not (key : 𝐷) and __elem ▷ ctor_is(Option::none))`,
+/// where `𝐷` is `domain`, the collection's domain, and `kind` is the collection's function kind
+/// (`src/ccl/design/collections.md`, "The checked lookup's refinement").
+///
+/// The judgment `key : 𝐷` is a [`TypedExprNode::Member`](crate::ccl::TypedExprNode::Member)
+/// node. Nothing here reads `domain` or `kind`, so either may still be an inference variable.
+/// [`presence_judgment`] finds the judgment again.
+pub fn lookup_checked_refinement(
+    key: &crate::ccl::TypedExpr,
+    domain: Type,
+    kind: FunKind,
+    payload: &Type,
+) -> Refinement {
+    use crate::ccl::{BinOpKind, LogicKind, TypedExpr, TypedExprNode, UnaryOpKind};
+    let bool_ty = Type::Base(BaseType::Bool);
+    let member = || {
+        TypedExpr::new(TypedExprNode::Member {
+            key: Box::new(key.clone_preserving_ids()),
+            domain: domain.clone(),
+            kind: kind.clone(),
+        })
+        .with_ty(bool_ty.clone())
+    };
+    let elem = || TypedExpr::var(Name::elem()).with_ty(Type::option_of(payload.clone()));
+    let is_none = || ctor_is(elem(), &option_ctor(V_NONE), std::slice::from_ref(payload));
+    let not = |e: TypedExpr| TypedExpr::unary(UnaryOpKind::Not, e).with_ty(bool_ty.clone());
+    let logic = |l: TypedExpr, op: LogicKind, r: TypedExpr| {
+        TypedExpr::binop(l, BinOpKind::BoolLogic(op), r).with_ty(bool_ty.clone())
+    };
+    let some_arm = logic(member(), LogicKind::And, not(is_none()));
+    let none_arm = logic(not(member()), LogicKind::And, is_none());
+    Refinement::born(Rc::new(logic(some_arm, LogicKind::Or, none_arm)))
+}
+
+/// The judgment `key : 𝐷` a checked lookup's refinement states ([`lookup_checked_refinement`]),
+/// as its `Member` node, or `None` when `r` is not such a refinement.
+pub fn presence_judgment(r: &Refinement) -> Option<&crate::ccl::TypedExpr> {
+    use crate::ccl::{BinOpKind, LogicKind, TypedExprNode};
+    fn or_and(
+        e: &crate::ccl::TypedExpr,
+        op: LogicKind,
+    ) -> Option<(&crate::ccl::TypedExpr, &crate::ccl::TypedExpr)> {
+        match &e.node {
+            TypedExprNode::BinOp {
+                left,
+                op: BinOpKind::BoolLogic(o),
+                right,
+            } if *o == op => Some((left.as_ref(), right.as_ref())),
+            _ => None,
+        }
+    }
+    let (some_arm, none_arm) = or_and(&r.predicate, LogicKind::Or)?;
+    let (member, excluded) = or_and(some_arm, LogicKind::And)?;
+    let (_, included) = or_and(none_arm, LogicKind::And)?;
+    (matches!(member.node, TypedExprNode::Member { .. })
+        && tests_elem_is_none(included)
+        && excludes_none(excluded))
+    .then_some(member)
+}
+
+/// Whether `e` is `not (__elem ▷ ctor_is(Option::none))`: the refinement on `Option::value`'s
+/// parameter, which `x!` demands of `x`.
+pub fn excludes_none(e: &crate::ccl::TypedExpr) -> bool {
+    use crate::ccl::{TypedExprNode, UnaryOpKind};
+    matches!(&e.node, TypedExprNode::UnaryOp(op, inner)
+        if op.unrefined() == UnaryOpKind::Not && tests_elem_is_none(inner))
+}
+
+/// Whether `e` is `__elem ▷ ctor_is(Option::none)`.
+fn tests_elem_is_none(e: &crate::ccl::TypedExpr) -> bool {
+    use crate::ccl::{Builtin, TypedExprNode};
+    let TypedExprNode::Apply { function, argument } = &e.node else {
+        return false;
+    };
+    matches!(&argument.node, TypedExprNode::Var(n) if *n == Name::elem())
+        && matches!(&function.node, TypedExprNode::Builtin(Builtin::CtorIs(c))
+            if c.decl == option() && c.ctor == V_NONE.name())
+}
+
+/// `Option`'s constructor `label`.
+fn option_ctor(label: Label) -> CtorRef {
+    CtorRef {
+        decl: option(),
+        ctor: label.name().into(),
+    }
+}
+
 /// The compiler-provided declaration `name` names, if any.
 pub fn builtin(name: &str) -> Option<Rc<NominalDecl>> {
     (name == OPTION).then(option)
