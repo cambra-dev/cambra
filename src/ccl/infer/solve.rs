@@ -9,13 +9,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
+use crate::ccl::expr::CallObligation;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::{read_mut, read_through};
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::coalesce::FailedPosition;
 use crate::ccl::infer::solver::traits::{
-    Assoc, Implementation, InstanceBody, InstanceHead, InstanceTable, OperatorCall, Signature,
-    TraitInstance, function_over, replace_params,
+    Answer, Assoc, Implementation, InstanceBody, InstanceHead, InstanceTable, OperatorCall,
+    Signature, TraitInstance, function_over, replace_params,
 };
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
@@ -2368,42 +2369,33 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         return;
     }
     let rewrites = rewrites_here(ctx);
-    // `c ▷ Iterable::elements` over a structural collection is `c`: the collection rule
-    // answered its obligation, so the collection is its own `Elements` and `elements` the
-    // identity (`src/ccl/design/type-inference.md`, "A collection is answered off the
-    // table"). The call goes before anything reads it, here and in each copy a predicate
-    // holds, so no pass after inference meets it.
-    if rewrites
-        && !ctx.discarding
-        && let Some(collection) = elements_of_a_collection(solver, expr)
-    {
-        *expr = collection;
-        return coalesce_node_inner(solver, expr, level, ctx);
-    }
-    if rewrites && !ctx.discarding {
-        dispatch_operator(solver, expr, ctx);
-    }
-    // A trait function's call answered by an instance a module declares becomes a use of
-    // the function the instance's `def` binds, before anything reads the node: the use then
-    // specializes below, as any use of a generalized definition does. A walk whose types are
-    // dropped resolves nothing to choose by: its operands are the definition's own, and
-    // each use's clone chooses at its own types.
+    // A call a trait answers becomes what its obligation's answer says, before anything reads
+    // the node, here and in each copy a predicate holds, so no pass after inference meets it
+    // (`src/ccl/design/type-inference.md`, "A call reads its obligation's answer"). A walk
+    // whose types are dropped carries out no answer: the definition's own obligations are
+    // answered by its assumptions, and each use's clone carries out its copies' answers.
     let mut instance_call = false;
-    if rewrites && matches!(expr.node, TypedExprNode::TraitFn { .. }) && !ctx.discarding {
-        match matching_instance(solver, expr, ctx) {
-            Err(error) => {
-                ctx.push_error(error);
+    if rewrites && !ctx.discarding {
+        // `c ▷ Iterable::elements` whose obligation the collection rule answered is `c`: the
+        // collection is its own `Elements`, and `elements` the identity
+        // (`src/ccl/design/type-inference.md`, "A collection is answered off the table").
+        if let Some(collection) = elements_of_a_collection(expr) {
+            *expr = collection;
+            return coalesce_node_inner(solver, expr, level, ctx);
+        }
+        dispatch_operator(solver, expr);
+        // A trait function's call answered by an instance a module declares becomes a use of
+        // the function the instance's `def` binds: the use then specializes below, as any use
+        // of a generalized definition does.
+        if let TypedExprNode::TraitFn { obligation, .. } = &expr.node
+            && let Some(Answer::Instance(instance)) = obligation.get().map(|o| o.answer())
+            && instance.declared.is_some()
+        {
+            if !use_instance_function(expr, &instance, ctx) {
                 ctx.plan.stopped.insert(expr.node_id());
                 return;
             }
-            Ok(Some(instance)) => {
-                if instance.declared.is_some() && !use_instance_function(expr, &instance, ctx) {
-                    ctx.plan.stopped.insert(expr.node_id());
-                    return;
-                }
-                instance_call = true;
-            }
-            Ok(None) => {}
+            instance_call = true;
         }
     }
     // A method call emission deferred becomes a use of the method its receiver's type
@@ -2412,14 +2404,15 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     // refuses one its definition leaves open, and coalescing follows no error.
     if let TypedExprNode::Method {
         candidates,
-        deferred: Some(call),
+        obligation,
         ..
     } = &mut expr.node
+        && let Some(call) = obligation.get()
         && rewrites
     {
-        let selected = call
-            .selected_instance()
-            .expect("emission refuses a method call nothing resolves");
+        let Answer::Instance(selected) = call.answer() else {
+            panic!("emission refuses a method call nothing resolves, got {call:?}")
+        };
         let [InstanceHead::Nominal(decl)] = selected.heads() else {
             unreachable!("a method's row is headed by the type declaring it")
         };
@@ -2500,7 +2493,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             coalesce_node(solver, left, level, ctx);
             coalesce_node(solver, right, level, ctx);
         }
-        TypedExprNode::UnaryOp(_, inner) => coalesce_node(solver, inner, level, ctx),
+        TypedExprNode::UnaryOp(_, inner, _) => coalesce_node(solver, inner, level, ctx),
         TypedExprNode::Lambda { param, body } => {
             // Before the body reads the parameter. In a walk whose types are dropped, an
             // unbounded parameter is the definition's own, and the uses supply it.
@@ -3140,15 +3133,15 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
     });
 
     // A compiler instance builds its function at the type the call resolved to, so it is
-    // chosen once that type is.
-    if matches!(expr.node, TypedExprNode::TraitFn { .. })
+    // built once that type is.
+    if let TypedExprNode::TraitFn { obligation, .. } = &expr.node
         && !ctx.discarding
-        && let Ok(Some(instance)) = matching_instance(solver, expr, ctx)
+        && let Some(Answer::Instance(instance)) = obligation.get().map(|o| o.answer())
     {
         build_instance_function(solver, expr, &instance);
     }
     if !ctx.discarding {
-        run_instance_primitive(solver, expr);
+        run_instance_primitive(expr);
     }
 }
 
@@ -3229,30 +3222,42 @@ fn rewrites_here(ctx: &CoalesceCtx) -> bool {
 
 /// Replace an arithmetic operator answered by an instance a module declares with the call of
 /// the instance's function the operator makes ([`OperatorCall`]): `a + b` is `add` of
-/// `(a, b)`. The walk then reaches the call's `TraitFn` as it reaches any trait function's,
-/// which becomes a use of the instance's function (`src/ccl/design/type-inference.md`, "An
-/// operator's instance"). An operator a compiler instance answers stays, and runs that
-/// instance's primitive ([`run_instance_primitive`]); a comparison calls no function.
-fn dispatch_operator(solver: &mut Solver, expr: &mut Expr, ctx: &CoalesceCtx) {
-    let (call, operands): (OperatorCall, Vec<&Expr>) = match &expr.node {
-        TypedExprNode::BinOp { left, op, right } => match OperatorCall::of_binop(*op) {
-            Some(call) => (call, vec![&**left, &**right]),
-            None => return,
-        },
-        TypedExprNode::UnaryOp(op, inner) => match OperatorCall::of_unary(*op) {
-            Some(call) => (call, vec![&**inner]),
-            None => return,
-        },
+/// `(a, b)`. The call's `TraitFn` holds the operator's obligation, and the walk reaches it
+/// as it reaches any trait function's, which becomes a use of the instance's function
+/// (`src/ccl/design/type-inference.md`, "An operator's instance"). An operator a compiler
+/// instance answers stays, and runs that instance's primitive ([`run_instance_primitive`]); a
+/// comparison calls no function.
+fn dispatch_operator(solver: &mut Solver, expr: &mut Expr) {
+    let (call, operands, obligation) = match &expr.node {
+        TypedExprNode::BinOp {
+            left,
+            op,
+            right,
+            obligation,
+        } => (
+            OperatorCall::of_binop(*op),
+            vec![&**left, &**right],
+            obligation,
+        ),
+        TypedExprNode::UnaryOp(op, inner, obligation) => {
+            (OperatorCall::of_unary(*op), vec![&**inner], obligation)
+        }
         _ => return,
+    };
+    let Some(call) = call else {
+        return;
     };
     let Some(function) = call.function() else {
         return;
     };
-    // Resolving the operands copies their refinements' predicates, so it waits for a
-    // declared instance to choose between.
-    if !ctx.instances.declares(&call.trait_) {
+    let Some(Answer::Instance(instance)) = obligation.get().map(|o| o.answer()) else {
+        return;
+    };
+    if instance.declared.is_none() {
         return;
     }
+    let obligation = obligation.clone();
+    // The call is typed by its function's signature at the operands' types.
     let Ok(types) = operands
         .iter()
         .map(|e| {
@@ -3263,14 +3268,7 @@ fn dispatch_operator(solver: &mut Solver, expr: &mut Expr, ctx: &CoalesceCtx) {
     else {
         return;
     };
-    let declared = ctx
-        .instances
-        .instances(&call.trait_)
-        .iter()
-        .any(|i| i.declared.is_some() && i.matches(solver, &types));
-    if declared {
-        call_instance_function(solver, expr, &call, function, types);
-    }
+    call_instance_function(solver, expr, &call, function, types, obligation);
 }
 
 /// Bind `value` to a fresh name around the term `body` builds from a read of it.
@@ -3283,13 +3281,15 @@ fn bind(value: Expr, body: impl FnOnce(Expr) -> Expr) -> Expr {
 }
 
 /// Rewrite an operator a declared instance answers into the call its [`OperatorCall`]
-/// makes, at the operands' resolved `types`, keeping the node's identity and its type.
+/// makes, at the operands' resolved `types`, keeping the node's identity and its type. The
+/// call holds the operator's `obligation`.
 fn call_instance_function(
     solver: &mut Solver,
     expr: &mut Expr,
     call: &OperatorCall,
     function: &str,
     types: Vec<Type>,
+    obligation: CallObligation,
 ) {
     let id = expr.node_id();
     let ty = expr.ty.clone();
@@ -3300,7 +3300,7 @@ fn call_instance_function(
     );
     let mut operands = match std::mem::replace(&mut expr.node, TypedExprNode::Defer) {
         TypedExprNode::BinOp { left, right, .. } => vec![*left, *right],
-        TypedExprNode::UnaryOp(_, inner) => vec![*inner],
+        TypedExprNode::UnaryOp(_, inner, _) => vec![*inner],
         _ => unreachable!("`dispatch_operator` rewrites an operator"),
     };
     let Signature {
@@ -3332,6 +3332,7 @@ fn call_instance_function(
         function: function.into(),
         operands: types,
         assoc: Vec::new(),
+        obligation,
     })
     .with_ty(replace_params(
         &function_over(inputs, output.clone()),
@@ -3351,9 +3352,16 @@ fn call_instance_function(
 /// Make an operator a compiler instance answers run that instance's primitive: `+` of two
 /// strings is `Concat`. An operator whose primitive is what it already computes keeps its
 /// own kind, so a `^` sibling (`^-` answered by `Sub`) keeps the operation its result type
-/// names.
-fn run_instance_primitive(solver: &mut Solver, expr: &mut Expr) {
-    let TypedExprNode::BinOp { left, op, right } = &mut expr.node else {
+/// names. The operator then lets go of its obligation: no node holds solver state past
+/// inference.
+fn run_instance_primitive(expr: &mut Expr) {
+    let obligation = match &mut expr.node {
+        TypedExprNode::BinOp { obligation, .. } | TypedExprNode::UnaryOp(_, _, obligation) => {
+            std::mem::take(obligation)
+        }
+        _ => return,
+    };
+    let TypedExprNode::BinOp { op, .. } = &mut expr.node else {
         return;
     };
     let Some(call) = OperatorCall::of_binop(*op) else {
@@ -3362,48 +3370,27 @@ fn run_instance_primitive(solver: &mut Solver, expr: &mut Expr) {
     let Some(function) = call.function() else {
         return;
     };
-    let types = [
-        crate::ccl::ccl_utils::strip_refinements_in(solver, &left.ty),
-        crate::ccl::ccl_utils::strip_refinements_in(solver, &right.ty),
-    ];
-    let primitive = InstanceTable::builtin()
-        .instances(&call.trait_)
-        .iter()
-        .find(|i| i.matches(solver, &types))
-        .and_then(|i| match i.implementation(function) {
-            Some(Implementation::Primitive(InstanceBody::Binary(primitive))) => Some(*primitive),
-            _ => None,
-        });
-    if let Some(primitive) = primitive
-        && primitive != op.unrefined()
+    let Some(Answer::Instance(instance)) = obligation.get().map(|o| o.answer()) else {
+        return;
+    };
+    if let Some(Implementation::Primitive(InstanceBody::Binary(primitive))) =
+        instance.implementation(function)
+        && *primitive != op.unrefined()
     {
-        *op = primitive;
+        *op = *primitive;
     }
 }
 
-/// The collection `expr` walks, when it is `c ▷ Iterable::elements` and `c`'s type resolves to
-/// a structural collection; the call's argument is moved out of it.
-///
-/// `c`'s type is read at the call's operand, or at `c` itself where the operand has not
-/// resolved: a tree whose inference failed has its argument typed and its operand unsettled.
-pub(crate) fn elements_of_a_collection(solver: &mut Solver, expr: &mut Expr) -> Option<Expr> {
+/// The collection `expr` walks, when it is `c ▷ Iterable::elements` and the collection rule
+/// answers the call's obligation; the call's argument is moved out of it.
+pub(crate) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
     let TypedExprNode::Apply { argument, function } = &expr.node else {
         return None;
     };
-    let TypedExprNode::TraitFn {
-        trait_, operands, ..
-    } = &function.node
-    else {
+    let TypedExprNode::TraitFn { obligation, .. } = &function.node else {
         return None;
     };
-    if !trait_.reads_collections() {
-        return None;
-    }
-    let mut is_collection = |ty: &Type| {
-        resolve_var_type(solver, ty)
-            .is_ok_and(|t| crate::ccl::infer::solver::traits::is_structural_collection(solver, &t))
-    };
-    if !is_collection(operands.first()?) && !is_collection(&argument.ty) {
+    if !matches!(obligation.get()?.answer(), Answer::Collection) {
         return None;
     }
     debug_assert!(
@@ -3441,69 +3428,6 @@ fn build_instance_function(solver: &mut Solver, expr: &mut Expr, instance: &Trai
     };
     let Expr { node, ty, .. } = built;
     *expr = Expr::preserve(id, node).with_ty(ty);
-}
-
-/// The instance a `TraitFn`'s operand types match (`src/ccl/design/type-inference.md`,
-/// "Trait functions"), or `None` while an operand does not resolve, or resolves to a
-/// variable nothing determines: the node's own type holds the same variable, and what
-/// leaves it unresolved or undetermined is reported there.
-///
-/// The obligation the node's emission placed accepted these operands, so an instance
-/// matches; one that does not is reported as a missing instance.
-fn matching_instance(
-    solver: &mut Solver,
-    expr: &Expr,
-    ctx: &CoalesceCtx,
-) -> Result<Option<Rc<TraitInstance>>, InferError> {
-    let TypedExprNode::TraitFn {
-        trait_,
-        function,
-        operands,
-        ..
-    } = &expr.node
-    else {
-        unreachable!("`matching_instance` is called on a `TraitFn`")
-    };
-    let Ok(resolved) = operands
-        .iter()
-        .map(|x| resolve_var_type(solver, x))
-        .collect::<Result<Vec<Type>, _>>()
-    else {
-        return Ok(None);
-    };
-    if resolved.iter().any(|ty| matches!(ty, Type::Infer(_))) {
-        return Ok(None);
-    }
-    let instances = ctx.instances.instances(trait_);
-    let mut matching = instances.iter().filter(|i| i.matches(solver, &resolved));
-    let Some(instance) = matching.next() else {
-        let position = resolved
-            .iter()
-            .enumerate()
-            .position(|(pos, ty)| !instances.iter().any(|i| i.accepts(pos as u8, ty)))
-            .unwrap_or(0);
-        let mut accepted: Vec<Type> = Vec::new();
-        for t in instances
-            .iter()
-            .filter_map(|i| i.accepted_type(position as u8))
-        {
-            if !accepted.contains(&t) {
-                accepted.push(t);
-            }
-        }
-        return Err(InferError::NoTraitInstance {
-            trait_: trait_.to_string(),
-            position: position as u8,
-            found: Box::new(resolved[position].clone()),
-            accepted,
-            at: format!("{trait_}::{function}"),
-        });
-    };
-    assert!(
-        matching.next().is_none(),
-        "two instances of `{trait_}` match {resolved:?}; lowering refuses overlapping instances"
-    );
-    Ok(Some(Rc::clone(instance)))
 }
 
 /// Replace a `TraitFn` answered by an instance a module declares with a use of the function
@@ -3830,20 +3754,6 @@ fn share_with_its_origin(solver: &Solver, ctx: &mut CoalesceCtx, r: &mut crate::
 // use. Parents consume resolved clones, and the enclosing let retains only referenced
 // specializations. See `src/ccl/design/type-inference.md`, "Specialization scope and
 // lifecycle" and "Coalescing in two passes".
-
-/// Whether `ty` holds no inference variable and no type parameter: a type an instance head
-/// can be matched against.
-fn names_no_variable(ty: &Type) -> bool {
-    if matches!(
-        ty,
-        Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
-    ) {
-        return false;
-    }
-    let mut closed = true;
-    ty.walk_children(|child| closed &= names_no_variable(child));
-    closed
-}
 
 /// The names the arguments reaching a use read: each parameter's domain as the values flowing
 /// into it make it, through a curried function's codomains.
@@ -4300,7 +4210,9 @@ pub(super) fn specialize_use(
                 .iter()
                 .map(|a| {
                     let a = freshen_above(solver, cutoff, a, target, &mut fresh);
-                    resolve_var_type(solver, &a).ok().filter(names_no_variable)
+                    resolve_var_type(solver, &a)
+                        .ok()
+                        .filter(Type::names_no_variable)
                 })
                 .collect();
             let Some(at_operands) = at_operands else {
@@ -4316,6 +4228,20 @@ pub(super) fn specialize_use(
             constrain_subtype(solver, &standing, &associated, &mut cache)?;
         }
         Ok(())
+    });
+    // A variable of the clone's that an obligation watches and that no contribution reaches
+    // is offered its resolution, as emission offers the program's (`src/ccl/design/type-inference.md`, "An
+    // operand nothing reaches is judged by its resolution"): the pin can bound it from above
+    // alone, and coalescing reads the obligation's answer.
+    let pinned = pinned.and_then(|()| {
+        let vars: Vec<_> = fresh.vars.values().cloned().collect();
+        crate::ccl::infer::solver::traits::deliver_resolutions(
+            solver,
+            &vars,
+            &mut cache,
+            |solver, ty| resolve_var_type(solver, ty).ok(),
+        )
+        .map_err(|(error, _)| error)
     });
     cache.report_recorded(solver, || EdgeReport::Labeled(PIN_LABEL.to_string()));
     // The pin added bounds to the clone's copies of the definition's barrier variables,

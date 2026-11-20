@@ -342,6 +342,7 @@ pub fn defined_as(solver: &mut Solver, ty: Type, definition: &TypedExpr) -> Type
         ),
         op: BinOpKind::Compare(CompareKind::Equals),
         right: Box::new(definition),
+        obligation: crate::ccl::expr::CallObligation::default(),
     })
     .with_ty(Type::Base(BaseType::Bool));
     Type::refined_one(ty, Refinement::born(std::rc::Rc::new(predicate)))
@@ -354,7 +355,7 @@ fn in_term_fragment(e: &TypedExpr) -> bool {
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_) | Lit::Bool(_)) | TypedExprNode::Var(_) => true,
         TypedExprNode::Apply { .. } => Path::of(e).is_some(),
-        TypedExprNode::UnaryOp(_, operand) => in_term_fragment(operand),
+        TypedExprNode::UnaryOp(_, operand, _) => in_term_fragment(operand),
         TypedExprNode::BinOp { left, right, .. } => {
             in_term_fragment(left) && in_term_fragment(right)
         }
@@ -858,7 +859,7 @@ impl<'a> Encode<'a> {
                 Some(path) => self.leaf(solver, path, &e.ty),
                 None => Err(unencodable(e)),
             },
-            TypedExprNode::UnaryOp(op, operand) => {
+            TypedExprNode::UnaryOp(op, operand, _) => {
                 let operand = self.expr(solver, operand)?;
                 // `^not` computes what `not` computes, as a binary `^` sibling does.
                 Ok(match op.unrefined() {
@@ -867,7 +868,9 @@ impl<'a> Encode<'a> {
                     UnaryOpKind::NotRefined => unreachable!("`unrefined` answers no `NotRefined`"),
                 })
             }
-            TypedExprNode::BinOp { left, op, right } => {
+            TypedExprNode::BinOp {
+                left, op, right, ..
+            } => {
                 let (l, r) = (self.expr(solver, left)?, self.expr(solver, right)?);
                 self.binop(*op, left, right, l, r)
             }
@@ -1043,7 +1046,7 @@ fn unencodable(e: &TypedExpr) -> String {
 fn is_int_literal(e: &TypedExpr) -> bool {
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_)) => true,
-        TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => is_int_literal(operand),
+        TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand, _) => is_int_literal(operand),
         _ => false,
     }
 }

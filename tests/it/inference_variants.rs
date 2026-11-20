@@ -739,6 +739,7 @@ fn read_arm_payload_is_pinned_to_a_type_its_reads_accept(
         left: Box::new(var("w")),
         op: BinOpKind::Arithmetic(op),
         right: Box::new(rhs),
+        obligation: Default::default(),
     });
     let body = TypedExpr::new(TypedExprNode::Case {
         scrutinee: Some(Box::new(var("x"))),

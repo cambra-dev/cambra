@@ -2902,7 +2902,7 @@ pub(super) fn lower_method_call(
             name: method.node.to_string(),
             args: args.len(),
             candidates,
-            deferred: None,
+            obligation: crate::ccl::expr::CallObligation::default(),
         }),
         method.span,
     );

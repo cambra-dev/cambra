@@ -4361,10 +4361,11 @@ one.
 - **The requirement sweep skips the obligation** while the rule may answer, as it skips one the
   product rule answered: the rule accepts every collection, which an intersection of bases cannot
   state.
-- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` whose operand resolves to a
-  structural collection is replaced by `𝑐` before any other rule reads it, in the tree and in
-  each predicate copy (`elements_of_a_collection`). A message's predicate copy drops it the same
-  way, so a diagnostic spells the source as the program does. A call a declared instance answers
+- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` whose obligation the rule answers is
+  replaced by `𝑐` before any other rule reads it, in the tree and in each predicate copy
+  (`elements_of_a_collection`;
+  [A call reads its obligation's answer](#a-call-reads-its-obligations-answer)). A message's
+  predicate copy drops it the same way, so a diagnostic spells the source as the program does. A call a declared instance answers
   is replaced by that instance's function, as any trait function's is
   ([Trait functions](#trait-functions)).
 
@@ -4491,7 +4492,10 @@ loop iterates, so the key type reaches the position variable as an upper bound. 
 the obligation judges it as one that arrived: a record the loop's positions resolve to fails
 `Orderable` there. A variable that stays a variable is offered nothing. The pass runs after the
 sweep, whose deposits are upper bounds too, and before the emission seal, since it narrows a
-definition's obligations.
+definition's obligations. It runs again over a specialization clone's variables once the pin has
+tied them to the use's types (`specialize_use`): the pin can bound an operand from above alone,
+and coalescing reads the clone's obligations' answers
+([A call reads its obligation's answer](#a-call-reads-its-obligations-answer)).
 
 #### The unit is a place, not a variable
 
@@ -4550,6 +4554,53 @@ That the list is closed is an argument about today's code, not something the com
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and resolves its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
 
+### A call reads its obligation's answer
+
+A node a trait answers holds the obligation emission placed for it (`CallObligation`): a trait
+function's call (`TraitFn`), an operator (`BinOp`, `UnaryOp`), and a method call whose receiver's
+type was unknown where it stands (`Method`). Coalescing rewrites the node by that obligation's
+answer (`TraitObligation::answer`). It does not match resolved operand types against the instance
+tables: resolving an operand compacts every type its refinements quote, and a comprehension's
+source quotes the whole chain of comprehensions before it.
+
+The answer is one of these:
+
+- **an instance**, once one is selected
+  ([Selecting a declared instance](#selecting-a-declared-instance)), or once contributions have
+  narrowed the candidates to one row and no assumption naming a variable or a type parameter still
+  answers the obligation. A compiler row over bases states everything at its operands and is never
+  selected. An assumption at types naming neither, which a specialization settles, is answered by
+  the row its types match;
+- **the product rule** or **the collection rule**
+  ([A product is answered off the table](#a-product-is-answered-off-the-table),
+  [A collection is answered off the table](#a-collection-is-answered-off-the-table));
+- **an assumption** in scope, which each use of the definition stating it answers in turn;
+- **open**, while nothing that has reached the obligation decides between its candidates. The only
+  candidate of a trait nothing has narrowed is open: no operand has chosen it.
+
+Coalescing carries out an instance and the collection rule, before anything reads the node:
+
+- `𝑐 ▷ Iterable::elements` that the collection rule answers is `𝑐`.
+- A trait function's call or an operator that a declared instance answers becomes a use of the
+  instance's function ([Trait functions](#trait-functions),
+  [An operator's instance](#an-operators-instance)).
+- A trait function's call or an operator that a compiler instance answers runs the instance's
+  primitive.
+- A method call becomes the candidate its selected row reaches
+  ([nominal-types.md, "Method calls"](nominal-types.md#method-calls)).
+
+Any other answer leaves the node. A walk whose types are dropped carries out no answer: the
+definition's own obligations are answered by its assumptions, and each use's clone carries out its
+copies' answers.
+
+A copy of the node holds the same obligation, so a predicate a resolution copies reads the answers
+its original does. A specialization's clone holds the use's copies: `freshen_expr_type_slots` maps
+the node's obligation as it maps the node's types, to the copy freshening a watched variable makes
+(`freshen_obligation`). An obligation watching no variable above the cutoff was minted by the
+enclosing scope and is its own. An operator lets go of its obligation once the stamp pass has run
+its primitive, and no `TraitFn` or `Method` node survives inference, so no node holds solver state
+after it.
+
 ### Trait functions
 
 A function read from an instance, `summon(Area(_))::area` or `a::area` under
@@ -4580,10 +4631,10 @@ included, for a name.
   at `Area(S)`, whose obligation the assumption `Area(S)` answers, as it answers
   `summon(Area(_))::area` applied to an `S`. Each use of the definition passes the instance its
   types pick, so specialization chooses the instance either way.
-- **Coalescing** resolves the operand slots and finds the one instance the resolved operands match
-  (`matching_instance`). The slots are type slots, so a generalized definition's specialization
-  clone freshens them with the rest of the clone, and each clone chooses its own instance. A walk
-  whose types are dropped chooses nothing. No `TraitFn` survives inference.
+- **Coalescing** carries out the answer of the node's obligation
+  ([A call reads its obligation's answer](#a-call-reads-its-obligations-answer)). A generalized
+  definition's specialization clone holds the use's copy of the obligation, so each clone carries
+  out its own. No `TraitFn` survives inference.
   - An instance's functions are `def`s, which lowering binds where the `instance` stands, each
     under a name the instance records. Before anything reads the node, `use_instance_function`
     makes it a use of that name with the node's own type, the signature at the call's types, and
@@ -4607,9 +4658,6 @@ included, for a name.
     compares a new specialization with the active ones of its own function, skipping each pair
     where the earlier type is bigger, and memoizes each pair of subterms, so it costs
     `O(𝑑 · |𝑠| · |𝑡|)` for `𝑑` active specializations.
-
-The obligation and the choice read the same heads, so the one instance a resolved operand matches
-is the one its obligation narrowed to.
 
 An instance's functions are a `DefGroup`, as a type's own `impl` block's are
 ([A definition group is emitted in the order its references need](#a-definition-group-is-emitted-in-the-order-its-references-need)).
@@ -4639,17 +4687,18 @@ binds.
 
 ### An operator's instance
 
-`emit_binop` places an operator's trait obligation over its operands and types the result by the
-operator's `OperatorResult`. What runs is chosen at
-coalesce, from the operands' resolved types (`dispatch_operator`, `run_instance_primitive`):
+`emit_binop` places an operator's trait obligation over its operands, which the node holds, and
+types the result by the operator's `OperatorResult`. Coalescing carries out the obligation's answer
+([A call reads its obligation's answer](#a-call-reads-its-obligations-answer); `dispatch_operator`,
+`run_instance_primitive`):
 
 - **An arithmetic operator a declared instance answers becomes the call its `OperatorCall` makes.**
   `a + b` is rewritten to `let t = (a, b) in t ▷ Addable::add`, a `TraitFn` at the resolved
   operand types and typed by the trait's signature there, whose `Output` is the operator's own
-  result. The walk then dispatches the `TraitFn` as any trait function's
-  ([Trait functions](#trait-functions)), so the call specializes the instance's function. Only a
-  program that declares an instance of the trait resolves its operators' operand types here,
-  since resolving copies the refinements' predicates.
+  result. The `TraitFn` holds the operator's obligation, and the walk dispatches it as any trait
+  function's ([Trait functions](#trait-functions)), so the call specializes the instance's
+  function. Only an operator a declared instance answers has its operand types resolved, since
+  resolving copies the refinements' predicates.
 - **An operator a compiler instance answers runs the instance's primitive.** The node stays, and
   its operator becomes the row's (`InstanceBody::Binary`): `Concat` for two strings. A temporary `^`
   operator whose row runs the operation it already computes keeps its own kind (`^-` answered by

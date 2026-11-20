@@ -3554,6 +3554,7 @@ fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
         left,
         op: crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
         right,
+        ..
     } = &r.predicate.node
     else {
         return None;
@@ -4345,6 +4346,20 @@ impl Type {
     /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
     pub fn structure(&self) -> Cow<'_, Type> {
         self.structure_in(&mut Solver::none())
+    }
+
+    /// Whether this holds no inference variable and no type parameter: a type an instance head
+    /// can be matched against.
+    pub fn names_no_variable(&self) -> bool {
+        if matches!(
+            self,
+            Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
+        ) {
+            return false;
+        }
+        let mut closed = true;
+        self.walk_children(|child| closed &= child.names_no_variable());
+        closed
     }
 
     /// Whether a [`Type::Nominal`] occurs anywhere in this type.
@@ -6103,18 +6118,20 @@ fn eq_term_modulo_ty_slots_go(
                 left: l1,
                 op: o1,
                 right: r1,
+                ..
             },
             N::BinOp {
                 left: l2,
                 op: o2,
                 right: r2,
+                ..
             },
         ) => {
             o1 == o2
                 && eq_term_modulo_ty_slots_go(l1, l2, pairs)
                 && eq_term_modulo_ty_slots_go(r1, r2, pairs)
         }
-        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => {
+        (N::UnaryOp(k1, e1, _), N::UnaryOp(k2, e2, _)) => {
             k1 == k2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)
         }
         (
@@ -6327,18 +6344,17 @@ fn eq_term_modulo_ty_slots_go(
                 name: m1,
                 args: a1,
                 candidates: c1,
-                deferred: d1,
+                ..
             },
             N::Method {
                 name: m2,
                 args: a2,
                 candidates: c2,
-                deferred: d2,
+                ..
             },
         ) => {
             m1 == m2
                 && a1 == a2
-                && d1 == d2
                 && c1.len() == c2.len()
                 && c1.iter().zip(c2).all(|(x, y)| {
                     x.decl == y.decl
@@ -6451,7 +6467,7 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         },
         TypedExprNode::Builtin(b) => b.hash(state),
         TypedExprNode::BinOp { op, .. } => op.hash(state),
-        TypedExprNode::UnaryOp(kind, _) => kind.hash(state),
+        TypedExprNode::UnaryOp(kind, ..) => kind.hash(state),
         TypedExprNode::Aggregate { kind, .. } => kind.hash(state),
         TypedExprNode::VariantCtor { tag, .. } => tag.hash(state),
         TypedExprNode::NominalCtor { decl, ctor, .. } => {

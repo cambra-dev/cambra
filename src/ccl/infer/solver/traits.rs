@@ -1264,6 +1264,7 @@ impl InstanceBody {
                     left: Box::new(read(&names[0], &left)),
                     op: *op,
                     right: Box::new(read(&names[1], &right)),
+                    obligation: crate::ccl::expr::CallObligation::default(),
                 })
                 .with_ty(codomain.clone());
                 for (i, (name, part)) in names.iter().zip([left, right]).enumerate().rev() {
@@ -1277,10 +1278,12 @@ impl InstanceBody {
                 }
                 body
             }
-            (InstanceBody::Unary(op), _) => {
-                TypedExpr::new(TypedExprNode::UnaryOp(*op, Box::new(read(&param, &domain))))
-                    .with_ty(codomain)
-            }
+            (InstanceBody::Unary(op), _) => TypedExpr::new(TypedExprNode::UnaryOp(
+                *op,
+                Box::new(read(&param, &domain)),
+                crate::ccl::expr::CallObligation::default(),
+            ))
+            .with_ty(codomain),
             (InstanceBody::Binary(op), other) => {
                 panic!("`{op:?}` is over a pair of operands, got {other}")
             }
@@ -1739,6 +1742,22 @@ fn matches_pattern(pattern: &Type, ty: &Type, at: &mut HashMap<TypeParamId, Type
             None => pattern == ty,
         },
     }
+}
+
+/// What answers a [`TraitObligation`] ([`TraitObligation::answer`]).
+#[derive(Clone, Debug)]
+pub enum Answer {
+    /// Nothing that has reached the obligation decides between its candidates yet.
+    Open,
+    /// One instance: a module's, or a compiler row.
+    Instance(Rc<TraitInstance>),
+    /// The product rule, componentwise over a tuple or a record.
+    Product,
+    /// The collection rule: the operand is its own `Elements`.
+    Collection,
+    /// An assumption of a `requires` clause in scope, which each use of the definition
+    /// stating it answers in turn.
+    Assumption,
 }
 
 /// Stable identity of a [`TraitObligation`].
@@ -3447,6 +3466,37 @@ impl TraitObligation {
         constrain_subtype(solver, &operand, &elements, cache)
     }
 
+    /// What answers this obligation, as far as the contributions that have reached it decide
+    /// (`src/ccl/design/type-inference.md`, "A call reads its obligation's answer").
+    ///
+    /// An instance answers once it is selected, or once contributions have narrowed the
+    /// candidates to one row and no assumption naming a variable or a type parameter still
+    /// answers the obligation. [`try_select`](Self::try_select) leaves a compiler row over
+    /// bases unselected, because the deposit settles everything it states. The only candidate
+    /// of a trait nothing has narrowed has not been chosen by any operand.
+    pub fn answer(&self) -> Answer {
+        if self.collection_rule.get() == CollectionRule::Applied {
+            return Answer::Collection;
+        }
+        if matches!(*self.product_rule.borrow(), ProductRule::Applied(_)) {
+            return Answer::Product;
+        }
+        let candidates = self.candidates.borrow();
+        let assumptions = self.assumptions.borrow();
+        // An assumption at types naming no variable and no parameter is answered by the row
+        // its types match, which narrowing leaves among the candidates.
+        let assumed = assumptions
+            .iter()
+            .any(|a| !a.args.iter().all(Type::names_no_variable));
+        match candidates.as_slice() {
+            [only] if self.selected.get() || (self.narrowed.get() && !assumed) => {
+                Answer::Instance(Rc::clone(only))
+            }
+            [] if !assumptions.is_empty() => Answer::Assumption,
+            _ => Answer::Open,
+        }
+    }
+
     /// Whether the collection rule answers this obligation.
     pub(super) fn answered_by_collection(&self) -> bool {
         self.collection_rule.get() == CollectionRule::Applied
@@ -4169,8 +4219,8 @@ fn group_operand_failures(
         .collect()
 }
 
-/// Offer each watched variable that no contribution reached the type it resolves to, and
-/// answer the first obligation that refuses it with the node that placed it.
+/// Offer each of `vars` that is watched and that no contribution reached the type it resolves
+/// to, and answer the first obligation that refuses it with the node that placed it.
 ///
 /// **The check delivery cannot make.** Narrowing acts on what flows into an operand, so an
 /// operand bounded only from above is never offered anything and its obligations stay
@@ -4181,28 +4231,43 @@ fn group_operand_failures(
 /// offered it here as a contribution, and the obligation judges it as it would one that
 /// arrived; one that stays a variable is offered nothing.
 ///
-/// Runs after [`resolve_operand_requirements`], whose deposits are upper bounds too, and before
-/// the emission seal, since it narrows a definition's obligations.
-pub fn deliver_resolutions(
+/// Runs over the program's variables after [`resolve_operand_requirements`], whose deposits are
+/// upper bounds too, and before the emission seal, since it narrows a definition's
+/// obligations. It runs again over a specialization clone's variables once the pin has tied
+/// them to the use's types (`infer::solve::specialize_use`), since coalescing reads the
+/// answers of the clone's obligations.
+pub fn deliver_resolutions<'v>(
     solver: &mut Solver,
+    vars: impl IntoIterator<Item = &'v Rc<InferVar>>,
     cache: &mut ConstrainCache,
     resolve: impl Fn(&mut Solver, &Type) -> Option<Type>,
 ) -> Result<(), (ConstrainError, provenance::NodeId)> {
-    for var in solver.infer_vars().to_vec() {
-        let watches = var.watches(solver).to_vec();
-        if watches.is_empty() || !var.bounds(solver).lower().is_empty() {
-            continue;
-        }
-        let Some(resolved) = resolve(solver, &Type::Infer(Rc::clone(&var))) else {
-            continue;
-        };
-        if matches!(offered(&resolved), Offered::Unknown) {
-            continue;
-        }
-        for (obligation, pos) in watches {
-            deliver(solver, &obligation, pos, &resolved, None, cache)
-                .map_err(|e| (e, obligation.operator_node_id))?;
-        }
+    for var in vars {
+        deliver_resolution(solver, var, cache, &resolve)?;
+    }
+    Ok(())
+}
+
+/// Offer `var`'s resolution to every obligation watching it, if no contribution reached it.
+fn deliver_resolution(
+    solver: &mut Solver,
+    var: &Rc<InferVar>,
+    cache: &mut ConstrainCache,
+    resolve: &impl Fn(&mut Solver, &Type) -> Option<Type>,
+) -> Result<(), (ConstrainError, provenance::NodeId)> {
+    let watches = var.watches(solver).to_vec();
+    if watches.is_empty() || !var.bounds(solver).lower().is_empty() {
+        return Ok(());
+    }
+    let Some(resolved) = resolve(solver, &Type::Infer(Rc::clone(var))) else {
+        return Ok(());
+    };
+    if matches!(offered(&resolved), Offered::Unknown) {
+        return Ok(());
+    }
+    for (obligation, pos) in watches {
+        deliver(solver, &obligation, pos, &resolved, None, cache)
+            .map_err(|e| (e, obligation.operator_node_id))?;
     }
     Ok(())
 }

@@ -343,7 +343,7 @@ where
             open(f, left);
             open(f, right);
         }
-        N::UnaryOp(_, inner) => open(f, inner),
+        N::UnaryOp(_, inner, _) => open(f, inner),
         N::Aggregate { input, .. } => open(f, input),
         N::VariantCtor { payload, .. } | N::NominalCtor { payload, .. } => open(f, payload),
         N::Method { candidates, .. } => {
@@ -748,7 +748,11 @@ mod tests {
                 crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
                 var("r"),
             ),
-            node(N::UnaryOp(crate::ccl::UnaryOpKind::Neg, Box::new(var("u")))),
+            node(N::UnaryOp(
+                crate::ccl::UnaryOpKind::Neg,
+                Box::new(var("u")),
+                Default::default(),
+            )),
             TypedExpr::lambda("p", Occurrence::mint(), Type::Hole, var("p")),
             node(N::Aggregate {
                 input: Box::new(var("agg")),
@@ -795,6 +799,7 @@ mod tests {
                 function: "add".into(),
                 operands: vec![Type::Hole],
                 assoc: Vec::new(),
+                obligation: Default::default(),
             }),
             node(N::Method {
                 name: "m".into(),
@@ -810,7 +815,7 @@ mod tests {
                     function: var("N::m"),
                     copy: false,
                 }],
-                deferred: None,
+                obligation: Default::default(),
             }),
             transact_one_key_one_writer(),
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),

@@ -1632,7 +1632,42 @@ pub fn freshen_expr_type_slots(
             *slot = slot.map_vars(&mut |v| freshen_capability_var(solver, lim, v, target, cache));
         }
     }
+    // The obligation of the call the node makes: the use's copy of it, as its types hold the
+    // use's copies of their variables.
+    if let Some(slot) = expr.node.call_obligation_mut()
+        && let Some(obligation) = slot.get().cloned()
+    {
+        *slot = crate::ccl::expr::CallObligation::placed(freshen_obligation(
+            solver,
+            lim,
+            &obligation,
+            target,
+            cache,
+        ));
+    }
     expr.walk_children_mut(|c| freshen_expr_type_slots(solver, c, lim, target, cache));
+}
+
+/// The copy of `obligation` this freshening makes: one exists where a variable it watches is
+/// above the cutoff, and freshening that variable copies the obligation with it
+/// ([`freshen_watches`]). An obligation watching none, which the enclosing scope minted, is
+/// its own.
+fn freshen_obligation(
+    solver: &mut Solver,
+    lim: Level,
+    obligation: &Rc<TraitObligation>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<TraitObligation> {
+    if !cache.obligations.contains_key(&obligation.uid) {
+        for operand in obligation.operands().into_iter().flatten() {
+            freshen_above(solver, lim, &operand, target, cache);
+        }
+    }
+    cache
+        .obligations
+        .get(&obligation.uid)
+        .map_or_else(|| Rc::clone(obligation), Rc::clone)
 }
 
 /// Structurally pair a use site's resolved instantiation type against the
