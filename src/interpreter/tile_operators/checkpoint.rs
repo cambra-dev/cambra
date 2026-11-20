@@ -10,15 +10,18 @@
 //!
 //! [`Checkpoint::persist`] models the write-ahead rule of `docs/durability.md`: a breaker persists
 //! its state before it releases its input. A test calls it after every top-level step, and it
-//! copies out each breaker whose releases or stated completeness changed since its last copy, so
-//! breakers' copies are of different moments. The model never stops a run between a copy and the
-//! release it covers, nor inside one step.
+//! copies out each breaker whose releases changed since its last copy, so breakers' copies are of
+//! different moments. The model never stops a run between a copy and the release it covers, nor
+//! inside one step.
 //!
-//! A copy is taken where stated completeness changes as well as where a release changes. A reader that
-//! takes output the breaker states complete may hold it after the breaker's state has moved on, and
-//! the breaker must then answer that output the same way after a recovery. A transaction drive is
-//! the case that needs it: the row it emits for an attempt carries the store's frontier at the
-//! emit, which a drive recovered from an older copy would read differently.
+//! A breaker recovered from an older copy may have emitted output after that copy that its readers
+//! took and released. Recovery replays those releases. A breaker whose output is a function of its
+//! state and its replayed input renders that output again unchanged. A transaction drive's is not:
+//! the row it emits for an attempt carries the store's frontier at the emit. The drive does not get
+//! back the rows or the `latest_emit` it had after its copy. It learns from the replayed releases
+//! which attempts its readers released
+//! ([`TileProducer::reader_released`](super::TileProducer::reader_released)) and emits its next
+//! attempt past them.
 //!
 //! A loop's or a transaction's open request is run state and is not copied. A recovered run
 //! rebuilds it from the breakers. The store's pipeline queues the positions of its input the store
@@ -67,10 +70,6 @@ struct BreakerCheckpoint {
     /// The guard the breaker released to each producer it visits as an input, in visit order: a
     /// store's seeds as well as its body.
     taken: Vec<TileGuard>,
-    /// What the breaker stated complete ([`BreakingProducer::complete`]) when copied. Restore
-    /// does not install it; [`Checkpoint::persist`] copies the breaker again once it changes, since
-    /// a reader may then take output the breaker must answer the same way after a recovery.
-    stated: TileGuard,
 }
 
 /// What tells a breaker from another at the same position of [`walk`]: its name without the
@@ -118,8 +117,8 @@ pub(crate) struct Checkpoint {
 
 #[cfg(test)]
 impl Checkpoint {
-    /// Copy out each breaker under `roots` whose releases or stated completeness differ from its
-    /// latest copy, or every breaker where `every` is set, and every root's release.
+    /// Copy out each breaker under `roots` whose releases differ from its latest copy, or every
+    /// breaker where `every` is set, and every root's release.
     ///
     /// Answers `false`, and copies nothing, where a store is borrowed and the walk reached only
     /// part of the graph. With one worker no step ends with a store borrowed; with several, a
@@ -131,15 +130,13 @@ impl Checkpoint {
             let at = identities.len();
             identities.push(identity_of(breaker));
             let taken = taken_of(breaker);
-            let stated = breaker.complete();
             let changed = match self.breakers.get(at).and_then(Option::as_ref) {
-                Some(latest) => latest.taken != taken || latest.stated != stated,
-                None => taken.iter().any(|guard| !guard.is_empty()) || !stated.is_empty(),
+                Some(latest) => latest.taken != taken,
+                None => taken.iter().any(|guard| !guard.is_empty()),
             };
             copies.push((every || changed).then(|| BreakerCheckpoint {
                 state: breaker.checkpoint(),
                 taken,
-                stated,
             }));
         });
         if !complete {

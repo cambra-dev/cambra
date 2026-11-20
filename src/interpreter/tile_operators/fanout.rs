@@ -1290,6 +1290,9 @@ fn release_shared(shared_rc: &Arc<RwLock<FanOutShared>>, increment: Option<&Tile
     let intersection = live.fold(shared.release_guards[first].clone(), |guard, i| {
         guard.intersect(&shared.release_guards[i])
     });
+    if let (Some(Inner::Owned(producer)), Some(increment)) = (shared.producer.as_ref(), increment) {
+        producer.reader_released(increment);
+    }
     if intersection == shared.released {
         return;
     }

@@ -2052,6 +2052,19 @@ pub trait TileProducer: Send + Sync {
         None
     }
 
+    /// What one reader behind this producer's fan-out has just released, where
+    /// [`release`](Self::release) receives only what every reader released. A producer whose
+    /// rendering of a position depends on when it renders uses it to render no released position
+    /// again. The transaction drive is the one producer that does, keeping the highest attempt
+    /// released.
+    ///
+    /// The fan-out calls it from `release_shared` on every slot release, including one that
+    /// leaves the intersection unchanged, with the fan-out's shared state write-locked, so an
+    /// implementation must not release or pull through that fan-out. Only an ordinary fan-out
+    /// calls it, not a store's cyclic one, and a producer read without a fan-out never receives
+    /// it.
+    fn reader_released(&self, _released: &TileGuard) {}
+
     /// Where this producer is a loop's drive, the target the entry in front of its source records
     /// a decided push at while the drive reads the source by pull, and `None` for any other
     /// producer ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).
