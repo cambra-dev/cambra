@@ -2176,16 +2176,27 @@ impl InferCtx {
         } else {
             match definition {
                 Some(definition)
-                    if let_scheme != LetScheme::Poisoned
-                        && !matches!(
-                            definition.node,
-                            TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
-                        ) =>
+                    if matches!(
+                        definition.node,
+                        TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
+                    ) =>
                 {
+                    ScopeExit::Keep
+                }
+                Some(definition) if let_scheme != LetScheme::Poisoned => {
                     // In the spelling a predicate takes it in, once for every reader.
                     ScopeExit::Discharge(Rc::new(crate::ccl::ccl_utils::predicate_term(definition)))
                 }
-                _ => ScopeExit::Keep,
+                // The definition did not type, so the program is already rejected, and a type
+                // lifted past the binder keeps its name: `r = xs[0]; r!` leaves the body's
+                // type reading `r`. Entering the name as opaque accounts for it in every
+                // telescope, so that type resolves in scope (`src/ccl/design/type-inference.md`,
+                // "The invariant") and the rejection is reported. No standing fact is recorded
+                // for it: the type it is bound at is poisoned, so no query may assume it.
+                _ => {
+                    self.telescope.enter_opaque(name);
+                    ScopeExit::Keep
+                }
             }
         };
         // Generalize at the current (outer) level: any variable in `bound_ty`

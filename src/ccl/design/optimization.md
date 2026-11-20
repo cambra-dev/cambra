@@ -198,8 +198,8 @@ Every type check from this phase through planning runs in `infer::CheckMode::Ref
 which selects `Derivation::RefinementBlind` for the constraint walk. That walk compares refinements
 only inside the domain edge of two data functions, and inside the kind premise between their Σ
 binders. Everywhere else it relates a refined type by its base, and a `UInt` or a range by the
-`UInt` a range `0..𝑛` refines. A proven lookup's key, erased to `UInt`, meets its list's domain
-`0..𝑛` this way. Each check entry point takes the mode as a parameter, and the pipeline
+`UInt` a range `0..𝑛` refines. The key of a list's application, erased to `UInt`, meets the list's
+domain `0..𝑛` this way. Each check entry point takes the mode as a parameter, and the pipeline
 (`ccl/context.rs`) passes it at every boundary. `planning::run` takes it too, and its
 `FragmentChecker` checks every term a rewrite builds in it.
 

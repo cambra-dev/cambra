@@ -842,6 +842,12 @@ A bound's substitution can suspend the variable it reaches, so the bound read th
 suspension where the bound holds the variable. Both stand at that position: an upper bound is read
 as the variable's position as well as the suspension's, and an occurrence is recorded for both.
 
+An answer is read off other variables' bounds, and those can stand under binders `𝛼` does not: an
+application's result reads the application's expected binder until its discharge fires. The answer
+keeps only the refinements whose predicates name binders in `𝛼`'s telescope (`within_telescope`),
+because `𝛼` is pinned to it ([The invariant](#the-invariant)). Dropping a refinement only widens
+the pin.
+
 A bare variable is not an answer. The first answer that resolves fully wins; with none, the first
 answer with an unresolved position inside it does, which is what an upper bound to a partly known
 shape gives. Where the variable's trait obligations watch it, an answer that is not a base they
@@ -2564,7 +2570,10 @@ Each telescope also shares a growing set of opaque binders with the other telesc
 root. `enter_opaque` adds a name to that set, including for variables created before entry.
 This permits a mutable variable declared outside a read binder to receive a refinement naming
 that read: `x := x + 1` contributes `__elem == __read + 1` to the variable created for `x`.
-A transparent let is discharged instead; a `for` target has no such exemption.
+A transparent let is discharged instead; a `for` target has no such exemption. A `let` whose
+definition did not type has no definiens to discharge, so a type lifted past it keeps its name, and
+`let_scope_binding` enters that name as opaque. It records no standing fact for the name: the type
+the name is bound at is poisoned, and the program is already rejected.
 
 `check_scope_valid` likewise seeds its root with every opaque binder present in the tree.
 Neither check establishes lexical containment for those names. TODO: enforce opaque-binder
@@ -3665,8 +3674,8 @@ Refinement predicates also contain type slots. After resolving a predicate,
 projection paths through products. Updating only the element binder's occurrence would
 leave projection slots with stale witness names.
 
-A proven lookup `xs[i]!` on a sum emits the same application constraint as any other proven
-lookup: `type(xs) <: (type(i) ⇒ ?r)`, with a funkind variable on the demand. The codomain receives
+Applying a sum, `xs(i)`, emits the same application constraint as any other application:
+`type(xs) <: (type(i) ⇒ ?r)`, with a funkind variable on the demand. The codomain receives
 one covariant constraint. The index type and witness reference constrain the domain; any
 unresolved domain comparison must remain valid when the bounds materialize. See
 [Apply is one-way](#apply-is-one-way) and [Data domains are invariant](#data-domains-are-invariant).
@@ -5283,8 +5292,8 @@ t.0
 
 The parser retains the attribute spelling. Lowering maps an attribute beginning with
 a digit to a positional `ProjKey::Index`; an identifier becomes `ProjKey::Field`.
-Square brackets denote collection application, not product projection. Symbolically,
-`𝑟.x` is `𝑟 ▷ .x`, whereas the proven lookup `𝑐[𝑘]!` is `𝑘 ▷ 𝑐`.
+Square brackets denote collection lookup, not product projection. Symbolically, `𝑟.x` is
+`𝑟 ▷ .x`, whereas the checked lookup `𝑐[𝑘]` is `(𝑐, 𝑘) ▷ lookup?` and the call `𝑐(𝑘)` is `𝑘 ▷ 𝑐`.
 
 Record inference assigns each field its value-read type, as tuple inference does for
 positions. A record node retains a record type. Inside lambda elimination, its fields

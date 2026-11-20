@@ -1388,6 +1388,36 @@ fn position_type(
     let mut question = PositionQuestion::default();
     let full = position_type_go(v, index, &mut question, &mut partial);
     full.or(partial)
+        .map(|answer| within_telescope(&answer, &v.telescope))
+}
+
+/// `ty` without the refinements that read a term binder outside `telescope`.
+///
+/// A position's answer is read off other variables' bounds, and those may stand under binders
+/// the asking variable does not: an application's result reads the application's expected
+/// binder until the result's discharge fires. The answer is what the variable is pinned to, and
+/// a variable resolves to a type naming its telescope's binders and nothing else
+/// (`src/ccl/design/type-inference.md`, "The invariant"). Dropping a refinement only widens the
+/// pin.
+fn within_telescope(ty: &Type, telescope: &crate::ccl::infer_var::Telescope) -> Type {
+    match ty {
+        Type::Refinement(base, rs) => Type::refined(
+            within_telescope(base, telescope),
+            rs.iter()
+                .filter(|r| {
+                    crate::ccl::subst::refinement_free_vars(r)
+                        .iter()
+                        .all(|n| telescope.contains(n))
+                })
+                .cloned()
+                .collect(),
+        ),
+        _ => {
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = within_telescope(c, telescope));
+            out
+        }
+    }
 }
 
 /// What one [`position_type`] question has learned so far.

@@ -357,16 +357,23 @@ runtime-free conversion API. No surface view constructor should be inferred from
 
 ## Lookup: membership discharge
 
-The proven lookup `c[k]!` lowers as function application. It requires the key type to be below
-the collection's domain. `c[k]` is checked lookup: it requires a compatible key type but decides
-presence at runtime and returns `Option`. The
-[CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access) owns the spellings.
+`c[k]` is checked lookup: it requires a compatible key type but decides presence at runtime and
+returns `Option`. The proven lookup `c[k]!` is `!` applied to it, and lowers to
+`(c, k) ▷ lookup? ▷ Option::value`. `Option::value`'s parameter excludes `none`, so `c[k]!` is
+accepted where [The checked lookup's refinement](#the-checked-lookups-refinement) entails that the
+key is present. The [CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access)
+owns the spellings.
 
-A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
-That typing rule does not construct a value at such a domain. A concrete keyed domain requires
-its own membership evidence; a known source element does not currently acquire it automatically.
-A list's proven lookup accepts a `UInt` key whose refinement entails the range bound, such as
-`xs[int_to_uint(1)]!` over `0..3` (see
+The call `c(k)` lowers as function application, which requires the key type to be below the
+collection's domain. Unlike `!`, that requirement reaches an unannotated key: in `\i -> xs(i)`,
+`i` is refined by `xs`'s domain, and `\i -> xs[i]!` is rejected because `i`'s type does not entail
+presence.
+
+A `FullMap(K, V)` parameter's domain is `K` with no refinement, so `present` is `true` for a key of
+type `K` and `m[k]!` is accepted. That typing rule does not construct a value at such a domain. A
+concrete keyed domain requires its own membership evidence; a known source element does not
+currently acquire it automatically. A list's proven lookup accepts a `UInt` key whose refinement
+entails the range bound, such as `xs[int_to_uint(1)]!` over `0..3` (see
 [Semantic entailment as a fallback](type-inference.md#semantic-entailment-as-a-fallback)).
 
 ### The checked lookup `𝑐[𝑘]`
@@ -419,6 +426,8 @@ answers a plain `Option` wherever `present` cannot state all of it:
 - `𝑘` is outside the term fragment (`in_term_fragment`). An unencodable refinement in a query's
   antecedent fails the query (`smt_undecided_is_mismatch`).
 
+A plain `Option` does not exclude `none`, so `c[k]!` is rejected in each of these cases.
+
 A predicate of `𝑞` that reads an element outside its own refinement is left out of the `some`
 branch. Leaving it out only weakens the answer.
 
@@ -462,10 +471,14 @@ A key produced by a collection's key morphism should support membership in that 
 The current compiler does not implement that introduction rule. The regression
 `a_key_from_the_source_does_not_yet_carry_its_key_domain` rejects direct source elements,
 applications of the key function and projected source fields. This is missing functionality,
-not a decision that such keys must remain unusable.
+not a decision that such keys must remain unusable. Those programs look up a group-by, whose
+values are collections. The checked lookup requires `Equatable(V, V)` of the values
+([Constructors state what they build](../../../docs/chl-spec.md#constructors-state-what-they-build)),
+so `g[k]!` on a group-by is rejected at every key before membership is considered.
 
-A key whose type names a sum's witness through the sum's value is a member by its type; see
-[Projecting a sum's witness](#projecting-a-sums-witness).
+A key whose type names a sum's witness through the sum's value is a member by its type, so applying
+the sum to it type-checks; see [Projecting a sum's witness](#projecting-a-sums-witness). A sum's
+checked lookup answers a plain `Option`, so `c[k]!` on a sum is rejected.
 
 ## Projecting a sum's witness
 

@@ -1593,9 +1593,8 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
 /// the edge — and the raw mismatch reads as an internal confusion rather than as what it
 /// is, a lookup whose proof obligation cannot be discharged. An `Array(3, 𝑇)`'s range
 /// domain `0..3` is left to its own message, which already says it wanted an index in the
-/// range. Named here rather than at the subscript form because `c[k]!` lowers to
-/// exactly the application `c(k)`, so the diagnosis has to be type-directed to cover both
-/// spellings.
+/// range. The subscript `c[k]` lowers to the checked lookup, whose key is related only to the
+/// domain's base, so only the application `c(k)` meets this edge.
 ///
 /// The proven/checked operator pair this points at is specified in `docs/chl-spec.md`,
 /// "3.9 Subscript and attribute access"; the discharge it rests on is
@@ -1638,10 +1637,10 @@ fn undischarged_index_hint(
         return None;
     }
     Some(format!(
-        "hint: `{}` is not known to lie in the collection's domain `{}`, so this lookup is \
-         not provably total. A proven lookup needs an index whose type carries that proof \
-         (one drawn from the collection itself); write `c[k]` for the checked form, which \
-         answers `some(v)`/`none` for any key.",
+        "hint: `{}` is not known to lie in the collection's domain `{}`, so this application \
+         is not provably total. Applying a collection needs an index whose type carries that \
+         proof (one drawn from the collection itself); write `c[k]` for the checked form, \
+         which answers `some(v)`/`none` for any key.",
         w.ty(index),
         w.ty(domain)
     ))

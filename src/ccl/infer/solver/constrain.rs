@@ -1596,8 +1596,8 @@ fn constrain_go_impl(
         (Type::UIntRange(a), Type::UIntRange(b)) if a <= b => Ok(()),
         (Type::UIntRange(_), Type::Base(BaseType::UInt)) => Ok(()),
         // The bound `0..𝑛` puts on a `UInt` is a refinement the bases carry, so a
-        // refinement-blind edge relates the two by the `UInt` they refine. A proven lookup's
-        // key, erased to `UInt`, meets its list's domain `0..𝑛` this way.
+        // refinement-blind edge relates the two by the `UInt` they refine. The key of a list's
+        // application, erased to `UInt`, meets the list's domain `0..𝑛` this way.
         (Type::Base(BaseType::UInt) | Type::UIntRange(_), Type::UIntRange(_))
             if cache.refinement_blind() =>
         {
