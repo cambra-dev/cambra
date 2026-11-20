@@ -4,7 +4,6 @@
 use super::plan::Execution;
 use super::*;
 use crate::interpreter::CurryLevel;
-use std::sync::MutexGuard;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::thread::{Scope, ScopedJoinHandle};
@@ -45,13 +44,22 @@ pub(super) struct WorkerPool {
     count: usize,
     /// Per pipeline, its breaker and level where several claims consume it at once.
     specs: Vec<Option<Spec>>,
-    /// Held by the thread that runs serial work: a package or a finish of a pipeline that is not
-    /// partitioned, a finish of one that is, and the coordinator's resume pass and live polling.
-    /// Serial work runs one claim at a time, in claim order, on any thread, as the coordinator
-    /// alone ran it before workers claimed it; only this lock's holder takes a store's blocking
-    /// `write`.
-    // shared-state-ok: a lock that orders serial work between the run's threads, holding no data.
-    serial: Mutex<()>,
+    /// Per pipeline, the exclusion domain its serial work belongs to: a package of a pipeline that
+    /// is not partitioned, and every pipeline's finish ([`ExclusionDomains`]).
+    domain_of: Vec<usize>,
+    /// Per exclusion domain, its pipelines.
+    domains: Vec<Vec<PipelineId>>,
+    /// Per exclusion domain, whether a thread holds it: one claim of its serial work, or the
+    /// coordinator's control ([`control`](Self::control)).
+    // shared-state-ok: one flag per domain, set by compare-and-swap; the holder alone clears it.
+    busy: Vec<AtomicBool>,
+    /// Per exclusion domain, whether a thread found it held since its holder took it: the holder
+    /// wakes the claimants as it releases it, so one that skipped the domain sees it free.
+    // shared-state-ok: a flag a thread sets and the domain's holder clears as it releases it.
+    contended: Vec<AtomicBool>,
+    /// Set while the coordinator takes or holds every domain for the run's control: no serial
+    /// claim starts, so the coordinator is not starved of a domain a worker takes again.
+    controlling: AtomicBool,
     /// Set where the system refused every worker thread: the coordinator claims everything.
     unstarted: AtomicBool,
     #[cfg(test)]
@@ -63,6 +71,8 @@ impl WorkerPool {
         count: usize,
         targets: Vec<Option<BreakerHandle>>,
         bodies: Vec<Option<Vec<PipelineId>>>,
+        mut domains: Joining,
+        reads: &[Vec<usize>],
     ) -> Self {
         assert!(count > 0, "a run has at least one worker");
         debug_assert_eq!(
@@ -86,12 +96,37 @@ impl WorkerPool {
                 })
             })
             .collect();
+        // A pipeline that is not partitioned shares a domain with every pipeline it reads: its
+        // consume reads what their claims are still changing, and its release counts on none of
+        // them running beside it. A partitioned pipeline's packages hold no domain, and its finish
+        // waits for every pipeline it reads to finish.
+        for (pipeline, spec) in specs.iter().enumerate() {
+            if spec.is_none() {
+                for &read in &reads[pipeline] {
+                    domains.join(pipeline, read);
+                }
+            }
+        }
+        let domains = domains.done();
+        debug_assert_eq!(
+            domains.domain_of.len(),
+            specs.len(),
+            "every pipeline belongs to one exclusion domain"
+        );
+        let mut members = vec![Vec::new(); domains.count];
+        for (pipeline, &domain) in domains.domain_of.iter().enumerate() {
+            members[domain].push(PipelineId(pipeline));
+        }
         Self {
             count,
             #[cfg(test)]
             stats: (0..specs.len()).map(|_| Stats::default()).collect(),
             specs,
-            serial: Mutex::new(()),
+            domain_of: domains.domain_of,
+            busy: (0..members.len()).map(|_| AtomicBool::new(false)).collect(),
+            contended: (0..members.len()).map(|_| AtomicBool::new(false)).collect(),
+            domains: members,
+            controlling: AtomicBool::new(false),
             unstarted: AtomicBool::new(false),
         }
     }
@@ -102,22 +137,68 @@ impl WorkerPool {
         self.count > 1 && self.specs.iter().any(Option::is_some)
     }
 
-    /// Whether several claims of `pipeline` consume it at once, outside the serial lock. With one
-    /// thread every package is serial work.
+    /// Whether several claims of `pipeline` consume it at once, outside its exclusion domain. With
+    /// one thread every package is serial work.
     fn partitioned(&self, pipeline: PipelineId) -> bool {
         self.threaded()
             && !self.unstarted.load(Ordering::SeqCst)
             && self.specs.get(pipeline.0).is_some_and(Option::is_some)
     }
 
-    /// The serial lock: a panic while it is held fails the run, so a poisoned lock is taken as is.
-    pub(super) fn serial(&self) -> MutexGuard<'_, ()> {
-        self.serial.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Take `domain` where no thread holds it. A thread that finds it held marks it contended
+    /// and tries once more, so a holder that released it in between is not missed: either this
+    /// try takes it, or the holder saw the mark and woke the claimants.
+    fn try_hold(&self, domain: usize) -> bool {
+        let take = || {
+            self.busy[domain]
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        };
+        if take() {
+            return true;
+        }
+        self.contended[domain].store(true, Ordering::SeqCst);
+        take()
     }
 
-    /// Claim and run the next package or finish: a package of a partitioned pipeline without the
-    /// serial lock, then serial work under it. [`Claimed::Wait`] answers a generation taken before
-    /// either claim, so a wait on it misses nothing that became claimable since.
+    /// Release `domain`, and wake the claimants where a thread found it held: it skipped the
+    /// domain, or the coordinator waits to take it.
+    fn release(&self, dispatcher: &Dispatcher, domain: usize) {
+        self.busy[domain].store(false, Ordering::SeqCst);
+        if self.contended[domain].swap(false, Ordering::SeqCst) {
+            dispatcher.wake_claimants();
+        }
+    }
+
+    /// Take every exclusion domain for the run's control: source starts, range landings, the
+    /// resume pass, live polling and the stall check. No serial claim runs until the guard drops;
+    /// partitioned claims go on. The coordinator alone takes it, so no two threads wait for each
+    /// other's domains.
+    pub(super) fn control<'a>(&'a self, dispatcher: &'a Dispatcher) -> Control<'a> {
+        self.controlling.store(true, Ordering::SeqCst);
+        let mut control = Control {
+            pool: self,
+            dispatcher,
+            held: 0,
+        };
+        while control.held < self.domains.len() {
+            let generation = dispatcher.generation();
+            if self.try_hold(control.held) {
+                control.held += 1;
+            } else if dispatcher.has_failed() {
+                // A failed run's claims stop, and a holder that panicked never releases.
+                break;
+            } else {
+                dispatcher.wait(generation);
+            }
+        }
+        control
+    }
+
+    /// Claim and run the next package or finish: a package of a partitioned pipeline, with no
+    /// domain held, then serial work of the first exclusion domain that has some and that this
+    /// thread takes. [`Claimed::Wait`] answers a generation taken before either claim, so a wait
+    /// on it misses nothing that became claimable since, nor a domain released since.
     pub(super) fn run_next(
         &self,
         dispatcher: &Dispatcher,
@@ -127,7 +208,7 @@ impl WorkerPool {
         #[cfg_attr(not(test), allow(unused_variables))] worker: usize,
     ) -> Claimed {
         let generation =
-            match dispatcher.try_claim_where(*preferred, &|p| self.partitioned(p), false) {
+            match dispatcher.try_claim_where(*preferred, &|p| self.partitioned(p), &|_| false) {
                 Next::Package(package) => {
                     *preferred = Some(package.pipeline);
                     #[cfg(test)]
@@ -140,25 +221,42 @@ impl WorkerPool {
                 Next::Failed => return Claimed::Failed,
                 Next::Finish { .. } => unreachable!("a claim without finishes answers none"),
             };
-        let _serial = self.serial();
-        match dispatcher.try_claim_where(None, &|p| !self.partitioned(p), true) {
-            Next::Package(package) => {
-                execution.consume(dispatcher, reach, package);
-                // The coordinator, waiting for the serial lock to decide whether the run is
-                // stalled, sees this claim's progress in the generation.
-                dispatcher.wake_claimants();
-                Claimed::Ran
-            }
-            Next::Finish { pipeline, consumed } => {
-                self.finishing(pipeline, reach);
-                execution.finish(dispatcher, reach, pipeline, consumed);
-                dispatcher.wake_claimants();
-                Claimed::Ran
-            }
-            Next::Wait(_) => Claimed::Wait(generation),
-            Next::Done => Claimed::Done,
-            Next::Failed => Claimed::Failed,
+        if self.controlling.load(Ordering::SeqCst) {
+            // The control's release advances the generation.
+            return Claimed::Wait(generation);
         }
+        for (domain, pipelines) in self.domains.iter().enumerate() {
+            if !dispatcher.may_hand_out(pipelines) || !self.try_hold(domain) {
+                continue;
+            }
+            let ran = match dispatcher.try_claim_where(
+                None,
+                &|p| self.domain_of[p.0] == domain && !self.partitioned(p),
+                &|p| self.domain_of[p.0] == domain,
+            ) {
+                Next::Package(package) => {
+                    execution.consume(dispatcher, reach, package);
+                    Claimed::Ran
+                }
+                Next::Finish { pipeline, consumed } => {
+                    self.finishing(pipeline, reach);
+                    execution.finish(dispatcher, reach, pipeline, consumed);
+                    Claimed::Ran
+                }
+                Next::Wait(_) => {
+                    self.release(dispatcher, domain);
+                    continue;
+                }
+                Next::Done => Claimed::Done,
+                Next::Failed => Claimed::Failed,
+            };
+            self.release(dispatcher, domain);
+            // The coordinator, deciding under its control whether the run is stalled, sees this
+            // claim's progress in the generation.
+            dispatcher.wake_claimants();
+            return ran;
+        }
+        Claimed::Wait(generation)
     }
 
     /// Start the workers in `scope`. Each claims until the run is done, has failed, or its claims
@@ -222,7 +320,7 @@ impl WorkerPool {
         let pipeline = package.pipeline;
         let spec = self.specs[pipeline.0]
             .as_ref()
-            .expect("a claim outside the serial lock is of a partitioned pipeline");
+            .expect("a claim outside an exclusion domain is of a partitioned pipeline");
         let target = &spec.target;
         {
             let breaker = target.read().unwrap_or_else(PoisonError::into_inner);
@@ -287,9 +385,9 @@ impl WorkerPool {
 
     /// Whether a package of a partitioned pipeline is in flight or claimable: the coordinator,
     /// finding nothing to claim, waits for it rather than deciding the run is stalled. Asked
-    /// under the serial lock, where no serial claim is running, it misses no running claim; one
-    /// that ends wakes the claimants ([`consume`](Self::consume)).
-    pub(super) fn may_progress(&self, dispatcher: &Dispatcher) -> bool {
+    /// under [`control`](Self::control), where no serial claim is running, it misses no running
+    /// claim; one that ends wakes the claimants ([`consume`](Self::consume)).
+    pub(super) fn may_progress(&self, dispatcher: &Dispatcher, _control: &Control<'_>) -> bool {
         self.threaded()
             && !self.unstarted.load(Ordering::SeqCst)
             && dispatcher.may_claim_where(&|pipeline| self.partitioned(pipeline))
@@ -366,6 +464,85 @@ impl WorkerPool {
         for (planned, used) in planned.iter_mut().zip(used) {
             planned.workers_used = used.count_ones() as usize;
         }
+    }
+}
+
+/// The coordinator's hold of every exclusion domain ([`WorkerPool::control`]). Dropping it
+/// releases them and lets serial claims start again.
+pub(super) struct Control<'a> {
+    pool: &'a WorkerPool,
+    dispatcher: &'a Dispatcher,
+    /// The domains taken, from the first: every one, unless the run failed while it waited.
+    held: usize,
+}
+
+impl Drop for Control<'_> {
+    fn drop(&mut self) {
+        let pool = self.pool;
+        pool.controlling.store(false, Ordering::SeqCst);
+        for domain in 0..self.held {
+            pool.busy[domain].store(false, Ordering::SeqCst);
+            pool.contended[domain].store(false, Ordering::SeqCst);
+        }
+        // A claimant that found the run under control waits on a generation from before.
+        self.dispatcher.wake_claimants();
+    }
+}
+
+/// The run's pipelines partitioned into exclusion domains: at most one claim of a domain's serial
+/// work runs at a time, and the domains' serial work runs concurrently. A domain holds the
+/// pipelines whose serial claims share state no other lock orders: a scope's request, step and
+/// body, the scopes of one store, and a pipeline queued reads again with every pipeline it reads.
+/// See `src/interpreter/design-dispatcher.md`, "Exclusion domains".
+pub(super) struct ExclusionDomains {
+    /// Per pipeline, its domain, numbered from 0.
+    domain_of: Vec<usize>,
+    count: usize,
+}
+
+impl ExclusionDomains {
+    /// `pipelines` domains of one pipeline each, which [`join`](Self::join) merges.
+    pub(super) fn singletons(pipelines: usize) -> Joining {
+        Joining {
+            parent: (0..pipelines).collect(),
+        }
+    }
+}
+
+/// [`ExclusionDomains`] while planning merges them: a union-find over the pipelines.
+pub(super) struct Joining {
+    parent: Vec<usize>,
+}
+
+impl Joining {
+    fn root(&mut self, mut pipeline: usize) -> usize {
+        while self.parent[pipeline] != pipeline {
+            self.parent[pipeline] = self.parent[self.parent[pipeline]];
+            pipeline = self.parent[pipeline];
+        }
+        pipeline
+    }
+
+    /// Put `a` and `b` in one domain.
+    pub(super) fn join(&mut self, a: usize, b: usize) {
+        let (a, b) = (self.root(a), self.root(b));
+        self.parent[a.max(b)] = a.min(b);
+    }
+
+    pub(super) fn done(mut self) -> ExclusionDomains {
+        let mut number = vec![usize::MAX; self.parent.len()];
+        let mut count = 0;
+        let domain_of = (0..self.parent.len())
+            .map(|pipeline| {
+                let root = self.root(pipeline);
+                if number[root] == usize::MAX {
+                    number[root] = count;
+                    count += 1;
+                }
+                number[root]
+            })
+            .collect();
+        ExclusionDomains { domain_of, count }
     }
 }
 

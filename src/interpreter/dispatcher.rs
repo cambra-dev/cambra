@@ -1563,10 +1563,10 @@ impl Dispatcher {
             .expect("a pipeline that reads its input again knows its input");
         let queue = &self.states[reader].queue;
         let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // A pipeline that is queued reads again and every pipeline it reads run as serial work,
-        // which claims and runs one package at a time under one lock (`WorkerPool::run_next`), so
-        // a change reaches a reader while no read of that reader is consumed, and two reads of
-        // one open row never run at once.
+        // A pipeline that is queued reads again and every pipeline it reads run as serial work in
+        // one exclusion domain, which runs one claim at a time (`WorkerPool::run_next`), so a
+        // change reaches a reader while no read of that reader is consumed, and two reads of one
+        // open row never run at once.
         debug_assert!(
             !state
                 .in_flight
@@ -1949,6 +1949,12 @@ impl Dispatcher {
         let reserved = state.queue.reserved.load(Ordering::Acquire);
         #[cfg(test)]
         self.run_transition_hook(true);
+        self.finishes_at(pipeline, reserved)
+    }
+
+    /// [`ready_to_finish`](Self::ready_to_finish) at the queue's reservation count `reserved`.
+    fn finishes_at(&self, pipeline: usize, reserved: usize) -> bool {
+        let state = &self.states[pipeline];
         !state.held.load(Ordering::SeqCst)
             && state.phase.load() == Phase::Running
             && reserved & CLOSED != 0
@@ -1971,18 +1977,19 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_where(preferred, &|_| true, true)
+        self.try_claim_where(preferred, &|_| true, &|_| true)
     }
 
     /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
-    /// and to no finish where `finishes` is false: a claimant that runs only some breakers, as a
-    /// thread of the pool claims partitioned packages apart from serial work. After
+    /// and to the finishes of those `finishes` admits: a claimant that runs only some breakers, as a
+    /// thread of the pool claims partitioned packages apart from one exclusion domain's serial
+    /// work. After
     /// [`stop_claims`](Self::stop_claims) it answers [`Next::Done`].
     pub(crate) fn try_claim_where(
         &self,
         preferred: Option<PipelineId>,
         takes: &dyn Fn(PipelineId) -> bool,
-        finishes: bool,
+        finishes: &dyn Fn(PipelineId) -> bool,
     ) -> Next {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
@@ -2004,7 +2011,7 @@ impl Dispatcher {
         {
             return Next::Package(package);
         }
-        for p in (0..count).filter(|_| finishes) {
+        for p in (0..count).filter(|&p| finishes(PipelineId(p))) {
             let begun = self.try_begin_finish(p);
             if begun {
                 return Next::Finish {
@@ -2049,6 +2056,32 @@ impl Dispatcher {
                         && !self.states[p].held.load(Ordering::SeqCst)
                         && self.takes_from(p))
             })
+    }
+
+    /// Whether a claim restricted to `pipelines` may hand out something now: a package that is
+    /// ready, not held and not held back by the pipelines it follows, or a finish. A claimant reads it before it reserves the pipelines for a
+    /// claim, so it reserves none that answer only [`Next::Wait`]; a `true` is not a promise, since
+    /// another claimant can take the package first.
+    pub(crate) fn may_hand_out(&self, pipelines: &[PipelineId]) -> bool {
+        pipelines.iter().any(|&PipelineId(p)| {
+            let state = &self.states[p];
+            if self.finishes_at(p, state.queue.reserved.load(Ordering::Acquire)) {
+                return true;
+            }
+            let ready = !state
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .ready
+                .is_empty();
+            ready && !state.held.load(Ordering::SeqCst) && self.takes_from(p)
+        })
+    }
+
+    /// The generation as it stands: a [`wait`](Self::wait) on it returns at the next change.
+    pub(crate) fn generation(&self) -> Generation {
+        Generation(self.generation.load(Ordering::SeqCst))
     }
 
     /// Whether the generation has advanced past `generation`: something changed that can make a

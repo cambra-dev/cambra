@@ -174,7 +174,7 @@ every round of a loop request it opened run before a control request is seen. `C
 bounds a package, not a pass, and no live run sets a source's limit on outstanding packages
 (`Dispatcher::limit`).
 
-Between two claims the serial driver may retain a loop or transaction scope's open request.
+Between two claims a scope's exclusion domain may retain a loop or transaction scope's open request.
 A loop request's state is `InductionRun::request`, which lives on the store producer and which run
 cleanup drops (`InductionStoreProducer::clear_run`). A pause between claims would have to keep it on
 the store and re-key its package, which names a queue index in the old plan, to a region of the
@@ -272,7 +272,9 @@ dirty.
 No read again is queued while one of the same pipeline waits unclaimed, since that one reads
 whatever arrived before its claim. No pipeline that is queued reads again is partitioned, and no
 pipeline such a pipeline reads, transitively ([Who claims what](#who-claims-what)): they run as
-serial work, one claim at a time. So no two reads of one open row run at once. The pipelines
+serial work in one exclusion domain, one claim at a time ([Exclusion domains](#exclusion-domains)).
+So no two reads of one open row run at once, and no read is in flight while a pipeline beneath it
+lands the change that queues the next. The pipelines
 beneath are serial too because a read again reads its input whole, and what lies beneath it reaches
 it through the regions those pipelines push, which partitioned packages push keyed rather than
 widened.
@@ -477,10 +479,10 @@ kinds:
 
 - A package of a **partitioned** pipeline runs without a lock, several at once
   ([A partitioned claim](#a-partitioned-claim)).
-- Everything else is **serial work**, run under `WorkerPool`'s serial lock: a package of a pipeline
-  that is not partitioned, every finish, the loop and transaction scopes' requests and steps, and
-  sinks. A thread takes the lock, claims, and runs the claim before it releases the lock, so serial
-  work runs one claim at a time, in claim order, on any thread.
+- Everything else is **serial work**: a package of a pipeline that is not partitioned, every
+  finish, the loop and transaction scopes' requests and steps, and sinks. Serial work runs on any
+  thread, at most one claim per exclusion domain at a time
+  ([Exclusion domains](#exclusion-domains)).
 
 A pipeline is partitioned when all of these hold:
 
@@ -494,9 +496,41 @@ A pipeline is partitioned when all of these hold:
   read their input again at a widened push, and the live pipelines notified of their whole input
   whose breaker reads an open input.
 
-The coordinator also runs the run's control under the serial lock: the start of each source, the
-resume pass ([A loop in rounds](#a-loop-in-rounds)), the polling of live sources and the stall check
-([Waiting and stalls](#waiting-and-stalls)).
+The coordinator also runs the run's control: the start of each source, the landing of ranges
+complete from the start, the resume pass ([A loop in rounds](#a-loop-in-rounds)), the polling of
+live sources and the stall check ([Waiting and stalls](#waiting-and-stalls)). It runs the control
+holding every exclusion domain (`WorkerPool::control`), so no serial claim runs beside it.
+Partitioned claims go on.
+
+### Exclusion domains
+
+An exclusion domain is a set of pipelines whose serial claims run one at a time
+(`ExclusionDomains`). Serial claims of different domains run at once. Planning puts two pipelines
+in one domain where their serial claims share state that no other lock orders:
+
+- A scope's request, step and body pipelines. The request, each step and the body's finish follow
+  each other in the scope's state, and each takes the store's blocking `write`.
+- The scopes of one store: a transaction store's writers.
+- A pipeline queued reads again and every pipeline it reads, transitively
+  ([Reading a widened input again](#reading-a-widened-input-again)).
+- A pipeline that is not partitioned and every pipeline it reads. Its consume reads what their
+  claims are still changing, and the input it releases counts on none of them running beside it.
+
+A partitioned pipeline joins no domain through what it reads: its packages hold no domain, and its
+finish is claimable only once every pipeline it reads has finished. Pipelines that the rules above
+leave apart, such as a loop and a serial pipeline that neither reads, run their serial work at once. A pipeline that is not partitioned, and every finish,
+has one claim in flight at a time.
+
+A thread takes a domain by compare-and-swap on its flag (`WorkerPool::try_hold`) and releases it
+when the claim ends. It takes a domain only where the dispatcher may hand out a package or a finish
+of it (`Dispatcher::may_hand_out`), and claims only that domain's serial work while it holds it. A
+thread that finds a domain held marks it contended and tries once more. The holder wakes the
+claimants as it releases a contended domain, so a thread that skipped it does not sleep past its
+release.
+
+The coordinator takes every domain for the run's control, in domain order, sleeping in
+`Dispatcher::wait` for each one held. While it takes them no serial claim starts
+(`WorkerPool::controlling`), so a worker does not take a released domain again before it.
 
 ### A partitioned claim
 
@@ -524,7 +558,7 @@ store's state until its next step. A reader of the round's first packages theref
 free and pulls the round's state, not the snapshot from before the round.
 
 A round's step passes only output the resume pass has published. Serial work re-holds every scope's
-followers after each claim (`Execution::consume`). A partitioned claim re-holds the followers of the
+followers after each claim (`Execution::consume`), with no breaker handle held. A partitioned claim re-holds the followers of the
 body it consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass
 reads the step's follower hold before it publishes and releases the followers only where that hold
 is unchanged (`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release
@@ -533,18 +567,18 @@ decided before a partitioned claim published fails, and the step waits for the n
 ### Waiting and stalls
 
 A worker that finds nothing to claim sleeps in `Dispatcher::wait`. A coordinator claim that finds
-nothing goes on under the serial lock, in this order:
+nothing takes the control and goes on under it, in this order:
 
 1. While a package of a partitioned pipeline is in flight or claimable
    (`WorkerPool::may_progress`, through `Dispatcher::may_claim_where`), the coordinator releases the
-   lock and sleeps in `Dispatcher::wait`. Under the lock no serial claim is running, so a
+   control and sleeps in `Dispatcher::wait`. Under the control no serial claim is running, so a
    partitioned claim is the only running one.
 2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress. A run
    with no live source panics. A live run has reached a drained boundary.
 
 Every claim a thread runs advances the generation when it ends (`Dispatcher::wake_claimants`), so
-serial work another thread ran while the coordinator waited for the lock counts as progress, and so
+serial work another thread ran while the coordinator took the control counts as progress, and so
 does a partitioned claim's publication during the resume pass. The coordinator claims again and
 reaches the same fixed point.
 
@@ -560,12 +594,16 @@ No two threads wait on each other through these rules:
   consumer takes only the lock on its own state and releases it before it notifies another, so a
   landing holds at most one consumer's lock at a time. No consumer takes a breaker handle or a store
   while it is notified.
-- Only the holder of the serial lock takes a store's blocking `write`, in serial work. While it
-  holds one it takes the scope's member handles, where `row_for` probes where a round's push lands;
-  a partitioned claim never waits on a store, since it reaches one only through `try_write`, and
-  never takes the serial lock, so the store-first order meets no thread waiting the other way. The
-  round's packages are queued after the store is released ([Bodies on workers](#bodies-on-workers)).
-- No thread waits in `Dispatcher::wait` while it holds the serial lock.
+- Only serial work and the control take a store's blocking `write`. While a thread holds one it
+  takes the scope's member handles, where `row_for` probes where a round's push lands. The members
+  are the scope's body pipelines, in the store's domain, so no serial claim of another domain holds
+  one; a partitioned claim never waits on a store, since it reaches one only through `try_write`.
+  The store-first order therefore meets no thread waiting the other way. A serial claim that holds
+  another scope's followers takes that scope's store with no handle held. The round's packages are
+  queued after the store is released ([Bodies on workers](#bodies-on-workers)).
+- A thread waits for no domain while it holds a handle or a store. A worker never waits for a
+  domain: it skips one that is held. The coordinator waits for domains only while taking the
+  control, and holds nothing else then.
 
 A wait for a handle is therefore a wait on a thread that holds a handle further upstream and waits
 for nothing but handles further upstream still. The pipelines form a DAG, since a loop's cycle runs

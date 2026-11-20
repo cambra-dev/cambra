@@ -9,7 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
-use super::workers::{Claimed, WorkerPool};
+use super::workers::{Claimed, ExclusionDomains, Joining, WorkerPool};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -915,15 +915,20 @@ fn run_targets(
                     && reads_open_input(&mut reach, PipelineId(p)))
         })
         .collect();
+    // Each pipeline queued reads again shares an exclusion domain with every pipeline it reads,
+    // transitively, so no read of it is in flight while a pipeline beneath it lands a change.
+    let mut domains = ExclusionDomains::singletons(serial_only.len());
     let mut beneath: Vec<usize> = (0..serial_only.len()).filter(|&p| serial_only[p]).collect();
     while let Some(p) = beneath.pop() {
         for &read in &dispatcher.infos[p].reads {
+            domains.join(p, read);
             if !serial_only[read] {
                 serial_only[read] = true;
                 beneath.push(read);
             }
         }
     }
+    execution.join_scopes(&mut domains);
     let worker_targets = worker_targets
         .into_iter()
         .zip(serial_only)
@@ -933,7 +938,17 @@ fn run_targets(
         })
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
-    let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
+    let workers = WorkerPool::new(
+        workers,
+        worker_targets,
+        execution.bodies_by_pipeline(),
+        domains,
+        &dispatcher
+            .infos
+            .iter()
+            .map(|info| info.reads.clone())
+            .collect::<Vec<_>>(),
+    );
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher, &execution, root_reach);
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
@@ -943,9 +958,8 @@ fn run_targets(
             let _coordinator = dispatcher.worker();
             in_a_run(|| {
                 // A range over a static extent has completed every key from the start. Its
-                // landing is the run's control, which runs under the serial lock: the workers
-                // already claim serial work.
-                let serial = workers.serial();
+                // landing is the run's control: the workers already claim serial work.
+                let control = workers.control(&dispatcher);
                 for (pipeline, ranges) in members.leaves.iter().enumerate() {
                     for (range, _) in ranges {
                         dispatcher.land_range_complete(
@@ -955,7 +969,7 @@ fn run_targets(
                         );
                     }
                 }
-                drop(serial);
+                drop(control);
                 match live.is_empty() {
                     true => {
                         execution.drive(&dispatcher, &mut reach, &workers);
@@ -1434,6 +1448,36 @@ impl Execution {
         bodies
     }
 
+    /// Put each scope's request, step and body in one exclusion domain, and the scopes of one
+    /// store in one: their serial claims take the store's blocking `write`, and a round's request,
+    /// step and finish follow each other in the scope's state, which no other lock orders.
+    fn join_scopes(&self, domains: &mut Joining) {
+        for (pipelines, step, scope) in &self.bodies {
+            domains.join(scope.0, step.0);
+            for pipeline in pipelines.clone() {
+                domains.join(scope.0, pipeline);
+            }
+        }
+        let stores: Vec<(usize, &StoreCell)> = self
+            .handlers
+            .iter()
+            .enumerate()
+            .filter_map(|(pipeline, handler)| match handler {
+                Handler::Request(Scope::Loop(store) | Scope::Writer { store, .. }) => {
+                    Some((pipeline, store))
+                }
+                _ => None,
+            })
+            .collect();
+        for (i, &(a, store)) in stores.iter().enumerate() {
+            for &(b, other) in &stores[i + 1..] {
+                if Arc::ptr_eq(store, other) {
+                    domains.join(a, b);
+                }
+            }
+        }
+    }
+
     /// Per pipeline, whether it is a scope's step.
     fn steps(&self) -> Vec<bool> {
         self.handlers
@@ -1556,7 +1600,7 @@ impl Execution {
     }
 
     fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>, workers: &WorkerPool) {
-        let serial = workers.serial();
+        let control = workers.control(dispatcher);
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
                 let mut input = None;
@@ -1572,16 +1616,16 @@ impl Execution {
                 );
             }
         }
-        drop(serial);
+        drop(control);
         let mut preferred = None;
         let coordinator = workers.coordinator();
         loop {
             match workers.run_next(dispatcher, self, reach, &mut preferred, coordinator) {
                 Claimed::Ran => {}
                 Claimed::Wait(generation) => {
-                    let serial = workers.serial();
-                    if workers.may_progress(dispatcher) {
-                        drop(serial);
+                    let control = workers.control(dispatcher);
+                    if workers.may_progress(dispatcher, &control) {
+                        drop(control);
                         dispatcher.wait(generation);
                     } else if !self.resume(dispatcher, reach)
                         && !dispatcher.changed_since(&generation)
@@ -3713,7 +3757,7 @@ fn drive_live(
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
-    let serial = workers.serial();
+    let control = workers.control(dispatcher);
     for (pipeline, info) in dispatcher.infos.iter().take(execution.roots).enumerate() {
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
             let mut input = None;
@@ -3727,11 +3771,11 @@ fn drive_live(
     // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
     // and the run has no finish before its sources close, so each pushes what it holds first.
     execution.push_held(dispatcher, reach);
-    drop(serial);
+    drop(control);
     let mut preferred = None;
     let coordinator = workers.coordinator();
     loop {
-        let serial = workers.serial();
+        let control = workers.control(dispatcher);
         let mut sources: Vec<LiveSource> = Vec::new();
         for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
             leaf.extent.for_each_source(&mut |source| {
@@ -3751,14 +3795,14 @@ fn drive_live(
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, reach);
         }
-        drop(serial);
+        drop(control);
         loop {
             match workers.run_next(dispatcher, execution, reach, &mut preferred, coordinator) {
                 Claimed::Ran => {}
                 Claimed::Wait(generation) => {
-                    let serial = workers.serial();
-                    if workers.may_progress(dispatcher) {
-                        drop(serial);
+                    let control = workers.control(dispatcher);
+                    if workers.may_progress(dispatcher, &control) {
+                        drop(control);
                         dispatcher.wait(generation);
                         continue;
                     }
