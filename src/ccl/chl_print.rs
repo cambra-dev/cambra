@@ -764,16 +764,22 @@ impl Printer<'_, '_> {
                 };
                 (Prec::Atom, text)
             }
-            TypedExprNode::BinOp { left, op, right } => {
+            TypedExprNode::BinOp {
+                left, op, right, ..
+            } => {
                 let l = self.expr_inner(left, env);
                 let r = self.expr_inner(right, env);
                 infix(op, l, r)
             }
-            TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => (
+            TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand, _) => (
                 Prec::Unary,
                 format!("-{}", self.expr(operand, Prec::Unary, env)),
             ),
-            TypedExprNode::UnaryOp(op @ (UnaryOpKind::Not | UnaryOpKind::NotRefined), operand) => (
+            TypedExprNode::UnaryOp(
+                op @ (UnaryOpKind::Not | UnaryOpKind::NotRefined),
+                operand,
+                _,
+            ) => (
                 Prec::Not,
                 format!("{} {}", unary_text(*op), self.expr(operand, Prec::Not, env)),
             ),

@@ -2203,6 +2203,7 @@ mod tests {
             left: Box::new(TypedExpr::var("x").with_ty(int.clone())),
             op: BinOpKind::Arithmetic(ArithmeticKind::Add),
             right: Box::new(TypedExpr::lit(Lit::Int(1)).with_ty(int.clone())),
+            obligation: Default::default(),
         })
         .with_ty(int.clone());
         TypedExpr::let_bind("x", Occurrence::mint(), bound, body)
@@ -2995,6 +2996,7 @@ mod tests {
             left: Box::new(pair_proj0),
             op: BinOpKind::Arithmetic(ArithmeticKind::Add),
             right: Box::new(pair_proj1),
+            obligation: Default::default(),
         })
         .with_ty(int.clone());
 
@@ -3033,6 +3035,7 @@ mod tests {
             left: Box::new(expected_left),
             op: BinOpKind::Arithmetic(ArithmeticKind::Add),
             right: Box::new(expected_right),
+            obligation: Default::default(),
         })
         .with_ty(int);
         assert_eq!(result, expected);

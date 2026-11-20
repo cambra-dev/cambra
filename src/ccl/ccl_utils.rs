@@ -800,6 +800,7 @@ fn reduce_application(
                     left: Box::new(key),
                     op: BinOpKind::Compare(crate::ccl::CompareKind::Equals),
                     right: Box::new(at_key),
+                    obligation: crate::ccl::expr::CallObligation::default(),
                 })
                 .with_ty(Type::Base(BaseType::Bool));
                 let domain = Type::refined_one(
@@ -986,6 +987,7 @@ fn reduce_application(
                     left: Box::new(left),
                     op: *op,
                     right: Box::new(right),
+                    obligation: crate::ccl::expr::CallObligation::default(),
                 })
                 .with_ty(ty.clone()),
             )
@@ -1095,7 +1097,12 @@ fn normal_cast_collection(value: Expr, domain: Type, ty: &Type) -> Expr {
 
 /// `op operand`, built without an identity.
 fn unary(op: UnaryOpKind, operand: Expr, ty: &Type) -> Expr {
-    Expr::throwaway(TypedExprNode::UnaryOp(op, Box::new(operand))).with_ty(ty.clone())
+    Expr::throwaway(TypedExprNode::UnaryOp(
+        op,
+        Box::new(operand),
+        crate::ccl::expr::CallObligation::default(),
+    ))
+    .with_ty(ty.clone())
 }
 
 /// A `match` with each arm's head spelled by its tag, the one [`read_eliminated_match`] reads
@@ -1340,6 +1347,7 @@ fn conjuncts_of(guard: Expr, into: &mut Vec<Expr>) {
             left,
             op: BinOpKind::BoolLogic(LogicKind::And),
             right,
+            ..
         } => {
             conjuncts_of(*left, into);
             conjuncts_of(*right, into);
@@ -1353,7 +1361,7 @@ fn conjuncts_of(guard: Expr, into: &mut Vec<Expr>) {
 /// conjunction, so the negation names several conjuncts at once.
 fn excludes(negating: &[Expr], negated: &[Expr]) -> bool {
     negating.iter().any(|conjunct| {
-        let TypedExprNode::UnaryOp(UnaryOpKind::Not, inner) = &conjunct.node else {
+        let TypedExprNode::UnaryOp(UnaryOpKind::Not, inner, _) = &conjunct.node else {
             return false;
         };
         let mut denied = Vec::new();
@@ -1520,7 +1528,7 @@ fn read_fan_out(
             // folding reduces to `¬𝑔₀` (`planning::const_fold`), so the bare negation of the
             // first guard reads back as the guard `true`.
             if i == 0
-                && let TypedExprNode::UnaryOp(UnaryOpKind::Not, negated) = &guard.node
+                && let TypedExprNode::UnaryOp(UnaryOpKind::Not, negated, _) = &guard.node
                 && crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard)
             {
                 guard = Expr::throwaway(TypedExprNode::Lit(Lit::Bool(true)))
@@ -1531,12 +1539,13 @@ fn read_fan_out(
                 left,
                 op: BinOpKind::BoolLogic(LogicKind::And),
                 right,
+                ..
             } = &guard.node
             else {
                 return None;
             };
             match &right.node {
-                TypedExprNode::UnaryOp(UnaryOpKind::Not, negated)
+                TypedExprNode::UnaryOp(UnaryOpKind::Not, negated, _)
                     if crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard) => {}
                 _ => return None,
             }
@@ -1740,6 +1749,7 @@ fn read_back_application(solver: &mut Solver, input: &Expr, f: &Expr, ty: &Type)
                     left: Box::new(parts[0].duplicate()),
                     op: *op,
                     right: Box::new(parts[1].duplicate()),
+                    obligation: crate::ccl::expr::CallObligation::default(),
                 })
                 .with_ty(ty.clone()),
             ),

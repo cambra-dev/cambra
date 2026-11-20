@@ -242,10 +242,9 @@ pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
             );
             // A loop source's `elements` call over a structural collection is the collection,
             // as coalescing reads it.
-            if let Some(collection) = crate::ccl::infer::solve::elements_of_a_collection(
-                &mut Solver::scratch(),
-                &mut definition,
-            ) {
+            if let Some(collection) =
+                crate::ccl::infer::solve::elements_of_a_collection(&mut definition)
+            {
                 definition = collection;
             }
             // An inference error leaves the tree partly typed. A definition has its binder's
@@ -682,7 +681,12 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left,
+            op,
+            right,
+            obligation,
+        } => {
             let (mut binds, left) = atomize(*left, muts);
             let (right_binds, right) = atomize(*right, muts);
             binds.extend(right_binds);
@@ -692,15 +696,16 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
                     left: Box::new(left),
                     op,
                     right: Box::new(right),
+                    obligation,
                 }),
             )
         }
 
-        TypedExprNode::UnaryOp(op, operand) => {
+        TypedExprNode::UnaryOp(op, operand, obligation) => {
             let (binds, operand) = atomize(*operand, muts);
             let_chain(
                 binds,
-                rebuild(TypedExprNode::UnaryOp(op, Box::new(operand))),
+                rebuild(TypedExprNode::UnaryOp(op, Box::new(operand), obligation)),
             )
         }
 

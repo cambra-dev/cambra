@@ -360,6 +360,7 @@ pub(super) fn lower_loop_source(
             assoc: Vec::new(),
             trait_,
             function: ITERABLE_ELEMENTS.into(),
+            obligation: crate::ccl::expr::CallObligation::default(),
         }),
         iter.span,
         label,
