@@ -556,7 +556,11 @@ lambda elimination, after loop recognition, and after planning:
 A part that also reads binders of the type's own, positions of the collection the morphism
 receives or earlier components of a dependent tuple, is a type per value of those binders. Its
 parameter is a **family**: it takes one argument per such binder (`TypeParam::arity`), and each
-occurrence is a `Type::FamilyApp` applying it to them, rendered `𝐷₁(𝑘)`. `uncurry` over rows whose
+occurrence is a `Type::FamilyApp` applying it to them, rendered `𝐷₁(𝑘)`. The part stated with other
+terms in those binders' places, as an application's result states it at its argument, is the family
+applied to those terms: `generalize::family_arguments` matches the part against each type the
+generalized type holds, the binders' reads holes it fills, and keeps the matches whose terms read only the
+type's own binders and names in scope. `uncurry` over rows whose
 inner domains differ is stamped
 `∀ (𝐷, 𝐷₁(_)). ((𝑘 : 𝐷) ⤇ (𝐷₁(𝑘) ⤇ Int)) ⇒ ((𝑘 : 𝐷) × 𝐷₁(𝑘) ⤇ Int)`. The type is generalized
 with its binders read by name, function binders and tuple components alike, so a part stated under
