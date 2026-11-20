@@ -107,7 +107,9 @@ each file's parse, the module graph, and the link order. Every compile entry poi
   recovery does not apply, and loading follows none of that file's statements.
 - **Cycles.** Each strongly connected component with a cycle is one error. It names the shortest
   cycle through the component's least module path, with a label at each statement in it. The link
-  order exists only for an acyclic graph.
+  order exists only for an acyclic graph. Lowering still processes independently ordered std
+  modules, so the root's inference can report errors using the operators std declares. User
+  dependencies remain unavailable when a cycle prevents linking them.
 - **Compilation.** Loading's errors come first: every file's parse errors, then missing modules and
   cycles.
 
@@ -473,8 +475,8 @@ module's own nominal types by name and another module's qualified by it (`chl_ty
 
 A trait is a member of its module, and its declaration records the module's path
 (`TraitDecl::module`), so two modules' traits of one name are two traits. A module names a trait
-it declares, a compiler trait, one a `use` name reaches (`Reached::Trait`), or a public one of the
-module a qualifier names (`Qualifier::reach_trait`), as in `shapes::Area(S)`
+it declares, one a `use` name reaches (`Reached::Trait`), the prelude's included, or a public one
+of the module a qualifier names (`Qualifier::reach_trait`), as in `shapes::Area(S)`
 (`LoweringContext::resolve_trait`). A summon, a requirement and an instance's head name a trait the
 same way, and an `impl` head naming one is refused (`LoweringContext::names_a_trait`).
 

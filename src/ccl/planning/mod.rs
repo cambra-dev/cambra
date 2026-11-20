@@ -90,7 +90,7 @@ pub(super) struct FragmentChecker {
 impl Default for FragmentChecker {
     fn default() -> FragmentChecker {
         FragmentChecker {
-            instances: InstanceTable::builtin(),
+            instances: InstanceTable::std(),
             mode: CheckMode::Full,
         }
     }
