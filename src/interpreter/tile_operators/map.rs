@@ -294,13 +294,11 @@ impl TileOperator for MapResult {
         let keeps_keys =
             self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
         // The function computes each value anew from the input's value there, so a part of that
-        // value names the whole value at its key (`whole_values_at`).
+        // value names the rows holding it (`whole_values_at`).
         let input_producer = match keeps_keys {
             true => self.input.clone().subscribe(
                 self.input.tiling().universal_guard(),
                 crate::interpreter::notifications::whole_values_at(
-                    self.level,
-                    self.input.tiling().clone(),
                     forwarding_consumer_keeping_keys(&shared),
                 ),
                 cx,

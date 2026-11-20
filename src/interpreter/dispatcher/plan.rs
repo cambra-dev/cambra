@@ -1650,6 +1650,7 @@ pub(super) fn plan_edges(
     for (pipeline, kind) in kinds.iter().enumerate() {
         if matches!(kind, Consumes::InOrder | Consumes::Rounds) {
             dispatcher.order(PipelineId(pipeline));
+            dispatcher.steps_on_decided(PipelineId(pipeline));
         }
     }
     for first in 0..pushes_with.len() {

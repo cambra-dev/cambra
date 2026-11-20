@@ -233,20 +233,16 @@ fn zip() -> Built {
     (Arc::new(op), vec![first, second])
 }
 
-/// The region of arm `name`'s rows `keys` admits, as a zip beneath rows restates it: those rows,
-/// within the arm's field alone.
-fn zip_field(name: &str, keys: Predicate) -> Projection {
-    Projection::within(
-        CurryLevel::OUTERMOST,
-        keys,
-        Projection::of_field(name, Projection::Everything),
-    )
+/// The region of arm `name`'s rows `keys` admits, as a zip beneath rows restates it: those rows.
+/// A notification names keys; what of a row's value is final the row's tile states.
+fn zip_field(_name: &str, keys: Predicate) -> Projection {
+    Projection::admitting(keys)
 }
 
-/// Each arm of a zip beneath rows is one field of them, so a region of an arm's rows names that
-/// field of the rows and nothing of the other arm's.
+/// Each arm of a zip beneath rows is one field of them, so a region of an arm's rows names those
+/// rows.
 #[test]
-fn zip_forwards_the_region_of_its_first_arm_as_that_field() {
+fn zip_forwards_the_region_of_its_first_arm_as_its_rows() {
     assert_eq!(
         received(&zip, 0, &region()),
         [zip_field("_0", keys_of(&region()))]
@@ -254,7 +250,7 @@ fn zip_forwards_the_region_of_its_first_arm_as_that_field() {
 }
 
 #[test]
-fn zip_forwards_the_region_of_its_second_arm_as_that_field_without_state() {
+fn zip_forwards_the_region_of_its_second_arm_as_its_rows_without_state() {
     for sent in [region(), Projection::Everything, another_region()] {
         assert_eq!(
             received(&zip, 1, &sent),
@@ -996,8 +992,8 @@ fn a_fan_out_passes_each_notification_to_its_readers() {
     );
 }
 
-/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each as that
-/// arm's field of the rows: a memo above it marks both regions dirty.
+/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each as those
+/// rows: a memo above it marks both regions dirty.
 #[test]
 fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     let (operator, inputs) = zip();

@@ -74,6 +74,14 @@ complete region that reaches its own pipelines around its recurrence. A consumer
 push along a path its walk did not take fails the run where the push is queued
 (`a_push_along_a_route_its_planner_did_not_walk_fails_the_run`).
 
+A notification names keys. What of a row's value is final is stated in the tile a reader pulls,
+not in the notification. A reader reads a row on each change a push brings
+(`Dispatcher::queue_changed`) and releases what its answer states final. The part of a consumed row
+its breaker leaves unreleased waits until the pipelines it reads complete it, or until the next
+change, and is read again then (`Dispatcher::hold_unreleased`). A store or a loop's scope steps only
+on input its reads have decided (`Dispatcher::steps_on_decided`), so a push to it waits for its rows
+to complete.
+
 A pipeline consumes one breaker input, and an entry lands regions of its own input's tiling. A
 breaker with several inputs, as a loop's scope with its seed, has entries of an input its pipeline
 does not consume. Such a region names the consumed input's rows (`rows_named_in`): a change of it

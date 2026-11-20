@@ -1400,12 +1400,8 @@ mod nested_projection_tests {
         notify_input(&left_consumer, &row);
         assert_eq!(
             *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [Projection::within(
-                CurryLevel::OUTERMOST,
-                Predicate::point(Value::UInt(0)),
-                Projection::of_field("a", Projection::of_path(&[Value::UInt(1)])),
-            )],
-            "a change of a row names that row of its group's arm"
+            std::slice::from_ref(&group),
+            "a change of a row names its group"
         );
 
         let complete = |consumer: &InputConsumer, region: &Projection| {
@@ -1421,12 +1417,8 @@ mod nested_projection_tests {
         complete(&left_consumer, &row);
         assert_eq!(
             *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [Projection::within(
-                CurryLevel::OUTERMOST,
-                Predicate::point(Value::UInt(0)),
-                Projection::of_field("a", Projection::of_path(&[Value::UInt(1)])),
-            )],
-            "a complete row of a group completes that part of the group, not the group"
+            [Projection::Nothing],
+            "a complete row of a group completes no group"
         );
         regions
             .write()
@@ -1435,12 +1427,8 @@ mod nested_projection_tests {
         complete(&left_consumer, &group);
         assert_eq!(
             *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [Projection::within(
-                CurryLevel::OUTERMOST,
-                Predicate::point(Value::UInt(0)),
-                Projection::of_field("a", Projection::Everything),
-            )],
-            "a complete group of one arm completes that arm's field of the pair's group"
+            [group],
+            "a complete group of one arm completes that arm's part of the pair's group"
         );
     }
 
