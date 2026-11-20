@@ -553,13 +553,8 @@ impl FreshenCache {
                     .fold(site, |t, n| t.extended(self.binder_name(&n)))
             }
             None => match &self.use_telescope {
-                Some(site) => {
-                    let mut inside: Vec<_> = original.iter().cloned().collect();
-                    inside.reverse();
-                    site.rescoped(|_| false, inside)
-                }
-                None if self.entered_binders.is_empty() => original.clone(),
-                None => original.rescoped(|_| false, self.entered_binders.iter().cloned()),
+                Some(site) => site.entered_from(original),
+                None => original.entered(self.entered_binders.iter().cloned()),
             },
         }
     }

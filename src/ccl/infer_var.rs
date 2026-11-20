@@ -565,6 +565,8 @@ pub struct Telescope {
 
 struct TelescopeNode {
     binder: Name,
+    /// The number of lexical entries from this one outward, itself included.
+    depth: usize,
     parent: Telescope,
 }
 
@@ -581,6 +583,7 @@ impl Telescope {
         Telescope {
             lexical: Some(Rc::new(TelescopeNode {
                 binder,
+                depth: self.depth() + 1,
                 parent: self.clone(),
             })),
             opaque: Rc::clone(&self.opaque),
@@ -642,10 +645,48 @@ impl Telescope {
             lexical: None,
             opaque: Rc::clone(&self.opaque),
         };
-        let scope = kept.into_iter().fold(root, |t, n| t.extended(n));
-        added
-            .into_iter()
-            .fold(scope, |t, n| if t.contains(&n) { t } else { t.extended(n) })
+        kept.into_iter()
+            .fold(root, |t, n| t.extended(n))
+            .entered(added)
+    }
+
+    /// This scope with `added` entered innermost, in order, each that is not already an entry.
+    /// The result extends this scope's own nodes.
+    pub fn entered(&self, added: impl IntoIterator<Item = Name>) -> Telescope {
+        added.into_iter().fold(
+            self.clone(),
+            |t, n| if t.contains(&n) { t } else { t.extended(n) },
+        )
+    }
+
+    /// This scope with `other`'s lexical entries entered innermost, outermost first, each that
+    /// is not already an entry: [`entered`](Self::entered) over `other`'s entries.
+    ///
+    /// The two scopes share their outer nodes when both extend one walk's scope. Every entry at
+    /// or below the innermost shared node is an entry of `self`, so only the entries `other`
+    /// holds above that node are looked up. Finding the node walks each scope down from its
+    /// innermost entry to the node's depth.
+    pub fn entered_from(&self, other: &Telescope) -> Telescope {
+        let mut ours = self.lexical.as_ref();
+        let mut theirs = other.lexical.as_ref();
+        let mut above = Vec::new();
+        while let Some(node) = theirs {
+            match ours {
+                Some(mine) if Rc::ptr_eq(mine, node) => break,
+                Some(mine) if mine.depth > node.depth => ours = mine.parent.lexical.as_ref(),
+                _ => {
+                    above.push(node.binder.clone());
+                    theirs = node.parent.lexical.as_ref();
+                }
+            }
+        }
+        above.reverse();
+        self.entered(above)
+    }
+
+    /// The number of lexical entries.
+    fn depth(&self) -> usize {
+        self.lexical.as_ref().map_or(0, |node| node.depth)
     }
 
     /// The lexical binders, innermost first.
