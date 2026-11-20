@@ -317,7 +317,7 @@ impl TileProducer for ExtractFinalProducer {
         let state = &mut *state_guard;
 
         let projection = projection_of_one_value(&self.name(), "extracts one final value", &guard);
-        if projection == Projection::Nothing || self.obsolete_guard().is_universal() {
+        if projection == Projection::Nothing || self.reclaimed_guard().is_universal() {
             return self.tiling().empty_tile();
         }
         // A final record of values is pulled at a part of it as any record is.
@@ -366,7 +366,7 @@ impl Breaker for ExtractFinalProducer {
         let state = &mut *state_guard;
 
         assert!(
-            self.obsolete_guard().is_universal() || state.final_tile.is_some(),
+            self.reclaimed_guard().is_universal() || state.final_tile.is_some(),
             "{} finishes after it extracted its value: the source released whole and any \
              default it fell back to converged",
             self.name()
@@ -394,7 +394,7 @@ impl Breaker for ExtractFinalProducer {
             "{} consumes a guard of its source's tiling: {guard:?}",
             self.name()
         );
-        if self.obsolete_guard().is_universal() || guard.is_empty() || self.extracted() {
+        if self.reclaimed_guard().is_universal() || guard.is_empty() || self.extracted() {
             return;
         }
         let mut answered = self.source.get(guard);
@@ -414,7 +414,7 @@ impl Breaker for ExtractFinalProducer {
 
     fn finish_parallel_input(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.obsolete_guard().is_universal() || state.final_tile.is_some() {
+        if self.reclaimed_guard().is_universal() || state.final_tile.is_some() {
             return;
         }
         self.source.release(self.source.tiling().universal_guard());

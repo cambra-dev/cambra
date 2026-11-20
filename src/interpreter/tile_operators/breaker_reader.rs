@@ -31,10 +31,13 @@ impl TileProducer for BreakerReader {
     fn get(&self, guard: TileGuard) -> Tile {
         #[cfg(debug_assertions)]
         pull_levels::check_input_level(pull_levels::address_of(self), || self.name(), &guard);
-        self.handle
+        let mut answer = self
+            .handle
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(guard)
+            .get(guard);
+        cut_held(&self.base, &mut answer);
+        answer
     }
     fn get_impl(&self, guard: TileGuard) -> Tile {
         self.handle

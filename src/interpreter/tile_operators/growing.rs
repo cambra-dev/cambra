@@ -128,7 +128,7 @@ impl TileProducer for Input {
             .unwrap_or_else(PoisonError::into_inner)
             .pulled
             .push(guard.clone());
-        if released_whole(&guard, &self.obsolete_guard()) {
+        if released_whole(&guard, &self.reclaimed_guard()) {
             self.source
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -151,7 +151,7 @@ impl TileProducer for Input {
                 .statement(),
             BitSet::new(),
         );
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.compact();
         tile.restrict_to(&guard.projection("Input"), self.tiling());
         tile
@@ -503,7 +503,7 @@ impl TileProducer for NestedInput {
             .unwrap_or_else(PoisonError::into_inner)
             .pulled
             .push(guard.clone());
-        if released_whole(&guard, &self.obsolete_guard()) {
+        if released_whole(&guard, &self.reclaimed_guard()) {
             self.source
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -557,7 +557,7 @@ impl TileProducer for NestedInput {
             outer,
             BitSet::new(),
         );
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         tile.compact();
         tile.restrict_to(&guard.projection("NestedInput"), self.tiling());
         tile

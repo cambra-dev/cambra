@@ -552,7 +552,7 @@ impl CheckedLookupProducer {
         // What an answer with nothing in it tiles as: an empty column where one key is
         // answered, an empty collection where a stream of them is.
         let empty = self.tiling().empty_tile();
-        if self.obsolete_guard().is_universal() {
+        if self.reclaimed_guard().is_universal() {
             return empty;
         }
         // Every leg is searched by position, and a release marks rows deleted rather than

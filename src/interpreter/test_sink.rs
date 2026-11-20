@@ -94,7 +94,7 @@ impl DataSink for TestSink {
 
 /// Read a tile as `rows` values. A tile is a value of its type vectorized over its rows: one
 /// at the top level, and a collection's key count beneath one.
-fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
+pub(crate) fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
     match tile {
         Tile::Scalar(cv) => {
             // An empty column is one that has not arrived ("not ready" in `valid_over`),

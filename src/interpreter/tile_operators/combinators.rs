@@ -475,8 +475,8 @@ impl TileProducer for ConverseProducer {
         // row arriving later with a released value would put the group back into a region the
         // consumer has let go; it is released upstream on the pull that first holds it, since
         // the release reached `release_impl` before the row arrived.
-        if !self.obsolete_guard().is_empty() {
-            let released = self.obsolete_guard();
+        if !self.reclaimed_guard().is_empty() {
+            let released = self.reclaimed_guard();
             out.remove_guarded(released);
         }
         out.restrict_to(&projection, self.tiling());
@@ -499,7 +499,7 @@ impl TileProducer for ConverseProducer {
     /// where the output path it stands at is: the rows held now, and a row arriving later
     /// on a later release delivery, once a read identifies which group it joins.
     fn release_impl(&self, _obsolete_guard: TileGuard) {
-        let obsolete_guard = self.obsolete_guard().clone();
+        let obsolete_guard = self.reclaimed_guard().clone();
         if obsolete_guard.is_universal() {
             self.held
                 .lock()
@@ -938,7 +938,7 @@ impl TileProducer for UncurryProducer {
                     None => self.empty_pair.clone(),
                 }
             });
-        result.remove_guarded(self.obsolete_guard());
+        result.remove_guarded(self.reclaimed_guard());
         result.restrict_to(&projection, self.tiling());
         result
     }
@@ -2061,7 +2061,7 @@ impl TileProducer for ProductProducer {
         {
             *domain_predicate = domain_predicate.union(&rows_complete);
         }
-        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.remove_guarded(self.reclaimed_guard().clone());
         // The completeness intersected above is each side's, which a side states over the region
         // it was pulled at and the pairing restates over the product's keys, so it is cut to the
         // projection whether or not the sides were pulled at more.
@@ -4994,7 +4994,7 @@ mod uncurry_projection_tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(projection_guard.clone());
             let mut tile = self.tile.clone();
-            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.remove_guarded(self.reclaimed_guard().clone());
             tile.restrict_to(&projection_guard.projection(&self.name()), self.tiling());
             tile
         }

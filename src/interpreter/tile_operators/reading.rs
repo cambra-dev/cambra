@@ -419,7 +419,7 @@ impl TileProducer for ReadingsProducer {
 
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let Some(input) = &self.input else {
-            if self.obsolete_guard().is_universal() {
+            if self.reclaimed_guard().is_universal() {
                 return self.tiling().empty_tile();
             }
             let reading = self
@@ -428,7 +428,7 @@ impl TileProducer for ReadingsProducer {
                 .unwrap_or_else(PoisonError::into_inner)
                 .at(self.reader, Vec::new(), &[]);
             let mut output = Tile::Scalar(ColumnValue::Ints(vec![reading]));
-            output.remove_guarded(self.obsolete_guard().clone());
+            output.remove_guarded(self.reclaimed_guard().clone());
             return output;
         };
         let input_guard = match projection_guard {
@@ -472,7 +472,7 @@ impl TileProducer for ReadingsProducer {
             "each value of the input stands at one position"
         );
         *slot = Tile::Scalar(ColumnValue::Ints(readings));
-        output.remove_guarded(self.obsolete_guard().clone());
+        output.remove_guarded(self.reclaimed_guard().clone());
         output
     }
 
@@ -483,7 +483,7 @@ impl TileProducer for ReadingsProducer {
         self.source
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .release(self.reader, self.obsolete_guard());
+            .release(self.reader, self.reclaimed_guard());
         if let Some(input) = &self.input {
             let upstream = crate::interpreter::tiling::through_shared_levels(
                 obsolete_guard,

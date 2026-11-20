@@ -967,17 +967,22 @@ producers. Persisting needs each producer state as data that can be written to s
 read back. `BreakingProducer::checkpoint` encodes a breaker's state as bytes and
 `BreakingProducer::restore` installs it into a graph compiled again from the same text.
 
-`src/interpreter/durability/` writes each breaker's checkpoint to a store behind a trait
+`src/interpreter/durability/` implements these rules for one process, with the store behind a trait
 (`CheckpointStore`) that hands out a ticket per write and reports the ticket through which writes
-are durable. After each top-level step the run writes a checkpoint of each breaker whose releases
-changed, so each breaker's checkpoint is of its own moment. No release waits for a durable
-checkpoint yet, so a test over an in-memory store whose writes are durable at the end of each step
-recovers after a crash at any step. A transaction drive recovered from an older checkpoint emits its
-next attempt past every attempt its readers released (`TileProducer::reader_released`), since a row
-it emitted again would carry another frontier. A loop's or a transaction's open request is not
-written: the recovered run rebuilds it from the stores and drives. A constructor's tag encodes its
-declaration as the process's id, so a checkpoint decodes in the process that wrote it, and a
-breaker's only identity across compilations is its position in a walk of the graph.
+are durable. A durable run installs a release gate (`ReleaseGate`) on each input of each breaker and
+on each root. A release to a gated producer stops at the gate, and the producer's `obsolete_guard`
+answers it, so its consumer and the dispatcher read the region as released. After each top-level
+step the run writes a checkpoint of each breaker whose issued releases changed, then passes on to
+each input what a durable checkpoint covers, which is when the input reclaims. The inputs of the
+commit operator and of a transaction's writer pass no gate, because their releases acknowledge a
+commit and finish a position within one step. A test over an in-memory store whose writes become
+durable every third step recovers after a crash at any step, for programs with no transaction and no
+nested loop. A transaction drive recovered from an older checkpoint emits its next attempt past
+every attempt its readers released (`TileProducer::reader_released`), since a row it emitted again
+would carry another frontier. A loop's or a transaction's open request is not written: the recovered
+run rebuilds it from the stores and drives. A constructor's tag encodes its declaration as the
+process's id, so a checkpoint decodes in the process that wrote it, and a breaker's only identity
+across compilations is its position in a walk of the graph.
 
 A producer chooses when to checkpoint. Checkpointing once the input it has taken since its last
 checkpoint passes a bound keeps what recovery recomputes for that producer below the bound, which
