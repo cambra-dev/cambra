@@ -6,6 +6,7 @@
 mod binop;
 pub mod commit_operator;
 pub mod dispatcher;
+pub(crate) mod durability;
 pub mod http_server;
 mod notifications;
 pub mod operator_conversion;

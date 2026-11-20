@@ -3709,13 +3709,14 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     assert_eq!(canonical(&value), expected, "{source}");
 }
 
-/// A run recovers from a checkpoint alone and answers as one run, whether it stops at the first
-/// delivery's pause or crashes at any crash point of its two deliveries ([`recovers`]).
+/// A run recovers from its durable checkpoints alone and answers as one run, whether it stops at
+/// the first delivery's pause or crashes at any crash point of its two deliveries ([`recovers`]).
 ///
 /// After the stop, the test drops the run's context, compiled program, producers and source. A
-/// second compilation of the same text receives the checkpoint (`checkpoint::restore`) and runs
-/// what is left. The `main` output's recipient stands outside both processes and outlives them.
-/// It is handed each key once, and an answer that states the output complete.
+/// second compilation of the same text starts from the store the crash leaves
+/// (`Durability::start`) and runs what is left. The `main` output's recipient stands outside both
+/// processes and outlives them. It is handed each key once, and an answer that states the output
+/// complete.
 ///
 /// The recovered source models one of two external systems. Without `retains`, it holds only what
 /// the first run had not released, so a recovered breaker that reads a released position again
@@ -3862,38 +3863,60 @@ fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
 /// A crash the test stops a process at, as an unwind out of [`Persisting::stepped`].
 struct Crashed;
 
-/// A run's observer that persists every breaker whose releases changed after each step
-/// (`Checkpoint::persist`), pauses at every drained boundary, and crashes after the crash point
-/// `crash_after` names.
+/// A durable run's observer: it steps the durability after each step and at each drained
+/// boundary (`Durability::step`), makes the store's writes durable after every step, pauses at
+/// every drained boundary, and crashes after the crash point `crash_after` names.
 ///
 /// Every top-level step is a crash point, those inside a loop's or a transaction's open request
-/// included: the recovered run rebuilds the request from the breakers (`checkpoint.rs`).
+/// included: the recovered run rebuilds the request from the breakers (`durability`).
 struct Persisting {
     roots: Vec<crate::interpreter::sinks::ProducerSlot>,
-    checkpoint: crate::interpreter::tile_operators::checkpoint::Checkpoint,
-    /// Whether the run has handed the `main` output its terminal answer, which the sink keeps
-    /// beside its release (`Targets::main_handed_terminal`).
-    handed_terminal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// `handed_terminal` as of the latest copy.
-    persisted_handed: bool,
+    store: std::sync::Arc<crate::interpreter::durability::MemoryStore>,
+    durability: crate::interpreter::durability::Durability,
     /// The crash points passed so far.
     steps: usize,
     crash_after: Option<usize>,
 }
 
+impl Persisting {
+    /// A durable run of `roots`, compiled from `source`, over `store`, with `handed` as the
+    /// `main` output's handed flag.
+    fn start(
+        source: &str,
+        roots: Vec<crate::interpreter::sinks::ProducerSlot>,
+        store: std::sync::Arc<crate::interpreter::durability::MemoryStore>,
+        handed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        crash_after: Option<usize>,
+    ) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut program = std::hash::DefaultHasher::new();
+        source.hash(&mut program);
+        let durability = crate::interpreter::durability::Durability::start(
+            store.clone(),
+            program.finish(),
+            &roots,
+            vec![Some(handed)],
+        )
+        .unwrap_or_else(|refused| panic!("the store opens: {refused:?}"));
+        Self {
+            roots,
+            store,
+            durability,
+            steps: 0,
+            crash_after,
+        }
+    }
+}
+
 impl crate::interpreter::dispatcher::RunObserver for Persisting {
     fn drained(&mut self, _changed: bool) -> std::ops::ControlFlow<()> {
+        self.durability.step(&self.roots);
         std::ops::ControlFlow::Break(())
     }
 
     fn stepped(&mut self) {
-        assert!(
-            self.checkpoint.persist(&self.roots, false),
-            "a run on one worker ends no step with a store borrowed"
-        );
-        self.persisted_handed = self
-            .handed_terminal
-            .load(std::sync::atomic::Ordering::SeqCst);
+        self.durability.step(&self.roots);
+        self.store.flush();
         self.steps += 1;
         if self.crash_after == Some(self.steps) {
             std::panic::resume_unwind(Box::new(Crashed));
@@ -3939,15 +3962,14 @@ fn compiled_over_source1(
     (ctx, feed, slot, targets)
 }
 
-/// Run `source` over `two_batches` in a process that stops, recover in another from the
-/// checkpoint alone, run what is left, and check the answer. Answers `false`, checking nothing,
-/// where the run ends before the crash point `crash_after` names.
+/// Run `source` over `two_batches` in a process that stops, recover in another from the store it
+/// leaves, run what is left, and check the answer. Answers `false`, checking nothing, where the
+/// run ends before the crash point `crash_after` names.
 ///
-/// With `crash_after` `None`, the process stops at the first delivery's pause and every breaker
-/// is copied there (`checkpoint::capture`). Otherwise it crashes at that crash point
-/// ([`Persisting`]), and each breaker recovers from its latest copy (`Checkpoint::persist`). Both
-/// runs use one worker, so no worker steps while the test copies. The crash points are every
-/// top-level step, so the test is quadratic in a program's steps.
+/// With `crash_after` `None`, the process stops at the first delivery's pause and every write is
+/// durable there. Otherwise it crashes at that crash point ([`Persisting`]), and the writes not yet
+/// durable are lost. Both runs use one worker, so no worker steps while the durability does. The
+/// crash points are every top-level step, so the test is quadratic in a program's steps.
 fn recovers(
     source: &str,
     expected: &str,
@@ -3956,21 +3978,21 @@ fn recovers(
     crash_after: Option<usize>,
 ) -> bool {
     use crate::interpreter::dispatcher::Ended;
-    use crate::interpreter::tile_operators::checkpoint;
+    use crate::interpreter::durability::MemoryStore;
     let main = std::sync::Arc::new(MainAnswers::default());
     let batches = two_batches();
     let delivered = std::cell::Cell::new(1);
-    let (checkpoint, released, old_source) = {
+    let (store, released, old_source) = {
         let (_ctx, feed, slot, targets) =
             compiled_over_source1(source, &batches[0].0, batches[0].1.clone(), &main);
-        let mut observer = Persisting {
-            roots: vec![slot.clone()],
-            checkpoint: checkpoint::Checkpoint::default(),
-            handed_terminal: targets.main_handed_terminal(),
-            persisted_handed: false,
-            steps: 0,
+        let store = std::sync::Arc::new(MemoryStore::default());
+        let mut observer = Persisting::start(
+            source,
+            vec![slot],
+            store.clone(),
+            targets.main_handed_terminal(),
             crash_after,
-        };
+        );
         let run = |observer: &mut Persisting| match targets
             .run_with_workers(rows, 1, observer)
             .unwrap_or_else(|refused| panic!("{refused}"))
@@ -3996,28 +4018,22 @@ fn recovers(
                 "the last delivery's run ends: {source}"
             );
         }));
-        let checkpoint = match (crashed, crash_after) {
-            (Ok(()), None) => (
-                checkpoint::capture(&[slot]),
-                observer
-                    .handed_terminal
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+        match (crashed, crash_after) {
+            (Ok(()), None) => store.flush(),
             (Ok(()), Some(_)) => return false,
-            (Err(payload), Some(_)) if payload.is::<Crashed>() => {
-                (observer.checkpoint, observer.persisted_handed)
-            }
+            (Err(payload), Some(_)) if payload.is::<Crashed>() => {}
             (Err(payload), _) => std::panic::resume_unwind(payload),
-        };
+        }
+        drop(observer);
         let released = feed
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get_released_predicate();
-        (checkpoint, released, feed.downgrade())
+        (store.crashed(), released, feed.downgrade())
     };
     assert!(
         old_source.upgrade().is_none(),
-        "the checkpoint holds no handle on the first process's source: {source}"
+        "the store holds no handle on the first process's source: {source}"
     );
     let delivered = delivered.get();
     let kept: Vec<(Value, Value)> = batches[..delivered]
@@ -4027,14 +4043,16 @@ fn recovers(
         .collect();
     let (_ctx, feed, slot, targets) =
         compiled_over_source1(source, &kept, batches[delivered - 1].1.clone(), &main);
-    let (checkpoint, handed_terminal) = checkpoint;
-    checkpoint::restore(&[slot], checkpoint);
-    targets
-        .main_handed_terminal()
-        .store(handed_terminal, std::sync::atomic::Ordering::SeqCst);
-    let run = || {
+    let mut observer = Persisting::start(
+        source,
+        vec![slot],
+        std::sync::Arc::new(store),
+        targets.main_handed_terminal(),
+        None,
+    );
+    let mut run = || {
         targets
-            .run_with_workers(rows, 1, &mut PauseAtOnce)
+            .run_with_workers(rows, 1, &mut observer)
             .unwrap_or_else(|refused| panic!("{refused}"))
     };
     if delivered == 1 {

@@ -19,8 +19,7 @@ use crate::{
 
 /// What a collection level states about its keys through the level beneath it
 /// (`src/interpreter/design-operators.md`, "Keys that follow the level beneath").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeysFollow {
     /// A key arrives at the level only with a key beneath it, so the level states every key
     /// complete where the level beneath states every key under every path complete.

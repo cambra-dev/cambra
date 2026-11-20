@@ -275,8 +275,8 @@ pub trait RunObserver {
     /// whether the pass notified a pipeline or closed one. `Break` ends the run here.
     fn drained(&mut self, changed: bool) -> ControlFlow<()>;
     /// A top-level package or finish has returned, so no operator is borrowed, though a loop's
-    /// or a transaction's open request may be. A test that simulates a crash panics here.
-    #[cfg(test)]
+    /// or a transaction's open request may be. A durable run checkpoints here
+    /// (`Durability::step`), and a test that simulates a crash panics here.
     fn stepped(&mut self) {}
 }
 
@@ -3799,11 +3799,9 @@ fn drive_live(
             changed |= at.poll(dispatcher, execution, reach);
         }
         loop {
-            #[cfg(test)]
-            let mut stepped = || observer.stepped();
-            #[cfg(not(test))]
-            let mut stepped = || {};
-            match execution.claim_until_quiescent(dispatcher, reach, workers, &mut stepped) {
+            match execution
+                .claim_until_quiescent(dispatcher, reach, workers, &mut || observer.stepped())
+            {
                 Claimed::Done => return true,
                 // A worker's panic failed the run; the pool resumes it once it joins.
                 Claimed::Failed => return false,

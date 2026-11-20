@@ -13,7 +13,7 @@ use crate::interpreter::{CurryLevel, Extent, Predicate, Tiling, Value};
 
 /// Specifies a sub-region of interest within a [`Tile`](crate::interpreter::Tile), used for
 /// demand-driven computation and incremental release.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TileGuard {
     /// A value with no keys of its own, named under the paths that reach it. The predicate
     /// is `True` (under every path), `False` (under none), or `Qualified { enclosing, here:
@@ -1054,7 +1054,7 @@ fn names_no_key_of_its_level(arm: &TileGuard, tiling: &Tiling, depth: usize) -> 
 
 /// A guard on a [`Tile::DataFunction`](crate::interpreter::Tile::DataFunction), naming which
 /// part of it is of interest: its own keys, or what those keys hold.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FunctionGuard {
     Domain(Predicate),
     Codomain(Box<TileGuard>),
