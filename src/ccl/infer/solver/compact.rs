@@ -4310,27 +4310,37 @@ fn compact_go_inner(
         Type::BarrierVar(barrier) => join_barrier_lowers(solver, barrier, subst_acc, st).0,
         Type::Infer(state) => {
             let uid = state.uid;
-            let memo_key: MemoKey = (
-                uid,
-                pol,
-                st.scope.enclosing().to_vec(),
-                fallback_allowed(pos, st),
-                pos.invariant,
-            );
+            let at = (fallback_allowed(pos, st), pos.invariant);
+            let names_enclosing = st.scope.enclosing().iter().any(Option::is_some);
             // A substitution that maps no name the walk below can reach leaves the walk as it
             // is under the identity: a refinement it does not act on keeps its predicate
             // (`Subst::force_refinement`). Witness operations are inert only where the
             // dependency summary rules out every shape they can affect.
-            let below = if subst_acc.is_id() {
+            let below = if subst_acc.is_id() && !names_enclosing {
                 None
             } else {
-                consulted_below(solver, state, pol, (memo_key.3, memo_key.4), st)
+                consulted_below(solver, state, pol, at, st)
                     .filter(|reads| !subst_acc.has_witnesses() || !reads.witnesses)
             };
             let memoizable = subst_acc.is_id()
                 || below
                     .as_ref()
                     .is_some_and(|reads| !subst_acc.maps_any(&reads.names));
+            // The enclosing binders enter the walk only where it closes a refinement or a
+            // quoted term, which rewrites the references to them (`RefinementScope::close`).
+            // Under a substitution inert below, a binder the walk below cannot read is a
+            // crossing and nothing more, so the key holds it as an unnamed one: the walks
+            // under two functions whose binders nothing below reads are one walk.
+            let enclosing = match &below {
+                Some(reads) if memoizable => st
+                    .scope
+                    .enclosing()
+                    .iter()
+                    .map(|b| b.clone().filter(|n| reads.names.contains(n)))
+                    .collect(),
+                _ => st.scope.enclosing().to_vec(),
+            };
+            let memo_key: MemoKey = (uid, pol, enclosing, at.0, at.1);
             // Below this variable the walk reads only the entries for the names it can reach,
             // so it carries only those: the substitution accumulates an entry per binder on
             // the path, and the walk composes it at every bound.
