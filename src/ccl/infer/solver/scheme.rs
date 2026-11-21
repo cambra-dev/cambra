@@ -7,16 +7,17 @@
 //! discharge payloads riding bound edges.
 
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::infer::solver::held::{Held, HeldKey, HeldKind};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::traits::{TraitObligation, TraitObligationId};
+use super::traits::TraitObligation;
 use crate::ccl::Duplicate;
 use crate::ccl::capabilities::{Capabilities, Capability, CapabilityVar, CapabilityVarId, Repr};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
-use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
+use crate::ccl::ty::{FunKind, FunKindVar};
 use crate::ccl::{
     BarrierVar, BarrierVarId, Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr,
 };
@@ -68,7 +69,7 @@ pub struct Instance {
     /// mints an obligation for each.
     pub requires: Vec<TraitRequirement>,
     /// The copy of each capability variable the scheme reaches, by the original's id
-    /// ([`FreshenCache::capability_vars`]), which the specialization the use mints takes: a
+    /// ([`FreshenCache::copies`]), which the specialization the use mints takes: a
     /// requirement's associated effect type is linked through it too.
     pub capability_copies: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
     /// The use's copy of each trait obligation the scheme carries: the use answers each under
@@ -186,8 +187,17 @@ impl PolyScheme {
             ty,
             bounds,
             requires,
-            capability_copies: cache.capability_vars,
-            obligations: cache.obligations.into_values().collect(),
+            capability_copies: cache
+                .copies::<Rc<CapabilityVar>>()
+                .filter_map(|(key, copy)| match key {
+                    HeldKey::Capability(id) => Some((id, copy)),
+                    _ => None,
+                })
+                .collect(),
+            obligations: cache
+                .copies::<Rc<TraitObligation>>()
+                .map(|(_, copy)| copy)
+                .collect(),
         }
     }
 
@@ -234,27 +244,17 @@ pub struct FreshenCache {
     /// clones, which stand where their definition stood or under the binders their use
     /// entered ([`entered_binders`](Self::entered_binders)).
     pub site_telescope: Option<Telescope>,
-    /// Original quantified var → its fresh replacement.
-    pub vars: HashMap<InferVarId, Rc<InferVar>>,
-    /// Original barrier variable → its fresh replacement, for the same reason as
-    /// [`vars`](Self::vars).
-    pub barrier_vars: HashMap<BarrierVarId, Rc<BarrierVar>>,
+    /// Each solver handle this freshening copied, by the original's key, with its copy: an
+    /// inference, barrier, kind or capability variable, an ordering requirement, a trait
+    /// obligation ([`HeldKey`]). Every kind is copied once per freshening and the same copy is
+    /// read wherever the original is, so two uses of one generalized definition are
+    /// constrained apart: a kind forced to `Data` at one use stays open at another, and a
+    /// `String` use of `λ 𝑥 → 𝑥 + 1` does not narrow the `Int` use's obligation. A copy is
+    /// recorded before the original's state is copied into it, so a cycle reaches the copy.
+    pub copies: HashMap<HeldKey, Held>,
     /// Original quantified channel-domain name → its rename. Seeded by
     /// `specialize_use` with use-site pairings; unpaired names mint fresh.
     pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
-    /// Original quantified kind variable → its fresh replacement. A generalized
-    /// function's kind ([`FunKind::Var`]) must be decided *per use*, just
-    /// like the type it quantifies: two instantiations that flow into differently
-    /// -kinded contexts (one demanding `Data`, one `Compute`) must not share a
-    /// `FunKindVar` cell, or forcing one contaminates the other into a spurious
-    /// `DomainJoinConflict`. Freshening mints one `κ'` per original `κ` (bounds
-    /// copied so def-intrinsic forcing survives), consistently within a copy.
-    pub fun_kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
-    /// Original quantified capability variable → its fresh replacement, so the capabilities of
-    /// two uses of one generalized function are collected apart
-    /// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
-    pub capability_vars: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    pub ordering: HashMap<u32, crate::ccl::capabilities::Requirement>,
     /// Original kind-variable binder → the copy's binder at the same position.
     ///
     /// A kind variable's binders are quantified with it: they are the scope its edges
@@ -265,13 +265,6 @@ pub struct FreshenCache {
     /// α-conversion [`Type::alpha_convert_sum`] performs for a written sum and
     /// [`chan_doms`](Self::chan_doms) for a rigid channel name.
     pub witnesses: HashMap<crate::ccl::ty::WitnessId, crate::ccl::ty::WitnessId>,
-    /// Original trait obligation → its per-instantiation copy, for the same reason
-    /// as [`fun_kind_vars`](Self::fun_kind_vars): a generalized function's operator
-    /// requirements are quantified along with the variables they constrain, so each
-    /// use resolves *its own* copy. `λ 𝑥 → 𝑥 + 1` generalizes to
-    /// `∀A O. A ⇒ O requires Addable(A, Int ⇝ O)`; sharing one obligation across uses
-    /// would let a `String` use narrow the `Int` use's candidate set to nothing.
-    pub obligations: HashMap<TraitObligationId, Rc<TraitObligation>>,
     /// Original type parameter → what this copy stands it at
     /// (`src/ccl/design/type-parameters.md`, "Instantiation" and "Specialization").
     ///
@@ -325,6 +318,26 @@ pub struct FreshenCache {
 impl FreshenCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This freshening's copy of `original`, if it has made one.
+    pub fn copy_of<K: HeldKind + Clone>(&self, original: &K) -> Option<K> {
+        self.copies
+            .get(&original.held_key())
+            .and_then(K::from_held)
+            .cloned()
+    }
+
+    /// Record `copy` as this freshening's copy of `original`.
+    pub fn record_copy<K: HeldKind>(&mut self, original: &K, copy: K) {
+        self.copies.insert(original.held_key(), copy.into_held());
+    }
+
+    /// Each copy of one kind of handle, by its original's key.
+    pub fn copies<K: HeldKind + Clone>(&self) -> impl Iterator<Item = (HeldKey, K)> + '_ {
+        self.copies
+            .iter()
+            .filter_map(|(key, held)| K::from_held(held).map(|k| (*key, k.clone())))
     }
 
     /// The name a copied function binder `n` takes in this copy, minted on first use. The copy's
@@ -400,8 +413,8 @@ fn freshen_requirement(
     if order.decision(solver) == Some(true) {
         return r.clone();
     }
-    if let Some(copy) = cache.ordering.get(&order.id) {
-        return copy.clone();
+    if let Some(copy) = cache.copy_of(r) {
+        return copy;
     }
     let iter = order
         .iter
@@ -433,7 +446,7 @@ fn freshen_requirement(
         Some(_) => copy.at_use(),
         None => copy,
     };
-    cache.ordering.insert(order.id, copy.clone());
+    cache.record_copy(r, copy.clone());
     copy
 }
 
@@ -448,14 +461,14 @@ fn freshen_capability_var(
     if v.level(solver) <= lim {
         return Rc::clone(v);
     }
-    if let Some(f) = cache.capability_vars.get(&v.uid) {
-        return Rc::clone(f);
+    if let Some(f) = cache.copy_of(v) {
+        return f;
     }
     let f = CapabilityVar::fresh(solver, target.level_of(v.level(solver)));
     let open = v.open_input(solver);
     f.set_open_input(solver, open);
     // Cached before the edges are copied, so a cycle reaches the copy.
-    cache.capability_vars.insert(v.uid, Rc::clone(&f));
+    cache.record_copy(v, Rc::clone(&f));
     // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
     // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
     // bring instead.
@@ -561,8 +574,8 @@ fn freshen_kind_var(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<FunKindVar> {
-    if let Some(f) = cache.fun_kind_vars.get(&kv.uid) {
-        return f.clone();
+    if let Some(f) = cache.copy_of(kv) {
+        return f;
     }
     // A funkind variable at or below the cutoff is an enclosing scope's, as a variable there
     // is, and freshens to itself: a copy of a function this freshening copies relates to it as
@@ -576,7 +589,7 @@ fn freshen_kind_var(
     }
     // Registered **before** the bounds are carried across: a collection reaches itself
     // through a recurrence, and the cache is what terminates the walk.
-    cache.fun_kind_vars.insert(kv.uid, Rc::clone(&f));
+    cache.record_copy(kv, Rc::clone(&f));
     // **Everything the definition recorded comes across; the variable does not.** A pin the
     // definition site acquires later must not reach this instantiation, which a fresh `uid`
     // with copied state gives and a shared variable would not.
@@ -1136,8 +1149,8 @@ pub fn freshen_above(
             Type::Poly(Rc::new(out))
         }
         Type::Infer(tv) => {
-            if let Some(existing) = cache.vars.get(&tv.uid) {
-                return Type::Infer(Rc::clone(existing));
+            if let Some(existing) = cache.copy_of(tv) {
+                return Type::Infer(existing);
             }
             debug_assert!(
                 tv.fun_kind.level(solver).is_none_or(|level| level > lim),
@@ -1167,12 +1180,12 @@ pub fn freshen_above(
             // part of this copy names. The edges this copy owes are the ones to kinds the
             // instantiation actually copied, which is what the cache holds once the bounds
             // are done.
-            let fun_kind = match cache.fun_kind_vars.get(&tv.fun_kind.uid) {
-                Some(existing) => Rc::clone(existing),
+            let fun_kind = match cache.copy_of(&tv.fun_kind) {
+                Some(existing) => existing,
                 None => {
                     let f = FunKindVar::fresh(solver);
                     f.place_at(solver, new_level);
-                    cache.fun_kind_vars.insert(tv.fun_kind.uid, Rc::clone(&f));
+                    cache.record_copy(&tv.fun_kind, Rc::clone(&f));
                     f
                 }
             };
@@ -1199,20 +1212,14 @@ pub fn freshen_above(
             v.inherit_witness_placement_renamed(
                 solver,
                 tv,
-                |k| {
-                    cache
-                        .fun_kind_vars
-                        .get(&k.uid)
-                        .cloned()
-                        .unwrap_or_else(|| Rc::clone(k))
-                },
+                |k| cache.copy_of(k).unwrap_or_else(|| Rc::clone(k)),
                 |w| cache.witnesses.get(w).copied().unwrap_or(*w),
             );
             if tv.names_domain(solver) {
                 v.mark_named_domain(solver);
             }
             v.inherit_stands_for(solver, tv);
-            cache.vars.insert(tv.uid, Rc::clone(&v));
+            cache.record_copy(tv, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
@@ -1350,14 +1357,14 @@ pub fn freshen_above(
         // the bounds, so the copy's follows from the freshened ones. It has no telescope
         // or kind to copy.
         Type::BarrierVar(barrier) => {
-            if let Some(existing) = cache.barrier_vars.get(&barrier.uid) {
-                return Type::BarrierVar(Rc::clone(existing));
+            if let Some(existing) = cache.copy_of(barrier) {
+                return Type::BarrierVar(existing);
             }
             // Registered before the bounds are copied, so a bound that reaches this
             // barrier variable again resolves to the copy.
             let fresh =
                 BarrierVar::fresh(solver, Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
-            cache.barrier_vars.insert(barrier.uid, Rc::clone(&fresh));
+            cache.record_copy(barrier, Rc::clone(&fresh));
 
             // Snapshot bounds before recursing, as the `Infer` arm does.
             let lows = barrier.lowers(solver).to_vec();
@@ -1423,10 +1430,7 @@ impl FreshenCache {
         copy: &Rc<FunKindVar>,
     ) {
         let copied = |k: &FunKind| match k {
-            FunKind::Var(v) => self
-                .fun_kind_vars
-                .get(&v.uid)
-                .map(|c| FunKind::Var(Rc::clone(c))),
+            FunKind::Var(v) => self.copy_of(v).map(FunKind::Var),
             concrete => Some(concrete.clone()),
         };
         {
@@ -1500,14 +1504,14 @@ fn freshen_watches(
     cache: &mut FreshenCache,
 ) {
     for (obligation, pos) in watches {
-        if let Some(existing) = cache.obligations.get(&obligation.uid) {
-            attach(solver, &obligation, existing, pos);
+        if let Some(existing) = cache.copy_of(&obligation) {
+            attach(solver, &obligation, &existing, pos);
             continue;
         }
         // Phase 1: a copy carrying the original's candidate set, with the output
         // position still pointing at the definition's — enough to be reachable.
         let copy = TraitObligation::new_from(solver, &obligation);
-        cache.obligations.insert(obligation.uid, Rc::clone(&copy));
+        cache.record_copy(&obligation, Rc::clone(&copy));
         attach(solver, &obligation, &copy, pos);
         // A specialization clone turns the binding's own type parameters, the ones
         // one level above the cutoff, into variables; an assumption about one of
@@ -1659,15 +1663,14 @@ fn freshen_obligation(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<TraitObligation> {
-    if !cache.obligations.contains_key(&obligation.uid) {
+    if cache.copy_of(obligation).is_none() {
         for operand in obligation.operands().into_iter().flatten() {
             freshen_above(solver, lim, &operand, target, cache);
         }
     }
     cache
-        .obligations
-        .get(&obligation.uid)
-        .map_or_else(|| Rc::clone(obligation), Rc::clone)
+        .copy_of(obligation)
+        .unwrap_or_else(|| Rc::clone(obligation))
 }
 
 /// Structurally pair a use site's resolved instantiation type against the
@@ -1848,7 +1851,13 @@ fn freshen_subst_payloads(
     // The witness half comes across too: its binders and the kinds it eliminates are this
     // instantiation's, and a discharge's type is freshened as any other type the bound carries.
     let renames = cache.witnesses.clone();
-    let kinds = cache.fun_kind_vars.clone();
+    let kinds: HashMap<crate::ccl::ty::FunKindVarId, Rc<FunKindVar>> = cache
+        .copies::<Rc<FunKindVar>>()
+        .filter_map(|(key, copy)| match key {
+            HeldKey::FunKind(id) => Some((id, copy)),
+            _ => None,
+        })
+        .collect();
     subst.map_witness_half(
         |w| renames.get(w).copied().unwrap_or(*w),
         |k| kinds.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),

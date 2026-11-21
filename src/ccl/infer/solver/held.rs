@@ -11,11 +11,13 @@
 use std::rc::Rc;
 
 use crate::ccl::Type;
-use crate::ccl::capabilities::{CapabilityVar, OrderableIfRequiredBy};
+use crate::ccl::capabilities::{
+    CapabilityVar, CapabilityVarId, OrderableIfRequiredBy, Requirement,
+};
 use crate::ccl::expr::TypedExpr;
-use crate::ccl::infer::solver::traits::TraitObligation;
-use crate::ccl::infer_var::{BarrierVar, InferVar};
-use crate::ccl::ty::{FunKind, FunKindVar, TraitRequirement};
+use crate::ccl::infer::solver::traits::{TraitObligation, TraitObligationId};
+use crate::ccl::infer_var::{BarrierVar, BarrierVarId, InferVar, InferVarId};
+use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId, TraitRequirement};
 
 /// One handle to a typing run's state.
 #[derive(Clone)]
@@ -25,10 +27,76 @@ pub enum Held {
     FunKind(Rc<FunKindVar>),
     Capability(Rc<CapabilityVar>),
     /// An ordering requirement, whose proof state its run records.
-    Ordering(Rc<OrderableIfRequiredBy>),
+    Ordering(Requirement),
     /// A trait obligation a node's call holds ([`crate::ccl::expr::CallObligation`]).
     Obligation(Rc<TraitObligation>),
 }
+
+/// A handle's identity: what a copy of solver state is keyed by ([`Held::key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeldKey {
+    Infer(InferVarId),
+    Barrier(BarrierVarId),
+    FunKind(FunKindVarId),
+    Capability(CapabilityVarId),
+    Ordering(u32),
+    Obligation(TraitObligationId),
+}
+
+impl Held {
+    pub fn key(&self) -> HeldKey {
+        match self {
+            Held::Infer(v) => HeldKey::Infer(v.uid),
+            Held::Barrier(b) => HeldKey::Barrier(b.uid),
+            Held::FunKind(k) => HeldKey::FunKind(k.uid),
+            Held::Capability(c) => HeldKey::Capability(c.uid),
+            Held::Ordering(r) => HeldKey::Ordering(
+                r.ordering()
+                    .expect("an ordering handle holds an ordering requirement")
+                    .id,
+            ),
+            Held::Obligation(o) => HeldKey::Obligation(o.uid),
+        }
+    }
+}
+
+/// One kind of handle, as [`Held`] holds it: what a map of copies keyed by [`HeldKey`] stores and
+/// gives back for that kind.
+pub trait HeldKind: Sized {
+    fn held_key(&self) -> HeldKey;
+    fn into_held(self) -> Held;
+    fn from_held(held: &Held) -> Option<&Self>;
+}
+
+macro_rules! held_kind {
+    ($ty:ty, $variant:ident, |$x:ident| $key:expr) => {
+        impl HeldKind for $ty {
+            fn held_key(&self) -> HeldKey {
+                let $x = self;
+                HeldKey::$variant($key)
+            }
+            fn into_held(self) -> Held {
+                Held::$variant(self)
+            }
+            fn from_held(held: &Held) -> Option<&Self> {
+                match held {
+                    Held::$variant(x) => Some(x),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+held_kind!(Rc<InferVar>, Infer, |v| v.uid);
+held_kind!(Rc<BarrierVar>, Barrier, |b| b.uid);
+held_kind!(Rc<FunKindVar>, FunKind, |k| k.uid);
+held_kind!(Rc<CapabilityVar>, Capability, |c| c.uid);
+held_kind!(Rc<TraitObligation>, Obligation, |o| o.uid);
+held_kind!(Requirement, Ordering, |r| r
+    .ordering()
+    .expect("an ordering handle holds an ordering requirement")
+    .id);
 
 /// What a walk of held state does at each handle and at each quoted term.
 pub trait HeldVisitor {
@@ -43,7 +111,7 @@ pub trait HeldVisitor {
 
     /// Whether to walk what `order`, an ordering requirement just reported, holds: its
     /// positions, its source's type, its capabilities and its assumptions.
-    fn enter_ordering(&mut self, _order: &Rc<OrderableIfRequiredBy>) -> bool {
+    fn enter_ordering(&mut self, _order: &OrderableIfRequiredBy) -> bool {
         true
     }
 }

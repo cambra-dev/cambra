@@ -1490,8 +1490,9 @@ pub(super) fn assert_settled(
                      capabilities"
                 ),
                 // A requirement no run recorded, one a clause writes, holds nothing of a run.
-                Held::Ordering(order) => assert!(
-                    order.decided.is_some() || order.home.is_none(),
+                Held::Ordering(r) => assert!(
+                    r.ordering()
+                        .is_some_and(|order| order.decided.is_some() || order.home.is_none()),
                     "an ordering requirement is not closed once inference has closed \
                      capabilities"
                 ),
@@ -1510,7 +1511,7 @@ pub(super) fn assert_settled(
         // requirement.
         fn enter_ordering(
             &mut self,
-            order: &Rc<crate::ccl::capabilities::OrderableIfRequiredBy>,
+            order: &crate::ccl::capabilities::OrderableIfRequiredBy,
         ) -> bool {
             order.decided.is_none() && order.home.is_some()
         }
@@ -4019,7 +4020,17 @@ pub(super) fn specialize_use(
         param_telescope: Some(param_telescope),
         entered_binders,
         // The clone's capability variables are the use's copies (`capabilities::UseCapabilities`).
-        capability_vars: ctx.use_capabilities.copies(use_expr.node_id()),
+        copies: ctx
+            .use_capabilities
+            .copies(use_expr.node_id())
+            .into_iter()
+            .map(|(id, copy)| {
+                (
+                    crate::ccl::infer::solver::held::HeldKey::Capability(id),
+                    crate::ccl::infer::solver::held::Held::Capability(copy),
+                )
+            })
+            .collect(),
         use_at: Some(use_expr.node_id()),
         ..FreshenCache::new()
     };
@@ -4047,7 +4058,7 @@ pub(super) fn specialize_use(
     freshen_expr_type_slots(solver, &mut clone, cutoff, target, &mut fresh);
     // Each use in the clone instantiated through the clone's copies.
     ctx.use_capabilities
-        .specialize(&origins, &fresh.capability_vars);
+        .specialize(&origins, &capability_copies(&fresh));
 
     // Pin the clone to the use's live instantiation type. Outward, clone below
     // use, the pin connects the clone into the use's component of the live
@@ -4082,7 +4093,8 @@ pub(super) fn specialize_use(
     let mut cache = ConstrainCache::new().without_capabilities();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
-    for obligation in fresh.obligations.values() {
+    for (_, obligation) in fresh.copies::<Rc<crate::ccl::infer::solver::traits::TraitObligation>>()
+    {
         if obligation.assumptions().is_empty() {
             obligation.assume_more(&ctx.assumptions);
         }
@@ -4233,7 +4245,10 @@ pub(super) fn specialize_use(
     // operand nothing reaches is judged by its resolution"): the pin can bound it from above
     // alone, and coalescing reads the obligation's answer.
     let pinned = pinned.and_then(|()| {
-        let vars: Vec<_> = fresh.vars.values().cloned().collect();
+        let vars: Vec<_> = fresh
+            .copies::<Rc<crate::ccl::infer_var::InferVar>>()
+            .map(|(_, copy)| copy)
+            .collect();
         crate::ccl::infer::solver::traits::deliver_resolutions(
             solver,
             &vars,
@@ -4535,6 +4550,20 @@ impl OpenNumbering {
         }
         ty.walk_children_mut(|child| self.replace(solver, child, ctx, answer));
     }
+}
+
+/// The copies of capability variables `fresh` made, by the original's id.
+fn capability_copies(
+    fresh: &FreshenCache,
+) -> HashMap<crate::ccl::capabilities::CapabilityVarId, Rc<crate::ccl::capabilities::CapabilityVar>>
+{
+    fresh
+        .copies::<Rc<crate::ccl::capabilities::CapabilityVar>>()
+        .filter_map(|(key, copy)| match key {
+            crate::ccl::infer::solver::held::HeldKey::Capability(id) => Some((id, copy)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Undo [`suspend_for_clone`].
