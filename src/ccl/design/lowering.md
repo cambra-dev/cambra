@@ -63,8 +63,9 @@ registered source when one has that name and as an ordinary application otherwis
 application with no arguments applies the callee to the unit, `f()` → `unit ▷ f`, and a function of
 no parameters binds nothing of the unit (`lower_params`). A `@Builtin` function of a std module's top level
 takes the body the compiler supplies for its path, a `Reading` node (`builtin_body`). The `with`
-block recognizes `begin`, and `sink_declaration` recognizes `http_serve` and `test_sink`, both
-through the same table.
+block recognizes `begin`, and `sink_declaration` recognizes `test_sink`, both through the same
+table. A `@Builtin` type or value of `std::http::serve` takes what the compiler supplies for its
+path (`HttpBuiltin::supplied_by`).
 
 ## Generator functions and feed-only loops
 
@@ -176,9 +177,26 @@ A declaration with any other annotation requires an initializer. Feed and define
 sequence through `ExprStmt`. A borrowed parameter is a named binder, so inlining substitutes the
 place the caller lent for it.
 
+`run std::http::serve(…) as server` instantiates the embedded route module. Its `@Builtin`
+declarations read the route's address off the module's `const` parameters `port`, `method` and
+`path`: `@Builtin type Reqs` is an alias of the route's source-domain type, spelled `Reqs`,
+`_requests` binds a `Source`, and `_responses` a response `Defer`. Sink registration records the
+response declaration. `respond(values: Reqs |=> http::Response)` defines
+that response data function with `<<=`. The importable `std::http` module declares the shared
+nominal values and pure helpers.
+
+Linking instantiates route source names in expressions and types, including exported aliases
+and quoted predicates. Module interfaces retain route templates for that substitution. A nested
+run over outer constant parameters retains a symbolic template until its enclosing run supplies
+the address. Checking a module uses unopened sources; only linking a concrete root opens routes.
+The exported `Reqs` alias consequently names the same source domain as the run's requests.
+Renaming a source for a run prefixes its type's spelling with the run's name, so a diagnostic
+prints `server::Reqs` (`SourceName`).
+
 `out = test_sink()` binds a response `Defer` to a `TestSink` registered by the test through
-`GlobalContext::register_test_sink`. This form exists only under `cfg(test)`. `sink_declaration` in `lower/sinks.rs` recognizes both sink declarations; non-top-level
-blocks reject them because the program's sink record reads only top-level bindings.
+`GlobalContext::register_test_sink`. This form exists only under `cfg(test)`. `sink_declaration`
+in `lower/sinks.rs` recognizes it; non-top-level blocks reject it, and a nested `@Builtin`, because
+the program's sink record reads only top-level bindings.
 
 ### The `channelize` step (feed channelization)
 
@@ -461,3 +479,12 @@ the module lowers nothing when it reports. A path with a capitalized qualifier s
 ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]"). A module that
 uses refused syntax therefore reports only those refusals, and none of the lowering errors its
 other statements would raise.
+
+### Sink domain contracts
+
+A sink retains its required input domain independently of the inferred response expression.
+Inference defers comparisons against rigid Feed channel domains until channelization assembles
+their contributions. After that substitution, the compiler compares the sink's actual and
+required domains in both directions using the existing subtype solver. A partial Feed cannot
+satisfy an HTTP route's complete response contract by passing through the deferred comparison.
+A domain mismatch is a source-attributed compilation error before operator conversion.

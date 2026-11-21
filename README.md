@@ -28,24 +28,28 @@ Programs are written in a Pythonic surface syntax — the Cambra High-level Lang
 The aim is to abstract over memory, threads, and connections the way garbage collection abstracted over allocation: the programmer writes the logic and the high-level architecture; batching, incrementality, join strategies, and scheduling are the runtime's job. Put differently: the elegance that query planners bring to `SELECT` statements, applied to whole programs.
 
 ```python
+import std::http
+
 products = [
     {sku: "espresso", price: 3},
     {sku: "latte",    price: 5},
 ]
 
 # Orders arrive over HTTP: each POST body is an order record.
-orders, order_acks = http_serve("8080", "POST", "/order")
-for o in orders:
-    order_acks << "ok\n"
+run std::http::serve(port="8080", method="POST", path="/order") as order_route
+orders = [parse_order(r.body()) for r in order_route::requests]
+order_route::respond([http::ok_text("ok\n") for o in orders])
 
 # Rolling revenue, served: the order stream joined to the catalog,
 # summed up to each reading transaction's time.
-revenue_reqs, revenue_resps = http_serve("8080", "GET", "/revenue")
-for req in revenue_reqs:
+run std::http::serve(port="8080", method="GET", path="/revenue") as revenue_route
+revenue_resps: Feed(http::Response)
+for req in revenue_route::requests:
     with txn = begin():
         so_far = orders.restrict(lambda o: o.time < txn::now())
         revenue = sum([p.price * o.qty for p in products for o in so_far if p.sku == o.sku])
-        revenue_resps[req.id] = str(revenue) + "\n"
+        revenue_resps << http::ok_text(str(revenue) + "\n")
+revenue_route::respond(revenue_resps)
 ```
 
 The comprehension is not an embedded query DSL, and `orders` is not a list — it's the stream of requests hitting `/order`. The planner notices the equality predicate and lowers the cross product to a keyed hash-join. And note what `/revenue` returns: a bare `sum` over the order stream would denote *total* revenue — a value that exists only once the stream closes — so the handler instead pins the aggregate to its transaction's time, making "revenue to date" a well-defined read at any moment. The pinned view is materializable: the runtime is free to maintain the join-and-sum incrementally as orders arrive rather than rescanning the feed per request.

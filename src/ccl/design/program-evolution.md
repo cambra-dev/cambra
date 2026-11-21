@@ -1195,23 +1195,23 @@ What it costs:
 > (`the_last_branch_cannot_be_deleted`).
 
 A `SourceSinkRegistry` (`ccl/context.rs`) holds a program's open data sources, the reply sink of
-each open `http_serve` route, and the listener behind each bound port. A listener's socket, its
+each open HTTP route, and the listener behind each bound port. A listener's socket, its
 routing-table entry, and the requests buffered behind it are program state, not compilation state,
 and they outlive the version that opened them.
 
-Compiling any version seeds a fresh `LoweringContext` from that registry. An `http_serve` call
-naming a route the registry holds binds it, keeping the listener and everything buffered behind it.
-The compile that installs a version opens a route the registry does not hold, and the compiles
-before it open none ([Order of a reload](#order-of-a-reload)). Adding an `http_serve` therefore
-works: the added route serves as soon as the swap completes, and what was already there keeps its
-state. Routes are keyed by their source name, not by the response binding's name, which a new
-version may spell differently. Seeding the registry is also what lets `/diff` be answered about a
-running program: compiling the new version in a fresh `GlobalContext` would try to bind a port the
+Compiling any version seeds a fresh `LoweringContext` from that registry. A run of
+`std::http::serve` naming a route the registry holds binds it, keeping the listener and everything
+buffered behind it. The compile that installs a version opens a route the registry does not hold,
+and the compiles before it open none ([Order of a reload](#order-of-a-reload)). Adding a route
+therefore works: the added route serves as soon as the swap completes, and what was already there
+keeps its state. Routes are keyed by their source name, not by the response binding's name, which a
+new version may spell differently. Seeding the registry is also what lets `/diff` be answered about
+a running program: compiling the new version in a fresh `GlobalContext` would try to bind a port the
 running program holds and fail.
 
 ### A route a version stops serving is retired
 
-Removing an `http_serve` is accepted, and the route goes with it. Left registered, the address would
+Removing a route is accepted, and the route goes with it. Left registered, the address would
 keep matching requests and buffering them for a reader that no longer exists, and the client would
 wait on a reply nobody computes. `SourceSinkRegistry::retire_routes_absent_from` compares the routes
 the registry holds against the union of the routes the pass bound and the routes every other

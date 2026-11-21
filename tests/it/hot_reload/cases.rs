@@ -1023,7 +1023,7 @@ fn a_site_added_elsewhere_keeps_a_channels_tags() {
     );
 }
 
-/// The state guard covers a `stdin`-sourced loop, not just an `http_serve` one.
+/// The state guard covers a `stdin`-sourced loop, not just an HTTP one.
 ///
 /// Nothing about the guard is HTTP-specific: it reads the variables a version
 /// declares off its planned tree, and `stdin` declares them the same way.
@@ -1330,12 +1330,13 @@ fn a_port_a_refused_version_adds_is_released() {
     let adds_a_port = source("guestbook-retypes-state", port).replace(
         "for entry in sign_reqs:",
         indoc! {r#"
-            run std::http(port="{PORT}", method="GET", path="/other") as http_other_resps
-            http_other_resps_replies: Feed(String)
-            other_reqs = http_other_resps::requests
+            import std::http as http_api
+            run std::http::serve(port="{PORT}", method="GET", path="/other") as http_other_resps
+            http_other_resps_replies: Feed(http_api::Response)
+            other_reqs = [request.body() for request in http_other_resps::requests]
 
             for req in other_reqs:
-                http_other_resps_replies << "other\n"
+                http_other_resps_replies << http_api::ok_text("other\n")
 
             http_other_resps::respond(http_other_resps_replies)
             for entry in sign_reqs:
@@ -1571,13 +1572,14 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
     let base = |port: u16| {
         format!(
             indoc! {r#"
-                run std::http(port="{port}", method="POST", path="/bump") as http_resps
-                http_resps_replies: Feed(String)
-                reqs = http_resps::requests
+                import std::http as http_api
+                run std::http::serve(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(http_api::Response)
+                reqs = [request.body() for request in http_resps::requests]
                 n := (tag="x", count=0)
                 for r in reqs:
                     n := (tag=n.tag + "!", count=n.count + 1)
-                    http_resps_replies << n.tag + "\n"
+                    http_resps_replies << http_api::ok_text(n.tag + "\n")
                 http_resps::respond(http_resps_replies)
             "#},
             port = port,
@@ -1587,15 +1589,16 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
     let whole = |port: u16| {
         format!(
             indoc! {r#"
-                run std::http(port="{port}", method="POST", path="/bump") as http_resps
-                http_resps_replies: Feed(String)
-                reqs = http_resps::requests
+                import std::http as http_api
+                run std::http::serve(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(http_api::Response)
+                reqs = [request.body() for request in http_resps::requests]
                 @LoadFrom(n)
                 held <: {{tag: String, count: Int}}
                 m := held
                 for r in reqs:
                     m := (tag=m.tag + "?", count=m.count + 1)
-                    http_resps_replies << m.tag + "\n"
+                    http_resps_replies << http_api::ok_text(m.tag + "\n")
                 http_resps::respond(http_resps_replies)
             "#},
             port = port,
@@ -1605,15 +1608,16 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
     let one_field = |port: u16| {
         format!(
             indoc! {r#"
-                run std::http(port="{port}", method="POST", path="/bump") as http_resps
-                http_resps_replies: Feed(String)
-                reqs = http_resps::requests
+                import std::http as http_api
+                run std::http::serve(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(http_api::Response)
+                reqs = [request.body() for request in http_resps::requests]
                 @LoadFrom(n)
                 s: {{tag: String, count: Int}}
                 m := s.tag + "?"
                 for r in reqs:
                     m := m + "!"
-                    http_resps_replies << m + "\n"
+                    http_resps_replies << http_api::ok_text(m + "\n")
                 http_resps::respond(http_resps_replies)
             "#},
             port = port,
@@ -1653,13 +1657,14 @@ fn a_loaded_record_annotated_at_one_field_is_refused() {
     let base = |port: u16| {
         format!(
             indoc! {r#"
-                run std::http(port="{port}", method="POST", path="/bump") as http_resps
-                http_resps_replies: Feed(String)
-                reqs = http_resps::requests
+                import std::http as http_api
+                run std::http::serve(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(http_api::Response)
+                reqs = [request.body() for request in http_resps::requests]
                 n := (tag="x", count=0)
                 for r in reqs:
                     n := (tag=n.tag + "!", count=n.count + 1)
-                    http_resps_replies << n.tag + "\n"
+                    http_resps_replies << http_api::ok_text(n.tag + "\n")
                 http_resps::respond(http_resps_replies)
             "#},
             port = port,
@@ -1668,15 +1673,16 @@ fn a_loaded_record_annotated_at_one_field_is_refused() {
     let one_field = |port: u16| {
         format!(
             indoc! {r#"
-                run std::http(port="{port}", method="POST", path="/bump") as http_resps
-                http_resps_replies: Feed(String)
-                reqs = http_resps::requests
+                import std::http as http_api
+                run std::http::serve(port="{port}", method="POST", path="/bump") as http_resps
+                http_resps_replies: Feed(http_api::Response)
+                reqs = [request.body() for request in http_resps::requests]
                 @LoadFrom(n)
                 held <: {{tag: String}}
                 m := held.tag + "?"
                 for r in reqs:
                     m := m + "!"
-                    http_resps_replies << m + "\n"
+                    http_resps_replies << http_api::ok_text(m + "\n")
                 http_resps::respond(http_resps_replies)
             "#},
             port = port,
@@ -2557,12 +2563,12 @@ fn a_version_naming_an_unbindable_port_is_refused() {
     let adds_a_held_port = source("guestbook", port).replace(
         "for entry in sign_reqs:",
         indoc! {r#"
-            run std::http(port="{PORT}", method="GET", path="/other") as http_other_resps
-            http_other_resps_replies: Feed(String)
-            other_reqs = http_other_resps::requests
+            run std::http::serve(port="{PORT}", method="GET", path="/other") as http_other_resps
+            http_other_resps_replies: Feed(http_api::Response)
+            other_reqs = [request.body() for request in http_other_resps::requests]
 
             for req in other_reqs:
-                http_other_resps_replies << "other\n"
+                http_other_resps_replies << http_api::ok_text("other\n")
 
             http_other_resps::respond(http_other_resps_replies)
             for entry in sign_reqs:
@@ -2985,21 +2991,22 @@ fn a_port_whose_last_route_goes_is_released() {
     let kept = reserve_test_port();
     let dropped = reserve_test_port();
     let two_ports = indoc! {r#"
-        run std::http(port="{KEPT}", method="GET", path="/a") as http_a_resps
-        http_a_resps_replies: Feed(String)
-        a_reqs = http_a_resps::requests
-        run std::http(port="{DROPPED}", method="GET", path="/b") as http_b_resps
-        http_b_resps_replies: Feed(String)
-        b_reqs = http_b_resps::requests
-        run std::http(port="{KEPT}", method="GET", path="/c") as http_c_resps
-        http_c_resps_replies: Feed(String)
-        c_reqs = http_c_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{KEPT}", method="GET", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(http_api::Response)
+        a_reqs = [request.body() for request in http_a_resps::requests]
+        run std::http::serve(port="{DROPPED}", method="GET", path="/b") as http_b_resps
+        http_b_resps_replies: Feed(http_api::Response)
+        b_reqs = [request.body() for request in http_b_resps::requests]
+        run std::http::serve(port="{KEPT}", method="GET", path="/c") as http_c_resps
+        http_c_resps_replies: Feed(http_api::Response)
+        c_reqs = [request.body() for request in http_c_resps::requests]
         for r in a_reqs:
-            http_a_resps_replies << "a\n"
+            http_a_resps_replies << http_api::ok_text("a\n")
         for r in b_reqs:
-            http_b_resps_replies << "b\n"
+            http_b_resps_replies << http_api::ok_text("b\n")
         for r in c_reqs:
-            http_c_resps_replies << "c\n"
+            http_c_resps_replies << http_api::ok_text("c\n")
         http_a_resps::respond(http_a_resps_replies)
         http_b_resps::respond(http_b_resps_replies)
         http_c_resps::respond(http_c_resps_replies)
@@ -3007,11 +3014,12 @@ fn a_port_whose_last_route_goes_is_released() {
     .replace("{KEPT}", &kept.to_string())
     .replace("{DROPPED}", &dropped.to_string());
     let one_port = indoc! {r#"
-        run std::http(port="{KEPT}", method="GET", path="/a") as http_a_resps
-        http_a_resps_replies: Feed(String)
-        a_reqs = http_a_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{KEPT}", method="GET", path="/a") as http_a_resps
+        http_a_resps_replies: Feed(http_api::Response)
+        a_reqs = [request.body() for request in http_a_resps::requests]
         for r in a_reqs:
-            http_a_resps_replies << "a\n"
+            http_a_resps_replies << http_api::ok_text("a\n")
         http_a_resps::respond(http_a_resps_replies)
     "#}
     .replace("{KEPT}", &kept.to_string());
@@ -3688,14 +3696,15 @@ fn fold_to_main(step: &str) -> String {
 fn fold_behind_a_route(step: &str, port: u16) -> String {
     format!(
         indoc! {r#"
+            import std::http as http_api
             n := ""
-            run std::http(port="{port}", method="POST", path="/read") as http_resps
-            http_resps_replies: Feed(String)
-            reqs = http_resps::requests
+            run std::http::serve(port="{port}", method="POST", path="/read") as http_resps
+            http_resps_replies: Feed(http_api::Response)
+            reqs = [request.body() for request in http_resps::requests]
             for x in {items}:
                 {step}
             for r in reqs:
-                http_resps_replies << n + "\n"
+                http_resps_replies << http_api::ok_text(n + "\n")
             http_resps::respond(http_resps_replies)
         "#},
         port = port,

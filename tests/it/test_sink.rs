@@ -2,7 +2,7 @@
 //!
 //! Every program here observes through a sink rather than through a trailing bare
 //! expression, so it compiles down the sink-record path (`convert_record_fields_to_operators`),
-//! which a program otherwise reaches only through `http_serve`.
+//! which a program otherwise reaches only through an HTTP route.
 
 use std::cell::RefCell;
 use std::rc::Rc;

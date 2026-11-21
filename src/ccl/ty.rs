@@ -1321,6 +1321,101 @@ impl SharedHoleMint {
     }
 }
 
+/// The name of a registered source, which [`Type::DataSource`] is the key type of, and the
+/// spelling a program reaches that type by.
+///
+/// The name alone is the identity: equality, ordering and hashing read it and ignore the
+/// spelling. A `@Builtin type` gives its source's key type a spelling, `Reqs`, and each run
+/// that reaches it prefixes the run's name, `server::Reqs` (`docs/chl-spec.md`, "9.16 The std
+/// root"). A diagnostic prints the spelling where the type has one.
+#[derive(Debug, Clone)]
+pub struct SourceName {
+    name: String,
+    spelling: Option<SmolStr>,
+}
+
+impl SourceName {
+    /// The source `name`, spelled `spelling` in the program.
+    pub fn spelled(name: impl Into<String>, spelling: impl Into<SmolStr>) -> Self {
+        Self {
+            name: name.into(),
+            spelling: Some(spelling.into()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    /// How the program writes the type, where a declaration names it.
+    pub fn spelling(&self) -> Option<&str> {
+        self.spelling.as_deref()
+    }
+
+    /// The source renamed to `name`, reached through the run `run`, which qualifies the
+    /// spelling; the root reaches it through none.
+    pub fn renamed(&mut self, name: &str, run: Option<&str>) {
+        self.name = name.to_string();
+        if let (Some(spelling), Some(run)) = (&mut self.spelling, run) {
+            *spelling = format!("{run}::{spelling}").into();
+        }
+    }
+}
+
+impl From<String> for SourceName {
+    fn from(name: String) -> Self {
+        Self {
+            name,
+            spelling: None,
+        }
+    }
+}
+
+impl From<&str> for SourceName {
+    fn from(name: &str) -> Self {
+        name.to_string().into()
+    }
+}
+
+impl std::ops::Deref for SourceName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.name
+    }
+}
+
+impl PartialEq for SourceName {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for SourceName {}
+
+impl PartialOrd for SourceName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SourceName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name.cmp(&other.name)
+    }
+}
+
+impl std::hash::Hash for SourceName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl fmt::Display for SourceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
 /// What a function's codomain reads its input by ([`Type::Fun`]'s binder): nothing, its one
 /// parameter by one name, or each parameter of a list by a name of its own.
 ///
@@ -1638,7 +1733,7 @@ pub enum Type {
     /// by the source registry.  [`crate::interpreter::operator_conversion::OpConversionContext`]
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
-    DataSource(String),
+    DataSource(SourceName),
     /// the nominal, rigid domain of a feed channel, named by
     /// its defer binder. Minted by inference when it types a `let d = Defer`
     /// binding (instead of a fresh `Infer` domain), so every consumer of a

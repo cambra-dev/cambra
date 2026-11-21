@@ -519,9 +519,10 @@ and Feed declarations. A module exports a value read explicitly, `pub values = o
 functions may capture and contribute to its private Feed. Qualified collection reads are ordinary
 values.
 
-HTTP exposes `requests` and `respond(values)` from the embedded `std::http` module. Its private
-response Feed is registered as a sink separately from the pure CCL tree. Callers supply ordinary
-response collections. No writable place crosses the module boundary as data.
+HTTP exposes `Reqs`, `requests`, and `respond(values)` from the embedded `std::http::serve`
+run module. Its private response Feed is registered as a sink separately from the pure CCL tree.
+`respond` defines it once with a `Reqs |=> http::Response` data function. The nominal response
+type comes from importable `std::http`. No writable place crosses the module boundary as data.
 
 Inlining substitutes borrowed places into named parameters. Channelization gathers each Feed's
 contributions at its declaration and substitutes its assembled collection for reads. Its existing
@@ -1026,12 +1027,14 @@ The walk inlines five kinds of binding rather than keeping them:
 A transactional mutable variable and an induction counter shared across two HTTP endpoints:
 
 ```python
-run std::http(port="8080", method="POST", path="/incr") as incr
-run std::http(port="8080", method="GET", path="/get") as get
+import std::http
+param render_int: Int => String
+run std::http::serve(port="8080", method="POST", path="/incr") as incr
+run std::http::serve(port="8080", method="GET", path="/get") as get
 incr_reqs = incr::requests
 get_reqs = get::requests
-incr_replies: Feed(String)
-get_replies: Feed(String)
+incr_replies: Feed(http::Response)
+get_replies: Feed(http::Response)
 
 balance: Mut(Int, Txn) := 0
 cnt: Mut(Int) := 0
@@ -1040,11 +1043,11 @@ for req in incr_reqs:
     with begin():
         balance += 1
         cnt += 1
-    incr_replies << "ok " + str(cnt) + "\n"
+    incr_replies << http::ok_text("ok " + render_int(cnt) + "\n")
 
 for req in get_reqs:
     with begin():
-        get_replies << str(balance)
+        get_replies << http::ok_text(render_int(balance))
 
 incr::respond(incr_replies)
 get::respond(get_replies)

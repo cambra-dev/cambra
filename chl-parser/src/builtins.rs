@@ -29,7 +29,6 @@ pub enum SurfaceBuiltin {
     IntToUint,
     AwaitFinal,
     Begin,
-    HttpServe,
     TestSink,
     Stdin,
     Summon,
@@ -136,7 +135,6 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         entry("int_to_uint", B::IntToUint, Exact(1), Function),
         entry("await_final", B::AwaitFinal, Exact(1), Function),
         entry("begin", B::Begin, Exact(0), TransactionMarker),
-        entry("http_serve", B::HttpServe, Exact(3), SinkDeclaration),
         // Listed unconditionally. The `cambra` crate recognizes it only under `cfg(test)`,
         // and the differential interpreter always does; each consumer gates its own
         // recognition.
@@ -199,7 +197,6 @@ mod tests {
             | B::IntToUint
             | B::AwaitFinal
             | B::Begin
-            | B::HttpServe
             | B::TestSink
             | B::Stdin
             | B::Summon => b,
@@ -216,7 +213,6 @@ mod tests {
             B::IntToUint,
             B::AwaitFinal,
             B::Begin,
-            B::HttpServe,
             B::TestSink,
             B::Stdin,
             B::Summon,

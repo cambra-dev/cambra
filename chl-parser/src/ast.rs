@@ -191,10 +191,14 @@ pub enum Stmt {
     ///
     /// A feed is the one binding introduced before anything gives it a value: the
     /// statements that feed it give it one (`docs/chl-spec.md`, "3.7 Feed operator `<<`").
-    /// Which annotations may be declared this way is lowering's to decide.
+    /// Under `@Builtin` the compiler gives it its value. Which annotations may be declared this
+    /// way is lowering's to decide.
     Declare {
         target: Spanned<AssignTarget>,
         annotation: TypeAnnotation,
+        /// The `@Builtin` decorator on the line above: the compiler supplies the value
+        /// (`docs/chl-spec.md`, "9.16 The std root").
+        builtin: Option<Span>,
     },
 
     /// Augmented assignment: `target op= value`, e.g. `x += 1`.
@@ -306,6 +310,14 @@ pub enum Stmt {
         /// The `@Builtin` decorator on the line above: the compiler supplies the body, which is
         /// empty (`docs/chl-spec.md`, "9.16 The std root").
         builtin: Option<Span>,
+    },
+
+    /// `@Builtin type N`: a type the compiler supplies, declared by a std module
+    /// (`docs/chl-spec.md`, "9.16 The std root").
+    BuiltinType {
+        name: Spanned<SmolStr>,
+        /// The `@Builtin` decorator on the line above.
+        builtin: Span,
     },
 
     /// `type N(P…):` over constructor lines, or `type N(P…) = R` (`docs/chl-spec.md`,

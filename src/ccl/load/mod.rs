@@ -32,10 +32,16 @@ use std::path::Path;
 
 /// The std root's modules, by path and source text (`docs/chl-spec.md`, "9.16
 /// The std root").
-const STD_MODULES: &[(&str, &str)] = &[(
-    "std::http",
-    include_str!("../../../stdlib/src/std/http.cambra"),
-)];
+const STD_MODULES: &[(&str, &str)] = &[
+    (
+        "std::http",
+        include_str!("../../../stdlib/src/std/http.cambra"),
+    ),
+    (
+        "std::http::serve",
+        include_str!("../../../stdlib/src/std/http/serve.cambra"),
+    ),
+];
 
 /// Every file a program reaches from its root, parsed, with the module graph
 /// over them.

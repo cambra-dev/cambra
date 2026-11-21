@@ -11,8 +11,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-use smol_str::SmolStr;
-
 use crate::ccl::BarrierVar;
 use crate::ccl::infer_var::BarrierVarId;
 use crate::ccl::subst::{JoinSite, RefinementScope, Subst};
@@ -53,7 +51,7 @@ pub enum AtomKey {
     /// Finite index range `0..n`.
     UIntRange(u64),
     /// Externally-registered data source.
-    Source(SmolStr),
+    Source(crate::ccl::SourceName),
     /// The transaction-commit domain (nullary, like a base type).
     Txn,
     /// A reference to the nearest enclosing sum's witness — [`Type::WitnessRef`],
@@ -183,7 +181,7 @@ impl AtomKey {
         match ty {
             Type::Base(b) => Some(AtomKey::Prim(b.clone())),
             Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
-            Type::DataSource(n) => Some(AtomKey::Source(SmolStr::from(n.as_str()))),
+            Type::DataSource(n) => Some(AtomKey::Source(n.clone())),
             Type::Txn => Some(AtomKey::Txn),
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
@@ -198,7 +196,7 @@ impl AtomKey {
         match self {
             AtomKey::Prim(b) => Type::Base(b.clone()),
             AtomKey::UIntRange(n) => Type::UIntRange(*n),
-            AtomKey::Source(n) => Type::DataSource(n.to_string()),
+            AtomKey::Source(n) => Type::DataSource(n.clone()),
             AtomKey::Txn => Type::Txn,
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),

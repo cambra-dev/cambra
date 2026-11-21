@@ -1,12 +1,11 @@
-//! End-to-end tests for the HTTP server source/sink (`http_serve`).
+//! End-to-end tests for the HTTP server source/sink (`std::http::serve`).
 //!
-//! These tests compile a CHL program that uses `http_serve`, drive the Cambra
+//! These tests compile a CHL program that runs `std::http::serve`, drive the Cambra
 //! scheduler on the main thread, and send real HTTP requests from a background
 //! thread, verifying that the computed responses are delivered back to the
 //! caller.
 
 use cambra::ccl::load::LoadedProgram;
-use cambra::chl_parser::FileId;
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -18,9 +17,8 @@ use std::{
 use cambra::{
     ccl::{
         context::{CompileResultExt, GlobalContext, compile_program},
-        lower::{LoweringContext, LoweringError, lower_stmts},
+        lower::LoweringContext,
     },
-    chl_parser,
     interpreter::{
         Consumer, DataSourceDomainExtentImpl, HttpServerDataSource,
         http_server::{SharedHttpServer, reserve_test_port},
@@ -29,7 +27,6 @@ use cambra::{
 use indoc::formatdoc;
 use indoc::indoc;
 use rstest_log::rstest;
-use test_log::test;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -132,10 +129,11 @@ fn test_http_serve_echo() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
-            run std::http(port="{port}", method="POST", path="/echo") as server
-            server_replies: Feed(String)
-            for req in server::requests:
-                server_replies << "Received: " + req
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="POST", path="/echo") as server
+            server_replies: Feed(http_api::Response)
+            for req in [request.body() for request in server::requests]:
+                server_replies << http_api::ok_text("Received: " + req)
             server::respond(server_replies)
             "#
     );
@@ -158,16 +156,46 @@ fn test_http_serve_echo() {
     assert_eq!(response, "Received: hello");
 }
 
+/// A request reaches the route whose path its target spells equivalently: percent-encodings of
+/// unreserved characters, hex case and dot segments do not change the path (RFC 3986,
+/// "6.2.2. Syntax-Based Normalization").
+#[rstest]
+#[case::the_declared_spelling("/a%62/c%2f")]
+#[case::decoded("/ab/c%2F")]
+#[case::dot_segments("/x/../ab/./c%2F")]
+#[case::absolute_form("http://localhost/ab/c%2F?q=1")]
+fn a_request_reaches_the_route_its_path_spells_equivalently(#[case] target: &str) {
+    let port = reserve_test_port();
+    let code = indoc::formatdoc!(
+        r#"
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="POST", path="/a%62/c%2f") as server
+            server::respond([http_api::ok_text("at " + r.target()) for r in server::requests])
+            "#
+    );
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _ = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel::<String>();
+    let sent = target.to_string();
+    thread::spawn(move || {
+        tx.send(http_post(port, &sent, "")).unwrap();
+    });
+    let expected = format!("at {target}");
+    assert_eq!(drive_until(&mut ctx, &rx, Duration::from_secs(5)), expected);
+}
+
 #[rstest]
 fn test_http_serve_const() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
-            run std::http(port="{port}", method="GET", path="/static") as http_responses
-            http_responses_replies: Feed(String)
-            requests = http_responses::requests
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="GET", path="/static") as http_responses
+            http_responses_replies: Feed(http_api::Response)
+            requests = [request.body() for request in http_responses::requests]
             for req in requests:
-                http_responses_replies << "Hello, world!"
+                http_responses_replies << http_api::ok_text("Hello, world!")
             http_responses::respond(http_responses_replies)
             "#
     );
@@ -197,11 +225,12 @@ fn test_http_serve_two_sequential_requests() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
-            run std::http(port="{port}", method="POST", path="/echo") as http_responses
-            http_responses_replies: Feed(String)
-            requests = http_responses::requests
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="POST", path="/echo") as http_responses
+            http_responses_replies: Feed(http_api::Response)
+            requests = [request.body() for request in http_responses::requests]
             for req in requests:
-                http_responses_replies << "OK: " + req
+                http_responses_replies << http_api::ok_text("OK: " + req)
             http_responses::respond(http_responses_replies)
             "#
     );
@@ -235,18 +264,13 @@ fn test_http_serve_two_paths() {
     let port1 = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
-            run std::http(port="{port1}", method="GET", path="/greet") as http_resps1
-            http_resps1_replies: Feed(String)
-            reqs1 = http_resps1::requests
-            for req in reqs1:
-                http_resps1_replies << "hello"
-            run std::http(port="{port1}", method="POST", path="/echo") as http_resps2
-            http_resps2_replies: Feed(String)
-            reqs2 = http_resps2::requests
-            for req in reqs2:
-                http_resps2_replies << "echo: " + req
-            http_resps1::respond(http_resps1_replies)
-            http_resps2::respond(http_resps2_replies)
+            import std::http as http_api
+            def handle(req: http_api::Request, prefix: String) => http_api::Response:
+                http_api::ok_text(prefix + req.body())
+            run std::http::serve(port="{port1}", method="GET", path="/greet") as greet
+            run std::http::serve(port="{port1}", method="POST", path="/echo") as echo
+            greet::respond([handle(req, "hello") for req in greet::requests])
+            echo::respond([handle(req, "echo: ") for req in echo::requests])
             "#
     );
 
@@ -279,17 +303,18 @@ fn test_http_serve_two_paths_shared_outer_let() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
+            import std::http as http_api
             prefix = "greeting: "
-            run std::http(port="{port}", method="POST", path="/a") as http_resps1
-            http_resps1_replies: Feed(String)
-            reqs1 = http_resps1::requests
-            run std::http(port="{port}", method="POST", path="/b") as http_resps2
-            http_resps2_replies: Feed(String)
-            reqs2 = http_resps2::requests
+            run std::http::serve(port="{port}", method="POST", path="/a") as http_resps1
+            http_resps1_replies: Feed(http_api::Response)
+            reqs1 = [request.body() for request in http_resps1::requests]
+            run std::http::serve(port="{port}", method="POST", path="/b") as http_resps2
+            http_resps2_replies: Feed(http_api::Response)
+            reqs2 = [request.body() for request in http_resps2::requests]
             for req in reqs1:
-                http_resps1_replies << prefix + "alice"
+                http_resps1_replies << http_api::ok_text(prefix + "alice")
             for req in reqs2:
-                http_resps2_replies << prefix + req
+                http_resps2_replies << http_api::ok_text(prefix + req)
             http_resps1::respond(http_resps1_replies)
             http_resps2::respond(http_resps2_replies)
             "#
@@ -320,12 +345,13 @@ fn test_http_serve_echo_with_outer_let() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
+            import std::http as http_api
             prefix = "Echo: "
-            run std::http(port="{port}", method="POST", path="/echo") as http_responses
-            http_responses_replies: Feed(String)
-            requests = http_responses::requests
+            run std::http::serve(port="{port}", method="POST", path="/echo") as http_responses
+            http_responses_replies: Feed(http_api::Response)
+            requests = [request.body() for request in http_responses::requests]
             for req in requests:
-                http_responses_replies << prefix + req
+                http_responses_replies << http_api::ok_text(prefix + req)
             http_responses::respond(http_responses_replies)
             "#
     );
@@ -346,16 +372,17 @@ fn test_http_serve_echo_with_outer_let() {
     assert_eq!(response, "Echo: world");
 }
 
-/// `http_serve` returns a tuple, which a parenthesised pattern takes apart as well as a bare one.
+/// A route exposes ordinary request values through its module.
 #[rstest]
-fn test_http_serve_with_a_parenthesised_pattern() {
+fn test_http_serve_module_request_values() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
-        run std::http(port="{port}", method="POST", path="/echo") as http_responses
-        http_responses_replies: Feed(String)
-        requests = http_responses::requests
+        import std::http as http_api
+        run std::http::serve(port="{port}", method="POST", path="/echo") as http_responses
+        http_responses_replies: Feed(http_api::Response)
+        requests = [request.body() for request in http_responses::requests]
         for req in requests:
-            http_responses_replies << "Echo: " + req
+            http_responses_replies << http_api::ok_text("Echo: " + req)
         http_responses::respond(http_responses_replies)
     "#};
 
@@ -385,29 +412,26 @@ fn http_serve_lowering_errors(template: &str) -> Vec<String> {
     result.errors.iter().map(|e| format!("{e:?}")).collect()
 }
 
-/// HTTP does not return a writable Feed inside an ordinary value.
-#[test]
-fn http_serve_cannot_return_a_tuple_of_places() {
+/// `http_serve` is no builtin, so a module may bind the name.
+#[test_log::test]
+fn a_module_may_bind_the_name_http_serve() {
     let errors = http_serve_lowering_errors(indoc! {r#"
-        route = http_serve("PORT", "POST", "/echo")
-        0
+        def http_serve(port: String, method: String, path: String) => String:
+            method + " " + path + " on " + port
+        http_serve("PORT", "POST", "/echo")
     "#});
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("running `std::http")),
-        "{errors:?}"
-    );
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 /// A route whose responses the program never feeds is refused, and the error names the call
 /// rather than the name its response channel is bound under.
-#[test]
+#[test_log::test]
 fn a_route_whose_responses_are_never_fed_names_the_call() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
-        run std::http(port="{port}", method="POST", path="/e") as http_responses
-        requests = http_responses::requests
+        import std::http as http_api
+        run std::http::serve(port="{port}", method="POST", path="/e") as http_responses
+        requests = [request.body() for request in http_responses::requests]
         1
     "#};
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -422,19 +446,20 @@ fn a_route_whose_responses_are_never_fed_names_the_call() {
 }
 
 /// Two routes whose paths differ only in a character no identifier holds are two routes.
-#[test]
+#[test_log::test]
 fn paths_differing_only_in_punctuation_are_two_routes() {
     let errors = http_serve_lowering_errors(indoc! {r#"
-        run std::http(port="PORT", method="GET", path="/a-b") as http_resps1
-        http_resps1_replies: Feed(String)
-        reqs1 = http_resps1::requests
+        import std::http as http_api
+        run std::http::serve(port="PORT", method="GET", path="/a-b") as http_resps1
+        http_resps1_replies: Feed(http_api::Response)
+        reqs1 = [request.body() for request in http_resps1::requests]
         for req in reqs1:
-            http_resps1_replies << "dash"
-        run std::http(port="PORT", method="GET", path="/a_b") as http_resps2
-        http_resps2_replies: Feed(String)
-        reqs2 = http_resps2::requests
+            http_resps1_replies << http_api::ok_text("dash")
+        run std::http::serve(port="PORT", method="GET", path="/a_b") as http_resps2
+        http_resps2_replies: Feed(http_api::Response)
+        reqs2 = [request.body() for request in http_resps2::requests]
         for req in reqs2:
-            http_resps2_replies << "underscore"
+            http_resps2_replies << http_api::ok_text("underscore")
         http_resps1::respond(http_resps1_replies)
         http_resps2::respond(http_resps2_replies)
     "#});
@@ -445,20 +470,21 @@ fn paths_differing_only_in_punctuation_are_two_routes() {
 }
 
 /// Two spellings of one port are one route, so serving it under both is refused.
-#[test]
+#[test_log::test]
 fn spellings_of_one_port_are_one_route() {
     for spelled in ["0PORT", "+PORT"] {
         let errors = http_serve_lowering_errors(&formatdoc! {r#"
-            run std::http(port="PORT", method="GET", path="/x") as http_resps1
-            http_resps1_replies: Feed(String)
-            reqs1 = http_resps1::requests
+            import std::http as http_api
+            run std::http::serve(port="PORT", method="GET", path="/x") as http_resps1
+            http_resps1_replies: Feed(http_api::Response)
+            reqs1 = [request.body() for request in http_resps1::requests]
             for req in reqs1:
-                http_resps1_replies << "one"
-            run std::http(port="{spelled}", method="GET", path="/x") as http_resps2
-            http_resps2_replies: Feed(String)
-            reqs2 = http_resps2::requests
+                http_resps1_replies << http_api::ok_text("one")
+            run std::http::serve(port="{spelled}", method="GET", path="/x") as http_resps2
+            http_resps2_replies: Feed(http_api::Response)
+            reqs2 = [request.body() for request in http_resps2::requests]
             for req in reqs2:
-                http_resps2_replies << "two"
+                http_resps2_replies << http_api::ok_text("two")
             http_resps1::respond(http_resps1_replies)
             http_resps2::respond(http_resps2_replies)
         "#});
@@ -471,131 +497,18 @@ fn spellings_of_one_port_are_one_route() {
     }
 }
 
-/// A call of `http_serve` inside an expression opens no route, and says where the call goes.
-#[test]
-fn test_http_serve_inside_an_expression_is_error() {
-    let errors = http_serve_lowering_errors(indoc! {r#"
-        requests = http_serve("PORT", "POST", "/echo").0
-        0
-    "#});
-    assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("only supported as the whole right-hand side of a top-level `=`")),
-        "expected the expression-position refusal, got: {errors:?}",
-    );
-}
-
-/// `http_serve` inside an if/else branch is rejected at lowering time.
-#[test]
-fn test_http_serve_in_if_branch_is_error() {
-    let port = reserve_test_port();
-    let code = indoc::formatdoc!(
-        r#"
-            if True:
-                requests, responses = http_serve("{port}", "POST", "/echo")
-                for req in requests:
-                    responses << req
-            "#
-    );
-    let mut ctx = LoweringContext::default();
-    let module = chl_parser::parse_module(FileId::ROOT, &code)
-        .into_result()
-        .expect("parse failed");
-    let result = lower_stmts(&module, &mut ctx);
-    assert!(
-        result
-            .errors
-            .iter()
-            .any(|e| matches!(e, LoweringError::Unsupported { .. })),
-        "expected Unsupported error, got: {:?}",
-        result.errors,
-    );
-}
-
-/// `http_serve` inside a function body is rejected at lowering time.
-#[test]
-fn test_http_serve_in_function_body_is_error() {
-    let port = reserve_test_port();
-    let code = indoc::formatdoc!(
-        r#"
-            def handler():
-                requests, responses = http_serve("{port}", "POST", "/echo")
-                for req in requests:
-                    responses << req
-            handler()
-            "#
-    );
-    let mut ctx = LoweringContext::default();
-    let module = chl_parser::parse_module(FileId::ROOT, &code)
-        .into_result()
-        .expect("parse failed");
-    let result = lower_stmts(&module, &mut ctx);
-    assert!(
-        result
-            .errors
-            .iter()
-            .any(|e| matches!(e, LoweringError::Unsupported { .. })),
-        "expected Unsupported error, got: {:?}",
-        result.errors,
-    );
-}
-
-/// Lower `template` with a free port in place of `PORT`, and assert that `http_serve` is refused
-/// as not top level.
-fn assert_http_serve_refused_as_nested(template: &str) {
-    let code = template.replace("PORT", &reserve_test_port().to_string());
-    let mut ctx = LoweringContext::default();
-    let module = chl_parser::parse_module(FileId::ROOT, &code)
-        .into_result()
-        .expect("parse failed");
-    let result = lower_stmts(&module, &mut ctx);
-    assert!(
-        result
-            .errors
-            .iter()
-            .any(|e| format!("{e:?}").contains("http_serve is only supported at the top level")),
-        "expected a top-level restriction, got: {:?}",
-        result.errors,
-    );
-}
-
-/// A loop body lowers its statements apart from the top level, and refuses `http_serve` the
-/// same as any other nested block.
-#[test]
-fn test_http_serve_in_loop_body_is_error() {
-    assert_http_serve_refused_as_nested(indoc! {r#"
-        for x in [1, 2]:
-            requests, responses = http_serve("PORT", "POST", "/echo")
-        0
-    "#});
-}
-
-/// A `with` block lowers its statements apart from the top level, and refuses `http_serve`
-/// the same as any other nested block.
-#[test]
-fn test_http_serve_in_with_block_is_error() {
-    assert_http_serve_refused_as_nested(indoc! {r#"
-        pool: Mut(Int, Txn) := 0
-        for x in [1, 2]:
-            with begin():
-                requests, responses = http_serve("PORT", "POST", "/echo")
-                pool := x
-        0
-    "#});
-}
-
 /// Non-matching paths receive a 404 and do not produce a domain element.
 #[rstest]
 fn test_http_serve_wrong_path_gets_404() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
-            run std::http(port="{port}", method="POST", path="/echo") as http_responses
-            http_responses_replies: Feed(String)
-            requests = http_responses::requests
+            import std::http as http_api
+            run std::http::serve(port="{port}", method="POST", path="/echo") as http_responses
+            http_responses_replies: Feed(http_api::Response)
+            requests = [request.body() for request in http_responses::requests]
             for req in requests:
-                http_responses_replies << req
+                http_responses_replies << http_api::ok_text(req)
             http_responses::respond(http_responses_replies)
             "#
     );
@@ -622,54 +535,29 @@ fn test_http_serve_wrong_path_gets_404() {
     );
 }
 
-/// A conditionally fed output answers the requests its guard admits, and only those.
-///
-/// Feeding under a guard restricts the channel's domain, so the output's type is
-/// `{source(…) | __elem ▷ …} ⤇ String`, a refined collection that planning marks as an
-/// iteration site like any other (`Type::is_collection`). A rejected request gets no
-/// response, so it goes first on its own connection, left open, and the admitted request
-/// after it must still be answered with its own body.
-#[rstest]
-fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
+/// A response definition cannot omit requests selected out by a guard.
+#[test_log::test]
+fn a_conditionally_fed_output_is_rejected_as_incomplete() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
-        run std::http(port="{port}", method="POST", path="/g") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
-        for req in reqs:
-            if req != "skip":
-                http_resps_replies << req
-        http_resps::respond(http_resps_replies)
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/g") as server
+        replies: Feed(http::Response)
+        for req in server::requests:
+            if req.body() != "skip":
+                replies << http::ok_text(req.body())
+        server::respond(replies)
     "#};
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-
-    let (tx, rx) = mpsc::channel::<(String, TcpStream)>();
-    thread::spawn(move || {
-        let mut rejected = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-        rejected
-            .write_all(
-                format!(
-                    "POST /g HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 4\r\n\
-                     Connection: close\r\n\r\nskip"
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        rejected.flush().unwrap();
-        tx.send((http_post(port, "/g", "go"), rejected)).unwrap();
-    });
-    let (admitted, mut rejected) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
-    assert_eq!(admitted, "go");
-
-    ctx.scheduler().check_for_notifications();
-    rejected.set_nonblocking(true).unwrap();
-    let mut buf = [0u8; 64];
+    let result = compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {}));
+    let errors = match result {
+        Ok(_) => panic!("an incomplete response definition compiled"),
+        Err(e) => e,
+    };
+    let text = cambra::ccl::context::render_errors(&errors, loaded.sources());
     assert!(
-        matches!(rejected.read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-        "the request the guard rejects is not answered",
+        text.contains("do not answer exactly its requests"),
+        "{text}"
     );
 }
 
@@ -687,7 +575,7 @@ fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
 /// answers a one-step route outright.
 /// `a_request_that_arrived_before_its_route_was_retired_is_answered` covers the
 /// other stage, a request still in the channel, through a real reload.
-#[test]
+#[test_log::test]
 fn a_retired_route_answers_a_request_it_had_accepted() {
     let port = reserve_test_port();
     let server = SharedHttpServer::new(port).expect("the reserved port binds");
@@ -742,18 +630,19 @@ fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> St
 
 /// A reply fed in the loop body, after a block that writes a mutable variable, answers each
 /// request.
-#[test]
+#[test_log::test]
 fn a_reply_after_a_writing_block_answers_the_request() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
-        run std::http(port="{port}", method="POST", path="/hit") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{port}", method="POST", path="/hit") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         hits: Mut(Int, Txn) := 0
         for req in reqs:
             with begin():
                 hits := hits + 1
-            http_resps_replies << "ok\n"
+            http_resps_replies << http_api::ok_text("ok\n")
         http_resps::respond(http_resps_replies)
     "#};
     assert_eq!(
@@ -765,18 +654,19 @@ fn a_reply_after_a_writing_block_answers_the_request() {
 /// A reply fed inside the block that writes a mutable variable answers the request: it rides
 /// the transaction's commit and is keyed by the request it answers (`docs/chl-spec.md`, "8.4
 /// Deferred collections").
-#[test]
+#[test_log::test]
 fn a_reply_inside_a_writing_block_answers_the_request() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
-        run std::http(port="{port}", method="POST", path="/hit") as http_resps
-        http_resps_replies: Feed(String)
-        reqs = http_resps::requests
+        import std::http as http_api
+        run std::http::serve(port="{port}", method="POST", path="/hit") as http_resps
+        http_resps_replies: Feed(http_api::Response)
+        reqs = [request.body() for request in http_resps::requests]
         hits: Mut(Int, Txn) := 0
         for req in reqs:
             with begin():
                 hits := hits + 1
-                http_resps_replies << "ok\n"
+                http_resps_replies << http_api::ok_text("ok\n")
         http_resps::respond(http_resps_replies)
     "#};
     assert_eq!(
@@ -787,18 +677,19 @@ fn a_reply_inside_a_writing_block_answers_the_request() {
 
 /// Each request is answered with the reply its own transaction fed: the reply is keyed by the
 /// request, and the commit order (here the arrival order) decides what each transaction read.
-#[test]
+#[test_log::test]
 fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
-        run std::http(port="{port}", method="POST", path="/hit") as server
-        reqs = server::requests
-        resps: Feed(String)
+        import std::http as http_api
+        run std::http::serve(port="{port}", method="POST", path="/hit") as server
+        reqs = [request.body() for request in server::requests]
+        resps: Feed(http_api::Response)
         seen: Mut(String, Txn) := ""
         for req in reqs:
             with begin():
                 seen := seen + req
-                resps << seen
+                resps << http_api::ok_text(seen)
         server::respond(resps)
     "#};
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -824,14 +715,15 @@ fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
 fn two_runs_serve_the_routes_their_arguments_give() {
     let port = reserve_test_port();
     let service = indoc! {r#"
+        import std::http as http_api
         const param port: String
         const param path: String
         param reply: String
-        run std::http(port=port, method="GET", path=path) as http_responses
-        http_responses_replies: Feed(String)
-        requests = http_responses::requests
+        run std::http::serve(port=port, method="GET", path=path) as http_responses
+        http_responses_replies: Feed(http_api::Response)
+        requests = [request.body() for request in http_responses::requests]
         for req in requests:
-            http_responses_replies << reply
+            http_responses_replies << http_api::ok_text(reply)
         http_responses::respond(http_responses_replies)
     "#};
     let root = formatdoc! {r#"
@@ -858,4 +750,263 @@ fn two_runs_serve_the_routes_their_arguments_give() {
     });
     let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(responses, vec!["hello from eu", "hello from us"]);
+}
+
+struct HttpReply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+fn exchange(port: u16, path: &str, body: &[u8], headers: &[(&str, &str)]) -> HttpReply {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )
+    .unwrap();
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n").unwrap();
+    }
+    stream.write_all(b"\r\n").unwrap();
+    stream.write_all(body).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").expect("an HTTP response");
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .map(|l| {
+            let (name, value) = l.split_once(':').unwrap();
+            (name.to_string(), value.trim().to_string())
+        })
+        .collect();
+    HttpReply {
+        status,
+        headers,
+        body: body.to_string(),
+    }
+}
+
+#[test_log::test]
+fn typed_http_preserves_metadata_status_and_repeated_headers() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/typed") as server
+        def handle(req: http::Request) => http::Response:
+            repeated := ""
+            for h in req.headers():
+                if h.name() == "X-Input":
+                    repeated += h.value() + ";"
+            http::Response::new(201, box([
+                http::Header::new("X-Output", "one"),
+                http::Header::new("X-Output", "two"),
+            ]), req.method() + " " + req.target() + " " + req.body() + " " + repeated)
+        server::respond([handle(req) for req in server::requests])
+    "#};
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        tx.send(exchange(
+            port,
+            "/typed?query=yes",
+            "héllo".as_bytes(),
+            &[("X-Input", "a"), ("X-Input", "b")],
+        ))
+        .unwrap();
+    });
+    let reply = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(reply.status, 201);
+    assert_eq!(reply.body, "POST /typed?query=yes héllo a;b;");
+    let repeated: Vec<_> = reply
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("X-Output"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(repeated, ["one", "two"]);
+}
+
+#[test_log::test]
+fn typed_http_rejects_non_utf8_without_poisoning_the_route() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/text") as server
+        server::respond([http::ok_text(req.body()) for req in server::requests])
+    "#};
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let bad = exchange(port, "/text", &[0xff], &[]);
+        let good = exchange(port, "/text", "λ".as_bytes(), &[]);
+        tx.send((bad, good)).unwrap();
+    });
+    let (bad, good) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(bad.status, 400);
+    assert_eq!(good.status, 200);
+    assert_eq!(good.body, "λ");
+}
+
+#[rstest]
+#[case::wrong_route(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/left") as left
+    run std::http::serve(port="{PORT}", method="POST", path="/right") as right
+    left::respond([http::ok_text(r.body()) for r in right::requests])
+    right::respond([http::ok_text(r.body()) for r in left::requests])
+"#}, "Conflicting Types: left::Reqs | right::Reqs")]
+#[case::missing_keys(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/typed") as server
+    server::respond([http::ok_text(r.body()) for r in server::requests if r.body() == "only"])
+"#}, "domain")]
+#[case::nominal_response(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/typed") as server
+    server::respond([r.body() for r in server::requests])
+"#}, "Response")]
+#[case::missing_connection(indoc! {r#"
+    run std::http::serve(port="{PORT}", method="POST", path="/typed") as server
+"#}, "no feed or define")]
+#[case::conditional_connection(indoc! {r#"
+    import std::http
+    enabled = sum([1 for line in stdin()]) > 0
+    run std::http::serve(port="{PORT}", method="POST", path="/typed") as server
+    if enabled:
+        server::respond([http::ok_text(r.body()) for r in server::requests])
+    else:
+        ()
+    0
+"#}, "<<= must occur as a top-level statement")]
+#[case::repeated_connection(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/typed") as server
+    server::respond([http::ok_text(r.body()) for r in server::requests])
+    server::respond([http::ok_text(r.body()) for r in server::requests])
+"#}, "multiple definitions")]
+fn typed_http_rejects_invalid_response_contracts(#[case] template: &str, #[case] needle: &str) {
+    let code = template.replace("{PORT}", &reserve_test_port().to_string());
+    let loaded = LoadedProgram::test(&code);
+    let result = compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {}));
+    let errors = match result {
+        Ok(_) => panic!("invalid response contract compiled"),
+        Err(e) => e,
+    };
+    let text = cambra::ccl::context::render_errors(&errors, loaded.sources());
+    assert!(text.contains(needle), "expected {needle:?}: {text}");
+}
+
+#[test_log::test]
+fn a_response_waits_for_its_complete_header_list() {
+    use cambra::{
+        ccl::Type,
+        interpreter::{BaseType, Extent, Predicate, TestDataSource, Value},
+    };
+    use std::{cell::RefCell, rc::Rc};
+    let control = Rc::new(RefCell::new(TestDataSource::new(
+        "control",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/later") as server
+        later = "seven" if sum(control()) == 7 else "other"
+        server::respond([
+            http::Response::new(202, box([
+                http::Header::new("X-Later", later) for unused in [0]
+            ]), req.body())
+            for req in server::requests
+        ])
+    "#};
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(control.clone());
+    let loaded = LoadedProgram::test(&code);
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        tx.send(exchange(port, "/later", b"ready body", &[]))
+            .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < deadline {
+        ctx.scheduler().check_for_notifications();
+        assert!(
+            rx.try_recv().is_err(),
+            "response sent before its headers completed"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    control
+        .borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(7))]);
+    control.borrow_mut().set_yield_predicate(Predicate::True);
+    let reply = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(reply.status, 202);
+    assert_eq!(reply.body, "ready body");
+    assert!(
+        reply
+            .headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("X-Later") && v == "seven")
+    );
+}
+
+#[test_log::test]
+fn invalid_response_headers_fail_one_request_and_leave_the_route_usable() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/headers") as server
+        server::respond([
+            http::Response::new(200, box([
+                http::Header::new("X-Echo", req.body()) for unused in [0]
+            ]), "body")
+            for req in server::requests
+        ])
+    "#};
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let bad = exchange(port, "/headers", b"unsafe\r\nX-Injected: yes", &[]);
+        let good = exchange(port, "/headers", b"valid", &[]);
+        tx.send((bad, good)).unwrap();
+    });
+    let (bad, good) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(bad.status, 500);
+    assert!(
+        !bad.headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("X-Injected"))
+    );
+    assert_eq!(good.status, 200);
+    assert_eq!(good.body, "body");
+    assert!(
+        good.headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("X-Echo") && v == "valid")
+    );
 }
