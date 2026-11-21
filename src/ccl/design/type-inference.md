@@ -1002,15 +1002,19 @@ every handle a value holds, in one place per holder:
 
 The walk reports a handle where the value holds it and does not follow what is recorded on the
 handle: a variable's bounds and a capability variable's incoming edges are the run's, not the
-value's. A term can be quoted by many types, and an ordering requirement holds types and
-capabilities of its own, so a visitor decides whether to enter each one.
+value's. A term can be quoted by many types, so a visitor decides whether to enter each one.
 
-`assert_settled` reads a tree, an error's types and a scheme through it, and panics on a capability
-variable or an undecided ordering requirement still held once capabilities are closed. A
-requirement no run recorded, one a written clause states, has no `home` and holds nothing of a run.
-The check does not enter a closed requirement: `close_requirements` closes the capabilities of the
-function types in its positions but not the variables and nested requirements they hold, so a
-closed requirement still holds the run's state.
+The same trait rewrites what a value holds in place (`rewrite_held`), entering the parts the walk
+reports. At each capability value and each ordering requirement it asks the rewriter
+(`HeldRewriter`) for a replacement, and then enters what the answer holds. A rewriter that replaces
+an ordering requirement rewrites the requirement's parts itself
+(`Requirement::rewrite_ordering_parts`), so it decides how a requirement nested in its own
+capabilities is met. A term a type quotes is rewritten through `PredMemo::rebuild`, so every
+occurrence of a shared term reads one rewritten copy.
+
+`assert_settled` reads a tree, an error's types and a scheme through the walk, and panics on a
+capability variable or an ordering requirement that is not closed, inside a closed requirement
+included, once the run is settled ([Settling capabilities](#settling-capabilities)).
 
 ### Copying solver state
 
@@ -5181,19 +5185,31 @@ projection's sum, a family's arguments (`settle_capabilities` in `solve.rs`). A 
 before coalesce settles its tree the same way (`run_once` in `infer/mod.rs`), since the passes after
 a failed inference still read it.
 
-Settling closes the types in the tree too: a function type's capabilities become the set they
-resolve to, and an ordering requirement in any set becomes one whose capabilities are known and
-whose answer is decided by the run, since its capabilities no longer say whether an effect input is
-open (`Requirement::closed`). Every run, failed or not, also closes the types its errors hold, the
-schemes it records and the ordering requirements of its top level (`close_outputs`). Nothing of a
-run's capability variables leaves it, which debug builds check.
-
 A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
 arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one
 clone has one set of capabilities at each node. Uses whose arguments bring different capabilities
 therefore share no clone: the specialization key holds, at each function position of the use's type,
 what the function there requires and causes, resolved (`spec_key`'s `KeyView::capabilities`). A use
 inside a clone instantiated through the clone's copies.
+
+#### Settling capabilities
+
+Settling is one rewrite of what each value holds (`Settler`, through `HoldsSolverState`'s
+`rewrite_held`):
+
+- a capability value, a node's slot or a function type's, becomes the set it resolves to, each
+  raised exception at its resolved type;
+- an ordering requirement the run has not closed becomes a closed one (`Requirement::closed`): the
+  run decides whether it is satisfied now, while its capabilities can still say whether an effect
+  input is open, and what it holds is settled by the same rewrite. That covers its positions, its
+  source's type, its capabilities and its assumptions;
+- an ordering requirement met inside its own parts, a loop's body requiring what the loop does, is
+  closed to the run's answer with no capabilities;
+- a requirement a run closed is entered like any other value.
+
+Every run, failed or not, also settles the types its errors hold, the schemes it records and the
+capabilities of its top level (`close_outputs`). Nothing of a run's capability variables or open
+ordering requirements leaves it, which debug builds check (`assert_settled`).
 
 ### Discharging capabilities
 

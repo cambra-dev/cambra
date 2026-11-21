@@ -1826,6 +1826,33 @@ impl Children {
         )
     }
 
+    /// These parts with what each holds rewritten, the types a part's `try` catches included
+    /// ([`crate::ccl::infer::solver::held::HoldsSolverState::rewrite_held`]); `None` where none changed.
+    fn rewrite_parts(
+        &self,
+        m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter,
+    ) -> Option<Children> {
+        use crate::ccl::infer::solver::held::HoldsSolverState;
+        let mut changed = false;
+        let parts = self
+            .parts
+            .iter()
+            .map(|(part, catches)| {
+                let mut part = part.clone();
+                changed |= part.rewrite_held(m);
+                let catches = catches.as_ref().map(|catches| {
+                    let mut rewritten: Vec<crate::ccl::Type> = catches.to_vec();
+                    for ty in &mut rewritten {
+                        changed |= ty.rewrite_held(m);
+                    }
+                    Rc::from(rewritten)
+                });
+                (part, catches)
+            })
+            .collect();
+        changed.then(|| Children::new(parts, self.begin))
+    }
+
     fn new(parts: Vec<(Capabilities, Option<Rc<[crate::ccl::Type]>>)>, begin: bool) -> Self {
         Children {
             parts,
@@ -3758,6 +3785,35 @@ impl crate::ccl::infer::solver::held::HoldsSolverState for Capabilities {
             }
         }
     }
+    fn rewrite_held(&mut self, m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter) -> bool {
+        let mut changed = false;
+        if let Some(replaced) = m.capabilities(self) {
+            changed = replaced != *self;
+            *self = replaced;
+        }
+        let rewritten = match self.repr() {
+            Repr::Known(set) => {
+                let mut set = set.clone();
+                set.rewrite_held(m).then(|| Capabilities::known(set))
+            }
+            Repr::Var(_) => None,
+            Repr::Written(written) => {
+                let mut written = written.clone();
+                written
+                    .set
+                    .rewrite_held(m)
+                    .then(|| Capabilities::written(written))
+            }
+            Repr::Children(children) => children
+                .rewrite_parts(m)
+                .map(|children| Capabilities(Rc::new(Repr::Children(children)))),
+        };
+        if let Some(rewritten) = rewritten {
+            *self = rewritten;
+            changed = true;
+        }
+        changed
+    }
 }
 
 impl crate::ccl::infer::solver::held::HoldsSolverState for CapabilitySet {
@@ -3775,6 +3831,30 @@ impl crate::ccl::infer::solver::held::HoldsSolverState for CapabilitySet {
             v.held(Held::Capability(Rc::clone(var)));
         }
     }
+
+    /// The variables a set names, [`CapabilitySet::vars`], are kept: only a rendering collects
+    /// them, after its run has settled what it renders.
+    fn rewrite_held(&mut self, m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter) -> bool {
+        let mut changed = false;
+        self.requires = std::mem::take(&mut self.requires)
+            .into_iter()
+            .map(|mut r| {
+                changed |= r.rewrite_held(m);
+                r
+            })
+            .collect();
+        self.causes = std::mem::take(&mut self.causes)
+            .into_iter()
+            .map(|e| match e {
+                Effect::Raise(mut raised) => {
+                    changed |= raised.ty.rewrite_held(m);
+                    Effect::Raise(raised)
+                }
+                e => e,
+            })
+            .collect();
+        changed
+    }
 }
 
 impl crate::ccl::infer::solver::held::HoldsSolverState for Requirement {
@@ -3783,9 +3863,6 @@ impl crate::ccl::infer::solver::held::HoldsSolverState for Requirement {
         self.0.walk_held(v);
         if let Some(order) = &self.1 {
             v.held(Held::Ordering(self.clone()));
-            if !v.enter_ordering(order) {
-                return;
-            }
             order.positions.walk_held(v);
             if let Some(iter) = &order.iter {
                 iter.walk_held(v);
@@ -3795,6 +3872,49 @@ impl crate::ccl::infer::solver::held::HoldsSolverState for Requirement {
                 assumption.walk_held(v);
             }
         }
+    }
+    fn rewrite_held(&mut self, m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter) -> bool {
+        let mut changed = self.0.rewrite_held(m);
+        if self.1.is_some() {
+            if let Some(replaced) = m.ordering(self) {
+                *self = replaced;
+                return true;
+            }
+            changed |= self.rewrite_ordering_parts(m);
+        }
+        changed
+    }
+}
+
+impl Requirement {
+    /// Rewrite what this ordering requirement holds, the parts a walk enters: its positions,
+    /// its source's type, its capabilities and its assumptions
+    /// ([`crate::ccl::infer::solver::held::HoldsSolverState::rewrite_held`]). Whether any changed.
+    pub(crate) fn rewrite_ordering_parts(
+        &mut self,
+        m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter,
+    ) -> bool {
+        use crate::ccl::infer::solver::held::HoldsSolverState;
+        let Some(order) = &self.1 else {
+            return false;
+        };
+        let mut order = (**order).clone();
+        let mut changed = order.positions.rewrite_held(m);
+        if let Some(iter) = &mut order.iter {
+            changed |= iter.rewrite_held(m);
+        }
+        changed |= order.capabilities.rewrite_held(m);
+        for assumption in &mut order.assumptions {
+            let mut rewritten = (**assumption).clone();
+            if rewritten.rewrite_held(m) {
+                *assumption = Rc::new(rewritten);
+                changed = true;
+            }
+        }
+        if changed {
+            self.1 = Some(Rc::new(order));
+        }
+        changed
     }
 }
 
