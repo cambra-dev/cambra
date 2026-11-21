@@ -295,7 +295,7 @@ impl<'m> Walk<'m> {
             // parameter's bound is a child of its `Poly`.
             | Type::WitnessRef(_)
             | Type::Param(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_) => {}
             Type::Poly(poly) => poly.types().for_each(|t| self.ty(t)),
             // A projected sum and a family's arguments are terms the type quotes. They bind no

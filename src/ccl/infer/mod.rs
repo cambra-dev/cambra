@@ -157,7 +157,7 @@ fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> Option<
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::SharedHole(_)
             | Type::DataSource(_)
             | Type::ChanDom(_, _)
@@ -1045,7 +1045,7 @@ fn unavailable_contracts(tree: &Expr) -> HashSet<Name> {
                 ty,
                 Type::Hole
                     | Type::Infer(_)
-                    | Type::BarrierVar(_)
+                    | Type::BarrierHole(_)
                     | Type::SharedHole(_)
                     | Type::BoundedHole(_)
             )

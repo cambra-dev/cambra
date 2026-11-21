@@ -1,4 +1,5 @@
-//! Solving barrier variables: checking each [`BarrierVar`]'s upper bounds against its
+//! Solving barrier variables: checking each barrier variable's ([`InferVar::opaque`]) upper
+//! bounds against its
 //! resolution, the phase that runs between constraint emission and compaction.
 //!
 //! A barrier variable's resolution is the join of its lower bounds with the refinements at
@@ -14,7 +15,7 @@ use std::rc::Rc;
 
 use crate::ccl::infer::InferError;
 use crate::ccl::infer_var::{BarrierCheck, Origin};
-use crate::ccl::{BarrierVar, Name, Type};
+use crate::ccl::{InferVar, Name, Type};
 
 use super::coalesce::coalesce_position;
 use super::constrain::{ConstrainCache, ConstrainError, constrain_opaque_upper};
@@ -69,7 +70,7 @@ const MAX_ROUNDS: usize = 64;
 ///
 /// A check runs `constrain`, which can add a lower bound to another barrier variable or a
 /// bound to a variable inside another one's resolution, so one round is not enough: the
-/// loop runs until every variable's memo ([`BarrierVar::checked`]) matches the graph. A
+/// loop runs until every variable's memo ([`InferVar::checked`]) matches the graph. A
 /// variable whose resolution is unchanged has only its newly arrived upper bounds checked.
 /// A variable that fails is reported once and not checked again.
 ///
@@ -79,7 +80,7 @@ pub fn solve_barrier_vars(solver: &mut Solver) -> Vec<BarrierFailure> {
     let mut failures = Vec::new();
     for _ in 0..MAX_ROUNDS {
         let mut checked_any = false;
-        for barrier in solver.barrier_vars().to_vec() {
+        for barrier in solver.barrier_vars() {
             checked_any |= check_barrier(solver, &barrier, &mut failures);
         }
         if !checked_any {
@@ -96,7 +97,7 @@ pub fn solve_barrier_vars(solver: &mut Solver) -> Vec<BarrierFailure> {
 /// bound was checked, which is when the graph may have changed.
 fn check_barrier(
     solver: &mut Solver,
-    barrier: &Rc<BarrierVar>,
+    barrier: &Rc<InferVar>,
     failures: &mut Vec<BarrierFailure>,
 ) -> bool {
     let previous = barrier.checked(solver);
@@ -105,7 +106,7 @@ fn check_barrier(
         Some(BarrierCheck::Passed { resolution, uppers }) => (resolution, uppers),
         None => (None, 0),
     };
-    let uppers = barrier.uppers(solver).to_vec();
+    let uppers = barrier.barrier_uppers(solver);
     let (own, escaped) = super::compact::barrier_resolution(solver, barrier);
     if uppers.is_empty() && escaped.is_empty() {
         barrier.record_check(
@@ -141,7 +142,7 @@ fn check_barrier(
         return false;
     };
     if !escaped.is_empty() {
-        let origin = barrier.lowers(solver).iter().find_map(|b| b.origin);
+        let origin = barrier.bounds(solver).lower().iter().find_map(|b| b.origin);
         failures.push(BarrierFailure::Escape {
             names: escaped,
             resolved,
@@ -160,7 +161,7 @@ fn check_barrier(
         return false;
     }
     // The resolution's value comes from the lower bounds, as an `Escape` reports it.
-    let value = barrier.lowers(solver).iter().find_map(|b| b.origin);
+    let value = barrier.bounds(solver).lower().iter().find_map(|b| b.origin);
     let mut cache = ConstrainCache::new();
     for upper in &uppers[first_unchecked..] {
         if let Err(error) = constrain_opaque_upper(solver, &resolved, value, upper, &mut cache) {

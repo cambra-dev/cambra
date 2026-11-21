@@ -11,8 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use smol_str::SmolStr;
 
 use crate::ccl::{
-    BarrierVar, BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils,
-    symbolic,
+    BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic,
 };
 
 /// The introduction level riding a [`Type::ChanDom`] — deliberately
@@ -1469,10 +1468,12 @@ pub enum Type {
     ///
     /// See `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
     BoundedHole(Box<Type>),
-    /// Unresolved type that needs to hide opaque variables from the
-    /// outer scope, identified by a unique [`crate::ccl::BarrierVarId`].
-    /// Gathers its lower bounds.
-    BarrierVar(Rc<BarrierVar>),
+    /// A lambda body's output annotation, which hides the opaque binders `opaque_output` found
+    /// the body binding: what the body produces with the refinements naming them dropped
+    /// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's opaque
+    /// binders"). A pre-inference marker, as [`Type::Hole`] is: normalization replaces it
+    /// with a barrier variable ([`InferVar::barrier`]), so the solver never meets one.
+    BarrierHole(Rc<[crate::ccl::Name]>),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -3223,7 +3224,7 @@ fn fmt_type(
         // The mirror of `BoundedHole`'s `<:𝑇`. Rendered by identity like
         // `Infer`'s `?N`, never by reading `lowers`, which may be cyclic or
         // mutably borrowed.
-        Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
+        Type::BarrierHole(_) => write!(f, "_"),
         Type::UIntRange(n) => write!(f, "0..{n}"),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
         // function (and an unresolved kind var), `⤇` for a data collection
@@ -4362,7 +4363,7 @@ impl Type {
     pub fn names_no_variable(&self) -> bool {
         if matches!(
             self,
-            Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
+            Type::Infer(_) | Type::Param(_) | Type::BarrierHole(_) | Type::Hole
         ) {
             return false;
         }
@@ -4838,7 +4839,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -4884,7 +4885,7 @@ impl Type {
                     | Type::Hole
                     | Type::SharedHole(_)
                     | Type::BoundedHole(_)
-                    | Type::BarrierVar(_)
+                    | Type::BarrierHole(_)
                     | Type::Refinement(..)
             )
         })
@@ -4958,7 +4959,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -5035,7 +5036,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)

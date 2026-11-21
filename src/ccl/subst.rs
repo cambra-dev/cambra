@@ -2631,7 +2631,7 @@ impl Subst {
             // A type parameter names no term binder; its bound is a child of the
             // `Poly` that declares it, reached by the arm below.
             | Type::Param(_)
-            | Type::BarrierVar(_) => {}
+            | Type::BarrierHole(_) => {}
             // A projected sum and a family's arguments are terms the type quotes, each rebuilt
             // once per substitution as a predicate is. They bind no element, so the
             // substitution acts on each whole, and as on a collection's domain, which a witness
@@ -3084,7 +3084,7 @@ impl Subst {
             | Type::Hole
             | Type::SharedHole(_)
             | Type::Param(_)
-            | Type::BarrierVar(_) => ty.clone(),
+            | Type::BarrierHole(_) => ty.clone(),
             Type::Infer(v) => self.suspended(solver, v),
             Type::Poly(poly) => Type::Poly(Rc::new(
                 poly.map_types(|t| self.apply_type_inner(solver, t)),
@@ -3577,7 +3577,7 @@ pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
 /// [`InferError::UnresolvedBoundedHole`](crate::ccl::infer::InferError::UnresolvedBoundedHole),
 /// not by this test.
 pub fn type_contains_infer(ty: &Type) -> bool {
-    ty.holds_type(&|ty| matches!(ty, Type::Infer(_) | Type::BarrierVar(_)))
+    ty.holds_type(&|ty| matches!(ty, Type::Infer(_) | Type::BarrierHole(_)))
 }
 
 /// Every stored dependent function in `ty` whose codomain still references its
@@ -4369,7 +4369,7 @@ impl<'a> PiWalk<'a> {
             | Type::Hole
             | Type::SharedHole(_)
             | Type::Param(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_) => {}
             Type::Poly(poly) => Rc::make_mut(poly)
                 .types_mut()
@@ -4679,7 +4679,7 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             | Type::ChanDom(..)
             | Type::Txn
             | Type::Hole
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::SharedHole(_)
             | Type::Param(_)
             | Type::Infer(_) => false,

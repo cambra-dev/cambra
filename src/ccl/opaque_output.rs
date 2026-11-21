@@ -1,4 +1,4 @@
-//! Binding a lambda's result under an [`BarrierVar`](crate::ccl::Type::BarrierVar)
+//! Binding a lambda's result under a [`BarrierHole`](crate::ccl::Type::BarrierHole)
 //! annotation when the body binds an opaque variable.
 //!
 //! [`run`] is the phase, between [`crate::ccl::comprehension`] and
@@ -6,13 +6,13 @@
 //! an [opaque](crate::ccl::BindingTransparency::Opaque) variable to
 //!
 //! ```text
-//! λ x → let __output : ⟨barrier variable⟩ = body in __output
+//! λ x → let __output : ⟨barrier⟩ = body in __output
 //! ```
 //!
-//! The annotation is a fresh `Type::BarrierVar` per lambda, which records the
-//! opaque binders the body binds. An opaque binder withholds its definiens, so a
-//! type leaving its scope cannot read the binder back as anything else. The
-//! barrier variable is the slot at which the body's type leaves the scope of
+//! The annotation is a `Type::BarrierHole` per lambda, which names the opaque binders the body
+//! binds. An opaque binder withholds its definiens, so a type leaving its scope cannot read the
+//! binder back as anything else. Inference mints a barrier variable for the annotation
+//! ([`crate::ccl::InferVar::barrier`]), the slot at which the body's type leaves the scope of
 //! every opaque binder inside it.
 //!
 //! A lambda is left alone in two cases:
@@ -34,7 +34,7 @@ use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BarrierVar, BindingTransparency, Expr, Name, Type, TypedBinding, TypedExprNode,
+    BindingTransparency, Expr, Name, Type, TypedBinding, TypedExprNode,
     provenance::{self, Nature},
 };
 
@@ -125,7 +125,7 @@ fn is_concrete(ty: &Type) -> bool {
             | Type::SharedHole(_)
             | Type::BoundedHole(_)
             | Type::Infer(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
     ) {
         return false;
     }
@@ -189,7 +189,7 @@ fn wrap(body: Expr, opaque: Rc<[Name]>) -> Expr {
     let output = Name::output();
     // Minted without bounds: normalizing the annotation replaces it with a fresh
     // barrier variable, which gathers the bounds during inference.
-    let barrier = Type::BarrierVar(BarrierVar::unowned(opaque));
+    let barrier = Type::BarrierHole(opaque);
     let binding = TypedBinding::new_annotated(
         output.clone(),
         Occurrence::mint(),
@@ -232,7 +232,7 @@ mod tests {
         else {
             return false;
         };
-        matches!(binding.annotation_ty(), Some(Type::BarrierVar(_)))
+        matches!(binding.annotation_ty(), Some(Type::BarrierHole(_)))
             && matches!(&tail.node, TypedExprNode::Var(n) if *n == binding.name)
             && matches!(
                 &binding.name,
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn each_wrap_mints_its_own_barrier_var() {
+    fn each_wrap_names_its_own_opaque_binders() {
         let (r, s) = (Name::fresh("r"), Name::fresh("s"));
         let out = run(Expr::tuple(vec![
             lambda(opaque_let(&r, Expr::var(r.clone()))),

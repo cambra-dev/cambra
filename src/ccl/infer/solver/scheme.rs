@@ -18,9 +18,7 @@ use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
 use crate::ccl::ty::{FunKind, FunKindVar};
-use crate::ccl::{
-    BarrierVar, BarrierVarId, Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr,
-};
+use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
 
 // ---------------------------------------------------------------------------
 // Polymorphic schemes
@@ -724,7 +722,6 @@ fn freshen_held(
     }
     match held {
         Held::Infer(v) => Held::Infer(copy_infer_var(solver, lim, v, target, cache)),
-        Held::Barrier(b) => Held::Barrier(copy_barrier_var(solver, lim, b, target, cache)),
         Held::FunKind(k) => Held::FunKind(copy_kind_var(solver, k, lim, target, cache)),
         Held::Capability(c) => Held::Capability(copy_capability_var(solver, lim, c, target, cache)),
         Held::Ordering(r) => Held::Ordering(copy_ordering(solver, lim, r, target, cache)),
@@ -752,7 +749,6 @@ fn freshen_handle<K: HeldKind + Clone>(
 fn held_above(solver: &mut Solver, lim: Level, held: &Held) -> bool {
     match held {
         Held::Infer(v) => v.level(solver) > lim,
-        Held::Barrier(b) => freshen_level(solver, &Type::BarrierVar(Rc::clone(b))) > lim,
         Held::FunKind(k) => kind_level(solver, k) > lim,
         Held::Capability(c) => c.level(solver) > lim,
         Held::Ordering(_) | Held::Obligation(_) => true,
@@ -891,7 +887,6 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
     // nothing else to freshen.
     let mut lvl = match ty {
         Type::Infer(v) => v.level(solver),
-        Type::BarrierVar(barrier) => barrier.level(solver),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
@@ -1029,10 +1024,8 @@ pub fn freshen_above(
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
         // the solver never sees one.
-        Type::BoundedHole(_) => {
-            unreachable!(
-                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
-            )
+        Type::BoundedHole(_) | Type::BarrierHole(_) => {
+            unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
         }
         Type::Base(_)
         | Type::UIntRange(_)
@@ -1343,10 +1336,6 @@ pub fn freshen_above(
             Type::Poly(Rc::new(out))
         }
         Type::Infer(tv) => Type::Infer(freshen_handle(solver, lim, tv, target, cache)),
-        // Freshens like `Infer`, over what a barrier variable carries ([`copy_barrier_var`]).
-        Type::BarrierVar(barrier) => {
-            Type::BarrierVar(freshen_handle(solver, lim, barrier, target, cache))
-        }
     }
 }
 
@@ -1411,7 +1400,17 @@ fn copy_infer_var(
                     None => tv.telescope.entered(cache.entered_binders.iter().cloned()),
                 },
             };
-            let v = InferVar::fresh_over(solver, new_level, &telescope, fun_kind);
+            // A barrier variable's copy is one, standing under the same opaque binders.
+            let v = match tv.opaque() {
+                Some(opaque) => InferVar::barrier_over(
+                    solver,
+                    new_level,
+                    &telescope,
+                    fun_kind,
+                    Rc::clone(opaque),
+                ),
+                None => InferVar::fresh_over(solver, new_level, &telescope, fun_kind),
+            };
             // The kinds the original sits under are this copy's kinds, whichever this walk
             // reaches first: a variable copied before the function it is a part of would
             // otherwise sit under the definition's kind, which nothing at the use relates to.
@@ -1551,70 +1550,36 @@ fn copy_infer_var(
             }
             cache.relate_kind_copy(solver, &tv.fun_kind, &v.fun_kind);
             let watches = tv.watches(solver).to_vec();
-            freshen_watches(
-                solver,
-                lim,
-                watches,
-                &|solver, original, copy, pos| copy.copy_watch(solver, original, pos, tv.uid, &v),
-                target,
-                cache,
-            );
+            if tv.is_barrier() {
+                // An upper bound's report is the edge's that recorded it, the copy's too.
+                for (i, upper) in tv.barrier_uppers(solver).iter().enumerate() {
+                    if let Some(report) = &upper.report {
+                        v.report_upper(solver, i, Rc::clone(report));
+                    }
+                }
+                // A barrier variable is never an operand, so the copy records the watch
+                // without `TraitObligation::watch`, which would make it one.
+                freshen_watches(
+                    solver,
+                    lim,
+                    watches,
+                    &|solver, _, copy, pos| v.watches_mut(solver).push((Rc::clone(copy), pos)),
+                    target,
+                    cache,
+                );
+            } else {
+                freshen_watches(
+                    solver,
+                    lim,
+                    watches,
+                    &|solver, original, copy, pos| {
+                        copy.copy_watch(solver, original, pos, tv.uid, &v)
+                    },
+                    target,
+                    cache,
+                );
+            }
             v
-        }
-    }
-}
-
-/// A new copy of `barrier`, as [`copy_infer_var`] copies a variable, over what a barrier
-/// variable carries: its opaque binders, its lower and upper bounds, and its watches. Its level
-/// is read from the bounds, so the copy's follows from the freshened ones. It has no telescope
-/// or kind to copy.
-fn copy_barrier_var(
-    solver: &mut Solver,
-    lim: Level,
-    barrier: &Rc<BarrierVar>,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-) -> Rc<BarrierVar> {
-    {
-        {
-            // Registered before the bounds are copied, so a bound that reaches this
-            // barrier variable again resolves to the copy.
-            let fresh =
-                BarrierVar::fresh(solver, Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
-            cache.record_copy(barrier, Rc::clone(&fresh));
-
-            // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = barrier.lowers(solver).to_vec();
-            let ups = barrier.uppers(solver).to_vec();
-            let mut freshen_bound = |b: &Bound| Bound {
-                origin: b.origin,
-                self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
-                ty: freshen_above(solver, lim, &b.ty, target, cache),
-                ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
-                rendered: Default::default(),
-            };
-            let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
-            let new_ups: Vec<_> = ups
-                .iter()
-                .map(|u| crate::ccl::BarrierUpper {
-                    bound: freshen_bound(&u.bound),
-                    report: u.report.clone(),
-                })
-                .collect();
-            *fresh.lowers_mut(solver) = new_lows;
-            *fresh.uppers_mut(solver) = new_ups;
-            // A barrier variable is never an operand, so the copy records the watch
-            // without `TraitObligation::watch`, which would make it one.
-            let watches = barrier.watches(solver).to_vec();
-            freshen_watches(
-                solver,
-                lim,
-                watches,
-                &|solver, _, copy, pos| fresh.watches_mut(solver).push((Rc::clone(copy), pos)),
-                target,
-                cache,
-            );
-            fresh
         }
     }
 }
@@ -1929,7 +1894,6 @@ pub fn seed_chan_dom_pairings(
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum BoundHolder {
     InferVar(InferVarId),
-    BarrierVar(BarrierVarId),
 }
 
 fn seed_pairings_go(
@@ -1951,11 +1915,19 @@ fn seed_pairings_go(
     // by its `Fun`). Descend through the bounds, once per var (`seen` guards
     // the cyclic bound graph). The use side is resolved; a placeholder var
     // there has no bounds and pairs nothing.
+    // A barrier variable resolves to the join of its lower bounds, so those carry its
+    // structure on either side; its upper bounds are checks against that join and add no
+    // position to pair.
     if let Type::Infer(dv) = peel(def_ty) {
         if seen.insert(BoundHolder::InferVar(dv.uid)) {
             let (lows, ups) = {
                 let s = dv.bounds(solver);
-                (Rc::clone(s.lower()), Rc::clone(s.upper()))
+                let ups = if dv.is_barrier() {
+                    Rc::new(Vec::new())
+                } else {
+                    Rc::clone(s.upper())
+                };
+                (Rc::clone(s.lower()), ups)
             };
             for b in lows.iter().chain(ups.iter()) {
                 seed_pairings_go(solver, use_ty, &b.ty, lim, out, seen);
@@ -1967,30 +1939,14 @@ fn seed_pairings_go(
         if seen.insert(BoundHolder::InferVar(uv.uid)) {
             let (lows, ups) = {
                 let s = uv.bounds(solver);
-                (Rc::clone(s.lower()), Rc::clone(s.upper()))
+                let ups = if uv.is_barrier() {
+                    Rc::new(Vec::new())
+                } else {
+                    Rc::clone(s.upper())
+                };
+                (Rc::clone(s.lower()), ups)
             };
             for b in lows.iter().chain(ups.iter()) {
-                seed_pairings_go(solver, &b.ty, def_ty, lim, out, seen);
-            }
-        }
-        return;
-    }
-    // A barrier variable resolves to the join of its lower bounds, so those carry its
-    // structure on either side. Its upper bounds are checks against that join and
-    // add no position to pair.
-    if let Type::BarrierVar(dh) = peel(def_ty) {
-        if seen.insert(BoundHolder::BarrierVar(dh.uid)) {
-            let lows = dh.lowers(solver).to_vec();
-            for b in &lows {
-                seed_pairings_go(solver, use_ty, &b.ty, lim, out, seen);
-            }
-        }
-        return;
-    }
-    if let Type::BarrierVar(uh) = peel(use_ty) {
-        if seen.insert(BoundHolder::BarrierVar(uh.uid)) {
-            let lows = uh.lowers(solver).to_vec();
-            for b in &lows {
                 seed_pairings_go(solver, &b.ty, def_ty, lim, out, seen);
             }
         }

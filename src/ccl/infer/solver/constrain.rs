@@ -25,8 +25,8 @@ use crate::ccl::infer_var::{GuardedBound, Origin};
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
-    BarrierUpper, BarrierVar, BarrierVarId, BaseType, Bound, HistoryKind, InferVar, InferVarId,
-    Level, Name, Refinement, RefinementSet, Type,
+    BarrierUpper, BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement,
+    RefinementSet, Type,
 };
 
 use super::barrier::EdgeReport;
@@ -307,9 +307,10 @@ pub struct ConstrainCache {
     /// and read by the caller with [`take_failure`](Self::take_failure).
     failure: Option<(Option<Origin>, Option<Origin>)>,
     /// The barrier variable upper bounds recorded since [`at`](Self::at), each as its
-    /// variable and its index in [`BarrierVar::uppers`], awaiting the report the edge's
+    /// variable and its index among its upper bounds ([`InferVar::barrier_uppers`]), awaiting
+    /// the report the edge's
     /// caller gives them ([`report_recorded`](Self::report_recorded)).
-    unreported: Vec<(Rc<BarrierVar>, usize)>,
+    unreported: Vec<(Rc<InferVar>, usize)>,
     /// The proxies extrusion has made in the current constraint walk, per target level.
     ///
     /// A proxy is linked to its original by a bound, so a bound the original gains later
@@ -415,7 +416,7 @@ impl ConstrainCache {
 
     fn stamp_recorded(&mut self, solver: &mut Solver, report: &Rc<EdgeReport>) {
         for (barrier, index) in self.unreported.drain(..) {
-            barrier.uppers_mut(solver)[index].report = Some(Rc::clone(report));
+            barrier.report_upper(solver, index, Rc::clone(report));
         }
     }
 
@@ -527,12 +528,10 @@ impl ConstrainCache {
 /// (see Parreaux 2020 §3.4).
 #[derive(Debug, Default)]
 pub struct ExtrudeCache {
-    /// Original inference variable → its proxy at the target level.
+    /// Original inference variable → its proxy at the target level, a barrier variable's
+    /// included. Registered before the proxy's bounds are extruded, so a bound reaching the
+    /// original again resolves to the proxy.
     pub vars: HashMap<(InferVarId, bool), Rc<InferVar>>,
-    /// Original barrier variable → its copy at the target level. Registered before the
-    /// copy's bounds are extruded, so a bound reaching the original again resolves to
-    /// the copy.
-    pub barrier_vars: HashMap<(BarrierVarId, bool), Rc<BarrierVar>>,
 }
 
 impl ExtrudeCache {
@@ -1329,7 +1328,7 @@ fn admits(
         TypeKind::Type => Ok(()),
         // A barrier variable is a head nothing has resolved yet, so it abstains.
         TypeKind::UIntRanges => match d {
-            Type::UIntRange(_) | Type::Hole | Type::SharedHole(_) | Type::BarrierVar(_) => Ok(()),
+            Type::UIntRange(_) | Type::Hole | Type::SharedHole(_) | Type::BarrierHole(_) => Ok(()),
             _ => Err(not_of_kind()),
         },
         TypeKind::SubtypesOf(_) | TypeKind::Enumerated(_) if open => Ok(()),
@@ -2360,26 +2359,36 @@ fn constrain_go_impl(
                 constrain_go(solver, w1, w0, &Subst::id(), &Subst::id(), cache, scope)
             })
         }
-        // Record the upper edge in native form (`H‹sl› <: rhs‹sr›`), as the
-        // `(Type::Infer(_), _)` arm below does. It is not closed against the lowers:
+        // A barrier variable's upper edge, recorded in native form (`H‹sl› <: rhs‹sr›`) as
+        // the `(Type::Infer(_), _)` arm below records one, and not closed against the lowers:
         // `solver::barrier::solve_barrier_vars` checks each upper against the variable's
-        // resolution once the lowers have arrived.
-        (Type::BarrierVar(barrier), rhs) if !matches!(rhs, Type::Infer(_)) => {
+        // resolution once the lowers have arrived. An edge to an ordinary variable is that
+        // variable's to record, as a lower bound it closes against its own uppers.
+        (Type::Infer(barrier), rhs)
+            if barrier.is_barrier()
+                && !is_ordinary_var(rhs)
+                && type_level(solver, rhs) <= barrier.level(solver) =>
+        {
             let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
                 .with_origin(cache.origins.1);
-            let uppers = barrier.uppers_mut(solver);
+            crate::ccl::infer_var::enforce_bound_scope(solver, barrier, "upper", &bound);
+            let uppers = barrier.bounds_mut(solver).upper_mut();
             cache.unreported.push((Rc::clone(barrier), uppers.len()));
-            uppers.push(BarrierUpper::unreported(bound));
+            uppers.push(bound);
             Ok(())
         }
-        // Record the lower edge in native form (`lhs‹sl› <: H‹sr›`), as the
-        // `(_, Type::Infer(_))` arm below does, and likewise not closed against the
-        // uppers. The contribution is delivered to the obligations watching a variable
+        // A barrier variable's lower edge (`lhs‹sl› <: H‹sr›`), likewise not closed against
+        // the uppers. The contribution is delivered to the obligations watching a variable
         // this one flows into (see `link_barrier_watches`).
-        (lhs, Type::BarrierVar(barrier)) if !matches!(lhs, Type::Infer(_)) => {
+        (lhs, Type::Infer(barrier))
+            if barrier.is_barrier()
+                && !is_ordinary_var(lhs)
+                && type_level(solver, lhs) <= barrier.level(solver) =>
+        {
             let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
                 .with_origin(cache.origins.0);
-            barrier.lowers_mut(solver).push(bound);
+            crate::ccl::infer_var::enforce_bound_scope(solver, barrier, "lower", &bound);
+            barrier.bounds_mut(solver).lower_mut().push(bound);
             notify_barrier_lower(solver, barrier, lhs, cache)
         }
         // There is deliberately **no deref arm here.** A mutable variable mention that denotes
@@ -2400,7 +2409,7 @@ fn constrain_go_impl(
         // existing lower (`low.ty‹low.ty_subst› <: V‹low.self_subst›`) against
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
-        (Type::Infer(lv), _) if type_level(solver, rhs) <= lv.level(solver) => {
+        (Type::Infer(lv), _) if !lv.is_barrier() && type_level(solver, rhs) <= lv.level(solver) => {
             crate::ccl::capabilities::lower_capability_levels(solver, rhs, lv.level(solver));
             let lows = {
                 let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
@@ -2502,7 +2511,7 @@ fn constrain_go_impl(
         // edge's forward morphism was reconstructed by inverting its stored
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
-        (_, Type::Infer(rv)) if type_level(solver, lhs) <= rv.level(solver) => {
+        (_, Type::Infer(rv)) if !rv.is_barrier() && type_level(solver, lhs) <= rv.level(solver) => {
             crate::ccl::capabilities::lower_capability_levels(solver, lhs, rv.level(solver));
             let ups = {
                 let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
@@ -2587,6 +2596,9 @@ fn constrain_go_impl(
                 notify_lower(solver, rv, lhs, cache)?;
             }
             match lhs {
+                Type::Infer(barrier) if barrier.is_barrier() => {
+                    link_barrier_watches(solver, barrier, rv, cache)?
+                }
                 Type::Infer(lv) => {
                     let into = edge_into_holder(solver, sl, sr);
                     link_watches(solver, lv, rv, &into, cache)
@@ -2605,7 +2617,6 @@ fn constrain_go_impl(
                 // A barrier variable's lowers are not closed against `rv`'s uppers, and
                 // `notify_lower` offers nothing for it, so the watch follows the edge
                 // down as it does for a var-var edge.
-                Type::BarrierVar(barrier) => link_barrier_watches(solver, barrier, rv, cache)?,
                 _ => {}
             }
             for up in ups.iter() {
@@ -3167,6 +3178,12 @@ fn copy_watches(solver: &mut Solver, from: &Rc<InferVar>, to: &Rc<InferVar>) {
     }
 }
 
+/// Whether `ty` is an ordinary inference variable: one that closes its bounds against each
+/// other, unlike a barrier variable ([`InferVar::opaque`]).
+fn is_ordinary_var(ty: &Type) -> bool {
+    matches!(ty, Type::Infer(v) if !v.is_barrier())
+}
+
 /// A type parameter in `ty`'s structure opened above `target_level`, if one is: the
 /// parameter an edge to a variable at `target_level` would carry out of its
 /// definition. Variables are not entered; an edge reaching one records the
@@ -3216,42 +3233,39 @@ pub fn extrude(
     match ty {
         // Not a type — an annotation-position obligation, erased by
         // `normalize_annotation` before any constraint is emitted (see `Type::BoundedHole`).
-        Type::BoundedHole(_) => {
-            unreachable!(
-                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
-            )
+        Type::BoundedHole(_) | Type::BarrierHole(_) => {
+            unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
         }
-        // A fresh barrier variable over the original's bounds, each extruded at `pol`.
-        // Its level is read from its bounds, so extruding them moves it to the target
-        // level. Both lists extrude at the same polarity: a positive extrusion widens
-        // the lowers, so the resolution can only grow, and widens the uppers it is
-        // checked against with it; a negative one narrows both.
+        // A barrier variable's proxy is a barrier variable at the target level over the
+        // original's bounds, each extruded at `pol`, standing where the original does. Both
+        // lists extrude at the same polarity: a positive extrusion widens the lowers, so the
+        // resolution can only grow, and widens the uppers it is checked against with it; a
+        // negative one narrows both. An ordinary proxy would close the original's lowers,
+        // refinements naming its opaque binders included, against what it flows into.
         //
-        // The copy is linked to the original through a fresh variable `?v` at the target
-        // level, as an `Infer` proxy is: `B <: ?v <: B'` at a positive extrusion,
-        // `B' <: ?v <: B` at a negative one. Each edge is recorded on the barrier
-        // variable, not on `?v`: a barrier variable's level is its bounds' maximum, so
-        // `?v` at the target level leaves `B'` there, and `?v` cannot hold `B` as a bound
-        // without sitting above the target level, so `?v` has no bounds of its own. A
-        // bound reaching `B` after a positive extrusion then reaches `B'` through the
+        // The proxy is linked to the original through a fresh variable `?v` at the target
+        // level: `B <: ?v <: B'` at a positive extrusion, `B' <: ?v <: B` at a negative one.
+        // A bound reaching `B` after a positive extrusion then reaches `B'` through the
         // barrier checks: `B`'s resolution is checked against `?v`, which records it as a
-        // lower bound of `?v`, and compacting `B'` reads the lower bounds of `?v`, one of
-        // its own lowers. A negative extrusion mirrors it with `B` and `B'` exchanged.
-        Type::BarrierVar(barrier) => {
-            if let Some(existing) = cache.barrier_vars.get(&(barrier.uid, pol)) {
-                return Type::BarrierVar(Rc::clone(existing));
+        // lower bound of `?v`, and compacting `B'` reads the lower bounds of `?v`, one of its
+        // own lowers. A negative extrusion mirrors it with `B` and `B'` exchanged.
+        Type::Infer(barrier) if barrier.is_barrier() => {
+            if let Some(existing) = cache.vars.get(&(barrier.uid, pol)) {
+                return Type::Infer(Rc::clone(existing));
             }
-            // Registered before the bounds are extruded, as `freshen_above` registers
-            // its copy: a bound reaching `B` through structure resolves to `B'` instead
-            // of extruding `B` again.
-            let fresh =
-                BarrierVar::fresh(solver, Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
-            cache
-                .barrier_vars
-                .insert((barrier.uid, pol), Rc::clone(&fresh));
+            let opaque = Rc::clone(
+                barrier
+                    .opaque()
+                    .expect("a barrier variable has opaque binders"),
+            );
+            // Registered before the bounds are extruded, as `freshen_above` registers its
+            // copy: a bound reaching `B` through structure resolves to `B'` instead of
+            // extruding `B` again.
+            let fresh = InferVar::barrier(solver, target_level, &barrier.telescope, opaque);
+            cache.vars.insert((barrier.uid, pol), Rc::clone(&fresh));
             // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = barrier.lowers(solver).to_vec();
-            let ups = barrier.uppers(solver).to_vec();
+            let lows = Rc::clone(barrier.bounds(solver).lower());
+            let ups = barrier.barrier_uppers(solver);
             let mut extrude_bound = |solver: &mut Solver, b: &Bound| Bound {
                 origin: b.origin,
                 self_subst: b.self_subst.clone(),
@@ -3262,27 +3276,29 @@ pub fn extrude(
             let new_lows: Vec<_> = lows.iter().map(|b| extrude_bound(solver, b)).collect();
             let new_ups: Vec<_> = ups
                 .iter()
-                .map(|u| BarrierUpper {
-                    bound: extrude_bound(solver, &u.bound),
-                    report: u.report.clone(),
-                })
+                .map(|u| extrude_bound(solver, &u.bound))
                 .collect();
-            *fresh.lowers_mut(solver) = new_lows;
-            *fresh.uppers_mut(solver) = new_ups;
-            // The bounds above are direct writes, so the copy carries the original's
-            // watches, as `copy_watches` gives a proxy its original's.
-            let watches = barrier.watches(solver).to_vec();
-            fresh.watches_mut(solver).extend(watches);
+            fresh.bounds_mut(solver).set_lower(new_lows);
+            fresh.bounds_mut(solver).set_upper(new_ups);
+            for (i, u) in ups.iter().enumerate() {
+                if let Some(report) = &u.report {
+                    fresh.report_upper(solver, i, Rc::clone(report));
+                }
+            }
+            // The bounds above are direct writes, so the proxy carries the original's
+            // watches, as an ordinary proxy does.
+            copy_watches(solver, barrier, &fresh);
             let link = Type::Infer(InferVar::fresh(solver, target_level));
             let (from, to) = if pol {
                 (barrier, &fresh)
             } else {
                 (&fresh, barrier)
             };
-            from.uppers_mut(solver)
-                .push(BarrierUpper::unreported(Bound::conc(link.clone())));
-            to.lowers_mut(solver).push(Bound::conc(link));
-            Type::BarrierVar(fresh)
+            from.bounds_mut(solver)
+                .upper_mut()
+                .push(Bound::conc(link.clone()));
+            to.bounds_mut(solver).lower_mut().push(Bound::conc(link));
+            Type::Infer(fresh)
         }
         Type::Base(_)
         | Type::UIntRange(_)
@@ -4043,23 +4059,30 @@ mod tests {
     fn extruding_a_barrier_reaching_itself_through_its_lower_reuses_the_copy() {
         let solver = &mut Solver::new();
         for pol in [true, false] {
-            let barrier = BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
-            let b = Type::BarrierVar(Rc::clone(&barrier));
+            // At level 1, the level its lower bound's domain stands at.
+            let barrier = InferVar::barrier(
+                solver,
+                1,
+                &crate::ccl::infer_var::Telescope::empty(),
+                Rc::from([]),
+            );
+            let b = Type::Infer(Rc::clone(&barrier));
             let domain = Type::Infer(InferVar::fresh(solver, 1));
             barrier
-                .lowers_mut(solver)
+                .bounds_mut(solver)
+                .lower_mut()
                 .push(Bound::conc(Type::fun(domain, b.clone())));
             let out = extrude(solver, &b, pol, 0, &mut ExtrudeCache::new());
-            let Type::BarrierVar(copy) = out else {
+            let Type::Infer(copy) = out else {
                 panic!("extruding a barrier variable yields one, got {out:?}");
             };
             assert_ne!(copy.uid, barrier.uid, "pol={pol}: the extrusion copies");
-            let lowers = copy.lowers(solver);
+            let lowers = copy.bounds(solver).lower();
             let Some(Type::Fun { codomain, .. }) = lowers.first().map(|b| &b.ty) else {
                 panic!("pol={pol}: the copy keeps the function lower, got {lowers:?}");
             };
             assert!(
-                matches!(&**codomain, Type::BarrierVar(c) if c.uid == copy.uid),
+                matches!(&**codomain, Type::Infer(c) if c.uid == copy.uid),
                 "pol={pol}: the copy's lower reaches the copy, got {codomain:?}"
             );
         }
@@ -4898,7 +4921,7 @@ mod tests {
         let (Type::Infer(a_var), Type::Infer(b_var)) = (&a, &b) else {
             unreachable!("fresh_var yields Type::Infer");
         };
-        let barrier = BarrierVar::fresh(
+        let barrier = crate::ccl::infer_var::test_barrier(
             solver,
             Rc::from(Vec::new()),
             vec![Bound::conc(fun(prim(BaseType::Int), a.clone()))],
@@ -4910,12 +4933,12 @@ mod tests {
         assert_eq!(barrier.level(solver), 1);
         let out = extrude(
             solver,
-            &Type::BarrierVar(Rc::clone(&barrier)),
+            &Type::Infer(Rc::clone(&barrier)),
             true,
             0,
             &mut ExtrudeCache::new(),
         );
-        let Type::BarrierVar(extruded) = &out else {
+        let Type::Infer(extruded) = &out else {
             panic!("extrude changed the constructor: {out}");
         };
         assert_ne!(
@@ -4923,9 +4946,9 @@ mod tests {
             "extrusion mints a fresh barrier variable"
         );
         assert_eq!(extruded.level(solver), 0);
-        assert_eq!(extruded.opaque, barrier.opaque);
-        let lows = extruded.lowers(solver);
-        let ups = extruded.uppers(solver);
+        assert_eq!(extruded.opaque(), barrier.opaque());
+        let lows = extruded.bounds(solver).lower();
+        let ups = extruded.barrier_uppers(solver);
         assert_eq!((lows.len(), ups.len()), (2, 1));
 
         let Type::Infer(link) = &lows[1].ty else {
@@ -4937,7 +4960,7 @@ mod tests {
         assert_eq!(link.level(solver), 0);
         assert!(
             barrier
-                .uppers(solver)
+                .barrier_uppers(solver)
                 .iter()
                 .any(|bd| bd.bound.ty == lows[1].ty),
             "`B` should flow into the link that flows into `B'`"
@@ -4997,7 +5020,7 @@ mod tests {
         let (Type::Infer(a_var), Type::Infer(b_var)) = (&a, &b) else {
             unreachable!("fresh_var yields Type::Infer");
         };
-        let barrier = BarrierVar::fresh(
+        let barrier = crate::ccl::infer_var::test_barrier(
             solver,
             Rc::from(Vec::new()),
             vec![Bound::conc(fun(prim(BaseType::Int), a.clone()))],
@@ -5009,12 +5032,12 @@ mod tests {
         assert_eq!(barrier.level(solver), 1);
         let out = extrude(
             solver,
-            &Type::BarrierVar(Rc::clone(&barrier)),
+            &Type::Infer(Rc::clone(&barrier)),
             false,
             0,
             &mut ExtrudeCache::new(),
         );
-        let Type::BarrierVar(extruded) = &out else {
+        let Type::Infer(extruded) = &out else {
             panic!("extrude changed the constructor: {out}");
         };
         assert_ne!(
@@ -5022,9 +5045,9 @@ mod tests {
             "extrusion mints a fresh barrier variable"
         );
         assert_eq!(extruded.level(solver), 0);
-        assert_eq!(extruded.opaque, barrier.opaque);
-        let lows = extruded.lowers(solver);
-        let ups = extruded.uppers(solver);
+        assert_eq!(extruded.opaque(), barrier.opaque());
+        let lows = extruded.bounds(solver).lower();
+        let ups = extruded.barrier_uppers(solver);
         assert_eq!((lows.len(), ups.len()), (1, 2));
 
         let Type::Infer(link) = &ups[1].bound.ty else {
@@ -5036,14 +5059,15 @@ mod tests {
         assert_eq!(link.level(solver), 0);
         assert!(
             barrier
-                .lowers(solver)
+                .bounds(solver)
+                .lower()
                 .iter()
                 .any(|bd| bd.ty == ups[1].bound.ty),
             "`B'` should flow into the link that flows into `B`"
         );
         assert!(
             !barrier
-                .uppers(solver)
+                .barrier_uppers(solver)
                 .iter()
                 .any(|bd| bd.bound.ty == ups[1].bound.ty),
             "a negative extrusion links `B` from below only"
@@ -5097,7 +5121,7 @@ mod tests {
         // the extrusion flows out through `B'` as one reaching an extruded `InferVar`
         // flows into its proxy, so the check fails.
         let a = fresh_var(solver, 1);
-        let barrier = BarrierVar::fresh(
+        let barrier = crate::ccl::infer_var::test_barrier(
             solver,
             Rc::from(Vec::new()),
             vec![Bound::conc(fun(prim(BaseType::Int), a))],
@@ -5106,7 +5130,7 @@ mod tests {
         assert_eq!(barrier.level(solver), 1);
         let extruded = extrude(
             solver,
-            &Type::BarrierVar(Rc::clone(&barrier)),
+            &Type::Infer(Rc::clone(&barrier)),
             true,
             0,
             &mut ExtrudeCache::new(),
@@ -5122,7 +5146,7 @@ mod tests {
         constrain_subtype(
             solver,
             &fun(prim(BaseType::Int), prim(BaseType::Bool)),
-            &Type::BarrierVar(Rc::clone(&barrier)),
+            &Type::Infer(Rc::clone(&barrier)),
             &mut cache,
         )
         .expect("the original barrier variable takes the later lower bound");
@@ -5149,7 +5173,7 @@ mod tests {
         // resolution `Int ⇒ (Int ∨ Bool)` would not coalesce, which the barrier check
         // skips rather than reports.
         let b = fresh_var(solver, 1);
-        let barrier = BarrierVar::fresh(
+        let barrier = crate::ccl::infer_var::test_barrier(
             solver,
             Rc::from(Vec::new()),
             Vec::new(),
@@ -5158,7 +5182,7 @@ mod tests {
         assert_eq!(barrier.level(solver), 1);
         let extruded = extrude(
             solver,
-            &Type::BarrierVar(Rc::clone(&barrier)),
+            &Type::Infer(Rc::clone(&barrier)),
             false,
             0,
             &mut ExtrudeCache::new(),
@@ -5173,7 +5197,7 @@ mod tests {
         .expect("the extruded barrier variable takes the outer lower bound");
         constrain_subtype(
             solver,
-            &Type::BarrierVar(Rc::clone(&barrier)),
+            &Type::Infer(Rc::clone(&barrier)),
             &fun(prim(BaseType::Int), prim(BaseType::Int)),
             &mut cache,
         )

@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::ccl::capabilities::{
     CapabilityRun, CapabilityState, CapabilityVar, OrderableIfRequiredBy, OrderingState,
 };
-use crate::ccl::infer_var::{
-    BarrierState, BarrierVar, InferBounds, InferState, InferVar, InferVarId, SuspendedMemberships,
-};
+use crate::ccl::infer_var::{InferBounds, InferState, InferVar, InferVarId, SuspendedMemberships};
 use crate::ccl::ty::{FunKindState, FunKindVar};
 
 /// Identity of a [`Solver`], so a handle can tell the solver that minted it from any other.
@@ -37,8 +35,7 @@ static SOLVER_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Every write to such state goes through an accessor on [`Solver`] that moves its count: a
 /// kind's `*_state_mut`, [`Solver::funkind_names_mut`] for the binder names a funkind variable
 /// settles on, which [`FunKindVar::resolved`] does not read, and [`Solver::capability_run_mut`].
-/// No cached answer reads a barrier
-/// variable's state, so it has no count; a cache that does would add one there. A cached answer
+/// A cached answer
 /// records the counts of everything it reads ([`Solver::funkind_revision`],
 /// [`Solver::capability_revision`]) and is reused only while they stand, so no write it reads
 /// can outlive it, while a write to state it does not read leaves it standing. Caches live
@@ -231,8 +228,6 @@ pub struct Solver {
     infer_slots: HashMap<InferVarId, usize>,
     /// What is recorded on each funkind variable.
     funkinds: Table<FunKindVar, FunKindState>,
-    /// What is recorded on each barrier variable.
-    barriers: Table<BarrierVar, BarrierState>,
     /// What is recorded on each capability variable.
     capabilities: Table<CapabilityVar, CapabilityState>,
     /// What is recorded on each ordering requirement the run made.
@@ -316,7 +311,6 @@ impl Solver {
             infer: Table::default(),
             infer_slots: HashMap::new(),
             funkinds: Table::default(),
-            barriers: Table::default(),
             capabilities: Table::default(),
             orderings: Table::default(),
             reading: 0,
@@ -480,7 +474,7 @@ impl Solver {
     /// Whether no operation has minted or recorded a variable here: what ran through this solver
     /// read no variable's state it would have recorded, so it reads the same through any other.
     pub(crate) fn records_nothing(&self) -> bool {
-        self.infer.is_empty() && self.funkinds.is_empty() && self.barriers.is_empty()
+        self.infer.is_empty() && self.funkinds.is_empty()
     }
 
     fn reach(&self, what: std::fmt::Arguments<'_>) {
@@ -537,33 +531,14 @@ impl Solver {
         self.infer.get_mut(self.id, var)
     }
 
-    /// The home the barrier variable this solver mints next gets.
-    pub(crate) fn next_barrier_home(&self) -> Home {
-        self.reach(format_args!("a fresh barrier variable"));
-        self.barriers.next_home(self.id)
-    }
-
-    /// Take ownership of a barrier handle minted at [`Self::next_barrier_home`].
-    pub(crate) fn adopt_barrier(&mut self, var: &Rc<BarrierVar>, state: BarrierState) {
-        self.barriers.adopt(self.id, var, state);
-    }
-
-    /// Every barrier variable this solver minted, in minting order.
-    pub(crate) fn barrier_vars(&self) -> &[Rc<BarrierVar>] {
-        &self.barriers.handles
-    }
-
-    /// What has been recorded on the barrier `var`.
-    pub(crate) fn barrier_state(&self, var: &BarrierVar) -> &BarrierState {
-        self.reach(format_args!("{var:?}"));
-        self.barriers.get(self.id, var)
-    }
-
-    /// What has been recorded on the barrier `var`, for recording more. No cached answer reads
-    /// it, so no revision moves ([`Revisions`]).
-    pub(crate) fn barrier_state_mut(&mut self, var: &BarrierVar) -> &mut BarrierState {
-        self.reach(format_args!("{var:?}"));
-        self.barriers.get_mut(self.id, var)
+    /// Every barrier variable this solver minted ([`InferVar::opaque`]), in minting order.
+    pub(crate) fn barrier_vars(&self) -> Vec<Rc<InferVar>> {
+        self.infer
+            .handles
+            .iter()
+            .filter(|v| v.is_barrier())
+            .cloned()
+            .collect()
     }
 
     /// The home the capability variable this solver mints next gets.
@@ -697,15 +672,6 @@ fn assert_records_on_a_run_kind(var: &FunKindVar) {
         var.home().is_some(),
         "a run records nothing on {var:?}, a kind lowering minted"
     );
-}
-
-impl Handle for BarrierVar {
-    fn key(&self) -> u32 {
-        self.uid.0
-    }
-    fn home(&self) -> Option<Home> {
-        BarrierVar::home(self)
-    }
 }
 
 impl Handle for InferVar {

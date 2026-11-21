@@ -953,7 +953,7 @@ fn for_each_positioned_var(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
-        | Type::BarrierVar(_)
+        | Type::BarrierHole(_)
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::WitnessRef(_)
@@ -1484,7 +1484,7 @@ pub(super) fn assert_settled(
                     "an ordering requirement is not closed once inference has closed \
                      capabilities"
                 ),
-                Held::Infer(_) | Held::Barrier(_) | Held::FunKind(_) | Held::Obligation(_) => {}
+                Held::Infer(_) | Held::FunKind(_) | Held::Obligation(_) => {}
             }
         }
 
@@ -3658,7 +3658,7 @@ fn coalesce_type_predicates_go(
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and
         // `resolve_binder_slot` has already reported that failure.
-        Type::BarrierVar(_)
+        Type::BarrierHole(_)
         | Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
