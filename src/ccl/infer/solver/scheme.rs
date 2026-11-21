@@ -1751,11 +1751,10 @@ fn copy_obligation(
             if reset {
                 cache.reset_obligations.push(Rc::clone(&copy));
             }
-            // What the reset keeps names enclosing definitions' parameters, which
-            // freshen to themselves, and nested definitions' ones, which the clone
-            // re-mints through this cache.
-            copy.map_assumptions(|t| freshen_above(solver, lim, t, target, cache));
         }
+        // What the copy assumes names enclosing definitions' parameters, which freshen to
+        // themselves, and nested definitions' ones, which the copy re-mints through this cache.
+        copy.map_assumptions(|t| freshen_above(solver, lim, t, target, cache));
         // A copy made for a use is answered under what the use assumes, where nothing the
         // definition assumed about its trait answers it: one assuming nothing, or one the reset
         // took the definition's own assumptions from.
