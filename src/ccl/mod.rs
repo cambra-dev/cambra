@@ -85,7 +85,6 @@ pub(crate) use infer_var::fresh_infer_var_id;
 #[cfg(test)]
 pub fn reset_all_id_counters() {
     reset_infer_var_counter();
-    reset_barrier_var_counter();
     reset_fun_kind_var_counter();
 }
 

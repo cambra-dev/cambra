@@ -88,35 +88,6 @@ pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
-/// Identity of a [`Type::BarrierVar`](crate::ccl::Type::BarrierVar), the
-/// counterpart of [`InferVarId`] for [`BarrierVar`].
-///
-/// The inner `u32` is `pub(crate)` for the same reason as [`InferVarId`]'s: use
-/// [`fresh_barrier_var_id`] to mint one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BarrierVarId(pub(crate) u32);
-
-impl fmt::Display for BarrierVarId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Global counter for [`BarrierVarId`] allocation.
-static BARRIER_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// Allocate a fresh, globally-unique [`BarrierVarId`].
-pub(crate) fn fresh_barrier_var_id() -> BarrierVarId {
-    BarrierVarId(BARRIER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
-}
-
-/// Reset the barrier-variable counter to zero. Test-only, under the same
-/// concurrency caveat as [`reset_infer_var_counter`].
-#[cfg(test)]
-pub fn reset_barrier_var_counter() {
-    BARRIER_VAR_COUNTER.store(0, Ordering::Relaxed);
-}
-
 /// Polymorphism scope level. Larger = more deeply nested. We currently keep
 /// every variable at level 0 (monomorphic `let`); the field is threaded
 /// through for a future let-poly extension.
@@ -846,6 +817,14 @@ pub struct InferVar {
     pub fun_kind: Rc<crate::ccl::ty::FunKindVar>,
     /// The solver holding what is recorded on this variable ([`InferState`]).
     home: Option<crate::ccl::infer::solver::state::Home>,
+    /// For a **barrier** variable, the opaque binders its lower bounds may name and its
+    /// resolution does not: those the lambda body it annotates binds
+    /// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's opaque
+    /// binders"). It stands under them, so its telescope holds them. Its lower bounds are not
+    /// closed against its upper bounds: it resolves to their join with the refinements at its
+    /// positive positions dropped, and `solver::barrier::solve_barrier_vars` checks each upper
+    /// bound against that resolution. `None` for every other variable.
+    opaque: Option<Rc<[Name]>>,
 }
 
 /// What a run has recorded on an [`InferVar`], held by the run's
@@ -892,6 +871,22 @@ pub(crate) struct InferState {
     /// [`telescope`](InferVar::telescope) the name half reads; [`enforce_bound_scope`] rejects a
     /// bound naming a witness free that no scope here binds.
     witness_scopes: Vec<WitnessScope>,
+    /// What a barrier variable's checks read and record ([`InferVar::opaque`]).
+    barrier: BarrierRecord,
+}
+
+/// What [`solver::barrier::solve_barrier_vars`](crate::ccl::infer::solver::barrier::solve_barrier_vars)
+/// reads and records on a barrier variable.
+#[derive(Default)]
+pub(crate) struct BarrierRecord {
+    /// The report of each upper bound, by its index among the variable's upper bounds: the
+    /// error the edge that recorded it raises when it fails as it is drawn
+    /// ([`BarrierUpper::report`]).
+    reports: Vec<Option<Rc<crate::ccl::infer::solver::barrier::EdgeReport>>>,
+    /// What the last check found: `None` before the first check. A record of the checking,
+    /// which no cached answer reads, so a cell that recording moves no count in
+    /// ([`crate::ccl::infer::solver::state::Revisions`]).
+    checked: RefCell<Option<BarrierCheck>>,
 }
 
 /// A function a variable is a part of, as what binds its witnesses: a funkind variable, whose
@@ -1053,9 +1048,93 @@ impl InferVar {
             initial_level: level,
             telescope: telescope.clone(),
             home: Some(solver.next_infer_home()),
+            opaque: None,
         });
         solver.adopt_infer(&var, InferState::default());
         var
+    }
+
+    /// Mint a barrier variable at `level`, standing in `telescope` with the binders `opaque`
+    /// entered: its lower bounds may name them, and its resolution does not
+    /// ([`InferVar::opaque`]).
+    pub fn barrier(
+        solver: &mut Solver,
+        level: Level,
+        telescope: &Telescope,
+        opaque: Rc<[Name]>,
+    ) -> Rc<InferVar> {
+        let fun_kind = crate::ccl::ty::FunKindVar::fresh(solver, level);
+        Self::barrier_over(solver, level, telescope, fun_kind, opaque)
+    }
+
+    /// [`InferVar::barrier`] over the kind `fun_kind`, as [`InferVar::fresh_over`] mints an
+    /// ordinary variable over one.
+    pub fn barrier_over(
+        solver: &mut Solver,
+        level: Level,
+        telescope: &Telescope,
+        fun_kind: Rc<crate::ccl::ty::FunKindVar>,
+        opaque: Rc<[Name]>,
+    ) -> Rc<InferVar> {
+        let var = Rc::new(InferVar {
+            uid: fresh_infer_var_id(),
+            fun_kind,
+            initial_level: level,
+            telescope: telescope.entered(opaque.iter().cloned()),
+            home: Some(solver.next_infer_home()),
+            opaque: Some(opaque),
+        });
+        solver.adopt_infer(&var, InferState::default());
+        var
+    }
+
+    /// The opaque binders of a barrier variable ([`InferVar::opaque`]); `None` for any other.
+    pub fn opaque(&self) -> Option<&Rc<[Name]>> {
+        self.opaque.as_ref()
+    }
+
+    /// Whether this is a barrier variable ([`InferVar::opaque`]).
+    pub fn is_barrier(&self) -> bool {
+        self.opaque.is_some()
+    }
+
+    /// A barrier variable's upper bounds, each with its report ([`BarrierRecord::reports`]).
+    pub fn barrier_uppers(&self, solver: &Solver) -> Vec<BarrierUpper> {
+        let state = solver.infer_state(self);
+        state
+            .bounds
+            .upper()
+            .iter()
+            .enumerate()
+            .map(|(i, bound)| BarrierUpper {
+                bound: bound.clone(),
+                report: state.barrier.reports.get(i).cloned().flatten(),
+            })
+            .collect()
+    }
+
+    /// Give a barrier variable's upper bound at `index` the report its edge raises.
+    pub(crate) fn report_upper(
+        &self,
+        solver: &mut Solver,
+        index: usize,
+        report: Rc<crate::ccl::infer::solver::barrier::EdgeReport>,
+    ) {
+        let reports = &mut solver.infer_state_mut(self).barrier.reports;
+        if reports.len() <= index {
+            reports.resize(index + 1, None);
+        }
+        reports[index] = Some(report);
+    }
+
+    /// What the last check of this barrier variable found ([`BarrierRecord::checked`]).
+    pub fn checked(&self, solver: &Solver) -> Option<BarrierCheck> {
+        solver.infer_state(self).barrier.checked.borrow().clone()
+    }
+
+    /// Record what a check of this barrier variable found.
+    pub fn record_check(&self, solver: &Solver, check: BarrierCheck) {
+        *solver.infer_state(self).barrier.checked.borrow_mut() = Some(check);
     }
 
     /// The solver slot holding what is recorded on this variable, where a solver minted it.
@@ -1072,6 +1151,7 @@ pub(crate) struct InferVarFields {
     pub(crate) uid: (),
     pub(crate) level: (),
     pub(crate) telescope: (),
+    pub(crate) opaque: (),
     pub(crate) bounds: (),
     pub(crate) fun_kind: (),
     pub(crate) home: (),
@@ -1080,6 +1160,7 @@ pub(crate) struct InferVarFields {
     pub(crate) named_domain: (),
     pub(crate) stands_for: (),
     pub(crate) witness_scopes: (),
+    pub(crate) barrier: (),
 }
 
 impl InferVar {
@@ -1092,6 +1173,7 @@ impl InferVar {
             telescope: _,
             fun_kind: _,
             home: _,
+            opaque: _,
         } = self;
         let InferState {
             lowered_to: _,
@@ -1101,11 +1183,13 @@ impl InferVar {
             named_domain: _,
             stands_for: _,
             witness_scopes: _,
+            barrier: _,
         } = solver.infer_state(self);
         InferVarFields {
             uid: (),
             level: (),
             telescope: (),
+            opaque: (),
             bounds: (),
             fun_kind: (),
             home: (),
@@ -1114,6 +1198,7 @@ impl InferVar {
             named_domain: (),
             stands_for: (),
             witness_scopes: (),
+            barrier: (),
         }
     }
     /// The scope level the variable belongs to.
@@ -1336,52 +1421,37 @@ impl fmt::Debug for InferVar {
     }
 }
 
-/// An unresolved type that hides opaque variables from the outer scope,
-/// gathering its lower and upper bounds. Carried by
-/// [`Type::BarrierVar`](crate::ccl::Type::BarrierVar).
-///
-/// Identity follows [`InferVar`]: equality, hashing and `Debug` read only the
-/// immutable `uid`, never `lowers` or `uppers`, so [`Type`](crate::ccl::Type) keeps
-/// deriving `PartialEq`/`Eq`/`Hash`/`Debug` while the bounds are cyclic or
-/// mutably borrowed.
-pub struct BarrierVar {
-    /// Stable, globally-unique identity.
-    pub uid: BarrierVarId,
-    /// The opaque binders the variable sits outside of: those the lambda body it
-    /// annotates binds. A refinement naming one cannot be read outside the body.
-    pub opaque: Rc<[Name]>,
-    /// The solver holding what is recorded on this variable ([`BarrierState`]), where a solver
-    /// minted it.
-    home: Option<crate::ccl::infer::solver::state::Home>,
+/// A barrier variable over `lowers` and `uppers`, outside the binders `opaque`, at the highest
+/// level a bound reaches: what a unit test builds directly where inference would mint one at an
+/// output annotation.
+#[cfg(test)]
+pub(crate) fn test_barrier(
+    solver: &mut Solver,
+    opaque: Rc<[Name]>,
+    lowers: Vec<Bound>,
+    uppers: Vec<BarrierUpper>,
+) -> Rc<InferVar> {
+    let level = lowers
+        .iter()
+        .chain(uppers.iter().map(|u| &u.bound))
+        .map(|b| crate::ccl::infer::solver::type_level(solver, &b.ty))
+        .max()
+        .unwrap_or(0);
+    let barrier = InferVar::barrier(solver, level, &Telescope::empty(), opaque);
+    barrier.bounds_mut(solver).set_lower(lowers);
+    barrier
+        .bounds_mut(solver)
+        .set_upper(uppers.iter().map(|u| u.bound.clone()).collect());
+    for (i, u) in uppers.iter().enumerate() {
+        if let Some(report) = &u.report {
+            barrier.report_upper(solver, i, Rc::clone(report));
+        }
+    }
+    barrier
 }
 
-/// What a run has recorded on a [`BarrierVar`].
-#[derive(Default)]
-pub(crate) struct BarrierState {
-    /// Set while [`BarrierVar::level`] reads this variable's bounds, so a bound that
-    /// reaches the variable again contributes 0 instead of recursing.
-    reading_level: std::cell::Cell<bool>,
-    /// The gathered lower bounds. The variable resolves to their join with the
-    /// refinements at its positive positions dropped (the `BarrierVar` arm of
-    /// `solver::compact::compact_go`).
-    pub(crate) lowers: Vec<Bound>,
-    /// The gathered upper bounds. Each is checked against the resolution from
-    /// `lowers` by `solver::barrier::solve_barrier_vars`, not closed against the
-    /// lowers as they arrive.
-    pub(crate) uppers: Vec<BarrierUpper>,
-    /// Trait obligations watching an inference variable this barrier variable is a lower
-    /// bound of, with the operand position each watches. Every lower bound recorded here
-    /// is delivered to them (`notify_barrier_lower` in `src/ccl/infer/solver/traits.rs`):
-    /// the resolution's base is a lower bound's base, so the watched variable resolves to
-    /// it.
-    pub(crate) watches: Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>,
-    /// What `solver::barrier::solve_barrier_vars` last checked: `None` before the
-    /// first check. A record of the checking, which no cached answer reads, so a cell that
-    /// recording moves no count in ([`crate::ccl::infer::solver::state::Revisions`]).
-    checked: RefCell<Option<BarrierCheck>>,
-}
-
-/// An upper bound of a [`BarrierVar`], with the error a failed check of it reports.
+/// An upper bound of a barrier variable ([`InferVar::opaque`]), with the error a failed check
+/// of it reports.
 #[derive(Debug, Clone)]
 pub struct BarrierUpper {
     pub bound: Bound,
@@ -1402,7 +1472,7 @@ impl BarrierUpper {
     }
 }
 
-/// The state [`BarrierVar::checked`] records after a check of a barrier variable.
+/// The state [`InferVar::checked`] records after a check of a barrier variable.
 #[derive(Debug, Clone)]
 pub enum BarrierCheck {
     /// `resolution` was checked against the first `uppers` upper bounds, each
@@ -1415,135 +1485,6 @@ pub enum BarrierCheck {
     /// The check reported an error. A failed variable is not checked again: a
     /// re-check would report the same failure.
     Failed,
-}
-
-impl BarrierVar {
-    /// Mint a fresh barrier variable owned by `solver`, outside the binders `opaque`, over
-    /// `lowers` and `uppers`.
-    pub fn fresh(
-        solver: &mut Solver,
-        opaque: Rc<[Name]>,
-        lowers: Vec<Bound>,
-        uppers: Vec<BarrierUpper>,
-    ) -> Rc<BarrierVar> {
-        let barrier = Rc::new(BarrierVar {
-            uid: fresh_barrier_var_id(),
-            opaque,
-            home: Some(solver.next_barrier_home()),
-        });
-        solver.adopt_barrier(
-            &barrier,
-            BarrierState {
-                lowers,
-                uppers,
-                ..BarrierState::default()
-            },
-        );
-        barrier
-    }
-
-    /// Mint a barrier variable outside every run, with nothing recorded: `opaque_output`
-    /// places its placeholders before inference starts.
-    pub fn unowned(opaque: Rc<[Name]>) -> Rc<BarrierVar> {
-        Rc::new(BarrierVar {
-            uid: fresh_barrier_var_id(),
-            opaque,
-            home: None,
-        })
-    }
-
-    /// The solver slot holding what is recorded on this variable, where a solver minted it.
-    pub(crate) fn home(&self) -> Option<crate::ccl::infer::solver::state::Home> {
-        self.home
-    }
-
-    /// The gathered lower bounds ([`BarrierState::lowers`]).
-    pub fn lowers<'s>(&self, solver: &'s Solver) -> &'s [Bound] {
-        &solver.barrier_state(self).lowers
-    }
-
-    /// The lower bounds, for recording more.
-    pub fn lowers_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut Vec<Bound> {
-        &mut solver.barrier_state_mut(self).lowers
-    }
-
-    /// The gathered upper bounds ([`BarrierState::uppers`]).
-    pub fn uppers<'s>(&self, solver: &'s Solver) -> &'s [BarrierUpper] {
-        &solver.barrier_state(self).uppers
-    }
-
-    /// The upper bounds, for recording more.
-    pub fn uppers_mut<'s>(&self, solver: &'s mut Solver) -> &'s mut Vec<BarrierUpper> {
-        &mut solver.barrier_state_mut(self).uppers
-    }
-
-    /// The trait obligations watching this variable ([`BarrierState::watches`]).
-    pub fn watches<'s>(
-        &self,
-        solver: &'s Solver,
-    ) -> &'s [(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)] {
-        &solver.barrier_state(self).watches
-    }
-
-    /// The watching obligations, for adding one.
-    pub fn watches_mut<'s>(
-        &self,
-        solver: &'s mut Solver,
-    ) -> &'s mut Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)> {
-        &mut solver.barrier_state_mut(self).watches
-    }
-
-    /// What the last check found ([`BarrierState::checked`]).
-    pub fn checked(&self, solver: &Solver) -> Option<BarrierCheck> {
-        solver.barrier_state(self).checked.borrow().clone()
-    }
-
-    /// Record what a check found.
-    pub fn record_check(&self, solver: &Solver, check: BarrierCheck) {
-        *solver.barrier_state(self).checked.borrow_mut() = Some(check);
-    }
-
-    /// The scope level the variable belongs to, with the meaning of [`InferVar`]'s: a
-    /// generalized `let` quantifies a barrier variable above its level. It is the
-    /// maximum [`type_level`](crate::ccl::infer::solver::type_level) of the bounding
-    /// types in `lowers` and `uppers`, and 0 when both are empty.
-    pub fn level(&self, solver: &Solver) -> Level {
-        let state = solver.barrier_state(self);
-        if state.reading_level.replace(true) {
-            return 0;
-        }
-        let level = state
-            .lowers
-            .iter()
-            .map(|b| crate::ccl::infer::solver::type_level(solver, &b.ty))
-            .chain(
-                state
-                    .uppers
-                    .iter()
-                    .map(|u| crate::ccl::infer::solver::type_level(solver, &u.bound.ty)),
-            )
-            .max()
-            .unwrap_or(0);
-        state.reading_level.set(false);
-        level
-    }
-}
-
-impl PartialEq for BarrierVar {
-    fn eq(&self, other: &Self) -> bool {
-        self.uid == other.uid
-    }
-}
-impl Eq for BarrierVar {}
-impl std::hash::Hash for BarrierVar {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.uid.hash(state);
-    }
-}
-impl fmt::Debug for BarrierVar {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, ":>{}", self.uid)
-    }
 }
 
 #[cfg(test)]

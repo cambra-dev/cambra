@@ -84,8 +84,8 @@ use smol_str::SmolStr;
 use crate::ccl::nominal::NominalDecl;
 use crate::ccl::ty::{TypeParam, TypeParamId};
 use crate::ccl::{
-    ArithmeticKind, BarrierVar, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId,
-    Name, Type, TypedExpr, TypedExprNode, UnaryOpKind, provenance,
+    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name, Type,
+    TypedExpr, TypedExprNode, UnaryOpKind, provenance,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -4468,7 +4468,7 @@ fn places_under(solver: &mut Solver, root: &Rc<InferVar>) -> BTreeMap<StepPath, 
                 | Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::Hole
-                | Type::BarrierVar(_)
+                | Type::BarrierHole(_)
                 | Type::SharedHole(_)
                 | Type::DataSource(_)
                 | Type::ChanDom(_, _)
@@ -5097,14 +5097,14 @@ pub(super) fn link_watches(
         let below: Vec<(Rc<InferVar>, crate::ccl::subst::Subst)> = lowers
             .iter()
             .filter_map(|b| match &b.ty {
-                Type::Infer(v) => Some((Rc::clone(v), b.render_subst(solver))),
+                Type::Infer(v) if !v.is_barrier() => Some((Rc::clone(v), b.render_subst(solver))),
                 _ => None,
             })
             .collect();
-        let barriers_below: Vec<Rc<BarrierVar>> = lowers
+        let barriers_below: Vec<Rc<InferVar>> = lowers
             .iter()
             .filter_map(|b| match &b.ty {
-                Type::BarrierVar(barrier) => Some(Rc::clone(barrier)),
+                Type::Infer(barrier) if barrier.is_barrier() => Some(Rc::clone(barrier)),
                 _ => None,
             })
             .collect();
@@ -5163,7 +5163,7 @@ pub(super) fn link_watches(
 /// [`notify_barrier_lower`].
 pub(super) fn link_barrier_watches(
     solver: &mut Solver,
-    lower: &Rc<BarrierVar>,
+    lower: &Rc<InferVar>,
     upper: &Rc<InferVar>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
@@ -5185,7 +5185,7 @@ pub(super) fn link_barrier_watches(
         return Ok(());
     }
     // Snapshot: a delivery re-enters `constrain_go`, which can add a lower bound here.
-    let lowers = lower.lowers(solver).to_vec();
+    let lowers = lower.bounds(solver).lower().to_vec();
     for (obligation, pos) in &added {
         for bound in &lowers {
             deliver(solver, obligation, *pos, &bound.ty, bound.origin, cache)?;
@@ -5199,7 +5199,7 @@ pub(super) fn link_barrier_watches(
 /// `constrain_go`.
 pub(super) fn notify_barrier_lower(
     solver: &mut Solver,
-    barrier: &Rc<BarrierVar>,
+    barrier: &Rc<InferVar>,
     contribution: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {

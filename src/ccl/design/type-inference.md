@@ -1047,7 +1047,7 @@ ordering requirement, and a trait obligation, which a watch of a copied variable
 scope minted it. A kind lowering minted is the program's, not a run's: it has no home, so no run
 records on it (`Solver::funkind_state_mut` panics on one), and a copy keeps it. A copy of an ordering requirement its run has
 decided holds that decision. What each kind's copy carries is its
-own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`,
+own (`copy_infer_var`, `copy_kind_var`, `copy_capability_var`,
 `copy_ordering`, `copy_obligation`): what is recorded on the original, copied through the same
 rule. A capability set a type or a node states is copied through the rule too
 (`freshen_capabilities`): its variables, and a known set's requirements and raised types, as a
@@ -1722,12 +1722,13 @@ Each inference run owns a `Solver` (`infer/solver/state.rs`), which holds what t
 its variables. `run_once` creates the run's solver. A typing run of its own creates another:
 `case_result_ty`, and each check in `infer/check.rs`.
 
-An inference, funkind, barrier or capability variable is a handle: `InferVar`, `FunKindVar`,
-`BarrierVar`, `CapabilityVar`. The handle holds what is fixed when the variable is minted: its
-identity, an inference variable's telescope and kind, and its home, which is the solver that minted
-it and the variable's slot in that solver's tables. What the run learns is the state at that slot:
-an inference variable's bounds, trait watches and suspensions, a funkind variable's facts, a barrier
-variable's bounds, and a capability variable's capabilities, the edges into it and its upper bounds.
+An inference, funkind or capability variable is a handle: `InferVar`, `FunKindVar`,
+`CapabilityVar`. A barrier variable is an inference variable (`InferVar::opaque`). The handle holds
+what is fixed when the variable is minted: its identity, an inference variable's telescope, kind and
+opaque binders, and its home, which is the solver that minted it and the variable's slot in that
+solver's tables. What the run learns is the state at that slot: an inference variable's bounds,
+trait watches and suspensions, with a barrier variable's check record, a funkind variable's facts,
+and a capability variable's capabilities, the edges into it and its upper bounds.
 A function that records takes `&mut Solver`, and so does one that resolves a type or a capability
 variable, which can record as it reads: a suspension, a funkind variable's binder ids. A read that
 records nothing takes `&Solver`.
@@ -1755,10 +1756,10 @@ returns alike. An obligation copy holds a strong reference to its parent; these 
 acyclic chain, so the watches the solver drops release the copies and the parents they hold
 (`copied_requirements_release_their_ancestors_with_the_solver`).
 
-A handle the solver did not mint is foreign: one minted outside every run (`FunKindVar::unowned_data`,
-`BarrierVar::unowned`), or one a finished run left in a tree. A foreign handle reads as unrecorded
+A handle the solver did not mint is foreign: one minted outside every run (`FunKindVar::unowned_data`),
+or one a finished run left in a tree. A foreign handle reads as unrecorded
 until this run records on it, and what this run records stays in this solver. A type operation
-outside every run takes `Solver::none()`, which panics on reaching an inference or barrier variable,
+outside every run takes `Solver::none()`, which panics on reaching an inference variable,
 or a funkind variable that a solver minted. A funkind variable no solver minted reads as unrecorded
 through it. The type operations most used outside a run have a form that passes it: `Type::pi`
 takes no solver, and `Type::pi_in` takes the run's. A pass after inference whose tree still holds a finished run's variables takes
@@ -2993,13 +2994,20 @@ that names no such binder (`return_opaque_annotated_function_from_unannotated_fu
 `tests/it/compilation_pipeline/type_annotations.rs`).
 
 `opaque_output::run` runs before inference and rewrites such a lambda to
-`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::BarrierVar` recording
-the opaque binders the body binds. Inference records each edge into the barrier variable from a type
-other than an inference variable as a lower bound and each such edge out of it as an upper bound,
-and closes neither against the other. An edge between the barrier variable and an inference variable
-is recorded on the inference variable. The barrier variable resolves to the join of its lower bounds
-with the refinements at positive positions dropped
-(`CompactType::resolve_barrier_refinements` in `solver/compact.rs`).
+`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a `Type::BarrierHole` naming the
+opaque binders the body binds. Normalization replaces it with a barrier variable: an inference
+variable at the annotation's level that stands in the annotation's telescope with those binders
+entered (`InferVar::barrier`, `InferVar::opaque`). Its bounds are closed against that telescope
+when recorded, as any variable's are, so its lower bounds name the opaque binders and nothing out
+of scope. A substitution acting on a binder in its telescope suspends on it, as on any variable.
+
+Inference records each edge into a barrier variable from a type other than an ordinary inference
+variable as a lower bound and each such edge out of it as an upper bound, and closes neither
+against the other. An edge between a barrier variable and an ordinary inference variable is
+recorded on the ordinary one, which closes it against its own bounds. A barrier variable resolves to
+the join of its lower bounds with the refinements at positive positions dropped
+(`CompactType::resolve_barrier_refinements` in `solver/compact.rs`). Its proxy in an extrusion and
+its copy in a freshening are barrier variables over the same opaque binders.
 
 `solver::barrier::solve_barrier_vars` checks each barrier variable against its resolution. It
 reports the escape above, or checks each upper bound against the resolution. A failed check is
@@ -3013,7 +3021,7 @@ ordinary edge does (`the_resolution_of_a_function_result_barrier` in
 `tests/it/compilation_pipeline/secondary_labels.rs`). A check is a
 `constrain`, so it adds bounds to the variables it reaches, other barrier variables' lower bounds
 included. The phase therefore repeats until a round checks nothing, and each variable records what
-it was last checked against (`BarrierVar::checked`), so an unchanged resolution has only its newly
+it was last checked against (`InferVar::checked`), so an unchanged resolution has only its newly
 arrived upper bounds checked. The phase runs once after emission and again after each
 specialization pin in `solve::specialize_use`, which gives the clone's copies of the barrier
 variables new bounds. Both runs precede every compaction that reads the bounds they add, so
@@ -4746,7 +4754,7 @@ A variable's lower bounds are written in exactly four places, and delivery is wi
 * `extrude`'s proxy seeding, and `freshen_above`'s clone — both seed bounds by direct writes rather than through `constrain_go`.
 
 A barrier variable's lower bounds are not closed against the variable it flows into, so the
-barrier variable holds the watches it receives (`BarrierVar::watches`) and delivers each lower bound
+barrier variable holds the watches it receives (`InferVar::watches`) and delivers each lower bound
 recorded afterwards (`notify_barrier_lower`). Its resolution has the base of a lower bound, so the
 base a lower bound offers is the base the watched variable resolves to. `extrude` and
 `freshen_above` copy a barrier variable's watches with it.

@@ -1103,7 +1103,7 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
         // `type_free_vars` in the `Fun` arm above.
         | Type::WitnessProjection(_)
         | Type::Param(_)
-        | Type::BarrierVar(_)
+        | Type::BarrierHole(_)
         | Type::FamilyApp(_)
         | Type::Poly(_) => false,
     }

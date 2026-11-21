@@ -381,7 +381,7 @@ impl Printer<'_, '_> {
             Type::DataSource(name) => format!("Source({name})"),
             Type::Txn => "Txn".to_string(),
             Type::Hole => "_".to_string(),
-            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) => self.variable(ty),
+            Type::SharedHole(_) | Type::BarrierHole(_) | Type::Infer(_) => self.variable(ty),
             Type::Param(p) => match self.joins.iter().find(|(id, _)| *id == p.id) {
                 Some((_, text)) => text.clone(),
                 None => p.spelling.to_string(),

@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ccl::infer_var::BarrierVarId;
 use crate::ccl::nominal::Variance;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
@@ -452,11 +451,11 @@ struct KeyCtx {
     #[cfg(debug_assertions)]
     visiting_scopes: HashMap<(InferVarId, bool), Vec<Option<Name>>>,
     /// Barrier variables whose lower bounds are currently being walked, the guard
-    /// `compact_go`'s `BarrierVar` arm runs on the same key, each with the innermost variable
+    /// `compact_go`'s barrier arm runs on the same key, each with the innermost variable
     /// being expanded when it was entered: a barrier's lowers are read at positive polarity
     /// whatever the reference's. A lower reaching its own barrier again is a recursive type:
     /// the walk truncates it, and no variable from that innermost one up is memoized.
-    visiting_barriers: HashMap<BarrierVarId, Option<usize>>,
+    visiting_barriers: HashMap<InferVarId, Option<usize>>,
     /// Completed keys per `(variable, polarity, enclosing binders)`, each with the
     /// substitution it was reached under, restricted to the names that substitution could
     /// act on below the variable ([`ConsultedNames`]).
@@ -620,10 +619,8 @@ fn key_go(
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
         // the solver never sees one.
-        Type::BoundedHole(_) => {
-            unreachable!(
-                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
-            )
+        Type::BoundedHole(_) | Type::BarrierHole(_) => {
+            unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
         }
         Type::Split { .. } => {
             unreachable!("a split argument stands only in a nominal type, which keys its sides")
@@ -652,12 +649,12 @@ fn key_go(
         // lowering-time linkage and not part of the type, so there is nothing here to
         // key on either.
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
-        // A barrier variable keys as its resolution, the `BarrierVar` arm of `compact_go`:
+        // A barrier variable keys as its resolution, as `compact_go` reads one:
         // its lower bounds, each read at positive polarity whatever the reference's, with
         // the refinements at their covariant positions dropped. It stands in a use's
         // instantiation wherever an opaque-binding function's type does, so two uses whose
         // barrier variables resolve differently clone differently.
-        Type::BarrierVar(barrier) => {
+        Type::Infer(barrier) if barrier.is_barrier() => {
             if let Some(&entered_in) = ctx.visiting_barriers.get(&barrier.uid) {
                 if let Some(from) = entered_in {
                     ctx.walk.taint_from(from);
@@ -668,7 +665,7 @@ fn key_go(
                 .insert(barrier.uid, ctx.walk.innermost());
             // The lowers are read as new positions, as `compact_go` reads them.
             let chain_from = std::mem::replace(&mut ctx.chain_from, ctx.walk.next_index());
-            let lowers = barrier.lowers(solver).to_vec();
+            let lowers = barrier.bounds(solver).lower().to_vec();
             let mut acc = KeyView::default();
             for b in &lowers {
                 let inner_acc = {
@@ -1496,8 +1493,14 @@ mod tests {
         use crate::ccl::Refinement;
         use crate::ccl::infer::solver::test_helpers::dep_pred;
         let solver = &mut Solver::new();
-        let barrier = crate::ccl::BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
-        let b = Type::BarrierVar(Rc::clone(&barrier));
+        // The barrier stands under `x`, which its lower bound names.
+        let barrier = crate::ccl::InferVar::barrier(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(Name::raw("x")),
+            Rc::from([]),
+        );
+        let b = Type::Infer(Rc::clone(&barrier));
         let lower = Type::fun(
             Type::refined_one(int(), Refinement::born(dep_pred("x"))),
             int(),
@@ -1527,8 +1530,9 @@ mod tests {
     #[test]
     fn a_barrier_reaching_itself_through_its_lower_keys() {
         let solver = &mut Solver::new();
-        let barrier = crate::ccl::BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
-        let b = Type::BarrierVar(Rc::clone(&barrier));
+        let barrier =
+            crate::ccl::infer_var::test_barrier(solver, Rc::from([]), Vec::new(), Vec::new());
+        let b = Type::Infer(Rc::clone(&barrier));
         let lower = Type::fun(int(), b.clone());
         constrain_subtype(solver, &lower, &b, &mut ConstrainCache::new())
             .expect("the lower flows in");
