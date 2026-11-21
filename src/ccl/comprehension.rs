@@ -335,11 +335,18 @@ fn encode(
         (Some(pred_op), Some(pred_source)) => {
             // The refinement's element is the reserved `REFINEMENT_BINDER`, the position the
             // filter is read at; the predicate is a bare boolean expression, not a lambda.
+            // The predicate's lambda binds the generator's element too, at a second place, so it
+            // binds a name of its own: every binder is bound in one place
+            // (`src/ccl/design/type-inference.md`, "The invariant").
+            let mut pred_binding = binding.duplicate();
+            pred_binding.name = Name::fresh_like(&binding.name);
+            let mut pred_op = pred_op;
+            rename_references(&mut pred_op, &binding.name, &pred_binding.name);
             let pred_expr = Expr::apply(
                 Expr::apply(Expr::var(Name::elem()), unbox(pred_source)),
-                // The predicate's lambda is a second binder for the same generator, a copy
-                // of its occurrence.
-                per_element_lambda(&binding, binding.occurrence.duplicate(), pred_op),
+                // A copy of the generator's occurrence, as the predicate's binder is a copy of
+                // the generator's.
+                per_element_lambda(&pred_binding, binding.occurrence.duplicate(), pred_op),
             );
             // A refined parameter is `cast(refined_data_fun, λ outer_var → body_expr)`, a
             // type-level assertion of the predicate-refined domain. The refinement is carried
@@ -536,6 +543,25 @@ fn flattened_nest(
 /// The binder is the one lowering put on the generator, so the lambda it becomes
 /// binds the same [`Name`] the element and the guards already reference — which
 /// is what keeps this phase from needing to rename anything it did not mint.
+/// `e` with each reference to `from` reading `to`, the terms its types quote included: an
+/// inner comprehension's filter, encoded already, sits in its cast target's refinement. Every
+/// binder is bound once, so no binder in `e` shadows `from`.
+fn rename_references(e: &mut Expr, from: &Name, to: &Name) {
+    if let TypedExprNode::Var(n) = &mut e.node
+        && n == from
+    {
+        *n = to.clone();
+    }
+    let memo = PredMemo::replacing();
+    e.walk_type_slots_mut(|ty| {
+        crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, &memo, &(), &mut |term, _| {
+            rename_references(term, from, to);
+            true
+        });
+    });
+    e.walk_children_mut(|c| rename_references(c, from, to));
+}
+
 fn per_element_lambda(target: &TypedBinding, occurrence: Occurrence, body: Expr) -> Expr {
     debug_assert!(
         target.user_annotation.is_none(),
