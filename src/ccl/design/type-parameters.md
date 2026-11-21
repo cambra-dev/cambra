@@ -482,6 +482,17 @@ redelivery, which reads the bounds transitively, replaces it. That a reset oblig
 follows from the use having satisfied every requirement at the same types; one that did not would
 be an error the definition alone does not raise, which is reported at the use.
 
+An instantiation keeps its obligation copies' assumptions. It is a type at the use, not code that
+runs there, so no copy of it has to select an instance: the use's obligation for each requirement
+of the scheme checks the parameter at the use's types ([Instantiation](#instantiation)). A specialization clone is
+code that runs at the use's types, so its copies select their instances there, and the reset is
+what lets them.
+
+Every copy made for a use, its instantiation's and its clone's alike, is also answered under the
+assumptions in scope at the use (`FreshenCache::use_assumptions`): an obligation copy where nothing
+the definition assumed about its trait answers it, and every ordering requirement copy, which the
+use's run also records and checks once emission ends (`check_loop_orders`).
+
 The binding's own parameters are known by identity, the ids of its annotation's parameters
 (`SpecializeFrame::own_params`, carried to freshening as `FreshenCache::own_params`), not by level:
 a sibling definition's parameters can sit at the same level, and an obligation copied from its body

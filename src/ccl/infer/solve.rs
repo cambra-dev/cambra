@@ -3979,6 +3979,7 @@ pub(super) fn specialize_use(
         param_telescope: Some(param_telescope),
         entered_binders,
         use_at: Some(use_expr.node_id()),
+        use_assumptions: ctx.assumptions.clone(),
         ..FreshenCache::new()
     };
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -4037,12 +4038,6 @@ pub(super) fn specialize_use(
     let mut cache = ConstrainCache::new();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
-    for (_, obligation) in fresh.copies::<Rc<crate::ccl::infer::solver::traits::TraitObligation>>()
-    {
-        if obligation.assumptions().is_empty() {
-            obligation.assume_more(&ctx.assumptions);
-        }
-    }
     let pinned = constrain_subtype_in(
         solver,
         &clone.ty,
@@ -4142,7 +4137,6 @@ pub(super) fn specialize_use(
                     .ok()
                     .map(|settled| settled.peel_refinements().clone())
             });
-            obligation.assume_more(&ctx.assumptions);
             obligation.redeliver(solver, &mut cache)
         })?;
         crate::ccl::infer::solver::traits::settle_held_answers(solver, None, &mut cache)
