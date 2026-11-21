@@ -1486,54 +1486,53 @@ pub(super) fn settle_capabilities(solver: &mut Solver, expr: &mut Expr) {
 /// A pass after inference would read the variable when it reads it.
 #[cfg(debug_assertions)]
 pub(super) fn assert_capabilities_settled(expr: &Expr) {
-    let mut seen = std::collections::HashSet::new();
-    assert_expr_closed(expr, &mut seen);
+    assert_settled(expr, &mut std::collections::HashSet::new());
 }
 
-/// [`assert_capabilities_settled`] of one node and what is below it.
+/// Panic on a capability variable, or an ordering requirement not closed, that `value` still holds
+/// once inference has closed capabilities ([`assert_capabilities_settled`]). `seen` holds the
+/// quoted terms already checked, which types share.
 #[cfg(debug_assertions)]
-fn assert_expr_closed(e: &Expr, seen: &mut std::collections::HashSet<*const Expr>) {
-    for c in [&e.capabilities, &e.own_capabilities] {
-        assert_capabilities_closed(c, &|| format!("the node `{}`", symbolic(e)));
-    }
-    e.walk_type_slots(|ty| assert_type_closed(ty, seen));
-    e.walk_children(|child| assert_expr_closed(child, seen));
-}
-
-/// Panic on a function type in `ty`, or a node of a term it quotes, still holding anything of
-/// the run's ([`assert_capabilities_settled`]).
-#[cfg(debug_assertions)]
-pub(super) fn assert_type_closed(ty: &Type, seen: &mut std::collections::HashSet<*const Expr>) {
-    if let Type::Fun { capabilities, .. } = ty {
-        assert_capabilities_closed(capabilities, &|| format!("a function type in `{ty}`"));
-    }
-    ty.walk_quoted_terms(&mut |term| {
-        if seen.insert(Rc::as_ptr(term)) {
-            assert_expr_closed(term, seen);
-        }
-    });
-    ty.walk_children(|child| assert_type_closed(child, seen));
-}
-
-#[cfg(debug_assertions)]
-fn assert_capabilities_closed(c: &crate::ccl::capabilities::Capabilities, at: &dyn Fn() -> String) {
-    assert!(
-        !c.is_pending(),
-        "the capabilities of {} still read a variable once inference has closed them",
-        at()
-    );
-    if let Some(set) = c.known_set() {
-        for r in &set.requires {
-            if let Some(order) = r.ordering() {
-                assert!(
-                    order.decided.is_some(),
-                    "an ordering requirement in the capabilities of {} is not closed once \
-                     inference has closed them",
-                    at()
-                );
+pub(super) fn assert_settled(
+    value: &dyn crate::ccl::infer::solver::held::HoldsSolverState,
+    seen: &mut std::collections::HashSet<*const Expr>,
+) {
+    use crate::ccl::infer::solver::held::{Held, HeldVisitor};
+    struct Settled<'s>(&'s mut std::collections::HashSet<*const Expr>);
+    impl HeldVisitor for Settled<'_> {
+        fn held(&mut self, held: Held) {
+            match held {
+                Held::Capability(var) => panic!(
+                    "the capability variable {var:?} is still held once inference has closed \
+                     capabilities"
+                ),
+                // A requirement no run recorded, one a clause writes, holds nothing of a run.
+                Held::Ordering(order) => assert!(
+                    order.decided.is_some() || order.home.is_none(),
+                    "an ordering requirement is not closed once inference has closed \
+                     capabilities"
+                ),
+                Held::Infer(_) | Held::Barrier(_) | Held::FunKind(_) | Held::Obligation(_) => {}
             }
         }
+
+        fn enter_term(&mut self, term: &Rc<Expr>) -> bool {
+            self.0.insert(Rc::as_ptr(term))
+        }
+
+        // A closed requirement's positions and capabilities still hold the run's state:
+        // `close_requirements` closes the capabilities of the function types in them, not their
+        // variables or the requirements nested in them, so a solver-free read of one can reach
+        // a variable. Until closing settles all a requirement holds, this check stops at the
+        // requirement.
+        fn enter_ordering(
+            &mut self,
+            order: &Rc<crate::ccl::capabilities::OrderableIfRequiredBy>,
+        ) -> bool {
+            order.decided.is_none() && order.home.is_some()
+        }
     }
+    value.walk_held(&mut Settled(seen));
 }
 
 /// [`settle_capabilities`] sharing `memo` across the quoted terms it rewrites. Whether any slot

@@ -1000,6 +1000,32 @@ Generalization creates fresh bound-graph instances at uses. Coalescing specializ
 using those live instances, and predicate-rebuild memos preserve sharing where the rewrite context
 permits it. These operations have separate scopes and lifetimes.
 
+### Solver state a value holds
+
+A typing run's state is reached through handles: inference variables, barrier variables, function
+kind variables, capability variables, ordering requirements and trait obligations. Types, capability
+sets, requirements and expressions hold them, and `HoldsSolverState` (`infer/solver/held.rs`) walks
+every handle a value holds, in one place per holder:
+
+- a type holds its variables, a function's kind and capabilities, and what the terms it quotes hold
+  (a refinement's predicates, a projection's sum, a family's arguments);
+- a capability set holds its variables, its requirements and its raised types; an ordering
+  requirement is a handle, and its positions, source and capabilities are held with it;
+- an expression holds its type slots, both capability slots and its call's obligation
+  (`CallObligation`), and what its children hold.
+
+The walk reports a handle where the value holds it and does not follow what is recorded on the
+handle: a variable's bounds and a capability variable's incoming edges are the run's, not the
+value's. A term can be quoted by many types, and an ordering requirement holds types and
+capabilities of its own, so a visitor decides whether to enter each one.
+
+`assert_settled` reads a tree, an error's types and a scheme through it, and panics on a capability
+variable or an undecided ordering requirement still held once capabilities are closed. A
+requirement no run recorded, one a written clause states, has no `home` and holds nothing of a run.
+The check does not enter a closed requirement: `close_requirements` closes the capabilities of the
+function types in its positions but not the variables and nested requirements they hold, so a
+closed requirement still holds the run's state.
+
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
 `should_generalize` in `infer/context.rs` selects a syntactic lambda whose function kind is
