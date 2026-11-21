@@ -145,11 +145,13 @@ impl PolyScheme {
         current_level: Level,
         telescope: &Telescope,
         use_at: crate::ccl::provenance::NodeId,
+        assumptions: &[Rc<TraitRequirement>],
     ) -> Instance {
         #[cfg(debug_assertions)]
         let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.use_at = Some(use_at);
+        cache.use_assumptions = assumptions.to_vec();
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
@@ -513,6 +515,10 @@ pub struct FreshenCache {
     /// ordering requirement is reported (`docs/chl-spec.md`, "Conditional ordering
     /// requirements"). `None` for a copy no use makes.
     pub use_at: Option<crate::ccl::provenance::NodeId>,
+    /// The assumptions in scope at that use: each copy of a trait obligation or an ordering
+    /// requirement made for the use is answered under them too, its instantiation's and its
+    /// specialization's alike.
+    pub use_assumptions: Vec<Rc<TraitRequirement>>,
     /// An operator scheme's Pi binder → the name this instantiation gives it.
     pub binders: HashMap<crate::ccl::Name, crate::ccl::Name>,
     /// Opened family parameter → what this instantiation stands it at: a variable that may
@@ -677,6 +683,14 @@ fn copy_ordering(
             .expect("a copy of an ordering requirement is one")
             .decide(solver, decision);
     }
+    // A copy made for a use is checked at the use, under what the use assumes, once the use's
+    // run has typed the use (`InferCtx::check_loop_orders`).
+    if cache.use_at.is_some() {
+        copy.record(solver);
+        copy.ordering()
+            .expect("a copy of an ordering requirement is one")
+            .assume_more(solver, cache.use_assumptions.iter().cloned());
+    }
     cache.record_copy(r, copy.clone());
     copy
 }
@@ -803,8 +817,9 @@ fn copy_capability_var(
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.record_copy(v, Rc::clone(&f));
     // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
-    // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
-    // bring instead.
+    // for what each use passes (`InferCtx::open_poly`), as an opened type parameter stands for
+    // itself. A copy above the cutoff is the use's variable for the parameter, as a copied type
+    // parameter is a fresh variable, so it holds what the use's arguments bring instead.
     for capability in v.own(solver) {
         match &capability.item {
             Capability::Param(_) => {}
@@ -1990,14 +2005,22 @@ fn copy_obligation(
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:
         // a sibling definition's parameters can sit at the same level.
+        let mut reset = false;
         if let Some(own) = cache.own_params.clone() {
-            if copy.reset_for_specialization(&own) {
+            reset = copy.reset_for_specialization(&own);
+            if reset {
                 cache.reset_obligations.push(Rc::clone(&copy));
             }
             // What the reset keeps names enclosing definitions' parameters, which
             // freshen to themselves, and nested definitions' ones, which the clone
             // re-mints through this cache.
             copy.map_assumptions(|t| freshen_above(solver, lim, t, target, cache));
+        }
+        // A copy made for a use is answered under what the use assumes, where nothing the
+        // definition assumed about its trait answers it: one assuming nothing, or one the reset
+        // took the definition's own assumptions from.
+        if reset || copy.assumptions().is_empty() {
+            copy.assume_more(&cache.use_assumptions);
         }
         // Phase 2: now that re-entry finds the copy, freshen every operand, and the
         // output and the input expressions a refinement template builds from. An

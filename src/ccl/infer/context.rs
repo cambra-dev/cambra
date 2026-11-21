@@ -304,7 +304,7 @@ pub(super) struct InferCtx {
     /// clauses of the polymorphic annotations whose right-hand sides enclose it.
     /// Every obligation `require_trait` mints takes those about its trait
     /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
-    assumptions: Vec<Rc<TraitRequirement>>,
+    pub(super) assumptions: Vec<Rc<TraitRequirement>>,
     /// The binders in lexical scope at the current emission position — what
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
@@ -1523,30 +1523,6 @@ impl InferCtx {
             },
             source,
         ))
-    }
-
-    pub(super) fn assume_at_use(&self, obligations: &[Rc<TraitObligation>]) {
-        for obligation in obligations {
-            if obligation.assumptions().is_empty() {
-                obligation.assume_more(&self.assumptions);
-            }
-        }
-    }
-
-    pub(super) fn record_order_assumptions(
-        &mut self,
-        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    ) {
-        for var in copies.values() {
-            for capability in var.own(&self.solver) {
-                if let Capability::Requires(r) = capability.item
-                    && let Some(order) = r.ordering()
-                {
-                    r.record(&mut self.solver);
-                    order.assume_more(&mut self.solver, self.assumptions.iter().cloned());
-                }
-            }
-        }
     }
 
     /// Hold each loop's order to what its body was found to cause once emission is done. A loop

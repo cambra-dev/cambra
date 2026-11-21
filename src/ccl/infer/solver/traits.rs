@@ -3724,8 +3724,13 @@ impl TraitObligation {
             .as_ref()
             .expect("only a method call's obligation instantiates a method");
         let (level, telescope) = call.at.borrow().clone();
-        let instance =
-            scheme.instantiate_with_params(solver, level, &telescope, self.operator_node_id);
+        let instance = scheme.instantiate_with_params(
+            solver,
+            level,
+            &telescope,
+            self.operator_node_id,
+            &self.context.borrow(),
+        );
         for (instantiation, bound, _) in &instance.bounds {
             constrain_subtype(solver, instantiation, bound, cache)?;
         }
