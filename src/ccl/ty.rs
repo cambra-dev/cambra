@@ -465,9 +465,10 @@ impl FunKind {
         self.resolved_in(solver).arity()
     }
 
-    /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds), owned by `solver`.
-    pub fn fresh_var(solver: &mut Solver) -> FunKind {
-        FunKind::Var(FunKindVar::fresh(solver))
+    /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds), owned by `solver`, for
+    /// a function standing at `level`.
+    pub fn fresh_var(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> FunKind {
+        FunKind::Var(FunKindVar::fresh(solver, level))
     }
 
     /// A fresh kind variable **pinned to `Data`** — a consumer's function, polymorphic in
@@ -475,15 +476,14 @@ impl FunKind {
     /// "Consuming a sum: pinning the consumer's kind"). The kind equation relates it to
     /// a plain collection and to a sum alike; a compute function flowing in is the conflict.
     pub fn fresh_data() -> FunKind {
-        FunKind::Var(FunKindVar::unowned(KindPin::Data, false))
+        FunKind::Var(FunKindVar::unowned_data(false))
     }
 
     /// [`fresh_data`](Self::fresh_data) for a function an annotation's normalization mints at
     /// `level`.
     pub fn fresh_data_at(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> FunKind {
-        let v = FunKindVar::fresh(solver);
+        let v = FunKindVar::fresh(solver, level);
         v.stamp_data(solver);
-        v.place_at(solver, level);
         FunKind::Var(v)
     }
 
@@ -495,7 +495,7 @@ impl FunKind {
     /// normalization replaces it with a fresh data funkind at each occurrence, and nothing
     /// relates two occurrences through it.
     pub fn data_hole() -> FunKind {
-        FunKind::Var(FunKindVar::unowned(KindPin::Data, true))
+        FunKind::Var(FunKindVar::unowned_data(true))
     }
 }
 
@@ -814,8 +814,9 @@ impl FunKindVar {
 }
 
 impl FunKindVar {
-    /// Mint a fresh funkind variable owned by `solver`, with nothing recorded.
-    pub fn fresh(solver: &mut Solver) -> Rc<FunKindVar> {
+    /// Mint a fresh funkind variable owned by `solver`, with nothing recorded, for an owner
+    /// standing at `level` ([`FunKindState`]'s `level`).
+    pub fn fresh(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> Rc<FunKindVar> {
         let v = Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             hole: false,
@@ -823,16 +824,18 @@ impl FunKindVar {
             home: Some(solver.next_funkind_home()),
         });
         solver.adopt_funkind(&v);
+        v.place_at(solver, level);
         v
     }
 
-    /// Mint a funkind variable outside every run, as lowering does, carrying what construction
-    /// says of it.
-    pub fn unowned(minted: KindPin, hole: bool) -> Rc<FunKindVar> {
+    /// Mint a data funkind variable outside every run, as lowering does: a mark in the program
+    /// that a run's normalization replaces with a kind of its own
+    /// (`InferCtx::normalize_fun_kind_in`), so no run records anything on it.
+    fn unowned_data(hole: bool) -> Rc<FunKindVar> {
         Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             hole,
-            minted,
+            minted: KindPin::Data,
             home: None,
         })
     }
@@ -4107,10 +4110,16 @@ impl Type {
         }
     }
 
-    /// A **consumer's** collection function: data by construction, polymorphic in the
-    /// slot ([`FunKind::fresh_data`]) so a plain collection and a sum satisfy it alike.
-    pub fn consumer_fun(solver: &mut Solver, domain: Self, codomain: Self) -> Self {
-        let fun_kind = FunKind::fresh_data();
+    /// A **consumer's** collection function standing at `level`: data by construction,
+    /// polymorphic in the slot ([`FunKind::fresh_data_at`]) so a plain collection and a sum
+    /// satisfy it alike.
+    pub fn consumer_fun(
+        solver: &mut Solver,
+        level: crate::ccl::infer_var::Level,
+        domain: Self,
+        codomain: Self,
+    ) -> Self {
+        let fun_kind = FunKind::fresh_data_at(solver, level);
         // The parts sit under the binders the kind may come to have.
         InferVar::place_parts_under(solver, &domain, &fun_kind);
         InferVar::place_parts_under(solver, &codomain, &fun_kind);
@@ -7157,21 +7166,21 @@ mod tests {
     #[test]
     fn cached_witness_positions_read_new_names_edges_and_copies() {
         let solver = &mut Solver::new();
-        let a = FunKindVar::fresh(solver);
-        let b = FunKindVar::fresh(solver);
+        let a = FunKindVar::fresh(solver, 0);
+        let b = FunKindVar::fresh(solver, 0);
         a.record(solver, FunKind::Var(Rc::clone(&b)), true);
         let absent = *Witness::mint(TypeKind::UIntRanges).id();
         assert_eq!(a.binder_position(solver, &absent), None);
         let first = b.binder_id_at(solver, 0);
         assert_eq!(a.binder_position(solver, &first), Some(0));
 
-        let c = FunKindVar::fresh(solver);
+        let c = FunKindVar::fresh(solver, 0);
         let second = c.binder_id_at(solver, 1);
         assert_eq!(a.binder_position(solver, &second), None);
         b.record(solver, FunKind::Var(Rc::clone(&c)), false);
         assert_eq!(a.binder_position(solver, &second), Some(1));
 
-        let original = FunKindVar::fresh(solver);
+        let original = FunKindVar::fresh(solver, 0);
         let third = original.binder_id_at(solver, 2);
         assert_eq!(a.binder_position(solver, &third), None);
         c.copied_from(solver, &original);
@@ -7190,21 +7199,21 @@ mod tests {
     #[test]
     fn a_cached_kind_component_reads_new_binders_and_edges() {
         let solver = &mut Solver::new();
-        let a = FunKindVar::fresh(solver);
-        let b = FunKindVar::fresh(solver);
+        let a = FunKindVar::fresh(solver, 0);
+        let b = FunKindVar::fresh(solver, 0);
         a.record(solver, FunKind::Var(Rc::clone(&b)), true);
         assert!(a.component_binder_ids(solver).is_empty());
 
         let first = b.binder_id_at(solver, 0);
         assert_eq!(a.component_binder_ids(solver), vec![first]);
 
-        let c = FunKindVar::fresh(solver);
+        let c = FunKindVar::fresh(solver, 0);
         let second = c.binder_id_at(solver, 0);
         b.record(solver, FunKind::Var(Rc::clone(&c)), true);
         assert!(a.same_component(solver, &c));
         assert_eq!(a.component_binder_ids(solver), vec![first, second]);
 
-        let original = FunKindVar::fresh(solver);
+        let original = FunKindVar::fresh(solver, 0);
         let third = original.binder_id_at(solver, 0);
         c.copied_from(solver, &original);
         assert_eq!(a.component_binder_ids(solver), vec![first, second, third]);
@@ -7769,7 +7778,7 @@ mod tests {
     fn a_resolved_kind_follows_a_later_write_to_a_kind_it_reaches() {
         let solver = &mut Solver::new();
         let reaching = |solver: &mut Solver| {
-            let (k1, k2) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+            let (k1, k2) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
             k1.record(solver, FunKind::Var(Rc::clone(&k2)), true);
             assert_eq!(k1.resolved_in(solver), KindPin::Unpinned);
             (k1, k2)

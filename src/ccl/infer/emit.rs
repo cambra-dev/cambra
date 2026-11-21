@@ -1226,7 +1226,10 @@ pub(super) fn emit_cast<C: Typing>(
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
     // still carries its kind, which a match on the raw target would drop
     // to the `Compute` default.
-    let fun_kind = target.fun_kind().cloned().unwrap_or(FunKind::Compute);
+    let fun_kind = match target.fun_kind() {
+        Some(fun_kind) => ctx.normalize_fun_kind(fun_kind),
+        None => FunKind::Compute,
+    };
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),

@@ -5604,7 +5604,7 @@ mod tests {
         let node_id = provenance::NodeId::fresh();
         let x = Name::raw("x");
         let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         let v = InferVar::fresh_over(solver, 0, &telescope, kind);
         let operand = Type::Infer(Rc::clone(&v));
         let ob = TraitObligation::new(

@@ -663,6 +663,7 @@ impl Solver {
         &mut self,
         var: &FunKindVar,
     ) -> &mut Vec<crate::ccl::infer_var::WitnessBinderId> {
+        assert_records_on_a_run_kind(var);
         self.reach(format_args!("{var:?}"));
         self.revisions.funkind_names += 1;
         self.funkinds.get_mut(self.id, var).names_mut()
@@ -670,10 +671,21 @@ impl Solver {
 
     /// What has been recorded on the kind `var`, for recording more ([`Revisions`]).
     pub(crate) fn funkind_state_mut(&mut self, var: &FunKindVar) -> &mut FunKindState {
+        assert_records_on_a_run_kind(var);
         self.reach(format_args!("{var:?}"));
         self.revisions.funkind += 1;
         self.funkinds.get_mut(self.id, var)
     }
+}
+
+/// A run records only on kinds some run minted: a kind lowering minted is the program's, and
+/// normalization gives the run a kind of its own in its place
+/// (`src/ccl/design/type-inference.md`, "Funkind variables are copied by level").
+fn assert_records_on_a_run_kind(var: &FunKindVar) {
+    assert!(
+        var.home().is_some(),
+        "a run records nothing on {var:?}, a kind lowering minted"
+    );
 }
 
 impl Handle for BarrierVar {

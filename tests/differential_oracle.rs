@@ -640,7 +640,8 @@ fn gen_bound(solver: &mut Solver, rng: &mut Rng) -> CompactType {
     }
     let ty = gen_ty(rng, 3, Fragment::Modelled);
     let ty = open_some_tuples(rng, ty);
-    compact_type(solver, &maybe_kind_var(rng, ty)).term
+    let ty = maybe_kind_var(rng, solver, ty);
+    compact_type(solver, &ty).term
 }
 
 /// Reopen some of a generated type's non-empty tuples, so the bounds carry open widths too. A

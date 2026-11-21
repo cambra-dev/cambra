@@ -1042,9 +1042,10 @@ above the binding's cutoff (`FreshenCache`). Every handle goes through one rule 
    is copied into it, so a cycle through the handle reaches the copy.
 
 A handle with a level of its own, an inference, barrier, kind or capability variable, stands above
-the cutoff where that level is above it. One with none is copied wherever freshening reaches it: a
-kind no function has placed, an ordering requirement, and a trait obligation, which a watch of a
-copied variable reaches whichever scope minted it. A copy of an ordering requirement its run has
+the cutoff where that level is above it. One with none is copied wherever freshening reaches it: an
+ordering requirement, and a trait obligation, which a watch of a copied variable reaches whichever
+scope minted it. A kind lowering minted is the program's, not a run's: it has no home, so no run
+records on it (`Solver::funkind_state_mut` panics on one), and a copy keeps it. A copy of an ordering requirement its run has
 decided holds that decision. What each kind's copy carries is its
 own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`,
 `copy_ordering`, `copy_obligation`): what is recorded on the original, copied through the same
@@ -1054,9 +1055,7 @@ copied variable's own capabilities are. Written clauses hold nothing of a run an
 
 `freshen_level` returns a type unchanged when nothing it holds is above the cutoff, so it reads the
 same state the rule copies: a function's kind and capabilities, a known set's contents, where an
-ordering requirement counts as above every cutoff. A kind variable can be minted without a level,
-which no other variable can; such a kind counts as the outermost there, and the rule copies it
-wherever it is reached.
+ordering requirement counts as above every cutoff.
 
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
@@ -1756,7 +1755,7 @@ returns alike. An obligation copy holds a strong reference to its parent; these 
 acyclic chain, so the watches the solver drops release the copies and the parents they hold
 (`copied_requirements_release_their_ancestors_with_the_solver`).
 
-A handle the solver did not mint is foreign: one minted outside every run (`FunKindVar::unowned`,
+A handle the solver did not mint is foreign: one minted outside every run (`FunKindVar::unowned_data`,
 `BarrierVar::unowned`), or one a finished run left in a tree. A foreign handle reads as unrecorded
 until this run records on it, and what this run records stays in this solver. A type operation
 outside every run takes `Solver::none()`, which panics on reaching an inference or barrier variable,
@@ -3984,12 +3983,16 @@ the recorded one
 
 ### Funkind variables are copied by level
 
-A funkind variable records the level of what owns it, where that is known
-(`FunKindVar::level`): a variable's own funkind variable stands at the variable's level and is
-lowered with it, and the one an annotation's normalization mints for a funkind hole stands at the
-level the annotation is normalized at. `freshen_kind_var` copies a funkind variable above the
-freshening's cutoff and leaves one at or below it in place, as freshening treats a type variable.
-A funkind variable with no recorded level is copied by every freshening that reaches it.
+A funkind variable a run mints stands at the level of what owns it, given when it is minted
+(`FunKindVar::fresh`, `FunKindVar::level`): a variable's own funkind variable stands at the
+variable's level and is lowered with it, a demand's at the level it is made at, and the one an
+annotation's normalization mints stands at the level the annotation is normalized at. Lowering
+mints data funkind variables outside every run, a consumer's and an annotation's hole
+(`FunKind::fresh_data`, `FunKind::data_hole`). Normalization replaces each with a fresh one of the
+run's per occurrence (`InferCtx::normalize_fun_kind_in`), for an annotation and for a cast's
+target alike, so no run records on lowering's. `freshen_kind_var` copies a funkind variable above
+the freshening's cutoff and leaves one at or below it in place, as freshening treats a type
+variable.
 `lower_levels` and extrusion also lower a function type's funkind variable to the destination
 level, including when its domain and codomain contain no variable above that level.
 

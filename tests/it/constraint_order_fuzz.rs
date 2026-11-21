@@ -122,7 +122,7 @@ fn canonicalize(s: &str) -> String {
     out
 }
 
-fn gen_specs(rng: &mut Rng, nvars: usize) -> Vec<Spec> {
+fn gen_specs(rng: &mut Rng, solver: &mut Solver, nvars: usize) -> Vec<Spec> {
     let count = 2 + rng.below(5) as usize;
     let mut specs = Vec::with_capacity(count);
     // One pool per set, so two constraints can carry the same kind variable and a
@@ -130,13 +130,13 @@ fn gen_specs(rng: &mut Rng, nvars: usize) -> Vec<Spec> {
     let mut kinds = KindVarPool::new();
     for _ in 0..count {
         let v = rng.below(nvars as u64) as usize;
-        let concrete = |rng: &mut Rng, kinds: &mut KindVarPool| {
+        let concrete = |rng: &mut Rng, kinds: &mut KindVarPool, solver: &mut Solver| {
             let t = gen_ty(rng, 2, Fragment::WithSums);
-            maybe_kind_var_from(rng, kinds, t)
+            maybe_kind_var_from(rng, kinds, solver, t)
         };
         match rng.below(4) {
-            0 => specs.push(Spec::Low(v, concrete(rng, &mut kinds))),
-            1 => specs.push(Spec::Up(v, concrete(rng, &mut kinds))),
+            0 => specs.push(Spec::Low(v, concrete(rng, &mut kinds, solver))),
+            1 => specs.push(Spec::Up(v, concrete(rng, &mut kinds, solver))),
             2 if nvars > 1 => {
                 let mut w = rng.below(nvars as u64) as usize;
                 if w == v {
@@ -147,7 +147,7 @@ fn gen_specs(rng: &mut Rng, nvars: usize) -> Vec<Spec> {
             _ => {
                 // Correlated bounds — the same type arriving on both sides
                 // is where joins actually meet.
-                let t = concrete(rng, &mut kinds);
+                let t = concrete(rng, &mut kinds, solver);
                 specs.push(if rng.chance(1, 2) {
                     Spec::Low(v, t)
                 } else {
@@ -199,7 +199,7 @@ fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
         let scope = Telescope::empty();
         let v0 = Type::Infer(InferVar::fresh_in(solver, 0, &scope));
         let v1 = Type::Infer(InferVar::fresh_in(solver, 0, &scope));
-        let (k1, k2) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+        let (k1, k2) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
         let mut rejected = false;
         for &i in order {
             let r = match i {
@@ -302,16 +302,16 @@ fn solving_is_independent_of_constraint_arrival_order() {
         // kind variable carries its pin in an `Rc<RefCell<_>>`, so a cloned spec
         // would leak one run's pins into the next.
         let case_seed = rng.next();
-        let build = || {
+        let build = |solver: &mut Solver| {
             let mut r = Rng::new(case_seed);
             let nvars = 1 + r.below(3) as usize;
-            let specs = gen_specs(&mut r, nvars);
+            let specs = gen_specs(&mut r, solver, nvars);
             (nvars, specs)
         };
-        let (nvars, specs) = build();
+        let (nvars, specs) = build(solver);
         let baseline = run(solver, nvars, &specs, &(0..specs.len()).collect::<Vec<_>>());
         for _ in 0..8 {
-            let (nvars, specs) = build();
+            let (nvars, specs) = build(solver);
             let order = shuffle(&mut rng, specs.len());
             let outcome = run(solver, nvars, &specs, &order);
             if outcome != baseline {

@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         let collection = Rc::new(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
         let (root, nodes) =
@@ -1393,7 +1393,7 @@ mod tests {
         // which keys as the `Compute` default rather than as its own point.
         let unresolved = |solver: &mut Solver| Type::Fun {
             name: None,
-            fun_kind: crate::ccl::ty::FunKind::fresh_var(solver),
+            fun_kind: crate::ccl::ty::FunKind::fresh_var(solver, 0),
             domain: Box::new(int()),
             codomain: Box::new(int()),
             capabilities: crate::ccl::capabilities::Capabilities::none(),

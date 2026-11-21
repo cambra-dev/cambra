@@ -3935,8 +3935,7 @@ mod tests {
     #[test]
     fn monomorphic_functions_keep_their_kind_at_the_bindings_level() {
         let solver = &mut Solver::new();
-        let kind = FunKindVar::fresh(solver);
-        kind.place_at(solver, 2);
+        let kind = FunKindVar::fresh(solver, 2);
         let function = Type::Fun {
             name: None,
             fun_kind: FunKind::Var(Rc::clone(&kind)),
@@ -3955,8 +3954,7 @@ mod tests {
         let solver = &mut Solver::new();
         for has_variable in [false, true] {
             for invariant in [false, true] {
-                let kind = FunKindVar::fresh(solver);
-                kind.place_at(solver, 2);
+                let kind = FunKindVar::fresh(solver, 2);
                 let function = Type::Fun {
                     name: None,
                     fun_kind: FunKind::Var(Rc::clone(&kind)),
@@ -6012,13 +6010,13 @@ mod tests {
         let cond = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
         let consumer = {
             let fresh = fresh_var(solver, 0);
-            Type::consumer_fun(solver, fresh, prim(BaseType::Int))
+            Type::consumer_fun(solver, 0, fresh, prim(BaseType::Int))
         };
         assert!(constrain_subtype(solver, &cond, &consumer, &mut ConstrainCache::new()).is_ok());
         // A consumer demanding a *concrete narrower* domain fails: the concrete type
         // meets the witness at every candidate, and `0..3` is not `0..2` — the
         // conditional collection never silently narrows to a single domain.
-        let narrow = Type::consumer_fun(solver, Type::UIntRange(2), prim(BaseType::Int));
+        let narrow = Type::consumer_fun(solver, 0, Type::UIntRange(2), prim(BaseType::Int));
         assert!(constrain_subtype(solver, &cond, &narrow, &mut ConstrainCache::new()).is_err());
     }
 
@@ -6043,7 +6041,7 @@ mod tests {
             // comprehension). Its domain accumulates the witness.
             let consumer = {
                 let fresh = fresh_var(solver, 0);
-                Type::consumer_fun(solver, fresh, int.clone())
+                Type::consumer_fun(solver, 0, fresh, int.clone())
             };
             assert!(
                 constrain_subtype(solver, &collection, &consumer, &mut ConstrainCache::new())
@@ -6133,7 +6131,7 @@ mod tests {
         let solver = &mut Solver::new();
         // The edge relates the two kinds, so a pin either side carries is a pin
         // both read — whichever side it was recorded on.
-        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
         let mut cache = ConstrainCache::new();
         // Pin `a` to compute, leaving `b` unpinned.
         constrain_subtype(
@@ -6171,7 +6169,7 @@ mod tests {
     #[test]
     fn a_pin_arriving_after_a_var_var_kind_edge_still_crosses_it() {
         let solver = &mut Solver::new();
-        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
         // The edge first, both sides unpinned — nothing to carry.
         constrain_subtype(
             solver,
@@ -6207,9 +6205,9 @@ mod tests {
     fn a_pin_crosses_a_chain_of_var_var_kind_edges() {
         let solver = &mut Solver::new();
         let (a, b, c) = (
-            FunKindVar::fresh(solver),
-            FunKindVar::fresh(solver),
-            FunKindVar::fresh(solver),
+            FunKindVar::fresh(solver, 0),
+            FunKindVar::fresh(solver, 0),
+            FunKindVar::fresh(solver, 0),
         );
         for (x, y) in [(&a, &b), (&b, &c)] {
             constrain_subtype(
@@ -6242,7 +6240,7 @@ mod tests {
     #[test]
     fn a_plain_collection_and_a_sum_do_not_merge() {
         let solver = &mut Solver::new();
-        let v = FunKindVar::fresh(solver);
+        let v = FunKindVar::fresh(solver, 0);
         let mut cache = ConstrainCache::new();
         constrain_subtype(
             solver,
@@ -6279,7 +6277,7 @@ mod tests {
         // The pin crosses the edge, so the *second* concrete kind meets a component that
         // already holds the first — and a concrete kind settles the variable it meets, so
         // the contradiction is reported at that edge rather than carried to coalesce.
-        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
         constrain_subtype(
             solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
@@ -6318,7 +6316,7 @@ mod tests {
         // whichever kind of edge that is. A variable between the two ends hides nothing:
         // `resolved` folds the whole component.
         let fun_over = fun_at;
-        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
         let mut cache = ConstrainCache::new();
         constrain_subtype(
             solver,
@@ -6357,7 +6355,7 @@ mod tests {
         // A kind var meeting `Data` is *pinned* to it, never an eager rejection,
         // and resolves at coalesce. A compute function meeting the same var would
         // pin it the other way, and holding both points is `KindPin::Conflict`.
-        let v = FunKindVar::fresh(solver);
+        let v = FunKindVar::fresh(solver, 0);
         let var_fun = Type::Fun {
             name: None,
             fun_kind: FunKind::Var(Rc::clone(&v)),
