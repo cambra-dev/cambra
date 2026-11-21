@@ -623,15 +623,24 @@ fn freshen_requirement(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> crate::ccl::capabilities::Requirement {
-    let Some(order) = r.ordering() else {
-        return r.clone();
-    };
-    if order.decision(solver) == Some(true) {
+    if r.ordering().is_none() {
         return r.clone();
     }
-    if let Some(copy) = cache.copy_of(r) {
-        return copy;
-    }
+    freshen_handle(solver, lim, r, target, cache)
+}
+
+/// A new copy of `r`, an ordering requirement, over its positions, source and capabilities
+/// as this freshening copies them ([`freshen_held`]).
+fn copy_ordering(
+    solver: &mut Solver,
+    lim: Level,
+    r: &crate::ccl::capabilities::Requirement,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> crate::ccl::capabilities::Requirement {
+    let order = r
+        .ordering()
+        .expect("an ordering handle holds an ordering requirement");
     let iter = order
         .iter
         .as_ref()
@@ -674,12 +683,17 @@ fn freshen_capability_var(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<CapabilityVar> {
-    if v.level(solver) <= lim {
-        return Rc::clone(v);
-    }
-    if let Some(f) = cache.copy_of(v) {
-        return f;
-    }
+    freshen_handle(solver, lim, v, target, cache)
+}
+
+/// A new copy of `v` with its own capabilities, incoming edges and bounds ([`freshen_held`]).
+fn copy_capability_var(
+    solver: &mut Solver,
+    lim: Level,
+    v: &Rc<CapabilityVar>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<CapabilityVar> {
     let f = CapabilityVar::fresh(solver, target.level_of(v.level(solver)));
     let open = v.open_input(solver);
     f.set_open_input(solver, open);
@@ -790,15 +804,75 @@ fn freshen_kind_var(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<FunKindVar> {
-    if let Some(f) = cache.copy_of(kv) {
-        return f;
+    freshen_handle(solver, lim, kv, target, cache)
+}
+
+/// Freshening's one rule for a solver handle (`src/ccl/design/type-inference.md`, "Copying
+/// solver state"): the copy this freshening already made; the handle itself where it stands at or
+/// below the cutoff, an enclosing scope's; and otherwise a new copy carrying what is recorded on
+/// the original, which records itself before copying that state, so a cycle reaches it.
+fn freshen_held(
+    solver: &mut Solver,
+    lim: Level,
+    held: &Held,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Held {
+    if let Some(copy) = cache.copies.get(&held.key()) {
+        return copy.clone();
     }
-    // A funkind variable at or below the cutoff is an enclosing scope's, as a variable there
-    // is, and freshens to itself: a copy of a function this freshening copies relates to it as
-    // the original did.
-    if kv.level(solver).is_some_and(|l| l <= lim) {
-        return Rc::clone(kv);
+    if !held_above(solver, lim, held) {
+        return held.clone();
     }
+    match held {
+        Held::Infer(v) => Held::Infer(copy_infer_var(solver, lim, v, target, cache)),
+        Held::Barrier(b) => Held::Barrier(copy_barrier_var(solver, lim, b, target, cache)),
+        Held::FunKind(k) => Held::FunKind(copy_kind_var(solver, k, lim, target, cache)),
+        Held::Capability(c) => Held::Capability(copy_capability_var(solver, lim, c, target, cache)),
+        Held::Ordering(r) => Held::Ordering(copy_ordering(solver, lim, r, target, cache)),
+        Held::Obligation(o) => Held::Obligation(copy_obligation(solver, lim, o, target, cache)),
+    }
+}
+
+/// [`freshen_held`] for a handle of a known kind.
+fn freshen_handle<K: HeldKind + Clone>(
+    solver: &mut Solver,
+    lim: Level,
+    handle: &K,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> K {
+    let held = freshen_held(solver, lim, &handle.clone().into_held(), target, cache);
+    K::from_held(&held)
+        .expect("a handle freshens to a handle of its kind")
+        .clone()
+}
+
+/// Whether freshening copies `held`: a handle with a level of its own is copied where that level
+/// is above the cutoff, and one with none, a kind no function has placed, an ordering
+/// requirement or an obligation, wherever freshening reaches it. An ordering requirement its run
+/// has decided holds is kept, its answer shared.
+fn held_above(solver: &mut Solver, lim: Level, held: &Held) -> bool {
+    match held {
+        Held::Infer(v) => v.level(solver) > lim,
+        Held::Barrier(b) => freshen_level(solver, &Type::BarrierVar(Rc::clone(b))) > lim,
+        Held::FunKind(k) => k.level(solver).is_none_or(|l| l > lim),
+        Held::Capability(c) => c.level(solver) > lim,
+        Held::Ordering(r) => r
+            .ordering()
+            .is_some_and(|order| order.decision(solver) != Some(true)),
+        Held::Obligation(_) => true,
+    }
+}
+
+/// A new copy of `kv` with what the definition recorded on it ([`freshen_held`]).
+fn copy_kind_var(
+    solver: &mut Solver,
+    kv: &Rc<FunKindVar>,
+    lim: Level,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<FunKindVar> {
     // Each field of the original, and what the copy makes of it.
     let crate::ccl::ty::FunKindVarFields {
         // The copy's own.
@@ -1390,10 +1464,26 @@ pub fn freshen_above(
             }
             Type::Poly(Rc::new(out))
         }
-        Type::Infer(tv) => {
-            if let Some(existing) = cache.copy_of(tv) {
-                return Type::Infer(existing);
-            }
+        Type::Infer(tv) => Type::Infer(freshen_handle(solver, lim, tv, target, cache)),
+        // Freshens like `Infer`, over what a barrier variable carries ([`copy_barrier_var`]).
+        Type::BarrierVar(barrier) => {
+            Type::BarrierVar(freshen_handle(solver, lim, barrier, target, cache))
+        }
+    }
+}
+
+/// A new copy of `tv` with what the definition recorded on it: its bounds, kinding
+/// constraints, guarded bounds and suspended memberships, under a copy of its kind and in the
+/// scope a copy stands in ([`freshen_held`]).
+fn copy_infer_var(
+    solver: &mut Solver,
+    lim: Level,
+    tv: &Rc<InferVar>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<InferVar> {
+    {
+        {
             debug_assert!(
                 tv.fun_kind.level(solver).is_none_or(|level| level > lim),
                 "a quantified type variable's own funkind is quantified at the same cutoff"
@@ -1619,16 +1709,24 @@ pub fn freshen_above(
                 target,
                 cache,
             );
-            Type::Infer(v)
+            v
         }
-        // Freshens like `Infer`, over what a barrier variable carries: its opaque
-        // binders, its lower and upper bounds, and its watches. Its level is read from
-        // the bounds, so the copy's follows from the freshened ones. It has no telescope
-        // or kind to copy.
-        Type::BarrierVar(barrier) => {
-            if let Some(existing) = cache.copy_of(barrier) {
-                return Type::BarrierVar(existing);
-            }
+    }
+}
+
+/// A new copy of `barrier`, as [`copy_infer_var`] copies a variable, over what a barrier
+/// variable carries: its opaque binders, its lower and upper bounds, and its watches. Its level
+/// is read from the bounds, so the copy's follows from the freshened ones. It has no telescope
+/// or kind to copy.
+fn copy_barrier_var(
+    solver: &mut Solver,
+    lim: Level,
+    barrier: &Rc<BarrierVar>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<BarrierVar> {
+    {
+        {
             // Registered before the bounds are copied, so a bound that reaches this
             // barrier variable again resolves to the copy.
             let fresh =
@@ -1666,7 +1764,7 @@ pub fn freshen_above(
                 target,
                 cache,
             );
-            Type::BarrierVar(fresh)
+            fresh
         }
     }
 }
@@ -1775,15 +1873,26 @@ fn freshen_watches(
     cache: &mut FreshenCache,
 ) {
     for (obligation, pos) in watches {
-        if let Some(existing) = cache.copy_of(&obligation) {
-            attach(solver, &obligation, &existing, pos);
-            continue;
-        }
+        let copy = freshen_handle(solver, lim, &obligation, target, cache);
+        attach(solver, &obligation, &copy, pos);
+    }
+}
+
+/// A new copy of `obligation`: its candidates and state, and, once the copy is reachable, its
+/// operands, associated types, effects and refinement inputs as this freshening copies them
+/// ([`freshen_held`]).
+fn copy_obligation(
+    solver: &mut Solver,
+    lim: Level,
+    obligation: &Rc<TraitObligation>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<TraitObligation> {
+    {
         // Phase 1: a copy carrying the original's candidate set, with the output
         // position still pointing at the definition's — enough to be reachable.
-        let copy = TraitObligation::new_from(solver, &obligation);
-        cache.record_copy(&obligation, Rc::clone(&copy));
-        attach(solver, &obligation, &copy, pos);
+        let copy = TraitObligation::new_from(solver, obligation);
+        cache.record_copy(obligation, Rc::clone(&copy));
         // A specialization clone turns the binding's own type parameters, the ones
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:
@@ -1842,6 +1951,7 @@ fn freshen_watches(
                     .collect(),
             );
         }
+        copy
     }
 }
 
@@ -1934,14 +2044,7 @@ fn freshen_obligation(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<TraitObligation> {
-    if cache.copy_of(obligation).is_none() {
-        for operand in obligation.operands().into_iter().flatten() {
-            freshen_above(solver, lim, &operand, target, cache);
-        }
-    }
-    cache
-        .copy_of(obligation)
-        .unwrap_or_else(|| Rc::clone(obligation))
+    freshen_handle(solver, lim, obligation, target, cache)
 }
 
 /// Structurally pair a use site's resolved instantiation type against the
