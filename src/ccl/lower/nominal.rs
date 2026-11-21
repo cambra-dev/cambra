@@ -2398,13 +2398,7 @@ pub(super) fn lower_member_call(
             }
             None => {
                 let binding = named.reference(name, ctx);
-                super::exprs::lower_application(
-                    Name::raw(&binding),
-                    span,
-                    args,
-                    super::exprs::Passing::Values,
-                    ctx,
-                )
+                super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
             }
         },
     }
@@ -2821,7 +2815,7 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             p.name_span,
             format!(
                 "`{}::{name}` takes a `Mut` parameter `{}`; an associated function with a \
-                 pass-by-reference parameter is not supported yet",
+                 borrowed parameter is not supported yet",
                 decl.name, p.name
             ),
         ));
@@ -3067,6 +3061,15 @@ pub(super) fn lower_method_call(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    if let Some(argument) = std::iter::once(receiver)
+        .chain(args)
+        .find(|argument| super::exprs::borrowed_place(argument).is_some())
+    {
+        return Err(LoweringError::unsupported(
+            argument.span,
+            "borrowed method parameters are not implemented; use a function with a borrowed parameter",
+        ));
+    }
     // A position is spelled as digits, which no method's name is.
     if method.node.bytes().all(|b| b.is_ascii_digit()) {
         return Err(LoweringError::unsupported(

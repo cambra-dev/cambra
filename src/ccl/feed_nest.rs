@@ -1,5 +1,5 @@
 //! A feed's contribution from under nested loops, keyed by the tuple of the loops' positions
-//! (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability").
+//! (`docs/chl-spec.md`, "8.4 Deferred collections").
 //!
 //! Two phases build this key. `channelize` rebuilds a nest it finds under a feed
 //! ([`Nest`]), and `mut_elim` flattens the taps a recurrence's feeds rode
@@ -277,7 +277,7 @@ pub(crate) fn flatten_nested_contribution(value: Expr, levels: usize) -> Expr {
     }
     // One `uncurry(𝑛)` keys the outer `levels` levels by the tuple of their positions: a feed
     // under three loops is keyed by the three positions, not by a pair of a pair and a position
-    // (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). A loop's own key
+    // (`docs/chl-spec.md`, "8.4 Deferred collections"). A loop's own key
     // that is a tuple stays one component.
     let flat = flattened_type(&value.ty, levels);
     apply_primitive(value, Builtin::Uncurry(levels), flat)
@@ -440,7 +440,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
 }
 
 /// How a feed's contribution from under nested loops is rebuilt to be keyed by the tuple of
-/// the loops' positions (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability").
+/// the loops' positions (`docs/chl-spec.md`, "8.4 Deferred collections").
 enum Nest {
     /// No loop's source reads an enclosing loop's binder or a name bound inside one, so the
     /// positions are a product: [`nest_as_product`].
@@ -640,7 +640,7 @@ fn generator_nest(
 }
 
 /// The domain of a loop's source: a collection's, or, for a read of a deferred collection
-/// (a generator's channel, typed by its handle until `channelize` assembles it), the handle's
+/// (a generator's channel, typed by its place type until `channelize` assembles it), the place's
 /// channel domain, which its read view states ([`Type::read_view`]).
 fn source_domain(ty: &Type) -> Option<Type> {
     ty.read_view().domain()

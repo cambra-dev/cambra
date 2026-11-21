@@ -1650,23 +1650,23 @@ impl Capability {
     }
 }
 
-/// A [`Capability`] with where the variable it names is bound, which decides the function bodies
-/// it leaves.
+/// A [`Capability`] with the node it entered at. Where the variable it names is bound decides
+/// the function bodies it leaves, which the variable's name says: every binder has a name of its
+/// own, and a scope drops the capabilities naming the binders it binds ([`PlaceBinders`]).
 ///
 /// Equality, ordering and hashing leave out [`at`](Self::at): where a capability entered does not
 /// make it another capability, and a set keeps the first place it entered.
 #[derive(Debug, Clone)]
 pub struct ScopedCapability {
     pub item: Capability,
-    pub bound: Bound,
     /// The node where the capability entered the variable holding it: the statement recording
     /// it, or the call an edge carried it through. `None` for one a type states.
     pub at: Option<NodeId>,
 }
 
 impl ScopedCapability {
-    fn key(&self) -> (&Capability, Bound) {
-        (&self.item, self.bound)
+    fn key(&self) -> &Capability {
+        &self.item
     }
 }
 
@@ -1686,7 +1686,7 @@ impl PartialOrd for ScopedCapability {
 
 impl Ord for ScopedCapability {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
+        self.key().cmp(other.key())
     }
 }
 
@@ -1696,20 +1696,72 @@ impl Hash for ScopedCapability {
     }
 }
 
-/// Where the variable a [`ScopedCapability`] names is bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Bound {
-    /// Nowhere a scope's end discharges: the capability names no variable, or names a public feed,
-    /// which belongs to the run.
-    Escaping,
-    /// In the body of the function this many function bodies deep, `0` at a module's top
-    /// level.
-    At(u32),
-    /// As a parameter. A parameter's history is its argument's, so the call records what is
-    /// done to it, and the capability leaves no function body: only the statement doing it holds it
-    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
-    Parameter,
+/// Where a mutable variable or a feed is bound, for the capabilities naming it.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaceBinder {
+    /// The function-body depth it is bound at, `0` at a module's top level.
+    pub depth: u32,
+    /// A parameter borrows its argument's place, which outlives the function: a value handed
+    /// to it must not hold what the function binds. What the function does to it is its own,
+    /// bound at its body's depth, and the call records it.
+    pub parameter: bool,
+    /// A transactional mutable variable, or a parameter passed one: reading or writing it
+    /// requires `Transaction`, and its capabilities are `ReadTxn` and `WriteTxn`.
+    pub transactional: bool,
+    /// A feed, which a clause names in `Append(f)`; every other binder here is a mutable
+    /// variable.
+    pub feed: bool,
+    /// It belongs to the run, a public feed or a declared transactional variable, so no scope
+    /// drops what names it.
+    pub escapes: bool,
 }
+
+impl PlaceBinder {
+    /// The depth whose scope drops the capabilities naming it, unless it belongs to the run.
+    pub fn scope_depth(&self) -> Option<u32> {
+        (!self.escapes).then_some(self.depth)
+    }
+}
+
+/// Every mutable variable and feed in scope, keyed by its unique name and registered where it
+/// is bound, its last registration standing. A scope drops the capabilities naming the binders
+/// it binds, which a function boundary reads here ([`Filter::below`]).
+#[derive(Debug, Clone, Default)]
+pub struct PlaceBinders(Rc<RefCell<HashMap<Name, PlaceBinder>>>);
+
+impl PlaceBinders {
+    /// Record where `name` is bound.
+    pub fn bind(&self, name: Name, binder: PlaceBinder) {
+        self.0.borrow_mut().insert(name, binder);
+    }
+
+    /// Where the place variable `name` is bound, if it is one.
+    pub fn get(&self, name: &Name) -> Option<PlaceBinder> {
+        self.0.borrow().get(name).copied()
+    }
+
+    /// Whether some place variable is bound as `f` says.
+    pub fn any(&self, f: impl Fn(&PlaceBinder) -> bool) -> bool {
+        self.0.borrow().values().any(f)
+    }
+
+    /// The depth whose scope drops `capability`, if it names a variable a scope binds.
+    pub fn depth_of(&self, capability: &Capability) -> Option<u32> {
+        capability
+            .variable()
+            .and_then(|n| self.get(n))
+            .and_then(|b| b.scope_depth())
+    }
+}
+
+/// One table of the inference, so edges compare by identity.
+impl PartialEq for PlaceBinders {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PlaceBinders {}
 
 /// What an edge into a [`CapabilityVar`] lets through
 /// (`src/ccl/design/type-inference.md`, "Capability variables").
@@ -1721,10 +1773,10 @@ pub struct Filter {
     /// collection is evaluated where it is built, so its body's capabilities are the enclosing
     /// body's, and a lambda that turns out to be a function's are latent in its type.
     pub when_data: Option<Rc<crate::ccl::ty::FunKindVar>>,
-    /// The receiving function's body depth: a capability naming a variable bound at this depth
-    /// or deeper is that function's own, and stops here, as one naming a parameter does
-    /// ([`Bound::Parameter`]).
-    pub below: Option<u32>,
+    /// The receiving function's body depth, with where each variable is bound: a capability
+    /// naming a variable bound at this depth or deeper is that function's own, its parameters'
+    /// included, and stops here.
+    pub below: Option<(u32, PlaceBinders)>,
     /// Requirements the edge's context supplies, `Transaction` inside a `with begin():`
     /// body.
     pub discharges: BTreeSet<Requirement>,
@@ -1958,10 +2010,11 @@ impl Filter {
         {
             return false;
         }
-        match (self.below, capability.bound) {
-            (None, _) | (Some(_), Bound::Escaping) => true,
-            (Some(below), Bound::At(at)) => at < below,
-            (Some(_), Bound::Parameter) => false,
+        match &self.below {
+            None => true,
+            Some((below, binders)) => binders
+                .depth_of(&capability.item)
+                .is_none_or(|at| at < *below),
         }
     }
 }
@@ -2289,11 +2342,7 @@ impl CapabilityVar {
                         of_requires
                     };
                     if side {
-                        hole.record(ScopedCapability {
-                            item,
-                            bound: Bound::Escaping,
-                            at: None,
-                        });
+                        hole.record(ScopedCapability { item, at: None });
                     }
                 }
                 hole.bound_above(Upper {
@@ -2757,11 +2806,7 @@ impl Capabilities {
             .map(|r| Capability::Requires(r.clone()))
             .chain(set.causes.iter().map(|e| Capability::Causes(e.clone())))
             .chain(set.tops.iter().cloned().map(Capability::Every))
-            .map(|item| ScopedCapability {
-                item,
-                bound: Bound::Escaping,
-                at: None,
-            })
+            .map(|item| ScopedCapability { item, at: None })
             .collect()
     }
 
@@ -3255,11 +3300,7 @@ mod tests {
     fn items_at(items: impl IntoIterator<Item = Capability>) -> BTreeSet<ScopedCapability> {
         items
             .into_iter()
-            .map(|item| ScopedCapability {
-                item,
-                bound: Bound::Escaping,
-                at: None,
-            })
+            .map(|item| ScopedCapability { item, at: None })
             .collect()
     }
 
@@ -3464,11 +3505,7 @@ mod tests {
             except: [top(Family::Write)].into(),
             ..Filter::default()
         };
-        let at = |item| ScopedCapability {
-            item,
-            bound: Bound::Escaping,
-            at: None,
-        };
+        let at = |item| ScopedCapability { item, at: None };
         let (write_top, every) = (at(top(Family::Write)), at(Capability::Every(effect())));
         assert!(filter.pass(&write_top).is_none());
         let passed = filter.pass(&every).expect("`Effect` passes less writes");

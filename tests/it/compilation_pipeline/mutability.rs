@@ -63,7 +63,7 @@ use super::helpers::*;
 // invariant the call was rejected outright. The ordinary application edges cannot supply
 // it — `apply` records `arg <: d` against a *fresh variable*, so a `Mut` argument meets
 // an `Infer` and takes the deliberate deref arm, which is right for a bare read
-// (`cnt + 1`) and drops the handle here.
+// (`cnt + 1`) and drops the place here.
 #[case(
     indoc::indoc! {r#"
 
@@ -71,7 +71,7 @@ use super::helpers::*;
           c += 1
         x := 0
         for i in [1, 2, 3]:
-          fw(x)
+          fw(&x)
         x"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
@@ -88,7 +88,7 @@ use super::helpers::*;
           c += n
         x := 0
         for i in [1, 2, 3]:
-          fw(2, x)
+          fw(2, &x)
         x"#},
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
@@ -102,7 +102,7 @@ use super::helpers::*;
         x := 0
         y := 0
         for i in [1, 2, 3]:
-          fw(x, y)
+          fw(&x, &y)
         (x, y)"#},
     Tile::record(HashMap::from([
         ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
@@ -118,10 +118,10 @@ use super::helpers::*;
         def inner(c: Mut(Int)):
           c += 1
         def outer(n: Int, c: Mut(Int)):
-          inner(c)
+          inner(&c)
         x := 0
         for i in [1, 2, 3]:
-          outer(7, x)
+          outer(7, &x)
         x"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
@@ -328,8 +328,8 @@ use super::helpers::*;
                 ColumnValue::UInts(vec![0, 1, 2]),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60]))), channel_predicate(&["o<<", "o<<#1", "o<<#2"]), BitSet::new())
 )]
-// Pass-by-reference `Mut` param, driven by a loop: `bump(c)` writes its
-// pass-by-ref mutable variable on each iteration. `bump(cnt)` inlines to `MutWrite(cnt,
+// Borrowed `Mut` param, driven by a loop: `bump(c)` writes its
+// borrowed mutable variable on each iteration. `bump(cnt)` inlines to `MutWrite(cnt,
 // cnt + 1)`, and the letrec phase reads the hidden write off the `For` marker
 // as an accumulator recurrence: 0 → 1 → 2 → 3 over [1, 2, 3].
 #[case(
@@ -339,11 +339,11 @@ use super::helpers::*;
             c += 1
         cnt: Mut(Int) := 0
         for x in [1, 2, 3]:
-            bump(cnt)
+            bump(&cnt)
         cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
-// The same pass-by-ref writer applied once, outside any loop: the inlined
+// The same borrowing writer applied once, outside any loop: the inlined
 // `MutWrite(cnt, cnt + 1)` normalizes to a shadowing `let`, so `cnt` reads 1.
 #[case(
     indoc::indoc! {r#"
@@ -351,7 +351,7 @@ use super::helpers::*;
         def bump(c: Mut(Int)):
             c += 1
         cnt: Mut(Int) := 0
-        bump(cnt)
+        bump(&cnt)
         cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
@@ -388,7 +388,7 @@ use super::helpers::*;
         a * 1000 + b"#},
     Tile::Scalar(ColumnValue::Ints(vec![2106]))
 )]
-// A pass-by-ref writer whose body is *two* statements, applied once outside a
+// A borrowing writer whose body is *two* statements, applied once outside a
 // loop. Inlining splices `ExprStmt(ExprStmt(cnt := cnt+1, cnt := cnt+2), cnt)`;
 // flat-spine normalization un-nests it so both writes land on the spine.
 #[case(
@@ -398,11 +398,11 @@ use super::helpers::*;
             c += 1
             c += 2
         cnt: Mut(Int) := 0
-        bump2(cnt)
+        bump2(&cnt)
         cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
-// A pass-by-ref writer applied in *value* position (`y = bump(cnt)`). Inlining
+// A borrowing writer applied in *value* position (`y = bump(cnt)`). Inlining
 // binds `y` to a bare `MutWrite`; flat-spine normalization hoists the write onto
 // the spine (its value is `unit`), so the mutable-variable advance reaches the trailing read.
 #[case(
@@ -411,7 +411,7 @@ use super::helpers::*;
         def bump(c: Mut(Int)):
             c += 1
         cnt: Mut(Int) := 0
-        y = bump(cnt)
+        y = bump(&cnt)
         cnt"#},
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
@@ -678,24 +678,20 @@ fn a_mutable_variable_holds_the_join_of_its_writes(#[case] code: &str, #[case] e
 }
 
 // ---------------------------------------------------------------------------
-// Second-class `Mut` discipline (`src/ccl/design/mutability.md`, "No aliasing:
-// `Mut` values are second-class (downward-only)"). A mutable value must stay
-// traceable to one introduction: it may only be a bare variable reference
-// (rule 1), never nested in a composite type or returned from a function
-// (rule 2). There is no rule about an unannotated binding holding a `Mut`: only
-// a `MutDecl` and a pass-by-reference param can bind one.
+// Place checks (`src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
+// second-class (downward-only)"). A borrow lends only a place variable (rule 1),
+// and a place type is never nested in a composite type or returned from a
+// function (rule 2). Only a `MutDecl` and a borrowed parameter bind a `Mut`.
 // ---------------------------------------------------------------------------
 
 /// Compile `code`, expect failure, and assert the rendered errors contain
 /// `needle`.
-fn expect_mut_discipline_error(code: &str, needle: &str) {
+fn expect_place_error(code: &str, needle: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let loaded = LoadedProgram::from_text("<mut-discipline-test>", code);
+    let loaded = LoadedProgram::from_text("<place-test>", code);
     let errs = match compile_program(&mut ctx, &loaded, consumer) {
-        Ok(_) => panic!(
-            "expected a Mut-discipline error containing {needle:?}, but the program compiled"
-        ),
+        Ok(_) => panic!("expected a place error containing {needle:?}, but the program compiled"),
         Err(e) => e,
     };
     let rendered = render_errors(&errs, loaded.sources());
@@ -717,7 +713,7 @@ fn compile_errors(code: &str) -> String {
 }
 
 /// Compile `code`, expect failure, and assert the rendered errors contain
-/// `needle`. The kind-agnostic sibling of [`expect_mut_discipline_error`], for
+/// `needle`. The kind-agnostic sibling of [`expect_place_error`], for
 /// surface diagnostics that surface at lowering or channelization.
 fn expect_compile_error(code: &str, needle: &str) {
     let rendered = compile_errors(code);
@@ -738,7 +734,7 @@ fn expect_compile_error(code: &str, needle: &str) {
 /// [`write_of_the_wrong_type_is_rejected_against_the_mut_vars_value_type`].
 #[test]
 fn augmented_assignment_to_non_mutable_rejected() {
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc::indoc! {r#"
         x = 0
         x += 1
@@ -761,7 +757,7 @@ fn augmented_assignment_to_non_mutable_rejected() {
 /// check runs at all.
 #[test]
 fn a_write_to_a_binder_monomorphization_dropped_is_rejected() {
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc! {r#"
         def f(v):
             v + 1
@@ -1035,7 +1031,7 @@ fn the_exact_mut_spelling_the_diagnostic_names_compiles() {
 }
 
 /// A `Mut(…)` annotation is exact wherever it is written, so the same invariance
-/// argument rejects a bounded pass-by-reference parameter.
+/// argument rejects a bounded borrowed parameter.
 #[test]
 fn a_bounded_mut_param_is_rejected() {
     expect_compile_error(
@@ -1044,7 +1040,7 @@ fn a_bounded_mut_param_is_rejected() {
                 c := c + 1
             cnt: Mut(Int) := 0
             for i in [1, 2, 3]:
-                bump(cnt)
+                bump(&cnt)
             cnt
         "#},
         "invariant in its value type",
@@ -1152,7 +1148,7 @@ fn cross_channel_cycle_is_rejected() {
 
 /// `b = a` off a mutable **reads** it — a value snapshot, exactly as `a + 1` or
 /// `f(a)` read it. There is no alias to reject, because a `Let` cannot bind a
-/// mutable variable: only `MutDecl` (`:=`) and a pass-by-reference `Mut` parameter can, so
+/// mutable variable: only `MutDecl` (`:=`) and a borrowed `Mut` parameter can, so
 /// the copy is an ordinary value binding by construction.
 #[test]
 fn plain_assignment_off_a_mutable_is_a_value_read() {
@@ -1172,7 +1168,7 @@ fn plain_assignment_off_a_mutable_is_a_value_read() {
 /// error names the write (the actual mistake) rather than the binding.
 #[test]
 fn writing_through_a_value_copy_of_a_mutable_is_rejected() {
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc! {r#"
         a := 0
         b = a
@@ -1183,7 +1179,7 @@ fn writing_through_a_value_copy_of_a_mutable_is_rejected() {
     );
 }
 
-/// A mutable variable's **value type is invariant** across a pass-by-reference boundary:
+/// A mutable variable's **value type is invariant** across a borrowing call:
 /// the callee's declared value type may be neither narrower nor wider than the
 /// caller's mutable variable.
 ///
@@ -1192,13 +1188,9 @@ fn writing_through_a_value_copy_of_a_mutable_is_rejected() {
 /// `r := (a=5)` would drop a field the caller's declaration still promises, and the
 /// caller's later `x.b` would type-check against a value that no longer has it.
 ///
-/// Both directions are rejected today, but *not* by one rule. At an argument position
-/// the deref coercion fires first — `apply` records `arg <: ?d` against a fresh
-/// variable, so a mutable variable meets an `Infer` and reads through — which means the
-/// `(History, History)` invariance rule never runs there. Narrowing is caught instead
-/// by the write contribution (`emit::contribute_pbr_writes`, `param_value <:
-/// arg_value`) and widening by the ordinary application edge. These tests pin the
-/// *property* so that consolidating those mechanisms cannot quietly drop it.
+/// Both directions are rejected by one rule: a call lends the variable with `&`, which keeps
+/// its place type (`emit::emit_borrow`), so the `(History, History)` arm relates the two
+/// value types invariantly (`Type::History`'s docs). These tests pin the *property*.
 #[test]
 fn a_mut_vars_value_type_is_invariant_across_a_mut_parameter() {
     // Narrowing: the callee would drop `b`, and the diagnostic names that field —
@@ -1210,7 +1202,7 @@ fn a_mut_vars_value_type_is_invariant_across_a_mut_parameter() {
                 r := (a=5)
             x: Mut({a: Int, b: Int}) := (a=1, b=2)
             for i in [1]:
-                narrow(x)
+                narrow(&x)
             x.b
         "#},
         ".b",
@@ -1223,7 +1215,7 @@ fn a_mut_vars_value_type_is_invariant_across_a_mut_parameter() {
                 r := (a=5, b=6)
             x: Mut({a: Int}) := (a=1)
             for i in [1]:
-                wide(x)
+                wide(&x)
             x.a
         "#},
         ".b",
@@ -1231,7 +1223,7 @@ fn a_mut_vars_value_type_is_invariant_across_a_mut_parameter() {
 }
 
 /// The equal-width case still works, which is what makes the two rejections above a
-/// statement about *variance* rather than about pass-by-reference being broken.
+/// statement about *variance* rather than about borrowing being broken.
 #[test]
 fn an_equal_width_mut_parameter_still_accepts_a_mut_var() {
     check_scalar(
@@ -1240,7 +1232,7 @@ fn an_equal_width_mut_parameter_still_accepts_a_mut_var() {
                 r += 1
             x: Mut(Int) := 0
             for i in [1, 2, 3]:
-                bump(x)
+                bump(&x)
             x
         "#},
         Value::Int(3),
@@ -1366,10 +1358,20 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
     );
 }
 
-/// A function whose result is a mutable variable returns the variable's value, however many tail
-/// positions sit between the function boundary and the mention: the result reads it, as a
-/// statement's continuation does (`docs/chl-spec.md`, "8.3 Reads"), so no `Mut` leaves the
-/// function.
+/// A function returns the value of a captured mutable variable.
+#[test]
+fn a_function_reads_a_captured_mut_as_a_value() {
+    check_scalar(
+        indoc! {r#"
+        x := 7
+        f = \z -> x
+        f(0)
+    "#},
+        Value::Int(7),
+    );
+}
+
+/// Return reads a place through every source tail position.
 #[rstest]
 #[case::a_lambda(indoc! {r#"
     x := 0
@@ -1381,22 +1383,24 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
         y = 1
         c
     x := 0
-    f(x)
+    f(&x)
 "#}, 0)]
 #[case::through_a_statement(indoc! {r#"
     def f(c: Mut(Int)):
         c += 1
         c
     x := 0
-    f(x)
+    f(&x)
 "#}, 1)]
 #[case::through_a_mut_var_introduction(indoc! {r#"
     def f(c: Mut(Int)):
         z := 1
         c
     x := 0
-    f(x)
+    f(&x)
 "#}, 0)]
+// A mutable variable does not escape its own introduction either: returning one declared
+// *inside* the function is the same escape as returning a parameter.
 #[case::its_own_mut_var(indoc! {r#"
     def g(n):
         z := n
@@ -1418,10 +1422,7 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
         s
     total([1, 2, 3])
 "#}, 6)]
-fn a_function_returning_a_mutable_variable_returns_its_value(
-    #[case] code: &str,
-    #[case] expected: i64,
-) {
+fn a_function_tail_reads_a_place_value(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
 
@@ -1443,23 +1444,20 @@ fn a_programs_tail_read_of_its_accumulator_is_a_value() {
     );
 }
 
-/// Rule 1: an argument to a `Mut` parameter must be a bare variable reference,
-/// so a *conditional* selecting between two mutable variables — which one would
-/// the callee's write target? — is rejected. The check reads the argument node,
-/// not its type: a conditional over two mutable variables reads their *values* (a
-/// mutable read derefs into the arms' join, as it does into a tuple element), so
-/// there is no `Mut` on the selection itself to key on.
+/// Rule 1: a borrow lends a place, so a *conditional* selecting between two mutable
+/// variables — which one would the callee's write target? — is refused at lowering: an
+/// operation yields a value, whatever its operands.
 #[test]
 fn rule1_selected_mut_argument_is_rejected() {
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc::indoc! {r#"
             def bump(c: Mut(Int)):
                 c += 1
             x := 0
             y := 1
-            bump(x if True else y)
+            bump(&(x if True else y))
             x"#},
-        "must be a mutable variable named where it is used",
+        "`&` lends a place, a place variable or a path from one",
     );
 }
 
@@ -1539,44 +1537,44 @@ fn mut_collection_as_for_source_derefs() {
         Value::Int(6),
     );
 }
-// Multi-parameter pass-by-reference: a `Mut` parameter alongside a plain one is
+// Multi-parameter borrowing call: a `Mut` parameter alongside a plain one is
 // curried into a chain of named lambdas (a `Mut` param must stay a named binder
 // so inlining renames its `MutWrite` target to the caller's mutable variable) and inlined
 // at the call site. The plain parameter rides the same call.
 #[test]
-fn multi_param_pass_by_ref_assign_works() {
+fn multi_param_borrow_assign_works() {
     check_scalar(
         indoc::indoc! {r#"
             def add_to(c: Mut(Int), amt: Int):
                 c := c + amt
             cnt: Mut(Int) := 0
-            add_to(cnt, 5)
+            add_to(&cnt, 5)
             cnt"#},
         Value::Int(5),
     );
 }
 #[test]
-fn multi_param_pass_by_ref_augassign_works() {
+fn multi_param_borrow_augassign_works() {
     check_scalar(
         indoc::indoc! {r#"
             def f(c: Mut(Int), d: Int):
                 c += d
             cnt: Mut(Int) := 0
-            f(cnt, 7)
+            f(&cnt, 7)
             cnt"#},
         Value::Int(7),
     );
 }
 #[test]
 fn mut_arg_must_be_a_mutable_not_a_plain_value() {
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc::indoc! {r#"
             x = 7
             def bump(c: Mut(Int)):
                 c := c + 1
-            bump(x)
+            bump(&x)
             x"#},
-        "mutable variable",
+        "cannot borrow `x`: it is a value",
     );
 }
 // A mutable variable passed to a *non*-`Mut` parameter is read by value (its
@@ -1609,7 +1607,7 @@ fn nonmut_param_annotation_enforced_against_mut_arg() {
         "mismatch",
     );
 }
-// Pass-by-reference sibling of the above: a `Mut(Int)` mutable variable cannot bind a
+// Borrowing sibling of the above: a `Mut(Int)` mutable variable cannot bind a
 // `Mut(String)` parameter — the value types must agree across the `(Mut, Mut)`
 // edge. (This path is unchanged by parameter-annotation enforcement; the `Mut`
 // annotation always seeded the binder type. Pinned here because nothing else
@@ -1621,44 +1619,44 @@ fn mut_param_value_type_must_match_mut_arg() {
             cnt: Mut(Int) := 0
             def g(c: Mut(String)):
                 c := "x"
-            g(cnt)
+            g(&cnt)
             cnt"#},
         "mismatch",
     );
 }
 #[test]
-fn single_param_pass_by_ref_still_works() {
+fn single_param_borrow_still_works() {
     check_scalar(
         indoc::indoc! {r#"
             cnt: Mut(Int) := 0
             def bump(c: Mut(Int)):
                 c := c + 1
-            bump(cnt)
+            bump(&cnt)
             cnt"#},
         Value::Int(1),
     );
 }
-// Regression: a pass-by-reference writer that computes an *intermediate* binding
+// Regression: a writer that borrows its parameter and computes an *intermediate* binding
 // before its mutable write (`tmp = c + 1; c := tmp`). Inlining splices the body as
 // a `Let`-headed chain; `flatten_spine`'s hoist must lift the intermediate onto
 // the statement spine alongside the write. Before the fix the write stayed
 // trapped in the bound expression — silently returning `0` in value position and
 // panicking ("marker survived") inside a loop.
 #[test]
-fn pass_by_ref_writer_with_intermediate_value_position() {
+fn borrowing_writer_with_intermediate_value_position() {
     check_scalar(
         indoc::indoc! {r#"
             def f(c: Mut(Int)):
                 tmp = c + 1
                 c := tmp
             cnt: Mut(Int) := 0
-            y = f(cnt)
+            y = f(&cnt)
             cnt"#},
         Value::Int(1),
     );
 }
 #[test]
-fn pass_by_ref_writer_with_intermediate_in_loop() {
+fn borrowing_writer_with_intermediate_in_loop() {
     check_scalar(
         indoc::indoc! {r#"
             def f(c: Mut(Int)):
@@ -1666,7 +1664,7 @@ fn pass_by_ref_writer_with_intermediate_in_loop() {
                 c := tmp
             cnt: Mut(Int) := 0
             for i in [1, 2, 3]:
-                y = f(cnt)
+                y = f(&cnt)
             cnt"#},
         Value::Int(3),
     );
@@ -1675,7 +1673,7 @@ fn pass_by_ref_writer_with_intermediate_in_loop() {
 // intermediates: the body splices as a `Let`-chain in *effect* position, which
 // `flatten_spine` must lift out of the `ExprStmt` effect too. 0 → +11 per iter.
 #[test]
-fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
+fn borrowing_writer_with_intermediates_bare_statement_loop() {
     check_scalar(
         indoc::indoc! {r#"
             def f(c: Mut(Int)):
@@ -1684,7 +1682,7 @@ fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
                 c := b
             cnt: Mut(Int) := 0
             for i in [1, 2, 3]:
-                f(cnt)
+                f(&cnt)
             cnt"#},
         Value::Int(33),
     );
@@ -1704,7 +1702,7 @@ fn wildcard_annotated_copy_of_a_mutable_is_a_value_read() {
         "#},
         Value::Int(5),
     );
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc! {r#"
             a: Mut(Int) := 0
             b: _ = a
@@ -1792,9 +1790,9 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
 /// (`Mut({Int | __elem == 5}, ?d)`), and a parameter whose type is left to inference takes
 /// that refinement, because the call site is typed against the dereferenced value.
 /// Beta-reduction then has to discharge a refinement demanded of the value against an
-/// argument node still stamped with the handle: the `Mut` survives on the bare `Var` for
-/// the phase to find the read. Reading through the handle is what makes the two
-/// comparable; comparing the stamp directly asks a handle to entail a fact about a value
+/// argument node still stamped with the place type: the `Mut` survives on the bare `Var` for
+/// the phase to find the read. Reading through the place is what makes the two
+/// comparable; comparing the stamp directly asks a place type to entail a fact about a value
 /// and trips `inline`'s entailment assert.
 ///
 /// The last two cases are the surrounding ones that reach the same parameter *without* a
@@ -1858,7 +1856,7 @@ fn a_mut_var_read_through_a_udf_inside_its_own_loop() {
 /// write-target check trusting `.ty` over the annotation.
 #[test]
 fn write_to_deref_copy_rejected() {
-    expect_mut_discipline_error(
+    expect_place_error(
         indoc::indoc! {r#"
             x: Mut(Int) := 1
             y: Int = x
@@ -1881,11 +1879,7 @@ fn genuine_mutable_still_accumulates() {
 }
 
 // ---------------------------------------------------------------------------
-// Curried-vs-tupled call-shape scoping (`history_param_fns`). A `def` with a
-// pass-by-reference `Mut` parameter lowers curried; every other `def` lowers
-// tupled. The registry keying that choice is block-scoped and last-def-wins,
-// so a `Mut`-param `def` cannot force the curried shape onto a same-named
-// non-`Mut` `def`/call in a sibling/enclosing scope or after a redefinition.
+// Explicit borrows select the call shape independently of callee names.
 // ---------------------------------------------------------------------------
 
 /// Regression: a non-`Mut` `def` that redefines an earlier `Mut`-param `def` of
@@ -1923,14 +1917,14 @@ fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
                 def bump(c: Mut(Int)):
                     c += 1
                 y: Mut(Int) := 0
-                bump(y)
+                bump(&y)
                 y + z
             r + outer(100)"#},
         Value::Int(108),
     );
 }
 
-/// Regression: a pass-by-reference writer loop as the program's *final*
+/// Regression: a borrowing writer loop as the program's *final*
 /// statement (its mutable-variable value unobserved) must lower — mirroring the same loop
 /// in middle position. Before the fix `lower_final_stmt` lacked the hidden-writer
 /// fallback and rejected it with "must end in a yield/feed".
@@ -1941,7 +1935,7 @@ fn trailing_hidden_writer_loop_compiles() {
             c += 1
         cnt: Mut(Int) := 0
         for x in [1, 2, 3]:
-            bump(cnt)"#};
+            bump(&cnt)"#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(code);
@@ -2125,7 +2119,7 @@ fn a_mut_loop_over_a_product_domain_runs_in_pair_order(#[case] code: &str, #[cas
     check_scalar(code, Value::Int(expected));
 }
 
-/// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where
+/// A `Lambda` param may still bind a mutable variable — that is a borrowed parameter, where
 /// the mutable variable genuinely crosses a function boundary. Pinned because `emit_let`
 /// now reads through an initializer that is a mutable variable, and widening that to argument
 /// positions would silently turn every `Mut` parameter into a value copy: the
@@ -2137,7 +2131,7 @@ fn a_mut_param_still_binds_a_mut_var() {
             def bump(c: Mut(Int)):
                 c += 1
             x := 0
-            bump(x)
+            bump(&x)
             x
         "#},
         Value::Int(1),
@@ -2152,7 +2146,7 @@ fn a_non_mut_parameter_annotation_is_enforced_in_a_curried_function() {
                 m := 1
 
             total: Mut(Int) := 0
-            f("hello", total)
+            f("hello", &total)
             total
         "#},
         "Type mismatch for this call: expected Int, found String",
@@ -2167,7 +2161,7 @@ fn a_declared_curried_parameter_still_accepts_its_own_type() {
                 m := a
 
             total: Mut(Int) := 0
-            f(3, total)
+            f(3, &total)
             total
         "#},
         Value::Int(3),
@@ -2188,7 +2182,7 @@ fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
                 m := c
 
             total: Mut(Int) := 0
-            f(1, 5, total)
+            f(1, 5, &total)
             total
         "#},
         Value::Int(5),
@@ -2202,7 +2196,7 @@ fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
                 m := c
 
             total: Mut(Int) := 0
-            f(5, 1, total)
+            f(5, 1, &total)
             total
         "#},
         "expected {Int where _ >= 5}, found {Int where _ == 1}",
@@ -2213,7 +2207,7 @@ fn a_curried_parameter_annotation_may_name_a_parameter_to_its_left() {
                 m := c
 
             total: Mut(Int) := 0
-            f(5, 1, total)
+            f(5, 1, &total)
             total
         "#},
         "Unbound variable: 'b'",
@@ -2230,7 +2224,7 @@ fn a_feed_parameter_annotation_constrains_what_is_fed() {
             x := 0
             out: Feed(_)
             for i in [1, 2, 3]:
-              fw(x, out)
+              fw(&x, &out)
             out
         "#},
         "expected String, found Int",
@@ -2247,7 +2241,7 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
             x := 0
             out: Feed(_)
             for i in [1, 2, 3]:
-              fw(x, out)
+              fw(&x, &out)
             out
         "#},
         "bounds a feed by its own type",
@@ -2260,7 +2254,7 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
             x := 0
             out: Feed(_)
             for i in [1, 2, 3]:
-              fw(x, out)
+              fw(&x, &out)
             out
         "#},
         "`Feed` takes one type argument: `Feed(T)`",
@@ -2705,8 +2699,8 @@ fn a_writing_branch_value_merges_as_a_variable(#[case] code: &str, #[case] expec
         else:
             c += 100
     acc := 5
-    bump(acc, 3)
-    bump(acc, 0)
+    bump(&acc, 3)
+    bump(&acc, 0)
     acc
 "}, Value::Int(108))]
 // A written map is a sum, so this `if` keeps taking the statements after it into each branch.
@@ -2816,7 +2810,7 @@ fn dependent_codomain_discharges_mut_var_argument_into_refinement() {
                 a ^+ a
             test(x)
         "#},
-        "mutable-reference type survived the unified phase",
+        "mutable place type survived the unified phase",
     )
 }
 
@@ -2836,7 +2830,7 @@ fn dependent_codomain_via_snapshot_binder_reaches_the_boundary() {
                 a ^+ x1
             test(x)
         "#},
-        "mutable-reference type survived the unified phase",
+        "mutable place type survived the unified phase",
     )
 }
 
@@ -2855,7 +2849,7 @@ fn call_site_argument_carries_mut_var_into_refinement() {
                 a ^+ x0
             test(x)
         "#},
-        "mutable-reference type survived the unified phase",
+        "mutable place type survived the unified phase",
     )
 }
 
@@ -3148,7 +3142,8 @@ def f(u):
     for r in [1, 2]:
         t += r
         o << [v for v in [1, 2, 3] if v > t]
-    o
+    values = o
+    values
 1
 "#},
         "depend on `t`, read between",
@@ -3196,7 +3191,7 @@ def g(c: Mut(Int)):
     c += 100
     c + 0
 x := 1
-t = (x, g(x))
+t = (x, g(&x))
 t.0 * 1000 + t.1
 "#},
         Value::Int(1101),
@@ -3213,7 +3208,7 @@ def g(c: Mut(Int)):
     c += 100
     c + 0
 x := 1
-t = (g(x), x)
+t = (g(&x), x)
 t.0 * 1000 + t.1
 "#},
         Value::Int(101101),
@@ -3228,7 +3223,7 @@ def g(c: Mut(Int)):
     c += 100
     c + 0
 x := 1
-t = g(x)
+t = g(&x)
 t
 "#},
         Value::Int(101),
@@ -3619,7 +3614,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         t := 0
-        x = add(t, 4)
+        x = add(&t, 4)
         t + x
     "},
     8
@@ -3629,7 +3624,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
         def add(c: Mut(Int), n: Int) => {}:
             c += n
         t := 0
-        add(t, 4)
+        add(&t, 4)
         t
     "},
     4
@@ -3641,7 +3636,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             n
         t := 0
         for x in [1, 2, 3]:
-            add(t, x)
+            add(&t, x)
         t
     "},
     6
@@ -3653,7 +3648,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             n
         t := 0
         for x in [1, 2, 3]:
-            add(t, x)
+            add(&t, x)
         t
     "},
     6
@@ -3665,7 +3660,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             n * 2
         t := 0
         for x in [1, 2, 3]:
-            add(t, x)
+            add(&t, x)
         t
     "},
     6
@@ -3678,7 +3673,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
         t := 0
         for x in [1, 2]:
             for y in [10, 20]:
-                add(t, y)
+                add(&t, y)
         t
     "},
     60
@@ -3689,7 +3684,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         t := 0
-        x = add(t, 4) + 1
+        x = add(&t, 4) + 1
         t + x
     "},
     9
@@ -3700,11 +3695,11 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         def add2(c: Mut(Int), n: Int):
-            a = add(c, n)
-            b = add(c, n)
+            a = add(&c, n)
+            b = add(&c, n)
             a + b
         t := 0
-        x = add2(t, 4)
+        x = add2(&t, 4)
         t + x
     "},
     16
@@ -3717,7 +3712,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += k
             k
         t := 0
-        x = add(t, 4)
+        x = add(&t, 4)
         t + x
     "},
     10
@@ -3731,8 +3726,8 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
                 c += 0
             n
         t := 0
-        x = add(t, 4)
-        y = add(t, 1)
+        x = add(&t, 4)
+        y = add(&t, 1)
         t + x + y
     "},
     9
@@ -3744,7 +3739,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
                 c += x
             0
         t := 0
-        x = add(t, [1, 2, 3])
+        x = add(&t, [1, 2, 3])
         t + x
     "},
     6
@@ -3755,7 +3750,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         t := 0
-        k := add(t, 4)
+        k := add(&t, 4)
         k += 1
         t + k
     "},
@@ -3768,7 +3763,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             n
         t := 0
         s := 0
-        s := add(t, 4)
+        s := add(&t, 4)
         t + s
     "},
     8
@@ -3780,7 +3775,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             n
         t := 0
         y := 0
-        if add(t, 4) > 2:
+        if add(&t, 4) > 2:
             y := 1
         else:
             y := 2
@@ -3795,7 +3790,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             n
         t := 0
         s := 0
-        for x in [add(t, 4), 1]:
+        for x in [add(&t, 4), 1]:
             s += x
         t + s
     "},
@@ -3807,7 +3802,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         t := 0
-        x = add(t, 4) + add(t, 1)
+        x = add(&t, 4) + add(&t, 1)
         t + x
     "},
     10
@@ -3818,9 +3813,9 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         def both(c: Mut(Int)):
-            add(c, 1) + add(c, 2)
+            add(&c, 1) + add(&c, 2)
         t := 0
-        x = both(t)
+        x = both(&t)
         t + x
     "},
     6
@@ -3831,7 +3826,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
             c += n
             n
         t := 1
-        x = t + add(t, 4)
+        x = t + add(&t, 4)
         t + x
     "},
     10
@@ -3846,7 +3841,7 @@ fn a_variable_leaving_an_if_types_as_the_join_of_its_values(
         t := 0
         s := 0
         for x in [1, 2]:
-            y = add(t, x) + 1
+            y = add(&t, x) + 1
             s += y
         t + s
     "},

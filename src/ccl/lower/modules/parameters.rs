@@ -305,6 +305,15 @@ impl LoweringContext {
             .fold(run, |body, (parameter, span, value)| {
                 let bound = argument_name(name, &QualifiedName::new(parameter.clone()));
                 let bound = match parameters.get(&parameter).cloned().flatten() {
+                    // A parameter typed as a place transports the place the run passed.
+                    Some(ty) if ty.is_place() => Expr::let_bind_annotated(
+                        bound,
+                        Occurrence::mint(),
+                        value,
+                        body,
+                        Annotation::new(ty, Occurrence::mint()),
+                    )
+                    .binding_a_place(),
                     Some(ty) => Expr::let_bind_annotated(
                         bound,
                         Occurrence::mint(),
@@ -665,7 +674,7 @@ pub(super) fn rebind_entry(
         .user_annotation
         .expect("an entry's `let` carries the entry's type");
     let bound = Expr::let_bind_annotated(binder.raw(), Occurrence::mint(), member, *body, ty);
-    *at = ctx.tag_image(bound, span);
+    *at = ctx.tag_image(bound.binding_a_place(), span);
 }
 
 /// Rebind, in `chain`, a copy of a module's chain, the transactional variable the Module-typed

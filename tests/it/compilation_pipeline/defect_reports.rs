@@ -699,12 +699,12 @@ fn an_unreadable_list_element_hides_no_independent_join() {
     "#},
     &["x += 1", r#"[1, "a"]"#],
 )]
-#[case::a_value_passed_by_reference(
+#[case::a_value_borrowed(
     indoc! {r#"
         def bump(c: Mut(Int)):
             c += 1
         x = 1
-        bump(x)
+        bump(&x)
         y = [1, "a"]
         y
     "#},

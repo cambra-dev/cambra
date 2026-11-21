@@ -426,7 +426,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             expected: None,
         },
         ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
-            ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
+            ctx: format!("{ctx_label} (a feed is required here, but the value is not one)"),
             found: Box::new(coalesce_for_error(&found)),
             expected: Some(Box::new(coalesce_for_error(&required))),
         },
@@ -1684,7 +1684,7 @@ fn run_once(
     sub_ctx.name_other_feed_places(&mut errors);
     // The mutability rules on resolved types read the tree coalesce left, which is
     // whole past a node coalesce failed at.
-    errors.extend(check_mut_discipline(expr).err().unwrap_or_default());
+    errors.extend(check_places(expr).err().unwrap_or_default());
     if !errors.is_empty() {
         return Err(failed(errors));
     }
@@ -1962,6 +1962,7 @@ mod tests {
         // λx. x applied to 42 → Int
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
@@ -2008,6 +2009,7 @@ mod tests {
         // let x = 42 in x → Int
         let mut e = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,

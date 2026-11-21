@@ -4,16 +4,16 @@
 //! ask — [`crate::ccl::anf`], to sequence a read against the writes around it,
 //! and [`crate::ccl::mut_read`], to name the value one denotes — and neither can
 //! ask inference, which has not run. The answer is syntactic: a
-//! [`TypedExprNode::MutDecl`] binder, and a `Lambda` parameter annotated
-//! `Mut(…)`, which is pass-by-reference and so denotes a mutable variable its
-//! caller owns.
+//! [`TypedExprNode::MutDecl`] binder or a borrowed `Lambda` parameter whose type is mutable.
+//! An unresolved borrowed parameter may be mutable, so its reads are named conservatively
+//! until inference distinguishes mutable and deferred places.
 //!
 //! Post-uniquify every binder is globally unique, so membership answers "is this
 //! `Var` a mutable variable?" on the name alone.
 //!
-//! The same scope holds the functions that take a parameter by reference, which a call's
-//! arguments are passed to: an argument there that is a mutable variable is a handle position
-//! rather than a read ([`Muts::passes_by_reference`]).
+//! The same scope holds the functions with a borrowed parameter, which a call's arguments
+//! are passed to: an argument there that is a mutable variable is a lent place rather than a
+//! read ([`Muts::borrows`]).
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -22,20 +22,20 @@ use std::rc::Rc;
 use crate::ccl::{Expr, Name, TypedBinding, TypedExprNode};
 
 /// The mutable variables in scope, by the binder that introduced them, and the functions of the
-/// program that take a parameter by reference.
+/// program that have a borrowed parameter.
 #[derive(Clone, Default)]
 pub struct Muts {
     vars: HashSet<Name>,
-    by_reference: Rc<HashSet<Name>>,
+    borrowing: Rc<HashSet<Name>>,
 }
 
 impl Muts {
-    /// No mutable variable, and no function taking a parameter by reference.
+    /// No mutable variable, and no function with a borrowed parameter.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// No mutable variable yet, and the functions `e` binds that take a parameter by reference:
+    /// No mutable variable yet, and the functions `e` binds that have a borrowed parameter:
     /// the scope a walk of `e` from its root starts in.
     pub fn of_program(e: &Expr) -> Self {
         fn go(e: &Expr, out: &mut HashSet<Name>) {
@@ -60,11 +60,11 @@ impl Muts {
             }
             e.walk_children(|c| go(c, out));
         }
-        let mut by_reference = HashSet::new();
-        go(e, &mut by_reference);
+        let mut borrowing = HashSet::new();
+        go(e, &mut borrowing);
         Muts {
             vars: HashSet::new(),
-            by_reference: Rc::new(by_reference),
+            borrowing: Rc::new(borrowing),
         }
     }
 
@@ -78,11 +78,11 @@ impl Muts {
         self.vars.iter()
     }
 
-    /// Whether a call of `function` may pass an argument by reference: a function the program
+    /// Whether a call of `function` may lend a place as an argument: a function the program
     /// binds with a `Mut(…)` or `Feed(…)` parameter, or a trait's function with one.
-    pub fn passes_by_reference(&self, function: &Expr) -> bool {
+    pub fn borrows(&self, function: &Expr) -> bool {
         match &function.node {
-            TypedExprNode::Var(f) => self.by_reference.contains(f),
+            TypedExprNode::Var(f) => self.borrowing.contains(f),
             TypedExprNode::TraitFn {
                 trait_, function, ..
             } => trait_.function(function).is_some_and(|f| {
@@ -102,14 +102,14 @@ impl Muts {
     }
 }
 
-/// Is `e` a bare reference to a mutable variable — the shape a handle position
+/// Is `e` a bare reference to a mutable variable — the shape a borrowed argument
 /// requires (`src/ccl/design/mutability.md`, "A mutable variable read is an
 /// explicit operation")?
 pub fn is_mut_var(e: &Expr, muts: &Muts) -> bool {
     matches!(&e.node, TypedExprNode::Var(name) if muts.contains(name))
 }
 
-/// Does `param` bind a mutable variable — a pass-by-reference `Mut(…)`
+/// Does `param` bind a mutable variable — a borrowed `Mut(…)`
 /// parameter, whose body's mentions of it read a mutable variable its caller
 /// owns?
 ///
@@ -117,14 +117,13 @@ pub fn is_mut_var(e: &Expr, muts: &Muts) -> bool {
 /// the annotation when there is one, and the binder's own slot otherwise
 /// (`crate::ccl::lower::functions`, `lower_params`, stamps both).
 pub fn is_mut_param(param: &TypedBinding) -> bool {
-    param
-        .annotation_ty()
-        .unwrap_or(&param.ty)
-        .mut_value_type()
-        .is_some()
+    let ty = param.annotation_ty().unwrap_or(&param.ty);
+    ty.mut_value_type().is_some()
+        || (param.parameter_mode == crate::ccl::place::ParameterMode::Borrow
+            && matches!(ty, crate::ccl::Type::Hole | crate::ccl::Type::Infer(_)))
 }
 
-/// Does `param` take its argument by reference — a `Mut(…)` or a `Feed(…)` parameter?
+/// Does `param` borrow its argument — a `Mut(…)` or a `Feed(…)` parameter?
 pub fn is_history_param(param: &TypedBinding) -> bool {
     param
         .annotation_ty()
@@ -158,7 +157,7 @@ pub fn bound_in(e: &Expr) -> Muts {
     go(e, &mut vars);
     Muts {
         vars,
-        by_reference: Rc::default(),
+        borrowing: Rc::default(),
     }
 }
 
@@ -169,7 +168,7 @@ pub fn with(muts: &Muts, name: &Name) -> Muts {
 }
 
 /// The scope a `Lambda`'s body is walked under: `muts` plus each of `params` that is
-/// pass-by-reference, and `muts` itself when none is.
+/// borrowed, and `muts` itself when none is.
 pub fn under_params<'a>(muts: &'a Muts, params: &[TypedBinding]) -> Cow<'a, Muts> {
     if params.iter().any(is_mut_param) {
         Cow::Owned(

@@ -1,0 +1,25 @@
+# One HTTP route, with a request collection and a function consuming responses.
+# Run the module once per route. Address arguments are string constants, and each
+# (port, method, path) triple is unique across the program. Runs on a port share a listener.
+#
+# Example:
+#     run std::http(port="8080", method="POST", path="/echo") as server
+#     replies: Feed(String)
+#     for request in server::requests:
+#         replies << request
+#     server::respond(replies)
+#
+# Status: implemented.
+
+const param port: String
+const param method: String
+const param path: String
+
+_requests, _responses = http_serve(port, method, path)
+
+pub requests = _requests
+
+# Each response is paired with the request whose position keys it.
+pub def respond(values):
+    for value in values:
+        _responses << value

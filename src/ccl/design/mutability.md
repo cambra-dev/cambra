@@ -18,22 +18,15 @@ A mutable variable is a function from a **sequencing domain** (a time axis) to a
 accumulation, and concurrent transactions are then one model over three domains, not three
 mechanisms.
 
-A **feed** (a reply or yield, written `<<`) is the same object — a function over the same
-kind of domain — and is therefore **the second form of mutability**, not a separate concept:
-`o << e` is surface-impure exactly as `x := e` is (action-at-a-distance on a channel bound
-elsewhere; both break referential transparency). The two forms differ only in their
-**merge/read law**:
+A **feed**, written `out: Feed(T)`, is an immutable place defined by its contributions.
+It has no surface history. Each read denotes its final collection; the runtime delivers that
+collection incrementally. A mutable place instead gives its value at the read's source position.
 
-- **mutable variable** — *last-write-wins* (overwrite). The value at a position is the latest
-  write ≤ it; a read derefs to that scalar. Introduced with `:=` / `+=`.
-- **feed** — *append-only*. Contributions union (`++`); there is no carry-forward, and a read
-  yields the whole collection. Written with `<<`.
-
-So there is one idea — *surface-impure histories* `𝐷 ⤇ 𝑉`, eliminated into pure dataflow — in
-two merge laws. This distinction is the through-line of the whole document: it is what the
-`HistoryKind` marker (`Overwrite` / `Append`) encodes in the type, why the two disciplines
-differ (a last-write-wins mutable variable needs a resolvable writer; an append merge is commutative
-and safe to alias), and why the eliminator has two halves.
+`place::PlaceKind` distinguishes mutable and deferred places. `Type::as_place` exposes their
+kind and read type, and `Type::read_value_type` implements the shared place-to-value operation.
+`Type::History` remains the compiler's internal carrier: `Overwrite` stores a mutable history,
+and `Append` stores a deferred collection. `HistoryKind::Append` does not expose historical Feed
+snapshots in CHL. Both compile into pure dataflow.
 
 This rests on the existing extent-vs-tiling correspondence
 ([operational-semantics/summary.md](../../../docs/operational-semantics/summary.md)) applied to a
@@ -128,53 +121,24 @@ lets a feed be a plain output rather than a cyclic binding.
 
 ### A mutable variable read is an explicit operation
 
-A mutable variable mention that denotes its **value** is dereffed by the rule that emits it
-(`infer::emit::emit_value_read`), not by the subtyping relation. `Mut(𝑉) <: 𝑉` is not a
-subtyping fact.
+`infer::emit::emit_value_read` reads a place before constraining a value operand. Assignment,
+return, product fields, ordinary arguments, operands and collection sources are value positions.
+A Mut gives its current value. A Feed gives its complete collection, retaining the dependent
+key binder. Neither read is a subtype coercion.
 
-Two positions read for a reason of their own rather than by asking for a value operand, and
-both are how a mutable **collection** is read as a collection. A **function position** reads,
-because a handle is not a function and applying a collection is what puts one there — a
-comprehension's generator source is its own function, applied at each position. And a node
-under a **user annotation that is not itself a handle** reads, because an annotation names the
-value at its position; `emit_let` already applies that rule before it matches its annotation
-forms, which is what leaves `_` needing no case of its own.
+`Borrow(place)` preserves the place in a call argument. The source writes `&x`, and `emit_apply`
+checks that its operand names a place. Unmarked arguments always read values. `ParameterMode`
+records whether a source parameter receives a value or a temporary borrow. Lowering infers a
+borrow from writes, contributions or forwarding with `&`; an explicit place annotation also
+asserts borrowing. A caller cannot change a value parameter's mode by passing `&x`.
 
-The handle survives in exactly **three** positions, and the second-class discipline is what
-makes them enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var` and rule 2
-keeps `Mut` out of every composite, so a parent always knows whether the operand it is
-about to constrain is a handle position.
+Write targets preserve their place identity without an expression read. `await_final` also names
+its place directly because it reduces a complete mutable history. Every source function result
+reads a value, including a bare final place name. No tail walk rejects that read as an escape.
 
-- A **pass-by-reference argument**, decided in `emit_apply` by reading the parameter off
-  the head of the application spine. The handle reaches the parameter, so the invariance
-  rule relates the two value types directly.
-- A **write's target**, which is resolved by name rather than as a subexpression. The
-  written *value* is an ordinary value position and reads.
-- **[`await_final`](#await_final)'s operand.** The terminal read reduces the mutable variable's
-  history rather than one sampled value, so its scheme `∀ν. Mut(ν, Txn) ⇒ ν` puts a `Mut` in
-  the domain. Inference sees the pass-by-reference case above — `emit_apply` reads that `Mut`
-  off the head of the spine — and lowering resolves the operand by name as it does a write
-  target, so the mention never becomes a value position at all.
-
-A lambda's result reads, as every tail does: a **statement's continuation**, a **mutable
-variable introduction's body** and a **`Let` body** each report their continuation's *value* —
-they emit it as a value operand — so a function ending in a mention of a mutable variable
-returns that variable's value (`docs/chl-spec.md`, "8.3 Reads"), and no `Mut` leaves a
-function. A program ending in a read of its accumulator has that accumulator's value for the
-same reason. Their coalesce-time lifted types deref too (`solve.rs`): a lift that copied the
-continuation's type verbatim would re-stamp the node with the handle the read looked through,
-leaving the node's recorded type contradicting the rule that typed it.
-
-**Neither direction is a subtyping fact**, and the symmetry is the point: `Mut(𝑉) <: 𝑉`
-would put a mutable variable *below* its value and `𝑉 <: Mut(𝑉, 𝐷)` would put it *above*, while
-`Mut` is invariant in `𝑉`. Either one is a coercion wearing a subtyping rule's clothes,
-and — because both fire against a fresh inference variable — neither can distinguish a
-read from a handle being passed along. The relation therefore relates a mutable variable only to
-another mutable variable, by invariance, and every position that means the *value* says so in the
-rule that emits it: `emit::emit_value_read` for an ordinary value position, and `emit_apply` reading
-through the parameter's handle for the one position where a `Mut` parameter is given
-something that is not a mutable variable (a program the second-class discipline rejects, but which
-still has to be typed to be reported well).
+Inlining consumes each `Borrow` when substituting the argument into its named parameter.
+A borrow surviving to channelization violates the pass invariant. No executable reference
+operation reaches planning.
 
 ### A read is performed where it is written
 
@@ -186,9 +150,9 @@ in `t = (x, g(x))`, with `g` writing through a `Mut` parameter, hoisting the cal
 reading `x` to be performed after the write. Named, the element is the value `x` held where the
 tuple was written.
 
-An application's **argument** is the position this does not reach. A read there may be the handle a
-pass-by-reference callee writes through, which is a question about the callee's parameter and so
-unanswerable before inference, and the mention has to stay bare for `emit_apply` to relate it to
+An application's borrowed argument is the position this does not reach. A read there may be the
+place a callee's borrowed parameter writes through, which is a question about the callee's
+parameter and so unanswerable before inference, and the mention has to stay bare for `emit_apply` to relate it to
 that parameter. Such a read is performed at the call.
 
 ### A read is named while inference runs
@@ -220,10 +184,11 @@ spells it: a binding on a writer's spine is an operator in the graph, and the ph
 a read by its term. Every use of such a binder precedes the write that ended the segment, which is
 what makes the substitution sound; `inline` moves uses, so it runs after.
 
-That ordering rests on the CHL rule that captured names are read-only
-([chl-spec.md](../../../docs/chl-spec.md), "4.1 `def` — function definition"), which no pass
-enforces today: a `def` that writes a captured mutable variable compiles, and the write is
-invisible to the segment its call sits in.
+Captured induction Mut writers are rejected after inference (`captured_induction_writes`), including
+writers capturing borrowed parameters: their writes would lack positions in the caller's history.
+Transactional state, currently spelled `Mut(V, Txn)`, supports captured writers because commit time
+orders its writes. Deferred writers may capture a Feed within its declaring scope because their
+contributions need no source ordering.
 
 A-normalization's binding stays. Its uses carry no such ordering — one hoisted out of a value
 position can stand after the write that ended the segment — and the binding is what holds the read
@@ -256,14 +221,15 @@ A read that reaches a refinement predicate before inference is named by A-normal
 the term carrying it, one binding per variable, and renamed in every copy at once. Two terms do: a
 comprehension's guards and sources, which `ccl/comprehension.rs` places in its cast's predicate, and
 a refined cast's value, whose target holds a copy of the term. Neither performs a write, so every
-read in one denotes the value at the term's position, the handle positions inside it included.
+read in one denotes the value at the term's position, the place positions inside it included.
 A-normalization does not descend into a type, and this rename is what keeps such a predicate off the
 variable: `[z for z in xs if z > acc]` types over `{… | z > __anf}`.
 
-Outside those terms, three positions keep the read as lowering built it, in both passes, each
-because a later pass reads the term there: an application's function and argument (the three handle
-positions above) and a block's terminal expression (the tail rules). The module docs carry the
-per-position detail.
+Outside those terms, four positions keep the read as lowering built it, in both passes, each because
+a later pass reads the term there: an application's function, an explicit borrow argument,
+a block's terminal expression and the value of a feed (`rewrite_as_of_reads`). Ordinary call
+arguments are atomized as value reads before sibling computations can mutate their places. The
+module docs carry the per-position detail.
 
 A read binder is opaque only while inference runs. Mutability elimination gives every value a
 mutable variable holds a binder of its own, so a read binder's definiens is then that value, and
@@ -337,7 +303,7 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   `MutWrite` for its writing half; before it existed the introduction was a `Let`
   carrying a `Mut` annotation, and every pass that had to recognize one consulted
   that annotation as a proxy for the declaration. It is the only node that binds
-  a mutable variable (a pass-by-reference `Mut` parameter aside), which is what makes
+  a mutable variable (a borrowed `Mut` parameter aside), which is what makes
   "is this binder mutable?" a question about the node rather than about a type that
   happened to survive inference.
 - `MutWrite { name, key, value }` — one write to a variable. Value `Unit`. Its target must be
@@ -374,30 +340,28 @@ residue, and planning/op-conversion never see them.
 
 ### Mutability is the type (no lowering registry)
 
-Whether a name denotes a mutable variable is carried by the mutable-variable type alone
-`Type::History { history_kind: Overwrite }` (displayed `Mut(𝑉, 𝐷)`), and is therefore known
-only after inference. Lowering never tracks it — there is no lowering-side mutable-variable registry. This is
-what keeps lowering a pure representation change: it emits the markers above by *shape and scope
-alone*, and every decision that needs mutability happens later, keyed on the type.
+A mutable place has type `Type::History { history_kind: Overwrite }`, displayed `Mut(𝑉, 𝐷)`.
+Lowering keeps no mutable-variable registry. It records declarations, writes and borrowed parameters;
+inference checks these markers against their place types.
 
-Lowering's one classification choice is scope-only: `x := e` where `x` is out of scope is an
+Scope distinguishes a declaration from a write: `x := e` where `x` is out of scope is an
 introduction — a `MutDecl` binding `x` at `Mut(𝑉, 𝐷)` (`𝐷 = Txn` iff annotated `Mut(𝑉, Txn)`, else a
 `Hole` the phase resolves). `x := e` / `x += e` where `x` is in scope is a write — a bare
 `MutWrite(x, e)`. The choice is membership in the ambient scope set (which lowering already threads
 for other reasons); it consults no mutability record.
 
 Lowering decides nothing about the loop: every `for` becomes a `For` marker (above), generator
-and mutating alike, because the classification needs a type that does not exist yet. Everything
-mutability-dependent is a post-inference decision on the `Type::History`:
+and mutating alike, because the classification needs a type that does not exist yet.
+Loop routing follows inference and reads the `Type::History`:
 
 1. **Writes require a mutable** (`MutWrite` target must be `Mut`, above). A `+=` / `:=` to a plain
    binding is a type error, not a shadow. This is the single rule that makes "declare it with `:=`"
    a real discipline rather than a lowering-time heuristic.
-2. **Pass-by-reference requires the `Mut(…)` annotation.** The annotation is *what gives the
-   parameter a mutable `Type::History`*, so its body writes type-check (rule 1) and the phase can classify the
-   writer; an unannotated parameter is non-`Mut`, so writing it is rejected by rule 1. Carrying the
-   annotation means mutability is present in the type from the parameter inward through the whole
-   pipeline — inlining, the phase, planning — with nothing to reconstruct.
+2. **A borrowed parameter carries a place type.** `lower_params` uses an explicit `Mut(…)` or
+   `Feed(…)` annotation, or seeds that type from writes or contributions in the body. Forwarding
+   with `&` sets the borrowing mode and leaves the place kind to inference. Inference checks the
+   caller's loan against the parameter's place type. See
+   [place reads and borrowing](#a-mutable-variable-read-is-an-explicit-operation).
 3. **Loop routing is the phase's** (see [mut_elim](#mut_elim-eliminating-overwrite-mutability)): a `For` whose body
    writes a `Mut` variable bound outside the loop is an accumulator recurrence; any other `For` (only
    feeds/yields, or writes to loop-local mutable variables) is a plain map — rebuilt as the
@@ -416,7 +380,7 @@ wrapper variant carried on the introduction's binding and on every reference to 
 `Type::History` variant with a feed channel, distinguished by `history_kind`; a mutable variable is the
 `Overwrite` (last-write-wins) kind. Making mutability a real type buys two things:
 
-- **Pass-by-reference.** A function can take a mutable variable as a parameter
+- **Borrowed parameters.** A function can borrow a mutable variable as a parameter
   (`def bump(c: Mut(Int)): c += 1`) and write *the caller's* variable. Because mut_elim
   runs after inlining, this needs no new machinery: beta-reduction substitutes the argument
   variable for the parameter, so the callee's `MutWrite`s land at the call site naming the actual
@@ -436,20 +400,20 @@ Typing:
 
 - **Reads deref at the rule that emits them**: `cnt + 1`, `f(cnt)` for an `Int` parameter, and a
   trailing `cnt` all read, and each reads because the rule typing that position asks for a value
-  operand (`emit::emit_value_read`). Only a position that *expects* `Mut` — a pass-by-reference
-  argument, a write's target — receives the handle. `Mut(𝑉) <: 𝑉` is not a subtyping
+  operand (`emit::emit_value_read`). An explicit `Borrow`, a write target and `await_final` preserve
+  the place. `Mut(𝑉) <: 𝑉` is not a subtyping
   fact; see [A mutable variable read is an explicit operation](#a-mutable-variable-read-is-an-explicit-operation)
-  for why putting it in the relation could not distinguish a read from a handle passed along.
+  for why putting it in the relation could not distinguish a read from a place lent along.
   After inlining, no `Mut`-expecting positions remain, so the phase's rewrite is purely structural
   — every surviving `Mut`-typed occurrence is a write target or a read, decided by context.
 - **A read derefs the constraint, not the node.** The deref decides what an operand is
   *constrained against*; the operand's own type slot keeps `Mut(𝑉, 𝐷)`, because that stamp is
   how the phase finds the read in the first place. So the parameter a mutable variable was passed to
-  holds 𝑉 while the argument node holds the handle, and a later pass comparing the two is
-  comparing types at different levels unless it reads through the handle itself. `inline`'s
+  holds 𝑉 while the argument node holds the place type, and a later pass comparing the two is
+  comparing types at different levels unless it reads through the place itself. `inline`'s
   refinement-entailment check is where that bites: an unwritten mutable variable's value type is still
   its seed's singleton, so a parameter left to inference acquires a refinement — one the
-  argument does establish, but of the value it denotes rather than of the handle.
+  argument does establish, but of the value it denotes rather than of the place.
 - A parameter `Mut(Int)` means `Mut(Int, _)`; the domain instantiates per call site through the
   let-generalization of UDF bindings. Whether a write site requires `Txn` is the phase's structural
   check, post-inline — so one `bump` can serve an induction accumulator and a transactional
@@ -483,17 +447,14 @@ scope where the mutable variable is typed, and `with begin():` binds none. The
 
 #### No aliasing: `Mut` values are second-class (downward-only)
 
-Passing a reference *down* is safe exactly as long as the compiler can statically resolve which
-introduction every write targets. The discipline:
+A mutable place is borrowed for one call. Its declaration identity determines every write's
+target. The discipline:
 
-1. A `Mut`-typed expression must be a **bare variable reference** — an argument to a `Mut`
-   parameter is a variable, never a conditional or computed expression. The two halves catch
-   different things, because a *conditional* over two mutable variables is not itself `Mut`-typed: a
-   mutable read derefs into the arms' join exactly as it derefs into a tuple element (each is a
-   value position, above), so `x if c else y` reads their values and types as a plain `V`.
-   What the rule is protecting is the write capability travelling somewhere its target can't be
-   traced, and that is the **argument** half: `bump(x if c else y)` is rejected on the argument's
-   node, not its type.
+1. A borrow operand must name a place: `bump(&x)` accepts a mutable declaration or a borrowed
+   parameter. A call or an operation yields a value, so lowering refuses `&f(x)` and
+   `&(x if c else y)`, and emission refuses a value variable or a path from one. Lending a path
+   from a place, `&s.items`, is planned, and emission refuses it too
+   (`PlaceDefect::BorrowsPartOfAPlace`).
 2. `Mut` may not appear **inside any composite type** — tuples, records, lists, function codomains
    (so it is never a return type), `Feed` payloads, or another `Mut`.
 3. A plain `=` off a mutable **reads** it: `b = a` binds `b` at `a`'s value — a
@@ -502,73 +463,78 @@ introduction every write targets. The discipline:
    `Let` cannot bind a mutable variable, so the alias is unrepresentable rather than
    rejected. Writing through the copy (`b += 1`) is then the ordinary
    write-to-a-non-mutable error, which blames the write instead of the binding.
+   An `=` binding's annotation states no place type, written or through an alias: lowering
+   refuses one (`lower_let_annotation`), whatever the initializer.
    The only mutable variable binders are `MutDecl` (a `:=` introduction) and a
-   pass-by-reference `Mut` parameter — both declarations by construction. Pinned
+   borrowed `Mut` parameter — both declarations by construction. Pinned
    by `infer::api::debug_assert_no_mut_var_let`.
 
-Inference enforces these rules. Emission reads pass-by-reference arguments through their
-A-normalization temps and refuses an argument that is not a bare variable of `Mut` type (rule 1).
-It refuses a write whose target is not a mutable variable (rule 3). Rule 2 and rule 1's
-computed-expression check need resolved types. `check_mut_discipline` checks them over the
-coalesced tree as the last step of each run and reports its errors with coalesce's.
+Emission preserves explicit borrow arguments and refuses an operand that is not a place variable
+(rule 1, `emit::emit_borrow`). It refuses a write whose target is not a mutable variable (rule 3). Lowering refuses a
+written type with a place type nested in it (`place::visit_places`), and an inferred one needs
+resolved types: `check_places` checks the coalesced tree with the same walk as the last step of
+each run and reports its errors with coalesce's.
 
-The **merge law** determines the writer restrictions. Feeds combine by `++`, and transactional
-mutable variables combine through the commit operator's timestamped merge. Both merge operations
-permit multiple writers. Feed handles may be aliased and returned (`http_serve` returns one in
-its tuple). An induction accumulator instead compiles to a single-writer `InductionStore`
-changelog and requires a resolvable writer set. A `Txn` mutable variable supports an open writer
-set because its sites merge their commits by time; the uniform second-class discipline restricts
-it conservatively. Planned affine typing expresses induction handles that may be used at most
-once, keeping writers unique while relaxing the downward-only rule. First-class `Txn` requires
-a runtime mutable variable key into the keyed MVCC store.
-
-`Mut`-parameter functions must reach their call sites, so they must be inlineable — the stance the
-pipeline already takes for writers and `Feed`-mediating UDFs. (When general recursion lands,
-recursive functions that don't fully inline need either the letrec treatment or a ban on `Mut`
-parameters — deferred to that design.)
+The merge law determines the writer restrictions. Feed contributions combine by `++`, and
+transactional writes merge by commit time. Both support multiple statically identified writers.
+Induction accumulators compile to a single-writer `InductionStore` changelog. Both history kinds
+use non-storable references, so their writer sets remain associated with declarations.
+Functions with writable parameters must inline at their calls. General recursion with writable
+parameters requires a separate compilation rule.
 
 ### `Feed` is a CCL type
 
-`Type::History { function: 𝐷 ⤇ 𝑉, history_kind: HistoryKind::Append }` (displayed
-`feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out: Feed(_)` declaration introduces, what
-`http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
-carries. It is the same `Type::History` variant a mutable variable uses, under the `Append` kind;
-unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. A
-handle may be returned and aliased, since feed aliasing is benign (multiple feeders union by `++`),
-and `channelize` resolves a handle through `Var` aliases only. A handle in a tuple or record
-literal reaches it because the inline pass splits the literal into one binding per component
-([Functions held in products](optimization.md#functions-held-in-products)), in a loop body and in
-an inlined function's argument as well. The handle's binding is then an alias of its channel, and
-a computed component is still evaluated once. A handle chosen at run time does not resolve to its
-declaration and is refused
-([chl-spec.md, "A deferred collection inside a data structure [Open]"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure-open)).
-A feed handle reaching a deferred binding no cluster took is refused by `channelize`
-(`check_unrouted_feeds`) rather than dropped with the statement it stands in. `channelize`
-eliminates every feed-typed term when it resolves channels, so no history type survives to
-planning.
+`Type::History { function: 𝐷 ⤇ 𝑉, history_kind: HistoryKind::Append }` represents a deferred
+place. The rules below implement those for place variables in
+[mutability-model.md, "Values, Places, and Variables"](mutability-model.md#values-places-and-variables)
+for `Mut` and `Feed`, and a feed is a deferred collection as
+[mutability-model.md, "Deferred collections"](mutability-model.md#deferred-collections) describes. `out: Feed(V)` declares it. A function parameter temporarily borrows it through `&out`.
+Place types occur only at declarations and borrowed parameter roots. They never nest in values,
+return types, other places or stored fields. Ordinary reads produce values at those positions.
+One walk, `place::visit_places`, states these positions: lowering refuses a written type by it,
+and `check_places` an inferred one.
 
-#### A feed read is a deref, and a feed is below its collection
+A borrowed parameter is an ordinary binder of its function: what the function does to it is
+bound at its body, as a local variable's is, and the call records it for the place it lends
+(`emit::borrowed_arguments`). So a function capturing a borrowed or local place cannot outlive it:
+a returned one is refused by the escape check (`InferCtx::escaping_results`), and one handed to a
+longer-lived place by the same check or by the clauses the place's function type states. Capture
+reaches through tuples, records, nominal wrappers and collections, since the check reads every
+function a value holds. A `Mut(V)` type is well-formed only if no function type in `V` causes `Append`, `Write` or
+`WriteTxn`, so a Feed or a Mut is never inside a Mut; `check_no_nested_mut` checks it beside the
+rule that a place type nests in no other type (`InferError::MutValueActsOnPlace`). After
+inference, `check_places` classifies declaration and parameter binders with `Type::as_place`.
+It refuses a `&` reaching a value parameter, an exclusive loan overlapping another loan or captured
+access through the callee or argument functions (`exclusive_borrows`), and a function writing an
+induction place it captures (`captured_induction_writes`). A compute function's latent capabilities
+state its captured access; its own parameters and local places are bound in its body. A collection's
+capabilities record its construction and do not represent a later access through that value.
+Deferred borrows are shared and unordered. A module-local function may capture its module's Feed and
+contribute when called from another module.
+It may also capture its module's transactional state and write it in a transaction.
 
-A feed is read the way a mutable variable is: the rule that emits a position consuming a value
-derefs a feed operand to its collection (`infer::emit::emit_value_read`). An operator operand, a
-loop source, an aggregate, a function position, a `<<` payload and a `<<=` value are such
-positions. A position that passes its value along leaves a feed the handle it is
-(`infer::emit::read_mut`): a `let` initializer, an argument, a tuple element or record field, a
-statement's continuation, and a function's result.
+A module `param` binding, and a compiler binding transporting one, keep the place their initializer
+names rather than reading it (`Expr::binding_a_place`). Module syntax checking rejects `pub` on Mut
+and Feed declarations. A module exports a value read explicitly, `pub values = out`. Exported input
+functions may capture and contribute to its private Feed. Qualified collection reads are ordinary
+values.
 
-Feeds are not second-class, so a feed can reach a reader as an inference variable, as a call's
-result does. For that case the relation holds `Feed(𝐷, 𝑉) <: 𝐷 ⤇ 𝑉`: a feed is below the
-collection it reads as. Nothing else is below a feed, so feeding a collection is a type error in
-inference (`NotAFeed`), wherever the collection came from: `x = [1, 2]; x << 3`,
-`x: Feed(Int) = [1, 2]`, or a collection passed to a parameter the function feeds. A `<<` on a
-parameter bounds the parameter's variable by a feed, so an argument meets a feed demand there
-and a collection demand where the parameter is only read, and an unconstrained parameter passes
-the handle through (`def f(x): x`).
+HTTP exposes `requests` and `respond(values)` from the embedded `std::http` module. Its private
+response Feed is registered as a sink separately from the pure CCL tree. Callers supply ordinary
+response collections. No writable place crosses the module boundary as data.
 
-Coalescing follows the same order (`dissolve_read_feeds`). At a negative position the meet of a
-feed and its collection is the feed, so a parameter the body both feeds and reads, or feeds and
-returns, is a feed. At a positive position the join of a feed and a non-feed is above the feed's
-read view.
+Inlining substitutes borrowed places into named parameters. Channelization gathers each Feed's
+contributions at its declaration and substitutes its assembled collection for reads. Its existing
+scope rewrites also handle generated collections. `check_unrouted_feeds` rejects unrouted writes,
+and no append-history type reaches planning.
+
+#### Value reads share the Mut rule
+
+`Type::read_value_type` returns a Mut's value type with its refinements and a Feed's full
+collection type with its dependent binder. It is the identity on ordinary values. Inference uses
+it in every value position, including function results. Both internal history kinds remain
+invariant in domain and value; a plain collection cannot acquire a write capability through
+subtyping or a place annotation.
 
 ### `Txn` is a CCL type
 
@@ -868,8 +834,8 @@ is closed.
 Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` algebra) with every
 `For`/`MutWrite`/`Begin`/`Feed`/`Defer` eliminated (feeds routed here, then discharged by `channelize`). It:
 
-0. **Normalizes to the flat-spine invariant** (`flatten_spine`). Inlining a pass-by-reference
-   writer splices its body at the call site, which can bury a mutable write off the statement
+0. **Normalizes to the flat-spine invariant** (`flatten_spine`). Inlining a writer that borrows
+   its parameter splices its body at the call site, which can bury a mutable write off the statement
    spine: under another `ExprStmt` (`bump2(cnt)` with a two-write body), inside a `Let` bound to a
    value (`y = bump(cnt)`), in a `Let`-headed effect (a bare `bump(cnt)` whose body has a leading
    `let`), or in terminal/value position (a trailing `cnt += 1`). Whether an expression writes is
@@ -1060,8 +1026,12 @@ The walk inlines five kinds of binding rather than keeping them:
 A transactional mutable variable and an induction counter shared across two HTTP endpoints:
 
 ```python
-incr_reqs, incr_resps = http_serve("8080", "POST", "/incr")
-get_reqs,  get_resps  = http_serve("8080", "GET",  "/get")
+run std::http(port="8080", method="POST", path="/incr") as incr
+run std::http(port="8080", method="GET", path="/get") as get
+incr_reqs = incr::requests
+get_reqs = get::requests
+incr_replies: Feed(String)
+get_replies: Feed(String)
 
 balance: Mut(Int, Txn) := 0
 cnt: Mut(Int) := 0
@@ -1070,11 +1040,14 @@ for req in incr_reqs:
     with begin():
         balance += 1
         cnt += 1
-    incr_resps << "ok {cnt}\n"
+    incr_replies << "ok " + str(cnt) + "\n"
 
 for req in get_reqs:
     with begin():
-        get_resps << balance
+        get_replies << str(balance)
+
+incr::respond(incr_replies)
+get::respond(get_replies)
 ```
 
 Note the mix: `balance` is transactional; `cnt` is a plain induction accumulator whose write here sits
@@ -1641,7 +1614,7 @@ await-specific logic: the resolved read names the history binding, which is alre
 is carried into its store (["How many commit stores a program
 has"](#how-many-commit-stores-a-program-has)).
 
-The operand is the mutable variable **handle** — the third position alongside a pass-by-reference
+The operand is the mutable variable's **place** — the third position alongside a borrowed
 argument and a write target (["A mutable variable read is an explicit
 operation"](#a-mutable-variable-read-is-an-explicit-operation)). `Builtin::AwaitFinal`'s scheme
 `∀ν. Mut(ν, Txn) ⇒ ν` pins the domain, so awaiting an induction accumulator is a type error; and

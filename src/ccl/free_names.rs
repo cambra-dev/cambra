@@ -28,7 +28,7 @@ use crate::ccl::{Expr, Name, Refinement, Type, TypedExprNode, ty::PredicateId};
 pub(crate) struct Reads {
     /// Read the names a node's type slots read, as well as its term's.
     pub types: bool,
-    /// Count the target of a `Feed`, `Define` or `MutWrite`, a handle the write names.
+    /// Count the target of a `Feed`, `Define` or `MutWrite`, a place the write names.
     pub writes: bool,
 }
 

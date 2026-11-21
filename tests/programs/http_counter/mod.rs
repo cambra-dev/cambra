@@ -40,16 +40,22 @@ fn http_computed_live_read() {
     let port = reserve_test_port();
     let source = indoc::formatdoc!(
         r#"
-            set_reqs, set_resps = http_serve("{port}", "POST", "/set")
-            get_reqs, get_resps = http_serve("{port}", "GET", "/get")
+            run std::http(port="{port}", method="POST", path="/set") as setter
+            setter_replies: Feed(String)
+            set_reqs = setter::requests
+            run std::http(port="{port}", method="GET", path="/get") as getter
+            getter_replies: Feed(String)
+            get_reqs = getter::requests
             latest: Mut(String, Txn) := "(none)"
             for msg in set_reqs:
                 with begin():
                     latest := msg
-                set_resps << "ok\n"
+                setter_replies << "ok\n"
             for req in get_reqs:
                 with begin():
-                    get_resps << latest + "!"
+                    getter_replies << latest + "!"
+            setter::respond(setter_replies)
+            getter::respond(getter_replies)
             "#
     );
     let mut ctx = compile_sink(&source);
@@ -73,18 +79,24 @@ fn http_multi_mut_var_live_read() {
     let port = reserve_test_port();
     let source = indoc::formatdoc!(
         r#"
-            set_reqs, set_resps = http_serve("{port}", "POST", "/set")
-            get_reqs, get_resps = http_serve("{port}", "GET", "/get")
+            run std::http(port="{port}", method="POST", path="/set") as setter
+            setter_replies: Feed(String)
+            set_reqs = setter::requests
+            run std::http(port="{port}", method="GET", path="/get") as getter
+            getter_replies: Feed(String)
+            get_reqs = getter::requests
             a: Mut(String, Txn) := "a0"
             b: Mut(String, Txn) := "b0"
             for msg in set_reqs:
                 with begin():
                     a := msg
                     b := msg
-                set_resps << "ok\n"
+                setter_replies << "ok\n"
             for req in get_reqs:
                 with begin():
-                    get_resps << a + b
+                    getter_replies << a + b
+            setter::respond(setter_replies)
+            getter::respond(getter_replies)
             "#
     );
     let mut ctx = compile_sink(&source);

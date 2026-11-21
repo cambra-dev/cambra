@@ -798,14 +798,14 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 "}, Value::Int(303))]
 #[case::in_a_def_called_twice(indoc! {"
     o: Feed(_)
-    def f(m):
+    def f(m, o: Feed(_)):
         match m:
             case `a(n):
                 o << n
             case `b(k):
                 o << k * 10
-    f(`a(4))
-    f(`b(5))
+    f(`a(4), &o)
+    f(`b(5), &o)
     sum(o)
 "}, Value::Int(54))]
 #[case::default_arm_taken(indoc! {"
@@ -865,14 +865,14 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 "}, Value::Int(3))]
 #[case::tag_without_payload(indoc! {"
     o: Feed(_)
-    def f(m):
+    def f(m, o: Feed(_)):
         match m:
             case `none:
                 o << 1
             case `some(k):
                 o << k
-    f(`none)
-    f(`some(5))
+    f(`none, &o)
+    f(`some(5), &o)
     sum(o)
 "}, Value::Int(6))]
 #[case::default_arm_of_a_nested_match(indoc! {"
@@ -2004,7 +2004,7 @@ fn a_filtered_conditional_generator_beside_another(#[case] code: &str, #[case] e
 /// A **feed** collected while iterating a conditional collection. The channel is a
 /// collection over the same witness the source binds — `Σ (σ : 𝐾). σ ⤇ Int` — and the
 /// assembled channel's own type is the only thing that says so: `channelize` substitutes
-/// the witness into the handle's domain, and a witness reference carries no kind, so a
+/// the witness into the place type's domain, and a witness reference carries no kind, so a
 /// slot lost at the erasure cannot be rebuilt. Losing it left `σ` free in the consumer's
 /// domain (`(σ ⤇ Int) ⇒ Int` on `sum`), which the post-lambda-elim escape check reports.
 #[rstest]

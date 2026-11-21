@@ -141,6 +141,8 @@ pub enum SyntheticKind {
     /// The binder [`crate::ccl::opaque_output`] mints for a lambda's result,
     /// annotated with a barrier variable.
     Output,
+    /// A checked written result annotation, which may read a mutable value.
+    WrittenOutput,
     /// One component of a let-bound tuple or record that holds a function,
     /// bound on its own by the inliner so the function reaches its calls
     /// (`src/ccl/inline.rs`, "Functions held in products").
@@ -163,7 +165,7 @@ impl SyntheticKind {
             SyntheticKind::AnfTemp => "__anf",
             SyntheticKind::MutRead => "__read",
             SyntheticKind::IterRecord => "__iter_record",
-            SyntheticKind::Output => "__output",
+            SyntheticKind::Output | SyntheticKind::WrittenOutput => "__output",
             SyntheticKind::Component => "__component",
             SyntheticKind::ExceptionLoop => "__loop",
         }
@@ -621,6 +623,11 @@ impl Name {
         Self::synthetic(SyntheticKind::Output)
     }
 
+    /// A written result annotation after inference has checked its value-read semantics.
+    pub fn written_output() -> Self {
+        Self::synthetic(SyntheticKind::WrittenOutput)
+    }
+
     /// Is this a binder [`crate::ccl::anf`] minted for a hoisted
     /// sub-expression?
     pub fn is_anf_temp(&self) -> bool {
@@ -647,8 +654,7 @@ impl Name {
         )
     }
 
-    /// Is this the binder [`crate::ccl::opaque_output`] mints for a lambda's
-    /// result?
+    /// Is this an inferred or written compiler output binding?
     ///
     /// Asked by [`crate::ccl::opaque_output::output_body`].
     /// The variable exception elimination gives a loop whose body may raise.
@@ -671,7 +677,7 @@ impl Name {
         matches!(
             self,
             Name::Synthetic {
-                kind: SyntheticKind::Output,
+                kind: SyntheticKind::Output | SyntheticKind::WrittenOutput,
                 ..
             }
         )

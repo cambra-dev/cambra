@@ -113,7 +113,7 @@ struct KeyView {
     /// Variant tags, unioned.
     var: BTreeMap<FieldKey, KeyView>,
     /// History contributions, keyed by kind so an `Overwrite` and an `Append`
-    /// handle at one position stay distinguishable rather than one shadowing the
+    /// place type at one position stay distinguishable rather than one shadowing the
     /// other. Each maps to `(value, domain)`.
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
     /// Nominal contributions, keyed by declaration so two nominal types at one
@@ -1294,7 +1294,7 @@ mod tests {
         // And the merge keeps them apart rather than one shadowing the other —
         // which is what the `history` map being keyed by kind buys, and why
         // `HistoryKind` needs `Ord`. Driven through `union` directly: `constrain`
-        // reads an `Overwrite` handle *through* to its value type, so the two kinds
+        // reads an `Overwrite` place type *through* to its value type, so the two kinds
         // never reach one variable's bound list by way of a subtyping edge.
         let mut merged = key_go(
             &history(HistoryKind::Overwrite),

@@ -42,48 +42,66 @@ use super::serving::{
 /// divergent edit to the stateful loop, observable on a route `main` does not
 /// serve.
 const DASHED_LOG: &str = indoc! {r#"
-    set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-    get_reqs, get_resps = http_serve("{PORT}", "GET", "/get2")
+    run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+    http_set_resps_replies: Feed(String)
+    set_reqs = http_set_resps::requests
+    run std::http(port="{PORT}", method="GET", path="/get2") as http_get_resps
+    http_get_resps_replies: Feed(String)
+    get_reqs = http_get_resps::requests
 
     log: Mut(String, Txn) := ""
 
     for msg in set_reqs:
         with begin():
             log := log + "-" + msg
-        set_resps << "ok\n"
+        http_set_resps_replies << "ok\n"
 
     for req in get_reqs:
         with begin():
-            get_resps << log
+            http_get_resps_replies << log
+    http_set_resps::respond(http_set_resps_replies)
+    http_get_resps::respond(http_get_resps_replies)
 "#};
 
 /// A second divergent edit of the same shape, read on `/get2`.
 const PLUSSED_LOG: &str = indoc! {r#"
-    set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-    get_reqs, get_resps = http_serve("{PORT}", "GET", "/get2")
+    run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+    http_set_resps_replies: Feed(String)
+    set_reqs = http_set_resps::requests
+    run std::http(port="{PORT}", method="GET", path="/get2") as http_get_resps
+    http_get_resps_replies: Feed(String)
+    get_reqs = http_get_resps::requests
 
     log: Mut(String, Txn) := ""
 
     for msg in set_reqs:
         with begin():
             log := log + "+" + msg
-        set_resps << "ok\n"
+        http_set_resps_replies << "ok\n"
 
     for req in get_reqs:
         with begin():
-            get_resps << log
+            http_get_resps_replies << log
+    http_set_resps::respond(http_set_resps_replies)
+    http_get_resps::respond(http_get_resps_replies)
 "#};
 
 /// `running-log` with `log` dropped, which no version holding it may become.
 const LOG_DROPPED: &str = indoc! {r#"
-    set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-    get_reqs, get_resps = http_serve("{PORT}", "GET", "/get2")
+    run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+    http_set_resps_replies: Feed(String)
+    set_reqs = http_set_resps::requests
+    run std::http(port="{PORT}", method="GET", path="/get2") as http_get_resps
+    http_get_resps_replies: Feed(String)
+    get_reqs = http_get_resps::requests
 
     for msg in set_reqs:
-        set_resps << "ok\n"
+        http_set_resps_replies << "ok\n"
 
     for req in get_reqs:
-        get_resps << "none\n"
+        http_get_resps_replies << "none\n"
+    http_set_resps::respond(http_set_resps_replies)
+    http_get_resps::respond(http_get_resps_replies)
 "#};
 
 fn with_port(text: &str, port: u16) -> String {

@@ -456,7 +456,7 @@ fn importing_a_callback_function_preserves_its_ordering_requirement() {
         pub def counted(xs):
             c := 0
             for x in xs:
-                inc(c)
+                inc(&c)
             c
     "}
 )]

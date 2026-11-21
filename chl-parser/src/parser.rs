@@ -855,7 +855,17 @@ where
         // subscript parser above has already taken it as the proven lookup.
         let unwrap = just(Token::Bang).to(PostfixOp::Unwrap);
 
-        let postfix = atom
+        // One `&` borrows the atom it marks. A borrow is no place, so `&&x` borrows
+        // nothing and is a parse error at the second `&`.
+        let place_atom =
+            just(Token::Amp)
+                .or_not()
+                .then(atom.clone())
+                .map_with(|(mark, atom), e| match mark {
+                    Some(_) => Spanned::new(e.span(), Expr::Borrow(Box::new(atom))),
+                    None => atom,
+                });
+        let postfix = place_atom
             .clone()
             .foldl_with(
                 choice((call_args, subscript, method_call, attribute, unwrap)).repeated(),

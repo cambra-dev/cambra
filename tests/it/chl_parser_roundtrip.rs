@@ -41,6 +41,19 @@ fn must_parse_expr(src: &str) -> Spanned<Expr> {
 }
 
 #[test]
+fn a_borrow_binds_before_postfix_access() {
+    let expression = must_parse_expr("&xs.push(7)");
+    let Expr::MethodCall { receiver, .. } = expression.node else {
+        panic!("a method call")
+    };
+    assert!(matches!(receiver.node, Expr::Borrow(_)));
+    assert!(matches!(
+        must_parse_expr("left & right").node,
+        Expr::BinOp { .. }
+    ));
+}
+
+#[test]
 fn arithmetic_and_literals() {
     for src in &[
         "2",
