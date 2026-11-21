@@ -131,7 +131,6 @@ pub trait HeldRewriter {
     fn fun_kind_variable(&mut self, _k: &Rc<FunKindVar>) -> Option<Rc<FunKindVar>> {
         None
     }
-
     /// What `capabilities` becomes, or `None` to keep it. The rewrite then enters what the
     /// answer holds.
     fn capabilities(&mut self, _capabilities: &Capabilities) -> Option<Capabilities> {

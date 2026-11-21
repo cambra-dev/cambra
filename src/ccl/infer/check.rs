@@ -499,6 +499,15 @@ impl Typing for CheckCtx {
         scheme.instantiate_in(&mut self.solver, self.level, &self.telescope)
     }
 
+    /// A fully-typed tree's kinds are the run's that typed it, so normalization is the
+    /// identity, as [`Self::normalize`] is.
+    fn normalize_fun_kind(
+        &mut self,
+        fun_kind: &crate::ccl::ty::FunKind,
+    ) -> crate::ccl::ty::FunKind {
+        fun_kind.clone()
+    }
+
     fn normalize(&mut self, ann: &Type) -> Type {
         // A fully-typed tree carries no `Hole`s, so normalization is the
         // identity; refinements are kept (as everywhere else). Check reads no capabilities, so

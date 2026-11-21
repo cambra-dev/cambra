@@ -268,7 +268,7 @@ impl OperatorSchemes {
         let aggregate_sum = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                Type::consumer_fun(solver, alpha.clone(), prim(BaseType::Int)),
+                Type::consumer_fun(solver, BODY_LEVEL, alpha.clone(), prim(BaseType::Int)),
                 prim(BaseType::Int),
             ),
         );
@@ -279,7 +279,10 @@ impl OperatorSchemes {
         let gamma = fresh_var(solver, BODY_LEVEL);
         let aggregate_max = PolyScheme::poly(
             SCHEME_LEVEL,
-            fun(Type::consumer_fun(solver, alpha, gamma.clone()), gamma),
+            fun(
+                Type::consumer_fun(solver, BODY_LEVEL, alpha, gamma.clone()),
+                gamma,
+            ),
         );
 
         // Min: ∀α γ. (α ⤇ γ) → γ. Consumes a collection and folds its
@@ -288,7 +291,10 @@ impl OperatorSchemes {
         let gamma = fresh_var(solver, BODY_LEVEL);
         let aggregate_min = PolyScheme::poly(
             SCHEME_LEVEL,
-            fun(Type::consumer_fun(solver, alpha, gamma.clone()), gamma),
+            fun(
+                Type::consumer_fun(solver, BODY_LEVEL, alpha, gamma.clone()),
+                gamma,
+            ),
         );
 
         // Drain: ∀α γ. (α ⤇ γ) → unit. Consumes a collection of any element

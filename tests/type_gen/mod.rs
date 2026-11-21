@@ -11,6 +11,7 @@ use cambra::ccl::Occurrence;
 use std::rc::Rc;
 
 use cambra::ccl::Duplicate;
+use cambra::ccl::infer::solver::Solver;
 use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, FunKindVar, Lit, Name, Openness,
     Refinement, Type, TypeKind, TypedExpr, UnaryOpKind, ccl_utils,
@@ -188,12 +189,12 @@ impl KindVarPool {
     /// One of the variables already handed out, or a fresh one. Biased toward
     /// reuse, since a set of all-distinct variables is the case that already had
     /// coverage.
-    fn pick(&mut self, rng: &mut Rng) -> Rc<FunKindVar> {
+    fn pick(&mut self, rng: &mut Rng, solver: &mut Solver) -> Rc<FunKindVar> {
         if !self.0.is_empty() && rng.chance(2, 3) {
             let i = rng.below(self.0.len() as u64) as usize;
             return Rc::clone(&self.0[i]);
         }
-        let v = FunKindVar::unowned_unpinned();
+        let v = FunKindVar::fresh(solver, 0);
         self.0.push(Rc::clone(&v));
         v
     }
@@ -206,7 +207,12 @@ impl KindVarPool {
 /// are unreachable without this. A kind variable holds mutable state behind an
 /// `Rc` (its pin, and the variables it is related to), which is why a generator
 /// that replays re-runs rather than cloning.
-pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Type {
+pub fn maybe_kind_var_from(
+    rng: &mut Rng,
+    pool: &mut KindVarPool,
+    solver: &mut Solver,
+    t: Type,
+) -> Type {
     match t {
         // A sum's kind is its binders, which its domain names: replacing it would leave those
         // references with no binder.
@@ -218,7 +224,7 @@ pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Ty
             capabilities,
         } if !matches!(fun_kind, FunKind::Data(Some(_))) && rng.chance(1, 2) => Type::Fun {
             binder,
-            fun_kind: FunKind::Var(pool.pick(rng)),
+            fun_kind: FunKind::Var(pool.pick(rng, solver)),
             domain,
             codomain,
             capabilities: capabilities.clone(),
@@ -231,8 +237,8 @@ pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Ty
 /// a harness whose cases are independent and share nothing.
 // Used by `differential_oracle` only.
 #[allow(dead_code)]
-pub fn maybe_kind_var(rng: &mut Rng, t: Type) -> Type {
-    maybe_kind_var_from(rng, &mut KindVarPool::new(), t)
+pub fn maybe_kind_var(rng: &mut Rng, solver: &mut Solver, t: Type) -> Type {
+    maybe_kind_var_from(rng, &mut KindVarPool::new(), solver, t)
 }
 
 /// Which fragment of the type language a sampler draws from.

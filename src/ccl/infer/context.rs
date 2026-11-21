@@ -155,11 +155,6 @@ pub(super) struct InferCtx {
     /// The nodes under emission, innermost last: each one's capability variable, which its
     /// `capabilities` slot holds until coalesce resolves it.
     node_capabilities: Vec<NodeCapabilities>,
-    /// Each use's copies of its definition's capability variables, which the specialization the
-    /// use mints takes.
-    pub(super) use_capabilities: crate::ccl::capabilities::UseCapabilities,
-    /// Each use's copies of its definition's capability variables, which the specialization the
-    /// use mints takes and is keyed by.
     /// The capability variable of the tree's root, once it has been emitted.
     root_capabilities: Option<Rc<CapabilityVar>>,
     /// Each mutable variable and feed emission has bound, keyed by its binder: what a read, a
@@ -311,7 +306,7 @@ pub(super) struct InferCtx {
     /// clauses of the polymorphic annotations whose right-hand sides enclose it.
     /// Every obligation `require_trait` mints takes those about its trait
     /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
-    assumptions: Vec<Rc<TraitRequirement>>,
+    pub(super) assumptions: Vec<Rc<TraitRequirement>>,
     /// The binders in lexical scope at the current emission position — what
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
@@ -948,7 +943,6 @@ impl InferCtx {
             selected_methods: Rc::default(),
             place_reads: HashMap::new(),
             node_capabilities: Vec::new(),
-            use_capabilities: Default::default(),
             root_capabilities: None,
             places: HashMap::new(),
             capability_statements: Vec::new(),
@@ -1593,30 +1587,6 @@ impl InferCtx {
             },
             source,
         ))
-    }
-
-    pub(super) fn assume_at_use(&self, obligations: &[Rc<TraitObligation>]) {
-        for obligation in obligations {
-            if obligation.assumptions().is_empty() {
-                obligation.assume_more(&self.assumptions);
-            }
-        }
-    }
-
-    pub(super) fn record_order_assumptions(
-        &mut self,
-        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    ) {
-        for var in copies.values() {
-            for capability in var.own(&self.solver) {
-                if let Capability::Requires(r) = capability.item
-                    && let Some(order) = r.ordering()
-                {
-                    r.record(&mut self.solver);
-                    order.assume_more(&mut self.solver, self.assumptions.iter().cloned());
-                }
-            }
-        }
     }
 
     /// Hold each loop's order to what its body was found to cause once emission is done. A loop
@@ -2689,6 +2659,31 @@ impl InferCtx {
         self.normalize_annotation_in(ty, &telescope)
     }
 
+    /// A function's kind as lowering wrote it, normalized at `telescope`. The witness binders
+    /// riding a data kind normalize like the domain: their types are annotation content at the
+    /// enclosing scope. A kind lowering minted, an annotation's hole or a consumer's data kind,
+    /// holds nothing of a run, so this run takes a fresh data kind of its own in its place per
+    /// occurrence, standing where the annotation does, as a `Hole` is a fresh type.
+    fn normalize_fun_kind_in(
+        &mut self,
+        fun_kind: &crate::ccl::ty::FunKind,
+        telescope: &Telescope,
+    ) -> crate::ccl::ty::FunKind {
+        match fun_kind {
+            crate::ccl::ty::FunKind::Data(Some(ws)) => {
+                crate::ccl::ty::FunKind::Data(Some(Rc::new(
+                    ws.iter()
+                        .map(|w| w.map_types(|t| self.normalize_annotation_in(t, telescope)))
+                        .collect(),
+                )))
+            }
+            crate::ccl::ty::FunKind::Var(v) if v.home().is_none() => {
+                crate::ccl::ty::FunKind::fresh_data_at(&mut self.solver, self.level)
+            }
+            other => other.clone(),
+        }
+    }
+
     /// A function annotation's domain, normalized. A [`Type::SharedHole`] there names one
     /// data domain, so its variable is marked as one ([`InferVar::names_domain`]): a domain
     /// is the one position where the claim that two positions share a type is an equation
@@ -2844,25 +2839,7 @@ impl InferCtx {
                 let cod_telescope = binder
                     .names()
                     .fold(telescope.clone(), |t, b| t.extended(b.clone()));
-                // The witness binders riding the function normalize like the domain:
-                // their types are annotation content at the enclosing scope.
-                let fun_kind = match fun_kind {
-                        crate::ccl::ty::FunKind::Data(Some(ws)) => {
-                            crate::ccl::ty::FunKind::Data(Some(Rc::new(
-                                ws.iter()
-                                    .map(|w| {
-                                        w.map_types(|t| self.normalize_annotation_in(t, telescope))
-                                    })
-                                    .collect(),
-                            )))
-                        }
-                        // A funkind the annotation left to inference is a fresh one per
-                        // occurrence, as a `Hole` is a fresh type.
-                        crate::ccl::ty::FunKind::Var(v) if v.is_hole() => {
-                            crate::ccl::ty::FunKind::fresh_data_at(&mut self.solver, self.level)
-                        }
-                    other => other.clone(),
-                };
+                let fun_kind = self.normalize_fun_kind_in(fun_kind, telescope);
                 let domain = self.normalize_domain(d, telescope);
                 let codomain = self.normalize_annotation_in(c, &cod_telescope);
                 // The parts are minted for this function, so they sit under the witness
@@ -4015,6 +3992,14 @@ impl Typing for InferCtx {
         self.normalize_annotation(ann)
     }
 
+    fn normalize_fun_kind(
+        &mut self,
+        fun_kind: &crate::ccl::ty::FunKind,
+    ) -> crate::ccl::ty::FunKind {
+        let telescope = self.telescope.clone();
+        self.normalize_fun_kind_in(fun_kind, &telescope)
+    }
+
     fn require_trait(
         &mut self,
         trait_: Trait,
@@ -5131,7 +5116,7 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         // The parts of whatever function `t` is, a sum's included: under the binders of the
         // demand's kind, which the edge relates to `t`'s.
-        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver);
+        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level);
         let d = self.fresh_part(&kind);
         let c = self.fresh_part(&kind);
         // Destructuring is kind-agnostic: `Data` and `Compute` are incomparable, so the
@@ -5157,7 +5142,7 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         // A named demand, as `apply`'s: the codomain edge relates `t`'s binder to `binder`,
         // and the codomain is minted where `binder` is in scope.
-        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver);
+        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level);
         let d = self.fresh_part(&kind);
         let c = self.scoped(binder, &d, |ctx| ctx.fresh_part(&kind));
         let shape =
@@ -5260,7 +5245,7 @@ impl Typing for InferCtx {
         // second variable describes one consumption twice; see [`Typing::apply`].
         let demand_kind = match kind {
             Some(k @ crate::ccl::ty::FunKind::Var(_)) => k.clone(),
-            _ => crate::ccl::ty::FunKind::fresh_var(&mut self.solver),
+            _ => crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level),
         };
         // A call of one argument expects a function of one parameter, its binder the whole
         // input; an argument list expects a parameter list as long, each parameter named

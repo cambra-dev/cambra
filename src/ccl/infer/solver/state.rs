@@ -641,6 +641,7 @@ impl Solver {
         var: &FunKindVar,
     ) -> &mut Vec<crate::ccl::infer_var::WitnessBinderId> {
         self.reach(format_args!("{var:?}"));
+        assert_records_on_a_run_kind(var);
         self.revisions.funkind_names += 1;
         self.funkinds.get_mut(self.id, var).names_mut()
     }
@@ -711,6 +712,7 @@ impl Recorded for FunKind {
     }
     fn note_write(solver: &mut Solver, var: &FunKindVar) {
         solver.record(var.home(), format_args!("{var:?}"));
+        assert_records_on_a_run_kind(var);
         solver.revisions.funkind += 1;
     }
     fn adopt(solver: &mut Solver, var: &Rc<FunKindVar>, state: FunKindState) {
@@ -783,6 +785,16 @@ impl Handle for OrderableIfRequiredBy {
     fn home(&self) -> Option<Home> {
         self.home
     }
+}
+
+/// A run records only on kinds some run minted: a kind lowering minted is the program's, and
+/// normalization gives the run a kind of its own in its place
+/// (`src/ccl/design/type-inference.md`, "Funkind variables are copied by level").
+fn assert_records_on_a_run_kind(var: &FunKindVar) {
+    assert!(
+        var.home().is_some(),
+        "a run records nothing on {var:?}, a kind lowering minted"
+    );
 }
 
 impl Drop for Solver {

@@ -1102,21 +1102,20 @@ above the binding's cutoff (`FreshenCache`). Every handle goes through one rule 
    is copied into it, so a cycle through the handle reaches the copy.
 
 A handle with a level of its own, an inference, barrier, kind or capability variable, stands above
-the cutoff where that level is above it. One with none is copied wherever freshening reaches it: a
-kind no function has placed, an ordering requirement, and a trait obligation, which a watch of a
-copied variable reaches whichever scope minted it. A copy of an ordering requirement its run has
-decided holds that decision. What each kind's copy carries is its
-own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`,
-`copy_ordering`, `copy_obligation`): what is recorded on the original, copied through the same
-rule. A capability set a type or a node states is copied through the rule too
-(`freshen_capabilities`): its variables, and a known set's requirements and raised types, as a
-copied variable's own capabilities are. Written clauses hold nothing of a run and are kept.
+the cutoff where that level is above it. One with none is copied wherever freshening reaches it: an
+ordering requirement, and a trait obligation, which a watch of a copied variable reaches whichever
+scope minted it. A kind lowering minted is the program's, not a run's: it has no home, so no run
+records on it (`Solver::funkind_state_mut` panics on one), and a copy keeps it. A copy of an
+ordering requirement its run has decided holds that decision. What each kind's copy carries is its
+own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`, `copy_ordering`,
+`copy_obligation`): what is recorded on the original, copied through the same rule. A capability set
+a type or a node states is copied through the rule too (`freshen_capabilities`): its variables, and
+a known set's requirements and raised types, as a copied variable's own capabilities are. Written
+clauses hold nothing of a run and are kept.
 
 `freshen_level` returns a type unchanged when nothing it holds is above the cutoff, so it reads the
 same state the rule copies: a function's kind and capabilities, a known set's contents, where an
-ordering requirement counts as above every cutoff. A kind variable can be minted without a level,
-which no other variable can; such a kind counts as the outermost there, and the rule copies it
-wherever it is reached.
+ordering requirement counts as above every cutoff.
 
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
@@ -4121,12 +4120,16 @@ the recorded one
 
 ### Funkind variables are copied by level
 
-A funkind variable records the level of what owns it, where that is known
-(`FunKindVar::level`): a variable's own funkind variable stands at the variable's level and is
-lowered with it, and the one an annotation's normalization mints for a funkind hole stands at the
-level the annotation is normalized at. `freshen_kind_var` copies a funkind variable above the
-freshening's cutoff and leaves one at or below it in place, as freshening treats a type variable.
-A funkind variable with no recorded level is copied by every freshening that reaches it.
+A funkind variable a run mints stands at the level of what owns it, given when it is minted
+(`FunKindVar::fresh`, `FunKindVar::level`): a variable's own funkind variable stands at the
+variable's level and is lowered with it, a demand's at the level it is made at, and the one an
+annotation's normalization mints stands at the level the annotation is normalized at. Lowering
+mints data funkind variables outside every run, a consumer's and an annotation's hole
+(`FunKind::fresh_data`, `FunKind::data_hole`). Normalization replaces each with a fresh one of the
+run's per occurrence (`InferCtx::normalize_fun_kind_in`), for an annotation and for a cast's
+target alike, so no run records on lowering's. `freshen_kind_var` copies a funkind variable above
+the freshening's cutoff and leaves one at or below it in place, as freshening treats a type
+variable.
 `lower_levels` and extrusion also lower a function type's funkind variable to the destination
 level, including when its domain and codomain contain no variable above that level.
 
@@ -5442,7 +5445,10 @@ call of a function no value of the definition flows into, such as an unannotated
 what each use passes, so none of its clauses is refused at the definition: `Typing::apply` records
 each call whose callee is an inference variable, and the check skips a `try` reaching one whose
 variable receives no value. Each use of a polymorphic definition copies its `Raise` capabilities at
-its own instance of the types (`Raised::instantiated`).
+its own instance of the types (`Raised::instantiated`). The instance is the use's: every copy made
+for one use, its instantiation's and its specialization clone's, is one exception, and two uses are
+two. An exception carries which copy it is, each use it was copied for in order
+(`ExceptionInstance`), so the copies one use makes agree without a table relating them.
 
 ### Polymorphism and materialization
 
@@ -5504,12 +5510,12 @@ projection's sum, a family's arguments (`settle_capabilities` in `solve.rs`). A 
 before coalesce settles its tree the same way (`run_once` in `infer/mod.rs`), since the passes after
 a failed inference still read it.
 
-A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
-arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one
-clone has one set of capabilities at each node. Uses whose arguments bring different capabilities
-therefore share no clone: the specialization key holds, at each function position of the use's type,
-what the function there requires and causes, resolved (`spec_key`'s `KeyView::capabilities`). A use
-inside a clone instantiated through the clone's copies.
+A clone copies the definition's capability variables as it copies its type variables, and the pin
+relates the clone to its use's instantiation for capabilities as for types (`specialize_use`): what
+the use's arguments bring where the definition's effect parameters stand reaches the clone's copies
+through it. Uses whose arguments bring different capabilities therefore share no clone: the
+specialization key holds, at each function position of the use's type, what the function there
+requires and causes, resolved (`spec_key`'s `KeyView::capabilities`).
 
 #### Settling capabilities
 
@@ -5521,7 +5527,9 @@ Settling is one rewrite of what each value holds (`Settler`, through `HoldsSolve
 - an ordering requirement the run has not closed becomes a closed one (`Requirement::closed`): the
   run decides whether it is satisfied now, while its capabilities can still say whether an effect
   input is open, and what it holds is settled by the same rewrite. That covers its positions, its
-  source's type, its capabilities and its assumptions;
+  source's type, its capabilities and its assumptions. The type variables in them resolve, as a
+  node's type does, since a closed requirement is read once the run has ended. Elsewhere settling
+  keeps a type variable: coalesce decides a node's types, and an error's are reported as found;
 - an ordering requirement met inside its own parts, a loop's body requiring what the loop does, is
   closed to the run's answer with no capabilities;
 - a requirement a run closed is entered like any other value.

@@ -5332,7 +5332,7 @@ mod tests {
     #[test]
     fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         let collection = Rc::new(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
         let (root, nodes) = super::super::test_helpers::diamond_bound_graph(
@@ -5366,7 +5366,7 @@ mod tests {
         let Type::Infer(v) = &shared else {
             unreachable!()
         };
-        let fun_kind = crate::ccl::ty::FunKind::fresh_var(solver);
+        let fun_kind = crate::ccl::ty::FunKind::fresh_var(solver, 0);
         v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Fun {

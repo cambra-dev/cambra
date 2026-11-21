@@ -145,11 +145,13 @@ impl PolyScheme {
         current_level: Level,
         telescope: &Telescope,
         use_at: crate::ccl::provenance::NodeId,
+        assumptions: &[Rc<TraitRequirement>],
     ) -> Instance {
         #[cfg(debug_assertions)]
         let before = Minted::now();
         let mut cache = FreshenCache::new();
         cache.use_at = Some(use_at);
+        cache.use_assumptions = assumptions.to_vec();
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
@@ -337,13 +339,13 @@ pub(crate) fn assert_copied_apart_from(
     impl Audit<'_> {
         fn kind(&mut self, kind: &FunKind) {
             if let FunKind::Var(k) = kind {
-                let level = k.level(self.solver);
+                let level = kind_level(self.solver, k);
                 assert!(
-                    k.uid >= self.before.funkind || level.is_some_and(|l| l <= self.lim),
+                    k.uid >= self.before.funkind || level <= self.lim,
                     "an instantiation shares a funkind variable above the cutoff {} with its scheme: {k:?}",
                     self.lim
                 );
-                if level.is_some_and(|l| l <= self.lim) || !self.kinds.insert(k.uid) {
+                if level <= self.lim || !self.kinds.insert(k.uid) {
                     return;
                 }
                 let edges = k.lower_edges(self.solver);
@@ -513,6 +515,10 @@ pub struct FreshenCache {
     /// ordering requirement is reported (`docs/chl-spec.md`, "Conditional ordering
     /// requirements"). `None` for a copy no use makes.
     pub use_at: Option<crate::ccl::provenance::NodeId>,
+    /// The assumptions in scope at that use: each copy of a trait obligation or an ordering
+    /// requirement made for the use is answered under them too, its instantiation's and its
+    /// specialization's alike.
+    pub use_assumptions: Vec<Rc<TraitRequirement>>,
     /// An operator scheme's Pi binder → the name this instantiation gives it.
     pub binders: HashMap<crate::ccl::Name, crate::ccl::Name>,
     /// Opened family parameter → what this instantiation stands it at: a variable that may
@@ -702,6 +708,14 @@ fn copy_ordering(
             .expect("a copy of an ordering requirement is one")
             .decide(solver, decision);
     }
+    // A copy made for a use is checked at the use, under what the use assumes, once the use's
+    // run has typed the use (`InferCtx::check_loop_orders`).
+    if cache.use_at.is_some() {
+        copy.record(solver);
+        copy.ordering()
+            .expect("a copy of an ordering requirement is one")
+            .assume_more(solver, cache.use_assumptions.iter().cloned());
+    }
     cache.record_copy(r, copy.clone());
     copy
 }
@@ -758,7 +772,7 @@ fn freshen_capability_set(
         .map(|e| match e {
             crate::ccl::capabilities::Effect::Raise(raised) => {
                 let ty = freshen_above(solver, lim, &raised.ty, target, cache);
-                crate::ccl::capabilities::Effect::Raise(raised.instantiated(ty))
+                crate::ccl::capabilities::Effect::Raise(raised.instantiated(ty, cache.use_at))
             }
             e => e.clone(),
         })
@@ -825,21 +839,21 @@ fn copy_capability_var(
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.record_copy(v, Rc::clone(&f));
     // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
-    // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
-    // bring instead.
+    // for what each use passes (`InferCtx::open_poly`), as an opened type parameter stands for
+    // itself. A copy above the cutoff is the use's variable for the parameter, as a copied type
+    // parameter is a fresh variable, so it holds what the use's arguments bring instead.
     for capability in v.own(solver) {
         match &capability.item {
             Capability::Param(_) => {}
             // A use raises the exception at its own instance of the definition's types, and as
-            // an exception of its own: two uses at two types are two exceptions.
+            // an exception of its own: two uses are two exceptions.
             Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
                 let ty = freshen_above(solver, lim, &raised.ty, target, cache);
+                let raised = raised.instantiated(ty, cache.use_at);
                 f.record(
                     solver,
                     crate::ccl::capabilities::LocatedCapability {
-                        item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
-                            raised.instantiated(ty),
-                        )),
+                        item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)),
                         ..capability.clone()
                     },
                 );
@@ -977,9 +991,20 @@ fn held_above(solver: &mut Solver, lim: Level, held: &Held) -> bool {
     match held {
         Held::Infer(v) => v.level(solver) > lim,
         Held::Barrier(b) => freshen_level(solver, &Type::BarrierVar(Rc::clone(b))) > lim,
-        Held::FunKind(k) => k.level(solver).is_none_or(|l| l > lim),
+        Held::FunKind(k) => kind_level(solver, k) > lim,
         Held::Capability(c) => c.level(solver) > lim,
         Held::Ordering(_) | Held::Obligation(_) => true,
+    }
+}
+
+/// The level `k` stands at. A kind lowering minted is the program's, not a run's: it has no
+/// home and no level, nothing a run records is on it, and a copy keeps it.
+fn kind_level(solver: &Solver, k: &FunKindVar) -> Level {
+    match k.home() {
+        Some(_) => k
+            .level(solver)
+            .expect("a kind a run minted stands where its owner does"),
+        None => 0,
     }
 }
 
@@ -1013,10 +1038,10 @@ fn copy_kind_var(
         // A copy's witness positions belong to its own graph, so start without the cache.
         binder_positions_at: (),
     } = kv.fields(solver);
-    let f = FunKindVar::fresh(solver);
-    if let Some(l) = kv.level(solver) {
-        f.place_at(solver, target.level_of(l));
-    }
+    let level = kv
+        .level(solver)
+        .expect("a kind a run holds stands where its owner does");
+    let f = FunKindVar::fresh(solver, target.level_of(level));
     // Registered **before** the bounds are carried across: a collection reaches itself
     // through a recurrence, and the cache is what terminates the walk.
     cache.record_copy(kv, Rc::clone(&f));
@@ -1141,17 +1166,14 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
         Type::ChanDom(_, l) => l.0,
         // A function's capabilities and kind are copied like any state above the cutoff, so a
         // type whose only quantified content is either is not returned verbatim: each use would
-        // record its own funkind, or add its arguments' capabilities, on the definition's
-        // variable. A kind no function has placed has no level to compare, and is copied by
-        // every freshening that reaches it (`src/ccl/design/type-inference.md`, "Funkind
-        // variables are copied by level").
+        // add what its arguments bring to the definition's own variables.
         Type::Fun {
             capabilities,
             fun_kind,
             ..
         } => {
             let kind = match fun_kind {
-                FunKind::Var(k) => k.level(solver).unwrap_or(Level::MAX),
+                FunKind::Var(k) => kind_level(solver, k),
                 _ => 0,
             };
             capabilities_level(solver, capabilities).max(kind)
@@ -1624,8 +1646,7 @@ fn copy_infer_var(
             let fun_kind = match cache.copy_of(tv.fun_kind()) {
                 Some(existing) => existing,
                 None => {
-                    let f = FunKindVar::fresh(solver);
-                    f.place_at(solver, new_level);
+                    let f = FunKindVar::fresh(solver, new_level);
                     cache.record_copy(tv.fun_kind(), Rc::clone(&f));
                     f
                 }
@@ -1994,14 +2015,21 @@ fn copy_obligation(
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:
         // a sibling definition's parameters can sit at the same level.
+        let mut reset = false;
         if let Some(own) = cache.own_params.clone() {
-            if copy.reset_for_specialization(&own) {
+            reset = copy.reset_for_specialization(&own);
+            if reset {
                 cache.reset_obligations.push(Rc::clone(&copy));
             }
-            // What the reset keeps names enclosing definitions' parameters, which
-            // freshen to themselves, and nested definitions' ones, which the clone
-            // re-mints through this cache.
-            copy.map_assumptions(|t| freshen_above(solver, lim, t, target, cache));
+        }
+        // What the copy assumes names enclosing definitions' parameters, which freshen to
+        // themselves, and nested definitions' ones, which the copy re-mints through this cache.
+        copy.map_assumptions(|t| freshen_above(solver, lim, t, target, cache));
+        // A copy made for a use is answered under what the use assumes, where nothing the
+        // definition assumed about its trait answers it: one assuming nothing, or one the reset
+        // took the definition's own assumptions from.
+        if reset || copy.assumptions().is_empty() {
+            copy.assume_more(&cache.use_assumptions);
         }
         // Phase 2: now that re-entry finds the copy, freshen every operand, and the
         // output and the input expressions a refinement template builds from. An
@@ -2335,7 +2363,7 @@ mod tests {
         // a Fun whose kind is an unpinned var must mint a *new* FunKindVar (the pin
         // copied), not share the original — otherwise pinning one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
-        let kv = FunKindVar::fresh(solver);
+        let kv = FunKindVar::fresh(solver, 5);
         kv.stamp_data(solver); // a def-intrinsic answer to carry onto each instantiation
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
@@ -2378,8 +2406,7 @@ mod tests {
     #[test]
     fn a_capability_variable_beside_a_shared_funkind_variable_is_copied() {
         let solver = &mut Solver::new();
-        let kind = FunKindVar::fresh(solver);
-        kind.place_at(solver, 0);
+        let kind = FunKindVar::fresh(solver, 0);
         let quantified = CapabilityVar::fresh(solver, 1, &Telescope::empty());
         let ty = Type::Fun {
             binder: crate::ccl::FunBinder::None,
@@ -2512,7 +2539,7 @@ mod copy_audit_tests {
             None,
             Type::Base(BaseType::Int),
         );
-        let kind = FunKind::fresh_var(solver);
+        let kind = FunKind::fresh_var(solver, 1);
         let FunKind::Var(k) = &kind else {
             unreachable!()
         };
@@ -2561,7 +2588,7 @@ mod copy_audit_tests {
         let quantified = InferVar::fresh(solver, 1);
         let ty = Type::Fun {
             binder: crate::ccl::FunBinder::None,
-            fun_kind: FunKind::fresh_var(solver),
+            fun_kind: FunKind::fresh_var(solver, 1),
             domain: Box::new(Type::Tuple(vec![
                 Type::Infer(Rc::clone(&captured)),
                 Type::Infer(quantified),
@@ -2597,7 +2624,7 @@ mod copy_audit_tests {
     #[test]
     fn a_funkind_is_copied_even_when_its_function_has_no_type_variables() {
         let solver = &mut Solver::new();
-        let kind = FunKind::fresh_var(solver);
+        let kind = FunKind::fresh_var(solver, 1);
         let int = Type::Base(BaseType::Int);
         let ty = Type::fun_over(Name::fresh("x"), int.clone(), int, kind.clone());
         let scheme = PolyScheme::poly(0, ty);
