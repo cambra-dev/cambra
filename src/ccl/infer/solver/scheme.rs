@@ -455,6 +455,12 @@ fn copy_ordering(
         Some(_) => copy.at_use(),
         None => copy,
     };
+    // What the original's run has decided of it, the copy holds too.
+    if let Some(decision) = order.decision(solver) {
+        copy.ordering()
+            .expect("a copy of an ordering requirement is one")
+            .decide(solver, decision);
+    }
     cache.record_copy(r, copy.clone());
     copy
 }
@@ -503,9 +509,6 @@ fn copy_capability_var(
                     },
                 );
             }
-            Capability::Requires(r)
-                if r.ordering()
-                    .is_some_and(|o| o.decision(solver) == Some(true)) => {}
             Capability::Requires(r) if r.ordering().is_some() => {
                 let requirement = freshen_requirement(solver, lim, r, target, cache);
                 f.record(
@@ -634,18 +637,14 @@ fn freshen_handle<K: HeldKind + Clone>(
 
 /// Whether freshening copies `held`: a handle with a level of its own is copied where that level
 /// is above the cutoff, and one with none, a kind no function has placed, an ordering
-/// requirement or an obligation, wherever freshening reaches it. An ordering requirement its run
-/// has decided holds is kept, its answer shared.
+/// requirement or an obligation, wherever freshening reaches it.
 fn held_above(solver: &mut Solver, lim: Level, held: &Held) -> bool {
     match held {
         Held::Infer(v) => v.level(solver) > lim,
         Held::Barrier(b) => freshen_level(solver, &Type::BarrierVar(Rc::clone(b))) > lim,
         Held::FunKind(k) => k.level(solver).is_none_or(|l| l > lim),
         Held::Capability(c) => c.level(solver) > lim,
-        Held::Ordering(r) => r
-            .ordering()
-            .is_some_and(|order| order.decision(solver) != Some(true)),
-        Held::Obligation(_) => true,
+        Held::Ordering(_) | Held::Obligation(_) => true,
     }
 }
 

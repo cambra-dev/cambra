@@ -1026,8 +1026,8 @@ above the binding's cutoff (`FreshenCache`). Every handle goes through one rule 
 A handle with a level of its own, an inference, barrier, kind or capability variable, stands above
 the cutoff where that level is above it. One with none is copied wherever freshening reaches it: a
 kind no function has placed, an ordering requirement, and a trait obligation, which a watch of a
-copied variable reaches whichever scope minted it. An ordering requirement its run has already
-decided holds is kept rather than copied, its answer shared. What each kind's copy carries is its
+copied variable reaches whichever scope minted it. A copy of an ordering requirement its run has
+decided holds that decision. What each kind's copy carries is its
 own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`,
 `copy_ordering`, `copy_obligation`): what is recorded on the original, copied through the same
 rule.
