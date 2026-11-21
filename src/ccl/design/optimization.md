@@ -201,7 +201,9 @@ binders. Everywhere else it relates a refined type by its base, and a `UInt` or 
 `UInt` a range `0..𝑛` refines. A proven lookup's key, erased to `UInt`, meets its list's domain
 `0..𝑛` this way. Each check entry point takes the mode as a parameter, and the pipeline
 (`ccl/context.rs`) passes it at every boundary. `planning::run` takes it too, and its
-`FragmentChecker` checks every term a rewrite builds in it.
+`FragmentChecker` checks every term a rewrite builds in it. A rewrite's term stands inside the
+program and can read binders around it, as a group-by key reads a collection bound before it. The
+check puts every name the term reads free in scope (`check_fragment_located`).
 
 ---
 

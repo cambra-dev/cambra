@@ -32,7 +32,7 @@ use crate::ccl::infer::solver::traits::{
     Assoc, InstanceHead, InstanceTable, Trait, compares_by_value, offered_head,
 };
 use crate::util::ScopeStack;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 /// Post-inference structural type-check state.
@@ -1550,23 +1550,55 @@ pub(crate) fn check_located_against(
     instances: &Rc<InstanceTable>,
     mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
+    check_located_in(expr, sources, &BTreeSet::new(), instances, mode)
+}
+
+/// [`check_located`] of a term that stands under binders outside it: every name the term reads
+/// free, in a type slot or as a value, is in scope for the whole term.
+///
+/// A variable a rule mints carries the scope's telescope, and a bound recorded on it may name
+/// only that telescope's binders (`enforce_bound_scope`). A term that reads a binder of the
+/// program around it records such bounds: a key function filtering a collection `ys` bound
+/// outside it gives its comprehension the type `{0..𝑛 | __elem ▷ ys ▷ 𝑝}`. The rule for a
+/// variable reads its recorded type, so the binders need no type here.
+pub(crate) fn check_fragment_located(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+    mode: CheckMode,
+) -> Result<(), Vec<LocatedInferError>> {
+    let outer = crate::ccl::free_names::names(expr, crate::ccl::free_names::EVERY_READ);
+    check_located_in(expr, None, &outer, instances, mode)
+}
+
+/// [`check_located_against`] with the binders `outer` in scope around `expr`.
+fn check_located_in(
+    expr: &Expr,
+    sources: Option<&HashMap<String, Type>>,
+    outer: &BTreeSet<Name>,
+    instances: &Rc<InstanceTable>,
+    mode: CheckMode,
+) -> Result<(), Vec<LocatedInferError>> {
     // The walk opens a type's binders to reach the predicates beneath them, once per node
     // that carries the type, so one memo keeps each opened predicate one allocation and
     // `checked_predicates` checks it once.
     crate::ccl::subst::with_conversion_memo(|| {
-        check_located_memoized(expr, sources, instances, mode)
+        check_located_memoized(expr, sources, outer, instances, mode)
     })
 }
 
 fn check_located_memoized(
     expr: &Expr,
     sources: Option<&HashMap<String, Type>>,
+    outer: &BTreeSet<Name>,
     instances: &Rc<InstanceTable>,
     mode: CheckMode,
 ) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id(), Rc::clone(instances), mode);
     ctx.sources = sources.cloned();
+    ctx.telescope = outer
+        .iter()
+        .fold(Telescope::empty(), |t, n| t.extended(n.clone()));
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned

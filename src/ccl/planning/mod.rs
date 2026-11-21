@@ -30,7 +30,7 @@ use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, Name, ProjKey, Type,
     TypedExprNode,
     ccl_utils::apply_primitive,
-    infer::{CheckMode, InferError, solver::traits::InstanceTable, typecheck_in},
+    infer::{CheckMode, InferError, solver::traits::InstanceTable, typecheck_fragment},
     lambda_elim::{self, compose, id},
     provenance,
     simplify::simplify,
@@ -76,8 +76,9 @@ impl PlanningCtx {
     }
 }
 
-/// The check planning runs on each term it builds: [`typecheck_in`] against the program's
-/// instances, in the mode of the check planning's input answers to.
+/// The check planning runs on each term it builds: [`typecheck_fragment`] against the program's
+/// instances, in the mode of the check planning's input answers to. A term planning builds
+/// stands inside the program, so the binders it reads from around it are in scope.
 #[derive(Clone)]
 pub(super) struct FragmentChecker {
     /// The program's instances: a rewrite's term can state an obligation an instance the
@@ -98,7 +99,7 @@ impl Default for FragmentChecker {
 
 impl FragmentChecker {
     pub(super) fn check(&self, fragment: &Expr) -> Result<(), Vec<InferError>> {
-        typecheck_in(fragment, &self.instances, self.mode)
+        typecheck_fragment(fragment, &self.instances, self.mode)
     }
 }
 
