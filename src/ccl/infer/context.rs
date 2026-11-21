@@ -154,9 +154,6 @@ pub(super) struct InferCtx {
     /// `capabilities` slot holds until coalesce resolves it.
     node_capabilities: Vec<NodeCapabilities>,
     /// Each use's copies of its definition's capability variables, which the specialization the
-    /// use mints takes.
-    pub(super) use_capabilities: crate::ccl::capabilities::UseCapabilities,
-    /// Each use's copies of its definition's capability variables, which the specialization the
     /// use mints takes and is keyed by.
     /// The capability variable of the tree's root, once it has been emitted.
     root_capabilities: Option<Rc<CapabilityVar>>,
@@ -929,7 +926,6 @@ impl InferCtx {
             selected_methods: Rc::default(),
             capability_frames: vec![CapabilityFrame { depth: 0 }],
             node_capabilities: Vec::new(),
-            use_capabilities: Default::default(),
             root_capabilities: None,
             capability_binders: HashMap::new(),
             capability_statements: Vec::new(),

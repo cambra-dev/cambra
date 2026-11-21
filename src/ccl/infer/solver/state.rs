@@ -289,6 +289,16 @@ pub struct Solver {
     /// While an edge sets bounds aside ([`Self::set_aside_bounds`]), each variable's bounds as
     /// they stood before the edge first wrote them.
     bounds_before: Option<HashMap<Slot, InferBounds>>,
+    /// The instance each use's copies of an exception share, by the exception copied and the
+    /// use ([`crate::ccl::capabilities::Raised::instantiated`]).
+    pub(crate) exception_instances: HashMap<
+        (
+            crate::ccl::provenance::NodeId,
+            u32,
+            crate::ccl::provenance::NodeId,
+        ),
+        u32,
+    >,
 }
 
 impl Default for Solver {
@@ -328,6 +338,7 @@ impl Solver {
             dropped: Default::default(),
             held_answers: Vec::new(),
             bounds_before: None,
+            exception_instances: HashMap::new(),
         }
     }
 
