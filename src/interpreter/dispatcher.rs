@@ -150,17 +150,10 @@ struct QueueState {
     in_flight: HashMap<usize, TileGuard>,
     /// Deduplication and finish need the consumed region after individual packages are removed.
     region: Option<TileGuard>,
-    /// Admission and transfers from waiting to ready share this lock with queue history.
-    waiting_for_inputs: Vec<WaitingInput>,
-    /// Cached union of guards waiting for input completion. Admission subtracts it without scanning the backlog.
-    waiting_region: Option<TileGuard>,
-}
-
-impl QueueState {
-    fn wait_for_inputs(&mut self, morsel: WaitingInput) {
-        grow(&mut self.waiting_region, &morsel.guard);
-        self.waiting_for_inputs.push(morsel);
-    }
+    /// The rows waiting for the pipelines the reader reads to complete them
+    /// ([`Dispatcher::wait_for_inputs`]), `None` where none waits. Admission and transfers from
+    /// waiting to ready share this lock with queue history.
+    waiting_for_inputs: Option<TileGuard>,
 }
 
 impl Queue {
@@ -392,16 +385,6 @@ struct PathMarks {
 struct ReadRoutes {
     changes: Vec<Route>,
     completions: Vec<Route>,
-}
-
-/// A region awaiting input completion ([`Dispatcher::wait_for_inputs`]), and whether a release may hand out the part
-/// of it that is complete and keep the rest. A morsel a source's notify cut counts as one of that
-/// source's packages, and a row a loop's round queues is read for the row's end, which its reads
-/// state only once they have completed all of it, so both are released whole.
-#[derive(Debug)]
-struct WaitingInput {
-    guard: TileGuard,
-    splits: bool,
 }
 
 /// A pipeline's queue, progress counters, and published regions, completion and input waits for one run.
@@ -781,8 +764,8 @@ impl Dispatcher {
     /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
     /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
     /// closing round has every inner pipeline read again. A reader that
-    /// waits for inputs takes the row again whatever it took before, and only once the pipelines it reads
-    /// have completed all of it, the row's end with its rows ([`WaitingInput`]).
+    /// waits for inputs takes the row again whatever it took before, each part once the pipelines it
+    /// reads have completed it ([`queue_or_wait_for_inputs`](Self::queue_or_wait_for_inputs)).
     pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
         self.queue_in_current(reader, guard, true);
     }
@@ -1057,58 +1040,55 @@ impl Dispatcher {
         })
     }
 
-    /// The complete part of a region that may split, or the whole region once complete otherwise.
-    /// A round's row waits for its end as well as its values before it can be queued.
-    fn ready_part(&self, reader: usize, guard: &TileGuard, splits: bool) -> TileGuard {
-        match splits {
-            true => self.complete_part(reader, guard),
-            false if self.reads_complete(reader, guard) => guard.clone(),
-            false => guard_minus(guard, guard),
+    /// The part of `guard`, rows of `reader`'s input, that every pipeline `reader` reads has
+    /// completed, and the rest. Where nothing is left once the rest is closed over the input, the
+    /// part is `guard` as it was admitted: a row a round queues names the row with its end, and the
+    /// same cells spelled key by key name no end, so its reader would never read the row whole.
+    fn ready_part(&self, reader: usize, guard: TileGuard) -> (TileGuard, TileGuard) {
+        let part = self.complete_part(reader, &guard);
+        let rest = self.closed(reader, guard_minus(&guard, &part));
+        match rest.is_empty() {
+            true => (guard, rest),
+            false => (part, rest),
         }
     }
 
-    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which waits for inputs, where
-    /// every pipeline it reads has completed them, and wait for the rest ([`wait_for_inputs`](Self::wait_for_inputs)). Of a
-    /// push, only what no push or queue brought before is new. What the caller queues is queued
-    /// whole (`again`): a loop's closing round has each inner pipeline read its row again, which
-    /// then states the row complete.
+    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which waits for
+    /// inputs, where every pipeline it reads has completed them, and wait for the rest
+    /// ([`wait_for_inputs`](Self::wait_for_inputs)). Only what no push or queue brought before is
+    /// new. What the caller queues `again` is read again: a loop's closing round has each inner
+    /// pipeline read its row again, which then states the row complete, so its guard leaves the
+    /// record of what was queued before it is admitted.
     fn queue_or_wait_for_inputs(&self, reader: usize, guard: &TileGuard, again: bool) {
         let mut queue_state = self.states[reader]
             .queue
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let fresh = if again {
-            guard.clone()
-        } else {
-            let mut fresh = match &queue_state.region {
-                Some(queued) => guard_minus(guard, queued),
-                None => guard.clone(),
-            };
-            if let Some(waiting) = &queue_state.waiting_region {
-                fresh = guard_minus(&fresh, waiting);
-            }
-            fresh
+        if again && let Some(queued) = &queue_state.region {
+            let forgotten = guard_minus(queued, guard);
+            queue_state.region = (!forgotten.is_empty()).then_some(forgotten);
+        }
+        let mut fresh = match &queue_state.region {
+            Some(queued) => guard_minus(guard, queued),
+            None => guard.clone(),
         };
+        if let Some(waiting) = &queue_state.waiting_for_inputs {
+            fresh = guard_minus(&fresh, waiting);
+        }
         if fresh.is_empty() {
             return;
         }
-        let complete = self.ready_part(reader, &fresh, !again);
-        let rest = self.closed(reader, guard_minus(&fresh, &complete));
+        let (complete, rest) = self.ready_part(reader, fresh);
         if !rest.is_empty() {
-            queue_state.wait_for_inputs(WaitingInput {
-                guard: rest,
-                splits: !again,
-            });
+            queue_state.waiting_for_inputs =
+                Some(grown(queue_state.waiting_for_inputs.as_ref(), &rest));
         }
         if complete.is_empty() {
             return;
         }
         let queue = &self.states[reader].queue;
-        let appended = match again {
-            true => queue.append_again_locked(&mut queue_state, &complete),
-            false => queue.append_unqueued_locked(&mut queue_state, &complete),
-        };
+        let appended = queue.append_unqueued_locked(&mut queue_state, &complete);
         self.ensure(appended, || {
             format!(
                 "pipeline {reader} receives packages before the last pipeline it reads finishes"
@@ -1116,53 +1096,32 @@ impl Dispatcher {
         });
     }
 
-    /// Append the waiting morsels whose inputs are now complete to the reader’s
-    /// queue ([`wait_for_inputs`](Self::wait_for_inputs)). A complete push lands before the pushing pipeline counts its
-    /// finish toward `reader`'s close, so `reader`'s queue is open.
+    /// Append the waiting rows whose inputs are now complete to the reader’s queue
+    /// ([`wait_for_inputs`](Self::wait_for_inputs)). A complete push lands before the pushing
+    /// pipeline counts its finish toward `reader`'s close, so `reader`'s queue is open.
     fn queue_ready_inputs(&self, reader: usize) {
         let mut queue_state = self.states[reader]
             .queue
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut released = Vec::new();
-        let mut kept = Vec::new();
-        for morsel in std::mem::take(&mut queue_state.waiting_for_inputs) {
-            let part = self.ready_part(reader, &morsel.guard, morsel.splits);
-            let rest = self.closed(reader, guard_minus(&morsel.guard, &part));
-            if !part.is_empty() {
-                released.push((part, !morsel.splits));
-            }
-            if !rest.is_empty() {
-                kept.push(WaitingInput {
-                    guard: rest,
-                    splits: morsel.splits,
-                });
-            }
-        }
-        queue_state.waiting_region = None;
-        queue_state.waiting_for_inputs = Vec::new();
-        for morsel in kept {
-            queue_state.wait_for_inputs(morsel);
-        }
-        if released.is_empty() {
+        let Some(waiting) = queue_state.waiting_for_inputs.take() else {
+            return;
+        };
+        let (part, rest) = self.ready_part(reader, waiting);
+        queue_state.waiting_for_inputs = (!rest.is_empty()).then_some(rest);
+        if part.is_empty() {
             return;
         }
         let queue = &self.states[reader].queue;
-        // A pipeline that takes arrivals holds the morsels its sources' notifies cut, which count
-        // toward a source's packages; any other holds the rows pushes bring, which two pushes can
-        // both name, so each is queued less what is queued already.
+        // A pipeline that takes arrivals is queued its sources' regions one morsel per package, as
+        // a notify cuts them; any other is queued the rows less what is queued already.
         let appended = match self.infos[reader].arrivals {
             true => {
-                let morsels: Vec<TileGuard> =
-                    released.into_iter().map(|(morsel, _)| morsel).collect();
+                let morsels = cut_positions(&part, self.morsel_rows);
                 queue.append_locked(&mut queue_state, reader, &morsels)
             }
-            // A round's row is read again whole ([`WaitingInput`]).
-            false => released.iter().all(|(morsel, again)| match *again {
-                true => queue.append_again_locked(&mut queue_state, morsel),
-                false => queue.append_unqueued_locked(&mut queue_state, morsel),
-            }),
+            false => queue.append_unqueued_locked(&mut queue_state, &part),
         };
         self.ensure(appended, || {
             format!(
@@ -1688,10 +1647,8 @@ impl Dispatcher {
                 .cloned()
                 .partition(|morsel| self.reads_complete(p, morsel));
             for guard in incomplete {
-                admission.wait_for_inputs(WaitingInput {
-                    guard,
-                    splits: false,
-                });
+                admission.waiting_for_inputs =
+                    Some(grown(admission.waiting_for_inputs.as_ref(), &guard));
             }
             ready = complete;
             &ready[..]
@@ -2194,7 +2151,7 @@ impl Dispatcher {
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            self.ensure(queue_state.waiting_for_inputs.is_empty(), || {
+            self.ensure(queue_state.waiting_for_inputs.is_none(), || {
                 format!(
                     "pipeline {p} finishes with rows waiting for inputs that the pipelines it reads never \
                      complete: {:?}",
@@ -2326,11 +2283,6 @@ impl Dispatcher {
 /// `guard`, `None` where it is empty.
 fn nonempty(guard: TileGuard) -> Option<TileGuard> {
     (!guard.is_empty()).then_some(guard)
-}
-
-/// Grow `region` by `guard`.
-fn grow(region: &mut Option<TileGuard>, guard: &TileGuard) {
-    *region = Some(grown(region.as_ref(), guard));
 }
 
 /// `region` with `guard` added, or `guard` alone where there is no region yet.
@@ -3996,7 +3948,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .waiting_for_inputs
-                .is_empty()
+                .is_none()
         );
         // Acknowledgement does not erase admission history. A round still repeats the region.
         dispatcher.queue_for(reader, &keys_between(0, 31));
@@ -4010,7 +3962,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn waiting_for_inputs_membership_compacts_and_drains(#[values(100, 1000, 10000)] count: u64) {
+    fn waiting_rows_form_one_region_released_once_complete(#[values(100, 1000, 10000)] count: u64) {
         use crate::interpreter::tile_operators::test_helpers::keys_between;
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
         let reader = PipelineId(1);
@@ -4020,14 +3972,12 @@ mod tests {
         }
         {
             let state = dispatcher.states[1].queue.state.lock().unwrap();
-            assert_eq!(state.waiting_for_inputs.len(), count as usize);
-            assert_eq!(state.waiting_region, Some(keys_between(0, count - 1)));
+            assert_eq!(state.waiting_for_inputs, Some(keys_between(0, count - 1)));
         }
         dispatcher.record_complete(1, 0, None);
         let state = dispatcher.states[1].queue.state.lock().unwrap();
-        assert!(state.waiting_for_inputs.is_empty());
-        assert!(state.waiting_region.is_none());
-        assert_eq!(state.ready.len(), count as usize);
+        assert!(state.waiting_for_inputs.is_none());
+        assert_eq!(state.ready.len(), 1);
     }
 
     #[test]
@@ -4342,8 +4292,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .waiting_for_inputs
-                .len(),
-            usize::from(waits_for_inputs)
+                .is_some(),
+            waits_for_inputs
         );
         dispatcher.record_complete(1, 0, None);
         let package = dispatcher
@@ -4387,7 +4337,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .waiting_for_inputs
-                .is_empty()
+                .is_none()
         );
         assert!(matches!(dispatcher.try_claim(None), Next::Failed));
     }
@@ -4437,8 +4387,10 @@ mod tests {
         assert_eq!(partition_gap(&keys_between(0, 3), &claimed), None);
     }
 
+    /// A round's row is queued part by part as the pipelines its reader reads complete it, and a
+    /// later round reads the whole row again.
     #[rstest::rstest]
-    fn repeated_rounds_wait_for_their_whole_row(#[values(false, true)] complete_first: bool) {
+    fn repeated_rounds_queue_each_part_once_complete(#[values(false, true)] complete_first: bool) {
         use crate::interpreter::tile_operators::test_helpers::keys_between;
 
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
@@ -4448,19 +4400,24 @@ mod tests {
         dispatcher.record_complete(1, 0, Some(&keys_between(0, 1)));
         if complete_first {
             dispatcher.record_complete(1, 0, Some(&keys_between(2, 3)));
+            dispatcher.queue_round(reader, &row);
+            let package = dispatcher.claim_of(reader).expect("the row is complete");
+            assert_eq!(package.guard, row);
+            dispatcher.acknowledge(package);
+        } else {
+            dispatcher.queue_round(reader, &row);
+            for (from, to) in [(0, 1), (2, 2), (3, 3)] {
+                if from > 0 {
+                    assert!(dispatcher.claim_of(reader).is_none());
+                    dispatcher.record_complete(1, 0, Some(&keys_between(0, to)));
+                }
+                let package = dispatcher
+                    .claim_of(reader)
+                    .expect("the part its reads completed");
+                assert_eq!(package.guard, keys_between(from, to));
+                dispatcher.acknowledge(package);
+            }
         }
-        dispatcher.queue_round(reader, &row);
-        if !complete_first {
-            assert!(dispatcher.claim_of(reader).is_none());
-            let before = dispatcher.changes();
-            dispatcher.record_complete(1, 0, Some(&keys_between(0, 2)));
-            assert_eq!(dispatcher.changes(), before);
-            assert!(dispatcher.claim_of(reader).is_none());
-            dispatcher.record_complete(1, 0, Some(&keys_between(3, 3)));
-        }
-        let package = dispatcher.claim_of(reader).expect("the row is complete");
-        assert_eq!(package.guard, row);
-        dispatcher.acknowledge(package);
         assert!(dispatcher.claim_of(reader).is_none());
         dispatcher.queue_round(reader, &row);
         let package = dispatcher
