@@ -476,6 +476,99 @@ fn freshen_capability_var(
     freshen_handle(solver, lim, v, target, cache)
 }
 
+/// `capabilities` as this freshening copies what they hold: each variable through
+/// [`freshen_held`], each known set's requirements and raised types as a copied variable's own
+/// are. Written clauses are kept: lowering wrote them, and they hold nothing of a run.
+fn freshen_capabilities(
+    solver: &mut Solver,
+    lim: Level,
+    capabilities: &Capabilities,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Capabilities {
+    capabilities.map_leaves(&mut |leaf| match leaf.repr() {
+        Repr::Var(v) => Capabilities::var(freshen_capability_var(solver, lim, v, target, cache)),
+        Repr::Known(set) => {
+            Capabilities::known(freshen_capability_set(solver, lim, set, target, cache))
+        }
+        Repr::Written(_) => leaf.clone(),
+        Repr::Children(_) => unreachable!("`map_leaves` hands over no union"),
+    })
+}
+
+/// A known capability set's copy: its requirements and raised types freshened, as a copied
+/// variable's own capabilities are ([`copy_capability_var`]).
+fn freshen_capability_set(
+    solver: &mut Solver,
+    lim: Level,
+    set: &crate::ccl::capabilities::CapabilitySet,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> crate::ccl::capabilities::CapabilitySet {
+    let mut copy = set.clone();
+    copy.requires = set
+        .requires
+        .iter()
+        .map(|r| freshen_requirement(solver, lim, r, target, cache))
+        .collect();
+    copy.causes = set
+        .causes
+        .iter()
+        .map(|e| match e {
+            crate::ccl::capabilities::Effect::Raise(raised) => {
+                let ty = freshen_above(solver, lim, &raised.ty, target, cache);
+                crate::ccl::capabilities::Effect::Raise(raised.instantiated(ty))
+            }
+            e => e.clone(),
+        })
+        .collect();
+    copy.vars = set
+        .vars
+        .values()
+        .map(|v| {
+            let c = freshen_capability_var(solver, lim, v, target, cache);
+            (c.uid, c)
+        })
+        .collect();
+    copy
+}
+
+/// The level of what `capabilities` hold that freshening copies ([`freshen_level`]): a variable's
+/// own, and within a known set the highest of its raised types', its requirements' and its
+/// variables'. An ordering requirement is copied wherever freshening reaches it, so a set holding
+/// one is above every cutoff.
+fn capabilities_level(solver: &mut Solver, capabilities: &Capabilities) -> Level {
+    let mut level = 0;
+    capabilities.map_leaves(&mut |leaf| {
+        level = level.max(match leaf.repr() {
+            Repr::Var(v) => v.level(solver),
+            Repr::Known(set) => {
+                if set.requires.iter().any(|r| r.ordering().is_some()) {
+                    Level::MAX
+                } else {
+                    let raised = set.causes.iter().map(|e| match e {
+                        crate::ccl::capabilities::Effect::Raise(raised) => {
+                            freshen_level(solver, &raised.ty)
+                        }
+                        _ => 0,
+                    });
+                    let raised = raised.collect::<Vec<_>>().into_iter().max().unwrap_or(0);
+                    let vars = set
+                        .vars
+                        .values()
+                        .map(|v| v.level(solver))
+                        .max()
+                        .unwrap_or(0);
+                    raised.max(vars)
+                }
+            }
+            Repr::Written(_) | Repr::Children(_) => 0,
+        });
+        leaf.clone()
+    });
+    level
+}
+
 /// A new copy of `v` with its own capabilities, incoming edges and bounds ([`freshen_held`]).
 fn copy_capability_var(
     solver: &mut Solver,
@@ -785,7 +878,22 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
         // A capability variable is copied like any variable above the cutoff, so a type whose
         // only quantified content is a function's capabilities is not returned verbatim: each use
         // would add its arguments' capabilities to the definition's own variable.
-        Type::Fun { capabilities, .. } => capabilities.level(solver),
+        // A function's capabilities and kind are copied like any state above the cutoff, so a
+        // type whose only quantified content is either is not returned verbatim. A kind no
+        // function has placed has no level to compare, and counts as the outermost here: a kind
+        // variable can be minted without one, which no other variable can, and treating it as
+        // above every cutoff copies every type holding one.
+        Type::Fun {
+            capabilities,
+            fun_kind,
+            ..
+        } => {
+            let kind = match fun_kind {
+                FunKind::Var(k) => k.level(solver).unwrap_or(0),
+                _ => 0,
+            };
+            capabilities_level(solver, capabilities).max(kind)
+        }
         _ => 0,
     };
     for r in ty.refinements() {
@@ -1047,18 +1155,7 @@ pub fn freshen_above(
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
-                capabilities: match capabilities.repr() {
-                    Repr::Var(v) => {
-                        Capabilities::var(freshen_capability_var(solver, lim, v, target, cache))
-                    }
-                    Repr::Known(_) => capabilities.clone(),
-                    Repr::Written(_) => {
-                        unreachable!("a scheme's written clauses are normalized when it is bound")
-                    }
-                    Repr::Children(_) => {
-                        unreachable!("a union of a node's children's capabilities is in no type")
-                    }
-                },
+                capabilities: freshen_capabilities(solver, lim, capabilities, target, cache),
             };
             // The parts of a function whose kind may bind witnesses sit under those binders.
             if let Type::Fun {
@@ -1741,9 +1838,7 @@ pub fn freshen_expr_type_slots(
     // use's copy of it, as its types are.
     // A union of its children's, built while one of them was a variable, reads the copies too.
     for slot in [&mut expr.capabilities, &mut expr.own_capabilities] {
-        if slot.is_pending() {
-            *slot = slot.map_vars(&mut |v| freshen_capability_var(solver, lim, v, target, cache));
-        }
+        *slot = freshen_capabilities(solver, lim, slot, target, cache);
     }
     // The obligation of the call the node makes: the use's copy of it, as its types hold the
     // use's copies of their variables.
