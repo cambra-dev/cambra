@@ -328,6 +328,15 @@ impl Requirement {
         Self(self.0.clone(), Some(Rc::new(order)))
     }
 
+    /// This requirement with each type its trait requirement holds replaced by `f`'s answer;
+    /// an ordering requirement's own state is its copy's ([`Self::with_ordering`]).
+    pub(crate) fn map_trait_types(
+        &self,
+        f: impl FnMut(&crate::ccl::Type) -> crate::ccl::Type,
+    ) -> Self {
+        Self(self.0.map_types(f), self.1.clone())
+    }
+
     pub(crate) fn with_ordering(
         &self,
         positions: crate::ccl::Type,

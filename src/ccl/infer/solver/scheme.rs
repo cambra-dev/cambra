@@ -408,7 +408,7 @@ fn freshen_requirement(
     cache: &mut FreshenCache,
 ) -> crate::ccl::capabilities::Requirement {
     if r.ordering().is_none() {
-        return r.clone();
+        return r.map_trait_types(|t| freshen_above(solver, lim, t, target, cache));
     }
     freshen_handle(solver, lim, r, target, cache)
 }
