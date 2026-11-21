@@ -3768,7 +3768,7 @@ impl crate::ccl::infer::solver::held::HoldsSolverState for Requirement {
         use crate::ccl::infer::solver::held::Held;
         self.0.walk_held(v);
         if let Some(order) = &self.1 {
-            v.held(Held::Ordering(Rc::clone(order)));
+            v.held(Held::Ordering(self.clone()));
             if !v.enter_ordering(order) {
                 return;
             }
