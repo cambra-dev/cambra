@@ -1024,8 +1024,7 @@ impl InferVar {
     /// Mint a fresh variable carrying `telescope` as its scope, over a fresh kind.
     pub fn fresh_in(solver: &mut Solver, level: Level, telescope: &Telescope) -> Rc<InferVar> {
         {
-            let kind = crate::ccl::ty::FunKindVar::fresh(solver);
-            kind.place_at(solver, level);
+            let kind = crate::ccl::ty::FunKindVar::fresh(solver, level);
             Self::fresh_over(solver, level, telescope, kind)
         }
     }

@@ -4044,7 +4044,7 @@ mod tests {
     #[test]
     fn stamping_a_kind_unsettles_a_resolution_read_before() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         let source = CapabilityVar::fresh(solver, 0);
         let downstream = CapabilityVar::fresh(solver, 0);
         downstream.flows_from(

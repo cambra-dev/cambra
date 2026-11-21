@@ -735,9 +735,20 @@ fn held_above(solver: &mut Solver, lim: Level, held: &Held) -> bool {
     match held {
         Held::Infer(v) => v.level(solver) > lim,
         Held::Barrier(b) => freshen_level(solver, &Type::BarrierVar(Rc::clone(b))) > lim,
-        Held::FunKind(k) => k.level(solver).is_none_or(|l| l > lim),
+        Held::FunKind(k) => kind_level(solver, k) > lim,
         Held::Capability(c) => c.level(solver) > lim,
         Held::Ordering(_) | Held::Obligation(_) => true,
+    }
+}
+
+/// The level `k` stands at. A kind lowering minted is the program's, not a run's: it has no
+/// home and no level, nothing a run records is on it, and a copy keeps it.
+fn kind_level(solver: &Solver, k: &FunKindVar) -> Level {
+    match k.home() {
+        Some(_) => k
+            .level(solver)
+            .expect("a kind a run minted stands where its owner does"),
+        None => 0,
     }
 }
 
@@ -749,10 +760,10 @@ fn copy_kind_var(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Rc<FunKindVar> {
-    let f = FunKindVar::fresh(solver);
-    if let Some(l) = kv.level(solver) {
-        f.place_at(solver, target.level_of(l));
-    }
+    let level = kv
+        .level(solver)
+        .expect("a kind a run holds stands where its owner does");
+    let f = FunKindVar::fresh(solver, target.level_of(level));
     // Registered **before** the bounds are carried across: a collection reaches itself
     // through a recurrence, and the cache is what terminates the walk.
     cache.record_copy(kv, Rc::clone(&f));
@@ -875,21 +886,16 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
             .map(|a| predicate_level(solver, &a.term))
             .fold(app.param.opened_at.unwrap_or(0), Level::max),
         Type::ChanDom(_, l) => l.0,
-        // A capability variable is copied like any variable above the cutoff, so a type whose
-        // only quantified content is a function's capabilities is not returned verbatim: each use
-        // would add its arguments' capabilities to the definition's own variable.
         // A function's capabilities and kind are copied like any state above the cutoff, so a
-        // type whose only quantified content is either is not returned verbatim. A kind no
-        // function has placed has no level to compare, and counts as the outermost here: a kind
-        // variable can be minted without one, which no other variable can, and treating it as
-        // above every cutoff copies every type holding one.
+        // type whose only quantified content is either is not returned verbatim: each use would
+        // add what its arguments bring to the definition's own variables.
         Type::Fun {
             capabilities,
             fun_kind,
             ..
         } => {
             let kind = match fun_kind {
-                FunKind::Var(k) => k.level(solver).unwrap_or(0),
+                FunKind::Var(k) => kind_level(solver, k),
                 _ => 0,
             };
             capabilities_level(solver, capabilities).max(kind)
@@ -1369,8 +1375,7 @@ fn copy_infer_var(
             let fun_kind = match cache.copy_of(&tv.fun_kind) {
                 Some(existing) => existing,
                 None => {
-                    let f = FunKindVar::fresh(solver);
-                    f.place_at(solver, new_level);
+                    let f = FunKindVar::fresh(solver, new_level);
                     cache.record_copy(&tv.fun_kind, Rc::clone(&f));
                     f
                 }
@@ -2076,7 +2081,7 @@ mod tests {
         // a Fun whose kind is an unpinned var must mint a *new* FunKindVar (the pin
         // copied), not share the original — otherwise pinning one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
-        let kv = FunKindVar::fresh(solver);
+        let kv = FunKindVar::fresh(solver, 5);
         kv.stamp_data(solver); // a def-intrinsic answer to carry onto each instantiation
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.

@@ -991,7 +991,7 @@ impl Subst {
         // `v`'s kind. An elimination is the exception: it reads the sum out, and what is left
         // is a plain collection whatever `v` turns out to be, so it has a data kind of its own.
         let kind = if self.elims.iter().any(|e| matches!(e, Elim::Top(_))) {
-            let k = crate::ccl::ty::FunKindVar::fresh(solver);
+            let k = crate::ccl::ty::FunKindVar::fresh(solver, v.level(solver));
             k.stamp_data(solver);
             k
         } else {
@@ -4954,7 +4954,7 @@ mod tests {
         let solver = &mut Solver::new();
         let x = Name::raw("x");
         let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         let v = crate::ccl::infer_var::InferVar::fresh_over(solver, 0, &telescope, kind);
         let sigma = Subst::rename(x, Name::raw("y"));
         let ty = Type::Infer(Rc::clone(&v));
@@ -5616,10 +5616,10 @@ mod tests {
         crate::ccl::ty::WitnessId,
     ) {
         use crate::ccl::ty::{FunKind, FunKindVar};
-        let k = FunKindVar::fresh(solver);
-        let related = FunKindVar::fresh(solver);
+        let k = FunKindVar::fresh(solver, 0);
+        let related = FunKindVar::fresh(solver, 0);
         k.record(solver, FunKind::Var(Rc::clone(&related)), true);
-        let unrelated = FunKindVar::fresh(solver);
+        let unrelated = FunKindVar::fresh(solver, 0);
         let (own, theirs, outside) = (
             k.binder_id_at(solver, 0),
             related.binder_id_at(solver, 0),
