@@ -73,10 +73,8 @@ pub(super) fn lower_call(
             let Some(member) = ctx.member(q, func.span)? else {
                 return Ok(Expr::error());
             };
-            if member.history_param {
-                return lower_curried_call(member.name.raw(), func.span, args, ctx);
-            }
-            return lower_application(member.name.raw(), func.span, args, ctx);
+            let passing = Passing::of(member.history_param);
+            return lower_application(member.name.raw(), func.span, args, passing, ctx);
         }
         _ => return lower_expression_call(func, args, ctx),
     };
@@ -394,57 +392,47 @@ pub(super) fn lower_call(
                      `x: Feed(T)`, or `x: Feed(_)` to infer its value type",
                 ));
             }
-            // A `def` with a pass-by-reference `Mut` or `Feed` parameter is lowered
-            // curried (named lambdas), so its call is a curried application:
-            // `f(a, b, c)` → `c ▷ (b ▷ (a ▷ f))` (forward-apply, outermost
-            // parameter first). Beta-reduction on inlining then substitutes each
-            // argument variable into the named parameter — the route by which a
-            // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable,
-            // and a feed of a `Feed` parameter on the caller's channel.
-            if ctx.is_history_param_fn(name) {
-                return lower_curried_call(Name::raw(name), func.span, args, ctx);
-            }
-            lower_application(Name::raw(name), func.span, args, ctx)
+            // A `def` with a pass-by-reference `Mut` or `Feed` parameter takes a bare mutable
+            // variable or feed as that argument. Beta-reduction on inlining then substitutes
+            // the argument variable for the named parameter — the route by which a
+            // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable, and a
+            // feed of a `Feed` parameter on the caller's channel.
+            let passing = Passing::of(ctx.is_history_param_fn(name));
+            lower_application(Name::raw(name), func.span, args, passing, ctx)
         }
     }
 }
 
-/// The function `callee` names, a `def` with a `Mut` parameter written at
-/// `func_span`, applied to `args` as a curried application, the shape the `def`
-/// lowers to.
-fn lower_curried_call(
-    callee: Name,
-    func_span: Span,
-    args: &[Spanned<ChlExpr>],
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    // The callee `Var` images the function name the user wrote; the intermediate
-    // curried `Apply`s are manufactured (the outermost `Apply` is the call's
-    // image, tagged by `lower_expr`, whose entry overwrites the interim machinery
-    // tag).
-    let site = ctx.places.site(func_span);
-    let mut reference = ctx.reference(callee, func_span);
-    reference.site = Some(site);
-    let callee = ctx.tag_image(reference, func_span);
-    apply_by_reference(callee, func_span, args, ctx)
+/// How a call's arguments lower.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Passing {
+    /// Each argument is a value ([`lower_expr`]).
+    Values,
+    /// The callee has a pass-by-reference `Mut` or `Feed` parameter, so an argument may be a
+    /// bare mutable variable or feed ([`lower_call_arg`]).
+    ByReference,
 }
 
-/// `callee`, a function with a pass-by-reference parameter, applied to `args` one at a time,
-/// each lowered as an argument that may be a bare mutable variable or feed
-/// ([`lower_call_arg`]): `f(a, b, c)` → `c ▷ (b ▷ (a ▷ f))`. For one argument it is the
-/// application a tupled call builds.
-pub(super) fn apply_by_reference(
-    callee: Expr,
-    span: Span,
-    args: &[Spanned<ChlExpr>],
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    let mut acc = callee;
-    for arg in args {
-        let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
-        acc = ctx.tag_machinery(applied, span, "lower.curried_call");
+impl Passing {
+    /// [`Passing::ByReference`] for a callee with a pass-by-reference parameter.
+    pub(super) fn of(by_reference: bool) -> Self {
+        if by_reference {
+            Passing::ByReference
+        } else {
+            Passing::Values
+        }
     }
-    Ok(acc)
+
+    fn lower(
+        self,
+        arg: &Spanned<ChlExpr>,
+        ctx: &mut LoweringContext,
+    ) -> Result<Expr, LoweringError> {
+        match self {
+            Passing::Values => lower_expr(arg, ctx),
+            Passing::ByReference => lower_call_arg(arg, ctx),
+        }
+    }
 }
 
 /// Lower a call whose callee is an expression rather than a name.
@@ -456,11 +444,10 @@ pub(super) fn apply_by_reference(
 /// inliner leaves that call unresolved, and `inline::check_calls_resolved` refuses it
 /// (`src/ccl/design/optimization.md`, "Functions held in products").
 ///
-/// Builtins, sources, and the curried call shape of a `Mut`-parameter `def` are
-/// all decided by the callee's spelling, so none of them applies here: the
-/// arguments are tupled as a named call's are. A `Mut`-parameter function reached
-/// through a field is therefore called with a tuple its curried type does not
-/// accept, and inference refuses the call.
+/// Builtins, sources, and the bare-variable arguments of a `Mut`-parameter `def` are
+/// all decided by the callee's spelling, so none of them applies here: each argument is a
+/// value. A `Mut`-parameter function reached through a field is therefore passed a value
+/// where it takes a mutable variable, and inference refuses the call.
 fn lower_expression_call(
     func: &Spanned<ChlExpr>,
     args: &[Spanned<ChlExpr>],
@@ -482,7 +469,7 @@ fn lower_expression_call(
         // Left in call position, the lambda would reach `lambda_elim` unreduced.
         let callee_name = ctx.fresh_callee_name();
         let lambda = lower_expr(func, ctx)?;
-        let call = apply_to_args(args, func.span, ctx, |ctx| {
+        let call = apply_to_args(args, func.span, Passing::Values, ctx, |ctx| {
             Ok(ctx.tag_machinery(
                 Expr::var(callee_name.clone()),
                 func.span,
@@ -495,7 +482,7 @@ fn lower_expression_call(
         let bound = Expr::let_bind(callee_name, Occurrence::mint(), lambda, call);
         return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
     }
-    apply_to_args(args, func.span, ctx, |ctx| {
+    apply_to_args(args, func.span, Passing::Values, ctx, |ctx| {
         let mut callee = lower_expr(func, ctx)?;
         // A field callee is a call of the function the field holds: inlining reaches that
         // function's body through this place (`crate::ccl::site`).
@@ -506,50 +493,51 @@ fn lower_expression_call(
     })
 }
 
-/// Apply the callee `callee` builds to a call's arguments: `f()` → `() ▷ f`, the one empty
-/// product, `f(a)` → `a ▷ f`, and `f(a, b, …)` → `(a, b, …) ▷ f`. The arguments lower first.
+/// Apply the callee `callee` builds to a call's arguments: `f(a)` → `a ▷ f`, and any other
+/// number as their argument list ([`TypedExprNode::Arguments`]), `f(a, b, …)` →
+/// `args(a, b, …) ▷ f` and `f()` → `args() ▷ f`. The arguments lower first.
 ///
-/// The tupled form pairs with the uncurried multi-arg lambda lowering in
-/// [`lower_lambda`], so syntactic multi-arg functions compile without any
-/// `curry` combinator appearing in the tree. Every argument is an ordinary
-/// value, so it lowers through `lower_expr`, where the out-of-block
-/// transactional read gate applies. (Only a `Mut`-param callee, applied by
-/// [`lower_curried_call`], accepts a bare mutable variable and bypasses the gate.)
-fn apply_to_args(
+/// The list pairs with a lambda's parameter list ([`lower_lambda`]), and a tuple passed as one
+/// argument, `f((a, b))`, is not one. An argument lowers as `passing` says: a value lowers through
+/// `lower_expr`, where the out-of-block transactional read gate applies, and an argument a
+/// `Mut`-param callee takes may be a bare mutable variable, which bypasses the gate.
+pub(super) fn apply_to_args(
     args: &[Spanned<ChlExpr>],
     call_span: Span,
+    passing: Passing,
     ctx: &mut LoweringContext,
     callee: impl FnOnce(&mut LoweringContext) -> Result<Expr, LoweringError>,
 ) -> Result<Expr, LoweringError> {
     match args {
         [] => {
-            let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), call_span, "lower.call_unit");
-            Ok(Expr::apply(unit, callee(ctx)?))
+            let none = ctx.tag_machinery(Expr::arguments(Vec::new()), call_span, "lower.call_unit");
+            Ok(Expr::apply(none, callee(ctx)?))
         }
         [arg] => {
-            let arg = lower_expr(arg, ctx)?;
+            let arg = passing.lower(arg, ctx)?;
             Ok(Expr::apply(arg, callee(ctx)?))
         }
         _ => {
-            let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-            // The tuple is manufactured packing: there is no tuple in the source call.
+            let lowered: Result<Vec<_>, _> = args.iter().map(|a| passing.lower(a, ctx)).collect();
+            // The list is manufactured packing: the source call writes its arguments only.
             let args_span = args[0].span.join(args[args.len() - 1].span);
-            let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-            Ok(Expr::apply(arg_tuple, callee(ctx)?))
+            let list = ctx.tag_machinery(Expr::arguments(lowered?), args_span, "lower.call_tuple");
+            Ok(Expr::apply(list, callee(ctx)?))
         }
     }
 }
 
-/// The function `callee` names, written at `func_span`, applied to `args` as an ordinary
-/// call ([`apply_to_args`]). The callee images the function the user named.
+/// The function `callee` names, written at `func_span`, applied to `args`
+/// ([`apply_to_args`]). The callee images the function the user named.
 pub(super) fn lower_application(
     callee: Name,
     func_span: Span,
     args: &[Spanned<ChlExpr>],
+    passing: Passing,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let site = ctx.places.site(func_span);
-    apply_to_args(args, func_span, ctx, |ctx| {
+    apply_to_args(args, func_span, passing, ctx, |ctx| {
         let mut callee = ctx.reference(callee, func_span);
         // The call's place, which inlining extends the sites of the body it copies here with.
         callee.site = Some(site);
@@ -1170,23 +1158,10 @@ mod tests {
     #[case("a or b or c", "a or b or c")]
     // Mixed: `x == 1 and y == 2`
     #[case("x == 1 and y == 2", "x == 1 and y == 2")]
-    // Lambdas — single-arg emits `λ x → body` directly; multi-arg uncurries
-    // to a tupled-parameter lambda whose body binds each name to a
-    // projection, keeping the tree free of nested `Lambda` chains.
+    // Lambdas: one lambda over the parameter list, each parameter a named binder.
     #[case("\\x -> x + 1", "λ x → x + 1")]
-    #[case(
-        "\\x, y -> x + y",
-        "λ __arg_tuple_0 : (_, _) → __arg_tuple_0.0 + __arg_tuple_0.1"
-    )]
-    // Nested multi-arg lambdas: the outer lambda's substitution inserts a
-    // reference to its tuple parameter into the inner lambda's body.  Each
-    // multi-arg lambda mints a fresh `__arg_tuple_<N>` via `fresh_tuple_arg`,
-    // so the inserted reference does not collide with the inner binder.  The
-    // outer takes id 1 because the inner is lowered first and consumes id 0.
-    #[case(
-        "\\x, y -> \\a, b -> x + a",
-        "λ __arg_tuple_1 : (_, _) → λ __arg_tuple_0 : (_, _) → __arg_tuple_1.0 + __arg_tuple_0.0"
-    )]
+    #[case("\\x, y -> x + y", "λ (x, y) → x + y")]
+    #[case("\\x, y -> \\a, b -> x + a", "λ (x, y) → λ (a, b) → x + a")]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
@@ -1324,12 +1299,12 @@ mod tests {
         assert_eq!(symbolic(&ccl), "x ▷ foo");
     }
 
-    /// A zero-argument call to a name that is no source applies it to the unit.
+    /// A zero-argument call to a name that is no source passes it the empty argument list.
     #[test]
-    fn test_lower_unknown_zero_arg_applies_the_unit() {
+    fn test_lower_unknown_zero_arg_passes_the_empty_list() {
         let expr = parse_expr("foo()");
         let ccl = lower_expr(&expr, &mut placing(&expr)).expect("expected lowering to succeed");
-        assert_eq!(symbolic(&ccl), "unit ▷ foo");
+        assert_eq!(symbolic(&ccl), "args() ▷ foo");
     }
 
     // -----------------------------------------------------------------------

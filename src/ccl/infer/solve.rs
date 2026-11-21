@@ -476,14 +476,14 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         }
         (
             Type::Fun {
-                name: n1,
+                binder: n1,
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
                 ..
             },
             Type::Fun {
-                name: n2,
+                binder: n2,
                 fun_kind: k2,
                 domain: d2,
                 codomain: c2,
@@ -1057,7 +1057,17 @@ fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
     let Type::Fun { domain, .. } = lambda_ty.peel_refinements() else {
         return;
     };
-    let Type::Infer(v) = domain.as_ref() else {
+    // Several parameters are the components of the domain, each one parameter's type.
+    match domain.as_ref() {
+        Type::Tuple(ts) => ts.iter().for_each(|t| pin_unobservable_type(t, ctx)),
+        Type::DepTuple(cs) => cs.iter().for_each(|(_, t)| pin_unobservable_type(t, ctx)),
+        one => pin_unobservable_type(one, ctx),
+    }
+}
+
+/// [`pin_unobservable_param`] for one parameter's type `domain`.
+fn pin_unobservable_type(domain: &Type, ctx: &mut CoalesceCtx) {
+    let Type::Infer(v) = domain else {
         return;
     };
     if !matches!(resolve_var_type(domain), Ok(Type::Infer(_))) {
@@ -2344,24 +2354,28 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(right, level, ctx);
         }
         TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, ctx),
-        TypedExprNode::Lambda { param, body } => {
-            // Before the body reads the parameter. In a walk whose types are dropped, an
+        TypedExprNode::Lambda { params, body } => {
+            // Before the body reads the parameters. In a walk whose types are dropped, an
             // unbounded parameter is the definition's own, and the uses supply it.
             if !ctx.discarding {
                 pin_unobservable_param(&expr.ty, ctx);
             }
-            let param_name = param.name.clone();
-            ctx.lambda_params.push(param_name.clone());
+            let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
+            ctx.lambda_params.extend(names.iter().cloned());
             // The kind is still a variable here — the node's type is coalesced in the tail,
             // below — so what this function's binders correspond to is readable, and it is
             // what every type inside its body is written against.
-            ctx.binders.push(&param_name, param.ty.clone());
-            with_shadows(ctx, [param_name.clone()], |ctx| {
+            for param in params.iter() {
+                ctx.binders.push(&param.name, param.ty.clone());
+            }
+            with_shadows(ctx, names.iter().cloned(), |ctx| {
                 coalesce_node(body, level, ctx)
             });
-            splice_placed(ctx, &[param_name], body);
-            ctx.binders.pop();
-            ctx.lambda_params.pop();
+            splice_placed(ctx, &names, body);
+            for _ in &names {
+                ctx.binders.pop();
+                ctx.lambda_params.pop();
+            }
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
             // body-usage refinements are negative-polarity upper-bound
@@ -2441,6 +2455,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
+        | TypedExprNode::Arguments(elts)
         | TypedExprNode::Copair(elts)
         | TypedExprNode::DisjointJoin(elts)
         | TypedExprNode::Realized { legs: elts, .. } => {
@@ -2464,9 +2479,15 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // after it read its position by (`src/ccl/design/type-inference.md`, "A chain
             // names each position").
             let position = match (expr.ty.peel_refinements(), elts.first()) {
-                (Type::Fun { name: Some(k), .. }, _) => Some(k.clone()),
+                (
+                    Type::Fun {
+                        binder: crate::ccl::FunBinder::Whole(k),
+                        ..
+                    },
+                    _,
+                ) => Some(k.clone()),
                 (_, Some(head)) => match head.ty.peel_refinements() {
-                    Type::Fun { name, .. } => name.clone(),
+                    Type::Fun { binder, .. } => binder.whole().cloned(),
                     _ => None,
                 },
                 _ => None,
@@ -2486,7 +2507,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         ..
                     },
                     Type::Fun {
-                        name: _last_name,
+                        binder: _last_name,
                         codomain: last_cod,
                         ..
                     },
@@ -2501,12 +2522,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     elts,
                     Type::Fun {
                         // The chain's own input binder where a morphism's type reads it,
-                        // which keeps the name those types were written with; otherwise
+                        // which keeps the binder those types were written with; otherwise
                         // none, and the rule names the input
                         // (`ccl_utils::chain_input_binder`).
-                        name: position
+                        binder: position
                             .clone()
-                            .filter(|k| elts.iter().any(|e| crate::ccl::ccl_utils::is_free(k, e))),
+                            .filter(|k| elts.iter().any(|e| crate::ccl::ccl_utils::is_free(k, e)))
+                            .into(),
                         // FunKind is the first morphism's (mirrors `emit_compose`): a
                         // chain over a data source is a data collection.
                         fun_kind: first_kind.clone(),
@@ -3414,7 +3436,7 @@ fn coalesce_type_predicates_go(
         }
         Type::Fun {
             fun_kind,
-            name,
+            binder,
             domain: d,
             codomain: c,
             ..
@@ -3422,7 +3444,7 @@ fn coalesce_type_predicates_go(
             // A binder scopes over its codomain only. An unnamed function still
             // counts as a crossing: the index a reference below carries counts
             // every function between it and its binder.
-            let binder = name.clone();
+            let binder = binder.clone();
             for w in fun_kind.witnesses_mut() {
                 for t in w.types_mut() {
                     coalesce_type_predicates_go(t, level, ctx, scope);
@@ -3445,7 +3467,7 @@ fn coalesce_type_predicates_go(
             let n = cs.len();
             for (name, t) in cs.iter_mut() {
                 coalesce_type_predicates_go(t, level, ctx, scope);
-                scope.enter(name.clone());
+                scope.enter(name.clone().into());
             }
             (0..n).for_each(|_| scope.exit());
             // A component's determined projection is its one candidate (the arm below), which
@@ -3482,7 +3504,7 @@ fn coalesce_type_predicates_go(
                 coalesce_type_predicates_go(t, level, ctx, scope);
             }
             for (name, _) in binders.iter() {
-                scope.enter(name.clone());
+                scope.enter(name.clone().into());
             }
             coalesce_type_predicates_go(body, level, ctx, scope);
             binders.iter().for_each(|_| scope.exit());
@@ -4510,7 +4532,6 @@ fn specialization_let(
             user_annotation: None,
             transparency,
             site: None,
-            role: Default::default(),
         },
         bound_expr: Box::new(spec.def),
         body: Box::new(body),
@@ -4738,13 +4759,15 @@ fn typecheck_discarded_definition(
 /// too.
 pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
-        && let Type::Fun { name, codomain, .. } = morphism.ty.peel_refinements()
+        && let Type::Fun {
+            binder, codomain, ..
+        } = morphism.ty.peel_refinements()
     {
         // Only the domain is recovered. A projection out of a dependent tuple binds the
         // tuple, and its codomain reads it (`src/ccl/design/type-inference.md`,
         // "Projection"), so the binder and the stored codomain stay as they are.
         morphism.ty = Type::Fun {
-            name: name.clone(),
+            binder: binder.clone(),
             fun_kind: crate::ccl::FunKind::Compute,
             domain: Box::new(read_through(input)),
             codomain: codomain.clone(),
@@ -4764,11 +4787,36 @@ pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
 /// sum's domain — the witness — exactly as an ordinary lambda's is its function's. Matching
 /// `Type::Fun` alone left the slot an unresolved variable, which surfaces as an
 /// `UnresolvedInfer` on `__iter_record` rather than as anything about sums.
+///
+/// Several parameters bind the domain's components, each slot the component opened at the
+/// parameters before it.
 fn refresh_lambda_param_slot(expr: &mut Expr) {
-    if let TypedExprNode::Lambda { param, .. } = &mut expr.node
-        && let Some(dom) = expr.ty.domain()
-    {
-        param.ty = dom;
+    let TypedExprNode::Lambda { params, .. } = &mut expr.node else {
+        return;
+    };
+    let Some(dom) = expr.ty.domain() else {
+        return;
+    };
+    match params.as_mut_slice() {
+        [] => {}
+        [param] => param.ty = dom,
+        params => {
+            let components: Vec<Type> = match dom.peel_refinements() {
+                Type::Tuple(ts) if ts.len() == params.len() => ts.clone(),
+                Type::DepTuple(cs) if cs.len() == params.len() => {
+                    crate::ccl::subst::open_tuple_components(cs, |j, _| {
+                        crate::ccl::subst::Mapping::Rename(params[j].name.clone())
+                    })
+                }
+                other => panic!(
+                    "a lambda of {} parameters has a product domain, got {other}",
+                    params.len()
+                ),
+            };
+            for (param, ty) in params.iter_mut().zip(components) {
+                param.ty = ty;
+            }
+        }
     }
 }
 
@@ -4795,8 +4843,15 @@ fn refresh_param_references(expr: &mut Expr) {
         return;
     };
     let bound = bound.to_vec();
-    let TypedExprNode::Lambda { param, body } = &expr.node else {
+    let TypedExprNode::Lambda { params, body } = &expr.node else {
         return;
+    };
+    // A sum's binder is a collection's position, the one parameter of its lambda.
+    let [param] = params.as_slice() else {
+        panic!(
+            "a collection over a sum binds its position by one parameter, got {}",
+            params.len()
+        )
     };
     let name = param.name.clone();
     let mut renames = crate::ccl::subst::Subst::id();
@@ -5595,7 +5650,6 @@ mod tests {
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
                 },
                 empty_payload: false,
             }),

@@ -450,7 +450,7 @@ fn simplify_reconstruct(
     });
 
     let new_fun = ct.fun.map(|cf| CompactFun {
-        name: cf.name,
+        binder: cf.binder,
         kind: cf.kind,
         capabilities: cf.capabilities,
         // A binder's candidates are ordinary positions, so they are reconstructed like any
@@ -614,7 +614,7 @@ mod tests {
         Some(CompactFun {
             binders: Vec::new(),
             capabilities: Default::default(),
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             kind: KindPin::Compute,
             domains_disagree: false,
             domain: Box::new(dom),

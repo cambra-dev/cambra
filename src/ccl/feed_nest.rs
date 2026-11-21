@@ -145,7 +145,7 @@ impl FeedValue {
     /// chain's input and any reads of the original position over that binder.
     fn bind_position(&mut self, original: &Name, position: &Name) {
         let Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
@@ -158,7 +158,7 @@ impl FeedValue {
                 self.row
             )
         };
-        let codomain = crate::ccl::subst::codomain_renamed(name.as_ref(), position, codomain);
+        let codomain = crate::ccl::subst::codomain_renamed(binder, domain, position, codomain);
         let codomain = Subst::rename(original.clone(), position.clone()).apply_type(&codomain);
         self.row = Type::fun_over(
             position.clone(),
@@ -302,7 +302,7 @@ fn opened_levels(ty: &Type, levels: usize) -> (Vec<(Option<Name>, Type)>, Type) 
         let level = current.peel_refinements().clone();
         let Type::Fun {
             fun_kind: FunKind::Data(_),
-            name,
+            binder,
             domain,
             codomain,
             ..
@@ -310,7 +310,7 @@ fn opened_levels(ty: &Type, levels: usize) -> (Vec<(Option<Name>, Type)>, Type) 
         else {
             unreachable!("a contribution has a collection level per loop it was fed under")
         };
-        components.push((name.clone(), (**domain).clone()));
+        components.push((binder.whole().cloned(), (**domain).clone()));
         current = crate::ccl::subst::open_codomain(&level, codomain);
     }
     (components, current)
@@ -612,9 +612,10 @@ fn generator_nest(
             let [prefix @ .., last] = elts.as_slice() else {
                 return None;
             };
-            let TypedExprNode::Lambda { param, body } = &last.node else {
+            let TypedExprNode::Lambda { params, body } = &last.node else {
                 return None;
             };
+            let param = crate::ccl::one_param(params);
             let iterated = match prefix {
                 [] => return None,
                 [one] => one.clone(),
@@ -687,9 +688,9 @@ fn rebuild_nest(
             node_id,
             rebuild_nest(*body, depth, levels, level),
         ),
-        TypedExprNode::Lambda { param, body } => {
+        TypedExprNode::Lambda { params, body } => {
             let rebuilt = TypedExpr {
-                node: TypedExprNode::Lambda { param, body },
+                node: TypedExprNode::Lambda { params, body },
                 ty: Type::Hole,
                 user_annotation,
                 capabilities,
@@ -700,9 +701,10 @@ fn rebuild_nest(
             let Ok((position, source, step)) = crate::ccl::ccl_utils::into_loop(rebuilt) else {
                 panic!("a loop level of a feed contribution is a loop over a source")
             };
-            let TypedExprNode::Lambda { param, body } = step.node else {
+            let TypedExprNode::Lambda { params, body } = step.node else {
                 unreachable!("into_loop's step is a lambda")
             };
+            let param = crate::ccl::into_one_param(params);
             let inner = rebuild_nest(*body, depth + 1, levels, level);
             level(depth, source, param, inner, Some(position.name))
         }
@@ -710,9 +712,10 @@ fn rebuild_nest(
             let lambda = elts
                 .pop()
                 .expect("a generator has a source before its lambda");
-            let TypedExprNode::Lambda { param, body } = lambda.node else {
+            let TypedExprNode::Lambda { params, body } = lambda.node else {
                 panic!("a loop level of a feed contribution is `𝑠 ≫ (λ 𝑥 → body)`")
             };
+            let param = crate::ccl::into_one_param(params);
             let source = match elts.len() {
                 1 => elts.pop().expect("one element"),
                 _ => compose_typed_or_hole(elts),
@@ -755,7 +758,7 @@ fn read_level(
     // there.
     let item = match source.ty.read_view().peel_refinements() {
         Type::Fun {
-            name: Some(k),
+            binder: crate::ccl::FunBinder::Whole(k),
             codomain,
             ..
         } => crate::ccl::subst::discharge_codomain(k, &position, codomain),
@@ -825,8 +828,11 @@ fn loop_params(nest: &Expr, levels: usize) -> Vec<Name> {
                 None => break,
             },
             TypedExprNode::Compose(elts) => match elts.last().map(|e| &e.node) {
-                Some(TypedExprNode::Lambda { param, body }) => {
-                    params.push(param.name.clone());
+                Some(TypedExprNode::Lambda {
+                    params: lambda_params,
+                    body,
+                }) => {
+                    params.extend(lambda_params.iter().map(|p| p.name.clone()));
                     at = body;
                 }
                 _ => break,
@@ -866,12 +872,14 @@ fn lets_into_position(expr: Expr) -> Expr {
     match body.node {
         // A filter that reads the binding refines the positions, so the binding stays where
         // the lambda's domain can name it.
-        TypedExprNode::Lambda { param, body: step }
-            if !crate::ccl::subst::type_free_vars(&param.ty).contains(&name) =>
+        TypedExprNode::Lambda { params, body: step }
+            if !crate::ccl::subst::type_free_vars(&crate::ccl::one_param(&params).ty)
+                .contains(&name) =>
         {
+            let param = crate::ccl::into_one_param(params);
             TypedExpr {
                 node: TypedExprNode::Lambda {
-                    param,
+                    params: vec![param],
                     body: Box::new(rebind(*step)),
                 },
                 ty: lambda_ty,

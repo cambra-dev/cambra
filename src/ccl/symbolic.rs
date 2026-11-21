@@ -109,30 +109,61 @@ impl Precedence {
 /// unnamed function is an entry with no name: it counts as a crossing, because
 /// the index counts crossings.
 pub(crate) struct PiBinderEnv<'a> {
-    binder: Option<&'a crate::ccl::Name>,
+    binder: Crossed<'a>,
     outer: Option<&'a PiBinderEnv<'a>>,
 }
 
+/// What one crossing binds: one name (or none), or the components of a function's input.
+#[derive(Clone, Copy)]
+enum Crossed<'a> {
+    One(Option<&'a crate::ccl::Name>),
+    Components(&'a [Option<crate::ccl::Name>]),
+}
+
 impl<'a> PiBinderEnv<'a> {
-    /// This environment with `binder`'s function crossed — the innermost entry of
+    /// This environment with `binder`'s crossing crossed — the innermost entry of
     /// the result.
     pub(crate) fn crossing(
         outer: Option<&'a PiBinderEnv<'a>>,
         binder: Option<&'a crate::ccl::Name>,
     ) -> Self {
+        PiBinderEnv {
+            binder: Crossed::One(binder),
+            outer,
+        }
+    }
+
+    /// This environment with a function's codomain crossed, under its binder.
+    pub(crate) fn crossing_fun(
+        outer: Option<&'a PiBinderEnv<'a>>,
+        binder: &'a crate::ccl::FunBinder,
+    ) -> Self {
+        let binder = match binder {
+            crate::ccl::FunBinder::None => Crossed::One(None),
+            crate::ccl::FunBinder::Whole(n) => Crossed::One(Some(n)),
+            crate::ccl::FunBinder::Parameters(names) => Crossed::Components(names),
+        };
         PiBinderEnv { binder, outer }
     }
 
-    /// The name of the binder `index` crossings out, if the environment reaches
-    /// that far and that function names its binder. `None` leaves the reference to
-    /// render as the bare index: the type is being shown detached from the
-    /// function that binds it, and no spelling is available.
-    fn lookup(env: Option<&Self>, index: u32) -> Option<&crate::ccl::Name> {
+    /// The spelling of the binder `index` crossings out (of its component `component`, if
+    /// one), if the environment reaches that far and that crossing names it: a component of
+    /// a whole binder `p` reads `p.j`. `None` leaves the reference to render as its
+    /// display: the type is being shown detached from the function that binds it, and no
+    /// spelling is available.
+    fn lookup(env: Option<&Self>, index: u32, component: Option<u32>) -> Option<String> {
         let mut cur = env?;
         for _ in 0..index {
             cur = cur.outer?;
         }
-        cur.binder
+        match (cur.binder, component) {
+            (Crossed::One(name), None) => name.map(ToString::to_string),
+            (Crossed::One(name), Some(j)) => name.map(|n| format!("{n}.{j}")),
+            (Crossed::Components(names), Some(j)) => {
+                names.get(j as usize)?.as_ref().map(ToString::to_string)
+            }
+            (Crossed::Components(_), None) => None,
+        }
     }
 }
 
@@ -356,8 +387,8 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // [`PiBinderEnv`]), and as the bare index when it did not.
         TypedExprNode::Var(name) => {
             let spelling = match name.pi_bound_index() {
-                Some(k) => PiBinderEnv::lookup(opts.pi_binders, k)
-                    .map_or_else(|| name.to_string(), |b| b.to_string()),
+                Some(k) => PiBinderEnv::lookup(opts.pi_binders, k, name.pi_bound_component())
+                    .unwrap_or_else(|| name.to_string()),
                 None => name.to_string(),
             };
             (Precedence::Atom, spelling)
@@ -475,12 +506,19 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, text)
         }
 
-        TypedExprNode::Lambda { param, body } => {
+        TypedExprNode::Lambda { params, body } => {
             // Domain refinements ride the type lattice, so they render as part
-            // of `param.ty` (a `Type::Refinement`) via `Display for Type`.
-            let header = match &param.ty {
-                Type::Hole | Type::Infer(_) => format!("λ {}", param.name),
-                ty => format!("λ {} : {}", param.name, ty_at(ty, opts)),
+            // of each param's `ty` (a `Type::Refinement`) via `Display for Type`.
+            let param = |p: &crate::ccl::TypedBinding| match &p.ty {
+                Type::Hole | Type::Infer(_) => p.name.to_string(),
+                ty => format!("{} : {}", p.name, ty_at(ty, opts)),
+            };
+            let header = match params.as_slice() {
+                [one] => format!("λ {}", param(one)),
+                many => format!(
+                    "λ ({})",
+                    many.iter().map(param).collect::<Vec<_>>().join(", ")
+                ),
             };
             let body_str = fmt(body, Precedence::Lowest, opts);
             (Precedence::Lowest, format!("{header} → {body_str}"))
@@ -518,6 +556,14 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                 .map(|e| fmt(e, Precedence::Lowest, opts))
                 .collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
+        }
+
+        TypedExprNode::Arguments(elts) => {
+            let items: Vec<_> = elts
+                .iter()
+                .map(|e| fmt(e, Precedence::Lowest, opts))
+                .collect();
+            (Precedence::Atom, format!("args({})", items.join(", ")))
         }
 
         TypedExprNode::Record(fields) => {
@@ -1235,7 +1281,7 @@ mod tests {
         Expr::lambda(
             "x",
             Occurrence::mint(),
-            Type::Fun { name: None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) , capabilities: crate::ccl::capabilities::Capabilities::none() },
+            Type::Fun { binder: crate::ccl::FunBinder::None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) , capabilities: crate::ccl::capabilities::Capabilities::none() },
             Expr::var("x"),
         ),
         "λ x : (Int ⇒ Bool) → x"
@@ -1393,7 +1439,7 @@ mod tests {
                     ty: Type::Base(BaseType::Int),
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent, site: None,
-                    role: Default::default(), },
+                    },
                 Expr::lit(Lit::Int(0)),
             )],
             Expr::var("x"),

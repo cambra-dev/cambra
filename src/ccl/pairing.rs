@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use crate::ccl::ty::FunKind;
+use crate::ccl::ty::{FunBinder, FunKind};
 use crate::ccl::{FieldKey, Label, Name, Type};
 
 /// Where a part stands in the type holding it.
@@ -82,14 +82,14 @@ pub(crate) fn paired_parts<'a>(left: &'a Type, right: &'a Type) -> Option<Pairin
     };
     match left {
         Type::Fun {
-            name: ln,
+            binder: ln,
             fun_kind: lk,
             domain: ld,
             codomain: lc,
             capabilities: lcap,
         } => {
             let Type::Fun {
-                name: rn,
+                binder: rn,
                 fun_kind: rk,
                 domain: rd,
                 codomain: rc,
@@ -111,7 +111,26 @@ pub(crate) fn paired_parts<'a>(left: &'a Type, right: &'a Type) -> Option<Pairin
                 }
             }
             pair(PartAt::Domain, ld, rd, Vec::new());
-            pair(PartAt::Codomain, lc, rc, vec![(ln.as_ref(), rn.as_ref())]);
+            // A codomain stands under the names each side's binder gives the input, paired name
+            // by name where the two bind alike: a whole input, or as many components.
+            let binders = match (ln, rn) {
+                (FunBinder::Parameters(ls), FunBinder::Parameters(rs)) if ls.len() == rs.len() => {
+                    ls.iter()
+                        .zip(rs)
+                        .map(|(l, r)| (l.as_ref(), r.as_ref()))
+                        .collect()
+                }
+                (FunBinder::Whole(_) | FunBinder::None, FunBinder::Whole(_) | FunBinder::None) => {
+                    vec![(ln.whole(), rn.whole())]
+                }
+                // Binders of two kinds pair no name with another: each stands alone.
+                _ => ln
+                    .names()
+                    .map(|l| (Some(l), None))
+                    .chain(rn.names().map(|r| (None, Some(r))))
+                    .collect(),
+            };
+            pair(PartAt::Codomain, lc, rc, binders);
         }
         Type::Tuple(ls) => match right {
             Type::Tuple(rs) if ls.len() == rs.len() => {

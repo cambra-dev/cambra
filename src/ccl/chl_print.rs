@@ -27,7 +27,7 @@ use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::names::SyntheticKind;
 use crate::ccl::ty::{FunKind, PolyType, TypeKind, TypeParamId};
 use crate::ccl::{BaseType, BinOpKind, Builtin, Expr, HistoryKind, Lit, Name, Type, TypedExprNode};
-use crate::ccl::{FieldKey, ProjKey, UnaryOpKind};
+use crate::ccl::{FieldKey, FunBinder, ProjKey, UnaryOpKind};
 
 /// What a written type says for a part CHL has no spelling for and no description fits.
 pub const NOT_PRINTABLE: &str = "‹not printable yet›";
@@ -141,7 +141,7 @@ struct Printer {
     /// spelling of each one's binder, or `None` for one that names none. A reference
     /// `index` crossings out reads entry `len - 1 - index`, as
     /// `symbolic::PiBinderEnv` does.
-    binders: Vec<Option<String>>,
+    binders: Vec<Crossing>,
     /// Every binder the printed text introduces and is inside of, innermost last, with
     /// the spelling it is written with. A reference by name reads its spelling here.
     spelled: Vec<(Name, String)>,
@@ -159,6 +159,61 @@ struct Printer {
     home: Option<Vec<SmolStr>>,
     /// The variables of the message the text is part of ([`Writer`]).
     variables: Rc<RefCell<Vec<String>>>,
+}
+
+/// What one crossing of [`Printer::binders`] binds, as the text spells it.
+enum Crossing {
+    /// The whole input, by its spelling, or `None` for a binder that names none.
+    Whole(Option<String>),
+    /// Each component of a product input, by its spelling where it has one.
+    Components(Vec<Option<String>>),
+}
+
+impl Crossing {
+    /// Whether the crossing spells `candidate`.
+    fn spells(&self, candidate: &str) -> bool {
+        match self {
+            Crossing::Whole(s) => s.as_deref() == Some(candidate),
+            Crossing::Components(cs) => cs.iter().flatten().any(|s| s == candidate),
+        }
+    }
+
+    /// How a reference to this crossing's input, or its component `component`, reads.
+    fn reference(&self, component: Option<u32>) -> Option<String> {
+        match (self, component) {
+            (Crossing::Whole(s), None) => s.clone(),
+            (Crossing::Whole(s), Some(j)) => s.as_ref().map(|s| format!("{s}.{j}")),
+            (Crossing::Components(cs), Some(j)) => cs.get(j as usize).cloned().flatten(),
+            (Crossing::Components(_), None) => None,
+        }
+    }
+}
+
+/// The number of components of `ty`, a product.
+fn product_width(ty: &Type) -> Option<usize> {
+    match ty.peel_refinements() {
+        Type::Tuple(ts) => Some(ts.len()),
+        Type::DepTuple(cs) => Some(cs.len()),
+        _ => None,
+    }
+}
+
+/// Whether a component after component `k` of a dependent tuple reads it: closed, component
+/// `𝑗` reaches component `𝑘` at index `𝑗 − 1 − 𝑘`, and open, by its name.
+fn read_by_later(components: &[(Option<Name>, Type)], k: usize) -> bool {
+    let name = &components[k].0;
+    components
+        .iter()
+        .enumerate()
+        .skip(k + 1)
+        .any(|(j, (_, t))| {
+            let at = (j - k) as u32;
+            (crate::ccl::subst::references_binder_within(t, at)
+                && !crate::ccl::subst::references_binder_within(t, at - 1))
+                || name
+                    .as_ref()
+                    .is_some_and(|n| crate::ccl::subst::type_free_vars(t).contains(n))
+        })
 }
 
 /// Binding tightness of a CHL expression, loosest first.
@@ -210,7 +265,7 @@ impl Printer {
             !self.taken.contains(candidate)
                 && !self.spelled.iter().any(|(_, s)| s == candidate)
                 && !self.free_spelled.iter().any(|(_, s)| s == candidate)
-                && !self.binders.iter().flatten().any(|s| s == candidate)
+                && !self.binders.iter().any(|c| c.spells(candidate))
         };
         std::iter::once(preferred.to_string())
             .chain((1..).map(|i| format!("{preferred}{i}")))
@@ -316,12 +371,12 @@ impl Printer {
             || !capabilities.to_string().is_empty();
         let body = match &body {
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 ..
-            } => self.fun(name.as_ref(), fun_kind, domain, codomain, closed),
+            } => self.fun(binder, fun_kind, domain, codomain, closed),
             body => self.ty(body),
         };
         let mut requires = family_bounds;
@@ -428,20 +483,14 @@ impl Printer {
                 }
             }
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
                 capabilities,
             } => {
                 let capabilities = capabilities.to_string();
-                let fun = self.fun(
-                    name.as_ref(),
-                    fun_kind,
-                    domain,
-                    codomain,
-                    !capabilities.is_empty(),
-                );
+                let fun = self.fun(binder, fun_kind, domain, codomain, !capabilities.is_empty());
                 format!("{fun}{capabilities}")
             }
             Type::History {
@@ -451,7 +500,7 @@ impl Printer {
                 // A value that reads its position has no spelling: `Mut` and `Feed` name
                 // one value type for every position.
                 Type::Fun {
-                    name: Some(key),
+                    binder: FunBinder::Whole(key),
                     codomain,
                     ..
                 } if crate::ccl::subst::codomain_depends_on(key, codomain) => {
@@ -527,7 +576,7 @@ impl Printer {
                 None => "_".to_string(),
             };
             shown.push(format!("{spelled}: {}", self.ty(domain)));
-            self.binders.push(Some(spelled.clone()));
+            self.binders.push(Crossing::Whole(Some(spelled.clone())));
             if let Some(n) = name {
                 self.spelled.push((n.clone(), spelled));
             }
@@ -551,7 +600,7 @@ impl Printer {
     /// function codomain.
     fn fun(
         &mut self,
-        name: Option<&Name>,
+        binder: &FunBinder,
         fun_kind: &FunKind,
         domain: &Type,
         codomain: &Type,
@@ -559,14 +608,46 @@ impl Printer {
     ) -> String {
         let witnesses = fun_kind.witnesses();
         if !witnesses.is_empty() {
-            return self.sum(name, witnesses, domain, codomain);
+            return self.sum(binder.whole(), witnesses, domain, codomain);
+        }
+        let is_data = fun_kind.resolved().is_data();
+        let arrow = if is_data { "|=>" } else { "=>" };
+        // A function of a parameter list writes the list, naming each parameter the codomain
+        // reads: `(a: A, B) => C(a)`.
+        if let Some(names) = binder.parameters()
+            && (product_width(domain) == Some(names.len())
+                || (names.is_empty() && matches!(domain, Type::Base(BaseType::Unit))))
+        {
+            let written: Vec<Option<String>> = names
+                .iter()
+                .map(|n| n.as_ref().map(|n| self.binder(n, "x")))
+                .collect();
+            let dom = self.parameter_list(domain, &written);
+            let spelled = self.spelled.len();
+            for (name, written) in names.iter().zip(&written) {
+                if let (Some(n), Some(s)) = (name, written) {
+                    self.spelled.push((n.clone(), s.clone()));
+                }
+            }
+            self.binders.push(Crossing::Components(written));
+            let cod = self.ty(codomain);
+            self.binders.pop();
+            self.spelled.truncate(spelled);
+            let cod = if clauses_follow && matches!(codomain, Type::Fun { .. }) {
+                format!("({cod})")
+            } else {
+                cod
+            };
+            return format!("{dom} {arrow} {cod}");
         }
         // A function whose codomain names its binder: CHL writes the binder only in a
         // `def`'s signature, so a type spells it as the parameter of the arrow.
-        let dependent = name.filter(|n| crate::ccl::subst::codomain_depends_on(n, codomain));
+        let dependent = binder
+            .whole()
+            .filter(|n| crate::ccl::subst::codomain_depends_on(n, codomain));
         // The domain is written only where the form shows it: `Array` and `Source` name
         // theirs by a length and a source.
-        let shown_domain = !(fun_kind.resolved().is_data()
+        let shown_domain = !(is_data
             && dependent.is_none()
             && matches!(domain, Type::UIntRange(_) | Type::DataSource(_)));
         let dom = if shown_domain {
@@ -574,9 +655,11 @@ impl Printer {
         } else {
             String::new()
         };
-        let is_data = fun_kind.resolved().is_data();
-        let binder = name.map(|n| (n, self.binder(n, if is_data { "k" } else { "x" })));
-        self.binders.push(binder.as_ref().map(|(_, s)| s.clone()));
+        let binder = binder
+            .whole()
+            .map(|n| (n, self.binder(n, if is_data { "k" } else { "x" })));
+        self.binders
+            .push(Crossing::Whole(binder.as_ref().map(|(_, s)| s.clone())));
         if let Some((n, s)) = &binder {
             self.spelled.push(((*n).clone(), s.clone()));
         }
@@ -593,7 +676,6 @@ impl Printer {
         }
         self.binders.pop();
         let binder = binder.map(|(_, s)| s).unwrap_or_default();
-        let arrow = if is_data { "|=>" } else { "=>" };
         match (dependent, domain) {
             (None, Type::UIntRange(n)) if is_data => format!("Array({n}, {cod})"),
             (None, Type::DataSource(source)) if is_data => format!("Source({source}, {cod})"),
@@ -632,7 +714,7 @@ impl Printer {
                 .map(|candidate| {
                     let values = crate::ccl::ty::instantiate_witness(codomain, w.id(), candidate);
                     let alternative = Type::Fun {
-                        name: name.cloned(),
+                        binder: name.cloned().into(),
                         fun_kind: FunKind::Data(None),
                         domain: Box::new(candidate.clone()),
                         codomain: Box::new(values),
@@ -645,7 +727,8 @@ impl Printer {
         }
         // The collection type names no key, so a value reading it reads a key outside
         // the written value type.
-        self.binders.push(Some(OUTER_ARGUMENT.to_string()));
+        self.binders
+            .push(Crossing::Whole(Some(OUTER_ARGUMENT.to_string())));
         let cod = self.ty(codomain);
         self.binders.pop();
         match w.type_kind() {
@@ -667,23 +750,76 @@ impl Printer {
         }
     }
 
-    /// A dependent tuple as the tuple of its components, each reference to an earlier
-    /// component described by its position: CHL has no binder in a tuple type.
+    /// A dependent tuple, each component a later one reads written with its name,
+    /// `{(i: A), (j: B(i)), C}` (`docs/chl-spec.md`, "Named components").
     fn dep_tuple(&mut self, components: &[(Option<Name>, Type)]) -> String {
+        let names: Vec<Option<String>> = components
+            .iter()
+            .enumerate()
+            .map(|(k, (name, _))| {
+                read_by_later(components, k).then(|| match name {
+                    Some(n) => self.binder(n, "c"),
+                    None => self.fresh("c"),
+                })
+            })
+            .collect();
+        self.written_components(components, &names)
+    }
+
+    /// The parameter list a function's `domain` is the product of, each parameter written
+    /// `name: T` where `names` gives it one and `T` otherwise: `(a: A, B)`, or `()` for none.
+    fn parameter_list(&mut self, domain: &Type, names: &[Option<String>]) -> String {
+        let parameters = if names.is_empty() {
+            Vec::new()
+        } else {
+            product_components(domain, names.len())
+        };
+        let parts = self.written_parts(&parameters, names, |n, ty| format!("{n}: {ty}"));
+        format!("({})", parts.join(", "))
+    }
+
+    /// The components of a tuple, each written `(name: T)` where `names` gives it one and `T`
+    /// otherwise; a later component's reference to an earlier one reads its name.
+    fn written_components(
+        &mut self,
+        components: &[(Option<Name>, Type)],
+        names: &[Option<String>],
+    ) -> String {
+        match self
+            .written_parts(components, names, |n, ty| format!("({n}: {ty})"))
+            .as_slice()
+        {
+            [one] => format!("{{{one},}}"),
+            parts => format!("{{{}}}", parts.join(", ")),
+        }
+    }
+
+    /// Each of `components` written as `named` writes a component `names` gives a name, and
+    /// as its type otherwise; a later component's reference to an earlier one reads its name.
+    fn written_parts(
+        &mut self,
+        components: &[(Option<Name>, Type)],
+        names: &[Option<String>],
+        named: impl Fn(&str, &str) -> String,
+    ) -> Vec<String> {
         let mut parts = Vec::with_capacity(components.len());
         let spelled = self.spelled.len();
-        for (position, (name, component)) in components.iter().enumerate() {
-            parts.push(self.ty(component));
-            let described = format!("‹position {position}›");
+        for ((name, component), written) in components.iter().zip(names) {
+            let ty = self.component(component);
+            parts.push(match written {
+                Some(written) => named(written, &ty),
+                None => ty,
+            });
             // A later component reads this one by index in a type and by name in a term.
+            let described = written.clone().unwrap_or_else(|| NOT_PRINTABLE.to_string());
             if let Some(name) = name {
                 self.spelled.push((name.clone(), described.clone()));
             }
-            self.binders.push(Some(described));
+            self.binders.push(Crossing::Whole(Some(described)));
         }
         self.binders.truncate(self.binders.len() - components.len());
         self.spelled.truncate(spelled);
-        format!("{{{}}}", parts.join(", "))
+        parts
     }
 
     /// A refinement predicate, at least as tight as `min`.
@@ -710,7 +846,7 @@ impl Printer {
                 if let Some(index) = name.pi_bound_index() {
                     let text = match (self.binders.len() as u32).checked_sub(index + 1) {
                         Some(i) => self.binders[i as usize]
-                            .clone()
+                            .reference(name.pi_bound_component())
                             .unwrap_or_else(|| NOT_PRINTABLE.to_string()),
                         None => OUTER_ARGUMENT.to_string(),
                     };
@@ -718,19 +854,19 @@ impl Printer {
                 }
                 let text = match (spelling(name), name) {
                     (Some(s), _) => s,
-                    // A `def`'s parameters, which it binds as one tuple.
-                    (None, _) if let Some(positions) = name.positions() => {
-                        format!("({})", positions.join(", "))
-                    }
                     // The binder the solver gives an application's expected function, which
-                    // the written type is the result of.
+                    // the written type is the result of: the variable the application passes,
+                    // where it passes one.
                     (
                         None,
                         Name::Synthetic {
-                            kind: SyntheticKind::SolverArg,
+                            kind: SyntheticKind::SolverArg(passed),
                             ..
                         },
-                    ) => OUTER_ARGUMENT.to_string(),
+                    ) => passed
+                        .as_deref()
+                        .and_then(spelling)
+                        .unwrap_or_else(|| OUTER_ARGUMENT.to_string()),
                     (None, _) => NOT_PRINTABLE.to_string(),
                 };
                 (Prec::Atom, text)
@@ -774,7 +910,7 @@ impl Printer {
             }
             TypedExprNode::Compose(stages) => match stages.as_slice() {
                 [source, stage] => match &stage.node {
-                    TypedExprNode::Lambda { param, body } => {
+                    TypedExprNode::Lambda { params, body } if let [param] = params.as_slice() => {
                         (Prec::Atom, self.comprehension(source, param, body, env))
                     }
                     _ => (Prec::Atom, NOT_PRINTABLE.to_string()),
@@ -838,18 +974,23 @@ impl Printer {
                     let outer: Env<'a> = env[..depth].to_vec();
                     return self.expr_inner(field, &outer);
                 }
-                // A position of a `def`'s parameter tuple is the parameter.
-                if let (TypedExprNode::Var(tuple), ProjKey::Index(i)) = (&argument.node, key)
-                    && let Some(parameter) = tuple.positions().and_then(|ps| ps.get(*i))
-                {
-                    return (Prec::Atom, parameter.to_string());
-                }
                 let target = self.expr(argument, Prec::Postfix, env);
                 (Prec::Postfix, format!("{target}.{key}"))
             }
-            TypedExprNode::Lambda { param, body } => {
+            // Each parameter reads its component of a built tuple, and one parameter the
+            // argument whole.
+            TypedExprNode::Lambda { params, body } => {
+                let parts: Vec<&'a Expr> = match (params.as_slice(), &argument.node) {
+                    ([_], _) => vec![argument],
+                    (params, TypedExprNode::Tuple(parts)) if parts.len() == params.len() => {
+                        parts.iter().collect()
+                    }
+                    _ => return (Prec::Atom, NOT_PRINTABLE.to_string()),
+                };
                 let mut inner = env.clone();
-                inner.push((&param.name, argument, env.len()));
+                for (param, part) in params.iter().zip(parts) {
+                    inner.push((&param.name, part, env.len()));
+                }
                 self.expr_inner(body, &inner)
             }
             // A method call inference has not resolved yet, as a predicate lowers one:
@@ -1209,7 +1350,10 @@ fn type_spellings(ty: &Type, out: &mut HashSet<String>) {
         Type::Param(p) => {
             out.insert(p.spelling.to_string());
         }
-        Type::Fun { name: Some(n), .. } => out.extend(spelling(n)),
+        Type::Fun {
+            binder: FunBinder::Whole(n),
+            ..
+        } => out.extend(spelling(n)),
         Type::Refinement(_, refinements) => {
             for r in refinements.iter() {
                 expr_spellings(&r.predicate, out);
@@ -1228,9 +1372,10 @@ fn expr_spellings(e: &Expr, out: &mut HashSet<String>) {
     match &e.node {
         TypedExprNode::Var(n) => {
             out.extend(spelling(n));
-            out.extend(n.positions().into_iter().flatten().map(ToString::to_string));
         }
-        TypedExprNode::Lambda { param, .. } => out.extend(spelling(&param.name)),
+        TypedExprNode::Lambda { params, .. } => {
+            out.extend(params.iter().flat_map(|p| spelling(&p.name)));
+        }
         _ => {}
     }
     e.walk_children(|c| expr_spellings(c, out));
@@ -1255,6 +1400,15 @@ impl fmt::Display for VariantArms {
     }
 }
 
+/// The `width` components of the product `domain`, each with the name a dependent tuple gives it.
+fn product_components(domain: &Type, width: usize) -> Vec<(Option<Name>, Type)> {
+    match domain.peel_refinements() {
+        Type::Tuple(ts) => ts.iter().map(|t| (None, t.clone())).collect(),
+        Type::DepTuple(cs) => cs.clone(),
+        other => unreachable!("a product of {width} components, got {other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -1262,8 +1416,8 @@ mod tests {
     use super::{NOT_PRINTABLE, OUTER_ARGUMENT, chl_type};
     use crate::ccl::lower::test_helpers::lower_type;
     use crate::ccl::{
-        BaseType, BinOpKind, Builtin, ChanLevel, CompareKind, Lit, LogicKind, Name, Refinement,
-        Type, TypedExpr,
+        BaseType, BinOpKind, Builtin, ChanLevel, CompareKind, FunKind, Lit, LogicKind, Name,
+        Refinement, Type, TypedExpr,
     };
 
     /// A type an annotation writes prints as an annotation, and that annotation lowers
@@ -1322,6 +1476,13 @@ mod tests {
         "forall (T) {T, T} => T requires r: Addable(T, T), r::Output <: T",
         "forall (T) {T, T} => T requires r: Addable(T, T), r::Output <: T"
     )]
+    // A parameter list is not a tuple, so each prints as written.
+    #[case("forall (T) (T, T) => T", "forall (T) (T, T) => T")]
+    #[case("() => Int", "() => Int")]
+    #[case(
+        "((Int => Int causes AffectWorld), Int) => Int",
+        "((Int => Int causes AffectWorld), Int) => Int"
+    )]
     fn a_written_type_prints_as_an_annotation_that_lowers_back(
         #[case] annotation: &str,
         #[case] printed: &str,
@@ -1334,6 +1495,22 @@ mod tests {
             again.without_pi_names().to_string(),
             ty.without_pi_names().to_string(),
             "{printed} lowers to the type it was printed from",
+        );
+        // The debug rendering writes a parameter list naming nothing as a tuple domain.
+        let parameters = |t: &Type| {
+            let t = match t {
+                Type::Poly(p) => &p.body,
+                t => t,
+            };
+            match t.peel_refinements() {
+                Type::Fun { binder, .. } => binder.parameter_count(),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            parameters(&again),
+            parameters(&ty),
+            "{printed} keeps its parameter list"
         );
     }
 
@@ -1407,10 +1584,10 @@ mod tests {
         );
     }
 
-    /// A dependent tuple is the tuple of its components, a read of an earlier one
-    /// described by its position.
+    /// A dependent tuple names each component a later one reads, as a program writes it
+    /// (`docs/chl-spec.md`, "Named components").
     #[test]
-    fn a_dependent_tuple_names_the_positions_it_reads() {
+    fn a_dependent_tuple_names_the_components_it_reads() {
         let i = Name::fresh("i");
         let at_i = TypedExpr::binop(
             elem(),
@@ -1419,7 +1596,28 @@ mod tests {
         );
         let ty = Type::dep_tuple(vec![(Some(i), int()), (None, refined(at_i))]);
         assert!(matches!(ty, Type::DepTuple(_)), "the premise: {ty}");
-        assert_eq!(chl_type(&ty), "{Int, {Int where _ == ‹position 0›}}");
+        assert_eq!(chl_type(&ty), "{(i: Int), {Int where _ == i}}");
+    }
+
+    /// A function of several parameters whose result reads them names them in its domain,
+    /// and a projection of the parameter tuple is the parameter it is.
+    #[test]
+    fn a_function_of_several_parameters_names_the_ones_its_result_reads() {
+        let (lo, x) = (Name::fresh("lo"), Name::fresh("x"));
+        let at_least_lo = TypedExpr::binop(
+            elem(),
+            BinOpKind::Compare(CompareKind::GreaterOrEq),
+            TypedExpr::var(lo.clone()).with_ty(int()),
+        );
+        let ty = Type::fun_of_params(
+            vec![(lo, int()), (x, refined(at_least_lo.clone()))],
+            refined(at_least_lo),
+            FunKind::Compute,
+        );
+        assert_eq!(
+            chl_type(&ty),
+            "(lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo}"
+        );
     }
 
     /// A form only a diagnostic writes reads as CHL.

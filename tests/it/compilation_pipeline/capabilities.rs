@@ -357,7 +357,7 @@ fn a_feed_reached_through_another_name(
         pub def call(f, x):
             f(x)
     "},
-    "pub call: forall (A, B, R <: Context, E <: Effect) {(A => B requires R causes E), A} => \
+    "pub call: forall (A, B, R <: Context, E <: Effect) ((A => B requires R causes E), A) => \
      B requires R causes E"
 )]
 #[case::a_hole_in_a_written_parameter_type(
@@ -365,14 +365,14 @@ fn a_feed_reached_through_another_name(
         pub def call_with(f: (Int => Int causes _), x: Int):
             f(x)
     "},
-    "pub call_with: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes E"
+    "pub call_with: forall (E <: Effect) ((Int => Int causes E), Int) => Int causes E"
 )]
 #[case::a_parameter_called_twice(
     indoc! {"
         pub def twice(f, x: Int) => Int:
             f(f(x))
     "},
-    "pub twice: forall (R <: Context, E <: Effect) {(Int => Int requires R causes E), Int} => Int \
+    "pub twice: forall (R <: Context, E <: Effect) ((Int => Int requires R causes E), Int) => Int \
      requires R causes E"
 )]
 #[case::a_parameter_never_called(
@@ -380,7 +380,7 @@ fn a_feed_reached_through_another_name(
         pub def keep(f, x: Int):
             x
     "},
-    "pub keep: forall (A) {A, Int} => Int  # callable in a constant"
+    "pub keep: forall (A) (A, Int) => Int  # callable in a constant"
 )]
 #[case::a_returned_function(
     indoc! {"
@@ -388,7 +388,7 @@ fn a_feed_reached_through_another_name(
             \\x -> g(f(x))
     "},
     "pub compose: forall (A, B, C, R <: Context, E <: Effect, R1 <: Context, E1 <: Effect) \
-     {(A => B requires R causes E), (B => C requires R1 causes E1)} => A => C requires R, R1 \
+     ((A => B requires R causes E), (B => C requires R1 causes E1)) => A => C requires R, R1 \
      causes E, E1"
 )]
 #[case::a_declared_effect_parameter(
@@ -396,7 +396,7 @@ fn a_feed_reached_through_another_name(
         pub def call_all(E <: Effect, f: (Int => Int causes E), x: Int) causes only E:
             f(x)
     "},
-    "pub call_all: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes E"
+    "pub call_all: forall (E <: Effect) ((Int => Int causes E), Int) => Int causes E"
 )]
 #[case::a_requirement_its_block_discharges(
     indoc! {"
@@ -405,7 +405,7 @@ fn a_feed_reached_through_another_name(
             with begin():
                 stock := f(x)
     "},
-    "pub with_txn: forall (R <: Context) {(Int => Int requires Transaction, R), Int} => {} \
+    "pub with_txn: forall (R <: Context) ((Int => Int requires Transaction, R), Int) => {} \
      requires R causes RunTransaction, WriteTxn(Module::*)"
 )]
 #[case::a_declared_requirement_parameter(
@@ -413,7 +413,7 @@ fn a_feed_reached_through_another_name(
         pub def with_ctx(R <: Context, f: (Int => Int requires R), x: Int) requires only R:
             f(x)
     "},
-    "pub with_ctx: forall (R <: Context) {(Int => Int requires R), Int} => Int requires R"
+    "pub with_ctx: forall (R <: Context) ((Int => Int requires R), Int) => Int requires R"
 )]
 #[case::a_raised_nominal_type(
     indoc! {"
@@ -433,7 +433,7 @@ fn a_feed_reached_through_another_name(
             except Int as e:
                 e + 1
     "},
-    "pub recover: forall (E <: Effect) {(Int => Int causes Raise(Int), E), Int} => Int causes E"
+    "pub recover: forall (E <: Effect) ((Int => Int causes Raise(Int), E), Int) => Int causes E"
 )]
 #[case::a_raised_parameter(
     indoc! {"
@@ -474,7 +474,7 @@ fn a_printed_contract_annotates_its_definition() {
         indoc! {"
             def call_with(f: (Int => Int causes _), x: Int):
                 f(x)
-            g: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes E = call_with
+            g: forall (E <: Effect) ((Int => Int causes E), Int) => Int causes E = call_with
             g(\\y -> y + 1, 4)
         "},
         Value::Int(5),
@@ -574,14 +574,14 @@ fn a_clause_refuses_what_exceeds_it(#[case] code: &str, #[case] needle: &str) {
         pub def p(f: (Int => Int causes _), x: Int) => Int causes nothing:
             f(x)
     "},
-    "pub p: {Int => Int, Int} => Int"
+    "pub p: (Int => Int, Int) => Int"
 )]
 #[case::a_listed_effect(
     indoc! {"
         pub def q(f: (Int => Int causes _), x: Int) => Int causes only Append(out):
             f(x)
     "},
-    "pub q: {(Int => Int causes Append(out)), Int} => Int causes Append(out)"
+    "pub q: ((Int => Int causes Append(out)), Int) => Int causes Append(out)"
 )]
 #[case::what_a_block_discharges(
     indoc! {"
@@ -590,7 +590,7 @@ fn a_clause_refuses_what_exceeds_it(#[case] code: &str, #[case] needle: &str) {
                 stock := f(x)
             x
     "},
-    "pub r: {(Int => Int requires Transaction), Int} => Int causes RunTransaction, \
+    "pub r: ((Int => Int requires Transaction), Int) => Int causes RunTransaction, \
      WriteTxn(Module::*)"
 )]
 #[case::a_clause_variable(
@@ -598,7 +598,7 @@ fn a_clause_refuses_what_exceeds_it(#[case] code: &str, #[case] needle: &str) {
         pub def s(E <: Effect, g: (Int => Int causes E), f: (Int => Int causes _), x: Int) => Int causes only E:
             g(f(x))
     "},
-    "pub s: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes E), Int} => Int \
+    "pub s: forall (E <: Effect) ((Int => Int causes E), (Int => Int causes E), Int) => Int \
      causes E"
 )]
 fn a_hole_reaching_a_bounded_clause_takes_its_bound(#[case] code: &str, #[case] line: &str) {
@@ -940,8 +940,8 @@ fn a_checked_module_prints_what_its_traits_cause() {
             pub type Box = Int
             pub trait Take(T):
                 Writes <: Effect except RunTransaction
-                take: {T, Mut(Int, Txn), Int} => Int causes RunTransaction, Writes
-            pub generic: forall (T) {T, Mut(Int, Txn), Int} => Int requires t: Take(T) causes RunTransaction, t::Writes
+                take: (T, Mut(Int, Txn), Int) => Int causes RunTransaction, Writes
+            pub generic: forall (T) (T, Mut(Int, Txn), Int) => Int requires t: Take(T) causes RunTransaction, t::Writes
         "}
     );
 }
@@ -992,7 +992,7 @@ fn a_checked_module_names_each_unnamed_requirement() {
     "});
     assert!(
         interface.contains(
-            "pub go: forall (T, U) {T, U} => Int requires r: Act(T), r1: Act(U) causes r::Does, \
+            "pub go: forall (T, U) (T, U) => Int requires r: Act(T), r1: Act(U) causes r::Does, \
              r1::Does"
         ),
         "{interface}"
@@ -1064,7 +1064,7 @@ fn an_inferred_requirement_states_its_associated_effect_types() {
     let interface = interface_of(INFERRED_LIB);
     assert!(
         interface.contains(
-            "pub inferred: forall (A) {A, Mut(Int, Txn), Int} => Int requires r: Take(A) causes \
+            "pub inferred: forall (A) (A, Mut(Int, Txn), Int) => Int requires r: Take(A) causes \
              r::Writes"
         ),
         "{interface}"
@@ -1477,7 +1477,7 @@ fn a_specialization_has_its_uses_effects() {
     /// The capabilities of each call of a function `apply`'s parameters hold.
     fn parameter_calls(e: &Expr, out: &mut Vec<String>) {
         if let TypedExprNode::Apply { function, .. } = &e.node
-            && cambra::ccl::symbolic::symbolic(function).starts_with("__arg_tuple")
+            && matches!(&function.node, TypedExprNode::Var(n) if n.base() == "f")
         {
             out.push(e.capabilities.to_string());
         }
@@ -1659,36 +1659,36 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
 #[rstest]
 #[case::every_effect(
     "pub def apply(f: (Int => Int causes Effect), x: Int) => Int causes Effect:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Effect), Int} => Int causes Effect"
+    "pub apply: ((Int => Int causes Effect), Int) => Int causes Effect"
 )]
 #[case::every_write(
     "pub def apply(f: (Int => Int causes Write(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Write(*)), Int} => Int causes Write(*)"
+    "pub apply: ((Int => Int causes Write(*)), Int) => Int causes Write(*)"
 )]
 #[case::every_append(
     "pub def apply(f: (Int => Int causes Append(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Append(*)), Int} => Int causes Append(*)"
+    "pub apply: ((Int => Int causes Append(*)), Int) => Int causes Append(*)"
 )]
 #[case::every_read(
     "pub def apply(f: (Int => Int requires Read(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int requires Read(*)), Int} => Int requires Read(*)"
+    "pub apply: ((Int => Int requires Read(*)), Int) => Int requires Read(*)"
 )]
 #[case::two_families(
     "pub def apply(f: (Int => Int causes Write(*), Append(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Write(*), Append(*)), Int} => Int causes Write(*), Append(*)"
+    "pub apply: ((Int => Int causes Write(*), Append(*)), Int) => Int causes Write(*), Append(*)"
 )]
 #[case::a_family_within_effect(
     "pub def apply(f: (Int => Int causes Effect, Write(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Effect), Int} => Int causes Effect"
+    "pub apply: ((Int => Int causes Effect), Int) => Int causes Effect"
 )]
 #[case::a_family_taken_from_effect(
     "pub def apply(f: (Int => Int causes Effect except Write(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Effect except Write(*)), Int} => Int causes Effect except \
+    "pub apply: ((Int => Int causes Effect except Write(*)), Int) => Int causes Effect except \
      Write(*)"
 )]
 #[case::reads_taken_from_context(
     "pub def apply(f: (Int => Int requires Context except Read(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int requires Context except Read(*)), Int} => Int requires Context \
+    "pub apply: ((Int => Int requires Context except Read(*)), Int) => Int requires Context \
      except Read(*)"
 )]
 #[case::one_top_holding_what_another_takes_away(
@@ -1696,7 +1696,7 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
         pub def both(f: (Int => Int causes Effect except Write(*)), g: (Int => Int causes Write(*)), x: Int) => Int:
             f(x) + g(x)
     "},
-    "pub both: {(Int => Int causes Effect except Write(*)), (Int => Int causes Write(*)), Int} => \
+    "pub both: ((Int => Int causes Effect except Write(*)), (Int => Int causes Write(*)), Int) => \
      Int causes Effect"
 )]
 #[case::a_variable_beside_a_top_taking_away_on_its_own(
@@ -1704,74 +1704,74 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
         pub def both(E <: Effect, f: (Int => Int causes E), g: (Int => Int causes Effect except RunTransaction), x: Int) => Int:
             f(x) + g(x)
     "},
-    "pub both: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Effect except \
-     RunTransaction), Int} => Int causes E, (Effect except RunTransaction)"
+    "pub both: forall (E <: Effect) ((Int => Int causes E), (Int => Int causes Effect except \
+     RunTransaction), Int) => Int causes E, (Effect except RunTransaction)"
 )]
 #[case::a_variable_written_beside_every_write(
     indoc! {"
         pub def both(E <: Effect, f: (Int => Int causes E), g: (Int => Int causes Write(*)), x: Int) => Int:
             f(x) + g(x)
-        pub h: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Write(*)), Int} => Int causes E, Write(*) = both
+        pub h: forall (E <: Effect) ((Int => Int causes E), (Int => Int causes Write(*)), Int) => Int causes E, Write(*) = both
     "},
-    "pub h: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Write(*)), Int} => Int \
+    "pub h: forall (E <: Effect) ((Int => Int causes E), (Int => Int causes Write(*)), Int) => Int \
      causes E, Write(*)"
 )]
 #[case::a_variable_taking_away(
     "pub def g(E <: Effect, f: (Int => Int causes E except RunTransaction), x: Int) => Int:\n    \
      f(x)\n",
-    "pub g: forall (E <: Effect) {(Int => Int causes E except RunTransaction), Int} => Int causes \
+    "pub g: forall (E <: Effect) ((Int => Int causes E except RunTransaction), Int) => Int causes \
      E except RunTransaction"
 )]
 #[case::a_variable_in_parentheses(
     "pub def g(E <: Effect, f: (Int => Int causes (E except AffectWorld)), x: Int) => Int:\n    \
      f(x)\n",
-    "pub g: forall (E <: Effect) {(Int => Int causes E except AffectWorld), Int} => Int causes E \
+    "pub g: forall (E <: Effect) ((Int => Int causes E except AffectWorld), Int) => Int causes E \
      except AffectWorld"
 )]
 #[case::variables_taking_away_differently(
     indoc! {"
         pub def g(E <: Effect, F <: Effect, f: (Int => Int causes (E except RunTransaction), F), x: Int) => Int:
             f(x)
-        pub h: forall (E <: Effect, F <: Effect) {(Int => Int causes (E except RunTransaction), F), Int} => Int causes (E except RunTransaction), F = g
+        pub h: forall (E <: Effect, F <: Effect) ((Int => Int causes (E except RunTransaction), F), Int) => Int causes (E except RunTransaction), F = g
     "},
-    "pub h: forall (E <: Effect, F <: Effect) {(Int => Int causes (E except RunTransaction), F), \
-     Int} => Int causes (E except RunTransaction), F"
+    "pub h: forall (E <: Effect, F <: Effect) ((Int => Int causes (E except RunTransaction), F), \
+     Int) => Int causes (E except RunTransaction), F"
 )]
 #[case::a_variable_taking_away_beside_a_top(
     indoc! {"
         pub def g(E <: Effect, f: (Int => Int causes E except RunTransaction), h: (Int => Int causes Write(*)), x: Int) => Int:
             f(x) + h(x)
     "},
-    "pub g: forall (E <: Effect) {(Int => Int causes E except RunTransaction), (Int => Int causes \
-     Write(*)), Int} => Int causes E, Write(*) except RunTransaction"
+    "pub g: forall (E <: Effect) ((Int => Int causes E except RunTransaction), (Int => Int causes \
+     Write(*)), Int) => Int causes E, Write(*) except RunTransaction"
 )]
 #[case::a_clause_taking_from_its_variable_what_an_argument_does(
     "pub def apply(E <: Effect, f: (Int => Int causes E except RunTransaction), x: Int) => Int \
      causes only E except RunTransaction:\n    f(x)\n",
-    "pub apply: forall (E <: Effect) {(Int => Int causes E except RunTransaction), Int} => Int \
+    "pub apply: forall (E <: Effect) ((Int => Int causes E except RunTransaction), Int) => Int \
      causes E except RunTransaction"
 )]
 #[case::a_top_in_parentheses(
     "pub def apply(f: (Int => Int requires (Context except ObserveWorld)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int requires Context except ObserveWorld), Int} => Int requires Context \
+    "pub apply: ((Int => Int requires Context except ObserveWorld), Int) => Int requires Context \
      except ObserveWorld"
 )]
 #[case::a_bounded_variable_within_a_top(
     "pub def apply(E <: Effect except RunTransaction, f: (Int => Int causes E), x: Int) => Int \
      causes only (Effect except RunTransaction):\n    f(x)\n",
-    "pub apply: forall (E <: Effect except RunTransaction) {(Int => Int causes E), Int} => Int \
+    "pub apply: forall (E <: Effect except RunTransaction) ((Int => Int causes E), Int) => Int \
      causes Effect except RunTransaction"
 )]
 #[case::a_bound_taking_capabilities_away(
     "pub def apply(E <: Effect except (RunTransaction, AffectWorld), f: (Int => Int causes E), \
      x: Int) => Int causes only E:\n    f(x)\n",
-    "pub apply: forall (E <: Effect except (RunTransaction, AffectWorld)) {(Int => Int causes E), \
-     Int} => Int causes E"
+    "pub apply: forall (E <: Effect except (RunTransaction, AffectWorld)) ((Int => Int causes E), \
+     Int) => Int causes E"
 )]
 #[case::a_bound_taking_a_family_away(
     "pub def apply(E <: Effect except Write(*), f: (Int => Int causes E), x: Int) => Int causes \
      only E:\n    f(x)\n",
-    "pub apply: forall (E <: Effect except Write(*)) {(Int => Int causes E), Int} => Int causes E"
+    "pub apply: forall (E <: Effect except Write(*)) ((Int => Int causes E), Int) => Int causes E"
 )]
 #[case::an_associated_bound_taking_capabilities_away(
     indoc! {"
@@ -1817,7 +1817,7 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
         pub def go(a, b) => Int:
             loop_over(\\y -> y, a ++ b)
     "},
-    "pub go: forall (A, B) {A => Int, B => Int} => Int causes Append(*)"
+    "pub go: forall (A, B) (A => Int, B => Int) => Int causes Append(*)"
 )]
 #[case::a_block_discharging_from_context(
     indoc! {"
@@ -1826,7 +1826,7 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
                 f(x)
             x
     "},
-    "pub apply: {(Int => Int requires Context causes Effect except RunTransaction), Int} => Int \
+    "pub apply: ((Int => Int requires Context causes Effect except RunTransaction), Int) => Int \
      requires Context except Transaction causes Effect"
 )]
 #[case::a_top_level_requiring_context_but_a_transaction(
@@ -1835,26 +1835,26 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
 )]
 #[case::every_raise(
     "pub def apply(f: (Int => Int causes Raise(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Raise(*)), Int} => Int causes Raise(*)"
+    "pub apply: ((Int => Int causes Raise(*)), Int) => Int causes Raise(*)"
 )]
 #[case::a_raise_within_every_raise(
     "pub def apply(f: (Int => Int causes Raise(Int), Raise(*)), x: Int) => Int:\n    f(x)\n",
-    "pub apply: {(Int => Int causes Raise(*)), Int} => Int causes Raise(*)"
+    "pub apply: ((Int => Int causes Raise(*)), Int) => Int causes Raise(*)"
 )]
 #[case::a_raise_taken_from_every_raise(
     "pub def apply(f: (Int => Int causes Write(*), Raise(*) except Raise(Int)), x: Int) => Int:\n    \
      f(x)\n",
-    "pub apply: {(Int => Int causes Write(*), Raise(*) except Raise(Int)), Int} => Int causes \
+    "pub apply: ((Int => Int causes Write(*), Raise(*) except Raise(Int)), Int) => Int causes \
      Write(*), Raise(*) except Raise(Int)"
 )]
 #[case::a_variable_beside_a_raise_top_written_back(
     indoc! {"
         pub def both(E <: Effect, f: (Int => Int causes E), g: (Int => Int causes (Raise(*) except Raise(Int))), x: Int) => Int causes E, (Raise(*) except Raise(Int)):
             f(x) + g(x)
-        pub h: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Raise(*) except Raise(Int)), Int} => Int causes E, (Raise(*) except Raise(Int)) = both
+        pub h: forall (E <: Effect) ((Int => Int causes E), (Int => Int causes Raise(*) except Raise(Int)), Int) => Int causes E, (Raise(*) except Raise(Int)) = both
     "},
-    "pub h: forall (E <: Effect) {(Int => Int causes E), (Int => Int causes Raise(*) except \
-     Raise(Int)), Int} => Int causes E, (Raise(*) except Raise(Int))"
+    "pub h: forall (E <: Effect) ((Int => Int causes E), (Int => Int causes Raise(*) except \
+     Raise(Int)), Int) => Int causes E, (Raise(*) except Raise(Int))"
 )]
 #[case::a_raise_held_by_a_wider_one(
     indoc! {"
@@ -1862,9 +1862,9 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
             raise 5
         pub def both(E <: Effect, f: (Int => Int causes E), x: Int) => Int:
             f(x) + thrower(x)
-        pub h: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes E, Raise(Int) = both
+        pub h: forall (E <: Effect) ((Int => Int causes E), Int) => Int causes E, Raise(Int) = both
     "},
-    "pub h: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes Raise(Int), E"
+    "pub h: forall (E <: Effect) ((Int => Int causes E), Int) => Int causes Raise(Int), E"
 )]
 #[case::raises_of_one_type_from_two_sites(
     "g: Int => Int causes Raise(Int) = \\x -> x\npub h: Int => Int causes Raise(Int) = g\n",
@@ -1878,7 +1878,7 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
             except Int:
                 0
     "},
-    "pub safe: {(Int => Int causes Raise(Int), Effect except Raise(*)), Int} => Int causes Effect \
+    "pub safe: ((Int => Int causes Raise(Int), Effect except Raise(*)), Int) => Int causes Effect \
      except Raise(*)"
 )]
 #[case::a_loop_running_effect_but_writes_and_raises(
@@ -1890,7 +1890,7 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
         pub def go(a, b) => Int:
             loop_over(\\y -> y, a ++ b)
     "},
-    "pub go: forall (A, B) {A => Int, B => Int} => Int causes Effect except (Write(*), Raise(*))"
+    "pub go: forall (A, B) (A => Int, B => Int) => Int causes Effect except (Write(*), Raise(*))"
 )]
 #[case::returned_raising(
     indoc! {"

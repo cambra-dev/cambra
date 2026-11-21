@@ -17,7 +17,7 @@ use std::rc::Rc;
 use crate::ccl::infer_var::BarrierVarId;
 use crate::ccl::nominal::Variance;
 use crate::ccl::subst::{RefinementScope, Subst};
-use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
+use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
 
 use super::compact::{AtomKey, ConsultedNames};
 use crate::ccl::ty::KindPin;
@@ -420,7 +420,7 @@ impl fmt::Display for SpecKey {
 }
 
 /// [`KeyCtx::memo`]'s key: the variable, the polarity and the enclosing binders.
-type KeyMemoKey = (InferVarId, bool, Vec<Option<Name>>);
+type KeyMemoKey = (InferVarId, bool, Vec<crate::ccl::FunBinder>);
 
 /// Walk-wide state: the cycle guard, the per-variable memo, and the truncation
 /// counter that decides what may be memoized.
@@ -446,7 +446,7 @@ struct KeyCtx {
     /// check it is cutting a same-scope re-entry rather than silently coarsening
     /// the key — the invariant stated on `visiting`.
     #[cfg(debug_assertions)]
-    visiting_scopes: HashMap<(InferVarId, bool), Vec<Option<Name>>>,
+    visiting_scopes: HashMap<(InferVarId, bool), Vec<crate::ccl::FunBinder>>,
     /// Barrier variables whose lower bounds are currently being walked, the guard
     /// `compact_go`'s `BarrierVar` arm runs on the same key: a barrier's lowers are read
     /// at positive polarity whatever the reference's. A lower reaching its own barrier
@@ -694,7 +694,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             k
         }
         Type::Fun {
-            name,
+            binder,
             domain,
             codomain,
             fun_kind,
@@ -706,12 +706,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // A Pi binder shadows the accumulated substitution inside the
             // codomain, as in `compact_go`. The binder *name* itself is not part
             // of the key — see `SpecKey::fun`.
-            let cod_acc = match name {
-                Some(b) => subst_acc.shadow(b),
-                None => subst_acc.clone(),
-            };
+            let cod_acc = binder
+                .names()
+                .fold(subst_acc.clone(), |acc, b| acc.shadow(b));
             // Entering the codomain crosses this function, as in `compact_go`.
-            ctx.scope.enter(name.clone());
+            ctx.scope.enter(binder.clone());
             let cod = key_go(codomain, pol, &cod_acc, ctx);
             ctx.scope.exit();
             // Resolved through `KindPin::of`, not off the `FunKind` itself: an
@@ -777,7 +776,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let mut components = Vec::with_capacity(cs.len());
             for (name, t) in cs {
                 components.push(key_go(t, pol, &acc, ctx));
-                ctx.scope.enter(name.clone());
+                ctx.scope.enter(name.clone().into());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
                 }
@@ -797,7 +796,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 .collect();
             let mut acc = subst_acc.clone();
             for (name, _) in binders {
-                ctx.scope.enter(name.clone());
+                ctx.scope.enter(name.clone().into());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
                 }
@@ -1244,7 +1243,7 @@ mod tests {
         // An *unresolved* kind does not split: both uses read the same unpinned var,
         // which keys as the `Compute` default rather than as its own point.
         let unresolved = || Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::fresh_var(),
             domain: Box::new(int()),
             codomain: Box::new(int()),
@@ -1384,13 +1383,14 @@ mod tests {
 #[cfg(test)]
 mod refinement_closing_tests {
     use super::*;
+    use crate::ccl::Name;
     use crate::ccl::infer::solver::test_helpers::dep_pred;
     use crate::ccl::infer::solver::{ConstrainCache, constrain_subtype};
     use crate::ccl::ty::FunKind;
 
     fn dep_fun(binder: &str) -> Type {
         Type::Fun {
-            name: Some(Name::raw(binder)),
+            binder: crate::ccl::FunBinder::Whole(Name::raw(binder)),
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::refined_one(
@@ -1430,11 +1430,11 @@ mod refinement_closing_tests {
     #[test]
     fn spec_key_keeps_distinct_binders_distinct() {
         let nested = |referenced: &str| Type::Fun {
-            name: Some(Name::raw("x")),
+            binder: crate::ccl::FunBinder::Whole(Name::raw("x")),
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Fun {
-                name: Some(Name::raw("y")),
+                binder: crate::ccl::FunBinder::Whole(Name::raw("y")),
                 fun_kind: FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(4)),
                 codomain: Box::new(Type::refined_one(

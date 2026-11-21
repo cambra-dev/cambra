@@ -1018,8 +1018,8 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
             contains_feed_or_define_for(bound_expr, name)
                 || (&binding.name != name && contains_feed_or_define_for(body, name))
         }
-        TypedExprNode::Lambda { param, body, .. } => {
-            &param.name != name && contains_feed_or_define_for(body, name)
+        TypedExprNode::Lambda { params, body } => {
+            params.iter().all(|p| &p.name != name) && contains_feed_or_define_for(body, name)
         }
         _ => expr.any_child(|c| contains_feed_or_define_for(c, name)),
     }
@@ -1263,7 +1263,7 @@ fn erase_chan_domains_in_type(
         // whether the read view binds a witness. Read it before the domain is substituted:
         // afterwards the domain is a bare reference, and a reference carries no kind.
         let Type::Fun {
-            name,
+            binder,
             domain,
             codomain: value,
             ..
@@ -1278,7 +1278,7 @@ fn erase_chan_domains_in_type(
         // A feed channel reads as a collection: erase History to its function, a data function
         // keeping the function's binder.
         *ty = Type::Fun {
-            name,
+            binder,
             fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
             domain,
             codomain: value,
@@ -1526,12 +1526,16 @@ fn assert_no_type_residue(expr: &Expr) {
         expr.ty
     );
     match &expr.node {
-        TypedExprNode::Lambda { param, .. } => assert!(
-            !has_type_residue(&param.ty),
-            "type residue survived channelize on lambda param `{}` : {}",
-            param.name,
-            param.ty
-        ),
+        TypedExprNode::Lambda { params, .. } => {
+            for param in params {
+                assert!(
+                    !has_type_residue(&param.ty),
+                    "type residue survived channelize on lambda param `{}` : {}",
+                    param.name,
+                    param.ty
+                );
+            }
+        }
         TypedExprNode::Let { binding, .. } => assert!(
             !has_type_residue(&binding.ty),
             "type residue survived channelize on let binding `{}` : {}",
@@ -1864,6 +1868,7 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         | TypedExprNode::Let { .. }
         | TypedExprNode::List(_)
         | TypedExprNode::Tuple(_)
+        | TypedExprNode::Arguments(_)
         | TypedExprNode::Record(_)
         | TypedExprNode::Case { .. }
         | TypedExprNode::VariantCtor { .. }
@@ -1948,6 +1953,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         | TypedExprNode::Let { .. }
         | TypedExprNode::List(_)
         | TypedExprNode::Tuple(_)
+        | TypedExprNode::Arguments(_)
         | TypedExprNode::Record(_)
         | TypedExprNode::Case { .. }
         | TypedExprNode::VariantCtor { .. }
@@ -2372,7 +2378,6 @@ fn channelize_cluster(
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
                 },
                 channel,
             ));
@@ -2652,10 +2657,11 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(body, bound, out);
                 bound.pop();
             }
-            TypedExprNode::Lambda { param, body, .. } => {
-                bound.push(param.name.clone());
+            TypedExprNode::Lambda { params, body } => {
+                let base = bound.len();
+                bound.extend(params.iter().map(|p| p.name.clone()));
                 rec(body, bound, out);
-                bound.pop();
+                bound.truncate(base);
             }
             TypedExprNode::Apply { function, argument } => {
                 rec(function, bound, out);
@@ -2671,6 +2677,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(inner, bound, out);
             }
             TypedExprNode::Tuple(elts)
+            | TypedExprNode::Arguments(elts)
             | TypedExprNode::List(elts)
             | TypedExprNode::Compose(elts)
             | TypedExprNode::Copair(elts)
@@ -3155,14 +3162,15 @@ fn extract_for_defer_impl(
             // surrounding apply that binds the lambda to its element.
             if matches!(
                 &function.node,
-                TypedExprNode::Lambda { param, .. } if &param.name != defer_name
+                TypedExprNode::Lambda { params, .. }
+                    if &crate::ccl::one_param(params).name != defer_name
             ) {
                 // Peeked above by reference; take ownership without cloning the
                 // whole function subtree (this runs on every `Apply` walked).
                 let TypedExpr {
                     node:
                         TypedExprNode::Lambda {
-                            param,
+                            params,
                             body: lambda_body,
                         },
                     ty: function_ty,
@@ -3176,6 +3184,7 @@ fn extract_for_defer_impl(
                 else {
                     unreachable!("peeked above as a lambda whose param is not the defer binder")
                 };
+                let param = crate::ccl::into_one_param(params);
                 let mut lambda_feeds: Vec<Contribution> = Vec::new();
                 let mut lambda_define: Option<(NodeId, Expr)> = None;
                 let new_lambda_body = extract_for_defer(
@@ -3213,7 +3222,7 @@ fn extract_for_defer_impl(
                 }
                 let new_function = TypedExpr {
                     node: TypedExprNode::Lambda {
-                        param,
+                        params: vec![param],
                         body: Box::new(new_lambda_body),
                     },
                     ty: function_ty,
@@ -3284,6 +3293,9 @@ fn extract_for_defer_impl(
                 .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
+        TypedExprNode::Arguments(_) => {
+            unreachable!("a call's argument list is a tuple once inference has typed it")
+        }
         TypedExprNode::List(elts) => TypedExprNode::List(
             elts.into_iter()
                 .map(|e| extract_for_defer(e, cx, feeds, define, in_inner_scope))
@@ -3311,7 +3323,10 @@ fn extract_for_defer_impl(
                 let elt_node_id = elt.node_id;
                 let elt_site = elt.site.clone();
                 match elt.node {
-                    TypedExprNode::Lambda { param, body } if &param.name != defer_name => {
+                    TypedExprNode::Lambda { params, body }
+                        if &crate::ccl::one_param(&params).name != defer_name =>
+                    {
+                        let param = crate::ccl::into_one_param(params);
                         // Feeding `λ p → Case({g₀ → Feed(d, v₀); …; true → Unit})`
                         // becomes one refined-source channel per feeding arm
                         // plus a Lambda whose body collapses to `Unit`.  See
@@ -3421,7 +3436,7 @@ fn extract_for_defer_impl(
                                     // The item at the element: a family's item reads its key.
                                     let item_at_elem = match source_prefix.ty.peel_refinements() {
                                         Type::Fun {
-                                            name: Some(key),
+                                            binder: crate::ccl::FunBinder::Whole(key),
                                             codomain,
                                             ..
                                         } => crate::ccl::subst::discharge_codomain(
@@ -3503,7 +3518,7 @@ fn extract_for_defer_impl(
                             // unrefined source to a no-op iteration.
                             let new_lambda = TypedExpr {
                                 node: TypedExprNode::Lambda {
-                                    param,
+                                    params: vec![param],
                                     body: Box::new(map_let_chain_tail(*body, lets.len(), |case| {
                                         residual_after_fanout(case, defer_name)
                                     })),
@@ -3564,7 +3579,7 @@ fn extract_for_defer_impl(
                         }
                         new_elts.push(TypedExpr {
                             node: TypedExprNode::Lambda {
-                                param,
+                                params: vec![param],
                                 body: Box::new(new_body),
                             },
                             ty: elt_ty,
@@ -3602,7 +3617,8 @@ fn extract_for_defer_impl(
             }
             TypedExprNode::Record(new_fields)
         }
-        TypedExprNode::Lambda { param, body } => {
+        TypedExprNode::Lambda { params, body } => {
+            let param = crate::ccl::into_one_param(params);
             // Lambda body is an inner scope.  Feeds extracted from inside
             // may reference the param, so each channel contribution must
             // be re-wrapped with the same Lambda before bubbling up to
@@ -3644,7 +3660,7 @@ fn extract_for_defer_impl(
                 });
             }
             TypedExprNode::Lambda {
-                param,
+                params: vec![param],
                 body: Box::new(body),
             }
         }
@@ -3993,9 +4009,10 @@ mod tests {
                 Type::feed(Type::Base(BaseType::Unit), int.clone()),
                 body,
             ));
-            let TypedExprNode::Lambda { param, body } = expr.node else {
+            let TypedExprNode::Lambda { params, body } = expr.node else {
                 panic!("the fixture is a feed parameter's lambda")
             };
+            let param = crate::ccl::into_one_param(params);
             let mut feeds = Vec::new();
             extract_for_defer(
                 *body,
@@ -4333,7 +4350,7 @@ mod tests {
         let pred = var("inner_k");
         let refinement = Refinement::born(Rc::new(pred));
         let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),

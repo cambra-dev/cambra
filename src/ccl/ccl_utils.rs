@@ -554,15 +554,19 @@ pub(crate) fn discharge_transparent_lets(r: &Refinement) -> Refinement {
 /// `let`'s definition or an application's argument, so the predicate that results needs no
 /// normalizing before it is compared.
 pub(crate) fn predicate_term(term: &Expr) -> Expr {
-    if !binds_a_transparent_let(term) {
-        return term.clone_preserving_ids();
-    }
-    let _g = crate::ccl::provenance::enter(
-        term.node_id(),
-        "predicate.discharge_transparent_lets",
-        crate::ccl::provenance::Nature::Machinery,
-    );
-    discharge_transparent_lets_in_term(term)
+    // A call's argument list is read as the value it passes ([`Expr::erase_argument_lists`]).
+    let mut out = if !binds_a_transparent_let(term) {
+        term.clone_preserving_ids()
+    } else {
+        let _g = crate::ccl::provenance::enter(
+            term.node_id(),
+            "predicate.discharge_transparent_lets",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        discharge_transparent_lets_in_term(term)
+    };
+    out.erase_argument_lists();
+    out
 }
 
 /// The normal form of a predicate term, the form refinements are compared and hashed in
@@ -686,10 +690,24 @@ fn reduce_application(
         _ => None,
     };
     match &function.node {
-        TypedExprNode::Lambda { param, body } => Some(normalize(
-            substitute_term(body.clone_preserving_ids(), &param.name, argument),
-            fuel,
-        )),
+        // Several parameters take the components of a tuple; a tuple named rather than built
+        // has none to take, and stays applied.
+        TypedExprNode::Lambda { params, body } => {
+            let parts: Vec<&Expr> = match (params.as_slice(), &argument.node) {
+                ([_], _) => vec![argument],
+                (params, TypedExprNode::Tuple(parts)) if parts.len() == params.len() => {
+                    parts.iter().collect()
+                }
+                _ => return None,
+            };
+            let body = params
+                .iter()
+                .zip(parts)
+                .fold(body.clone_preserving_ids(), |body, (param, part)| {
+                    substitute_term(body, &param.name, part)
+                });
+            Some(normalize(body, fuel))
+        }
         TypedExprNode::Cast { value, .. } => {
             Some(applied(a(), value.clone_preserving_ids(), ty.clone(), fuel))
         }
@@ -804,11 +822,10 @@ fn reduce_application(
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
                 };
                 Some(
                     Expr::throwaway(TypedExprNode::Lambda {
-                        param,
+                        params: vec![param],
                         body: Box::new(body),
                     })
                     .with_ty(ty.clone()),
@@ -912,7 +929,7 @@ fn normal_function_value(
     let (binder, mut result_ty) =
         crate::ccl::provenance::preserving_ids(|| match function.ty.peel_refinements() {
             Type::Fun {
-                name: Some(b),
+                binder: crate::ccl::FunBinder::Whole(b),
                 codomain,
                 ..
             } => (
@@ -958,10 +975,9 @@ fn normal_lambda(name: Name, body: Expr, ty: &Type) -> Expr {
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
         site: None,
-        role: Default::default(),
     };
     Expr::throwaway(TypedExprNode::Lambda {
-        param,
+        params: vec![param],
         body: Box::new(body),
     })
     .with_ty(ty.clone())
@@ -1052,7 +1068,6 @@ fn read_eliminated_match(argument: &Expr, ty: &Type, fuel: &mut usize) -> Option
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
                 },
                 empty_payload: false,
             }),
@@ -1564,10 +1579,8 @@ pub(crate) fn normal_refinement(r: &Refinement) -> Refinement {
 pub(crate) fn read_at(input: &Expr, f: &Expr) -> Expr {
     let cod = match f.ty.peel_refinements() {
         Type::Fun {
-            name: Some(b),
-            codomain,
-            ..
-        } => crate::ccl::subst::discharge_codomain(b, input, codomain),
+            binder, codomain, ..
+        } => crate::ccl::subst::discharge_at_binder(binder, input, codomain),
         _ => f.ty.codomain().unwrap_or(Type::Hole),
     };
     read_back_application(input, f, &cod)
@@ -1843,7 +1856,7 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
         elts,
         &instances,
         Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind,
             domain: Box::new(head_domain),
             codomain: Box::new(last_codomain),
@@ -1860,7 +1873,7 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
 /// position by the name `head`'s type gives it. [`pointwise_view_parts`] reads one back.
 pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
     let Type::Fun {
-        name,
+        binder,
         fun_kind,
         domain,
         codomain,
@@ -1869,6 +1882,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
     else {
         panic!("a view reads a collection, got {}", head.ty)
     };
+    let name = binder.whole().cloned();
     let position = name
         .as_ref()
         .map_or_else(|| Name::fresh("__pos"), Name::refreshed);
@@ -1877,7 +1891,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
         None => ty.clone(),
     };
     let named = Type::Fun {
-        name: Some(position.clone()),
+        binder: crate::ccl::FunBinder::Whole(position.clone()),
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
@@ -1902,7 +1916,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
         Type::pi_kinded(b, (*domain).clone(), value, fun_kind)
     } else {
         Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind,
             domain: domain.clone(),
             codomain: Box::new(body.ty.clone()),
@@ -1915,7 +1929,10 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
 /// The collection a [`pointwise_view`] reads and the steps it applies, in order; `None` where
 /// `e` is not one.
 pub(crate) fn pointwise_view_parts(e: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
-    let TypedExprNode::Lambda { param, body } = &e.node else {
+    let TypedExprNode::Lambda { params, body } = &e.node else {
+        return None;
+    };
+    let [param] = params.as_slice() else {
         return None;
     };
     let mut steps = Vec::new();
@@ -1948,10 +1965,13 @@ pub(crate) struct LoopParts<'a> {
 /// The parts of the loop `e` is ([`LoopParts`]); `None` where it is not one.
 pub(crate) fn loop_parts(e: &Expr) -> Option<LoopParts<'_>> {
     let TypedExprNode::Lambda {
-        param: position,
+        params: positions,
         body: step_at,
     } = &e.node
     else {
+        return None;
+    };
+    let [position] = positions.as_slice() else {
         return None;
     };
     let TypedExprNode::Apply {
@@ -1962,10 +1982,13 @@ pub(crate) fn loop_parts(e: &Expr) -> Option<LoopParts<'_>> {
         return None;
     };
     let TypedExprNode::Lambda {
-        param: element,
+        params: elements,
         body,
     } = &step.node
     else {
+        return None;
+    };
+    let [element] = elements.as_slice() else {
         return None;
     };
     let TypedExprNode::Apply {
@@ -2007,10 +2030,9 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
         site: None,
-        role: Default::default(),
     };
     let named = Type::Fun {
-        name: Some(position.name.clone()),
+        binder: crate::ccl::FunBinder::Whole(position.name.clone()),
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
@@ -2025,30 +2047,21 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
     let value = applied_type(&step.ty, &read);
     let ty = Type::fun_over(position.name.clone(), *domain, value.clone(), fun_kind);
     let body = Expr::apply(read, step).with_ty(value);
-    let TypedExprNode::Lambda { param, body } =
+    let TypedExprNode::Lambda { mut params, body } =
         Expr::lambda(position.name, position.occurrence, Type::Hole, body).node
     else {
         unreachable!("Expr::lambda builds a Lambda")
     };
-    Expr::new(TypedExprNode::Lambda {
-        param: TypedBinding {
-            ty: position.ty,
-            ..param
-        },
-        body,
-    })
-    .with_ty(ty)
+    params[0].ty = position.ty;
+    Expr::new(TypedExprNode::Lambda { params, body }).with_ty(ty)
 }
 
 /// The result of a function at `argument`, including its dependent codomain.
 pub(crate) fn applied_type(function: &Type, argument: &Expr) -> Type {
     match function.read_view().peel_refinements() {
         Type::Fun {
-            name: Some(x),
-            codomain,
-            ..
-        } => crate::ccl::subst::discharge_codomain(x, argument, codomain),
-        Type::Fun { codomain, .. } => (**codomain).clone(),
+            binder, codomain, ..
+        } => crate::ccl::subst::discharge_at_binder(binder, argument, codomain),
         other => panic!("an applied value is a function, got {other}"),
     }
 }
@@ -2059,9 +2072,10 @@ pub(crate) fn into_loop(e: Expr) -> Result<(TypedBinding, Expr, Expr), Box<Expr>
     if loop_parts(&e).is_none() {
         return Err(Box::new(e));
     }
-    let TypedExprNode::Lambda { param, body } = e.node else {
+    let TypedExprNode::Lambda { params, body } = e.node else {
         unreachable!("loop_parts matched a Lambda")
     };
+    let [param] = <[TypedBinding; 1]>::try_from(params).expect("loop_parts matched one position");
     let TypedExprNode::Apply { argument, function } = body.node else {
         unreachable!("loop_parts matched an Apply")
     };
@@ -2121,7 +2135,7 @@ fn chain_type_at(elts: &[Expr], types: &[Type], stated: Type) -> Type {
     let last_ty = crate::ccl::generalize::opened(last_ty);
     let (
         Type::Fun {
-            name: stated_name,
+            binder: stated_name,
             fun_kind,
             domain,
             ..
@@ -2135,7 +2149,7 @@ fn chain_type_at(elts: &[Expr], types: &[Type], stated: Type) -> Type {
         .iter()
         .map(|t| match crate::ccl::generalize::opened(t) {
             Type::Fun {
-                name: Some(b),
+                binder: crate::ccl::FunBinder::Whole(b),
                 domain,
                 ..
             } => Some((b.clone(), (**domain).clone())),
@@ -2150,7 +2164,7 @@ fn chain_type_at(elts: &[Expr], types: &[Type], stated: Type) -> Type {
     if !reads_a_position {
         return without_unread_binder(stated, elts, types);
     }
-    let position = chain_input_binder(elts, stated_name.as_ref(), &named);
+    let position = chain_input_binder(elts, stated_name.whole(), &named);
     // The reads are minted for the last morphism, whose codomain they restate.
     let _g = crate::ccl::provenance::enter(
         last.node_id(),
@@ -2195,7 +2209,7 @@ pub(crate) fn chain_input_binder(
 /// that name itself. A binder no type reads is no part of the chain's type.
 fn without_unread_binder(stated: Type, elts: &[Expr], types: &[Type]) -> Type {
     let Type::Fun {
-        name: Some(k),
+        binder: crate::ccl::FunBinder::Whole(k),
         fun_kind,
         domain,
         codomain,
@@ -2205,7 +2219,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr], types: &[Type]) -> Type {
         return stated;
     };
     let head_binds = types.first().is_some_and(
-        |head| matches!(crate::ccl::generalize::opened(head), Type::Fun { name: Some(h), .. } if h == k),
+        |head| matches!(crate::ccl::generalize::opened(head), Type::Fun { binder: crate::ccl::FunBinder::Whole(h), .. } if h == k),
     );
     if crate::ccl::subst::references_enclosing_function(codomain)
         || (!head_binds && elts.iter().any(|e| is_free(k, e)))
@@ -2213,7 +2227,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr], types: &[Type]) -> Type {
         return stated;
     }
     Type::Fun {
-        name: None,
+        binder: crate::ccl::FunBinder::None,
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
@@ -2275,13 +2289,13 @@ pub(crate) fn read_at_position(
             // one keeps the type it states.
             let stated = match Type::fun_like(&many[0].ty, head_domain, item.clone()) {
                 Type::Fun {
-                    name: Some(b),
+                    binder: crate::ccl::FunBinder::Whole(b),
                     fun_kind,
                     domain,
                     codomain,
                     capabilities,
                 } => Type::Fun {
-                    name: Some(b.refreshed()),
+                    binder: crate::ccl::FunBinder::Whole(b.refreshed()),
                     fun_kind,
                     domain,
                     codomain,
@@ -2667,7 +2681,7 @@ pub fn refined_data_fun(
     // source, so nothing ever told it whether it was a sum and materialization decided from
     // the domain.
     Type::Fun {
-        name: None,
+        binder: crate::ccl::FunBinder::None,
         fun_kind,
         domain: Box::new(Type::refined_one(
             base_domain,

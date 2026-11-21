@@ -1627,8 +1627,11 @@ fn below_last_let(
     chain
 }
 
-/// `N::c`, the function `λ __ctor_arg : payload → N::c(__ctor_arg)` a constructor that
-/// declares parameters is.
+/// `N::c`, the function a constructor that declares parameters is: of one,
+/// `λ __ctor_arg : T → N::c(__ctor_arg)`, and of several, their list,
+/// `λ (__ctor_arg_0 : T₀, …) → N::c((__ctor_arg_0, …))`, its payload the tuple of them
+/// (`docs/chl-spec.md`, "Parameter lists"). The parameters' annotations discharge the payload's
+/// refinements.
 fn bind_constructor(
     decl: &Rc<NominalDecl>,
     ctor: &NominalCtor,
@@ -1636,8 +1639,23 @@ fn bind_constructor(
     ctx: &mut LoweringContext,
 ) -> Expr {
     let label = "lower.nominal_ctor";
-    let arg = "__ctor_arg";
-    let payload = ctx.tag_machinery(Expr::var(arg), ctor.span, label);
+    let params: Vec<(String, Type)> = match ctor.params.as_slice() {
+        [(_, ty)] => vec![("__ctor_arg".to_string(), ty.clone())],
+        several => several
+            .iter()
+            .enumerate()
+            .map(|(i, (_, ty))| (format!("__ctor_arg_{i}"), ty.clone()))
+            .collect(),
+    };
+    let mut parts: Vec<Expr> = params
+        .iter()
+        .map(|(p, _)| ctx.tag_machinery(Expr::var(p.as_str()), ctor.span, label))
+        .collect();
+    let payload = if parts.len() == 1 {
+        parts.pop().expect("one parameter")
+    } else {
+        ctx.tag_machinery(Expr::tuple(parts), ctor.span, label)
+    };
     let value = ctx.tag_machinery(
         Expr::nominal_ctor(Rc::clone(decl), ctor.name.as_str(), payload),
         ctor.span,
@@ -1652,17 +1670,8 @@ fn bind_constructor(
     } else {
         ctx.occurrence_at(ctor.span)
     };
-    bind_function(
-        decl,
-        name,
-        binder,
-        arg,
-        ctor.payload(),
-        value,
-        acc,
-        ctor.span,
-        label,
-        ctx,
+    bind_function_of(
+        decl, name, binder, params, value, acc, ctor.span, label, ctx,
     )
 }
 
@@ -1818,17 +1827,17 @@ fn bind_value(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> E
 }
 
 /// `Option::unwrap_or`, the function
-/// `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, polymorphic
+/// `λ (𝑜 : Option(𝑇₁), 𝑑 : 𝑇₂) → match 𝑜 { Option::some(𝑣) → 𝑣; Option::none → 𝑑 }`, polymorphic
 /// over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃`.
 ///
 /// The option's payload and the default each have their own parameter, so a call does not
 /// equate their types. Only the result's parameter, `𝑇₃`, lies above both. The result's
-/// refinement is the one the `match` derives, `(𝑝.0 ▷ ctor_is(Option::some) and __elem ==
-/// 𝑝.0 ▷ ctor_payload(Option::some)) or (𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`.
+/// refinement is the one the `match` derives, `(𝑜 ▷ ctor_is(Option::some) and __elem ==
+/// 𝑜 ▷ ctor_payload(Option::some)) or (𝑜 ▷ ctor_is(Option::none) and __elem == 𝑑)`.
 fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
     let label = "lower.option_unwrap_or";
     let span = decl.span;
-    let arg = "__unwrap_or_arg";
+    let (option, default) = ("__unwrap_or_option", "__unwrap_or_default");
     debug_assert!(
         !decl.has_family_params(),
         "`Option`'s one type parameter is not a family, so `Option(𝑇₁)` is its application"
@@ -1847,16 +1856,12 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
         below_result("T2"),
     ];
     let [t1, t2] = [&params[1], &params[2]].map(|p| Type::Param(Rc::clone(&p.param)));
-    let param_ty = Type::Tuple(vec![Type::Nominal(Rc::clone(decl), vec![t1]), t2]);
-    let component = |i: usize, ctx: &mut LoweringContext| {
-        let read = Expr::apply(
-            ctx.tag_machinery(Expr::var(arg), span, label),
-            ctx.tag_machinery(Expr::proj_index(i), span, label),
-        );
-        ctx.tag_machinery(read, span, label)
-    };
-    let scrutinee = component(0, ctx);
-    let default = component(1, ctx);
+    let arguments = vec![
+        (option.to_string(), Type::Nominal(Rc::clone(decl), vec![t1])),
+        (default.to_string(), t2),
+    ];
+    let scrutinee = ctx.tag_machinery(Expr::var(option), span, label);
+    let default = ctx.tag_machinery(Expr::var(default), span, label);
     let case = match_option(decl, scrutinee, Some(default), span, label, ctx);
     let name = member_binding(decl, UNWRAP_OR);
     let binder = Occurrence::mint();
@@ -1865,8 +1870,7 @@ fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) 
         Vec::new(),
         name,
         binder,
-        arg,
-        param_ty,
+        arguments,
         case,
         acc,
         span,
@@ -1982,6 +1986,26 @@ fn bind_function(
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
+    let params = vec![(arg.to_string(), param_ty)];
+    bind_function_of(decl, name, binder, params, value, acc, span, label, ctx)
+}
+
+/// [`bind_function`] over a parameter list, each parameter of the type it is paired with.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bind_function's parts, with its parameter list"
+)]
+fn bind_function_of(
+    decl: &NominalDecl,
+    name: String,
+    binder: Occurrence,
+    arguments: Vec<(String, Type)>,
+    value: Expr,
+    acc: Expr,
+    span: Span,
+    label: crate::ccl::provenance::RewriteLabel,
+    ctx: &mut LoweringContext,
+) -> Expr {
     // A constructor states the declaration's `requires` clause, so a call is checked
     // against it at its own types, and `extract` assumes it.
     let (params, requires) = match decl.requirements() {
@@ -1999,32 +2023,37 @@ fn bind_function(
         ),
     };
     bind_function_over(
-        params, requires, name, binder, arg, param_ty, value, acc, span, label, ctx,
+        params, requires, name, binder, arguments, value, acc, span, label, ctx,
     )
 }
 
-/// `let name = λ arg : param_ty → value in acc`, polymorphic over `params` under `requires`
-/// when there are any parameters. `binder` is the occurrence of `name` in the binding.
+/// `let name = λ (arg : ty, …) → value in acc` over the parameter list `arguments`, polymorphic
+/// over `params` under `requires` when there are any parameters. `binder` is the occurrence of
+/// `name` in the binding.
 #[allow(clippy::too_many_arguments)]
 fn bind_function_over(
     params: Vec<PolyParam>,
     requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
     name: String,
     binder: Occurrence,
-    arg: &str,
-    param_ty: Type,
+    arguments: Vec<(String, Type)>,
     value: Expr,
     acc: Expr,
     span: Span,
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    // The function and its parameter are the compiler's own, so their occurrences record
+    // The function and its parameters are the compiler's own, so their occurrences record
     // where the function is tagged, as does `binder` unless the caller recorded it.
-    let mut function = Expr::lambda(arg, Occurrence::mint(), Type::Hole, value);
-    if let TypedExprNode::Lambda { param, .. } = &mut function.node {
-        param.declare(Annotation::new(param_ty, Occurrence::mint()));
-    }
+    let arguments = arguments
+        .into_iter()
+        .map(|(arg, ty)| {
+            let mut param = TypedBinding::new_unannotated(arg.as_str(), Occurrence::mint());
+            param.declare(Annotation::new(ty, Occurrence::mint()));
+            param
+        })
+        .collect();
+    let function = Expr::lambda_of(arguments, value);
     let function = ctx.tag_machinery(function, span, label);
     let binding = if params.is_empty() {
         Expr::let_bind(name, binder, function, acc)
@@ -2369,7 +2398,13 @@ pub(super) fn lower_member_call(
             }
             None => {
                 let binding = named.reference(name, ctx);
-                super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
+                super::exprs::lower_application(
+                    Name::raw(&binding),
+                    span,
+                    args,
+                    super::exprs::Passing::Values,
+                    ctx,
+                )
             }
         },
     }
@@ -2560,8 +2595,7 @@ pub(super) struct ParameterBind {
 
 /// `body` with each of `binds` replaced by its position of the tuple `payload` names.
 ///
-/// Substituted rather than bound, as a multi-parameter function's parameters are
-/// (`functions::uncurry_params`): an arm whose body is a bare feed keeps that shape, which
+/// Substituted rather than bound: an arm whose body is a bare feed keeps that shape, which
 /// the feed fan-out over a loop's `match` reads (`channelize`'s
 /// `try_extract_fanout_feed`). The payload's name is minted, so no binder in `body` can
 /// capture it.
@@ -2571,8 +2605,8 @@ pub(super) fn bind_parameters(
     body: Expr,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    // Tagged at the parameter's name in the pattern, as `uncurry_params` tags a
-    // function's: the projection is what became of the name, so each use's interior
+    // Tagged at the parameter's name in the pattern: the projection is what became of the
+    // name, so each use's interior
     // resolves to where the pattern declares it (`src/ccl/design/ir.md`, "Source
     // locations on substituted parameter projections").
     let label = "lower.param_proj";
@@ -3135,7 +3169,7 @@ pub(super) fn lower_method_call(
         for a in args {
             parts.push(super::lower_expr(a, ctx)?);
         }
-        ctx.tag_machinery(Expr::tuple(parts), span, "lower.call_tuple")
+        ctx.tag_machinery(Expr::arguments(parts), span, "lower.call_tuple")
     };
     Ok(Expr::apply(argument, placeholder))
 }

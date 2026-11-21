@@ -244,7 +244,7 @@ impl TypeInferenceContext {
              (`{elem_ty}`) — pass the element type, not the whole source function"
         );
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource(name.to_string())),
             codomain: Box::new(elem_ty),
@@ -683,6 +683,17 @@ pub enum InferError {
         /// The functions, each calling the next.
         names: Vec<String>,
     },
+    /// A call passing a number of arguments other than the length of its function's parameter
+    /// list: a function is never partially applied, and a tuple passed as one argument does
+    /// not spread over a parameter list (`docs/chl-spec.md`, "Parameter lists").
+    CallArity {
+        /// The function's source name, when the callee is one.
+        function: Option<String>,
+        /// The length of its parameter list.
+        params: usize,
+        /// The arguments the call passes.
+        args: usize,
+    },
     /// A method call `x.m(𝑎…)` passing a number of arguments after its receiver other than
     /// the parameters the receiver type's method declares after `self`.
     MethodArity {
@@ -954,7 +965,7 @@ impl InferError {
                 fn erase_binder_spelling(ty: &mut Type) {
                     ty.walk_children_mut(erase_binder_spelling);
                     match ty {
-                        Type::Fun { name, .. } => *name = None,
+                        Type::Fun { binder, .. } => *binder = crate::ccl::FunBinder::None,
                         Type::DepTuple(components) => {
                             components.iter_mut().for_each(|(name, _)| *name = None);
                         }
@@ -1187,6 +1198,7 @@ impl InferError {
             | InferError::ConstantFamilyReadsBinder { .. }
             | InferError::AmbiguousReceiver { .. }
             | InferError::MethodArity { .. }
+            | InferError::CallArity { .. }
             | InferError::DefinitionCycle { .. }
             | InferError::MissingRequirement { .. }
             | InferError::MonomorphicPolyBinding { .. }
@@ -1946,6 +1958,18 @@ impl std::fmt::Debug for InferError {
                         .join(", ")
                 ),
             },
+            InferError::CallArity {
+                function,
+                params,
+                args,
+            } => write!(
+                f,
+                "{} takes {params} argument{}, got {args}",
+                function
+                    .as_ref()
+                    .map_or("this function".to_string(), |n| format!("`{n}`")),
+                if *params == 1 { "" } else { "s" }
+            ),
             InferError::MethodArity {
                 method,
                 params,
@@ -2255,13 +2279,8 @@ impl std::fmt::Debug for InferError {
                 site,
                 fed_elsewhere,
             } => {
-                let spelled = |names: &[Name]| {
-                    names
-                        .iter()
-                        .flat_map(|n| binder_spellings(n, predicate))
-                        .map(|n| format!("`{n}`"))
-                        .collect::<Vec<_>>()
-                };
+                let spelled =
+                    |names: &[Name]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>();
                 let between = match site {
                     JoinSite::Contribution => "between the target's declaration and the write",
                     JoinSite::Arm => "in the arm",
@@ -2421,6 +2440,8 @@ pub fn infer(
     }
     let (ty, inert) = ty?;
     ctx.inert = inert;
+    // Every call's arity is checked, so its argument list is the tuple it passes from here on.
+    expr.erase_argument_lists();
     // Read while the annotations that state each parameter's domain are still there.
     let mut errors = Vec::new();
     transactional_args_to_mut_params(expr, &mut errors);
@@ -2446,63 +2467,64 @@ fn transactional_args_to_mut_params(expr: &Expr, errors: &mut Vec<LocatedInferEr
             Some((written, _, HistoryKind::Overwrite)) if !matches!(written, Type::Txn)
         ) && matches!(param.ty.history_parts(), Some((Type::Txn, _, _)))
     }
-    // Each let-bound function's misread parameters, by their position in its curried chain.
-    fn functions(e: &Expr, out: &mut HashMap<Name, Vec<(usize, String)>>) {
+    /// A let-bound function's misread parameters, by their position in its parameter list,
+    /// and how many it has.
+    struct Misread {
+        arity: usize,
+        params: Vec<(usize, String)>,
+    }
+    fn functions(e: &Expr, out: &mut HashMap<Name, Misread>) {
         if let TypedExprNode::Let {
             binding,
             bound_expr,
             ..
         } = &e.node
+            && let TypedExprNode::Lambda { params, .. } = &bound_expr.node
         {
-            let mut at = Vec::new();
-            let mut level: &Expr = bound_expr;
-            let mut depth = 0;
-            while let TypedExprNode::Lambda { param, body } = &level.node {
-                if misread(param) {
-                    at.push((depth, param.name.base().to_string()));
-                }
-                level = body;
-                depth += 1;
-            }
+            let at: Vec<(usize, String)> = params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| misread(p))
+                .map(|(i, p)| (i, p.name.base().to_string()))
+                .collect();
             if !at.is_empty() {
-                out.insert(binding.name.clone(), at);
+                out.insert(
+                    binding.name.clone(),
+                    Misread {
+                        arity: params.len(),
+                        params: at,
+                    },
+                );
             }
         }
         e.walk_children(|child| functions(child, out));
     }
-    // An error at each argument a call passes to a misread parameter.
+    // An error at each argument a call passes to a misread parameter: the component of the
+    // call's argument tuple, or the argument whole where it is not one.
     fn calls(
         e: &Expr,
-        functions: &HashMap<Name, Vec<(usize, String)>>,
+        functions: &HashMap<Name, Misread>,
         called: &mut HashSet<Name>,
         errors: &mut Vec<LocatedInferError>,
     ) {
-        let mut arguments = Vec::new();
-        let mut head = e;
-        while let TypedExprNode::Apply { argument, function } = &head.node {
-            arguments.push(argument.as_ref());
-            head = function;
-        }
-        arguments.reverse();
-        if let TypedExprNode::Var(f) = &head.node
-            && let Some(params) = functions.get(f)
-            && !arguments.is_empty()
+        if let TypedExprNode::Apply { argument, function } = &e.node
+            && let TypedExprNode::Var(f) = &function.node
+            && let Some(misread) = functions.get(f)
         {
             called.insert(f.clone());
-            for (depth, param) in params {
-                if let Some(argument) = arguments.get(*depth) {
-                    errors.push(LocatedInferError::new(
-                        InferError::TransactionalArgToMutParam {
-                            param: param.clone(),
-                        },
-                        argument.node_id(),
-                    ));
-                }
+            for (index, param) in &misread.params {
+                let at = match &argument.node {
+                    TypedExprNode::Tuple(components) if misread.arity > 1 => &components[*index],
+                    _ => argument.as_ref(),
+                };
+                errors.push(LocatedInferError::new(
+                    InferError::TransactionalArgToMutParam {
+                        param: param.clone(),
+                    },
+                    at.node_id(),
+                ));
             }
-            for argument in arguments {
-                calls(argument, functions, called, errors);
-            }
-            return;
+            return calls(argument, functions, called, errors);
         }
         e.walk_children(|child| calls(child, functions, called, errors));
     }
@@ -2515,23 +2537,23 @@ fn transactional_args_to_mut_params(expr: &Expr, errors: &mut Vec<LocatedInferEr
         } = &e.node
             && called.contains(&binding.name)
         {
-            // Its calls are reported: past its own lambdas, the bodies may hold other functions.
-            let mut level: &Expr = bound_expr;
-            while let TypedExprNode::Lambda { body, .. } = &level.node {
-                level = body;
-            }
+            // Its calls are reported: past its own lambda, the body may hold other functions.
+            let level = match &bound_expr.node {
+                TypedExprNode::Lambda { body, .. } => body.as_ref(),
+                _ => bound_expr.as_ref(),
+            };
             uncalled(level, called, errors);
             return uncalled(body, called, errors);
         }
-        if let TypedExprNode::Lambda { param, .. } = &e.node
-            && misread(param)
-        {
-            errors.push(LocatedInferError::new(
-                InferError::TransactionalArgToMutParam {
-                    param: param.name.base().to_string(),
-                },
-                e.node_id(),
-            ));
+        if let TypedExprNode::Lambda { params, .. } = &e.node {
+            for param in params.iter().filter(|p| misread(p)) {
+                errors.push(LocatedInferError::new(
+                    InferError::TransactionalArgToMutParam {
+                        param: param.name.base().to_string(),
+                    },
+                    e.node_id(),
+                ));
+            }
         }
         e.walk_children(|child| uncalled(child, called, errors));
     }
@@ -2680,51 +2702,6 @@ impl Contract {
             }
         }
     }
-
-    /// The contract of a `def` of `arity` parameters that lowers curried, one
-    /// function per parameter (`uncurry_params` in `src/ccl/lower/functions.rs`),
-    /// as its callers apply it: one function of the tuple of its parameters. A
-    /// `def` of one parameter takes it alone either way.
-    pub fn uncurried(&self, arity: usize) -> Contract {
-        let uncurry = |ty: &Type| {
-            let mut domains = Vec::new();
-            // A call of the uncurried function applies every arrow, so it does what each
-            // of them does.
-            let mut capabilities = crate::ccl::capabilities::CapabilitySet::default();
-            let mut at = ty;
-            for _ in 0..arity {
-                let Type::Fun {
-                    name,
-                    domain,
-                    codomain,
-                    capabilities: arrow,
-                    ..
-                } = at
-                else {
-                    panic!("a curried `def` of {arity} parameters has {arity} arrows: `{ty}`");
-                };
-                assert!(
-                    name.as_ref()
-                        .is_none_or(|n| !crate::ccl::subst::codomain_depends_on(n, codomain)),
-                    "a curried `def`'s later parameters do not read an earlier one: `{ty}`"
-                );
-                domains.push((**domain).clone());
-                capabilities = capabilities.union(&arrow.set());
-                at = codomain;
-            }
-            Type::fun(Type::tuple(domains), at.clone())
-                .with_capabilities(crate::ccl::capabilities::Capabilities::known(capabilities))
-        };
-        match self {
-            _ if arity < 2 => self.clone(),
-            Contract::Scheme(scheme) => {
-                let mut scheme = scheme.clone();
-                scheme.poly.body = uncurry(&scheme.poly.body);
-                Contract::Scheme(scheme)
-            }
-            Contract::Type(ty) => Contract::Type(uncurry(ty)),
-        }
-    }
 }
 
 /// `ty` with each variable a module type parameter with no kind written is opened as
@@ -2746,10 +2723,9 @@ fn write_opened(ty: &mut Type, opened: &super::OpenedVars) {
 /// `ty`. Keeping it afterwards is not free, because it is a *raw* type from
 /// lowering — it never had holes filled, and no coalesce ever visited it — so a
 /// later pass that pattern-matches on it reads a shape from before inference ran.
-/// That shape is genuinely raw: a two-parameter `def f(a: Int, b)` reaches the end of
-/// inference with its uncurried parameter annotated `(Int, _)` — an un-erased
-/// `Type::Hole` that `collect_type_errors` does not walk, so nothing would report it.
-/// Clearing is what makes that unobservable instead of merely unread.
+/// A parameter annotation containing `_` still holds a raw `Type::Hole` after inference;
+/// the resolved type is stored separately. Later passes read the resolved type, so the raw
+/// annotation is removed rather than retained as a second, stale type.
 ///
 /// Nothing outlives the annotation: the one fact a later pass used to need from it
 /// — whether this binder is a mutable variable — is answered by
@@ -3072,10 +3048,12 @@ fn one_per_value(expr: &Expr, raised: Vec<LocatedInferError>) -> Vec<LocatedInfe
         fn go(&mut self, e: &'a Expr) -> bool {
             let mut below = false;
             match &e.node {
-                TypedExprNode::Lambda { param, body } => {
-                    self.scope.push((&param.name, e.node_id()));
+                TypedExprNode::Lambda { params, body } => {
+                    let base = self.scope.len();
+                    self.scope
+                        .extend(params.iter().map(|param| (&param.name, e.node_id())));
                     below |= self.go(body);
-                    self.scope.pop();
+                    self.scope.truncate(base);
                     self.join_open_child(e, body);
                 }
                 TypedExprNode::Cast { value, .. } => {
@@ -3194,14 +3172,16 @@ fn collect_expr_errors(
     // Binder-bearing variants emit per-binding type errors before descending
     // into their children; everything else just visits its direct children.
     match &expr.node {
-        TypedExprNode::Lambda { param, body, .. } => {
-            collect_type_errors(
-                &param.ty,
-                param.name.base(),
-                strictness,
-                &mut NodeErrors::new(errors, expr.node_id()),
-                seen_refinements,
-            );
+        TypedExprNode::Lambda { params, body } => {
+            for param in params {
+                collect_type_errors(
+                    &param.ty,
+                    param.name.base(),
+                    strictness,
+                    &mut NodeErrors::new(errors, expr.node_id()),
+                    seen_refinements,
+                );
+            }
             collect_expr_errors(body, strictness, errors, seen_refinements);
         }
         TypedExprNode::Let { binding, .. } => {
@@ -3661,7 +3641,8 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 ///    argument rule emission checks where it passes an argument by reference
 ///    ([`InferError::MutArgNotMutable`]).
 /// 2. `Mut` may not appear inside any composite type — only at a top-level
-///    binding/parameter/expression position or a function *domain*
+///    binding/parameter/expression position, a function *domain* or one of its
+///    parameters, and a call's argument or one of its arguments
 ///    ([`InferError::MutInCompositeType`]).
 ///
 /// There is no third rule about an *unannotated* binding holding a `Mut`. It was
@@ -3675,7 +3656,7 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     debug_assert_no_mut_var_let(expr);
     let mut errors = Vec::new();
-    check_mut_discipline_go(expr, &mut errors);
+    check_mut_discipline_go(expr, false, &mut errors);
     // A function returning a mutable variable carries it at the lambda, its binding and each
     // use, so a nested `Mut` is reported once per value.
     let (nested, mut errors): (Vec<_>, Vec<_>) = errors
@@ -3751,10 +3732,19 @@ fn check_no_nested_mut(
             check_no_nested_mut(value, false, at, errors);
             check_no_nested_mut(domain, false, at, errors);
         }
+        // A domain that is a product is a parameter list, each component a parameter.
         Type::Fun {
             domain, codomain, ..
         } => {
-            check_no_nested_mut(domain, true, at, errors);
+            match domain.peel_refinements() {
+                Type::Tuple(ts) => ts
+                    .iter()
+                    .for_each(|t| check_no_nested_mut(t, true, at, errors)),
+                Type::DepTuple(cs) => cs
+                    .iter()
+                    .for_each(|(_, t)| check_no_nested_mut(t, true, at, errors)),
+                _ => check_no_nested_mut(domain, true, at, errors),
+            }
             check_no_nested_mut(codomain, false, at, errors);
         }
         Type::Refinement(base, _) => check_no_nested_mut(base, allow_mut, at, errors),
@@ -3784,7 +3774,10 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
     );
 }
 
-fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
+/// `argument` says `expr` is a call's argument, under the `let`s A-normalization put around it:
+/// a tuple there is the call's arguments, each passed to one parameter, so a component may be a
+/// mutable variable as a parameter may.
+fn check_mut_discipline_go(expr: &Expr, argument: bool, errors: &mut Vec<LocatedInferError>) {
     // This node's own violations, stamped with its id below.
     let mut here: Vec<InferError> = Vec::new();
 
@@ -3819,7 +3812,16 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
     // Rule 2 on this node's own type. A forwarder's type is its tail's, so the
     // tail's own check already covers it — skip to avoid ancestor-chain dupes.
     if !forwards_tail {
-        check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), &mut here);
+        match (&expr.node, expr.ty.peel_refinements()) {
+            (TypedExprNode::Tuple(_) | TypedExprNode::Arguments(_), Type::Tuple(components))
+                if argument =>
+            {
+                for c in components {
+                    check_no_nested_mut(c, true, &|| symbolic(expr), &mut here);
+                }
+            }
+            _ => check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), &mut here),
+        }
     }
 
     // Rule 2 on the binder slots `walk_children` does not reach.
@@ -3829,44 +3831,25 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
         here.into_iter()
             .map(|e| LocatedInferError::new(e, expr.node_id())),
     );
-    expr.walk_children(|e| check_mut_discipline_go(e, errors));
+    match &expr.node {
+        TypedExprNode::Apply { function, argument } => {
+            check_mut_discipline_go(function, false, errors);
+            check_mut_discipline_go(argument, true, errors);
+        }
+        // An argument's `let`s pass it along as their body.
+        TypedExprNode::Let {
+            bound_expr, body, ..
+        } if argument => {
+            check_mut_discipline_go(bound_expr, false, errors);
+            check_mut_discipline_go(body, true, errors);
+        }
+        _ => expr.walk_children(|e| check_mut_discipline_go(e, false, errors)),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// How a diagnostic names `binder`, which `predicate` reads. A `def`'s parameters are bound as
-/// one tuple, which is named by the parameters the predicate projects out of it, or by all of
-/// them where it reads the tuple whole.
-fn binder_spellings(binder: &Name, predicate: &Expr) -> Vec<String> {
-    fn projected(binder: &Name, e: &Expr, out: &mut Vec<usize>) {
-        if let TypedExprNode::Apply { argument, function } = &e.node
-            && let TypedExprNode::Var(n) = &argument.node
-            && n == binder
-            && let TypedExprNode::Proj(crate::ccl::ProjKey::Index(i)) = &function.node
-        {
-            out.push(*i);
-        }
-        e.walk_children(|c| projected(binder, c, out));
-    }
-    let Some(positions) = binder.positions() else {
-        return vec![binder.to_string()];
-    };
-    let mut read = Vec::new();
-    projected(binder, predicate, &mut read);
-    read.sort_unstable();
-    read.dedup();
-    let read: Vec<String> = read
-        .into_iter()
-        .filter_map(|i| positions.get(i).map(ToString::to_string))
-        .collect();
-    if read.is_empty() {
-        positions.iter().map(ToString::to_string).collect()
-    } else {
-        read
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3886,7 +3869,7 @@ mod tests {
     #[test]
     fn defect_identity_ignores_sites_and_bound_binder_spelling() {
         let function = |name: &str| Type::Fun {
-            name: Some(name.into()),
+            binder: crate::ccl::FunBinder::Whole(name.into()),
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::String)),
@@ -3912,7 +3895,7 @@ mod tests {
     #[test]
     fn defect_identity_preserves_kinds_and_free_variables() {
         let function = |kind| Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: kind,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -4160,7 +4143,7 @@ mod tests {
         assert_eq!(
             ty,
             Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
@@ -4182,7 +4165,8 @@ mod tests {
         assert_eq!(ty, int_lit_ty(42));
         // Verify the lambda was annotated in place.
         if let TypedExprNode::Apply { function, .. } = &expr.node {
-            if let TypedExprNode::Lambda { param, .. } = &function.node {
+            if let TypedExprNode::Lambda { params, .. } = &function.node {
+                let param = &params[0];
                 assert_eq!(param.ty, int_lit_ty(42));
             } else {
                 panic!("expected Lambda in function position");
@@ -4279,15 +4263,14 @@ mod tests {
         // but leaves p._1 unconstrained — returns a Fun rather than erroring.
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "p".into(),
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(body),
         });
         let ty = infer(&mut expr, &mut ctx).expect("inference allows partially-constrained params");
@@ -4425,7 +4408,7 @@ mod tests {
         assert_eq!(
             ty,
             Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
@@ -4433,7 +4416,8 @@ mod tests {
             }
         );
         // The param.ty was filled in as Int.
-        if let TypedExprNode::Lambda { param, .. } = &expr.node {
+        if let TypedExprNode::Lambda { params, .. } = &expr.node {
+            let param = &params[0];
             assert_eq!(param.ty, Type::Base(BaseType::Int));
         } else {
             panic!("expected Lambda");
@@ -4484,7 +4468,7 @@ mod tests {
     fn test_infer_list_param_consumed_by_aggregate() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4494,8 +4478,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
         let ty = infer(&mut expr, &mut ctx).expect("consuming a List param type-checks");
@@ -4518,7 +4501,7 @@ mod tests {
     fn test_infer_list_to_list_ascription() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4528,8 +4511,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
                 Occurrence::mint(),
@@ -4543,7 +4525,7 @@ mod tests {
         // The codomain still flows: a List(Int) is not a List(Str).
         let mut ctx = TypeInferenceContext::new();
         let mut bad = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4553,8 +4535,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
                 Occurrence::mint(),
@@ -4580,7 +4561,7 @@ mod tests {
     fn test_infer_list_param_annotation_round_trips() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4590,8 +4571,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::var("xs")),
         });
         let ty = infer(&mut expr, &mut ctx).expect("List(Int) param annotation round-trips");
@@ -4624,15 +4604,14 @@ mod tests {
         ] {
             let mut ctx = TypeInferenceContext::new();
             let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-                param: TypedBinding {
+                params: vec![TypedBinding {
                     occurrence: Occurrence::mint(),
                     name: "m".into(),
                     ty: Type::infer(),
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
-                },
+                }],
                 body: Box::new(Expr::var("m")),
             });
             let ty = infer(&mut expr, &mut ctx).expect("a `Map` param round-trips");
@@ -4686,7 +4665,7 @@ mod tests {
     fn test_infer_collection_param_and_consume() {
         let mut ctx = TypeInferenceContext::new();
         let mut ident = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4696,8 +4675,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::var("xs")),
         });
         let ty = infer(&mut ident, &mut ctx).expect("Collection param round-trips");
@@ -4712,7 +4690,7 @@ mod tests {
 
         let mut ctx = TypeInferenceContext::new();
         let mut consume = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
@@ -4722,8 +4700,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
         let ty = infer(&mut consume, &mut ctx).expect("consuming a Collection type-checks");
@@ -4787,7 +4764,6 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
             body: Box::new(Expr::var("x")),
@@ -5460,15 +5436,14 @@ mod tests {
                 Expr::var("s"),
             );
             let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-                param: TypedBinding {
+                params: vec![TypedBinding {
                     occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::infer(),
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
-                },
+                }],
                 body: Box::new(Expr::apply(Expr::var("x"), inner)),
             });
             infer_bare(&mut expr, &mut ctx).expect_err("Int and String cannot meet")
@@ -5507,7 +5482,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
-                param: TypedBinding {
+                params: vec![TypedBinding {
                     occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::infer(),
@@ -5517,8 +5492,7 @@ mod tests {
                     )),
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
-                },
+                }],
                 body: Box::new(Expr::var("x")),
             })),
             argument: Box::new(Expr::lit(Lit::Int(42))),
@@ -5544,7 +5518,7 @@ mod tests {
     fn test_infer_annotation_used_when_no_body_constraint() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::infer(),
@@ -5554,22 +5528,22 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::lit(Lit::Unit)),
         });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
             Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Unit)),
                 capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
-        if let TypedExprNode::Lambda { param, .. } = &expr.node {
+        if let TypedExprNode::Lambda { params, .. } = &expr.node {
+            let param = &params[0];
             assert_eq!(param.ty, Type::Base(BaseType::Int));
         }
     }
@@ -5585,7 +5559,7 @@ mod tests {
         ctx.register_source_type("mystream", Type::Base(BaseType::String));
         // Registration constructs the source's data function from the element type.
         let source_ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
@@ -5770,14 +5744,14 @@ mod tests {
         ctx.register_source_type("ints", Type::Base(BaseType::Int));
         ctx.register_source_type("strs", Type::Base(BaseType::String));
         let int_ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("ints".into())),
             codomain: Box::new(Type::Base(BaseType::Int)),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let str_ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("strs".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
@@ -6013,19 +5987,18 @@ mod tests {
     #[test]
     fn test_check_fully_typed_ok_nested() {
         let lambda = Expr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
         .with_ty(Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -6102,19 +6075,18 @@ mod tests {
         // The Apply node itself has a concrete type, but the argument still has Hole.
         let arg = Expr::lit(Lit::Int(42)); // ty: Hole
         let func = Expr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
         .with_ty(Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -6160,19 +6132,18 @@ mod tests {
         // The lambda's own type is concrete, but the param still holds an Infer var.
         // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
         let expr = Expr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Infer(var), // unsolved
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
         .with_ty(Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -6192,7 +6163,7 @@ mod tests {
     fn test_check_fully_typed_hole_inside_fun_type() {
         // The node type is Fun(Hole, Int) — the Hole is inside the compound type.
         let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Hole),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -6435,7 +6406,7 @@ mod tests {
         let int_elem = Expr::lit(Lit::Int(1)).with_ty(Type::Base(BaseType::Int));
         let str_elem = Expr::lit(Lit::String("hello".into())).with_ty(Type::Base(BaseType::String));
         let list_ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -6462,19 +6433,18 @@ mod tests {
         // with the Apply node given type String.  The argument is Int but the
         // domain is String — typecheck must detect this.
         let lambda = Expr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::String),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
         })
         .with_ty(Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::String)),
             codomain: Box::new(Type::Base(BaseType::String)),

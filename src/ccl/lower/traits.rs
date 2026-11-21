@@ -131,8 +131,7 @@ fn instance_function(
         ));
     }
     let arity = declared.signature.inputs.len();
-    // A pass-by-reference argument is lowered as one, a bare mutable variable or feed, whatever
-    // the arity: a single one's application is the one a tupled call builds.
+    // A pass-by-reference argument is lowered as one, a bare mutable variable or feed.
     let by_reference = declared
         .signature
         .inputs
@@ -177,35 +176,8 @@ pub(super) fn lower_instance_member_call(
             ),
         ));
     }
-    if by_reference {
-        return apply_by_reference(f, span, args, ctx);
-    }
-    apply_to_arguments(f, span, args, ctx)
-}
-
-/// `function` applied to `args`: to the one argument, or to the tuple of several, as every
-/// call lowers.
-pub(super) fn apply_to_arguments(
-    function: Expr,
-    span: Span,
-    args: &[Spanned<ChlExpr>],
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    let argument = match args {
-        [one] => lower_expr(one, ctx)?,
-        several => {
-            let parts = several
-                .iter()
-                .map(|a| lower_expr(a, ctx))
-                .collect::<Result<Vec<_>, _>>()?;
-            let args_span = several
-                .first()
-                .zip(several.last())
-                .map_or(span, |(first, last)| first.span.join(last.span));
-            ctx.tag_machinery(Expr::tuple(parts), args_span, "lower.call_tuple")
-        }
-    };
-    Ok(Expr::apply(argument, function))
+    let passing = Passing::of(by_reference);
+    apply_to_args(args, span, passing, ctx, |_| Ok(f))
 }
 
 /// What lowering keeps of an instance a module declares, for its `instance` block's `def`s,

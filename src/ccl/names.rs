@@ -123,7 +123,10 @@ pub enum SyntheticKind {
     FloatedDefer,
     /// The fresh binder the solver mints for a dependent application's
     /// expected Pi type (`(__arg: d) ⇒ result`), discharged to the argument.
-    SolverArg,
+    /// Carries the variable the application passes for it, where the argument is
+    /// one, so a message writes a type reading the binder with that variable's
+    /// spelling. (Boxed for the reason [`SyntheticKind::Mono`] is.)
+    SolverArg(Option<Box<Name>>),
     /// An administrative binding minted by A-normalization
     /// ([`crate::ccl::anf`]) to name a compound sub-expression that ANF
     /// requires be atomic in its position.
@@ -156,7 +159,7 @@ impl SyntheticKind {
             SyntheticKind::Pair => "__pair",
             SyntheticKind::Mono(_) => "__mono",
             SyntheticKind::FloatedDefer => "__floated",
-            SyntheticKind::SolverArg => "__arg",
+            SyntheticKind::SolverArg(_) => "__arg",
             SyntheticKind::AnfTemp => "__anf",
             SyntheticKind::MutRead => "__read",
             SyntheticKind::IterRecord => "__iter_record",
@@ -190,6 +193,10 @@ impl SyntheticKind {
 pub struct PiRef {
     /// Codomain crossings between the reference and the function binding it.
     pub index: u32,
+    /// The parameter of a function's parameter list the reference reads
+    /// (`FunBinder::Parameters`), or the component of its one input a projection of it reads,
+    /// and `None` for a read of the whole input. Part of the identity, as `index` is.
+    pub component: Option<u32>,
     /// The binder's spelling where the closing happened. Display only.
     ///
     /// Boxed to keep [`Name`] at the width its `Unique` variant already needs:
@@ -208,13 +215,17 @@ impl PiRef {
     /// ([`Name::pi_bound`]), so this is for a test naming a reference directly, and
     /// what it exercises is that the spelling decides nothing.
     pub fn bare(index: u32) -> Self {
-        PiRef { index, hint: None }
+        PiRef {
+            index,
+            component: None,
+            hint: None,
+        }
     }
 }
 
 impl PartialEq for PiRef {
     fn eq(&self, other: &Self) -> bool {
-        self.index == other.index
+        (self.index, self.component) == (other.index, other.component)
     }
 }
 
@@ -228,13 +239,13 @@ impl PartialOrd for PiRef {
 
 impl Ord for PiRef {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.index.cmp(&other.index)
+        (self.index, self.component).cmp(&(other.index, other.component))
     }
 }
 
 impl std::hash::Hash for PiRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.index.hash(state);
+        (self.index, self.component).hash(state);
     }
 }
 
@@ -245,12 +256,6 @@ pub struct UniqueMeta {
     /// for any other binder: a local, or a member of the root (`docs/modules.md`,
     /// "Names carry their home").
     home: Option<Arc<Home>>,
-    /// What each position of the tuple it binds reads as, for the tuple binder a
-    /// `def` of several parameters lowers to (`uncurry_params` in
-    /// `src/ccl/lower/functions.rs`): the parameters' spellings, in order.
-    /// Diagnostic formatting has neither source text nor a provenance projection. Keeping
-    /// the spellings on the name preserves them when predicates inside types are copied.
-    positions: Option<Box<[SmolStr]>>,
 }
 
 /// Where a module's top-level member lives (`docs/modules.md`, "Names carry
@@ -505,25 +510,7 @@ impl Name {
         Name::Unique {
             base: base.into(),
             uid: Uid::fresh(),
-            meta: home.map(|home| {
-                Arc::new(UniqueMeta {
-                    home: Some(home),
-                    positions: None,
-                })
-            }),
-        }
-    }
-
-    /// [`Name::fresh`] for a binder of a tuple whose position `i` reads as
-    /// `positions[i]` ([`Self::positions`]).
-    pub fn fresh_tuple(base: impl Into<SmolStr>, positions: Vec<SmolStr>) -> Self {
-        Name::Unique {
-            base: base.into(),
-            uid: Uid::fresh(),
-            meta: Some(Arc::new(UniqueMeta {
-                home: None,
-                positions: Some(positions.into_boxed_slice()),
-            })),
+            meta: home.map(|home| Arc::new(UniqueMeta { home: Some(home) })),
         }
     }
 
@@ -548,17 +535,6 @@ impl Name {
             Name::Unique {
                 meta: Some(meta), ..
             } => meta.home.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// What each position of the tuple this binds reads as, for a binder minted by
-    /// [`Self::fresh_tuple`].
-    pub fn positions(&self) -> Option<&[SmolStr]> {
-        match self {
-            Name::Unique {
-                meta: Some(meta), ..
-            } => meta.positions.as_deref(),
             _ => None,
         }
     }
@@ -615,9 +591,10 @@ impl Name {
     }
 
     /// The solver's fresh dependent-application binder
-    /// (`(__arg: d) ⇒ result`, discharged to the argument).
-    pub fn solver_arg() -> Self {
-        Self::synthetic(SyntheticKind::SolverArg)
+    /// (`(__arg: d) ⇒ result`, discharged to the argument), carrying the variable
+    /// passed for it where the argument is one.
+    pub fn solver_arg(passed: Option<&Name>) -> Self {
+        Self::synthetic(SyntheticKind::SolverArg(passed.cloned().map(Box::new)))
     }
 
     /// A-normalization's fresh binder for a compound sub-expression hoisted
@@ -754,8 +731,7 @@ impl Name {
     /// compiler minted.
     ///
     /// The spelling is the test because user code cannot bind a
-    /// double-underscore name, which `lower::TUPLE_ARG_PREFIX` and the other
-    /// minted prefixes already rely on. A minted binder's identity is its uid,
+    /// double-underscore name, which the minted prefixes already rely on. A minted binder's identity is its uid,
     /// and which uid it gets depends on how many the passes before it minted, so
     /// nothing outside one compilation can address it.
     ///
@@ -836,6 +812,17 @@ impl Name {
     pub fn pi_bound(index: u32, binder: &Name) -> Self {
         Name::PiBound(PiRef {
             index,
+            component: None,
+            hint: Some(binder.base().into()),
+        })
+    }
+
+    /// A reference to component `component` of the input of the function `index` crossings
+    /// out, a `FunBinder::Parameters` naming it `binder`.
+    pub fn pi_component(index: u32, component: u32, binder: &Name) -> Self {
+        Name::PiBound(PiRef {
+            index,
+            component: Some(component),
             hint: Some(binder.base().into()),
         })
     }
@@ -850,6 +837,14 @@ impl Name {
     pub fn pi_bound_index(&self) -> Option<u32> {
         match self {
             Name::PiBound(r) => Some(r.index),
+            _ => None,
+        }
+    }
+
+    /// The component a [`Name::PiBound`] reference reads, if it reads one.
+    pub fn pi_bound_component(&self) -> Option<u32> {
+        match self {
+            Name::PiBound(r) => r.component,
             _ => None,
         }
     }
@@ -899,7 +894,14 @@ impl From<&Name> for Name {
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
+            Name::PiBound(PiRef {
+                index,
+                component,
+                hint: None,
+            }) => match component {
+                None => write!(f, "#{index}"),
+                Some(j) => write!(f, "#{index}.{j}"),
+            },
             Name::Reserved(ReservedName::Elem(up)) if *up > 0 => write!(f, "__elem^{up}"),
             // An imported module's or a run's member renders qualified, in every
             // module's diagnostics alike.
@@ -1053,17 +1055,17 @@ mod tests {
             } if *src == Name::raw("f")
         ));
         assert_eq!(Name::floated().base(), "__floated");
-        assert_eq!(Name::solver_arg().base(), "__arg");
+        assert_eq!(Name::solver_arg(None).base(), "__arg");
         // Different kinds never collide even if uids ever coincided.
         assert!(matches!(
-            Name::solver_arg(),
+            Name::solver_arg(None),
             Name::Synthetic {
-                kind: SyntheticKind::SolverArg,
+                kind: SyntheticKind::SolverArg(_),
                 ..
             }
         ));
         // A source binder spelled like a stem is a different variant.
-        assert_ne!(Name::solver_arg(), Name::fresh("__arg"));
+        assert_ne!(Name::solver_arg(None), Name::fresh("__arg"));
     }
 
     #[test]

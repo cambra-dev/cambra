@@ -162,7 +162,7 @@ pub fn prim(b: BaseType) -> Type {
 /// Build a function [`Type`] from domain and codomain.
 pub fn fun(d: Type, c: Type) -> Type {
     Type::Fun {
-        name: None,
+        binder: crate::ccl::FunBinder::None,
         fun_kind: crate::ccl::ty::FunKind::Compute,
         domain: Box::new(d),
         codomain: Box::new(c),

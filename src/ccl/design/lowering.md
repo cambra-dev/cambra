@@ -9,45 +9,39 @@ subsequent `uniquify` pass assigns distinct identities to binders; see
 
 ## Lambda expressions and function definitions
 
-A one-parameter lambda lowers to one `Lambda`, such as `λ x → body`. An ordinary multi-parameter
-lambda or `def` also lowers to one `Lambda`. Its parameter is a fresh synthetic tuple name, and
-each use of a source parameter becomes a projection of that tuple. For a two-parameter function
-whose body is `x + y`, the result is `λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1`.
-A call `f(a, b)` packs its arguments and applies once: `(a, b) ▷ f`. A single-argument call
-applies its argument directly. Ordinary call targets must be names.
+A lambda or a `def` lowers to one `Lambda` over its parameter list, each parameter a named binder:
+`\x, y -> x + y` is `λ (x, y) → x + y` (`lower_params` in `lower/functions.rs`). The argument is the
+product of the parameters' types (`Type::params_domain`): one parameter binds the whole argument,
+several bind the components of a tuple, and none binds the unit. A call `f(a, b)` packs its
+arguments and applies once, `(a, b) ▷ f`; a single-argument call applies its argument directly, and
+a call with none applies the unit. A tuple holding the arguments is one value, so `f(p)` for a pair
+`p` is the same call. Ordinary call targets must be names.
 
-`LoweringContext::fresh_tuple_arg` gives each tuple parameter a distinct reserved name. The
-projection substitution traverses expression and type slots, including refinement predicates, and
-respects inner binders. Distinct reserved names prevent an outer tuple reference from being captured
-by a nested multi-parameter lambda. Substitution preserves each parameter occurrence's source site.
-Direct projection substitution avoids introducing `Let` bindings under the lambda. Such bindings
-would be lifted by `lambda_elim` into morphisms that current simplification does not reduce to the
-required bare projections.
+A parameter's annotation stays on its binding, and a later parameter's annotation may read an
+earlier parameter, which `uniquify` resolves with the parameters before it bound. A `def` output
+annotation inserts an annotated binding for `__output` inside the lambda body, so its refinement
+predicate can refer to the parameters. `opaque_output` renames the binder to the synthetic result
+binder it mints itself, so later passes read a lambda's result through one binder
+(`opaque_output::output_body`).
 
-Parameters with ordinary annotations retain those annotations on the lambda binding. For a tupled
-function, the binding carries a tuple of parameter annotations, with `Type::Hole` in unannotated
-positions. A `def` output annotation inserts an annotated binding for `__output` inside the lambda
-body. Its refinement predicate can therefore refer to function parameters. `opaque_output` renames
-the binder to the synthetic result binder it mints itself, so later passes read a lambda's result
-through one binder (`opaque_output::output_body`).
+A `Mut(…)` or `Feed(…)` parameter is a binder like any other, stamped with a history type whose
+domain inference fills; a transactional `Mut(…, Txn)` parameter fixes its domain to `Txn`. A mutable
+write and a feed keep the parameter name as their target, and inlining substitutes the caller's
+mutable variable or channel for it from the call's argument tuple. A call of such a function lowers
+each argument that is a bare name as the variable it names (`Passing::ByReference`), bypassing the
+out-of-block read gate a value read takes; inference decides from the callee's parameter types
+which components pass by reference.
 
-A function with a `Mut(…)` or `Feed(…)` parameter uses named, curried lambdas instead. A mutable
-write and a feed each keep the parameter name as their target; a tuple projection cannot be a
-`MutWrite` or `Feed` target. Calls to these functions use successive applications, so inlining can
-substitute the caller's mutable variable or channel at each named binder before lambda elimination.
-The outer lambda has `BindingRole::FunctionParameter`; generated curried continuations have
-`BindingRole::Temporary`. These roles identify the parameters of one source signature for
-contribution inference.
-`Mut(…)` and `Feed(…)` parameter annotations stamp history types with inferred domains; a
-transactional `Mut(…, Txn)` parameter fixes its domain to `Txn`. Other parameters retain their
-annotations.
+A call passing other than one argument lowers them as its argument list
+(`TypedExprNode::Arguments`), `f()` included, so that inference can tell it from a tuple passed as
+one argument (`docs/chl-spec.md`, "Parameter lists"). Inference types a lambda of other than one
+parameter as a function of their parameter list, its codomain reading each parameter by its name
+(`Type::fun_of_params`), and inlining substitutes the arguments of each call for them, so a lambda
+left past inlining binds one parameter, the form `lambda_elim` eliminates.
 
-The ordinary tuple shape prevents syntactic multi-argument functions from producing a nested
-lambda chain that `lambda_elim` would turn into `curry`. Explicitly nested lambdas can still
-produce that internal combinator and are not generally compilable through operator conversion.
-CHL has no built-in surface `curry` function.
-Function and lambda parameters must be nonempty. The parser rejects variadic, keyword-only, and
-default parameters.
+Explicitly nested lambdas can still produce the internal `curry` combinator and are not generally
+compilable through operator conversion. CHL has no built-in surface `curry` function.
+The parser rejects variadic, keyword-only, and default parameters.
 
 ## Builtin calls
 
@@ -58,7 +52,7 @@ arity is refused. A call of the `Qualifier`-kind `summon` is refused: the parser
 `summon(T)::f` itself. Any other name, including a builtin of another kind, lowers as a call to a
 registered source when one has that name and as an ordinary application otherwise. An ordinary
 application with no arguments applies the callee to the unit, `f()` → `unit ▷ f`, and a function of
-no parameters binds the unit (`uncurry_params`). A `@Builtin` function of a std module's top level
+no parameters binds nothing of the unit (`lower_params`). A `@Builtin` function of a std module's top level
 takes the body the compiler supplies for its path, a `Reading` node (`builtin_body`). The `with`
 block recognizes `begin`, and `sink_declaration` recognizes `http_serve` and `test_sink`, both
 through the same table.
@@ -171,10 +165,8 @@ the two is an error. Feed and define expressions have type `Unit`.
 `x: Feed(V)` becomes `let x : Feed(V) = Defer in body`, the `Defer` imaging the annotation
 (`feed_declaration` in `lower/stmts.rs`). A declaration with any other annotation is refused, since
 only a feed is introduced with no value. A feed or define in statement position is sequenced through
-`ExprStmt`. A function of several parameters substitutes a projection of its argument tuple for each
-parameter, but binds one its body feeds to that projection (`uncurry_params`), since a feed targets
-a name. Inlining folds a projection of a tuple or record literal holding a feed handle, so the
-binding becomes an alias of the handle the caller passed. A top-level
+`ExprStmt`. A `Feed(…)` parameter is a named binder, so inlining substitutes the handle the caller
+passed for it. A top-level
 `𝑝 = http_serve(port, method, path)` binds `𝑝` to the tuple `(Source(requests), responses)`, where
 `responses` names a `Defer` that a `let` around the statement binds. Both names are minted from the
 route, and `responses` is the sink's name for compilation, so the program's sink record reads the

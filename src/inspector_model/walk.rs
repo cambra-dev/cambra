@@ -71,7 +71,14 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Cast { .. } => "Cast".to_string(),
         BinOp { op, .. } => format!("BinOp({op:?})"),
         UnaryOp(op, _) => format!("UnaryOp({op:?})"),
-        Lambda { param, .. } => format!("Lambda({})", param.name),
+        Lambda { params, .. } => format!(
+            "Lambda({})",
+            params
+                .iter()
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Aggregate { kind, .. } => format!("Aggregate({kind:?})"),
         Let { binding, .. } => format!("Let({})", binding.name),
         List(_) => "List".to_string(),
@@ -97,6 +104,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         LetType { name, .. } => format!("LetType({name})"),
         Run { name, .. } => format!("Run({name})"),
         Tuple(_) => "Tuple".to_string(),
+        Arguments(_) => "Arguments".to_string(),
         Proj(k) => format!("Proj({k:?})"),
         Record(_) => "Record".to_string(),
         Source(s, keys) if keys.is_empty() => format!("Source({s})"),

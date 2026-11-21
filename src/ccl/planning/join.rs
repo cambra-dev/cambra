@@ -66,10 +66,15 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
     }
     while let TypedExprNode::Apply { argument, function } = &cur.node
         && let TypedExprNode::Lambda {
-            param, body: inner, ..
+            params,
+            body: inner,
+            ..
         } = &function.node
     {
-        env.push((param.name.clone(), (**argument).clone()));
+        env.push((
+            crate::ccl::one_param(params).name.clone(),
+            (**argument).clone(),
+        ));
         cur = inner.as_ref();
     }
     decompose_join_bool(cur, &env, rec_ty, &mut eq_conds, &mut other_preds);
@@ -101,12 +106,13 @@ fn filter_nest_levels(predicate: &Expr) -> Option<(Vec<(Name, &Expr)>, &Expr)> {
     let mut level: &Expr = nest;
     for i in 0..n {
         let TypedExprNode::Lambda {
-            param: position,
+            params: positions,
             body,
         } = &level.node
         else {
             return None;
         };
+        let position = crate::ccl::one_param(positions);
         let TypedExprNode::Apply {
             argument: read,
             function: per_element,
@@ -125,12 +131,13 @@ fn filter_nest_levels(predicate: &Expr) -> Option<(Vec<(Name, &Expr)>, &Expr)> {
             return None;
         }
         let TypedExprNode::Lambda {
-            param: element,
+            params: elements,
             body: inner,
         } = &per_element.node
         else {
             return None;
         };
+        let element = crate::ccl::one_param(elements);
         levels.push((element.name.clone(), source.as_ref()));
         level = inner;
         if i + 1 == n {

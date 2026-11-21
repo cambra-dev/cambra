@@ -1038,7 +1038,7 @@ pub fn freshen_above(
                     }
                 })
                 .collect();
-            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
+            let opened = crate::ccl::subst::open_family_body(binders, body, |j| {
                 crate::ccl::subst::Mapping::Rename(renamed[j].clone())
             });
             let fresh_body = freshen_above(lim, &opened, target, cache);
@@ -1093,7 +1093,7 @@ pub fn freshen_above(
             Type::ChanDom(fresh, crate::ccl::ChanLevel(target.level_of(lvl.0)))
         }
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain: d,
             codomain: c,
@@ -1104,30 +1104,29 @@ pub fn freshen_above(
             // binder at two scopes. Cache-consistent, so the functions a scheme names alike
             // stay alike. A specialization clone keeps its definition's names; it stands
             // where the definition stood ([`FreshenCache::site_telescope`]).
-            let name = match (name, &cache.site_telescope) {
-                (Some(n), Some(_)) => Some(cache.binder_name(n)),
-                _ => name.clone(),
+            let binder = match (binder, &cache.site_telescope) {
+                (crate::ccl::FunBinder::Whole(n), Some(_)) => {
+                    crate::ccl::FunBinder::Whole(cache.binder_name(n))
+                }
+                (crate::ccl::FunBinder::Parameters(_), Some(_)) => {
+                    binder.map_names(|n| cache.binder_name(n))
+                }
+                _ => binder.clone(),
             };
             let fun_kind = freshen_fun_kind(fun_kind, lim, target, cache);
             let domain = freshen_above(lim, d, target, cache);
-            let codomain = match &name {
+            let codomain = if !binder.is_none() && holds_family_app(c) {
                 // An application of a family parameter discharges that parameter's
                 // binders to its terms by name, so a codomain holding one is freshened
                 // opened at the binder.
-                Some(b) if holds_family_app(c) => {
-                    let opened = crate::ccl::subst::open_pi_binder(
-                        &crate::ccl::subst::Mapping::Rename(b.clone()),
-                        c,
-                    );
-                    crate::ccl::subst::close_pi_binder(
-                        b,
-                        &freshen_above(lim, &opened, target, cache),
-                    )
-                }
-                _ => freshen_above(lim, c, target, cache),
+                let b = crate::ccl::subst::named_binder(&binder);
+                let opened = crate::ccl::subst::open_at_binder(&b, &domain, c);
+                crate::ccl::subst::close_at_binder(&b, &freshen_above(lim, &opened, target, cache))
+            } else {
+                freshen_above(lim, c, target, cache)
             };
             let out = Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
@@ -2002,7 +2001,7 @@ mod tests {
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
         let f = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&kv)),
             domain: Box::new(Type::Infer(InferVar::fresh(5))),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -2043,7 +2042,7 @@ mod tests {
         kind.place_at(0);
         let quantified = CapabilityVar::fresh(1);
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&kind)),
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -2097,7 +2096,7 @@ mod tests {
             Refinement::sharing(&predicate),
         );
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(refined_domain),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -2214,7 +2213,7 @@ mod copy_audit_tests {
         let captured = InferVar::fresh(0);
         let quantified = InferVar::fresh(1);
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::fresh_var(),
             domain: Box::new(Type::Tuple(vec![
                 Type::Infer(Rc::clone(&captured)),

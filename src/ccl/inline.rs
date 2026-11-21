@@ -86,7 +86,6 @@ use crate::ccl::{
 
 use crate::ccl::infer::solver::smt::{BinderScope, ScopeEnv, SmtError, smt_sub};
 use std::collections::HashSet;
-use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -105,9 +104,39 @@ use std::rc::Rc;
 /// Literal product projections fold here when the product holds a function or feed handle
 /// ([`fold_product_projection`]); `crate::ccl::simplify` folds ordinary data tuples.
 pub fn inline_compute_lambdas(expr: Expr) -> Expr {
-    let expr = inline_impl(expr, &mut BinderScope::default());
+    let mut expr = inline_impl(expr, &mut BinderScope::default());
+    reduce_parameter_list_calls_in_types(&mut expr, &PredMemo::new());
     let expr = crate::ccl::observe_world::eliminate(expr);
     inline_list_element_reads(expr, &PredMemo::new()).0
+}
+
+/// Beta-reduce each call of a lambda of a parameter list in the predicates `expr`'s types
+/// quote, as [`inline_impl`] does in the tree: a compiler instance's function called in a
+/// comprehension's filter stands there (`InstanceBody::build`), and past inlining a lambda
+/// binds one parameter.
+fn reduce_parameter_list_calls_in_types(expr: &mut Expr, memo: &PredMemo) {
+    fn reduce(expr: Expr) -> Expr {
+        let mut expr = expr;
+        expr.map_children(reduce);
+        if calls_a_parameter_list(&expr) {
+            return reduce(beta_reduce_folded_call(expr, &mut BinderScope::default()));
+        }
+        expr
+    }
+    fn holds(expr: &Expr) -> bool {
+        calls_a_parameter_list(expr) || expr.any_child(holds)
+    }
+    expr.walk_type_slots_mut(|ty| {
+        walk_quoted_terms_mut(ty, memo, &(), &mut |pred, _| {
+            if !holds(pred) {
+                return false;
+            }
+            let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
+            *pred = reduce(old);
+            true
+        });
+    });
+    expr.walk_children_mut(|child| reduce_parameter_list_calls_in_types(child, memo));
 }
 
 /// Refuse a call whose function the inliner could not resolve, pointing at the call.
@@ -284,6 +313,13 @@ fn calls_a_lambda(expr: &Expr) -> bool {
         if matches!(function.node, TypedExprNode::Lambda { .. }))
 }
 
+/// Whether `expr` calls a lambda of a parameter list other than one long, `args(𝑎, 𝑏) ▷
+/// (λ (𝑥, 𝑦) → body)`.
+fn calls_a_parameter_list(expr: &Expr) -> bool {
+    matches!(&expr.node, TypedExprNode::Apply { function, .. }
+        if matches!(&function.node, TypedExprNode::Lambda { params, .. } if params.len() != 1))
+}
+
 /// Beta-reduce `𝑎 ▷ (λ 𝑥 → body)` where the lambda reached call position by
 /// [`fold_product_projection`]: the callee was a projection of a product that held
 /// it, as in `use(\x -> x + 1, 1)` once `use`'s body reads its parameters.
@@ -293,18 +329,18 @@ fn calls_a_lambda(expr: &Expr) -> bool {
 /// The inliner leaves the latter for `lambda_elim`, whose comprehension and scalar
 /// shapes depend on it (`src/ccl/design/optimization.md`, "Substitution and
 /// beta-reduction"). The caller has also checked [`calls_a_lambda`].
-fn beta_reduce_folded_call(expr: Expr, scope: &BinderScope) -> Expr {
+fn beta_reduce_folded_call(expr: Expr, scope: &mut BinderScope) -> Expr {
     let node_id = expr.node_id();
     let own = expr.own_capabilities.clone();
     let TypedExprNode::Apply { function, argument } = expr.node else {
         unreachable!("beta_reduce_folded_call: not a call")
     };
-    let TypedExprNode::Lambda { param, body } = function.node else {
+    let TypedExprNode::Lambda { params, body } = function.node else {
         unreachable!("beta_reduce_folded_call: the callee is not a lambda")
     };
     beta_reduce(
         node_id,
-        param,
+        params,
         *body,
         *argument,
         "a lambda held in a product",
@@ -396,7 +432,6 @@ fn split_product_let(binding: &TypedBinding, product: Expr, body: Expr) -> Expr 
                 user_annotation: None,
                 transparency: binding.transparency,
                 site: None,
-                role: Default::default(),
             };
             Expr::let_in(component_binding, component, body)
         })
@@ -419,7 +454,7 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
         TypedExprNode::Let { binding, .. } if &binding.name == name => true,
         // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
-        TypedExprNode::Lambda { param, .. } if &param.name == name => true,
+        TypedExprNode::Lambda { params, .. } if params.iter().any(|p| &p.name == name) => true,
         // A LetRec with any group binder matching `name` is a definitive
         // bind site (the group scopes every binding body and the letrec body).
         TypedExprNode::LetRec { bindings, .. } if bindings.iter().any(|(b, _)| &b.name == name) => {
@@ -461,7 +496,8 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 /// - a [`TypedExprNode::MutWrite`] target, which is the write itself; and
 /// - a **handle** — a bare reference whose node carries the `Mut` history
 ///   rather than the value — in an [`TypedExprNode::Apply`]'s function or
-///   argument position, which is where a pass-by-reference writer takes it.
+///   argument position, or a component of a call's argument tuple, which is where a
+///   pass-by-reference writer takes it.
 ///   The callee's body is not in hand here: this pass expands a UDF at the
 ///   binding that holds it, which is above the call, so a call in `expr` is
 ///   still an unexpanded `Apply` when this runs.
@@ -473,7 +509,10 @@ fn is_mut_written(name: &Name, expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::MutWrite { name: target, .. } if target == name => true,
         TypedExprNode::Apply { function, argument }
-            if is_handle_to(function, name) || is_handle_to(argument, name) =>
+            if is_handle_to(function, name)
+                || is_handle_to(argument, name)
+                || matches!(&argument.node, TypedExprNode::Tuple(components)
+                    if components.iter().any(|c| is_handle_to(c, name))) =>
         {
             true
         }
@@ -1236,12 +1275,10 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
                 .collect(),
         ),
 
-        TypedExprNode::Lambda { param, body } => {
-            let body = scope.under(&param.name, param.ty.clone(), |scope| {
-                inline_impl(*body, scope)
-            });
+        TypedExprNode::Lambda { params, body } => {
+            let body = scope.under_params(&params, |scope| inline_impl(*body, scope));
             TypedExprNode::Lambda {
-                param,
+                params,
                 body: Box::new(body),
             }
         }
@@ -1266,7 +1303,10 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
             };
             expr.map_children(|child| inline_impl(child, scope));
             let expr = expr.absorbing_children_capabilities();
-            if calls_a_projection && calls_a_lambda(&expr) {
+            // A lambda of a parameter list called where it stands is a compiler instance's
+            // function (`InstanceBody::build`); it is reduced at its call as a `def` is, since
+            // past inlining a lambda binds one parameter.
+            if (calls_a_projection && calls_a_lambda(&expr)) || calls_a_parameter_list(&expr) {
                 return inline_impl(beta_reduce_folded_call(expr, scope), scope);
             }
             return fold_product_projection(expr);
@@ -1429,8 +1469,8 @@ fn inline_and_beta_reduce(
         let argument = inline_and_beta_reduce(*argument, name, lambda, scope, memo);
         let function = inline_and_beta_reduce(*function, name, lambda, scope, memo);
         match function.node {
-            TypedExprNode::Lambda { param, body } => {
-                return beta_reduce(node_id, param, *body, argument, name, scope)
+            TypedExprNode::Lambda { params, body } => {
+                return beta_reduce(node_id, params, *body, argument, name, scope)
                     .doing_of_its_own(&own_capabilities);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
@@ -1499,16 +1539,16 @@ fn inline_and_beta_reduce(
                 refuted,
             }
         }
-        TypedExprNode::Lambda { param, body } => {
-            if &param.name == name {
+        TypedExprNode::Lambda { params, body } => {
+            if params.iter().any(|p| &p.name == name) {
                 // shadowed — stop substituting inside
-                TypedExprNode::Lambda { param, body }
+                TypedExprNode::Lambda { params, body }
             } else {
-                let body = scope.under(&param.name, param.ty.clone(), |scope| {
+                let body = scope.under_params(&params, |scope| {
                     inline_and_beta_reduce(*body, name, lambda, scope, memo)
                 });
                 TypedExprNode::Lambda {
-                    param,
+                    params,
                     body: Box::new(body),
                 }
             }
@@ -1606,15 +1646,16 @@ fn inline_and_beta_reduce(
     .absorbing_children_capabilities()
 }
 
-/// Beta-reduce `argument ▷ (λ param → body)`, the `Apply` numbered `node_id`.
+/// Beta-reduce `argument ▷ (λ params → body)`, the `Apply` numbered `node_id`: one parameter
+/// takes the argument, several take its components, and none takes the unit.
 /// `callee` names the function the lambda came from, for the assertion message.
 fn beta_reduce(
     node_id: provenance::NodeId,
-    param: TypedBinding,
+    params: Vec<TypedBinding>,
     body: Expr,
     argument: Expr,
     callee: impl std::fmt::Display,
-    scope: &dyn ScopeEnv,
+    scope: &mut BinderScope,
 ) -> Expr {
     // A domain refinement on this outer lambda encodes a precondition
     // `P(arg)` that beta reduction must not lose. Such refinements ride
@@ -1635,14 +1676,7 @@ fn beta_reduce(
     // assert, not `debug_assert`: this reads a live post-inference data
     // path, and a release build proceeding past it would miscompile to
     // wrong results rather than fail.
-    assert!(
-        refinement_discharged_by(&argument, &param.ty, scope),
-        "inline: outer lambda for `{callee}` has parameter type {} which the \
-             argument type {} does not entail; beta reduction would silently drop \
-             the precondition. This needs a `restrict` lift, not a substitution.",
-        param.ty,
-        argument.ty
-    );
+    //
     // Beta reduction, recorded against the `Apply` node it
     // collapses. It needs no `RecordingGuard::also_consumes`: the
     // `Apply` and the `Lambda` both vanish, and neither has to be
@@ -1651,7 +1685,44 @@ fn beta_reduce(
     // the substituted argument's copies arrive through `on_copy` as
     // copies of the argument's own interior, which is what they are.
     let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
-    substitute_floating_lets(body, param, argument)
+    // Several parameters take the argument's components, `argument.𝑗`, and a later one's type
+    // reads the earlier ones at theirs.
+    for (i, param) in params.iter().enumerate() {
+        if param.ty.refinements().is_empty() {
+            continue;
+        }
+        let (arg, param_ty) = match params.len() {
+            1 => (argument.clone_preserving_ids(), param.ty.clone()),
+            _ => {
+                // The call built its argument list, so each argument is in hand.
+                let passed = crate::ccl::ccl_utils::predicate_term(&argument);
+                let TypedExprNode::Tuple(built) = &passed.node else {
+                    unreachable!(
+                        "a call of a lambda of {} parameters passes the list of its arguments",
+                        params.len()
+                    )
+                };
+                let part = |j: usize| built[j].clone_preserving_ids();
+                let earlier: std::collections::HashMap<Name, Expr> = params[..i]
+                    .iter()
+                    .enumerate()
+                    .map(|(j, p)| (p.name.clone(), part(j)))
+                    .collect();
+                (
+                    part(i),
+                    crate::ccl::subst::Subst::discharge_env_in_type(&param.ty, &earlier),
+                )
+            }
+        };
+        let arg_ty = &arg.ty;
+        assert!(
+            refinement_discharged_by(&arg, &param_ty, &*scope),
+            "inline: outer lambda for `{callee}` has parameter type {param_ty} which the \
+             argument type {arg_ty} does not entail; beta reduction would silently drop \
+             the precondition. This needs a `restrict` lift, not a substitution.",
+        );
+    }
+    substitute_floating_lets(body, params, argument, scope)
 }
 
 /// `body` with each `let` binding a name in `names` renamed fresh, so a term reading those
@@ -1678,16 +1749,18 @@ fn refresh_lets_binding(mut body: Expr, names: &std::collections::BTreeSet<Name>
     body
 }
 
-/// `body[param := argument]`, with the `Let` chain wrapping `argument` floated out around
+/// `body[params := argument]`, with the `Let` chain wrapping `argument` floated out around
 /// the result: `(let 𝑥 = 𝑒 in 𝑣) ▷ (λ param → body)` reduces to `let 𝑥 = 𝑒 in
-/// body[param := 𝑣]`.
+/// body[param := 𝑣]`. Several parameters take the arguments of the list `𝑣` the call built, each
+/// substituted as one parameter is. No parameters take the unit, which an argument that is not
+/// the literal unit computes in a binding of its own.
 ///
 /// A-normalization names each compound component of a multi-arg call's argument tuple,
 /// so the tuple arrives as `let __anf = 𝑒 in (𝑎, __anf)`. Substituted whole, every read of
-/// the parameter becomes `(let __anf = 𝑒 in (𝑎, __anf)).𝑖`, which `simplify`'s literal-tuple
-/// projection does not fold. A function component then stays inside a value tuple, and
+/// the parameter would be a projection of the `let`, which `simplify`'s literal-tuple
+/// projection does not fold. A function component would then stay inside a value tuple, and
 /// op-conversion compiles it as a tuple element with no input. Floating the chain leaves
-/// each read a projection of the bare tuple, and binds `𝑒` once rather than once per read.
+/// each component bare, and binds `𝑒` once rather than once per read.
 ///
 /// Each floated binder is renamed fresh, because `body` may bind the same name: a
 /// specialization clone copies its definition's binders, so a clone's argument and the body
@@ -1696,7 +1769,12 @@ fn refresh_lets_binding(mut body: Expr, names: &std::collections::BTreeSet<Name>
 /// reason a `let` in `body` binding a name the argument reads from outside it, a binder of the
 /// calling clone, is renamed fresh before the argument is substituted under it
 /// ([`refresh_lets_binding`]).
-fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> Expr {
+fn substitute_floating_lets(
+    body: Expr,
+    params: Vec<TypedBinding>,
+    argument: Expr,
+    scope: &mut BinderScope,
+) -> Expr {
     let mut lets = Vec::new();
     let mut value = argument;
     while let Expr {
@@ -1714,12 +1792,34 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
         lets.push((node_id, binding, *bound_expr));
     }
     let body = refresh_lets_binding(body, &free_names(&value));
-    let reduced = if is_shared_computation(&value, &param.name, &body) {
-        bind_argument(param, value, body)
-    } else if matches!(value.node, TypedExprNode::Lambda { .. }) {
-        substitute_function(body, &param.name, &value)
-    } else {
-        substitute(body, &param.name, &value)
+    let reduced = match params.len() {
+        0 if matches!(value.node, TypedExprNode::Lit(Lit::Unit)) => body,
+        0 => {
+            let mut unit = TypedBinding::new_unannotated(
+                Name::fresh("__unit"),
+                crate::ccl::Occurrence::mint(),
+            );
+            unit.ty = value.ty.clone();
+            Expr::let_in(unit, value, body)
+        }
+        1 => {
+            let param = params.into_iter().next().expect("one parameter");
+            substitute_one(body, param, value, scope)
+        }
+        // A call passes a parameter list its arguments, the list built where the call stands
+        // (`docs/chl-spec.md`, "Parameter lists"): no tuple value spreads over one.
+        n => match value.node {
+            TypedExprNode::Tuple(parts) if parts.len() == n => params
+                .into_iter()
+                .zip(parts)
+                .fold(body, |body, (param, part)| {
+                    substitute_one(body, param, part, scope)
+                }),
+            other => unreachable!(
+                "a call of a lambda of {n} parameters passes the list of its arguments, got {}",
+                other.kind_name()
+            ),
+        },
     };
     lets.into_iter()
         .rev()
@@ -1728,47 +1828,20 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
         })
 }
 
-/// Substitute the function `value` for `name` in `body`, where each use is a call of its own:
-/// the readings and sites in each use's copy are reached through that use, as a named function's
-/// are ([`reached_through`]; `docs/chl-spec.md`, "Inputs from outside the program"). A copy of a
-/// data value is the same evaluation and keeps its sites, which is why only a function
-/// takes this path.
+/// `body[param := value]`: bound to it where `value` is a computation `body` reads more than
+/// once, and substituted otherwise.
 ///
-/// Each use is first renamed apart, so that [`substitute`] places every copy and keeps its
-/// capture avoidance. A mention in a type slot is not a use, and takes the plain copy.
-fn substitute_function(body: Expr, name: &Name, value: &Expr) -> Expr {
-    let mut uses = Vec::new();
-    let mut body = body;
-    rename_uses(&mut body, name, &mut uses);
-    let body = uses.into_iter().fold(body, |body, (renamed, call)| {
-        let mut copy = value.clone();
-        if let Some(call) = call {
-            reached_through(&mut copy, &call);
-        }
-        substitute(body, &renamed, &copy)
-    });
-    substitute(body, name, value)
-}
-
-/// Rename every free use of `name` in `e` to a name of its own, recording each with its call
-/// site, where it is a call.
-fn rename_uses(e: &mut Expr, name: &Name, uses: &mut Vec<(Name, Option<Rc<Site>>)>) {
-    let call = e.site.clone();
-    match &mut e.node {
-        TypedExprNode::Var(n) if n == name => {
-            let renamed = Name::fresh_like(name);
-            uses.push((renamed.clone(), call));
-            *n = renamed;
-        }
-        TypedExprNode::Lambda { param, .. } if &param.name == name => {}
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            ..
-        } if &binding.name == name => {
-            rename_uses(bound_expr, name, uses);
-        }
-        _ => e.walk_children_mut(|child| rename_uses(child, name, uses)),
+/// A function a parameter takes is inlined at each of its uses as a let-bound function is, and
+/// beta-reduced where a use is a call ([`inline_and_beta_reduce`]): a call through the
+/// parameter reaches the function's body as a call of its own, its readings and sites reached
+/// through that call (`docs/chl-spec.md`, "Inputs from outside the program").
+fn substitute_one(body: Expr, param: TypedBinding, value: Expr, scope: &mut BinderScope) -> Expr {
+    if matches!(value.node, TypedExprNode::Lambda { .. }) {
+        inline_and_beta_reduce(body, &param.name, &value, scope, &PredMemo::new())
+    } else if is_shared_computation(&value, &param.name, &body) {
+        bind_argument(param, value, body)
+    } else {
+        substitute(body, &param.name, &value)
     }
 }
 
@@ -1915,7 +1988,7 @@ mod tests {
     #[test]
     fn should_inline_scalar_to_scalar() {
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -1930,11 +2003,11 @@ mod tests {
         // concrete call sites eliminates the nested lambda before any `curry`
         // combinator is produced.
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
@@ -1954,14 +2027,14 @@ mod tests {
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
         let refinement = Refinement::born(pred);
         let inner_fun = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::refined_one(inner_fun, refinement)),
@@ -1976,7 +2049,7 @@ mod tests {
     #[test]
     fn should_not_inline_a_collection() {
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -1991,7 +2064,7 @@ mod tests {
     #[test]
     fn should_inline_a_compute_function_over_an_enumerable_domain() {
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
@@ -2004,7 +2077,7 @@ mod tests {
     fn should_inline_tuple_domain() {
         // (Int, Int) → Int: an uncurried multi-arg compute function, so inlined.
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::Base(BaseType::Int),
@@ -2021,7 +2094,7 @@ mod tests {
         // (UIntRange(3), Int) → Int: a compute function over a tuple, so inlined — the
         // enumerable first component makes no difference.
         let ty = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::UIntRange(3),
@@ -2308,7 +2381,7 @@ mod tests {
     /// `Fun(domain, codomain)` shorthand for the tests below.
     fn fn_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
@@ -2780,14 +2853,13 @@ mod tests {
 
         let result = inline_compute_lambdas(expr);
 
-        // Expected: outer Let / outer `λ __arg_pair` are gone; references to
-        // `__arg_pair` are rewritten to the concrete tuple literal, so the
-        // `Tuple([list, 10]).0` shape now sits inside the body verbatim.
-        let folded_pair_proj = TypedExpr::apply(arg, proj0).with_ty(list.clone());
+        // Expected: outer Let / outer `λ __arg_pair` are gone; a projection of
+        // `__arg_pair` reads the tuple literal's component, so the list literal now
+        // sits inside the body verbatim.
         let expected_body = TypedExpr::apply(
             TypedExpr::apply(
                 TypedExpr::var("__iter_record").with_ty(range.clone()),
-                folded_pair_proj,
+                list_literal,
             )
             .with_ty(int.clone()),
             TypedExpr::lambda(
@@ -2888,21 +2960,12 @@ mod tests {
         let expr = TypedExpr::let_bind("add", Occurrence::mint(), lambda, call);
         let result = inline_compute_lambdas(expr);
 
-        // Expected: Tuple(1,2).0 + Tuple(1,2).1 — projections unfolded here.
-        let expected_left = TypedExpr::new(TypedExprNode::Apply {
-            argument: Box::new(arg.clone()),
-            function: Box::new(proj0),
-        })
-        .with_ty(int.clone());
-        let expected_right = TypedExpr::new(TypedExprNode::Apply {
-            argument: Box::new(arg),
-            function: Box::new(proj1),
-        })
-        .with_ty(int.clone());
+        // Expected: 1 + 2 — a projection of the tuple the parameter takes reads its
+        // component.
         let expected = TypedExpr::new(TypedExprNode::BinOp {
-            left: Box::new(expected_left),
+            left: Box::new(lit1),
             op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-            right: Box::new(expected_right),
+            right: Box::new(lit2),
         })
         .with_ty(int);
         assert_eq!(result, expected);
@@ -2970,20 +3033,14 @@ mod tests {
             panic!("the callee's own binding stays, got {callee:?}");
         };
         let expected = TypedExpr::binop(
-            first(
-                TypedExpr::tuple(vec![
-                    TypedExpr::var(floated.name.clone()).with_ty(int.clone()),
-                    lit(3),
-                ])
-                .with_ty(pair_ty.clone()),
-            ),
+            TypedExpr::var(floated.name.clone()).with_ty(int.clone()),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
             TypedExpr::var("a").with_ty(int.clone()),
         )
         .with_ty(int);
         assert_eq!(
             **inner, expected,
-            "the tuple reads the floated binder, not the callee's"
+            "the component reads the floated binder, not the callee's"
         );
     }
 }

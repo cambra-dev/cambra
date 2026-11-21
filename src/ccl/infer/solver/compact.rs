@@ -22,6 +22,7 @@ use crate::ccl::{
 };
 
 use crate::ccl::FieldKey;
+use crate::ccl::FunBinder;
 pub use crate::ccl::ty::KindPin;
 
 // ---------------------------------------------------------------------------
@@ -611,7 +612,7 @@ fn own_bounds(v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
 /// children compacted at the history's own polarity (`CompactType::history_slot`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactHistory {
-    /// The function's binder, `na.or(nb)` on merge, as [`CompactFun::name`].
+    /// The function's binder, `na.or(nb)` on merge, as [`CompactFun::binder`].
     pub name: Option<Name>,
     pub value: Box<CompactType>,
     pub domain: Box<CompactType>,
@@ -620,7 +621,7 @@ pub struct CompactHistory {
 
 /// A dependent tuple in a compacted position: each component's binder and the component,
 /// compacted under the binders before it (`CompactType::dep_tuple`). The names are opening
-/// addresses and spellings, as [`CompactFun::name`] is; references between components are
+/// addresses and spellings, as [`CompactFun::binder`]'s are; references between components are
 /// indices by the time they land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactDepTuple {
@@ -630,7 +631,7 @@ pub struct CompactDepTuple {
 
 /// A family in a compacted position ([`Type::Family`]): each binder's name and domain, and
 /// the body compacted under every binder. The names are opening addresses and spellings, as
-/// [`CompactFun::name`] is; the body's references to the binders are indices by the time they
+/// [`CompactFun::binder`]'s are; the body's references to the binders are indices by the time they
 /// land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactFamily {
@@ -645,8 +646,8 @@ pub struct CompactFamily {
 /// [`CompactFun::merge`] reconciles them; there is no second route for a sum.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactFun {
-    /// The Pi (element) binder, `na.or(nb)` on merge.
-    pub name: Option<Name>,
+    /// The Pi (element) binder, the first side's that names one on merge.
+    pub binder: FunBinder,
     /// The merged kind — **compute or data, and nothing else**. What a data function is
     /// indexed by lives in [`binders`](Self::binders), where it is merged rather than
     /// snapshotted.
@@ -983,7 +984,11 @@ impl CompactFun {
     /// Merge two function slots. `pol` is the *outer* polarity; the domain merges
     /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
     fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
-        let name = a.name.clone().or_else(|| b.name.clone());
+        let binder = if a.binder.is_none() {
+            b.binder.clone()
+        } else {
+            a.binder.clone()
+        };
         // Capabilities are covariant: a positive position holds either function, so it may do
         // what either does, and a negative one accepts only what both accept. The variables
         // at a negative one are each a call's expectation of the one function value there,
@@ -1047,7 +1052,7 @@ impl CompactFun {
             || (kind.is_data()
                 && (combined.is_some() || denoted_domains(&domain).is_some_and(|ds| ds.len() > 1)));
         CompactFun {
-            name,
+            binder,
             kind,
             binders,
             capabilities,
@@ -1238,12 +1243,10 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<CompactHistory>,
-    /// A dependent tuple, if one contributed here: a telescope rides as a whole, component
-    /// `𝑘` compacted under the binders of the `𝑘` components before it, so its references to
-    /// binders around the tuple close `𝑘` deeper than a plain tuple's do in [`rec`](Self::rec).
-    /// The two slots therefore never merge into each other; meeting both at one position is
-    /// two shapes ([`shapes`](Self::shapes)). Materialization collapses a tuple whose
-    /// components read no earlier one to the plain tuple (`Type::dep_tuple`).
+    /// A dependent tuple, compacted under its earlier components. Plain tuple positions
+    /// in `rec` use the same binder coordinates. Equal closed widths merge here, as does
+    /// an open prefix meeting a dependent tuple. Materialization removes the earlier
+    /// components' binder crossings when no component reads them (`Type::dep_tuple`).
     pub dep_tuple: Option<CompactDepTuple>,
     /// A family, if one contributed here ([`CompactFamily`]): the body compacted under every
     /// binder, as a dependent tuple's later components are under the earlier ones. It stands
@@ -1913,7 +1916,7 @@ impl CompactType {
                     let kind_pending = comparison == Comparison::DataDomain
                         && (a.kind != b.kind || a.kind == KindPin::Unpinned)
                         && a.kind.clone().join(b.kind.clone()) != KindPin::Conflict;
-                    (comparison == Comparison::DataDomain || a.name == b.name)
+                    (comparison == Comparison::DataDomain || a.binder == b.binder)
                         && (kind_pending || a.kind == b.kind)
                         && (kind_pending
                             || (a.domains_disagree == b.domains_disagree
@@ -2105,6 +2108,31 @@ impl CompactType {
             };
             nominal.insert(decl, merged);
         }
+        // Positional components compact under the positions before them in both tuple
+        // presentations. Equal closed widths merge component by component; an open prefix
+        // meets a dependent tuple at the latter's closed width.
+        let (rec, width, dep_tuple) = match (rec, width, dep_tuple) {
+            (Some(positions), Some(width), Some(mut dep))
+                if match width {
+                    TupleWidth::Exactly(n) => n == dep.components.len(),
+                    TupleWidth::AtLeast { listed, .. } => !pol && listed <= dep.components.len(),
+                    TupleWidth::Conflict(_) => false,
+                } && positions.keys().all(|key| match key {
+                    FieldKey::Index(i) => *i < dep.components.len(),
+                    _ => false,
+                }) =>
+            {
+                for (key, ct) in positions {
+                    let FieldKey::Index(i) = key else {
+                        unreachable!("an open tuple's positions are indices")
+                    };
+                    let component = std::mem::replace(&mut dep.components[i], CompactType::value());
+                    dep.components[i] = Self::merge(pol, component, ct);
+                }
+                (None, None, Some(dep))
+            }
+            other => other,
+        };
         CompactType {
             vars,
             atoms,
@@ -3038,7 +3066,7 @@ const CYCLE_CLOSURE_ROUNDS: usize = 64;
 
 /// [`CompactState::memo`]'s key: the variable, the polarity, the enclosing binders, whether
 /// the walk is at the position, and whether the position is invariant.
-type MemoKey = (InferVarId, bool, Vec<Option<Name>>, bool, bool);
+type MemoKey = (InferVarId, bool, Vec<FunBinder>, bool, bool);
 
 /// A revisit [`compact_go`] cut: the variable and polarity, how many variables were being
 /// expanded when it was entered, and whether the cut was a spurious cycle, along one bound
@@ -3708,7 +3736,7 @@ fn compact_go_inner(
             let mut components = Vec::with_capacity(cs.len());
             for (name, t) in cs {
                 components.push(compact_go(t, pol, &acc, Position::default(), st));
-                st.scope.enter(name.clone());
+                st.scope.enter(name.clone().into());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
                 }
@@ -3731,7 +3759,7 @@ fn compact_go_inner(
                 .collect();
             let mut acc = subst_acc.clone();
             for (name, _) in binders {
-                st.scope.enter(name.clone());
+                st.scope.enter(name.clone().into());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
                 }
@@ -3876,7 +3904,7 @@ fn compact_go_inner(
         // fresh var), but treat it as no contribution for exhaustiveness.
         Type::Hole | Type::SharedHole(_) => CompactType::empty(),
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain: d,
             codomain: c,
@@ -3904,18 +3932,18 @@ fn compact_go_inner(
             st.data_domain_depth -= u32::from(data_domain);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain (it binds the name locally), so restrict it there.
-            let cod_acc = match name {
-                Some(b) => subst_acc.shadow(b),
-                None => subst_acc.clone(),
-            };
+            let cod_acc = binder
+                .names()
+                .fold(subst_acc.clone(), |acc, b| acc.shadow(b));
             // Entering the codomain crosses this function — named or not, it
             // deepens what a refinement landing below closes against.
-            st.scope.enter(name.clone());
+            st.scope.enter(binder.clone());
             let cod = compact_go(c, pol, &cod_acc, Position::default(), st);
             st.scope.exit();
             debug_assert!(
-                name.as_ref()
-                    .is_none_or(|binder| !refinements_name_binder(&cod, binder)),
+                binder
+                    .names()
+                    .all(|binder| !refinements_name_binder(&cod, binder)),
                 "landing closes: a function's own refinement must reference its binder by index, \
                  not by name"
             );
@@ -3991,7 +4019,7 @@ fn compact_go_inner(
                         other => other,
                     },
                     capabilities: Rc::new(capabilities_at(capabilities, pol, st)),
-                    name: name.clone(),
+                    binder: binder.clone(),
                     binders,
                     domains_disagree: false,
                     domain: Box::new(dom),
@@ -4006,11 +4034,16 @@ fn compact_go_inner(
         Type::Tuple(ts) | Type::OpenTuple(ts) => {
             let mut compacted = BTreeMap::new();
             for (i, v) in ts.iter().enumerate() {
+                // A plain position reads no earlier component, but uses the same binder
+                // coordinates as a dependent component so the two can merge.
+                let v = crate::ccl::subst::weaken_pi_binders(v, i as u32);
                 compacted.insert(
                     FieldKey::Index(i),
-                    compact_go(v, pol, subst_acc, Position::default(), st),
+                    compact_go(&v, pol, subst_acc, Position::default(), st),
                 );
+                st.scope.enter(FunBinder::None);
             }
+            ts.iter().for_each(|_| st.scope.exit());
             CompactType {
                 rec: Some(compacted),
                 width: Some(TupleWidth::of(matches!(ty, Type::OpenTuple(_)), ts.len())),
@@ -4061,7 +4094,7 @@ fn compact_go_inner(
             history_kind,
         } => {
             let Type::Fun {
-                name,
+                binder,
                 domain,
                 codomain: value,
                 ..
@@ -4070,16 +4103,15 @@ fn compact_go_inner(
                 unreachable!("a history's function is an unrefined function, got {function}")
             };
             let domain = compact_go(domain, pol, subst_acc, Position::default(), st);
-            let value_acc = match name {
-                Some(b) => subst_acc.shadow(b),
-                None => subst_acc.clone(),
-            };
-            st.scope.enter(name.clone());
+            let value_acc = binder
+                .names()
+                .fold(subst_acc.clone(), |acc, b| acc.shadow(b));
+            st.scope.enter(binder.clone());
             let value = compact_go(value, pol, &value_acc, Position::default(), st);
             st.scope.exit();
             CompactType {
                 history_slot: Some(CompactHistory {
-                    name: name.clone(),
+                    name: binder.whole().cloned(),
                     value: Box::new(value),
                     domain: Box::new(domain),
                     kind: *history_kind,
@@ -5157,7 +5189,7 @@ mod tests {
             .borrow_mut()
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Fun {
-                name: None,
+                binder: FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::fresh_var(),
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
@@ -5496,7 +5528,7 @@ mod tests {
             fun: Some(CompactFun {
                 binders: Vec::new(),
                 capabilities: Default::default(),
-                name: None,
+                binder: FunBinder::None,
                 kind: KindPin::Data,
                 domains_disagree: false,
                 domain: Box::new(domain),
@@ -5531,7 +5563,7 @@ mod tests {
             fun: Some(CompactFun {
                 binders: Vec::new(),
                 capabilities: Default::default(),
-                name: None,
+                binder: FunBinder::None,
                 kind: KindPin::Data,
                 domains_disagree: false,
                 domain: Box::new(domain),
@@ -5788,7 +5820,7 @@ mod tests {
             fun: Some(CompactFun {
                 binders: Vec::new(),
                 capabilities: Default::default(),
-                name: None,
+                binder: FunBinder::None,
                 kind,
                 domains_disagree: false,
                 domain: Box::new(CompactType {
@@ -6059,7 +6091,7 @@ mod tests {
             fun: Some(CompactFun {
                 binders: Vec::new(),
                 capabilities: Default::default(),
-                name: None,
+                binder: FunBinder::None,
                 kind: KindPin::Data,
                 domains_disagree: false,
                 domain: Box::new(CompactType::from_atom(AtomKey::Prim(dom))),
@@ -6168,7 +6200,7 @@ mod refinement_closing_tests {
 
     fn dep_fun(binder: &str) -> Type {
         Type::Fun {
-            name: Some(Name::raw(binder)),
+            binder: FunBinder::Whole(Name::raw(binder)),
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::refined_one(
@@ -6249,11 +6281,11 @@ mod refinement_closing_tests {
     #[test]
     fn closing_keeps_distinct_binders_distinct() {
         let nested = |referenced: &str| Type::Fun {
-            name: Some(Name::raw("x")),
+            binder: FunBinder::Whole(Name::raw("x")),
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Fun {
-                name: Some(Name::raw("y")),
+                binder: FunBinder::Whole(Name::raw("y")),
                 fun_kind: FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(4)),
                 codomain: Box::new(Type::refined_one(
