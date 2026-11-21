@@ -1044,7 +1044,15 @@ copied variable reaches whichever scope minted it. A copy of an ordering require
 decided holds that decision. What each kind's copy carries is its
 own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`,
 `copy_ordering`, `copy_obligation`): what is recorded on the original, copied through the same
-rule.
+rule. A capability set a type or a node states is copied through the rule too
+(`freshen_capabilities`): its variables, and a known set's requirements and raised types, as a
+copied variable's own capabilities are. Written clauses hold nothing of a run and are kept.
+
+`freshen_level` returns a type unchanged when nothing it holds is above the cutoff, so it reads the
+same state the rule copies: a function's kind and capabilities, a known set's contents, where an
+ordering requirement counts as above every cutoff. A kind variable can be minted without a level,
+which no other variable can; such a kind counts as the outermost there, and the rule copies it
+wherever it is reached.
 
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 

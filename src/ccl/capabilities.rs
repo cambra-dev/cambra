@@ -3237,6 +3237,17 @@ impl Capabilities {
         }
     }
 
+    /// This with each part that is not a union, a variable, a known set or written clauses,
+    /// replaced by `f`'s answer, a union's parts included.
+    pub fn map_leaves(&self, f: &mut dyn FnMut(&Capabilities) -> Capabilities) -> Capabilities {
+        match self.repr() {
+            Repr::Children(children) => Capabilities(Rc::new(Repr::Children(
+                children.map_parts(&mut |part| part.map_leaves(f)),
+            ))),
+            Repr::Var(_) | Repr::Known(_) | Repr::Written(_) => f(self),
+        }
+    }
+
     /// This with each variable it reads replaced by `f`'s answer, a union's parts included: a
     /// clone takes its use's copies of a definition's variables
     /// ([`crate::ccl::infer::solver::scheme`]'s `freshen_expr_type_slots`).
