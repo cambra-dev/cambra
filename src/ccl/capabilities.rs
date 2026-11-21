@@ -330,6 +330,15 @@ impl Requirement {
         Self(self.0.clone(), Some(Rc::new(order)))
     }
 
+    /// This requirement with each type its trait requirement holds replaced by `f`'s answer;
+    /// an ordering requirement's own state is its copy's ([`Self::with_ordering`]).
+    pub(crate) fn map_trait_types(
+        &self,
+        f: impl FnMut(&crate::ccl::Type) -> crate::ccl::Type,
+    ) -> Self {
+        Self(self.0.map_types(f), self.1.clone())
+    }
+
     pub(crate) fn with_ordering(
         &self,
         positions: crate::ccl::Type,
@@ -1831,6 +1840,33 @@ impl Children {
         )
     }
 
+    /// These parts with what each holds rewritten, the types a part's `try` catches included
+    /// ([`crate::ccl::infer::solver::held::HoldsSolverState::rewrite_held`]); `None` where none changed.
+    fn rewrite_parts(
+        &self,
+        m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter,
+    ) -> Option<Children> {
+        use crate::ccl::infer::solver::held::HoldsSolverState;
+        let mut changed = false;
+        let parts = self
+            .parts
+            .iter()
+            .map(|(part, catches)| {
+                let mut part = part.clone();
+                changed |= part.rewrite_held(m);
+                let catches = catches.as_ref().map(|catches| {
+                    let mut rewritten: Vec<crate::ccl::Type> = catches.to_vec();
+                    for ty in &mut rewritten {
+                        changed |= ty.rewrite_held(m);
+                    }
+                    Rc::from(rewritten)
+                });
+                (part, catches)
+            })
+            .collect();
+        changed.then(|| Children::new(parts, self.begin))
+    }
+
     fn new(parts: Vec<(Capabilities, Option<Rc<[crate::ccl::Type]>>)>, begin: bool) -> Self {
         Children {
             parts,
@@ -3266,6 +3302,17 @@ impl Capabilities {
         }
     }
 
+    /// This with each part that is not a union, a variable, a known set or written clauses,
+    /// replaced by `f`'s answer, a union's parts included.
+    pub fn map_leaves(&self, f: &mut dyn FnMut(&Capabilities) -> Capabilities) -> Capabilities {
+        match self.repr() {
+            Repr::Children(children) => Capabilities(Rc::new(Repr::Children(
+                children.map_parts(&mut |part| part.map_leaves(f)),
+            ))),
+            Repr::Var(_) | Repr::Known(_) | Repr::Written(_) => f(self),
+        }
+    }
+
     /// This with each variable it reads replaced by `f`'s answer, a union's parts included: a
     /// clone takes its use's copies of a definition's variables
     /// ([`crate::ccl::infer::solver::scheme`]'s `freshen_expr_type_slots`).
@@ -3770,6 +3817,156 @@ pub fn lower_capability_levels(solver: &mut Solver, ty: &crate::ccl::Type, level
         v.lower_level(solver, level);
     }
     ty.walk_children(|child| lower_capability_levels(solver, child, level));
+}
+
+impl crate::ccl::infer::solver::held::HoldsSolverState for Capabilities {
+    fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
+        use crate::ccl::infer::solver::held::Held;
+        match self.repr() {
+            Repr::Known(set) => set.walk_held(v),
+            Repr::Var(var) => v.held(Held::Capability(Rc::clone(var))),
+            Repr::Written(written) => written.set.walk_held(v),
+            Repr::Children(children) => {
+                for (part, catches) in &children.parts {
+                    part.walk_held(v);
+                    for ty in catches.iter().flat_map(|c| c.iter()) {
+                        ty.walk_held(v);
+                    }
+                }
+            }
+        }
+    }
+    fn rewrite_held(&mut self, m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter) -> bool {
+        let mut changed = false;
+        if let Some(replaced) = m.capabilities(self) {
+            changed = replaced != *self;
+            *self = replaced;
+        }
+        let rewritten = match self.repr() {
+            Repr::Known(set) => {
+                let mut set = set.clone();
+                set.rewrite_held(m).then(|| Capabilities::known(set))
+            }
+            Repr::Var(_) => None,
+            Repr::Written(written) => {
+                let mut written = written.clone();
+                written
+                    .set
+                    .rewrite_held(m)
+                    .then(|| Capabilities::written(written))
+            }
+            Repr::Children(children) => children
+                .rewrite_parts(m)
+                .map(|children| Capabilities(Rc::new(Repr::Children(children)))),
+        };
+        if let Some(rewritten) = rewritten {
+            *self = rewritten;
+            changed = true;
+        }
+        changed
+    }
+}
+
+impl crate::ccl::infer::solver::held::HoldsSolverState for CapabilitySet {
+    fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
+        use crate::ccl::infer::solver::held::Held;
+        for r in &self.requires {
+            r.walk_held(v);
+        }
+        for e in &self.causes {
+            if let Effect::Raise(raised) = e {
+                raised.ty.walk_held(v);
+            }
+        }
+        for var in self.vars.values() {
+            v.held(Held::Capability(Rc::clone(var)));
+        }
+    }
+
+    /// The variables a set names, [`CapabilitySet::vars`], are kept: only a rendering collects
+    /// them, after its run has settled what it renders.
+    fn rewrite_held(&mut self, m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter) -> bool {
+        let mut changed = false;
+        self.requires = std::mem::take(&mut self.requires)
+            .into_iter()
+            .map(|mut r| {
+                changed |= r.rewrite_held(m);
+                r
+            })
+            .collect();
+        self.causes = std::mem::take(&mut self.causes)
+            .into_iter()
+            .map(|e| match e {
+                Effect::Raise(mut raised) => {
+                    changed |= raised.ty.rewrite_held(m);
+                    Effect::Raise(raised)
+                }
+                e => e,
+            })
+            .collect();
+        changed
+    }
+}
+
+impl crate::ccl::infer::solver::held::HoldsSolverState for Requirement {
+    fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
+        use crate::ccl::infer::solver::held::Held;
+        self.0.walk_held(v);
+        if let Some(order) = &self.1 {
+            v.held(Held::Ordering(self.clone()));
+            order.positions.walk_held(v);
+            if let Some(iter) = &order.iter {
+                iter.walk_held(v);
+            }
+            order.capabilities.walk_held(v);
+            for assumption in &order.assumptions {
+                assumption.walk_held(v);
+            }
+        }
+    }
+    fn rewrite_held(&mut self, m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter) -> bool {
+        let mut changed = self.0.rewrite_held(m);
+        if self.1.is_some() {
+            if let Some(replaced) = m.ordering(self) {
+                *self = replaced;
+                return true;
+            }
+            changed |= self.rewrite_ordering_parts(m);
+        }
+        changed
+    }
+}
+
+impl Requirement {
+    /// Rewrite what this ordering requirement holds, the parts a walk enters: its positions,
+    /// its source's type, its capabilities and its assumptions
+    /// ([`crate::ccl::infer::solver::held::HoldsSolverState::rewrite_held`]). Whether any changed.
+    pub(crate) fn rewrite_ordering_parts(
+        &mut self,
+        m: &mut dyn crate::ccl::infer::solver::held::HeldRewriter,
+    ) -> bool {
+        use crate::ccl::infer::solver::held::HoldsSolverState;
+        let Some(order) = &self.1 else {
+            return false;
+        };
+        let mut order = (**order).clone();
+        let mut changed = order.positions.rewrite_held(m);
+        if let Some(iter) = &mut order.iter {
+            changed |= iter.rewrite_held(m);
+        }
+        changed |= order.capabilities.rewrite_held(m);
+        for assumption in &mut order.assumptions {
+            let mut rewritten = (**assumption).clone();
+            if rewritten.rewrite_held(m) {
+                *assumption = Rc::new(rewritten);
+                changed = true;
+            }
+        }
+        if changed {
+            self.1 = Some(Rc::new(order));
+        }
+        changed
+    }
 }
 
 #[cfg(test)]

@@ -1060,6 +1060,64 @@ Generalization creates fresh bound-graph instances at uses. Coalescing specializ
 using those live instances, and predicate-rebuild memos preserve sharing where the rewrite context
 permits it. These operations have separate scopes and lifetimes.
 
+### Solver state a value holds
+
+A typing run's state is reached through handles: inference variables, barrier variables, function
+kind variables, capability variables, ordering requirements and trait obligations. Types, capability
+sets, requirements and expressions hold them, and `HoldsSolverState` (`infer/solver/held.rs`) walks
+every handle a value holds, in one place per holder:
+
+- a type holds its variables, a function's kind and capabilities, and the handles of the terms it
+  holds (a refinement's predicates, a projection's sum, a family's arguments);
+- a capability set holds its variables, its requirements and its raised types; an ordering
+  requirement is a handle, and its positions, source and capabilities are held with it;
+- an expression holds its type slots, both capability slots and its call's obligation
+  (`CallObligation`), and what its children hold.
+
+The walk reports a handle where the value holds it and does not follow what is recorded on the
+handle: a variable's bounds and a capability variable's incoming edges are the run's, not the
+value's. A term can be held by many types, so a visitor decides whether to enter each one.
+
+The same trait rewrites what a value holds in place (`rewrite_held`), entering the parts the walk
+reports. At each type variable, funkind variable, capability value and ordering requirement it asks
+the rewriter (`HeldRewriter`) for a replacement, and then enters what the answer holds. A rewriter that replaces
+an ordering requirement rewrites the requirement's parts itself
+(`Requirement::rewrite_ordering_parts`), so it decides how a requirement nested in its own
+capabilities is met. A term a type holds is rewritten through `PredMemo::rebuild`, so every
+occurrence of a shared term reads one rewritten copy.
+
+`assert_settled` reads a tree, an error's types and a scheme through the walk, and panics on a
+capability variable or an ordering requirement that is not closed, inside a closed requirement
+included, once the run is settled ([Settling capabilities](#settling-capabilities)).
+
+### Copying solver state
+
+An instantiation and a specialization clone each copy the solver state of a generalized definition
+above the binding's cutoff (`FreshenCache`). Every handle goes through one rule (`freshen_held`):
+
+1. the copy this freshening already made of it, from one map keyed by the handle
+   (`FreshenCache::copies`), so every occurrence of an original reads one copy;
+2. the handle itself, where it stands at or below the cutoff: an enclosing scope's;
+3. otherwise a new copy, which records itself in the map before the original's recorded state
+   is copied into it, so a cycle through the handle reaches the copy.
+
+A handle with a level of its own, an inference, barrier, kind or capability variable, stands above
+the cutoff where that level is above it. One with none is copied wherever freshening reaches it: a
+kind no function has placed, an ordering requirement, and a trait obligation, which a watch of a
+copied variable reaches whichever scope minted it. A copy of an ordering requirement its run has
+decided holds that decision. What each kind's copy carries is its
+own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`,
+`copy_ordering`, `copy_obligation`): what is recorded on the original, copied through the same
+rule. A capability set a type or a node states is copied through the rule too
+(`freshen_capabilities`): its variables, and a known set's requirements and raised types, as a
+copied variable's own capabilities are. Written clauses hold nothing of a run and are kept.
+
+`freshen_level` returns a type unchanged when nothing it holds is above the cutoff, so it reads the
+same state the rule copies: a function's kind and capabilities, a known set's contents, where an
+ordering requirement counts as above every cutoff. A kind variable can be minted without a level,
+which no other variable can; such a kind counts as the outermost there, and the rule copies it
+wherever it is reached.
+
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
 `should_generalize` in `infer/context.rs` selects a syntactic lambda whose function kind is
@@ -1781,7 +1839,9 @@ level's capabilities. Each inference or barrier variable left in them becomes th
 `Type::Undetermined` it stands for, and each funkind variable the run minted an unowned one minted
 alike, which every solver reads as nothing recorded. Closing reads nothing a run recorded: coalesce
 has decided every type a node holds, and an error's types are reported as found. So a pass after
-inference, and a respelling of a failed run's errors, takes `Solver::none()`.
+inference, and a respelling of a failed run's errors, takes `Solver::none()`. Closing is a rewrite
+of held state ([Solver state a value holds](#solver-state-a-value-holds)), so it reaches every
+handle a walk of what a value holds reports.
 
 A run leaves a type undetermined where nothing in the program fixes it: an induction accumulator's
 domain, which the unified phase erases unread; a definition nothing applies; a feed nothing feeds; a
@@ -5444,21 +5504,33 @@ projection's sum, a family's arguments (`settle_capabilities` in `solve.rs`). A 
 before coalesce settles its tree the same way (`run_once` in `infer/mod.rs`), since the passes after
 a failed inference still read it.
 
-Settling closes the types in the tree too: a function type's capabilities become the set they
-resolve to, and an ordering requirement in any set becomes one whose capabilities are known and
-whose answer is decided by the run, since its capabilities no longer say whether an effect input is
-open (`Requirement::closed`). Every run, failed or not, also closes the types its errors hold, the
-schemes it records and the ordering requirements of its top level (`close_outputs`). Nothing of a
-run's capability variables leaves it, which debug builds check, and its type and funkind variables
-are closed with the rest of what it hands back ([A run closes what it hands
-back](#a-run-closes-what-it-hands-back)).
-
 A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
 arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one
 clone has one set of capabilities at each node. Uses whose arguments bring different capabilities
 therefore share no clone: the specialization key holds, at each function position of the use's type,
 what the function there requires and causes, resolved (`spec_key`'s `KeyView::capabilities`). A use
 inside a clone instantiated through the clone's copies.
+
+#### Settling capabilities
+
+Settling is one rewrite of what each value holds (`Settler`, through `HoldsSolverState`'s
+`rewrite_held`):
+
+- a capability value, a node's slot or a function type's, becomes the set it resolves to, each
+  raised exception at its resolved type;
+- an ordering requirement the run has not closed becomes a closed one (`Requirement::closed`): the
+  run decides whether it is satisfied now, while its capabilities can still say whether an effect
+  input is open, and what it holds is settled by the same rewrite. That covers its positions, its
+  source's type, its capabilities and its assumptions;
+- an ordering requirement met inside its own parts, a loop's body requiring what the loop does, is
+  closed to the run's answer with no capabilities;
+- a requirement a run closed is entered like any other value.
+
+Every run, failed or not, also settles the types its errors hold, the schemes it records and the
+capabilities of its top level (`close_outputs`). Nothing of a run's capability variables or open
+ordering requirements leaves it, which debug builds check (`assert_settled`), and its type and
+funkind variables are closed with the rest of what it hands back ([A run closes what it hands
+back](#a-run-closes-what-it-hands-back)).
 
 ### Discharging capabilities
 
