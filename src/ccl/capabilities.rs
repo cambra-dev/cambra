@@ -493,15 +493,33 @@ impl Raised {
 
     /// This exception as one use of its definition raises it: at the freshened type `ty`, and
     /// a capability of its own.
-    pub fn instantiated(&self, ty: crate::ccl::Type) -> Self {
+    ///
+    /// The instance is the use's, `at`: every copy made for one use, its instantiation's and its
+    /// specialization's alike, is one exception, and two uses are two. A copy no use makes is an
+    /// exception of its own.
+    pub fn instantiated(
+        &self,
+        solver: &mut Solver,
+        ty: crate::ccl::Type,
+        at: Option<NodeId>,
+    ) -> Self {
         thread_local! {
             static NEXT: Cell<u32> = const { Cell::new(1) };
         }
-        let instance = NEXT.with(|n| {
-            let i = n.get();
-            n.set(i + 1);
-            i
-        });
+        let fresh = || {
+            NEXT.with(|n| {
+                let i = n.get();
+                n.set(i + 1);
+                i
+            })
+        };
+        let instance = match at {
+            Some(at) => *solver
+                .exception_instances
+                .entry((self.site, self.instance, at))
+                .or_insert_with(fresh),
+            None => fresh(),
+        };
         Self {
             site: self.site,
             instance,
@@ -3029,55 +3047,6 @@ impl Eq for CapabilityVar {}
 impl Hash for CapabilityVar {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.uid.hash(state);
-    }
-}
-
-/// Each use of a polymorphic definition, by its node: the copies its instantiation made of the
-/// definition's capability variables, which a specialization the use mints takes for its own nodes
-/// (`src/ccl/design/type-inference.md`, "Capabilities on every expression").
-///
-/// A copy holds what the use's arguments bring where the definition's effect parameters stand,
-/// which a fresh copy of the definition's variable does not.
-#[derive(Debug, Default)]
-pub struct UseCapabilities {
-    uses: HashMap<NodeId, HashMap<CapabilityVarId, Rc<CapabilityVar>>>,
-}
-
-impl UseCapabilities {
-    /// The use at `node` instantiated its definition with `copies`.
-    pub fn record_use(
-        &mut self,
-        node: NodeId,
-        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    ) {
-        if !copies.is_empty() {
-            self.uses.insert(node, copies.clone());
-        }
-    }
-
-    /// The copies the use at `node` made, which the specialization it mints takes in place of
-    /// fresh ones.
-    pub fn copies(&self, node: NodeId) -> HashMap<CapabilityVarId, Rc<CapabilityVar>> {
-        self.uses.get(&node).cloned().unwrap_or_default()
-    }
-
-    /// A specialization was minted whose nodes are copies of its definition's, each by its
-    /// original in `origins`, and whose capability variables are `freshened`'s copies of theirs:
-    /// each use in it records the specialization's copies of its original's copies, which hold
-    /// what the specialization's own use brings, so a specialization it mints in turn takes
-    /// those.
-    pub fn specialize(
-        &mut self,
-        origins: &HashMap<NodeId, NodeId>,
-        freshened: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    ) {
-        let at = |var: &Rc<CapabilityVar>| Rc::clone(freshened.get(&var.uid).unwrap_or(var));
-        for (clone, original) in origins {
-            if let Some(inner) = self.uses.get(original) {
-                let inner = inner.iter().map(|(id, var)| (*id, at(var))).collect();
-                self.uses.insert(*clone, inner);
-            }
-        }
     }
 }
 

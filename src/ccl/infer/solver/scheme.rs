@@ -733,7 +733,11 @@ fn freshen_capability_set(
         .map(|e| match e {
             crate::ccl::capabilities::Effect::Raise(raised) => {
                 let ty = freshen_above(solver, lim, &raised.ty, target, cache);
-                crate::ccl::capabilities::Effect::Raise(raised.instantiated(ty))
+                crate::ccl::capabilities::Effect::Raise(raised.instantiated(
+                    solver,
+                    ty,
+                    cache.use_at,
+                ))
             }
             e => e.clone(),
         })
@@ -805,15 +809,14 @@ fn copy_capability_var(
         match &capability.item {
             Capability::Param(_) => {}
             // A use raises the exception at its own instance of the definition's types, and as
-            // an exception of its own: two uses at two types are two exceptions.
+            // an exception of its own: two uses are two exceptions.
             Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
                 let ty = freshen_above(solver, lim, &raised.ty, target, cache);
+                let raised = raised.instantiated(solver, ty, cache.use_at);
                 f.record(
                     solver,
                     crate::ccl::capabilities::ScopedCapability {
-                        item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
-                            raised.instantiated(ty),
-                        )),
+                        item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)),
                         ..capability.clone()
                     },
                 );

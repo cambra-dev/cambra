@@ -120,6 +120,12 @@ impl<F: FnMut(Held)> HeldVisitor for F {
 /// enters every part a walk reports; at each capability value and each ordering requirement it
 /// first asks the rewriter for a replacement.
 pub trait HeldRewriter {
+    /// What `ty`, an inference or barrier variable, becomes, or `None` to keep it. The rewrite
+    /// then enters what the answer holds.
+    fn type_variable(&mut self, _ty: &Type) -> Option<Type> {
+        None
+    }
+
     /// What `capabilities` becomes, or `None` to keep it. The rewrite then enters what the
     /// answer holds.
     fn capabilities(&mut self, _capabilities: &Capabilities) -> Option<Capabilities> {
@@ -175,6 +181,13 @@ impl HoldsSolverState for Type {
 
     fn rewrite_held(&mut self, m: &mut dyn HeldRewriter) -> bool {
         let mut changed = false;
+        if matches!(self, Type::Infer(_) | Type::BarrierVar(_))
+            && let Some(replaced) = m.type_variable(self)
+            && replaced != *self
+        {
+            *self = replaced;
+            changed = true;
+        }
         if let Type::Fun {
             fun_kind,
             capabilities,

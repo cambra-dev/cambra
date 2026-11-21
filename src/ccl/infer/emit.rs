@@ -166,10 +166,6 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                         &ctx.telescope,
                         node_id,
                     );
-                    // The specialization this use mints takes its copies of the definition's
-                    // capability variables (`capabilities::UseCapabilities`).
-                    ctx.use_capabilities
-                        .record_use(node_id, &instance.capability_copies);
                     // A block's bound copied with the definition is failed by what this use
                     // passes, so it is reported here.
                     for copy in instance.capability_copies.values() {

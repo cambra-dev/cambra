@@ -5242,7 +5242,9 @@ call of a function no value of the definition flows into, such as an unannotated
 what each use passes, so none of its clauses is refused at the definition: `Typing::apply` records
 each call whose callee is an inference variable, and the check skips a `try` reaching one whose
 variable receives no value. Each use of a polymorphic definition copies its `Raise` capabilities at
-its own instance of the types (`Raised::instantiated`).
+its own instance of the types (`Raised::instantiated`). The instance is the use's: every copy made
+for one use, its instantiation's and its specialization clone's, is one exception, and two uses are
+two (`Solver::exception_instances`).
 
 ### Polymorphism and materialization
 
@@ -5305,12 +5307,12 @@ projection's sum, a family's arguments (`settle_capabilities` in `solve.rs`). A 
 before coalesce settles its tree the same way (`run_once` in `infer/mod.rs`), since the passes after
 a failed inference still read it.
 
-A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
-arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one
-clone has one set of capabilities at each node. Uses whose arguments bring different capabilities
-therefore share no clone: the specialization key holds, at each function position of the use's type,
-what the function there requires and causes, resolved (`spec_key`'s `KeyView::capabilities`). A use
-inside a clone instantiated through the clone's copies.
+A clone copies the definition's capability variables as it copies its type variables, and the pin
+relates the clone to its use's instantiation for capabilities as for types (`specialize_use`): what
+the use's arguments bring where the definition's effect parameters stand reaches the clone's copies
+through it. Uses whose arguments bring different capabilities therefore share no clone: the
+specialization key holds, at each function position of the use's type, what the function there
+requires and causes, resolved (`spec_key`'s `KeyView::capabilities`).
 
 #### Settling capabilities
 
@@ -5322,7 +5324,9 @@ Settling is one rewrite of what each value holds (`Settler`, through `HoldsSolve
 - an ordering requirement the run has not closed becomes a closed one (`Requirement::closed`): the
   run decides whether it is satisfied now, while its capabilities can still say whether an effect
   input is open, and what it holds is settled by the same rewrite. That covers its positions, its
-  source's type, its capabilities and its assumptions;
+  source's type, its capabilities and its assumptions. The type variables in them resolve, as a
+  node's type does, since a closed requirement is read once the run has ended. Elsewhere settling
+  keeps a type variable: coalesce decides a node's types, and an error's are reported as found;
 - an ordering requirement met inside its own parts, a loop's body requiring what the loop does, is
   closed to the run's answer with no capabilities;
 - a requirement a run closed is entered like any other value.

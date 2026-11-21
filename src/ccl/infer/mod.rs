@@ -1753,7 +1753,6 @@ fn attempt_run(
         std::mem::take(&mut sub_ctx.bound_at_annotation),
         std::mem::take(&mut sub_ctx.definition_telescopes),
         Rc::clone(&sub_ctx.instances),
-        std::mem::take(&mut sub_ctx.use_capabilities),
     );
     sub_ctx.name_varying_binders(&mut errors);
     sub_ctx.name_other_feed_places(&mut errors);
