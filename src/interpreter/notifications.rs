@@ -922,10 +922,11 @@ impl Consumer for Pairing {
     /// Restates a region of one input as the pairs it reaches ([`Delivered`]), passed on as
     /// [`pass_on`](Self::pass_on) says.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        // Only a landing that queues packages grows what has been delivered and is cut by it. A
-        // completion record states what is decided rather than what arrived, and queues
-        // nothing, so it takes every pair the region decides ([`Landing::queues`]).
-        let recorded = landing.queues();
+        // A delivery grows what has been delivered and is cut by it: a landing that queues
+        // packages, a breaker's push or a range's arrival ([`Landing::queues`]). Any other landing
+        // states what is decided rather than what arrived, so it is cut by nothing and takes every
+        // pair it decides.
+        let delivery = landing.queues();
         // The pairs are read and the delta recorded under one lock, so of two deliveries on
         // different threads the later one announces each pair they complete, and once. The lock
         // is released before the region is passed on.
@@ -969,18 +970,18 @@ impl Consumer for Pairing {
                     ),
                     whole => (whole.clone(), None),
                 };
-                let Some((_, record)) = self.pairs(&keys_only, recorded, &delivered) else {
+                let Some((_, record)) = self.pairs(&keys_only, delivery, &delivered) else {
                     panic!("{arm:?} names keys beneath what a pairing restates");
                 };
                 let every = self.pairs(&keys_only, false, &delivered);
-                let (rows, partners) = match recorded {
+                let (rows, partners) = match delivery {
                     true => (delivered.rows.clone(), delivered.partners.clone()),
                     false => (
                         crate::interpreter::Predicate::True,
                         crate::interpreter::Predicate::True,
                     ),
                 };
-                if recorded {
+                if delivery {
                     record(&mut delivered);
                 }
                 let pairs = match (&values, every) {
@@ -1028,11 +1029,11 @@ impl Consumer for Pairing {
         if let (PairingSide::ConstantKeys, Projection::Keys { level, keys }) = (self.side, region)
             && *level > CurryLevel::OUTERMOST
         {
-            let rows = match recorded {
+            let rows = match delivery {
                 true => delivered.rows.clone(),
                 false => crate::interpreter::Predicate::True,
             };
-            if recorded {
+            if delivery {
                 let outermost = outermost_keys(keys, level.index());
                 delivered.partners = delivered.partners.union(&outermost);
             }
@@ -1046,7 +1047,7 @@ impl Consumer for Pairing {
             self.pass_on(&restated, landing);
             return;
         }
-        let Some((pairs, record)) = self.pairs(region, recorded, &delivered) else {
+        let Some((pairs, record)) = self.pairs(region, delivery, &delivered) else {
             drop(delivered);
             match self.side {
                 // A constant's region beneath its outermost keys names no key of the pairs.
@@ -1058,7 +1059,7 @@ impl Consumer for Pairing {
             }
             return;
         };
-        if recorded {
+        if delivery {
             record(&mut delivered);
         }
         drop(delivered);

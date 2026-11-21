@@ -2127,7 +2127,7 @@ impl Dispatcher {
         if morsels.is_empty() {
             return;
         }
-        let mut landing = Landing::new(Target::Queue { dispatcher: self }, pipeline);
+        let mut landing = Landing::push(self, PipelineId(pipeline));
         match to {
             Some(to) => {
                 for morsel in morsels {
@@ -2581,8 +2581,13 @@ pub struct Landing<'d> {
 
 /// What a [`Landing`] does with the regions that reach an [`Entry`].
 enum Target<'d> {
-    /// Queues each in the reader's queue.
-    Queue { dispatcher: &'d Dispatcher },
+    /// Queues each in the reader's queue. A region that reaches the pushing pipeline's own entry,
+    /// pushed by a range in that pipeline's chain, is collected in `own` for the pipeline to queue
+    /// once it has dropped what its input released ([`Landing::push`]).
+    Queue {
+        dispatcher: &'d Dispatcher,
+        own: Vec<TileGuard>,
+    },
     /// Records each, for a planner that probes which region of a reader's input a pipeline's push
     /// names; which edges keep keys the planner reads off a route walk ([`Landing::route`]).
     Probe(Vec<Arrival>),
@@ -2620,11 +2625,13 @@ pub(crate) struct Arrival {
 impl Landing<'_> {
     fn accepts_entry(&self, pipeline: PipelineId) -> bool {
         match &self.target {
-            Target::Queue { dispatcher } | Target::Completion { dispatcher, .. } => dispatcher
-                .infos[pipeline.0]
-                .ingress
-                .as_ref()
-                .is_none_or(|from| from.contains(&self.from)),
+            Target::Queue { dispatcher, .. } | Target::Completion { dispatcher, .. } => {
+                pipeline.0 == self.from
+                    || dispatcher.infos[pipeline.0]
+                        .ingress
+                        .as_ref()
+                        .is_none_or(|from| from.contains(&self.from))
+            }
             Target::Probe(_) | Target::ProbeCompletion(_) | Target::Route { .. } => true,
         }
     }
@@ -2655,6 +2662,27 @@ impl Landing<'_> {
     /// A landing that records where `from`'s push arrives, and queues nothing.
     pub(crate) fn probe(from: PipelineId) -> Landing<'static> {
         Landing::new(Target::Probe(Vec::new()), from.0)
+    }
+
+    /// A landing for a push of `from`: a breaker's, or the keys a range in `from`'s chain has newly
+    /// yielded. What reaches another pipeline's entry is queued there; what reaches `from`'s own
+    /// entry is collected ([`own_arrivals`](Self::own_arrivals)).
+    pub(crate) fn push(dispatcher: &Dispatcher, from: PipelineId) -> Landing<'_> {
+        Landing::new(
+            Target::Queue {
+                dispatcher,
+                own: Vec::new(),
+            },
+            from.0,
+        )
+    }
+
+    /// What a [`push`](Self::push) brought to its own pipeline's entry.
+    pub(crate) fn own_arrivals(self) -> Vec<TileGuard> {
+        match self.target {
+            Target::Queue { own, .. } => own,
+            _ => panic!("only a queueing landing collects its own pipeline's arrivals"),
+        }
     }
 
     /// A landing that records where `from`'s push of a wholly complete region arrives, and queues
@@ -2764,7 +2792,11 @@ impl Landing<'_> {
             final_key: self.final_key.clone(),
         };
         let dispatcher = match &mut self.target {
-            Target::Queue { dispatcher } => *dispatcher,
+            Target::Queue { own, .. } if reader.0 == self.from => {
+                own.push(guard.clone());
+                return;
+            }
+            Target::Queue { dispatcher, .. } => *dispatcher,
             Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => {
                 arrivals.push(Arrival {
                     pipeline: reader,
@@ -3392,6 +3424,7 @@ pub(crate) fn notify_for_test<C: Consumer + ?Sized>(consumer: &C, region: &Proje
     let mut landing = Landing::new(
         Target::Queue {
             dispatcher: &dispatcher,
+            own: Vec::new(),
         },
         0,
     );

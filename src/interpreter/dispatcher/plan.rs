@@ -539,7 +539,8 @@ fn run_targets(
     // scope is then notified of each delivery as rounds, as over the source itself, and holds each
     // delivery until the pipelines it reads have completed it (`Dispatcher::wait_for_inputs`).
     let one = Projection::admitting(Predicate::point(Value::UInt(0)));
-    let inherited: Vec<Vec<LiveLeaf>> = (0..members.live.len())
+    // Each inherited range with the pipeline whose chain holds it, which its keys are pushed as.
+    let inherited: Vec<Vec<(PipelineId, LiveLeaf)>> = (0..members.live.len())
         .map(|pipeline| {
             let scope = scopes[pipeline].as_ref();
             let store = matches!(members.located[pipeline], Located::Store { .. });
@@ -573,7 +574,11 @@ fn run_targets(
                     }) {
                         return Vec::new();
                     }
-                    leaves.extend(members.live[read].iter().cloned());
+                    leaves.extend(
+                        members.live[read]
+                            .iter()
+                            .map(|leaf| (PipelineId(read), leaf.clone())),
+                    );
                     continue;
                 }
                 let (pusher, _, pushed) = end_of(PipelineId(read))
@@ -584,7 +589,11 @@ fn run_targets(
                 if !keys_arrive_as_themselves(&routes, &arrived, &one) {
                     return Vec::new();
                 }
-                leaves.extend(members.live[read].iter().cloned());
+                leaves.extend(
+                    members.live[read]
+                        .iter()
+                        .map(|leaf| (PipelineId(read), leaf.clone())),
+                );
             }
             leaves
         })
@@ -631,10 +640,14 @@ fn run_targets(
     let mut reads_as_keys = Vec::new();
     for (pipeline, (own, inherited)) in members.live.iter().zip(&inherited).enumerate() {
         let inherits = own.is_empty() && !inherited.is_empty();
-        let leaves = match inherits {
-            true => inherited,
-            false => own,
+        let held: Vec<(PipelineId, LiveLeaf)> = match inherits {
+            true => inherited.clone(),
+            false => own
+                .iter()
+                .map(|leaf| (PipelineId(pipeline), leaf.clone()))
+                .collect(),
         };
+        let leaves: &Vec<LiveLeaf> = &held.iter().map(|(_, leaf)| leaf.clone()).collect();
         if leaves.is_empty() {
             continue;
         }
@@ -815,7 +828,7 @@ fn run_targets(
         }
         live.push(LivePipeline::new(
             PipelineId(pipeline),
-            leaves.clone(),
+            held,
             notifies,
             input,
             starts,
@@ -2171,6 +2184,24 @@ pub(super) fn probe(
         .into_iter()
         .filter(|arrival| arrival.pipeline.0 == reader)
         .collect()
+}
+
+/// Push `fresh`, the keys a range in `pipeline`'s chain has newly yielded, through `consumer`, the
+/// range's consumer ([`Landing::push`]), and return the region of `pipeline`'s own input it
+/// reaches.
+fn push_arrivals(
+    dispatcher: &Dispatcher,
+    consumer: &SharedConsumer,
+    pipeline: PipelineId,
+    fresh: &Predicate,
+) -> Vec<TileGuard> {
+    let mut landing = Landing::push(dispatcher, pipeline);
+    crate::interpreter::notifications::notify_shared(
+        consumer,
+        &Projection::admitting(fresh.clone()),
+        &mut landing,
+    );
+    landing.own_arrivals()
 }
 
 /// The region of `reader`'s input a push of `from`'s every key reaches through `consumer` when
@@ -3542,7 +3573,10 @@ enum Notifies {
 /// keys it has been notified of.
 struct LivePipeline {
     pipeline: PipelineId,
-    leaves: Vec<(LiveLeaf, Predicate)>,
+    /// Each range the pipeline polls, with the pipeline whose chain holds it and the keys it has
+    /// yielded so far. A scope that inherits the ranges of a pipeline it reads polls them, but
+    /// their keys are that pipeline's push.
+    leaves: Vec<(PipelineId, LiveLeaf, Predicate)>,
     notifies: Notifies,
     /// The pipeline's breaker's input, which a notification is a guard of.
     input: Tiling,
@@ -3560,7 +3594,7 @@ struct LivePipeline {
 impl LivePipeline {
     fn new(
         pipeline: PipelineId,
-        leaves: Vec<LiveLeaf>,
+        leaves: Vec<(PipelineId, LiveLeaf)>,
         notifies: Notifies,
         input: Tiling,
         starts: Vec<TileGuard>,
@@ -3571,7 +3605,7 @@ impl LivePipeline {
             pipeline,
             leaves: leaves
                 .into_iter()
-                .map(|leaf| (leaf, Predicate::False))
+                .map(|(holder, leaf)| (holder, leaf, Predicate::False))
                 .collect(),
             notifies,
             announced: input.empty_guard(),
@@ -3599,7 +3633,7 @@ impl LivePipeline {
         // they gained together, once.
         let mut positions = Predicate::False;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
-        for (index, (leaf, notified)) in self.leaves.iter_mut().enumerate() {
+        for (index, (holder, leaf, notified)) in self.leaves.iter_mut().enumerate() {
             let yielded = leaf.extent.complete_region();
             debug_assert!(
                 notified.minus(&yielded).is_false(),
@@ -3611,15 +3645,15 @@ impl LivePipeline {
                 continue;
             }
             changed = true;
+            // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
+            // them, so an operator that pairs them with another input's rows records them.
+            let delivered = push_arrivals(dispatcher, &leaf.consumer, *holder, &fresh);
             match self.notifies {
-                Notifies::Arrivals => {
-                    for arrival in probe(
-                        &leaf.consumer,
-                        self.pipeline,
-                        &Projection::admitting(fresh),
-                        self.pipeline.0,
-                    ) {
-                        arrivals = arrivals.union(&arrival.guard);
+                // What reaches another pipeline's entry is that pipeline's: a scope that inherits
+                // a read pipeline's ranges takes their keys through its rounds.
+                Notifies::Arrivals if holder.0 == self.pipeline.0 => {
+                    for guard in delivered {
+                        arrivals = arrivals.union(&guard);
                     }
                 }
                 Notifies::Items {
@@ -3638,6 +3672,7 @@ impl LivePipeline {
                         }
                     });
                 }
+                Notifies::Arrivals => {}
                 Notifies::Rounds | Notifies::Items { arms: None } => {
                     // A round runs once every position before it is complete, so a range read in
                     // rounds must yield a prefix of the positions of the field that orders it. A
@@ -3755,7 +3790,7 @@ fn drive_live(
     execution.push_held(dispatcher, reach);
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
-        for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
+        for (_, leaf, _) in live.iter().flat_map(|at| &at.leaves) {
             leaf.extent.for_each_source(&mut |source| {
                 if !sources.iter().any(|seen| Arc::ptr_eq(seen, source)) {
                     sources.push(source.clone());
