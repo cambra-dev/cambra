@@ -4417,30 +4417,20 @@ pub(super) fn lower_type_expr_or_poly(
                 chl_parser::ast::Arrow::Compute => crate::ccl::FunKind::Compute,
                 chl_parser::ast::Arrow::Data => crate::ccl::FunKind::Data(None),
             };
-            // A component with no name is read by none, so its name is one nothing spells.
-            let params: Vec<(Name, Type)> = components
-                .into_iter()
-                .map(|(name, ty)| {
-                    let name = name.map_or_else(|| Name::fresh("_"), |n| Name::raw(n.node));
-                    (name, ty)
-                })
+            // The codomain reads the components by their names.
+            let names: Vec<Option<Name>> = components
+                .iter()
+                .map(|(n, _)| n.as_ref().map(|n| Name::raw(n.node.clone())))
                 .collect();
             let depth = ctx.type_binders.len();
             ctx.type_binders.extend(
-                params
+                components
                     .iter()
-                    .map(|(name, ty)| (SmolStr::from(name.base()), ty.clone())),
+                    .filter_map(|(n, ty)| n.as_ref().map(|n| (n.node.clone(), ty.clone()))),
             );
             let codomain = lower_type_expr(codomain, ctx);
             ctx.type_binders.truncate(depth);
-            let names: Vec<Option<Name>> =
-                params.iter().map(|(name, _)| Some(name.clone())).collect();
-            let domain = Type::dep_tuple(
-                params
-                    .into_iter()
-                    .map(|(name, ty)| (Some(name), ty))
-                    .collect(),
-            );
+            let domain = named_product(components);
             // The one input is the tuple, read whole, and a component's name reads its
             // projection: `{(a: A), (b: B(a))} => C(a)` is `(p: {(a: A), (b: B(a))}) => C(p.0)`.
             // Closed, a read of component `𝑗` is `PiRef { component: Some(𝑗) }` under the whole
@@ -5761,25 +5751,6 @@ fn lower_named_components(
             }
             _ => (None, lower_type_expr(part, ctx)?),
         };
-        // A written type whose component reads an earlier one does not compile yet: a `def`'s
-        // parameter may read an earlier parameter, which binds it, but a value meeting a written
-        // dependent tuple has no binder for the earlier component to stand under.
-        let read = crate::ccl::subst::type_free_vars(&ty);
-        let earlier = components
-            .iter()
-            .filter_map(|(n, _)| n.as_ref())
-            .find(|n| read.contains(&Name::raw(n.node.clone())));
-        if let Some(earlier) = earlier {
-            let earlier = &earlier.node;
-            return Err(LoweringError::unsupported(
-                part.span,
-                format!(
-                    "this component's type reads the component `{earlier}` before it, which a \
-                     written type does not support yet; a `def`'s parameter may read an earlier \
-                     parameter, `def f({earlier}: …, x: {{Int where _ >= {earlier}}})`"
-                ),
-            ));
-        }
         if let Some(name) = &name {
             ctx.type_binders.push((name.node.clone(), ty.clone()));
         }
@@ -5790,8 +5761,9 @@ fn lower_named_components(
     lowered.map(|()| components)
 }
 
-/// The dependent tuple of `components` ([`lower_named_components`]), each later one reading
-/// the earlier ones by index, and the plain tuple where none does ([`Type::dep_tuple`]).
+/// The product of `components` ([`lower_named_components`]), each later one reading the
+/// earlier ones by index. It stays dependent when a component reads an earlier name or a
+/// hole after a named component may acquire that dependency during inference.
 fn named_product(components: NamedComponents) -> Type {
     let mut components: Vec<(Option<Name>, Type)> = components
         .into_iter()
@@ -5804,7 +5776,27 @@ fn named_product(components: NamedComponents) -> Type {
             *n = Name::fresh(n.base());
         }
     }
-    Type::closed_dep_tuple(components)
+    // A hole after a named component is inferred, and what it is inferred to may read that
+    // component, so the tuple stays dependent for it: `{(i: _), (j: _)}` types the keys of a
+    // collection whose inner keys differ with the outer key.
+    let hole_under_a_name = components.iter().enumerate().any(|(k, (_, t))| {
+        k > 0 && components[..k].iter().any(|(n, _)| n.is_some()) && holds_hole(t)
+    });
+    if hole_under_a_name {
+        Type::DepTuple(components)
+    } else {
+        Type::closed_dep_tuple(components)
+    }
+}
+
+/// Whether `ty` holds a hole anywhere.
+fn holds_hole(ty: &Type) -> bool {
+    if matches!(ty, Type::Hole) {
+        return true;
+    }
+    let mut found = false;
+    ty.walk_children(|t| found |= holds_hole(t));
+    found
 }
 
 /// `body` lowered with each of `scope`'s binders in scope at its type, innermost last, and

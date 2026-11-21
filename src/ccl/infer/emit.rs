@@ -309,8 +309,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Proj(key) => {
             // The projection's function type is built here: seed it with a
-            // fresh var that `emit_proj` ties to `domain ⇒ codomain`.
-            let seed = ctx.fresh();
+            // fresh var that `emit_proj` ties to `domain ⇒ codomain`, or with the
+            // function of the dependent tuple its application found it projecting
+            // (`emit_apply`).
+            let seed = match recorded_ty.peel_refinements() {
+                Type::Fun {
+                    binder: FunBinder::Whole(_),
+                    domain,
+                    ..
+                } if matches!(domain.peel_refinements(), Type::DepTuple(_)) => recorded_ty.clone(),
+                _ => ctx.fresh(),
+            };
             emit_proj(key, &seed, expr.node_id, ctx)?
         }
 
@@ -1079,10 +1088,27 @@ pub(super) fn emit_lambda<C: Typing>(
     // ([`FunBinder::Parameters`]), the empty one included.
     let (binder, domain) = match (params, domain.as_slice()) {
         ([param], [ty]) => (FunBinder::Whole(param.name.clone()), ty.clone()),
+        // The empty list's domain is unit, the product of no components.
+        ([], []) => (
+            FunBinder::Parameters(Vec::new()),
+            Type::Base(BaseType::Unit),
+        ),
+        // The domain names the parameters whether or not a later one's type reads an earlier
+        // one yet: a type the solve settles may, as a written dependent domain meeting it does,
+        // and compaction collapses it to the plain tuple where none does, as it does
+        // `uncurry`'s.
         (params, tys) => {
             let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
-            let domain =
-                Type::params_domain(names.iter().cloned().zip(tys.iter().cloned()).collect());
+            let mut components: Vec<(Option<Name>, Type)> = names
+                .iter()
+                .cloned()
+                .map(Some)
+                .zip(tys.iter().cloned())
+                .collect();
+            // Closed as `Type::dep_tuple` closes it, a later component's written read of an
+            // earlier one an index, without collapsing to the plain tuple.
+            crate::ccl::subst::close_tuple_components(&mut components);
+            let domain = Type::DepTuple(components);
             (
                 FunBinder::Parameters(names.into_iter().map(Some).collect()),
                 domain,
@@ -1408,6 +1434,25 @@ pub(super) fn emit_apply<C: Typing>(
             && let TypedExprNode::Var(r) = &position.node
         {
             ctx.note_loop_source(&param.name, r, source, &position.ty, &raw_arg_ty);
+        }
+        // `.𝑘` out of a dependent tuple reads its component at the projected value, which the
+        // projection's own type binds: seeded so before the projection is emitted, since an
+        // open tuple's positions stand outside the components a later one reads.
+        if let TypedExprNode::Proj(ProjKey::Index(_)) = &function.node
+            && matches!(function.ty, Type::Hole | Type::Infer(_))
+        {
+            let tuple = read_through(&raw_arg_ty);
+            if let Type::DepTuple(_) = tuple.peel_refinements() {
+                let b = Name::fresh("__tuple");
+                let codomain = ctx.scoped(&b, &tuple, |ctx| ctx.fresh());
+                function.ty = Type::Fun {
+                    binder: FunBinder::Whole(b),
+                    fun_kind: FunKind::Compute,
+                    domain: Box::new(tuple),
+                    codomain: Box::new(codomain),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
+                };
+            }
         }
         (raw_arg_ty, emit_function(function, ctx)?, false)
     };
@@ -1796,6 +1841,42 @@ fn refine_result(
 fn emit_function<C: Typing>(function: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
     let fn_ty = ctx.subexpr(function)?;
     Ok(read_value(function, &fn_ty, ctx))
+}
+
+/// `domain`, a dependent tuple, read at `value`: the tuple whose component `𝑘` is read with each
+/// earlier component at `value.𝑗`, the part a tuple built in place has in hand. Any other type is
+/// unchanged. Mints the projections, so the caller opens a recording.
+fn dep_tuple_at(domain: &Type, value: &Expr) -> Type {
+    let Type::DepTuple(components) = domain.peel_refinements() else {
+        return domain.clone();
+    };
+    let mut tuple = crate::ccl::ccl_utils::predicate_term(value);
+    tuple.ty = domain.clone();
+    // A tuple built in place has its components in hand; any other is read by projection.
+    let part = |j: usize| match &tuple.node {
+        TypedExprNode::Tuple(parts) if parts.len() == components.len() => {
+            parts[j].clone_preserving_ids()
+        }
+        _ => Expr::projection_of(&tuple, j),
+    };
+    let opened: Vec<Type> = (0..components.len())
+        .map(|k| {
+            domain
+                .component_type(k, |j, _| part(j))
+                .expect("a component of the dependent tuple")
+        })
+        .collect();
+    Type::tuple(opened)
+}
+
+/// Whether `value` is a tuple built in place, under the `let`s A-normalization puts around it
+/// to name its parts.
+fn built_tuple(value: &Expr) -> bool {
+    match &value.node {
+        TypedExprNode::Tuple(_) => true,
+        TypedExprNode::Let { body, .. } => built_tuple(body),
+        _ => false,
+    }
 }
 
 /// The argument list `argument` is ([`TypedExprNode::Arguments`]), under the `let`s
@@ -3108,7 +3189,33 @@ fn emit_let_bound<C: Typing>(
                     complete_annotation(ann, &bound_ty)
                 }
             };
-            match ctx.bind_annotation(&bound_ty, &declared) {
+            // A tuple built in place meets a written dependent tuple with each later
+            // component read at the parts before it, as a call's arguments meet a dependent
+            // domain; the binder keeps the dependent tuple ([`dep_tuple_at`]).
+            let bound = match (declared.peel_refinements(), built_tuple(bound_expr)) {
+                (Type::DepTuple(_), true) => {
+                    let _g = crate::ccl::provenance::enter(
+                        bound_expr.node_id(),
+                        "infer.annotation_components",
+                        crate::ccl::provenance::Nature::Machinery,
+                    );
+                    let at_parts = dep_tuple_at(&declared, bound_expr);
+                    // A mismatch names the annotation as written.
+                    match ctx.bind_annotation(&bound_ty, &at_parts) {
+                        Ok(_) => Ok(ctx.normalize(&declared)),
+                        Err(mut error) => {
+                            if let InferError::AnnotationMismatch { annotation, .. } =
+                                &mut error.error
+                            {
+                                **annotation = declared.clone();
+                            }
+                            Err(error)
+                        }
+                    }
+                }
+                _ => ctx.bind_annotation(&bound_ty, &declared),
+            };
+            match bound {
                 Ok(ty) => ty,
                 Err(error) => {
                     ctx.recover(error.at_annotation(annotation), reads_before)?;
@@ -3517,14 +3624,13 @@ fn projection(key: &ProjKey) -> String {
     format!("projection `.{key}`")
 }
 
-/// `Proj(k) : ∀α. {k: α, …} ⇒ α`. The node's own type *is* that function, so
+/// `Proj(k) : ∀α. {k: α, …} ⇒ α`. The node's own type is that function, so
 /// we decompose it into `(domain, codomain)` and require the domain to carry
 /// field `k` typed at the codomain.
 ///
-/// `node_ty` is the projection's function type: a fresh seed in Emit (which
-/// `provide_function` lower-bounds with `domain ⇒ codomain`, so it coalesces
-/// to the built function) and the recorded type in Check (destructured
-/// directly — no inference vars).
+/// Emit seeds `node_ty` from a known dependent input in `emit_apply`. Otherwise
+/// `provide_function` lower-bounds a fresh seed with `domain ⇒ codomain`.
+/// Check reads the recorded function type directly.
 ///
 /// A **dependent** projection reaches here: `lambda_elim`'s pairing rule carries a
 /// refinement that reads one component into the other's type, so `.k`'s codomain
@@ -3537,7 +3643,16 @@ pub(super) fn emit_proj<C: Typing>(
     node_id: NodeId,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let (domain, codomain) = ctx.provide_function(node_ty, &|| projection(key))?;
+    // A projection seeded as a function of the dependent tuple it projects (`emit_apply`)
+    // already has its shape; any other node supplies one.
+    let (domain, codomain) = match node_ty.peel_refinements() {
+        Type::Fun {
+            domain, codomain, ..
+        } if matches!(domain.peel_refinements(), Type::DepTuple(_)) => {
+            ((**domain).clone(), (**codomain).clone())
+        }
+        _ => ctx.provide_function(node_ty, &|| projection(key))?,
+    };
     let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
     if let (ProjKey::Index(k), Type::DepTuple(_)) = (key, domain.peel_refinements()) {
         let _g = crate::ccl::provenance::enter(
