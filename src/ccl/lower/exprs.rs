@@ -526,10 +526,11 @@ pub(super) fn lower_application(
 /// A lowered term that lowering places at more than one position.
 ///
 /// [`MintedTerm::mint`] mints its binders before any copy is taken ("Mint before copy",
-/// `crate::ccl::uniquify`), so every copy names the same binders. A copy of a raw term would
-/// mint binders of its own at the program's `uniquify`, while a refinement nested in the
-/// term is one `Rc` that every copy shares and that pass rebuilds once, against the first
-/// copy's binders; the other copies' refinement would name a binder they do not have.
+/// `crate::ccl::uniquify`). A copy of a raw term would mint binders of its own at the program's
+/// `uniquify`, while a refinement nested in the term is one `Rc` that every copy shares and that
+/// pass rebuilds once, against the first copy's binders; the other copies' refinement would name
+/// a binder they do not have. A copy of the minted term renames the binders it introduces,
+/// nested refinements included, so every copy binds names of its own.
 struct MintedTerm(Expr);
 
 impl MintedTerm {
@@ -560,8 +561,9 @@ impl MintedTerm {
                 record(o, c);
             }
         }
-        let copy = self.0.duplicate();
+        let mut copy = self.0.duplicate();
         record(&self.0, &copy);
+        crate::ccl::scope::freshen_bound_names(&mut copy, crate::ccl::Ids::Fresh);
         copy
     }
 

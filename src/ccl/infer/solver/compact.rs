@@ -5093,7 +5093,7 @@ mod tests {
             .into_result()
             .expect("the chain lowers");
         let mut expr = crate::ccl::opaque_output::run(crate::ccl::comprehension::run(
-            crate::ccl::uniquify::run(lowered),
+            crate::ccl::mut_read::run(crate::ccl::anf::run(crate::ccl::uniquify::run(lowered))),
             lctx.shared_holes(),
         ));
         let mut ictx = crate::ccl::infer::TypeInferenceContext::new();

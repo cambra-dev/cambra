@@ -4557,7 +4557,9 @@ mod tests {
             "x",
             Expr::var("x"),
         );
-        let mut outer_comp = list_comp_unannotated(solver, inner_comp, "y", Expr::var("y"));
+        let outer_comp = list_comp_unannotated(solver, inner_comp, "y", Expr::var("y"));
+        // Lowering uniquifies before inference, which binds every name once.
+        let mut outer_comp = crate::ccl::uniquify::run(outer_comp);
         let mut ctx = TypeInferenceContext::new();
         infer(&mut outer_comp, &mut ctx).unwrap();
 
@@ -5085,7 +5087,7 @@ mod tests {
             Type::Base(BaseType::String),
             Expr::var("b"),
         );
-        let mut expr = Expr::lambda(
+        let expr = Expr::lambda(
             "x",
             Occurrence::mint(),
             Type::infer(solver),
@@ -5099,6 +5101,8 @@ mod tests {
                 }),
             ),
         );
+        // Lowering uniquifies before inference, which binds every name once.
+        let mut expr = crate::ccl::uniquify::run(expr);
         let mut ctx = TypeInferenceContext::new();
         // inference catches the mismatch at the Apply site.
         let errs = infer_bare(&mut expr, &mut ctx)

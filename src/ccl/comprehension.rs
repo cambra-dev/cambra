@@ -335,11 +335,17 @@ fn encode(
         (Some(pred_op), Some(pred_source)) => {
             // The refinement's element is the reserved `REFINEMENT_BINDER`, the position the
             // filter is read at; the predicate is a bare boolean expression, not a lambda.
+            // The predicate's lambda binds the generator's element too, at a second place, so it
+            // binds a name of its own
+            // (`src/ccl/design/type-inference.md`, "Every binder is bound in one place").
+            let mut pred_lambda =
+                // A copy of the generator's occurrence, as the predicate's binder is a copy of
+                // the generator's.
+                per_element_lambda(&binding.duplicate(), binding.occurrence.duplicate(), pred_op);
+            crate::ccl::scope::freshen_bound_names(&mut pred_lambda, crate::ccl::Ids::Fresh);
             let pred_expr = Expr::apply(
                 Expr::apply(Expr::var(Name::elem()), unbox(pred_source)),
-                // The predicate's lambda is a second binder for the same generator, a copy
-                // of its occurrence.
-                per_element_lambda(&binding, binding.occurrence.duplicate(), pred_op),
+                pred_lambda,
             );
             // A refined parameter is `cast(refined_data_fun, λ outer_var → body_expr)`, a
             // type-level assertion of the predicate-refined domain. The refinement is carried
@@ -476,7 +482,11 @@ fn encode_curried(
         // read as it types the element: by `uncurry`'s dependent scheme, with no positional
         // projection to type ahead of knowing the domain's shape.
         Some(pred_op) => {
-            let filter = flattened_nest(pred_bindings, pred_sources, &ids, pred_op, holes, false);
+            let mut filter =
+                flattened_nest(pred_bindings, pred_sources, &ids, pred_op, holes, false);
+            // The filter's nest binds each generator a second time, so it binds names of its
+            // own (`src/ccl/design/type-inference.md`, "Every binder is bound in one place").
+            crate::ccl::scope::freshen_bound_names(&mut filter, crate::ccl::Ids::Fresh);
             let pred_expr = Expr::apply(Expr::var(Name::elem()), filter);
             make_cast(
                 flat,
@@ -534,8 +544,8 @@ fn flattened_nest(
 /// `λ target → body` at a generator's binder, at `occurrence`.
 ///
 /// The binder is the one lowering put on the generator, so the lambda it becomes
-/// binds the same [`Name`] the element and the guards already reference — which
-/// is what keeps this phase from needing to rename anything it did not mint.
+/// binds the same [`Name`] the element and the guards already reference. A filter's
+/// lambda is a second binding of it, which the filter's builder renames.
 fn per_element_lambda(target: &TypedBinding, occurrence: Occurrence, body: Expr) -> Expr {
     debug_assert!(
         target.user_annotation.is_none(),

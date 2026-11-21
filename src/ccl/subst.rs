@@ -276,7 +276,7 @@ impl Mapping {
         let out = match self {
             // A renamed occurrence retains its type, including inside predicates.
             Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
-            Mapping::Discharge(t) => (**t).copied(ids),
+            Mapping::Discharge(t) => placed_copy((**t).copied(ids), ids),
             Mapping::Join(..) => {
                 unreachable!("a joined binder has no term; its occurrence stays")
             }
@@ -293,7 +293,7 @@ impl Mapping {
             // See [`as_expr`]: the rename keeps the occurrence's type.
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
-            Mapping::Discharge(t) => t.copied_at(node_id, ids),
+            Mapping::Discharge(t) => placed_copy(t.copied_at(node_id, ids), ids),
             Mapping::Join(..) => {
                 unreachable!("a joined binder has no term; its occurrence stays")
             }
@@ -301,6 +301,13 @@ impl Mapping {
         assert_preserves_typedness(&out, occurrence_ty);
         out
     }
+}
+
+/// A discharge's term as placed at one occurrence: a copy binding names of its own
+/// (`src/ccl/design/type-inference.md`, "Every binder is bound in one place").
+fn placed_copy(mut copy: TypedExpr, ids: Ids) -> TypedExpr {
+    crate::ccl::scope::freshen_bound_names(&mut copy, ids);
+    copy
 }
 
 /// `domain`, taken from a `Compose`'s head, spelled in the **composition's own**
@@ -4641,6 +4648,26 @@ enum PiMode<'a> {
     Shift(i32),
 }
 
+/// Whether a type slot of `e` or of a node below it holds an inference variable, a held
+/// term's slots included. A held term shared by allocation is walked once.
+fn holds_infer_var(e: &TypedExpr) -> bool {
+    holds_infer_var_in(e, &mut HashSet::new())
+}
+
+fn holds_infer_var_in(e: &TypedExpr, seen: &mut HashSet<*const TypedExpr>) -> bool {
+    let mut found = false;
+    e.walk_type_slots(|t| {
+        if found || t.holds_type(&|t| matches!(t, Type::Infer(_))) {
+            found = true;
+            return;
+        }
+        t.walk_held_terms(&mut |q| {
+            found = found || (seen.insert(Rc::as_ptr(q)) && holds_infer_var_in(q, seen));
+        });
+    });
+    found || e.any_child(|c| holds_infer_var_in(c, seen))
+}
+
 /// The shared engine under [`close_pi_binder`] and [`open_pi_binder`]: one
 /// walk over the mixed type/term structure, threading the crossed-codomain
 /// depth. Only a `Fun` codomain crossing deepens; a domain, a refinement
@@ -4879,7 +4906,7 @@ impl<'a> PiWalk<'a> {
         // fresh ids are minted with nothing recording, and surface as dangling
         // parents once a later recorded rewrite names the converted root.
         let r_origin = Rc::clone(r.held());
-        let (pred, before) = {
+        let (mut pred, before) = {
             let _g = crate::ccl::provenance::enter(
                 r.held().node_id(),
                 "predicate.coordinate",
@@ -4893,6 +4920,13 @@ impl<'a> PiWalk<'a> {
         let done = if self.changed > before {
             // Occurrences that shared the original re-share the conversion
             // through the memo.
+            // The converted term is a second binding of every binder it introduces
+            // (`src/ccl/design/type-inference.md`, "Every binder is bound in one place"). A
+            // term holding an inference variable shares it with the original, whose bounds
+            // name the original's binders, so only a term holding none is renamed.
+            if !holds_infer_var(&pred) {
+                crate::ccl::scope::freshen_bound_names(&mut pred, self.ids);
+            }
             let done = Rc::new(pred);
             r.replace_held(Rc::clone(&done));
             done

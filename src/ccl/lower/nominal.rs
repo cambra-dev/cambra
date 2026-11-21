@@ -1196,8 +1196,8 @@ pub(super) fn associated_reach(
             ));
         }
     }
-    // An instance belongs to the whole program, and every copy of its module binds its
-    // functions under one binder, so they reach what an associated function may
+    // An instance belongs to the whole program, and a call it answers takes whichever copy of
+    // its module's functions is in scope, so they reach what an associated function may
     // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]").
     for block in &ctx.instance_blocks {
         let mut reaches = Vec::new();

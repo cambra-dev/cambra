@@ -1495,6 +1495,7 @@ fn inline_and_beta_reduce(
         // that is not a call, such as a function passed as an argument, names no call site,
         // and the sites in its copy are reached where it is called.
         let mut copy = lambda.duplicate();
+        crate::ccl::scope::freshen_bound_names(&mut copy, crate::ccl::Ids::Fresh);
         if let Some(call) = &expr.site {
             reached_through(&mut copy, call);
         }
@@ -1937,6 +1938,7 @@ fn substitute_function(body: Expr, name: &Name, value: &Expr) -> Expr {
     rename_uses(&mut body, name, &mut uses);
     let body = uses.into_iter().fold(body, |body, (renamed, call)| {
         let mut copy = value.duplicate();
+        crate::ccl::scope::freshen_bound_names(&mut copy, crate::ccl::Ids::Fresh);
         if let Some(call) = call {
             if matches!(copy.node, TypedExprNode::Var(_)) {
                 copy.site = Some(call);
@@ -2104,6 +2106,19 @@ fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeE
 mod tests {
     use super::*;
     use crate::ccl::Occurrence;
+
+    /// `actual` is `expected` up to the names of the binders it introduces, at the same type:
+    /// inlining copies a function at each use under fresh binder names
+    /// (`src/ccl/design/type-inference.md`, "Every binder is bound in one place").
+    #[track_caller]
+    fn assert_alpha_eq(actual: &TypedExpr, expected: &TypedExpr, what: &str) {
+        assert!(
+            crate::ccl::ty::eq_term_modulo_ty_slots(actual, expected) && actual.ty == expected.ty,
+            "{what}\n  actual:   {}\n  expected: {}",
+            crate::ccl::symbolic::symbolic_typed(actual),
+            crate::ccl::symbolic::symbolic_typed(expected),
+        );
+    }
     use crate::ccl::ty::FunKind;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
 
@@ -2602,7 +2617,7 @@ mod tests {
             &mut BinderScope::default(),
             &PredMemo::new(),
         );
-        assert_eq!(result, lambda);
+        assert_alpha_eq(&result, &lambda, "the use is the lambda");
     }
 
     #[test]
@@ -2740,7 +2755,7 @@ mod tests {
 
         let expected =
             TypedExpr::lambda("__iter_record", Occurrence::mint(), range, arg).with_ty(list);
-        assert_eq!(result, expected);
+        assert_alpha_eq(&result, &expected, "the inlined body");
     }
 
     /// A **mutable variable** argument in a value position: the demanded refinement rides the
@@ -2932,7 +2947,7 @@ mod tests {
         .with_ty(int);
         let expected = TypedExpr::lambda("__iter_record", Occurrence::mint(), range, expected_body)
             .with_ty(list);
-        assert_eq!(result, expected);
+        assert_alpha_eq(&result, &expected, "the inlined body");
     }
 
     #[test]
@@ -3026,7 +3041,7 @@ mod tests {
         .with_ty(int);
         let expected = TypedExpr::lambda("__iter_record", Occurrence::mint(), range, expected_body)
             .with_ty(list);
-        assert_eq!(result, expected);
+        assert_alpha_eq(&result, &expected, "the inlined body");
     }
 
     #[test]
@@ -3185,18 +3200,24 @@ mod tests {
         else {
             panic!("the argument's binding is floated out around the call, got {result:?}");
         };
-        let TypedExprNode::Let { body: inner, .. } = &callee.node else {
+        let TypedExprNode::Let {
+            binding: own,
+            body: inner,
+            ..
+        } = &callee.node
+        else {
             panic!("the callee's own binding stays, got {callee:?}");
         };
         let expected = TypedExpr::binop(
             TypedExpr::var(floated.name.clone()).with_ty(int.clone()),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
-            TypedExpr::var("a").with_ty(int.clone()),
+            TypedExpr::var(own.name.clone()).with_ty(int.clone()),
         )
         .with_ty(int);
-        assert_eq!(
-            **inner, expected,
-            "the component reads the floated binder, not the callee's"
+        assert_alpha_eq(
+            inner,
+            &expected,
+            "the component reads the floated binder, not the callee's",
         );
     }
 }

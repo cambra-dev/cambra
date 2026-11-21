@@ -721,6 +721,13 @@ fn reduce_head(solver: &mut Solver, e: Expr, fuel: &mut usize) -> Expr {
                 &binding.name,
                 bound_expr,
             );
+            // A handle's target holds only a name, so a discharge leaves a feed's target naming
+            // the binder. The let is then a handle's declaration rather than a definition, and
+            // discharging it is no equivalence: it stays. Type slots are not read, as the
+            // comparison the normal form serves does not read them.
+            if is_free_in_value(&binding.name, &substituted) {
+                return e;
+            }
             normalize(solver, substituted, fuel)
         }
         TypedExprNode::Apply { argument, function } => {
@@ -815,6 +822,188 @@ fn applied(
     reduce_head(solver, Expr::throwaway(node).with_ty(ty), fuel)
 }
 
+/// `argument ▷ (inner ▷ combinator)` reduced at its head, for [`reduce_application`]. A
+/// separate function because the reduction recurses through it: in a debug build every arm's
+/// temporaries share one frame, and the combinators' arms would otherwise ride on every level
+/// of a deep reduction.
+fn reduce_combinator_application(
+    solver: &mut Solver,
+    argument: &Expr,
+    function: &Expr,
+    inner: &Expr,
+    combinator: &Expr,
+    ty: &Type,
+    fuel: &mut usize,
+) -> Option<Expr> {
+    let a = || argument.clone_preserving_ids();
+    let codomain = |f: &Expr| f.ty.codomain().unwrap_or(Type::Hole);
+    let pair = |e: &Expr| match &e.node {
+        TypedExprNode::Tuple(parts) if parts.len() == 2 => Some((
+            parts[0].clone_preserving_ids(),
+            parts[1].clone_preserving_ids(),
+        )),
+        _ => None,
+    };
+    match &combinator.node {
+        TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
+        TypedExprNode::Builtin(Builtin::Converse) => {
+            let position = Name::fresh("__fiber_position");
+            let read = Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
+            let element = Expr::throwaway(TypedExprNode::Var(Name::elem())).with_ty(Type::Hole);
+            let (key_function, at_key) = (
+                crate::ccl::subst::shift_elems(solver, inner, 1, Ids::Kept),
+                crate::ccl::subst::shift_elems(solver, argument, 1, Ids::Kept),
+            );
+            let key = applied(solver, element, key_function, Type::Hole, fuel);
+            let predicate = Expr::throwaway(TypedExprNode::BinOp {
+                left: Box::new(key),
+                op: BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+                right: Box::new(at_key),
+                obligation: crate::ccl::expr::CallObligation::default(),
+            })
+            .with_ty(Type::Base(BaseType::Bool));
+            let domain = Type::refined_one(
+                inner.ty.domain().unwrap_or(Type::Hole),
+                Refinement::born(Rc::new(predicate)),
+            );
+            let lambda = normal_lambda(position, read, ty);
+            Some(normal_cast_collection(lambda, domain, ty))
+        }
+        TypedExprNode::Builtin(Builtin::Map) => {
+            let position = Name::fresh("__mapped_position");
+            let read = Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
+            let value = applied(solver, read, a(), Type::Hole, fuel);
+            let body = applied(
+                solver,
+                value,
+                inner.clone_preserving_ids(),
+                Type::Hole,
+                fuel,
+            );
+            let mapped = normal_function_value(solver, function, argument, ty, position, body);
+            Some(if let TypedExprNode::Cast { target, .. } = &argument.node {
+                let lambda = match mapped.node {
+                    TypedExprNode::Cast { value, .. } => *value,
+                    _ => mapped,
+                };
+                normal_cast_collection(lambda, target.domain().unwrap_or(Type::Hole), ty)
+            } else {
+                mapped
+            })
+        }
+        // `zip` fans its input out to each component, of a tuple or of a record.
+        TypedExprNode::Builtin(Builtin::Zip) => {
+            let mut at =
+                |f: &Expr| applied(solver, a(), f.clone_preserving_ids(), codomain(f), fuel);
+            let node = match &inner.node {
+                TypedExprNode::Tuple(parts) => {
+                    TypedExprNode::Tuple(parts.iter().map(&mut at).collect())
+                }
+                TypedExprNode::Record(fields) => TypedExprNode::Record(
+                    fields
+                        .iter()
+                        .map(|entry| {
+                            RecordEntry::new(
+                                entry.label.clone(),
+                                Occurrence::PLACEHOLDER,
+                                at(&entry.value),
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => return None,
+            };
+            Some(Expr::throwaway(node).with_ty(ty.clone()))
+        }
+        // A staged form reads as what it stages
+        // (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
+        // `𝑚 ▷ filter_values` is the identity on the elements `𝑚` keeps. Its stamped type
+        // is the unrefined `𝐷 ⤇ 𝐷`, so the reading holds where the enclosing refinement
+        // keeps the argument among them.
+        TypedExprNode::Builtin(Builtin::FilterValues) => Some(a()),
+        // `iterate` and `map_domain` map each key of their domain to itself.
+        TypedExprNode::Builtin(Builtin::Iterate | Builtin::MapDomain) => Some(a()),
+        // `𝑢 ▷ (𝑝 ▷ restrict)` maps each key it keeps to itself, as its upstream does, and
+        // `𝑘 ▷ (𝑓 ▷ converse)` maps each key of `𝑘`'s fiber under `𝑓` to itself. Each one's
+        // type states the domain it is the identity on.
+        TypedExprNode::Apply {
+            function: transformer,
+            ..
+        } if matches!(
+            transformer.node,
+            TypedExprNode::Builtin(Builtin::Restrict | Builtin::Converse)
+        ) =>
+        {
+            Some(a())
+        }
+        TypedExprNode::Builtin(Builtin::StrengthOver) => {
+            let k = Name::fresh("__strength_key");
+            let k_var = Expr::throwaway(TypedExprNode::Var(k.clone())).with_ty(Type::Hole);
+            let collection = applied(solver, a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+            let element = applied(solver, k_var, collection, Type::Hole, fuel);
+            let body =
+                Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
+            let param = TypedBinding {
+                parameter_mode: Default::default(),
+                name: k,
+                occurrence: Occurrence::PLACEHOLDER,
+                ty: Type::Hole,
+                user_annotation: None,
+                transparency: BindingTransparency::Transparent,
+                site: None,
+            };
+            Some(
+                Expr::throwaway(TypedExprNode::Lambda {
+                    params: vec![param],
+                    body: Box::new(body),
+                })
+                .with_ty(ty.clone()),
+            )
+        }
+        // `map(𝑔)` keeps a collection's keys and maps its values by `𝑔`.
+        TypedExprNode::Apply {
+            argument: g,
+            function: map,
+        } if matches!(map.node, TypedExprNode::Builtin(Builtin::Map)) => {
+            let at = applied(solver, a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+            Some(applied(
+                solver,
+                at,
+                g.as_ref().clone_preserving_ids(),
+                ty.clone(),
+                fuel,
+            ))
+        }
+        TypedExprNode::Builtin(Builtin::Curry | Builtin::CurryOver) => {
+            let inner = match &combinator.node {
+                TypedExprNode::Builtin(Builtin::CurryOver) => pair(inner)?.1,
+                _ => inner.clone_preserving_ids(),
+            };
+            let y = Name::fresh("__curried");
+            let y_var = Expr::throwaway(TypedExprNode::Var(y.clone())).with_ty(Type::Hole);
+            let both = Expr::throwaway(TypedExprNode::Tuple(vec![a(), y_var])).with_ty(Type::Hole);
+            let body = applied(solver, both, inner, Type::Hole, fuel);
+            Some(normal_function_value(
+                solver, function, argument, ty, y, body,
+            ))
+        }
+        // At a tuple `(𝑘₁, …, 𝑘ₙ)`, `uncurry(𝑛)` of `𝑔` reads `𝑘ₙ ▷ (… ▷ (𝑘₁ ▷ 𝑔))`.
+        TypedExprNode::Builtin(Builtin::Uncurry(n)) => {
+            let project = |k: usize| {
+                Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k))).with_ty(Type::Hole)
+            };
+            let mut level = inner.clone_preserving_ids();
+            for k in 0..*n {
+                let key = applied(solver, a(), project(k), Type::Hole, fuel);
+                let at = if k + 1 == *n { ty.clone() } else { Type::Hole };
+                level = applied(solver, key, level, at, fuel);
+            }
+            Some(level)
+        }
+        _ => None,
+    }
+}
+
 /// `argument ▷ function` reduced at its head, for normal `argument` and `function`; `None`
 /// where it is already normal.
 fn reduce_application(
@@ -872,179 +1061,7 @@ fn reduce_application(
         TypedExprNode::Apply {
             argument: inner,
             function: combinator,
-        } => match &combinator.node {
-            TypedExprNode::Builtin(Builtin::Const) => Some(inner.as_ref().clone_preserving_ids()),
-            TypedExprNode::Builtin(Builtin::Converse) => {
-                let position = Name::fresh("__fiber_position");
-                let read =
-                    Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
-                let element = Expr::throwaway(TypedExprNode::Var(Name::elem())).with_ty(Type::Hole);
-                let (key_function, at_key) = (
-                    crate::ccl::subst::shift_elems(solver, inner, 1, Ids::Kept),
-                    crate::ccl::subst::shift_elems(solver, argument, 1, Ids::Kept),
-                );
-                let key = applied(solver, element, key_function, Type::Hole, fuel);
-                let predicate = Expr::throwaway(TypedExprNode::BinOp {
-                    left: Box::new(key),
-                    op: BinOpKind::Compare(crate::ccl::CompareKind::Equals),
-                    right: Box::new(at_key),
-                    obligation: crate::ccl::expr::CallObligation::default(),
-                })
-                .with_ty(Type::Base(BaseType::Bool));
-                let domain = Type::refined_one(
-                    inner.ty.domain().unwrap_or(Type::Hole),
-                    Refinement::born(Rc::new(predicate)),
-                );
-                let lambda = normal_lambda(position, read, ty);
-                Some(normal_cast_collection(lambda, domain, ty))
-            }
-            TypedExprNode::Builtin(Builtin::Map) => {
-                let position = Name::fresh("__mapped_position");
-                let read =
-                    Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
-                let value = applied(solver, read, a(), Type::Hole, fuel);
-                let body = applied(
-                    solver,
-                    value,
-                    inner.as_ref().clone_preserving_ids(),
-                    Type::Hole,
-                    fuel,
-                );
-                let mapped = normal_function_value(solver, function, argument, ty, position, body);
-                Some(if let TypedExprNode::Cast { target, .. } = &argument.node {
-                    let lambda = match mapped.node {
-                        TypedExprNode::Cast { value, .. } => *value,
-                        _ => mapped,
-                    };
-                    normal_cast_collection(lambda, target.domain().unwrap_or(Type::Hole), ty)
-                } else {
-                    mapped
-                })
-            }
-            // `zip` fans its input out to each component, of a tuple or of a record.
-            TypedExprNode::Builtin(Builtin::Zip) => {
-                let mut at =
-                    |f: &Expr| applied(solver, a(), f.clone_preserving_ids(), codomain(f), fuel);
-                let node = match &inner.node {
-                    TypedExprNode::Tuple(parts) => {
-                        TypedExprNode::Tuple(parts.iter().map(&mut at).collect())
-                    }
-                    TypedExprNode::Record(fields) => TypedExprNode::Record(
-                        fields
-                            .iter()
-                            .map(|entry| {
-                                RecordEntry::new(
-                                    entry.label.clone(),
-                                    Occurrence::PLACEHOLDER,
-                                    at(&entry.value),
-                                )
-                            })
-                            .collect(),
-                    ),
-                    _ => return None,
-                };
-                Some(Expr::throwaway(node).with_ty(ty.clone()))
-            }
-            // A staged form reads as what it stages
-            // (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
-            // `𝑚 ▷ filter_values` is the identity on the elements `𝑚` keeps. Its stamped type
-            // is the unrefined `𝐷 ⤇ 𝐷`, so the reading holds where the enclosing refinement
-            // keeps the argument among them.
-            TypedExprNode::Builtin(Builtin::FilterValues) => Some(a()),
-            // `iterate` and `map_domain` map each key of their domain to itself.
-            TypedExprNode::Builtin(Builtin::Iterate | Builtin::MapDomain) => Some(a()),
-            // `𝑢 ▷ (𝑝 ▷ restrict)` maps each key it keeps to itself, as its upstream does, and
-            // `𝑘 ▷ (𝑓 ▷ converse)` maps each key of `𝑘`'s fiber under `𝑓` to itself. Each one's
-            // type states the domain it is the identity on.
-            TypedExprNode::Apply {
-                function: transformer,
-                ..
-            } if matches!(
-                transformer.node,
-                TypedExprNode::Builtin(Builtin::Restrict | Builtin::Converse)
-            ) =>
-            {
-                Some(a())
-            }
-            TypedExprNode::Builtin(Builtin::StrengthOver) => {
-                let k = Name::fresh("__strength_key");
-                let k_var = Expr::throwaway(TypedExprNode::Var(k.clone())).with_ty(Type::Hole);
-                let collection = applied(
-                    solver,
-                    a(),
-                    inner.as_ref().clone_preserving_ids(),
-                    Type::Hole,
-                    fuel,
-                );
-                let element = applied(solver, k_var, collection, Type::Hole, fuel);
-                let body =
-                    Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
-                let param = TypedBinding {
-                    parameter_mode: Default::default(),
-                    name: k,
-                    occurrence: Occurrence::PLACEHOLDER,
-                    ty: Type::Hole,
-                    user_annotation: None,
-                    transparency: BindingTransparency::Transparent,
-                    site: None,
-                };
-                Some(
-                    Expr::throwaway(TypedExprNode::Lambda {
-                        params: vec![param],
-                        body: Box::new(body),
-                    })
-                    .with_ty(ty.clone()),
-                )
-            }
-            // `map(𝑔)` keeps a collection's keys and maps its values by `𝑔`.
-            TypedExprNode::Apply {
-                argument: g,
-                function: map,
-            } if matches!(map.node, TypedExprNode::Builtin(Builtin::Map)) => {
-                let at = applied(
-                    solver,
-                    a(),
-                    inner.as_ref().clone_preserving_ids(),
-                    Type::Hole,
-                    fuel,
-                );
-                Some(applied(
-                    solver,
-                    at,
-                    g.as_ref().clone_preserving_ids(),
-                    ty.clone(),
-                    fuel,
-                ))
-            }
-            TypedExprNode::Builtin(Builtin::Curry | Builtin::CurryOver) => {
-                let inner = match &combinator.node {
-                    TypedExprNode::Builtin(Builtin::CurryOver) => pair(inner)?.1,
-                    _ => inner.as_ref().clone_preserving_ids(),
-                };
-                let y = Name::fresh("__curried");
-                let y_var = Expr::throwaway(TypedExprNode::Var(y.clone())).with_ty(Type::Hole);
-                let both =
-                    Expr::throwaway(TypedExprNode::Tuple(vec![a(), y_var])).with_ty(Type::Hole);
-                let body = applied(solver, both, inner, Type::Hole, fuel);
-                Some(normal_function_value(
-                    solver, function, argument, ty, y, body,
-                ))
-            }
-            // At a tuple `(𝑘₁, …, 𝑘ₙ)`, `uncurry(𝑛)` of `𝑔` reads `𝑘ₙ ▷ (… ▷ (𝑘₁ ▷ 𝑔))`.
-            TypedExprNode::Builtin(Builtin::Uncurry(n)) => {
-                let project = |k: usize| {
-                    Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k))).with_ty(Type::Hole)
-                };
-                let mut level = inner.as_ref().clone_preserving_ids();
-                for k in 0..*n {
-                    let key = applied(solver, a(), project(k), Type::Hole, fuel);
-                    let at = if k + 1 == *n { ty.clone() } else { Type::Hole };
-                    level = applied(solver, key, level, at, fuel);
-                }
-                Some(level)
-            }
-            _ => None,
-        },
+        } => reduce_combinator_application(solver, argument, function, inner, combinator, ty, fuel),
         TypedExprNode::Builtin(Builtin::Apply) => {
             let (x, f) = pair(argument)?;
             Some(applied(solver, x, f, ty.clone(), fuel))
