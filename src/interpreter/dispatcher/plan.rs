@@ -658,6 +658,7 @@ fn run_targets(
         let input = input.expect("a reach calls the breaker it reaches");
         let mut starts: Vec<TileGuard> = Vec::new();
         let mut at_close: Vec<TileGuard> = Vec::new();
+        let mut constants: Vec<SharedConsumer> = Vec::new();
         let special = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
             // completion; otherwise the scope holds each delivery on the pipelines it reads.
@@ -728,36 +729,46 @@ fn run_targets(
                         )));
                     }
                 }
-                // A range of the pipeline's own that no source yields brings its rows once: its
-                // probe's region is queued with the first notification.
-                {
-                    // What the live ranges bring arrives as their own packages, so a range's start
-                    // leaves it out: a static row paired with a source's positions is brought by
-                    // the positions as they arrive (`notifications::pairing`).
-                    let live_region = leaves
+                // An IterateExtent of the pipeline's own over a domain no source holds pushes its
+                // whole domain with the first poll ([`LivePipeline::poll`]). One whose route to the
+                // entry widens its keys, as a lookup's table is read, names values under keys
+                // rather than keys, so it pushes nothing: its region less what the live domains
+                // bring is queued with the first poll, since the rows it pairs with arrive with
+                // the live regions.
+                let live_region = leaves
+                    .iter()
+                    .flat_map(|leaf| {
+                        probe(
+                            &leaf.consumer,
+                            PipelineId(pipeline),
+                            &Projection::Everything,
+                            pipeline,
+                        )
+                    })
+                    .fold(input.empty_guard(), |region, arrival| {
+                        region.union(&arrival.guard)
+                    });
+                for (leaf, pushes) in &members.leaves[pipeline] {
+                    let widens = routes_to(leaf, pushes, pipeline)
                         .iter()
-                        .flat_map(|leaf| {
-                            probe(
-                                &leaf.consumer,
-                                PipelineId(pipeline),
-                                &Projection::Everything,
-                                pipeline,
-                            )
-                        })
-                        .fold(input.empty_guard(), |region, arrival| {
-                            region.union(&arrival.guard)
-                        });
-                    for (range, _) in &members.leaves[pipeline] {
-                        let everything = Projection::Everything;
-                        starts.extend(
-                            probe(range, PipelineId(pipeline), &everything, pipeline)
-                                .into_iter()
-                                .map(|arrival| {
-                                    guard_minus(&arrival.guard, &live_region).closed_over(&input)
-                                })
-                                .filter(|guard| !guard.is_empty()),
-                        );
+                        .any(|route| !route.keeps_keys);
+                    if !widens {
+                        constants.push(leaf.clone());
+                        continue;
                     }
+                    starts.extend(
+                        probe(
+                            leaf,
+                            PipelineId(pipeline),
+                            &Projection::Everything,
+                            pipeline,
+                        )
+                        .into_iter()
+                        .map(|arrival| {
+                            guard_minus(&arrival.guard, &live_region).closed_over(&input)
+                        })
+                        .filter(|guard| !guard.is_empty()),
+                    );
                 }
                 // A pipeline notified of arrivals takes no package but theirs and its ranges', so
                 // a pipeline it reads whose pushes arrive as its own keys brings rows no arrival
@@ -773,8 +784,14 @@ fn run_targets(
                         .fold(input.empty_guard(), |region, arrival| {
                             region.union(&arrival.guard)
                         });
-                    // What the arrivals, the pushes of the pipelines it reads and its ranges name.
-                    let mut named = arrived_region.clone();
+                    // What the arrivals, the pushes of the pipelines it reads and its constant
+                    // domains name.
+                    let mut named = constants
+                        .iter()
+                        .flat_map(|leaf| probe(leaf, PipelineId(pipeline), &everything, pipeline))
+                        .fold(arrived_region.clone(), |named, arrival| {
+                            named.union(&arrival.guard)
+                        });
                     for &read in &members.reads[pipeline] {
                         let (pusher, keyed, pushed) = end_of(PipelineId(read))
                             .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
@@ -829,6 +846,7 @@ fn run_targets(
         live.push(LivePipeline::new(
             PipelineId(pipeline),
             held,
+            constants,
             notifies,
             input,
             starts,
@@ -2186,21 +2204,17 @@ pub(super) fn probe(
         .collect()
 }
 
-/// Push `fresh`, the keys a range in `pipeline`'s chain has newly yielded, through `consumer`, the
-/// range's consumer ([`Landing::push`]), and return the region of `pipeline`'s own input it
-/// reaches.
-fn push_arrivals(
+/// Push `region` of an IterateExtent's domain, held in `pipeline`'s chain, through `consumer`, the
+/// IterateExtent's consumer ([`Landing::push`]), and return the region of `pipeline`'s own input
+/// it reaches.
+fn push_region(
     dispatcher: &Dispatcher,
     consumer: &SharedConsumer,
     pipeline: PipelineId,
-    fresh: &Predicate,
+    region: &Projection,
 ) -> Vec<TileGuard> {
     let mut landing = Landing::push(dispatcher, pipeline);
-    crate::interpreter::notifications::notify_shared(
-        consumer,
-        &Projection::admitting(fresh.clone()),
-        &mut landing,
-    );
+    crate::interpreter::notifications::notify_shared(consumer, region, &mut landing);
     landing.own_arrivals()
 }
 
@@ -3577,6 +3591,9 @@ struct LivePipeline {
     /// yielded so far. A scope that inherits the ranges of a pipeline it reads polls them, but
     /// their keys are that pipeline's push.
     leaves: Vec<(PipelineId, LiveLeaf, Predicate)>,
+    /// The consumers of the pipeline's own IterateExtents over domains no source holds, each of
+    /// which pushes its whole domain with the first poll, and none after.
+    constants: Vec<SharedConsumer>,
     notifies: Notifies,
     /// The pipeline's breaker's input, which a notification is a guard of.
     input: Tiling,
@@ -3595,6 +3612,7 @@ impl LivePipeline {
     fn new(
         pipeline: PipelineId,
         leaves: Vec<(PipelineId, LiveLeaf)>,
+        constants: Vec<SharedConsumer>,
         notifies: Notifies,
         input: Tiling,
         starts: Vec<TileGuard>,
@@ -3607,6 +3625,7 @@ impl LivePipeline {
                 .into_iter()
                 .map(|(holder, leaf)| (holder, leaf, Predicate::False))
                 .collect(),
+            constants,
             notifies,
             announced: input.empty_guard(),
             input,
@@ -3623,10 +3642,20 @@ impl LivePipeline {
         if self.closed {
             return false;
         }
-        let mut changed = !self.starts.is_empty();
+        let mut changed = !self.starts.is_empty() || !self.constants.is_empty();
         let mut arrivals = self.input.empty_guard();
         for start in std::mem::take(&mut self.starts) {
             arrivals = arrivals.union(&start);
+        }
+        for constant in std::mem::take(&mut self.constants) {
+            for guard in push_region(
+                dispatcher,
+                &constant,
+                self.pipeline,
+                &Projection::Everything,
+            ) {
+                arrivals = arrivals.union(&guard.closed_over(&self.input));
+            }
         }
         let mut complete = true;
         // Several ranges can read one source, so a scope or a store is notified of the positions
@@ -3647,7 +3676,12 @@ impl LivePipeline {
             changed = true;
             // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
             // them, so an operator that pairs them with another input's rows records them.
-            let delivered = push_arrivals(dispatcher, &leaf.consumer, *holder, &fresh);
+            let delivered = push_region(
+                dispatcher,
+                &leaf.consumer,
+                *holder,
+                &Projection::admitting(fresh.clone()),
+            );
             match self.notifies {
                 // What reaches another pipeline's entry is that pipeline's: a scope that inherits
                 // a read pipeline's ranges takes their keys through its rounds.
