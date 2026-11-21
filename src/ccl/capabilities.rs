@@ -3721,6 +3721,63 @@ pub fn lower_capability_levels(solver: &mut Solver, ty: &crate::ccl::Type, level
     ty.walk_children(|child| lower_capability_levels(solver, child, level));
 }
 
+impl crate::ccl::infer::solver::held::HoldsSolverState for Capabilities {
+    fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
+        use crate::ccl::infer::solver::held::Held;
+        match self.repr() {
+            Repr::Known(set) => set.walk_held(v),
+            Repr::Var(var) => v.held(Held::Capability(Rc::clone(var))),
+            Repr::Written(written) => written.set.walk_held(v),
+            Repr::Children(children) => {
+                for (part, catches) in &children.parts {
+                    part.walk_held(v);
+                    for ty in catches.iter().flat_map(|c| c.iter()) {
+                        ty.walk_held(v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl crate::ccl::infer::solver::held::HoldsSolverState for CapabilitySet {
+    fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
+        use crate::ccl::infer::solver::held::Held;
+        for r in &self.requires {
+            r.walk_held(v);
+        }
+        for e in &self.causes {
+            if let Effect::Raise(raised) = e {
+                raised.ty.walk_held(v);
+            }
+        }
+        for var in self.vars.values() {
+            v.held(Held::Capability(Rc::clone(var)));
+        }
+    }
+}
+
+impl crate::ccl::infer::solver::held::HoldsSolverState for Requirement {
+    fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
+        use crate::ccl::infer::solver::held::Held;
+        self.0.walk_held(v);
+        if let Some(order) = &self.1 {
+            v.held(Held::Ordering(Rc::clone(order)));
+            if !v.enter_ordering(order) {
+                return;
+            }
+            order.positions.walk_held(v);
+            if let Some(iter) = &order.iter {
+                iter.walk_held(v);
+            }
+            order.capabilities.walk_held(v);
+            for assumption in &order.assumptions {
+                assumption.walk_held(v);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

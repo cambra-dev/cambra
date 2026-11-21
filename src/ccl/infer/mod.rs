@@ -1446,7 +1446,7 @@ fn run_once(
             types.extend(scheme.poly.types().cloned());
         }
         for ty in &types {
-            solve::assert_type_closed(ty, &mut seen);
+            solve::assert_settled(ty, &mut seen);
         }
     }
     result
