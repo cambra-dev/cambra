@@ -2104,6 +2104,7 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
         site: None,
+        role: Default::default(),
     }
 }
 
@@ -4872,6 +4873,7 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             iter: Box::new(list),
             body: Box::new(body),

@@ -168,6 +168,17 @@ impl Annotation {
     }
 }
 
+/// The binding operation retained during inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindingRole {
+    #[default]
+    Local,
+    /// The outer parameter of a source function or lambda.
+    FunctionParameter,
+    /// Compiler parameter transport or an explicit result binding.
+    Temporary,
+}
+
 /// A typed binding site: a named variable together with its type.
 ///
 /// Used in [`TypedExprNode::Lambda`] and [`TypedExprNode::Let`] to carry
@@ -183,6 +194,7 @@ impl Annotation {
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
 #[derive(Debug, Clone)]
 pub struct TypedBinding {
+    pub role: BindingRole,
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
     pub name: Name,
@@ -243,6 +255,7 @@ impl TypedBinding {
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         }
     }
 
@@ -262,6 +275,7 @@ impl TypedBinding {
             user_annotation: Some(annotation),
             transparency: BindingTransparency::Transparent,
             site: None,
+            role: Default::default(),
         }
     }
 
@@ -1735,6 +1749,7 @@ impl TypedExpr {
                 user_annotation: None,
                 transparency,
                 site: None,
+                role: Default::default(),
             },
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
@@ -1810,6 +1825,7 @@ impl TypedExpr {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             init: Box::new(init),
             body: Box::new(body),
@@ -1884,6 +1900,18 @@ impl TypedExpr {
     /// is lowered as `Expr::apply(t, Expr::proj_index(n))`.
     pub fn proj_index(i: usize) -> Self {
         Self::new(TypedExprNode::Proj(ProjKey::Index(i)))
+    }
+
+    /// The component of a tuple or record literal selected by `key`.
+    pub(crate) fn product_component(&self, key: &ProjKey) -> Option<&Self> {
+        match (&self.node, key) {
+            (TypedExprNode::Tuple(elts), ProjKey::Index(i)) => elts.get(*i),
+            (TypedExprNode::Record(fields), ProjKey::Field(label)) => fields
+                .iter()
+                .find(|entry| &entry.label == label)
+                .map(|entry| &entry.value),
+            _ => None,
+        }
     }
 
     /// Construct a unary operation expression.
@@ -2006,6 +2034,7 @@ impl TypedExpr {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(body),
         })
@@ -3255,6 +3284,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(TypedExpr::lit(Lit::Unit)),
         });

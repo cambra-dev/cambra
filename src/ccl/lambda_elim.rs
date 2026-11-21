@@ -2086,6 +2086,7 @@ fn elim_lambda_impl(
                         user_annotation: b.user_annotation.clone(),
                         transparency: b.transparency,
                         site: b.site.clone(),
+                        role: Default::default(),
                     };
                     (binding, def)
                 })
@@ -3562,6 +3563,7 @@ mod tests {
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 empty_payload: false,
             }),

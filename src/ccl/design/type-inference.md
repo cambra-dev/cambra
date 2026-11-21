@@ -2972,6 +2972,35 @@ than the right-hand side's. The edge from `def f(y): out << y` into `out` then l
 to that level, `f` is monomorphic in `y`, and the channel receives what each call passes rather
 than the generic variable.
 
+#### A handle received through a parameter
+
+A feed's target can be an alias or a projection of the binding that holds the channel. Inference
+resolves the target to that binding through transparent aliases and projections of product
+literals (`InferCtx::target_origin`, `ccl_utils::resolve_product_reference`). The resolved binding
+decides the target's scope in the crossing, the contract the feed is checked against, and the
+places that feed the channel, so an alias introduces no scope of its own.
+
+Where the resolved binding is a joined binder, such as a lambda's parameter, the contribution
+crosses it as well as the binders after it. A projection of a product that is not a literal
+resolves to the product's binder. For an unannotated `def emit(v, out)`, `out` is a projection of
+the argument tuple, so the contribution crosses the tuple's binder. Joining over it drops the value
+facts about `v`, and refuses a collection domain that varies with `v`, as every join does.
+
+A curried function's parameters form one signature: lowering marks the first
+`BindingRole::FunctionParameter` and the rest `BindingRole::Temporary`. A contribution to a handle
+received through one of them crosses the target and the signature's earlier parameters, except the
+ones its history type names (`InferCtx::contribution_crossing`).
+So `def emit(v: Int, out: Feed(_))` infers a row that does not depend on the value of `v`. A
+function defined in another's body starts its own signature.
+
+Where the resolved binding is a feed binding, the feed is checked against that binding's contract,
+which holds the key binder a projected handle's own type lacks (`InferCtx::feed_contract`).
+Otherwise the target is required to be a feed, `target <: Feed(𝜌)` (`emit::feed_channel`).
+
+The places that feed a channel (`emit::feed_places`) follow the same resolution. Two aliases that
+feed one channel are two places. A call that receives only a computed component of a product
+holding the handle is not one.
+
 #### A history's value may depend on its position
 
 A history's type holds a data function, `Type::History { function, .. }` with `function` the

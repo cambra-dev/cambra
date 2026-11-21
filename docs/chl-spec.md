@@ -1132,17 +1132,17 @@ def fanout(a, b):
 
 #### A deferred collection inside a data structure [Open]
 
-A feed handle is a value: `http_serve` returns one as half of a tuple (§7.3), and a program can
-put one in a tuple of its own, pass that tuple to a function, or build it in a loop body, then
-feed the handle wherever it lands. A deferred collection's contributions are gathered where it
-is declared, and a handle that travels inside another value can reach a feed from code its
-declaration does not enclose, or be copied so that two places feed it at once. What such a
-program means is open. Giving it a meaning needs a mechanism that follows where a handle goes,
-such as an effect system or affine or linear types for feed handles.
+A feed handle is a value: `http_serve` returns one as half of a tuple (§7.3). A tuple or record
+literal can hold a handle beside other values. A projection or a tuple pattern (§4.3.1) that
+selects the handle out of such a literal denotes the same deferred collection, including where the
+literal is built in a loop body or passed to a function. A literal's components are evaluated
+once, where the literal is built. Selecting the handle evaluates no other component again, and a
+component that reads a mutable variable keeps the value read where the literal is built.
 
-Until then, a handle in a data structure has a meaning in one shape: a tuple literal bound by
-`=`, each of whose elements is a literal, a source or a feed handle, taken apart by projection
-or a tuple pattern (§4.3.1), as `requests, responses = http_serve(…)` is.
+A deferred collection's contributions are gathered where it is declared. What a program means is
+open where it feeds a handle chosen at run time, such as by a conditional, and where a handle is
+carried beyond its declaration's scope. Giving those programs a meaning needs a mechanism that
+follows where a handle goes, such as an effect system or affine or linear types for feed handles.
 
 ### 3.8 Function calls
 
