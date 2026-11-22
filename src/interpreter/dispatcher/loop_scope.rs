@@ -43,6 +43,9 @@ enum RoundItem {
     Notify(PipelineId, TileGuard),
     /// A pipeline given the round's package ([`Dispatcher::queue_round`]).
     Queue(PipelineId, TileGuard),
+    /// A nested loop's scope given the round's row, which it queues once its drive's source has
+    /// delivered the row ([`Body::hold_row`]).
+    Hold(StoreCell, TileGuard),
 }
 
 impl RoundWork {
@@ -54,12 +57,22 @@ impl RoundWork {
         self.0.push(RoundItem::Queue(pipeline, guard.clone()));
     }
 
+    pub(super) fn hold_round(&mut self, scope: &StoreCell, guard: &TileGuard) {
+        self.0.push(RoundItem::Hold(scope.clone(), guard.clone()));
+    }
+
     /// Queue the work, in the order it was gathered. The scope's store is released by now.
     pub(super) fn queue(self, dispatcher: &Dispatcher) {
         for item in self.0 {
             match item {
                 RoundItem::Notify(pipeline, guard) => dispatcher.notify(pipeline, &guard),
                 RoundItem::Queue(pipeline, guard) => dispatcher.queue_for(pipeline, &guard),
+                RoundItem::Hold(scope, guard) => {
+                    let mut scope = induction(&scope);
+                    let body = scope.body_mut();
+                    body.hold_row(&guard);
+                    body.queue_offered(dispatcher, true);
+                }
             }
         }
     }
@@ -97,6 +110,13 @@ pub(super) struct Body {
     /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
     /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
     offers: Offers,
+    /// Whether the scope is a nested loop's, whose rows the loop around it gives it: what its
+    /// drive's source offers then releases those rows ([`hold_row`](Self::hold_row)) rather than
+    /// being queued itself.
+    rows_from_outer: bool,
+    /// The rows the loop around a nested loop gave it, waiting for its drive's source to deliver
+    /// them.
+    held: Option<TileGuard>,
 }
 
 /// Where a body sits in the run's shared dispatcher.
@@ -128,6 +148,8 @@ impl Body {
             finishing: false,
             pending_step: None,
             offers: Offers::default(),
+            rows_from_outer: false,
+            held: None,
         }
     }
 
@@ -248,6 +270,7 @@ impl Body {
         if self.pending_step.is_none()
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|pipeline| pipeline.0))
             || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
+            || self.members_hold_rows()
         {
             return false;
         }
@@ -318,6 +341,30 @@ impl Body {
         });
     }
 
+    /// Whether a nested loop among the inner pipelines holds a row the round gave it: the round
+    /// has not run until that loop has queued and run it.
+    fn members_hold_rows(&self) -> bool {
+        self.members.iter().any(|member| match member {
+            Member::Scope(child) => induction(child).body_mut().held.is_some(),
+            Member::Chain(_) => false,
+        })
+    }
+
+    /// Take the rows the loop around this nested loop gives it: they are queued once the drive's
+    /// source has offered each whole ([`queue_offered`](Self::queue_offered)).
+    pub(super) fn hold_row(&mut self, guard: &TileGuard) {
+        self.rows_from_outer = true;
+        self.held = Some(match self.held.take() {
+            Some(before) => before.union(guard),
+            None => guard.clone(),
+        });
+    }
+
+    /// Mark this scope a nested loop's, whose rows come from the loop around it.
+    pub(super) fn take_rows_from_outer(&mut self) {
+        self.rows_from_outer = true;
+    }
+
     /// Close the scope's pipeline once everything offered to it is queued.
     pub(super) fn close_offers(&self) {
         self.offers
@@ -329,11 +376,42 @@ impl Body {
     /// Queue what was offered on the scope's pipeline, and close the pipeline once asked, where
     /// `ready` says a request can run: a writer's attempt reads its store, which must be open.
     /// Whether it queued or closed anything.
-    pub(super) fn queue_offered(&self, dispatcher: &Dispatcher, ready: bool) -> bool {
+    pub(super) fn queue_offered(&mut self, dispatcher: &Dispatcher, ready: bool) -> bool {
+        let input = self.rows_from_outer.then(|| {
+            self.driver_target().and_then(|target| {
+                let target = target.read().unwrap_or_else(PoisonError::into_inner);
+                target.as_ref().map(|(_, input)| input.clone())
+            })
+        });
         let Some(attached) = self.attached.as_ref() else {
             return false;
         };
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        // A nested loop queues each row given to it once its drive's source has delivered it.
+        if self.rows_from_outer {
+            let (Some(held), Some(delivered)) = (self.held.as_ref(), offered.region.as_ref())
+            else {
+                return false;
+            };
+            // A held row is ready where the source delivered it, and where what is left of it,
+            // closed over the scope's input, names no position: a closing round gives a row's
+            // remainder past the positions its domain has.
+            let rest = guard_minus(held, delivered);
+            let rest = match input.flatten() {
+                Some(input) => rest.closed_over(&input),
+                None => rest,
+            };
+            let ready_rows = guard_minus(held, &rest);
+            if ready_rows.is_empty() {
+                return false;
+            }
+            // What the drive's source delivered stays delivered: a closing round gives the row
+            // again, which reads it again.
+            drop(offered);
+            self.held = (!rest.is_empty()).then_some(rest);
+            dispatcher.queue_for(attached.pipeline, &ready_rows);
+            return true;
+        }
         if !ready || (offered.region.is_none() && !offered.closing) {
             return false;
         }
@@ -816,8 +894,18 @@ impl InductionStoreProducer {
             self.reach_local(reader, &mut |breaker, input| {
                 released = guard_minus(&row, &breaker.input_released(input)).is_empty()
             });
-            if !released {
-                work.queue_round(self.pipeline(reader), &row);
+            if released {
+                continue;
+            }
+            // A nested loop whose pipeline reads another holds the row until its drive's source
+            // has delivered it; any other reader takes it at once.
+            match &self.run().body.members[reader.0] {
+                Member::Scope(child)
+                    if !dispatcher.infos[self.pipeline(reader).0].reads.is_empty() =>
+                {
+                    work.hold_round(child, &row)
+                }
+                _ => work.queue_round(self.pipeline(reader), &row),
             }
         }
         if self.run().body.is_attached() {

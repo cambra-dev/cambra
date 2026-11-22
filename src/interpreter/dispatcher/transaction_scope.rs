@@ -137,7 +137,9 @@ impl CommitProducer {
             return false;
         }
         let open = self.is_open();
-        self.writer_run(writer).body.queue_offered(dispatcher, open)
+        self.writer_run_mut(writer)
+            .body
+            .queue_offered(dispatcher, open)
     }
 
     pub(super) fn begin_request(
