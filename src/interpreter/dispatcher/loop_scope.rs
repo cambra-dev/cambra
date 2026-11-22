@@ -187,8 +187,8 @@ impl Body {
         self.pipelines().into_iter().chain(std::iter::once(step))
     }
 
-    /// Place each inner pipeline's entries at its global id, except a source's, and let the inner
-    /// pipelines and the step run. Whether this call activated the body: it does so once.
+    /// Place each inner pipeline's entries at its global id, except a source's. Whether this call
+    /// activated the body: it does so once.
     pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
         if self.active {
             return false;
@@ -199,9 +199,7 @@ impl Body {
             for placement in placements {
                 placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
             }
-            dispatcher.hold_pipeline(pipeline, false);
         }
-        dispatcher.hold_pipeline(self.attached().step, false);
         true
     }
 
@@ -241,9 +239,11 @@ impl Body {
     /// pipeline one reads, has consumed every package queued for it: the round's work has run,
     /// pushes it brought included. Whether it queued the package.
     pub(super) fn queue_step_when_quiescent(&mut self, dispatcher: &Dispatcher) -> bool {
+        // Quiescence is read before the hold: a worker holds the followers before it acknowledges
+        // a body's package, so a quiescence that sees the acknowledgement sees the hold too.
         if self.pending_step.is_none()
-            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|pipeline| pipeline.0))
+            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
         {
             return false;
         }

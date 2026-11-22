@@ -823,7 +823,11 @@ fn run_targets(
     }
     // `Dispatcher::take_arrivals` requires that no queue holds a package, and attaching a writer
     // calls it for the writer's step, so the start regions are queued after every writer attaches.
-    queue_starts(&dispatcher, &start_regions);
+    for (pipeline, guard) in &start_regions {
+        if !execution.offer_request(*pipeline, guard) {
+            dispatcher.queue_for(*pipeline, guard);
+        }
+    }
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
@@ -1101,6 +1105,12 @@ impl Scope {
         if let Scope::Loop(store) = self {
             progressed |= induction(store).initialize_seed();
         }
+        // A writer's requests reach the scope, which queues them once its store is open.
+        if let Scope::Writer { store, writer } = self
+            && transaction_scope::transaction(store).queue_requests(dispatcher, *writer)
+        {
+            return true;
+        }
         if let Some(pipeline) = self.with_body(|body| body.take_finish(dispatcher)) {
             finish_with(dispatcher, reach, pipeline);
             self.with_body(|body| body.unplace());
@@ -1183,8 +1193,9 @@ impl Execution {
     }
 
     /// Append `scope`'s body graph to `dispatcher` after the scope's own pipeline `pipeline`, with
-    /// a step that follows every inner pipeline, and install their handlers. The inner pipelines
-    /// and the step are held until the scope's first request activates the body. The step.
+    /// a step pipeline, and install their handlers. Answers the step. Nothing in the body is
+    /// claimable before the scope's first request: the graph is appended with nothing queued, and
+    /// the scope queues every round's or attempt's work, and its step, itself.
     fn attach_body(
         &mut self,
         scope: Scope,
@@ -1202,14 +1213,12 @@ impl Execution {
         let body: Vec<PipelineId> = (base..base + members.len()).map(PipelineId).collect();
         for (member, &inner) in members.iter().zip(&body) {
             dispatcher.restrict_ingress(inner, base..base + members.len());
-            dispatcher.hold_pipeline(inner, true);
             if let Member::Scope(child) = member {
                 self.attach_store(child, dispatcher, inner);
             }
         }
         let step = dispatcher.add_pipeline(body.clone());
         dispatcher.order(step);
-        dispatcher.hold_pipeline(step, true);
         assert_eq!(step.0, self.handlers.len(), "each step has one handler");
         scope.with_body(|body| body.attach(pipeline, base, step));
         self.bodies
@@ -1335,9 +1344,23 @@ impl Execution {
         match &self.handlers[package.pipeline.0] {
             Handler::Request(scope) => scope.begin(dispatcher, package),
             Handler::Step(scope) => scope.step(dispatcher, package),
-            Handler::Root | Handler::Body(_) => consume_with(dispatcher, reach, package),
+            Handler::Root | Handler::Body(_) => {
+                consume_with(dispatcher, reach, package);
+                self.queue_writer_requests(dispatcher);
+            }
         }
         self.hold_followers(dispatcher);
+    }
+
+    /// Have each writer's scope queue the requests offered to it where its store has opened. A
+    /// store opens on the consume of its seed, which comes before the seed's pipeline finishes
+    /// and closes the queues of the writers' pipelines that read it.
+    fn queue_writer_requests(&self, dispatcher: &Dispatcher) {
+        for handler in &self.handlers {
+            if let Handler::Request(Scope::Writer { store, writer }) = handler {
+                transaction_scope::transaction(store).queue_requests(dispatcher, *writer);
+            }
+        }
     }
 
     pub(super) fn finish(
@@ -1349,7 +1372,10 @@ impl Execution {
         match &self.handlers[pipeline.0] {
             Handler::Request(scope) => scope.begin_finish(dispatcher),
             Handler::Step(_) => dispatcher.finish(dispatcher.pushes(pipeline)),
-            Handler::Root | Handler::Body(_) => finish_with(dispatcher, reach, pipeline),
+            Handler::Root | Handler::Body(_) => {
+                self.queue_writer_requests(dispatcher);
+                finish_with(dispatcher, reach, pipeline);
+            }
         }
         self.hold_followers(dispatcher);
     }
@@ -1380,6 +1406,29 @@ impl Execution {
         );
     }
 
+    /// Offer `guard`, requests of a writer's pipeline `pipeline`, to that writer's transaction
+    /// scope, which queues each request once it can run ([`CommitProducer::queue_requests`]).
+    /// Whether `pipeline` takes a writer's requests.
+    pub(super) fn offer_request(&self, pipeline: PipelineId, guard: &TileGuard) -> bool {
+        let Some(Handler::Request(Scope::Writer { store, writer })) = self.handlers.get(pipeline.0)
+        else {
+            return false;
+        };
+        transaction_scope::transaction(store).offer_request(*writer, guard);
+        true
+    }
+
+    /// Close the writer's pipeline `pipeline` once its scope has queued every request offered to
+    /// it. Whether `pipeline` takes a writer's requests.
+    pub(super) fn close_requests(&self, pipeline: PipelineId) -> bool {
+        let Some(Handler::Request(Scope::Writer { store, writer })) = self.handlers.get(pipeline.0)
+        else {
+            return false;
+        };
+        transaction_scope::transaction(store).close_requests(*writer);
+        true
+    }
+
     pub(super) fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
         let mut progressed = false;
         for scope in self.scopes() {
@@ -1396,9 +1445,8 @@ impl Execution {
             .handlers
             .iter()
             .enumerate()
-            .filter(|(pipeline, handler)| {
+            .filter(|(_, handler)| {
                 !matches!(handler, Handler::Step(_))
-                    && !dispatcher.states[*pipeline].held.load(Ordering::SeqCst)
                     && !matches!(handler, Handler::Request(scope) if scope.has_request())
             })
             .map(|(pipeline, _)| PipelineId(pipeline))
@@ -3409,7 +3457,12 @@ impl LivePipeline {
     /// notified of, as [`Notifies`] says, and close it once every source yields everything.
     /// `reach` reaches the pipeline's breaker. Answers whether a source yielded more or the
     /// pipeline closed.
-    fn poll(&mut self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
+    fn poll(
+        &mut self,
+        dispatcher: &Dispatcher,
+        execution: &Execution,
+        reach: &mut Reach<'_>,
+    ) -> bool {
         if self.closed {
             return false;
         }
@@ -3521,18 +3574,21 @@ impl LivePipeline {
         // Each poll announces what its ranges newly yielded, and the first poll also what its
         // constants and starts bring.
         if !arrivals.is_empty() {
-            notify_unreleased(dispatcher, reach, self.pipeline, &arrivals);
+            notify_unreleased(dispatcher, execution, reach, self.pipeline, &arrivals);
         }
         if !positions.is_false() {
             notify_unreleased(
                 dispatcher,
+                execution,
                 reach,
                 self.pipeline,
                 &Projection::admitting(positions).guard(&self.input),
             );
         }
         if complete {
-            dispatcher.close(self.pipeline);
+            if !execution.close_requests(self.pipeline) {
+                dispatcher.close(self.pipeline);
+            }
             self.closed = true;
             changed = true;
         }
@@ -3540,9 +3596,11 @@ impl LivePipeline {
     }
 }
 
-/// Queue the announced region that the pipeline's input has not released.
+/// Queue the announced region that the pipeline's input has not released, or offer it to the
+/// transaction scope whose requests the pipeline takes ([`Execution::offer_request`]).
 fn notify_unreleased(
     dispatcher: &Dispatcher,
+    execution: &Execution,
     reach: &mut Reach<'_>,
     pipeline: PipelineId,
     announced: &TileGuard,
@@ -3555,7 +3613,9 @@ fn notify_unreleased(
             &breaker.input_tiling(input),
         );
     });
-    if let Some(pending) = pending {
+    if let Some(pending) = pending
+        && !execution.offer_request(pipeline, &pending)
+    {
         dispatcher.notify(pipeline, &pending);
     }
 }
@@ -3605,7 +3665,7 @@ fn drive_live(
         observer.polled();
         let mut changed = false;
         for at in live.iter_mut() {
-            changed |= at.poll(dispatcher, reach);
+            changed |= at.poll(dispatcher, execution, reach);
         }
         loop {
             match workers.next(dispatcher) {

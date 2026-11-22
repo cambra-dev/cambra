@@ -1464,8 +1464,9 @@ pub(crate) fn guard_covers(released: &TileGuard, held: &TileGuard) -> bool {
 /// collection keys where it also holds cells beneath a row ([`keys_released_whole`]), and `None`
 /// where no part is spelled so, as a record whose collection field is complete through some rows.
 pub(crate) fn spelled_part(guard: &TileGuard) -> Option<TileGuard> {
-    // A push names rows whose whole value is final, at any level, and never part of a value.
-    if names_whole_keys(guard) {
+    // A push names what is final: rows whose whole value is, at any level, and the fields of a
+    // record under rows where some of its fields are and others still grow.
+    if Projection::of(guard).is_ok() {
         return Some(guard.clone());
     }
     names_collection_keys(guard)

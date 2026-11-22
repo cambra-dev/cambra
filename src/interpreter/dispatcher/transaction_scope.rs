@@ -18,6 +18,11 @@ pub(crate) struct TransactionRun {
 pub(super) struct WriterRun {
     pub(super) body: Body,
     attempt: Attempt,
+    /// The requests offered to the writer and not yet queued: the scope queues a request only
+    /// once an attempt can run, which reads the store, so once the store is open.
+    requested: Option<TileGuard>,
+    /// Whether the writer's pipeline closes once every request offered to it is queued.
+    closing: bool,
 }
 
 /// What a writer's attempts are for.
@@ -36,6 +41,8 @@ impl WriterRun {
         Self {
             body,
             attempt: Attempt::Idle,
+            requested: None,
+            closing: false,
         }
     }
 
@@ -129,6 +136,37 @@ impl CommitProducer {
             .expect("a transaction run is planned")
             .writers[writer]
     }
+    pub(super) fn offer_request(&mut self, writer: usize, guard: &TileGuard) {
+        let run = self.writer_run_mut(writer);
+        run.requested = Some(match run.requested.take() {
+            Some(requested) => requested.union(guard),
+            None => guard.clone(),
+        });
+    }
+
+    pub(super) fn close_requests(&mut self, writer: usize) {
+        self.writer_run_mut(writer).closing = true;
+    }
+
+    /// Queue the requests offered to writer `writer` on its pipeline, and close the pipeline once
+    /// asked, where the store is open: an attempt reads the store, which exists once every seed
+    /// key's value is final. Whether it queued or closed anything.
+    pub(super) fn queue_requests(&mut self, dispatcher: &Dispatcher, writer: usize) -> bool {
+        let run = self.writer_run(writer);
+        if (run.requested.is_none() && !run.closing) || !self.is_open() {
+            return false;
+        }
+        let run = self.writer_run_mut(writer);
+        let pipeline = run.body.attached().pipeline;
+        if let Some(requested) = run.requested.take() {
+            dispatcher.queue_for(pipeline, &requested);
+        }
+        if std::mem::take(&mut run.closing) {
+            dispatcher.close(pipeline);
+        }
+        true
+    }
+
     pub(super) fn begin_request(
         &mut self,
         dispatcher: &Dispatcher,
