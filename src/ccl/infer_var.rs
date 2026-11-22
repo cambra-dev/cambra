@@ -328,16 +328,23 @@ impl Bound {
     /// variable and pushes onto its `suspensions` ([`subst::Subst::suspended`]), so a scope
     /// check on that path changes solver state.
     pub(crate) fn rendered_names(&self, solver: &mut Solver) -> BTreeSet<Name> {
+        let names = self.content_names(solver);
+        self.holder_inverse(solver).names_after(names)
+    }
+
+    /// [`rendered_names`](Self::rendered_names) before the holder side is inverted: the names
+    /// the bound's type names in the edge's frame, once its own substitution and the holder
+    /// side's read-backs have acted.
+    pub(crate) fn content_names(&self, solver: &mut Solver) -> BTreeSet<Name> {
         let read_back = self.self_subst.read_backs(solver);
-        let names = if read_back.is_id() && !self.ty_subst.has_witnesses() {
+        if read_back.is_id() && !self.ty_subst.has_witnesses() {
             self.ty_subst.names_after(subst::type_free_vars(&self.ty))
         } else {
             subst::type_free_vars(
                 &subst::Subst::then(solver, &self.ty_subst, &read_back)
                     .apply_type_in(solver, &self.ty),
             )
-        };
-        self.holder_inverse(solver).names_after(names)
+        }
     }
 
     /// The term names this bound can put in its holder: the names it puts there now

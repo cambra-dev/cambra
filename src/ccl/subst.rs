@@ -731,12 +731,9 @@ impl Subst {
     /// **unconditionally**: the species is the caller's declared intent, even
     /// when `term` happens to be a bare variable reference. `[x ↦ k0]` from a
     /// dependent application `g(k0)` is fiber *selection* — inverting it
-    /// would be fiber→family generalization, an overclaim in general. The one
-    /// consumer permitted to read a Var-target discharge as a correspondence
-    /// is the closure bridge, through the explicitly licensed
-    /// [`Subst::licensed_correspondence_view`]; everywhere else the species
-    /// is honest, and a caller that *means* a frame correspondence
-    /// (relabeling, inversion-safe with no license) must say so with
+    /// would be fiber→family generalization, an overclaim in general, so no
+    /// consumer reads a discharge as a correspondence. A caller that *means*
+    /// a frame correspondence (relabeling, inversion-safe) says so with
     /// [`Subst::rename`].
     ///
     /// `term` is shared where the caller holds it in an `Rc`: a template is read, never
@@ -1062,6 +1059,32 @@ impl Subst {
     /// The binders this substitution acts on (its source domain).
     pub fn binders(&self) -> impl Iterator<Item = &Binder> {
         self.binders.keys()
+    }
+
+    /// Whether this substitution, as the variable side of an edge, discharges a binder in `v`'s
+    /// telescope. The edge then relates `v[σ]`, an instance of `v`, rather than `v` itself
+    /// (`src/ccl/design/type-inference.md`, "An edge through a discharge is a fact about an
+    /// instance").
+    pub(crate) fn discharges_binder_of(&self, v: &crate::ccl::infer_var::InferVar) -> bool {
+        self.binders
+            .iter()
+            .any(|(k, m)| matches!(m, Mapping::Discharge(_)) && binder_acts_on(k, v))
+    }
+
+    /// The context of `v[self]`: `v`'s telescope with this substitution's binders removed and
+    /// the names their images read added, as a suspension's is ([`Self::suspended`]).
+    pub(crate) fn instance_telescope(
+        &self,
+        v: &crate::ccl::infer_var::InferVar,
+    ) -> crate::ccl::infer_var::Telescope {
+        let reads: Vec<Name> = self
+            .binders
+            .values()
+            .flat_map(Mapping::image)
+            .filter(is_read_name)
+            .collect();
+        v.telescope
+            .rescoped(|n| self.binders.contains_key(n), reads)
     }
 
     /// Whether this substitution renames or discharges any of `names`.
@@ -1623,56 +1646,6 @@ impl Subst {
                     _ => s,
                 }),
             _ => self.clone(),
-        }
-    }
-
-    /// The **licensed correspondence view** of this substitution: every
-    /// `Rename` entry kept, and every discharge whose argument is a bare
-    /// variable reference (`[x ↦ k0]`, the dependent application at a
-    /// variable) *read as if* it were a correspondence into the outer scope.
-    /// Non-variable discharges are unchanged.
-    ///
-    /// This view is the **only** place a discharge's species is overridden,
-    /// and it exists for exactly one consumer: the closure bridge, when
-    /// reconciling two holder views of one variable. The reading is a license
-    /// with two terms, both currently held by **monomorphic determinism**
-    /// (every inference variable inhabits one fiber) and both expiring at the
-    /// polymorphism boundary (O1/O4/O2):
-    /// 1. Inverting `[x ↦ k0]` is fiber→family *generalization* — re-stating
-    ///    a fact about the fiber at `k0` over the open binder `x`. Sound only
-    ///    while the family is inhabited at exactly one index.
-    /// 2. `k0` is a program variable, not a globally fresh correspondence
-    ///    binder, so the inverse rewrites *incidental* free occurrences of
-    ///    `k0` along with fiber-index ones; the two roles coincide under the
-    ///    same monomorphic license.
-    ///
-    /// When polymorphic fibers land, delete this view: the bridge then sees
-    /// the honest `Discharge` species and its tripwire reports exactly the
-    /// sites that demanded the no-longer-licensed transport. The retirement
-    /// plan — observability probes first, then γ\[σ\] suspensions-on-uses for
-    /// first-class dependent functions — is tracked in the vault issue
-    /// `type-checker-first-class-dependent-functions`.
-    pub fn licensed_correspondence_view(&self) -> Subst {
-        let m = self
-            .binders
-            .iter()
-            .map(|(k, v)| {
-                let v = match v {
-                    Mapping::Discharge(_) => match v.var_target() {
-                        Some(n) => Mapping::Rename(n),
-                        None => v.clone(),
-                    },
-                    Mapping::Rename(_) | Mapping::Join(..) => v.clone(),
-                };
-                (k.clone(), v)
-            })
-            .collect();
-        // The license reads term discharges only; the witness half is carried as it is.
-        Subst {
-            binders: m,
-            witnesses: self.witnesses.clone(),
-            elims: self.elims.clone(),
-            ids: self.ids,
         }
     }
 

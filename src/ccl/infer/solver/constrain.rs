@@ -951,6 +951,32 @@ fn constrain_fun_kind(
     Ok(())
 }
 
+/// Panic where `bound`, recorded on `holder` under the holder side `s`, names a binder outside
+/// the context the edge relates. An edge whose holder side discharges one of `holder`'s binders
+/// bounds the instance `holder[s]`, and its bound is read in the edge's frame against the
+/// instance's context ([`Subst::instance_telescope`]); any other edge is read in `holder`'s own
+/// frame ([`crate::ccl::infer_var::enforce_bound_scope`]).
+fn enforce_scope(
+    solver: &mut Solver,
+    holder: &InferVar,
+    s: &Subst,
+    side: &'static str,
+    bound: &Bound,
+) {
+    if !s.discharges_binder_of(holder) {
+        return crate::ccl::infer_var::enforce_bound_scope(solver, holder, side, bound);
+    }
+    let telescope = s.instance_telescope(holder);
+    let names = bound.content_names(solver);
+    if let Some(open) = names.iter().find(|n| !telescope.contains(n)) {
+        panic!(
+            "open bound recorded on an instance of ?{}: `{open:?}` is free in the {side} bound \
+             `{}` and is not in the instance's context {:?}",
+            holder.uid, bound.ty, telescope,
+        );
+    }
+}
+
 /// Whether `d` is a variable that names one data domain ([`InferVar::names_domain`]), whose
 /// edges are invariant before any kind reaches it.
 fn named_domain(solver: &mut Solver, d: &Type) -> bool {
@@ -1009,20 +1035,12 @@ fn bridge_holder_gap(
     // instead, by reading a discharge to a variable as a correspondence, loses what the lower
     // side knows of `𝑘`: an argument meeting a parameter whose type reads an earlier parameter
     // knows the earlier argument, and the parameter's frame does not (`Typing::apply`). A
-    // handle discharged to a parameter is the parameter, so it keeps the correspondence below.
+    // discharge to a variable is left to the rules below.
     if lo.discharges_a_value()
         && let Some(hi_inv) = hi.invert()
     {
         return Some((Subst::id(), Subst::then(solver, &hi_inv, lo)));
     }
-    // Reconcile on the LICENSED CORRESPONDENCE VIEWS: Var-target discharges
-    // read as correspondences into the outer scope, under the monomorphic
-    // license documented at `Subst::licensed_correspondence_view` (the only
-    // species override anywhere). Species elsewhere stay caller-declared, so
-    // when the license expires with polymorphic fibers, deleting the view
-    // re-arms the tripwire below for exactly the sites that depended on it.
-    let lo = &lo.licensed_correspondence_view();
-    let hi = &hi.licensed_correspondence_view();
     if let Some(lo_inv) = lo.invert() {
         return Some((Subst::then(solver, &lo_inv, hi), Subst::id()));
     }
@@ -1136,9 +1154,19 @@ fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
 /// rather than left to the pointwise fallback because that fallback relates each
 /// collection to the consumer separately, which is the silent narrowing a lossless data
 /// join rules out, and which does not terminate.
-fn distinct_data_domains(solver: &mut Solver, lows: &[Bound]) -> Option<(Type, Type)> {
+fn distinct_data_domains(
+    solver: &mut Solver,
+    holder: &InferVar,
+    lows: &[Bound],
+) -> Option<(Type, Type)> {
     let mut seen: Vec<Type> = Vec::new();
     for low in lows {
+        // A bound on an instance of the holder bounds that instance, which is another type
+        // (`src/ccl/design/type-inference.md`, "An edge through a discharge is a fact about an
+        // instance"), so it joins with nothing the holder holds.
+        if low.self_subst.discharges_binder_of(holder) {
+            continue;
+        }
         let Type::Fun {
             fun_kind: fun_kind @ FunKind::Data(..),
             domain,
@@ -2643,7 +2671,7 @@ fn constrain_go_impl(
                 if let Some(e) = codomain_binder_gap(solver, lv, &bound, cache) {
                     return Err(e);
                 }
-                crate::ccl::infer_var::enforce_bound_scope(solver, lv, "upper", &bound);
+                enforce_scope(solver, lv, sl, "upper", &bound);
                 let s = lv.bounds_mut(solver);
                 s.upper_mut().push(bound);
                 #[cfg(test)]
@@ -2698,7 +2726,7 @@ fn constrain_go_impl(
             // consumer's domain would have to lie below both — and the transitive closure
             // does not terminate on it. Now that only sums join, this is the case `box`
             // is there to resolve: box each arm, and the arms join as sums.
-            if let Some(domains) = distinct_data_domains(solver, &lows) {
+            if let Some(domains) = distinct_data_domains(solver, lv, &lows) {
                 return Err(ConstrainError::DomainJoinConflict {
                     domains: vec![domains.0, domains.1],
                 });
@@ -2760,7 +2788,7 @@ fn constrain_go_impl(
                     "a lower bound reading a codomain binder outside its holder's scope is joined \
                      over the binder before it is recorded"
                 );
-                crate::ccl::infer_var::enforce_bound_scope(solver, rv, "lower", &bound);
+                enforce_scope(solver, rv, sr, "lower", &bound);
                 let s = rv.bounds_mut(solver);
                 s.lower_mut().push(bound);
                 #[cfg(test)]
@@ -4141,7 +4169,8 @@ mod tests {
             Bound::conc(Type::data_fun(plain, Type::Base(BaseType::Int))),
             Bound::conc(Type::data_fun(dependent, Type::Base(BaseType::Int))),
         ];
-        assert!(distinct_data_domains(solver, &lows).is_none());
+        let holder = InferVar::fresh(solver, 0);
+        assert!(distinct_data_domains(solver, &holder, &lows).is_none());
     }
 
     #[test]

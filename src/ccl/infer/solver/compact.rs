@@ -4636,6 +4636,20 @@ fn expand_variable(
         if acting.eliminates_top() && !matches!(v.fun_kind().resolved_in(solver), KindPin::Plain) {
             return false;
         }
+        // A bound on an instance of `𝑉` is `𝑉`'s own only if its content names nothing outside
+        // `𝑉`'s context: its own names, and what each variable it holds reads, in the edge's frame.
+        if b.self_subst.discharges_binder_of(v) {
+            let mut names = b.content_names(solver);
+            let mut held = Vec::new();
+            b.ty.walk_infer_vars(&mut |u| held.push(Rc::clone(u)));
+            for u in &held {
+                let reads = own_content.borrow_mut().reads_of(solver, u);
+                names.extend(b.ty_subst.names_after(reads.names.iter().cloned()));
+            }
+            if !names.iter().all(|n| v.telescope.contains(n)) {
+                return false;
+            }
+        }
         !content_mentions(solver, v, &acting, &mut own_content.borrow_mut())
     };
     // Walk bounds, transitively expanding, seeded from the variable's own
