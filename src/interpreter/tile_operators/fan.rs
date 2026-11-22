@@ -299,22 +299,36 @@ impl TileOperator for Zip {
                 consumer,
             ),
         });
+        // Beneath rows the arms share the rows' keys, and a row exists once every arm has
+        // delivered it, so each arm's delivery is passed on under the rows the others delivered
+        // (`notifications::aligned`).
+        let delivered = crate::interpreter::notifications::nothing_aligned(
+            self.inputs
+                .iter()
+                .map(|input| input.arrives_from_a_source()),
+        );
         let inputs = self
             .inputs
             .iter()
             .zip(&self.names)
+            .enumerate()
             // Every arm is pulled at the projection: the arms share the pair's keys.
-            .map(|(input, name)| match beneath_rows {
-                true => input.clone().subscribe(
+            .map(|(arm, (input, name))| match self.level.enclosing() {
+                Some(rows) if beneath_rows => input.clone().subscribe(
                     input.tiling().universal_guard(),
-                    crate::interpreter::notifications::field_beneath_rows(
-                        name.clone(),
-                        self.level,
-                        forwarding_consumer_keeping_keys(&shared),
+                    crate::interpreter::notifications::aligned(
+                        arm,
+                        rows,
+                        delivered.clone(),
+                        crate::interpreter::notifications::field_beneath_rows(
+                            name.clone(),
+                            self.level,
+                            forwarding_consumer_keeping_keys(&shared),
+                        ),
                     ),
                     cx,
                 ),
-                false => subscribe_forwarding_keeping_keys(input, &shared, cx),
+                _ => subscribe_forwarding_keeping_keys(input, &shared, cx),
             })
             .collect();
         Box::new(ZipProducer {
@@ -1363,73 +1377,6 @@ mod nested_projection_tests {
         assert_conforms_beneath(|| {
             Arc::new(RecordWrap::new_at("a".into(), spy(), CurryLevel::new(2)))
         });
-    }
-
-    /// A `Zip` pairing beneath its outermost level passes what an arm notifies through
-    /// `through_values`: a change of an inner row reaches its consumer as that row's group,  and a
-    /// complete region completes the same part. `through_values` itself is tested in
-    /// `notifications.rs`; this pins that the `Zip` subscribes its arms through it. Forwarded
-    /// unchanged, an inner row's region names keys beneath the pair, which are no keys of the
-    /// `Zip` (`a_tuple_of_a_fold_and_a_collection_the_filter_empties_for_some_groups`).
-    #[test]
-    fn a_zip_restates_an_arms_inner_rows_as_the_groups_it_pairs() {
-        use crate::interpreter::tile_operators::test_helpers::{
-            InputConsumer, NotifyingOp, RegionLog, notify_input, subscribed,
-        };
-        use crate::interpreter::{Predicate, Value};
-        let (tile, tiling) = two_levels_of_ints();
-        let (left, left_consumer) = NotifyingOp::new(tile.clone(), tiling.clone());
-        let (right, _) = NotifyingOp::new(tile, tiling.clone());
-        let zip = Arc::new(Zip::new_at(
-            vec!["a".into(), "b".into()],
-            vec![Arc::new(left), Arc::new(right)],
-            CurryLevel::new(1),
-        ));
-        let (log, regions) = RegionLog::new();
-        let mut cx = SubscribeContext::new();
-        let _producer = zip
-            .clone()
-            .subscribe(tiling.empty_guard(), Box::new(log), &mut cx);
-        let row = Projection::of_path(&[Value::UInt(0), Value::UInt(1)]);
-        let group = Projection::admitting(Predicate::point(Value::UInt(0)));
-
-        regions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        notify_input(&left_consumer, &row);
-        assert_eq!(
-            *regions.read().unwrap_or_else(PoisonError::into_inner),
-            std::slice::from_ref(&group),
-            "a change of a row names its group"
-        );
-
-        let complete = |consumer: &InputConsumer, region: &Projection| {
-            let mut landing = crate::interpreter::dispatcher::Landing::probe_complete(
-                crate::interpreter::dispatcher::PipelineId(0),
-            );
-            subscribed(consumer).notify(region, &mut landing);
-        };
-        regions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        complete(&left_consumer, &row);
-        assert_eq!(
-            *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [Projection::Nothing],
-            "a complete row of a group completes no group"
-        );
-        regions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        complete(&left_consumer, &group);
-        assert_eq!(
-            *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [group],
-            "a complete group of one arm completes that arm's part of the pair's group"
-        );
     }
 
     #[test]

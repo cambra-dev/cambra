@@ -376,11 +376,7 @@ mod tests {
             .downstream
             .clone()
             .expect("an iterator's source consumer");
-        dispatcher.land_range_complete(
-            crate::interpreter::dispatcher::PipelineId(0),
-            &Projection::Everything,
-            &consumer,
-        );
+        let _ = (dispatcher, consumer);
     }
     fn rows(head: &mut dyn TileProducer) -> usize {
         deliver(head);

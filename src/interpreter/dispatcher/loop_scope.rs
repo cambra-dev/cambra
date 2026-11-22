@@ -59,7 +59,7 @@ impl RoundWork {
         for item in self.0 {
             match item {
                 RoundItem::Notify(pipeline, guard) => dispatcher.notify(pipeline, &guard),
-                RoundItem::Queue(pipeline, guard) => dispatcher.queue_round(pipeline, &guard),
+                RoundItem::Queue(pipeline, guard) => dispatcher.queue_for(pipeline, &guard),
             }
         }
     }
@@ -90,7 +90,7 @@ pub(super) struct Body {
     active: bool,
     /// The region the scope's pipeline consumed, from the scope's finish until the inner pipelines
     /// and the step have finished.
-    finishing: Option<Option<TileGuard>>,
+    finishing: bool,
     /// The guard of the step's package for the open round or attempt, which the scope queues once
     /// the inner pipelines are quiescent ([`Body::queue_step_when_quiescent`]).
     pending_step: Option<TileGuard>,
@@ -122,7 +122,7 @@ impl Body {
             driver,
             attached: None,
             active: false,
-            finishing: None,
+            finishing: false,
             pending_step: None,
         }
     }
@@ -248,19 +248,19 @@ impl Body {
             return false;
         }
         let guard = self.pending_step.take().expect("checked above");
-        dispatcher.queue_round(self.attached().step, &guard);
+        dispatcher.queue_for(self.attached().step, &guard);
         true
     }
 
-    /// Begin the scope's finish, which consumed `consumed` of the scope's pipeline.
-    pub(super) fn begin_finish(&mut self, consumed: Option<TileGuard>) {
-        debug_assert!(self.finishing.is_none(), "a scope finishes once");
-        self.finishing = Some(consumed);
+    /// Begin the scope's finish.
+    pub(super) fn begin_finish(&mut self) {
+        debug_assert!(!self.finishing, "a scope finishes once");
+        self.finishing = true;
     }
 
     /// Whether the scope's finish has begun and the body has not finished.
     pub(super) fn is_finishing(&self) -> bool {
-        self.finishing.is_some()
+        self.finishing
     }
 
     /// Close the inner sources, so the inner pipelines finish once they have read what is queued.
@@ -272,13 +272,12 @@ impl Body {
         }
     }
 
-    /// The scope's pipeline and the region it consumed, once its finish has begun and the inner
-    /// pipelines and the step have all finished.
-    pub(super) fn take_finish(
-        &mut self,
-        dispatcher: &Dispatcher,
-    ) -> Option<(PipelineId, Option<TileGuard>)> {
-        self.finishing.as_ref()?;
+    /// The scope's pipeline, once its finish has begun and the inner pipelines and the step have
+    /// all finished.
+    pub(super) fn take_finish(&mut self, dispatcher: &Dispatcher) -> Option<PipelineId> {
+        if !self.finishing {
+            return None;
+        }
         let pipeline = self.attached.as_ref()?.pipeline;
         let finished = self
             .with_step()
@@ -286,8 +285,8 @@ impl Body {
         if !finished {
             return None;
         }
-        let consumed = self.finishing.take().expect("the finish is pending");
-        Some((pipeline, consumed))
+        self.finishing = false;
+        Some(pipeline)
     }
 
     /// Call `call` with the breaker of the inner pipeline `local`.
@@ -446,18 +445,14 @@ impl InductionStoreProducer {
         self.queue_package_round(dispatcher)
     }
 
-    pub(super) fn begin_shared_finish(
-        &mut self,
-        dispatcher: &Dispatcher,
-        consumed: Option<TileGuard>,
-    ) {
+    pub(super) fn begin_shared_finish(&mut self, dispatcher: &Dispatcher) {
         assert!(
             !self.has_package(),
             "a scope finishes after completing its requests"
         );
         self.activate(dispatcher);
         let body = &mut self.run_mut().body;
-        body.begin_finish(consumed);
+        body.begin_finish();
         body.close_sources(dispatcher);
     }
 
@@ -968,9 +963,9 @@ mod tests {
                         .consume(&self.dispatcher, &mut reach, package);
                     Some(pipeline)
                 }
-                Next::Finish { pipeline, consumed } => {
+                Next::Finish { pipeline } => {
                     self.execution
-                        .finish(&self.dispatcher, &mut reach, pipeline, consumed);
+                        .finish(&self.dispatcher, &mut reach, pipeline);
                     Some(pipeline)
                 }
                 Next::Wait(_) => {

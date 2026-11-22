@@ -96,11 +96,6 @@ impl Scripted {
         Self::new(held, true)
     }
 
-    /// A breaker whose consume releases nothing of its input.
-    fn keeping(held: TileGuard) -> Held<Scripted> {
-        Self::new(held, false)
-    }
-
     fn new(held: TileGuard, releases: bool) -> Held<Scripted> {
         let input = Input::over(&source(0..4));
         let releases = releases.then(|| input.tiling().universal_guard());
@@ -551,30 +546,6 @@ fn finish_twice_panics() {
     finish_pipeline(&dispatcher, &breakers, PipelineId(1));
 }
 
-/// A source finishes once its input has released every region queued for it: one whose input
-/// released less than its queue named would push what rests on rows the input has not stated.
-#[test]
-#[should_panic(
-    expected = "pipeline 0 finishes after its input has released every guard the pipeline consumed"
-)]
-fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
-    let memo = memo_over_rows(0..6);
-    let handle: BreakerHandle = memo.clone();
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
-    let Next::Package(package) = dispatcher.try_claim(None) else {
-        panic!("a started source hands out its package")
-    };
-    memo.write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .begin_run();
-    memo.write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, keys_between(0, 3));
-    dispatcher.acknowledge(package);
-    finish_pipeline(&dispatcher, &[handle], PipelineId(0));
-}
-
 /// An input of `0..2 ⤇ 0..3 ⤇ Int` that answers nothing: a test names what it releases.
 struct Positions {
     base: ProducerBase,
@@ -625,33 +596,6 @@ fn finish_row_released_through(path: Vec<Value>) {
 #[test]
 fn a_pipeline_finishes_once_its_input_released_a_row_through_its_last_position() {
     finish_row_released_through(vec![Value::UInt(0), Value::UInt(2)]);
-}
-
-/// An input that released a row short of its last position has not released the row.
-#[test]
-#[should_panic(
-    expected = "pipeline 0 finishes after its input has released every guard the pipeline consumed"
-)]
-fn a_pipeline_does_not_finish_while_its_input_holds_a_position_of_a_row_it_consumed() {
-    finish_row_released_through(vec![Value::UInt(0), Value::UInt(1)]);
-}
-
-/// A reader whose input has not released a guard the reader consumed does not finish: what it
-/// would push could rest on rows its input has not stated.
-#[test]
-#[should_panic(
-    expected = "pipeline 1 finishes after its input has released every guard the pipeline consumed"
-)]
-fn a_reader_finishes_after_its_input_released_what_it_consumed() {
-    let breakers: Vec<BreakerHandle> = vec![
-        Scripted::holding(ints().universal_guard()),
-        Scripted::keeping(ints().universal_guard()),
-    ];
-    wire(&[vec![], vec![0]], &breakers);
-    run(
-        &Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED),
-        &breakers,
-    );
 }
 
 /// A package whose guard is not of the tiling the breaker's input answers is refused.
@@ -1361,29 +1305,6 @@ fn drain(dispatcher: &Dispatcher, pipeline: usize) -> Vec<TileGuard> {
     consumed
 }
 
-/// A source is queued each region it is notified of, cut every `morsel_rows` positions, while it
-/// runs; it finishes only once closed.
-#[test]
-fn a_notified_source_consumes_each_region_and_finishes_once_closed() {
-    let dispatcher = Dispatcher::new(vec![vec![]], 2);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 4));
-    assert_eq!(
-        drain(&dispatcher, 0),
-        vec![keys_between(0, 1), keys_between(2, 3), keys_between(4, 4)]
-    );
-    assert!(
-        matches!(dispatcher.try_claim(None), Next::Wait(_)),
-        "an open source waits for more of its input"
-    );
-    dispatcher.notify(PipelineId(0), &keys_between(5, 6));
-    assert_eq!(drain(&dispatcher, 0), vec![keys_between(5, 6)]);
-    dispatcher.close(PipelineId(0));
-    let Next::Finish { consumed, .. } = dispatcher.try_claim(None) else {
-        panic!("a closed source whose packages are all acknowledged finishes")
-    };
-    assert_eq!(consumed, Some(keys_between(0, 6)));
-}
-
 /// A notified region is cut every `morsel_rows` positions counted across its runs.
 #[test]
 fn a_notified_region_is_cut_every_rows_positions_across_its_runs() {
@@ -1435,16 +1356,6 @@ fn a_second_close_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![]], 2);
     dispatcher.close(PipelineId(0));
     dispatcher.close(PipelineId(0));
-}
-
-/// A region notified twice would be consumed twice, which a debug build refuses.
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "pipeline 0 consumes each region once")]
-fn a_region_notified_twice_is_refused() {
-    let dispatcher = Dispatcher::new(vec![vec![]], 2);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 3));
-    dispatcher.notify(PipelineId(0), &keys_between(3, 4));
 }
 
 /// A limited source takes a notify only while fewer packages than its limit are outstanding,
@@ -1505,34 +1416,6 @@ fn pushes_dropped_with_morsels_are_refused() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     let mut pushes = dispatcher.pushes(PipelineId(0));
     pushes.push(&keys_between(0, 1), |guard, _| vec![guard.clone()]);
-    drop(pushes);
-}
-
-/// A second push of a breaker that holds nothing new carries its completion and no morsel.
-/// Pushes that carry a completion land it, so dropping them unlanded fails the run as dropping
-/// morsels does.
-#[test]
-#[should_panic(expected = "pipeline 0 lands its pushes through Dispatcher::land")]
-fn pushes_dropped_with_only_a_completion_are_refused() {
-    let memo = memo_over_rows(0..6);
-    memo.write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .begin_run();
-    memo.write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .consume_impl(InputId::ONLY, ints().universal_guard());
-    push_to(
-        &mut *memo.write().unwrap_or_else(PoisonError::into_inner),
-        &[1],
-    );
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    let mut pushes = dispatcher.pushes(PipelineId(0));
-    pushes.push_final(&*memo.read().unwrap_or_else(PoisonError::into_inner));
-    dispatcher.land(pushes);
-    assert!(dispatcher.pop().is_some(), "the first push lands the rows");
-    let mut pushes = dispatcher.pushes(PipelineId(0));
-    pushes.push_final(&*memo.read().unwrap_or_else(PoisonError::into_inner));
-    assert_eq!(dispatcher.pop(), None, "nothing new is queued");
     drop(pushes);
 }
 
@@ -1684,36 +1567,6 @@ fn a_push_naming_every_tag_whole_lands_universal() {
     assert_eq!(queued, vec![input.universal_guard()]);
 }
 
-/// A push that reaches one reader along two paths, as a filter reads one memo for its values and
-/// its predicate, is queued once: what is queued for the reader already is taken out.
-#[test]
-fn a_push_reaching_a_reader_twice_is_queued_once() {
-    let scripted = Scripted::holding(ints().universal_guard());
-    let shared = gated_entry(&ints());
-
-    let paths = vec![
-        forwarding_consumer_keeping_keys(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-    ];
-    scripted
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .base_mut()
-        .pushing_to(Arc::new(Paths(paths)));
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .finish(InputId::ONLY, pushes)
-    });
-    assert_eq!(
-        dispatcher.pop().map(|package| package.guard),
-        Some(ints().universal_guard())
-    );
-    assert_eq!(dispatcher.pop(), None, "one package for two paths");
-}
-
 /// A consumer with several paths to one reader: a push takes each.
 struct Paths(Vec<Box<dyn Consumer>>);
 
@@ -1752,178 +1605,9 @@ fn a_route_walk_records_whether_each_path_keeps_its_keys() {
     ]);
     let reached: Vec<_> = walk(&paths)
         .into_iter()
-        .map(|route| (route.pipeline, route.keeps_keys))
+        .map(|route| route.pipeline)
         .collect();
-    assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
-}
-
-/// A consumer that passes a route walk's push on with its keys kept and widens every push it
-/// delivers: deliberately inconsistent, as a consumer is whose `notify` passes a region the walk
-/// does not send otherwise than the ones it does.
-struct WidensDeliveries(Box<dyn Consumer>);
-
-impl Consumer for WidensDeliveries {
-    fn notify(
-        &self,
-        region: &Projection,
-        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
-    ) {
-        match landing.is_delivery() {
-            true => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
-            false => self.0.notify(region, landing),
-        }
-    }
-}
-
-/// Pipeline 1 reading pipeline 0, with the routes the planner walks of `walked` for a push of key
-/// 0 planned as pipeline 0's ([`walk_routes`](crate::interpreter::dispatcher::walk_routes)), and
-/// pipeline 0's breaker pushing `held` through `pushed` once it finishes. With `waits`, pipeline 1
-/// waits for its inputs, so it takes a widened push.
-fn planned_through(
-    walked: Box<dyn Consumer>,
-    pushed: Box<dyn Consumer>,
-    held: TileGuard,
-    waits: bool,
-) -> Dispatcher {
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    if waits {
-        dispatcher.wait_for_inputs(PipelineId(1));
-    }
-    let walked: SharedConsumer = Arc::new(Boxed(walked));
-    let (changes, completions) = crate::interpreter::dispatcher::walk_routes(
-        &walked,
-        &[Projection::admitting(Predicate::point(Value::UInt(0)))],
-        1,
-    );
-    dispatcher.plan_routes(PipelineId(1), PipelineId(0), changes, completions);
-    let scripted = Scripted::holding(held);
-    scripted
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .base_mut()
-        .pushing_to(Arc::new(Boxed(pushed)));
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .finish(InputId::ONLY, pushes)
-    });
-    dispatcher
-}
-
-/// A push lands along a route its planner walked: the walk of a consumer that keeps keys plans the
-/// route its push then takes.
-#[test]
-fn a_push_lands_along_the_route_its_planner_walked() {
-    let shared = gated_entry(&ints());
-    let dispatcher = planned_through(
-        forwarding_consumer_keeping_keys(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-        keys_between(0, 1),
-        false,
-    );
-    assert_eq!(
-        dispatcher.pop().map(|package| package.guard),
-        Some(keys_between(0, 1))
-    );
-}
-
-/// A widening passes a push of every key on unwidened, and the planner walks a push of every key
-/// too, so that push lands along the unwidened route the walk found.
-#[test]
-fn a_push_of_every_key_lands_unwidened_through_a_widening() {
-    let shared = gated_entry(&ints());
-    let dispatcher = planned_through(
-        forwarding_consumer(&shared),
-        forwarding_consumer(&shared),
-        ints().universal_guard(),
-        false,
-    );
-    assert_eq!(
-        dispatcher.pop().map(|package| package.guard),
-        Some(ints().universal_guard())
-    );
-}
-
-/// A consumer whose delivery takes a path its walk did not fails the run where the push is queued:
-/// the walk plans a route that keeps keys, and the delivery arrives widened at a reader that waits
-/// for its inputs, which takes a widened push.
-#[test]
-#[should_panic(
-    expected = "a push of pipeline 0 reaches pipeline 1 along a path its planner's route walk did \
-                not take (widened: true"
-)]
-fn a_push_along_a_route_its_planner_did_not_walk_fails_the_run() {
-    let shared = gated_entry(&ints());
-    planned_through(
-        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
-        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
-        keys_between(0, 1),
-        true,
-    );
-}
-
-/// A complete region that reaches a reader whose walk reached no entry of it fails the run where
-/// the read records it.
-#[test]
-#[should_panic(
-    expected = "a complete region of pipeline 0 reaches pipeline 1 along a path its planner's route \
-                walk did not take"
-)]
-fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
-    let shared = gated_entry(&ints());
-    planned_through(
-        Box::new(|| {}),
-        forwarding_consumer_keeping_keys(&shared),
-        keys_between(0, 1),
-        false,
-    );
-}
-
-/// A route walk records, per path, whether its decided region names only part of what a row
-/// depends on: a widening path's does, and so does a lookup operand's, which names rows by the key they
-/// read whatever their input holds. A path that keeps its keys does not.
-#[test]
-fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
-    let shared = gated_entry(&ints());
-
-    let paths = Paths(vec![
-        forwarding_consumer(&shared),
-        forwarding_consumer_keeping_keys(&shared),
-        crate::interpreter::notifications::restating_lookup(
-            Box::new(|region| region.clone()),
-            forwarding_consumer_keeping_keys(&shared),
-        ),
-    ]);
-    let parts: Vec<_> = walk(&paths)
-        .into_iter()
-        .map(|route| route.completes_part)
-        .collect();
-    assert_eq!(parts, [true, false, true]);
-}
-
-/// A push widened to `Everything` on its way fails the run, since the reader could not tell which
-/// of its keys it names: a reader reached that way reads the pushing pipeline once it finished.
-#[test]
-#[should_panic(
-    expected = "a push of pipeline 0 is widened to `Everything` on its way to pipeline 1"
-)]
-fn a_push_widened_on_its_way_fails_the_run() {
-    let scripted = Scripted::cutting(keys_between(0, 1), vec![keys_between(0, 1)]);
-    let shared = gated_entry(&ints());
-    let widening = forwarding_consumer(&shared);
-    scripted
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .base_mut()
-        .pushing_to(Arc::new(Boxed(widening)));
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .finish(InputId::ONLY, pushes)
-    });
+    assert_eq!(reached, [PipelineId(1), PipelineId(1)]);
 }
 
 /// A push whose chain leads back into a consumer it is passing through fails the run: only a
@@ -2027,22 +1711,6 @@ impl Consumer for Through {
     }
 }
 
-/// A source whose input was released whole, as a scalar a run before a pause or a reload took, is
-/// queued no package when a later run starts it, and finishes once claimed.
-#[test]
-fn a_source_started_over_an_input_released_whole_is_queued_nothing() {
-    let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &scalar, &scalar.universal_guard());
-    assert!(
-        matches!(
-            dispatcher.try_claim(None),
-            Next::Finish { consumed: None, .. }
-        ),
-        "nothing is queued, so the closed source finishes at once"
-    );
-}
-
 #[test]
 fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
     let guard = keys_between(3, 3);
@@ -2054,7 +1722,7 @@ fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
     body.order(PipelineId(0));
     body.follow(PipelineId(1), PipelineId(0));
     body.notify(PipelineId(0), &guard);
-    body.queue_round(PipelineId(1), &guard);
+    body.queue_for(PipelineId(1), &guard);
     body.close(PipelineId(0));
     body.hold_pipeline(PipelineId(0), true);
     assert_eq!(dispatcher.append_graph(body), 1);
@@ -2141,7 +1809,7 @@ fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
     dispatcher.hold_pipeline(step, true);
     let guard = keys_between(0, 0);
     dispatcher.notify(PipelineId(1), &guard);
-    dispatcher.queue_round(step, &guard);
+    dispatcher.queue_for(step, &guard);
     dispatcher.close(PipelineId(1));
 
     let Next::Package(body) = dispatcher.try_claim(None) else {

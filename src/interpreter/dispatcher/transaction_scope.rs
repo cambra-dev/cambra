@@ -195,7 +195,6 @@ impl CommitProducer {
         &mut self,
         dispatcher: &Dispatcher,
         writer: usize,
-        consumed: Option<TileGuard>,
     ) -> RoundWork {
         assert!(
             matches!(self.writer_run(writer).attempt, Attempt::Idle),
@@ -207,7 +206,7 @@ impl CommitProducer {
         self.begin_attempt();
         let run = self.writer_run_mut(writer);
         run.attempt = Attempt::Finishing;
-        run.body.begin_finish(consumed);
+        run.body.begin_finish();
         run.queue(dispatcher, &whole)
     }
 }

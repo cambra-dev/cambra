@@ -1709,11 +1709,6 @@ pub trait Breaker {
 /// the dispatcher calls [`Breaker::finish`].
 /// A placed producer's [`get_impl`](TileProducer::get_impl) reads state without pulling its input.
 pub trait BreakingProducer: TileProducer + Breaker {
-    /// Store keys whose writers have all completed. Other breakers declare none.
-    fn completed_keys(&self) -> Vec<Value> {
-        Vec::new()
-    }
-
     /// The complete output region, including keys known absent and output already released.
     /// This statement comes from the breaker's state. Publication and downstream readiness
     /// derive from it; reclaiming payloads must preserve the statement.

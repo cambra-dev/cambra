@@ -1469,19 +1469,6 @@ impl CommitProducer {
 }
 
 impl BreakingProducer for CommitProducer {
-    fn completed_keys(&self) -> Vec<Value> {
-        let mut state_guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = &mut *state_guard;
-
-        match state.breaker.snapshot.as_ref() {
-            Some(Tile::Store { closed_keys, .. }) => closed_keys.clone(),
-            _ => Vec::new(),
-        }
-    }
-
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
     /// decided, and a reader of its final value takes it once the store is terminal.
@@ -4493,15 +4480,11 @@ impl TileOperator for StoreFinalRead {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // A final read requires completion of this key, even when other store keys remain live.
         let consumer = shared_consumer(consumer);
 
         let forward = forwarding_consumer_keeping_keys(&consumer);
         let forward: Box<dyn Consumer> = if self.levels_above == 0 {
-            Box::new(FinalKeyConsumer {
-                key: self.key.clone(),
-                downstream: crate::interpreter::widening(forward),
-            })
+            crate::interpreter::widening(forward)
         } else {
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(self.levels_above),
@@ -4526,21 +4509,6 @@ impl TileOperator for StoreFinalRead {
             value_extent: self.value_extent.clone(),
             levels_above: self.levels_above,
         })
-    }
-}
-
-struct FinalKeyConsumer {
-    key: Value,
-    downstream: Box<dyn Consumer>,
-}
-
-impl Consumer for FinalKeyConsumer {
-    fn notify(
-        &self,
-        region: &Projection,
-        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
-    ) {
-        landing.requiring_final_key(&self.key, |landing| self.downstream.notify(region, landing));
     }
 }
 

@@ -2069,8 +2069,8 @@ fn a_totalled_nest_over_a_streamed_source_answers_at_the_close(
 }
 
 /// A collection per row paired against a streamed source: each row is a record whose collection
-/// field is part of its value, so a row is published once the whole record is final, at the
-/// source's close, and the first batch's pull holds no row.
+/// field grows with the source, and a row is published with the elements of that field that are
+/// final, so the first batch's pull holds each row with its first element.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
 fn a_collection_per_row_over_a_streamed_source() {
@@ -2089,7 +2089,7 @@ fn a_collection_per_row_over_a_streamed_source() {
     };
     assert_eq!(
         collections(each[0].clone()),
-        Vec::<i64>::new(),
+        vec![1, 2],
         "after the first batch"
     );
     assert_eq!(
