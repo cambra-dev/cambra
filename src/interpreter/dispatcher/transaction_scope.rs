@@ -86,7 +86,7 @@ impl WriterRun {
             }
         }
         work.queue_round(self.body.global(self.body.driver), guard);
-        work.queue_round(self.body.attached().step, guard);
+        self.body.end_round_with(guard);
         work
     }
 

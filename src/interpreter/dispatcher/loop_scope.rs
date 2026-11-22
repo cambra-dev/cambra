@@ -91,6 +91,9 @@ pub(super) struct Body {
     /// The region the scope's pipeline consumed, from the scope's finish until the inner pipelines
     /// and the step have finished.
     finishing: Option<Option<TileGuard>>,
+    /// The guard of the step's package for the open round or attempt, which the scope queues once
+    /// the inner pipelines are quiescent ([`Body::queue_step_when_quiescent`]).
+    pending_step: Option<TileGuard>,
 }
 
 /// Where a body sits in the run's shared dispatcher.
@@ -120,6 +123,7 @@ impl Body {
             attached: None,
             active: false,
             finishing: None,
+            pending_step: None,
         }
     }
 
@@ -221,6 +225,31 @@ impl Body {
     /// attached.
     pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
         Some(dispatcher.followers_hold(self.attached.as_ref()?.step))
+    }
+
+    /// End the open round or attempt with a step package of `guard` once the inner pipelines are
+    /// quiescent.
+    pub(super) fn end_round_with(&mut self, guard: &TileGuard) {
+        debug_assert!(
+            self.pending_step.is_none(),
+            "a scope runs one round or attempt at a time"
+        );
+        self.pending_step = Some(guard.clone());
+    }
+
+    /// Queue the step's package of the open round or attempt where every inner pipeline, and every
+    /// pipeline one reads, has consumed every package queued for it: the round's work has run,
+    /// pushes it brought included. Whether it queued the package.
+    pub(super) fn queue_step_when_quiescent(&mut self, dispatcher: &Dispatcher) -> bool {
+        if self.pending_step.is_none()
+            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
+            || !dispatcher.quiescent(self.pipelines().into_iter().map(|pipeline| pipeline.0))
+        {
+            return false;
+        }
+        let guard = self.pending_step.take().expect("checked above");
+        dispatcher.queue_round(self.attached().step, &guard);
+        true
     }
 
     /// Begin the scope's finish, which consumed `consumed` of the scope's pipeline.
@@ -760,7 +789,7 @@ impl InductionStoreProducer {
             }
         }
         if self.run().body.is_attached() {
-            work.queue_round(self.run().body.attached().step, guard);
+            self.run_mut().body.end_round_with(guard);
         }
         work
     }

@@ -1253,16 +1253,19 @@ impl Scope {
         if dispatcher.changes() != before {
             return true;
         }
-        let Some(hold) = hold else {
-            return progressed;
-        };
-        progressed
-            | match self {
-                Scope::Loop(store) => induction(store).release_followers(dispatcher, hold),
-                Scope::Writer { store, writer } => transaction_scope::transaction(store)
-                    .writer_run_mut(*writer)
-                    .release_followers(dispatcher, hold),
-            }
+        let released = hold.is_some_and(|hold| match self {
+            Scope::Loop(store) => induction(store).release_followers(dispatcher, hold),
+            Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                .writer_run_mut(*writer)
+                .release_followers(dispatcher, hold),
+        });
+        progressed | released
+    }
+
+    /// Queue the step of the open round or attempt where its work has run
+    /// ([`Body::queue_step_when_quiescent`]). Whether it queued it.
+    fn queue_step(&self, dispatcher: &Dispatcher) -> bool {
+        self.with_body(|body| body.queue_step_when_quiescent(dispatcher))
     }
 }
 
@@ -1329,9 +1332,6 @@ impl Execution {
         }
         let step = dispatcher.add_pipeline(body.clone());
         dispatcher.order(step);
-        for inner in body {
-            dispatcher.follow(step, inner);
-        }
         dispatcher.hold_pipeline(step, true);
         assert_eq!(step.0, self.handlers.len(), "each step has one handler");
         scope.with_body(|body| body.attach(pipeline, base, step));
@@ -1509,7 +1509,10 @@ impl Execution {
         for scope in self.scopes() {
             progressed |= scope.resume(dispatcher, reach);
         }
-        progressed
+        // A step runs on what its round settled, and one scope's step can bring another scope's
+        // body work, as a writer's commit does for a writer that reads the store: so a pass with
+        // nothing else to do queues one step, and the next pass reads the bodies again.
+        progressed || self.scopes().any(|scope| scope.queue_step(dispatcher))
     }
 
     fn push_held(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
