@@ -1913,8 +1913,8 @@ impl TileOperator for Product {
             PairingSide, Partners, nothing_delivered, pairing,
         };
         let delivered = nothing_delivered(
-            self.outer.arrives_from_a_source(),
-            self.inner.arrives_from_a_source(),
+            self.outer.keys_arrive_by_push(),
+            self.inner.keys_arrive_by_push(),
         );
         let paired = CurryLevel::new(level.index() + 1);
         let outer = self.outer.clone().subscribe(

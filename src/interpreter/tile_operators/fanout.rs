@@ -1525,6 +1525,11 @@ impl Memo {
 }
 
 impl TileOperator for Memo {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     /// A memo's record fields equal what its input's do.
@@ -1650,15 +1655,37 @@ impl MemoProducer {
 /// beneath a level of its own states that level complete only where the collection states
 /// `True`, so the cache states it once it can.
 fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
-    if let (
-        Some(Extent::UIntRange(positions)),
-        Tile::DataFunction {
-            domain_predicate, ..
-        },
-    ) = (tiling.domain_extent(), tile)
-        && !domain_predicate.is_true()
-        && domain_predicate.covers_positions(&positions)
+    let Tile::DataFunction {
+        domain,
+        codomain,
+        domain_predicate,
+        ..
+    } = tile
+    else {
+        return;
+    };
+    // A level beneath that states every key complete under every row makes each held row whole.
+    if let Some(beneath) = tiling.codomain() {
+        close_over_positions(codomain, &beneath);
+    }
+    if !domain_predicate.is_true()
+        && let Tile::DataFunction {
+            domain_predicate: rows_beneath,
+            ..
+        } = codomain.as_ref()
+        && rows_beneath.is_true()
     {
+        *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+    }
+    let covered = match tiling.domain_extent() {
+        Some(Extent::UIntRange(positions)) => domain_predicate.covers_positions(&positions),
+        // A level of one key, as a value's outermost level is, is complete once that key is.
+        Some(Extent::Base(crate::interpreter::BaseType::Unit)) => {
+            domain_predicate.contains(&Value::Unit)
+        }
+        _ => false,
+    };
+    if covered {
         *domain_predicate = Predicate::True;
     }
 }
@@ -3518,9 +3545,10 @@ mod consuming_tests {
     }
 
     /// A memo released position by position through the last position of a row, over a finite
-    /// range of positions, holds the row no more (`BreakingProducer::final_guard` closes it).
+    /// range of positions, holds none of the row's positions, and its final guard names the row's
+    /// remainder past them, which states the row's end (`BreakingProducer::final_guard`).
     #[test]
-    fn a_row_released_through_its_last_position_is_held_no_more() {
+    fn a_row_released_through_its_last_position_keeps_only_its_end() {
         use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
         use crate::interpreter::{BaseType, ColumnValue, Extent};
         use bit_set::BitSet;
@@ -3558,12 +3586,21 @@ mod consuming_tests {
                 ))),
             ))));
         }
-        let held = Projection::of(&memo.final_guard()).expect("a region of keys");
-        assert_eq!(held.level(), Some(CurryLevel::OUTERMOST), "{held:?}");
-        assert_eq!(
-            held.intersect(&Projection::admitting(Predicate::point(Value::UInt(0)))),
-            Projection::Nothing,
-            "row 0 is released through its last position"
+        let row_0 = |here: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(Predicate::point(Value::UInt(0)), here)),
+            ))))
+        };
+        let held = memo.final_guard();
+        let positions = row_0(Predicate::at_or_below(Value::UInt(1)));
+        assert!(
+            held.intersect(&positions).is_empty(),
+            "row 0 is released through its last position: {held:?}"
+        );
+        let end = guard_minus(&row_0(Predicate::True), &positions);
+        assert!(
+            guard_minus(&end, &held).is_empty(),
+            "the final guard names row 0's remainder, its end: {held:?}"
         );
     }
 

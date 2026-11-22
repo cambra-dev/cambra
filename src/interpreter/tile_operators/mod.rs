@@ -106,15 +106,16 @@ pub trait TileOperator: Send + Sync {
         self.tiling().extent()
     }
 
-    /// Whether any key of this operator's output can arrive while a run polls its sources: an
-    /// iteration over an extent that reads a source, or an operator with such an input. An output
-    /// that reads no source holds all its keys from the start, which a pairing reads as delivered
+    /// Whether keys of this operator's output reach its readers by a push during a run: an
+    /// iteration over an extent that reads a source, a breaker, whose output its pipeline pushes
+    /// to the pipelines that read it, or an operator with such an input. An output reached by no
+    /// push holds all its keys from the start, which a pairing reads as delivered
     /// (`notifications::Delivered`). A deferred input closes a recurrence and is not read.
-    fn arrives_from_a_source(&self) -> bool {
+    fn keys_arrive_by_push(&self) -> bool {
         let mut arrives = false;
         self.visit_inputs(&mut |edge| {
             if !matches!(edge.kind, EdgeKind::Value { deferred: true }) {
-                arrives |= edge.target.arrives_from_a_source();
+                arrives |= edge.target.keys_arrive_by_push();
             }
         });
         arrives
@@ -1464,8 +1465,9 @@ pub(crate) fn guard_covers(released: &TileGuard, held: &TileGuard) -> bool {
 /// collection keys where it also holds cells beneath a row ([`keys_released_whole`]), and `None`
 /// where no part is spelled so, as a record whose collection field is complete through some rows.
 pub(crate) fn spelled_part(guard: &TileGuard) -> Option<TileGuard> {
-    // A push names rows whose whole value is final, at any level, and never part of a value.
-    if names_whole_keys(guard) {
+    // A push names what is final: rows whose whole value is, at any level, and the fields of a
+    // record under rows where some of its fields are and others still grow.
+    if Projection::of(guard).is_ok() {
         return Some(guard.clone());
     }
     names_collection_keys(guard)
@@ -1478,6 +1480,39 @@ pub(crate) fn spelled_part(guard: &TileGuard) -> Option<TileGuard> {
 /// guard algebra's difference of keys is with whole keys alone.
 fn names_whole_keys(guard: &TileGuard) -> bool {
     Projection::of(guard).is_ok_and(|projection| !projection.names_part_of_values())
+}
+
+/// `guard`, a guard of `tiling`, closed over it ([`TileGuard::closed_over`]) one `Or` arm at a
+/// time, keeping each arm whose closure names nothing as it is. Such an arm lies wholly past the
+/// positions `tiling` ranges over: it is a row's remainder, and it states the row's end, which a
+/// push carries to the readers.
+pub(crate) fn closed_keeping_row_ends(guard: TileGuard, tiling: &Tiling) -> TileGuard {
+    if let TileGuard::Or(arms) = guard {
+        return TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| closed_keeping_row_ends(arm, tiling))
+                .collect(),
+        );
+    }
+    let closed = guard.clone().closed_over(tiling);
+    match closed.is_empty() {
+        true => guard,
+        false => closed,
+    }
+}
+
+/// [`BreakingProducer::final_guard`]'s default.
+fn held_final_guard<P: BreakingProducer + ?Sized>(producer: &P) -> TileGuard {
+    let held = producer.complete();
+    let obsolete = producer.obsolete_guard();
+    let left = match names_collection_keys(&obsolete) {
+        true => match keys_released_whole(&obsolete) {
+            Some(released) if !held.is_empty() => guard_minus(&held, &released),
+            _ => held,
+        },
+        false => guard_minus(&held, &obsolete),
+    };
+    closed_keeping_row_ends(left, producer.tiling())
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -1709,22 +1744,19 @@ pub trait Breaker {
 /// the dispatcher calls [`Breaker::finish`].
 /// A placed producer's [`get_impl`](TileProducer::get_impl) reads state without pulling its input.
 pub trait BreakingProducer: TileProducer + Breaker {
-    /// Store keys whose writers have all completed. Other breakers declare none.
-    fn completed_keys(&self) -> Vec<Value> {
-        Vec::new()
-    }
-
     /// The complete output region, including keys known absent and output already released.
     /// This statement comes from the breaker's state. Publication and downstream readiness
     /// derive from it; reclaiming payloads must preserve the statement.
     fn complete(&self) -> TileGuard;
 
-    /// The keys under which the producer holds a cell: [`complete`](Self::complete) less the keys its
-    /// readers have released whole ([`keys_released_whole`]), closed over the producer's tiling
-    /// (`TileGuard::closed_over`), so a row released through its last position is held no more. A
-    /// key some of whose cells a reader released, as a selector releases the fields it does not
-    /// read, is still held, so a push of the final guard names it. A release of a record, a scalar
-    /// or an aggregation is taken out of what is held as [`guard_minus`] takes it.
+    /// The keys under which the producer holds a cell, and the ends of the rows it completed:
+    /// [`complete`](Self::complete) less the keys its readers have released whole
+    /// ([`keys_released_whole`]), closed over the producer's tiling
+    /// ([`closed_keeping_row_ends`]). A row released through its last position holds no cell, and
+    /// its remainder past the positions stays, so a push names the row's end. A key some of whose
+    /// cells a reader released, as a selector releases the fields it does not read, is still held,
+    /// so a push of the final guard names it. A release of a record, a scalar or an aggregation is
+    /// taken out of what is held as [`guard_minus`] takes it.
     ///
     /// # Panics
     ///
@@ -1732,16 +1764,7 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// ([`guard_minus`]), or a release of a collection's keys has an arm that is no region of keys
     /// and no codomain guard ([`keys_released_whole`]).
     fn final_guard(&self) -> TileGuard {
-        let held = self.complete();
-        let obsolete = self.obsolete_guard();
-        let left = match names_collection_keys(&obsolete) {
-            true => match keys_released_whole(&obsolete) {
-                Some(released) if !held.is_empty() => guard_minus(&held, &released),
-                _ => held,
-            },
-            false => guard_minus(&held, &obsolete),
-        };
-        left.closed_over(self.tiling())
+        held_final_guard(self)
     }
 
     /// `guard`, a guard of this producer's tiling it pushes, cut into morsels that target `rows`

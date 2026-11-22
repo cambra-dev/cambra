@@ -26,11 +26,11 @@ use std::thread;
 
 use intervalsets::Bounding;
 
-use crate::interpreter::tile_operators::InputId;
 use crate::interpreter::tile_operators::{
     Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
     spelled_part,
 };
+use crate::interpreter::tile_operators::{InputId, closed_keeping_row_ends};
 use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
 };
@@ -45,7 +45,7 @@ pub use plan::{
     run_program_polling, run_program_with_workers,
 };
 #[cfg(test)]
-pub(crate) use plan::{default_workers, run_program_polling_with_workers, walk_routes};
+pub(crate) use plan::{default_workers, run_program_polling_with_workers};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -74,10 +74,7 @@ pub enum Next {
     /// pipeline's packages partition, which it consumed whole, and `None` when it had none.
     ///
     /// [Breaker::finish]: crate::interpreter::tile_operators::Breaker::finish
-    Finish {
-        pipeline: PipelineId,
-        consumed: Option<TileGuard>,
-    },
+    Finish { pipeline: PipelineId },
     /// Nothing is claimable and some pipeline has not finished: [`wait`](Dispatcher::wait) for a
     /// change after the generation.
     Wait(Generation),
@@ -148,12 +145,6 @@ struct QueueState {
     arrivals_closed: bool,
     ready: VecDeque<(usize, TileGuard)>,
     in_flight: HashMap<usize, TileGuard>,
-    /// Deduplication and finish need the consumed region after individual packages are removed.
-    region: Option<TileGuard>,
-    /// The rows waiting for the pipelines the reader reads to complete them
-    /// ([`Dispatcher::wait_for_inputs`]), `None` where none waits. Admission and transfers from
-    /// waiting to ready share this lock with queue history.
-    waiting_for_inputs: Option<TileGuard>,
 }
 
 impl Queue {
@@ -164,81 +155,26 @@ impl Queue {
         }
     }
 
-    /// Append morsels partitioning a region no earlier append named. A closed queue takes nothing.
-    /// Everything that can panic runs before the reservation, so a panic leaves no index reserved
-    /// that no package fills.
-    ///
-    /// # Panics
-    ///
-    /// In a debug build, when a morsel meets the region appended before.
-    fn append_locked(
-        &self,
-        state: &mut QueueState,
-        pipeline: usize,
-        morsels: &[TileGuard],
-    ) -> bool {
-        let mut region: Option<TileGuard> = None;
-        for morsel in morsels {
-            let before = region.as_ref().or(state.region.as_ref());
-            debug_assert!(
-                before.is_none_or(|region| region.intersect(morsel).is_empty()),
-                "pipeline {pipeline} consumes each region once: {morsel:?} meets {before:?}"
-            );
-            region = Some(grown(before, morsel));
+    /// Append each of `morsels` as a package. An empty morsel is no package. A closed queue takes
+    /// nothing.
+    fn append_locked(&self, state: &mut QueueState, morsels: &[TileGuard]) -> bool {
+        let morsels: Vec<&TileGuard> = morsels.iter().filter(|morsel| !morsel.is_empty()).collect();
+        if morsels.is_empty() {
+            return !self.is_closed();
         }
         let Some(first) = self.reserve(morsels.len()) else {
             return false;
         };
-        if region.is_some() {
-            state.region = region;
+        for (index, morsel) in (first..).zip(morsels) {
+            state.ready.push_back((index, morsel.clone()));
         }
-        state.ready.extend((first..).zip(morsels.iter().cloned()));
         true
     }
 
-    /// Append the region not already queued, atomically with recording it for deduplication.
-    ///
-    /// # Panics
-    ///
-    /// Where the guard algebra has no exact difference of `guard` and the region ([`guard_minus`]).
-    fn append_unqueued(&self, guard: &TileGuard) -> bool {
+    /// [`append_locked`](Self::append_locked) under the queue's lock.
+    fn append(&self, morsels: &[TileGuard]) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        self.append_unqueued_locked(&mut state, guard)
-    }
-
-    fn append_unqueued_locked(&self, state: &mut QueueState, guard: &TileGuard) -> bool {
-        let fresh = match state.region.as_ref() {
-            Some(region) => guard_minus(guard, region),
-            None => guard.clone(),
-        };
-        if fresh.is_empty() {
-            return !self.is_closed();
-        }
-        // The union can panic, so it runs before the reservation.
-        let region = grown(state.region.as_ref(), &fresh);
-        let Some(index) = self.reserve(1) else {
-            return false;
-        };
-        state.region = Some(region);
-        state.ready.push_back((index, fresh));
-        true
-    }
-
-    /// Append a repeated read of a loop's row, including its end, as a distinct package.
-    fn append_again(&self, guard: &TileGuard) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        self.append_again_locked(&mut state, guard)
-    }
-
-    fn append_again_locked(&self, state: &mut QueueState, guard: &TileGuard) -> bool {
-        // The union can panic, so it runs before the reservation.
-        let region = grown(state.region.as_ref(), guard);
-        let Some(index) = self.reserve(1) else {
-            return false;
-        };
-        state.region = Some(region);
-        state.ready.push_back((index, guard.clone()));
-        true
+        self.append_locked(&mut state, morsels)
     }
 
     /// Move the oldest ready package to in-flight while its dependencies permit the claim.
@@ -307,15 +243,6 @@ impl Queue {
     fn close(&self) -> bool {
         self.reserved.fetch_or(CLOSED, Ordering::AcqRel) & CLOSED == 0
     }
-
-    /// The union of every appended region, including acknowledged packages.
-    fn region(&self) -> Option<TileGuard> {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .region
-            .clone()
-    }
 }
 
 /// What the dispatcher knows of one pipeline: where it sits in the graph and how it consumes.
@@ -342,49 +269,15 @@ struct PipelineInfo {
     /// Whether it takes the arrivals of live sources although it reads pipelines
     /// ([`take_arrivals`](Dispatcher::take_arrivals)).
     arrivals: bool,
-    /// The pipelines it reads whose pushes arrive as its own keys, which no arrival names: a push
-    /// of one queues the rows it names fresh, though the pipeline takes arrivals
-    /// ([`queue_pushes_of`](Dispatcher::queue_pushes_of)).
-    pushed_rows: Vec<usize>,
-    /// Whether arrivals wait until the pipelines it reads have completed them
-    /// ([`wait_for_inputs`](Dispatcher::wait_for_inputs)).
-    waits_for_inputs: bool,
     /// Whether it is a store's seed input, which the store's other pipelines read and wait for
     /// the consume of ([`opens_before`](Dispatcher::opens_before)).
     opens: bool,
-    /// Per pipeline it reads, in the order of its `reads`, the region of its input that
-    /// pipeline's pushes reach along routes that keep its keys, `None` where they reach all of
-    /// it ([`reaches`](Dispatcher::reaches)).
-    reach: Vec<Option<TileGuard>>,
-    required_keys: Vec<Vec<Value>>,
     /// The tiling of the breaker input the pipeline consumes, where a planner set it
     /// ([`consumes_input`](Dispatcher::consumes_input)). An entry of another of the breaker's
     /// inputs, as a loop's seed is, lands regions of that input's tiling, which
     /// [`rows_named`](Dispatcher::rows_named) restates as rows of this one.
     input: Option<Tiling>,
-    /// Per pipeline it reads, in the order of its `reads`, the routes a push of that pipeline
-    /// takes to its entry, as the planner walked them through the pusher's consumer
-    /// ([`plan_routes`](Dispatcher::plan_routes)); `None` where no planner walked them. A push
-    /// queued, or a complete region recorded, along no planned route fails the run
-    /// ([`Landing::queue`]).
-    routes: Option<Vec<ReadRoutes>>,
     ingress: Option<std::ops::Range<usize>>,
-}
-
-/// What the operators on a push's path have marked it with ([`Landing`]), as a push carries them
-/// to the entry it reaches.
-struct PathMarks {
-    widened: bool,
-    completes_part: bool,
-    final_key: Option<Value>,
-}
-
-/// The routes a push of one pipeline takes to a reader's entry, as [`Dispatcher::plan_routes`]
-/// records them: those of a change, and those of a complete region.
-#[derive(Default)]
-struct ReadRoutes {
-    changes: Vec<Route>,
-    completions: Vec<Route>,
 }
 
 /// A pipeline's queue, progress counters, and published regions, completion and input waits for one run.
@@ -400,53 +293,12 @@ struct PipelineState {
     // shared-state-ok: the region a pipeline has pushed, which its pushes read and grow under the
     // lock; what crosses it is a guard naming a region, never a tile.
     pushed: Mutex<Option<TileGuard>>,
-    /// Per source of its breaker's input, what that source has completed of it: one per pipeline it
-    /// reads, in the order of its `reads`, then one for the ranges in its own chain
-    /// ([`Completion`]).
-    // shared-state-ok: guards naming regions of the pipeline's input, which the complete pushes
-    // of its sources grow under the lock; never a tile.
-    complete: Mutex<Vec<Completion>>,
     /// How many of the pipeline's packages have been acknowledged.
     acknowledged: AtomicUsize,
     /// Whether this pipeline waits for its loop's round to settle before following its reads, in
     /// the low bit, and how many holds it has taken, in the bits above: a release that read the
     /// count before a later hold fails ([`Dispatcher::release_followers_if`]).
     followers_hold: AtomicU64,
-    held: AtomicBool,
-}
-
-/// What one source of a pipeline's breaker's input has completed of that input: a pipeline it
-/// reads, or the ranges in its own chain.
-#[derive(Clone, Debug, Default)]
-pub(crate) enum Completion {
-    /// Nothing yet.
-    #[default]
-    Nothing,
-    /// The region its complete pushes have named.
-    Region(TileGuard),
-    /// All of what it contributes: it is wholly complete, and a push of it reaches the input only
-    /// widened, or it is read by pull, which reads all of it.
-    Whole,
-}
-
-impl Completion {
-    /// Whether it covers `guard`, a region of the input, as the end-of-run check reads it.
-    #[cfg(debug_assertions)]
-    pub(crate) fn covers(&self, guard: &TileGuard) -> bool {
-        match self {
-            Completion::Nothing => guard.is_empty(),
-            Completion::Region(region) => guard_minus(guard, region).is_empty(),
-            Completion::Whole => true,
-        }
-    }
-
-    fn grown(self, guard: &TileGuard) -> Completion {
-        match self {
-            Completion::Whole => Completion::Whole,
-            Completion::Nothing => Completion::Region(guard.clone()),
-            Completion::Region(region) => Completion::Region(region.union(guard)),
-        }
-    }
 }
 
 impl PipelineState {
@@ -456,10 +308,8 @@ impl PipelineState {
             phase: AtomicPhase::new(Phase::Running),
             unfinished: AtomicUsize::new(reads),
             pushed: Mutex::new(None),
-            complete: Mutex::new(Vec::new()),
             acknowledged: AtomicUsize::new(0),
             followers_hold: AtomicU64::new(0),
-            held: AtomicBool::new(false),
         }
     }
 
@@ -573,13 +423,8 @@ impl Dispatcher {
                 limit: usize::MAX,
                 pushes_with: pipeline,
                 arrivals: false,
-                pushed_rows: Vec::new(),
-                waits_for_inputs: false,
                 opens: false,
-                reach: Vec::new(),
-                required_keys: Vec::new(),
                 input: None,
-                routes: None,
                 ingress: None,
             })
             .collect();
@@ -634,7 +479,6 @@ impl Dispatcher {
                 .iter_mut()
                 .chain(&mut info.readers)
                 .chain(&mut info.follows)
-                .chain(&mut info.pushed_rows)
             {
                 *pipeline += offset;
             }
@@ -670,13 +514,8 @@ impl Dispatcher {
             limit: usize::MAX,
             pushes_with: pipeline,
             arrivals: false,
-            pushed_rows: Vec::new(),
-            waits_for_inputs: false,
             opens: false,
-            reach: Vec::new(),
-            required_keys: Vec::new(),
             input: None,
-            routes: None,
             ingress: None,
         });
         *self.unfinished.get_mut() += 1;
@@ -690,14 +529,6 @@ impl Dispatcher {
             "an ingress range names planned pipelines"
         );
         self.infos[pipeline.0].ingress = Some(from);
-    }
-
-    /// Hold a pipeline's packages and finish until it is activated by its execution handler.
-    /// The serial coordinator changes holds between claims; a hold does not revoke a claim.
-    pub(crate) fn hold_pipeline(&self, pipeline: PipelineId, held: bool) {
-        if self.state(pipeline).held.swap(held, Ordering::SeqCst) != held {
-            self.advance();
-        }
     }
 
     /// The count of the dispatcher's changes so far ([`Generation`]): an equal count read twice
@@ -749,39 +580,20 @@ impl Dispatcher {
         found[pipeline]
     }
 
-    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
-    /// what is queued for it already: at the start, what a range brings that no push names
-    /// ([`run_program`]). A reader configured by [`wait_for_inputs`](Self::wait_for_inputs) waits for the regions that the pipelines it reads have not completed,
-    /// and a release hands out the part they decide.
+    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`: at the
+    /// start, what a range brings that no push names ([`run_program`]), and a loop's round's row.
     ///
     /// # Panics
     ///
     /// When `reader`'s queue has closed: every pipeline it reads has finished.
     pub(crate) fn queue_for(&self, reader: PipelineId, guard: &TileGuard) {
-        self.queue_in_current(reader, guard, false);
+        self.queue_in_current(reader, guard);
     }
 
-    /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
-    /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
-    /// closing round has every inner pipeline read again. A reader that
-    /// waits for inputs takes the row again whatever it took before, each part once the pipelines it
-    /// reads have completed it ([`queue_or_wait_for_inputs`](Self::queue_or_wait_for_inputs)).
-    pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
-        self.queue_in_current(reader, guard, true);
-    }
-
-    fn queue_in_current(&self, reader: PipelineId, guard: &TileGuard, round: bool) {
+    fn queue_in_current(&self, reader: PipelineId, guard: &TileGuard) {
         let _publisher = self.publisher();
-        if self.infos[reader.0].waits_for_inputs {
-            self.queue_or_wait_for_inputs(reader.0, guard, round);
-            self.advance();
-            return;
-        }
         let queue = &self.states[reader.0].queue;
-        let appended = match round {
-            true => queue.append_again(guard),
-            false => queue.append_unqueued(guard),
-        };
+        let appended = queue.append(std::slice::from_ref(guard));
         assert!(
             appended,
             "pipeline {} takes packages before the last pipeline it reads finishes",
@@ -814,27 +626,6 @@ impl Dispatcher {
         self.infos[reader.0].follows.push(read.0);
     }
 
-    /// Have every push of `read` to `reader`, which takes arrivals and waits for inputs
-    /// ([`take_arrivals`](Self::take_arrivals), [`wait_for_inputs`](Self::wait_for_inputs)),
-    /// bring the rows it names: `read`'s pushes arrive as `reader`'s own keys, as an arm of a
-    /// concatenation, and no arrival names them.
-    ///
-    /// # Panics
-    ///
-    /// When `reader` does not read `read`, takes no arrivals, or does not wait for inputs, where a push
-    /// brings no row.
-    pub fn queue_pushes_of(&mut self, reader: PipelineId, read: PipelineId) {
-        let info = &mut self.infos[reader.0];
-        assert!(
-            info.reads.contains(&read.0) && info.arrivals && info.waits_for_inputs,
-            "pipeline {} takes arrivals, waits for inputs, and reads pipeline {}, whose pushes it \
-             queues",
-            reader.0,
-            read.0
-        );
-        info.pushed_rows.push(read.0);
-    }
-
     /// Mark `pipeline`, which reads pipelines, as also taking the arrivals of live sources: it is
     /// notified and closed as a source is ([`notify`](Self::notify), [`close`](Self::close)), and
     /// its queue closes once both its close and the finishes of the pipelines it reads have
@@ -847,37 +638,6 @@ impl Dispatcher {
     /// notified or closed already.
     pub fn take_arrivals(&mut self, pipeline: PipelineId) {
         self.mark_arrivals(pipeline);
-    }
-
-    /// Park `pipeline`'s arrivals until the pipelines it reads have completed them: a notify of a
-    /// region they have not all completed keeps its morsels out of the queue, and the complete push
-    /// that covers a morsel appends it to the pipeline's queue
-    /// ([`record_complete`](Self::record_complete)). A loop's scope or a transaction store, whose
-    /// steps pull the pipelines it reads, takes each delivery so once what it pulls is final
-    /// (`src/interpreter/design-dispatcher.md`, "Waiting for input completion").
-    ///
-    /// # Panics
-    ///
-    /// When `pipeline` reads no pipeline, and when a source has been notified or closed already.
-    pub fn wait_for_inputs(&mut self, pipeline: PipelineId) {
-        let p = pipeline.0;
-        assert!(
-            self.states.iter().all(|pipeline| {
-                pipeline.queue.reserved() == 0
-                    && !pipeline
-                        .queue
-                        .state
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .arrivals_closed
-            }),
-            "pipeline {p} is configured to wait for inputs before any notify or close"
-        );
-        assert!(
-            !self.infos[p].reads.is_empty(),
-            "pipeline {p} waits for arrivals from the pipelines it reads"
-        );
-        self.infos[p].waits_for_inputs = true;
     }
 
     /// Mark `pipeline` as a store's seed input, which the store's other pipelines read: a store
@@ -897,241 +657,6 @@ impl Dispatcher {
             pipeline.0
         );
         self.infos[pipeline.0].opens = true;
-    }
-
-    /// Whether `source`'s complete push of `guard`, `None` where it is whole, reaches `reader`
-    /// around a store's recurrence, which is no read and records nothing: a store's complete push
-    /// reaches its own pipelines, and a pipeline of a store reads a sibling only for its seed
-    /// input's consume ([`opens_before`](Self::opens_before)), which records it whole.
-    fn passes_around_recurrence(
-        &self,
-        reader: usize,
-        source: usize,
-        guard: Option<&TileGuard>,
-    ) -> bool {
-        guard.is_some()
-            && source != reader
-            && self.infos[source].pushes_with == self.infos[reader].pushes_with
-    }
-
-    /// Record the routes a push of `read`, a pipeline `reader` reads, takes to the entry of
-    /// `reader`, as the planner walked them through the pusher's consumer ([`Landing::route`]):
-    /// `changes` for a change pushed, and `completions` for a complete region stated.
-    ///
-    /// # Panics
-    ///
-    /// When `reader` does not read `read`.
-    pub(crate) fn plan_routes(
-        &mut self,
-        reader: PipelineId,
-        read: PipelineId,
-        changes: Vec<Route>,
-        completions: Vec<Route>,
-    ) {
-        let info = &mut self.infos[reader.0];
-        let at = info
-            .reads
-            .iter()
-            .position(|&r| r == read.0)
-            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
-        let len = info.reads.len();
-        let routes = info
-            .routes
-            .get_or_insert_with(|| (0..len).map(|_| ReadRoutes::default()).collect());
-        routes[at] = ReadRoutes {
-            changes,
-            completions,
-        };
-    }
-
-    /// Whether a push of `from` that reaches the entry of `reader` with the marks `marked` takes a
-    /// route the planner walked ([`plan_routes`](Self::plan_routes)): one with the same
-    /// completes-part mark and final key, and for a change widened exactly as the push is. A
-    /// reader no planner walked the routes of, as in a dispatcher a test builds by hand, takes any
-    /// push.
-    fn planned_route(
-        &self,
-        from: usize,
-        reader: usize,
-        marked: &PathMarks,
-        complete: bool,
-    ) -> bool {
-        let info = &self.infos[reader];
-        let Some(routes) = &info.routes else {
-            return true;
-        };
-        let Some(at) = info.reads.iter().position(|&r| r == from) else {
-            return false;
-        };
-        let routes = match complete {
-            true => &routes[at].completions,
-            false => &routes[at].changes,
-        };
-        routes.iter().any(|route| {
-            route.completes_part == marked.completes_part
-                && route.final_key == marked.final_key
-                && (complete || route.keeps_keys != marked.widened)
-        })
-    }
-
-    /// Fail the run where a push of `from` reaches `reader`'s entry along no route its planner
-    /// walked ([`planned_route`](Self::planned_route)).
-    fn ensure_planned(&self, from: usize, reader: usize, marked: &PathMarks, complete: bool) {
-        self.ensure(self.planned_route(from, reader, marked, complete), || {
-            format!(
-                "a {} of pipeline {from} reaches pipeline {reader} along a path its planner's \
-                     route walk did not take (widened: {}, completes part: {}, final key: {:?}): \
-                     a consumer on the way passes it on otherwise than the walk",
-                if complete { "complete region" } else { "push" },
-                marked.widened,
-                marked.completes_part,
-                marked.final_key
-            )
-        });
-    }
-
-    /// Record that the pushes of `read`, a pipeline `reader` reads, reach `region` of its input
-    /// along routes that keep their keys, and no more of it: a row outside `region` does not depend
-    /// on `read`, so it waits for nothing of it ([`wait_for_inputs`](Self::wait_for_inputs)). A read with no such record
-    /// reaches all of the input, as one along a route that widens, or one read by pull, does.
-    ///
-    /// # Panics
-    ///
-    /// When `reader` does not read `read`.
-    pub fn reaches(&mut self, reader: PipelineId, read: PipelineId, region: TileGuard) {
-        let info = &mut self.infos[reader.0];
-        let at = info
-            .reads
-            .iter()
-            .position(|&r| r == read.0)
-            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
-        if info.reach.len() < info.reads.len() {
-            info.reach.resize(info.reads.len(), None);
-        }
-        info.reach[at] = Some(region);
-    }
-
-    /// Whether every pipeline `reader` reads has completed what of `guard`, a region of its input,
-    /// it reaches ([`reaches`](Self::reaches)).
-    fn reads_complete(&self, reader: usize, guard: &TileGuard) -> bool {
-        guard_minus(guard, &self.complete_part(reader, guard)).is_empty()
-    }
-
-    /// The part of `guard`, a region of `reader`'s input, that every pipeline `reader` reads has
-    /// complete: per read, the rows it reaches that it has completed, and the rows it does not reach
-    /// ([`reaches`](Self::reaches)).
-    fn complete_part(&self, reader: usize, guard: &TileGuard) -> TileGuard {
-        let complete = self.states[reader]
-            .complete
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let info = &self.infos[reader];
-        (0..info.reads.len()).fold(guard.clone(), |part, at| {
-            let reach = info.reach.get(at).cloned().flatten();
-            match (complete.get(at).unwrap_or(&Completion::Nothing), reach) {
-                (Completion::Whole, _) => part,
-                (Completion::Region(region), Some(reach)) => {
-                    part.intersect(region).union(&guard_minus(&part, &reach))
-                }
-                (Completion::Region(region), None) => part.intersect(region),
-                (Completion::Nothing, Some(reach)) => guard_minus(&part, &reach),
-                (Completion::Nothing, None) => guard_minus(&part, &part),
-            }
-        })
-    }
-
-    /// The part of `guard`, rows of `reader`'s input, that every pipeline `reader` reads has
-    /// completed, and the rest. Where nothing is left once the rest is closed over the input, the
-    /// part is `guard` as it was admitted: a row a round queues names the row with its end, and the
-    /// same cells spelled key by key name no end, so its reader would never read the row whole.
-    fn ready_part(&self, reader: usize, guard: TileGuard) -> (TileGuard, TileGuard) {
-        let part = self.complete_part(reader, &guard);
-        let rest = self.closed(reader, guard_minus(&guard, &part));
-        match rest.is_empty() {
-            true => (guard, rest),
-            false => (part, rest),
-        }
-    }
-
-    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which waits for
-    /// inputs, where every pipeline it reads has completed them, and wait for the rest
-    /// ([`wait_for_inputs`](Self::wait_for_inputs)). Only what no push or queue brought before is
-    /// new. What the caller queues `again` is read again: a loop's closing round has each inner
-    /// pipeline read its row again, which then states the row complete, so its guard leaves the
-    /// record of what was queued before it is admitted.
-    fn queue_or_wait_for_inputs(&self, reader: usize, guard: &TileGuard, again: bool) {
-        let mut queue_state = self.states[reader]
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if again && let Some(queued) = &queue_state.region {
-            let forgotten = guard_minus(queued, guard);
-            queue_state.region = (!forgotten.is_empty()).then_some(forgotten);
-        }
-        let mut fresh = match &queue_state.region {
-            Some(queued) => guard_minus(guard, queued),
-            None => guard.clone(),
-        };
-        if let Some(waiting) = &queue_state.waiting_for_inputs {
-            fresh = guard_minus(&fresh, waiting);
-        }
-        if fresh.is_empty() {
-            return;
-        }
-        let (complete, rest) = self.ready_part(reader, fresh);
-        if !rest.is_empty() {
-            queue_state.waiting_for_inputs =
-                Some(grown(queue_state.waiting_for_inputs.as_ref(), &rest));
-        }
-        if complete.is_empty() {
-            return;
-        }
-        let queue = &self.states[reader].queue;
-        let appended = queue.append_unqueued_locked(&mut queue_state, &complete);
-        self.ensure(appended, || {
-            format!(
-                "pipeline {reader} receives packages before the last pipeline it reads finishes"
-            )
-        });
-    }
-
-    /// Append the waiting rows whose inputs are now complete to the reader’s queue
-    /// ([`wait_for_inputs`](Self::wait_for_inputs)). A complete push lands before the pushing
-    /// pipeline counts its finish toward `reader`'s close, so `reader`'s queue is open.
-    fn queue_ready_inputs(&self, reader: usize) {
-        let mut queue_state = self.states[reader]
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let Some(waiting) = queue_state.waiting_for_inputs.take() else {
-            return;
-        };
-        let (part, rest) = self.ready_part(reader, waiting);
-        queue_state.waiting_for_inputs = (!rest.is_empty()).then_some(rest);
-        if part.is_empty() {
-            return;
-        }
-        let queue = &self.states[reader].queue;
-        // A pipeline that takes arrivals is queued its sources' regions one morsel per package, as
-        // a notify cuts them; any other is queued the rows less what is queued already.
-        let appended = match self.infos[reader].arrivals {
-            true => {
-                let morsels = cut_positions(&part, self.morsel_rows);
-                queue.append_locked(&mut queue_state, reader, &morsels)
-            }
-            false => queue.append_unqueued_locked(&mut queue_state, &part),
-        };
-        self.ensure(appended, || {
-            format!(
-                "pipeline {reader} has not finished when a complete push covers its waiting inputs"
-            )
-        });
-        // A sleeping worker learns of the rows released; a push that releases none changes no
-        // queue, so the fixpoints of a live pass and a loop's round, which wait for the generation
-        // to stand still, end.
-        self.advance();
     }
 
     fn mark_arrivals(&mut self, pipeline: PipelineId) {
@@ -1200,47 +725,6 @@ impl Dispatcher {
         self.ensure(closed, || {
             format!("pipeline {reader} receives packages once")
         });
-    }
-
-    /// Grow what `source` has completed of `reader`'s input by `guard`, or record it whole where
-    /// `guard` is `None`. `source` is a pipeline `reader` reads, whose record every pipeline it
-    /// reads that shares `source`'s breaker shares, since a store's pipelines push one store's
-    /// complete region ([`share_pushes`](Self::share_pushes)); or `reader` itself, for the ranges
-    /// in its own chain.
-    fn record_complete(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
-        let reads = &self.infos[reader].reads;
-        if self.passes_around_recurrence(reader, source, guard) {
-            return;
-        }
-        self.ensure(source == reader || reads.contains(&source), || {
-            format!(
-                "pipeline {source} pushes a complete region to pipeline {reader}, which reads it"
-            )
-        });
-        let mut complete = self.states[reader]
-            .complete
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if complete.len() <= reads.len() {
-            complete.resize(reads.len() + 1, Completion::Nothing);
-        }
-        let slots: Vec<usize> = match source == reader {
-            true => vec![reads.len()],
-            false => (0..reads.len())
-                .filter(|&at| self.infos[reads[at]].pushes_with == self.infos[source].pushes_with)
-                .collect(),
-        };
-        for at in slots {
-            let before = std::mem::take(&mut complete[at]);
-            complete[at] = match guard {
-                Some(guard) => before.grown(guard),
-                None => Completion::Whole,
-            };
-        }
-        drop(complete);
-        if self.infos[reader].waits_for_inputs {
-            self.queue_ready_inputs(reader);
-        }
     }
 
     /// Whether a claim may take `pipeline`'s packages: once every pipeline it follows
@@ -1339,16 +823,6 @@ impl Dispatcher {
         released
     }
 
-    /// `guard`, a region of `reader`'s input, closed over that input where a planner recorded it
-    /// ([`consumes_input`](Self::consumes_input)): a difference of keys can name keys the input
-    /// has none of, as those under a tag a union does not have, which no input completes.
-    fn closed(&self, reader: usize, guard: TileGuard) -> TileGuard {
-        match &self.infos[reader].input {
-            Some(input) => guard.closed_over(input),
-            None => guard,
-        }
-    }
-
     /// Record that `pipeline` consumes a breaker input of `input`'s tiling.
     pub(crate) fn consumes_input(&mut self, pipeline: PipelineId, input: Tiling) {
         self.infos[pipeline.0].input = Some(input);
@@ -1362,43 +836,6 @@ impl Dispatcher {
         match &self.infos[reader].input {
             Some(input) => rows_named_in(input, guard, complete),
             None => Some(guard.clone()),
-        }
-    }
-
-    pub(crate) fn require_final_keys(
-        &mut self,
-        reader: PipelineId,
-        source: PipelineId,
-        keys: Vec<Value>,
-    ) {
-        let info = &mut self.infos[reader.0];
-        let at = info
-            .reads
-            .iter()
-            .position(|read| *read == source.0)
-            .expect("a completion belongs to a read pipeline");
-        info.required_keys.resize_with(info.reads.len(), Vec::new);
-        info.required_keys[at] = keys;
-    }
-
-    fn land_completed_keys(&self, source: usize, keys: &[Value]) {
-        if keys.is_empty() {
-            return;
-        }
-        for &reader in &self.infos[source].readers {
-            let info = &self.infos[reader];
-            let required: Vec<&Value> = info
-                .reads
-                .iter()
-                .enumerate()
-                .filter(|(_, read)| {
-                    self.infos[**read].pushes_with == self.infos[source].pushes_with
-                })
-                .flat_map(|(at, _)| info.required_keys.get(at).into_iter().flatten())
-                .collect();
-            if !required.is_empty() && required.iter().all(|key| keys.contains(key)) {
-                self.record_complete(reader, source, None);
-            }
         }
     }
 
@@ -1460,8 +897,6 @@ impl Dispatcher {
             dispatcher: self,
             pipeline: pipeline.0,
             morsels: Vec::new(),
-            complete: None,
-            completed_keys: Vec::new(),
             unspelled: false,
         }
     }
@@ -1595,12 +1030,6 @@ impl Dispatcher {
         }
         self.ensure_source(pipeline);
         let info = &self.infos[pipeline.0];
-        debug_assert!(
-            info.waits_for_inputs || info.reads.iter().all(|read| info.follows.contains(read)),
-            "pipeline {} does not wait for input completion, so it takes one only once every pipeline it reads is \
-             quiescent, which it follows",
-            pipeline.0
-        );
         // A limit is a source's alone (`limit`), whose every package its notifies queue.
         if info.limit != usize::MAX && self.state(pipeline).outstanding() >= info.limit {
             return false;
@@ -1640,25 +1069,10 @@ impl Dispatcher {
         });
         #[cfg(test)]
         self.run_transition_hook(false);
-        let ready;
-        let morsels = if self.infos[p].waits_for_inputs {
-            let (complete, incomplete): (Vec<TileGuard>, Vec<TileGuard>) = morsels
-                .iter()
-                .cloned()
-                .partition(|morsel| self.reads_complete(p, morsel));
-            for guard in incomplete {
-                admission.waiting_for_inputs =
-                    Some(grown(admission.waiting_for_inputs.as_ref(), &guard));
-            }
-            ready = complete;
-            &ready[..]
-        } else {
-            morsels
-        };
         if morsels.is_empty() {
             return;
         }
-        let appended = queue.append_locked(&mut admission, p, morsels);
+        let appended = queue.append_locked(&mut admission, morsels);
         self.ensure(appended, || {
             format!("pipeline {p} is queued nothing once it is closed")
         });
@@ -1700,9 +1114,6 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one. An ordered pipeline has at most one package in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
-        if self.states[pipeline].held.load(Ordering::SeqCst) {
-            return None;
-        }
         self.claim_in(pipeline)
     }
 
@@ -1726,8 +1137,7 @@ impl Dispatcher {
         let reserved = state.queue.reserved.load(Ordering::Acquire);
         #[cfg(test)]
         self.run_transition_hook(true);
-        !state.held.load(Ordering::SeqCst)
-            && state.phase.load() == Phase::Running
+        state.phase.load() == Phase::Running
             && reserved & CLOSED != 0
             && state.acknowledged.load(Ordering::Acquire) == reserved & !CLOSED
     }
@@ -1786,7 +1196,6 @@ impl Dispatcher {
             if begun {
                 return Next::Finish {
                     pipeline: PipelineId(p),
-                    consumed: self.states[p].queue.region(),
                 };
             }
         }
@@ -1836,10 +1245,7 @@ impl Dispatcher {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 // With nothing in flight, an ordered pipeline claims as any other does.
-                !queue.in_flight.is_empty()
-                    || (!queue.ready.is_empty()
-                        && !self.states[p].held.load(Ordering::SeqCst)
-                        && self.takes_from(p))
+                !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
             })
     }
 
@@ -1932,19 +1338,18 @@ impl Dispatcher {
         }
     }
 
-    /// Move `pipeline` to finishing, outside a claim, and answer what it consumed.
+    /// Move `pipeline` to finishing, outside a claim.
     ///
     /// # Panics
     ///
     /// When the pipeline has begun to finish already, a package queued for it has not been
     /// acknowledged, a pipeline it reads has not finished, its queue is not closed, or it is held.
-    pub fn begin_finish(&self, pipeline: PipelineId) -> Option<TileGuard> {
+    pub fn begin_finish(&self, pipeline: PipelineId) {
         let p = pipeline.0;
         self.state(pipeline);
         self.ensure(self.try_begin_finish(p), || {
             format!("pipeline {p} finishes once, after its queue is closed and consumed and its hold is released")
         });
-        self.states[p].queue.region()
     }
 
     /// Land what `pushes` holds now, while the pipeline runs: each morsel climbs the breaker's
@@ -1964,13 +1369,9 @@ impl Dispatcher {
         );
         let p = pushes.pipeline;
         let morsels = std::mem::take(&mut pushes.morsels);
-        let complete = pushes.complete.take();
-        let completed_keys = std::mem::take(&mut pushes.completed_keys);
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
-        self.land_complete(p, complete.as_ref(), pushes.to.as_ref());
-        self.land_completed_keys(p, &completed_keys);
         if morsels.is_empty() {
             return;
         }
@@ -1979,102 +1380,6 @@ impl Dispatcher {
         });
         self.land_in(p, &morsels, pushes.to.as_ref());
         self.advance();
-    }
-
-    /// Push `complete`, the region of its keys `pipeline`'s breaker has completed, through `to`, its
-    /// breaker's consumer, which restates it as each operator on the way completes
-    /// ([`Landing::is_complete`]), and record what reaches each reader's entry
-    /// ([`complete_of`](Self::complete_of)).
-    ///
-    /// Where `complete` is every key, each reader the push reached no entry of reads `pipeline` by
-    /// pull, as a loop's rounds pull a sum its body reads from outside the loop's cycle, which
-    /// reads all of it: it records `pipeline` whole.
-    /// `pipeline` is the pushing pipeline, or, for a range in its own chain, the pipeline itself.
-    fn land_complete(
-        &self,
-        pipeline: usize,
-        complete: Option<&Projection>,
-        to: Option<&SharedConsumer>,
-    ) {
-        self.land_complete_from(pipeline, complete, to, true);
-    }
-
-    /// Push `complete`, the region of its keys a range in `pipeline`'s chain has completed, through
-    /// `to`, the range's consumer, and record what reaches each pipeline's entry as complete by the
-    /// ranges in that pipeline's own chain ([`complete_of`](Self::complete_of)): a range can reach
-    /// the entry of a pipeline beside its own, as the rows of a store per row reach the reader of
-    /// the store.
-    pub(crate) fn land_range_complete(
-        &self,
-        pipeline: PipelineId,
-        complete: &Projection,
-        to: &SharedConsumer,
-    ) {
-        let _publisher = self.publisher();
-        self.land_complete_from(pipeline.0, Some(complete), Some(to), false);
-    }
-
-    /// [`land_complete`](Self::land_complete), applying its rule for readers a push reaches no
-    /// entry of only where `pulled` says the push is a breaker's, which its readers read.
-    fn land_complete_from(
-        &self,
-        pipeline: usize,
-        complete: Option<&Projection>,
-        to: Option<&SharedConsumer>,
-        pulled: bool,
-    ) {
-        let (Some(complete), Some(to)) = (complete, to) else {
-            return;
-        };
-        if *complete == Projection::Nothing {
-            return;
-        }
-        let whole = *complete == Projection::Everything;
-        let mut landing = Landing::new(
-            Target::Completion {
-                dispatcher: self,
-                whole,
-                reached: Vec::new(),
-                range: !pulled,
-            },
-            pipeline,
-        );
-        crate::interpreter::notifications::notify_shared(to, complete, &mut landing);
-        let Target::Completion { reached, .. } = landing.target else {
-            unreachable!("a complete landing stays one");
-        };
-        if whole && pulled {
-            for &reader in &self.infos[pipeline].readers {
-                if !reached.contains(&reader) {
-                    self.record_complete(reader, pipeline, None);
-                }
-            }
-        }
-    }
-
-    /// What `source` has completed of `reader`'s breaker's input: a pipeline `reader` reads, or
-    /// `reader` itself for the ranges in its own chain, as the end-of-run check reads it.
-    ///
-    /// # Panics
-    ///
-    /// When `source` is neither `reader` nor a pipeline it reads.
-    #[cfg(debug_assertions)]
-    pub(crate) fn complete_of(&self, reader: PipelineId, source: PipelineId) -> Completion {
-        let reads = &self.infos[reader.0].reads;
-        let at = match source.0 == reader.0 {
-            true => reads.len(),
-            false => reads
-                .iter()
-                .position(|&r| r == source.0)
-                .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, source.0)),
-        };
-        self.states[reader.0]
-            .complete
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(at)
-            .cloned()
-            .unwrap_or_default()
     }
 
     /// Push `morsels`, pushed by `pipeline`, through `to`, its breaker's consumer, one region of
@@ -2127,8 +1432,6 @@ impl Dispatcher {
         );
         let p = pushes.pipeline;
         let morsels = std::mem::take(&mut pushes.morsels);
-        let complete = pushes.complete.take();
-        let completed_keys = std::mem::take(&mut pushes.completed_keys);
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
@@ -2141,33 +1444,6 @@ impl Dispatcher {
         // Recorded before the reader's queue is closed, which lets the reader finish.
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
-        self.land_complete(p, complete.as_ref(), pushes.to.as_ref());
-        self.land_completed_keys(p, &completed_keys);
-        // At its finish every pipeline it reads has completed all of what it reaches (the
-        // planner's end-of-run check), so nothing stays waiting for inputs.
-        {
-            let queue_state = self.states[p]
-                .queue
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.ensure(queue_state.waiting_for_inputs.is_none(), || {
-                format!(
-                    "pipeline {p} finishes with rows waiting for inputs that the pipelines it reads never \
-                     complete: {:?}",
-                    queue_state.waiting_for_inputs
-                )
-            });
-        }
-        // The store's own pipelines wait for its seed input's consume; a reader of the store
-        // reads that pipeline too, but waits for what the store completes.
-        if self.infos[p].opens {
-            for &reader in &self.infos[p].readers {
-                if self.infos[reader].pushes_with == self.infos[p].pushes_with {
-                    self.record_complete(reader, p, None);
-                }
-            }
-        }
         self.land_in(p, &morsels, pushes.to.as_ref());
         for &reader in &self.infos[p].readers {
             self.count_toward_close(reader);
@@ -2199,7 +1475,6 @@ impl Dispatcher {
     }
 
     /// How many of `pipeline`'s packages are queued and not acknowledged.
-    #[cfg(test)]
     pub(crate) fn outstanding(&self, pipeline: PipelineId) -> usize {
         self.state(pipeline).outstanding()
     }
@@ -2283,14 +1558,6 @@ impl Dispatcher {
 /// `guard`, `None` where it is empty.
 fn nonempty(guard: TileGuard) -> Option<TileGuard> {
     (!guard.is_empty()).then_some(guard)
-}
-
-/// `region` with `guard` added, or `guard` alone where there is no region yet.
-fn grown(region: Option<&TileGuard>, guard: &TileGuard) -> TileGuard {
-    match region {
-        Some(before) => before.union(guard),
-        None => guard.clone(),
-    }
 }
 
 /// The rows of `rows`, a guard of `input`, that `released` does not name, closed over `input`
@@ -2379,12 +1646,6 @@ pub struct Pushes<'d> {
     dispatcher: &'d Dispatcher,
     pipeline: usize,
     morsels: Vec<TileGuard>,
-    /// The region of its keys the breaker has completed, as a projection, which climbs the
-    /// consumer chain beside the morsels ([`Landing::is_complete`]); `None` where it pushed none.
-    complete: Option<Projection>,
-    /// The store keys whose writers the breaker has completed, pushed beside the morsels
-    /// ([`BreakingProducer::completed_keys`]).
-    completed_keys: Vec<Value>,
     /// The consumer the morsels climb, the pushing breaker's.
     to: Option<SharedConsumer>,
     /// Whether the breaker completed a region no projection spells, which no push names yet
@@ -2408,7 +1669,6 @@ impl Pushes<'_> {
         if self.dispatcher.infos[self.pipeline].readers.is_empty() {
             return;
         }
-        self.completed_keys = breaker.completed_keys().to_vec();
         let to = breaker.base().downstream.clone();
         self.dispatcher.ensure(to.is_some(), || {
             format!(
@@ -2418,19 +1678,10 @@ impl Pushes<'_> {
             )
         });
         self.to = to;
-        // The complete region is the breaker's statement of it, released or not: a released key
-        // stays complete. A region no projection spells is pushed as nothing complete, which
-        // delays a reader and never misleads it.
-        self.complete = complete_projection(
-            breaker.complete().closed_over(breaker.tiling()),
-            breaker.tiling(),
-        );
         // A push names a projection of the breaker's keys, so it pushes the part of the final
         // guard a projection spells. The rest, such as a record whose collection field is
         // complete through some rows, is pushed once a projection spells what it has grown to, at
-        // the latest once it is whole, which a finish checks. A reader that reads its input again
-        // learns of it before then through the change a read of a widened input pushes
-        // ([`Dispatcher::land_change`]).
+        // the latest once it is whole, which a finish checks.
         let complete = breaker.final_guard();
         let spelled = spelled_part(&complete).unwrap_or_else(|| breaker.tiling().empty_guard());
         self.unspelled = Projection::of(&complete).is_err() && !complete.is_empty();
@@ -2503,9 +1754,7 @@ impl Drop for Pushes<'_> {
     /// completion and no morsel.
     fn drop(&mut self) {
         if !thread::panicking() {
-            let landed = self.morsels.is_empty()
-                && self.complete.is_none()
-                && self.completed_keys.is_empty();
+            let landed = self.morsels.is_empty();
             self.dispatcher.ensure(landed, || {
                 format!(
                     "pipeline {} lands its pushes through Dispatcher::land or \
@@ -2522,13 +1771,6 @@ impl Drop for Pushes<'_> {
 pub struct Landing<'d> {
     target: Target<'d>,
     from: usize,
-    widened: bool,
-    /// Whether an operator on the path passes on a complete region that names only part of what a
-    /// row it reaches depends on ([`completing_part`](Self::completing_part)).
-    completes_part: bool,
-    /// The key an operator on the path reads only once final
-    /// ([`requiring_final_key`](Self::requiring_final_key)).
-    final_key: Option<Value>,
 }
 
 /// What a [`Landing`] does with the regions that reach an [`Entry`].
@@ -2543,27 +1785,9 @@ enum Target<'d> {
     /// Records each, for a planner that probes which region of a reader's input a pipeline's push
     /// names; which edges keep keys the planner reads off a route walk ([`Landing::route`]).
     Probe(Vec<Arrival>),
-    /// Records each, as `Probe` does, for a push restated as a wholly complete region is: the
-    /// region of a reader's input a pipeline can ever decide ([`Dispatcher::reaches`]).
-    ProbeCompletion(Vec<Arrival>),
-    /// Records each entry the push reaches, with what the path declares of it, for a planner that
-    /// reads a pusher's routes ([`Landing::route`]). `complete` is `None` for a change, and for a
-    /// complete region whether its source is wholly complete.
-    Route {
-        routes: Vec<Route>,
-        complete: Option<bool>,
-    },
-    /// Grows, for each, what the pushing pipeline has completed of the reader's input
-    /// ([`Dispatcher::complete_of`]), and queues nothing. `whole` says the pushing pipeline is
-    /// wholly complete, and `reached` lists the readers whose entry the push reached.
-    Completion {
-        dispatcher: &'d Dispatcher,
-        whole: bool,
-        reached: Vec<usize>,
-        /// Whether a range pushes it, which counts as a range in the chain of each pipeline whose
-        /// entry it reaches.
-        range: bool,
-    },
+    /// Records each entry the push reaches, for a planner that reads a pusher's routes
+    /// ([`Landing::route`]).
+    Route { routes: Vec<Route> },
 }
 
 /// A region a probing push brought to an [`Entry`].
@@ -2577,38 +1801,28 @@ pub(crate) struct Arrival {
 impl Landing<'_> {
     fn accepts_entry(&self, pipeline: PipelineId) -> bool {
         match &self.target {
-            Target::Queue { dispatcher, .. } | Target::Completion { dispatcher, .. } => {
+            Target::Queue { dispatcher, .. } => {
                 pipeline.0 == self.from
                     || dispatcher.infos[pipeline.0]
                         .ingress
                         .as_ref()
                         .is_none_or(|from| from.contains(&self.from))
             }
-            Target::Probe(_) | Target::ProbeCompletion(_) | Target::Route { .. } => true,
+            Target::Probe(_) | Target::Route { .. } => true,
         }
     }
 
-    /// Whether this landing queues packages: a delivery that is no completion record
-    /// ([`Target::Completion`]).
+    /// Whether this landing queues packages.
     pub(crate) fn queues(&self) -> bool {
         matches!(self.target, Target::Queue { .. })
     }
 
     pub(crate) fn is_delivery(&self) -> bool {
-        matches!(
-            self.target,
-            Target::Queue { .. } | Target::Completion { .. }
-        )
+        matches!(self.target, Target::Queue { .. })
     }
 
     fn new(target: Target<'_>, from: usize) -> Landing<'_> {
-        Landing {
-            target,
-            from,
-            widened: false,
-            completes_part: false,
-            final_key: None,
-        }
+        Landing { target, from }
     }
 
     /// A landing that records where `from`'s push arrives, and queues nothing.
@@ -2637,43 +1851,19 @@ impl Landing<'_> {
         }
     }
 
-    /// A landing that records where `from`'s push of a wholly complete region arrives, and queues
-    /// nothing.
-    pub(crate) fn probe_complete(from: PipelineId) -> Landing<'static> {
-        Landing::new(Target::ProbeCompletion(Vec::new()), from.0)
-    }
-
     /// A landing that records the routes a push takes: each entry it reaches, whether the path
     /// keeps the pushed keys, and what the operators on the path declare of it. A planner walks a
     /// pusher's consumer with it ([`Consumer::notify`]), so the routes it plans are the paths a
     /// push takes, and [`queue`](Self::queue) checks every push against them.
     pub(crate) fn route() -> Landing<'static> {
-        Landing::new(
-            Target::Route {
-                routes: Vec::new(),
-                complete: None,
-            },
-            usize::MAX,
-        )
-    }
-
-    /// A routing landing for a complete region, which takes the paths a complete region does
-    /// ([`is_complete`](Self::is_complete)); `whole` says its source is wholly complete.
-    pub(crate) fn route_complete(whole: bool) -> Landing<'static> {
-        Landing::new(
-            Target::Route {
-                routes: Vec::new(),
-                complete: Some(whole),
-            },
-            usize::MAX,
-        )
+        Landing::new(Target::Route { routes: Vec::new() }, usize::MAX)
     }
 
     /// What a probing landing recorded.
     pub(crate) fn arrivals(self) -> Vec<Arrival> {
         match self.target {
-            Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => arrivals,
-            Target::Queue { .. } | Target::Completion { .. } | Target::Route { .. } => {
+            Target::Probe(arrivals) => arrivals,
+            Target::Queue { .. } | Target::Route { .. } => {
                 panic!("only a probing landing records arrivals")
             }
         }
@@ -2685,38 +1875,6 @@ impl Landing<'_> {
             Target::Route { routes, .. } => routes,
             _ => panic!("only a routing landing records routes"),
         }
-    }
-
-    /// Whether the region climbing is a complete region rather than a change: an operator restates
-    /// a complete region by keeping what it names where it keeps the keys, and where it widens them
-    /// by naming nothing until the region is every key, since each of its keys depends on every
-    /// key of its input.
-    pub fn is_complete(&self) -> bool {
-        matches!(
-            self.target,
-            Target::Completion { .. }
-                | Target::ProbeCompletion(_)
-                | Target::Route {
-                    complete: Some(_),
-                    ..
-                }
-        )
-    }
-
-    /// Whether the region climbing is a complete region of a source that is wholly complete: an
-    /// operator that widens its input's keys passes it as every key, since what that source
-    /// contributes to each of the operator's keys is complete, and the reader intersects what its
-    /// other sources complete.
-    pub fn is_wholly_complete(&self) -> bool {
-        matches!(
-            self.target,
-            Target::Completion { whole: true, .. }
-                | Target::ProbeCompletion(_)
-                | Target::Route {
-                    complete: Some(true),
-                    ..
-                }
-        )
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
@@ -2738,18 +1896,13 @@ impl Landing<'_> {
     /// its planner's route walk did not take ([`Dispatcher::plan_routes`]); and where the
     /// guard algebra has no exact difference of `guard` and what is queued ([`guard_minus`]).
     pub fn queue(&mut self, reader: PipelineId, guard: &TileGuard) {
-        let marked = PathMarks {
-            widened: self.widened,
-            completes_part: self.completes_part,
-            final_key: self.final_key.clone(),
-        };
         let dispatcher = match &mut self.target {
             Target::Queue { own, .. } if reader.0 == self.from => {
                 own.push(guard.clone());
                 return;
             }
             Target::Queue { dispatcher, .. } => *dispatcher,
-            Target::Probe(arrivals) | Target::ProbeCompletion(arrivals) => {
+            Target::Probe(arrivals) => {
                 arrivals.push(Arrival {
                     pipeline: reader,
                     guard: guard.clone(),
@@ -2757,38 +1910,8 @@ impl Landing<'_> {
                 return;
             }
             Target::Route { routes, .. } => {
-                routes.push(Route {
-                    pipeline: reader,
-                    keeps_keys: !self.widened,
-                    completes_part: self.completes_part,
-                    final_key: self.final_key.clone(),
-                });
+                routes.push(Route { pipeline: reader });
                 return;
-            }
-            Target::Completion {
-                dispatcher,
-                whole,
-                reached,
-                range,
-            } => {
-                reached.push(reader.0);
-                let source = match range {
-                    true => reader.0,
-                    false => self.from,
-                };
-                // A region that names the entry's input whole is the source wholly complete,
-                // whatever the entry's tiling: a store's seed entry is one value in front of a
-                // pipeline whose input is the loop's positions. A wholly complete source is, along
-                // whatever its push was restated to on the way, as an arm of a union restates it
-                // under its tag.
-                let Some(rows) = dispatcher.rows_named(reader.0, guard, true) else {
-                    return;
-                };
-                let guard = (!(*whole || rows.is_universal())).then_some(&rows);
-                if !*range && !dispatcher.passes_around_recurrence(reader.0, source, guard) {
-                    dispatcher.ensure_planned(source, reader.0, &marked, true);
-                }
-                return dispatcher.record_complete(reader.0, source, guard);
             }
         };
         let (from, r) = (self.from, reader.0);
@@ -2808,53 +1931,9 @@ impl Landing<'_> {
         dispatcher.ensure(queue.phase.load() == Phase::Running, || {
             format!("pipeline {r} receives packages before it finishes")
         });
-        // A reader that waits for inputs reads each row once, when every pipeline it reads has completed it:
-        // a push brings the rows it names, widened or not, less what a push brought before, and
-        // the complete pushes release them ([`Dispatcher::wait_for_inputs`]).
-        if info.waits_for_inputs {
-            if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
-                dispatcher.ensure_planned(from, r, &marked, false);
-                dispatcher.queue_or_wait_for_inputs(r, guard, false);
-            }
-            return;
-        }
-        dispatcher.ensure(!self.widened, || {
-            format!(
-                "a push of pipeline {from} is widened to `Everything` on its way to pipeline {r}, \
-                 which neither waits for inputs nor reads its input whole"
-            )
-        });
-        dispatcher.ensure_planned(from, r, &marked, false);
-        dispatcher.ensure(queue.queue.append_unqueued(guard), || {
+        dispatcher.ensure(queue.queue.append(std::slice::from_ref(guard)), || {
             format!("pipeline {r} receives packages before the last pipeline it reads finishes")
         });
-    }
-
-    /// Push on through `push` as widened: an operator on this path turned the push's region
-    /// into `Everything`, so the reader it reaches cannot tell which of its keys it names. A
-    /// sibling path the push takes after `push` returns is not widened by this one.
-    pub fn widened(&mut self, push: impl FnOnce(&mut Self)) {
-        let was = std::mem::replace(&mut self.widened, true);
-        push(self);
-        self.widened = was;
-    }
-
-    /// Push on through `push` as a path whose complete region names only part of what a row it
-    /// reaches depends on: a widening passes a region that is not whole on as nothing complete,
-    /// and a lookup's operand names the rows that read a complete key, whatever their input holds.
-    /// The planner reads it off a route walk ([`Landing::route`]).
-    pub(crate) fn completing_part(&mut self, push: impl FnOnce(&mut Self)) {
-        let was = std::mem::replace(&mut self.completes_part, true);
-        push(self);
-        self.completes_part = was;
-    }
-
-    /// Push on through `push` as a path whose reader reads `key` only once it is final. The
-    /// planner reads it off a route walk ([`Landing::route`]).
-    pub(crate) fn requiring_final_key(&mut self, key: &Value, push: impl FnOnce(&mut Self)) {
-        let was = self.final_key.replace(key.clone());
-        push(self);
-        self.final_key = was;
     }
 
     /// Fail the run: the push re-entered a consumer it is passing through, so its chain is a
@@ -2865,10 +1944,8 @@ impl Landing<'_> {
             self.from
         );
         match &self.target {
-            Target::Queue { dispatcher, .. } | Target::Completion { dispatcher, .. } => {
-                dispatcher.ensure(false, || message)
-            }
-            Target::Probe(_) | Target::ProbeCompletion(_) | Target::Route { .. } => {
+            Target::Queue { dispatcher, .. } => dispatcher.ensure(false, || message),
+            Target::Probe(_) | Target::Route { .. } => {
                 panic!("{message}")
             }
         }
@@ -2879,13 +1956,6 @@ impl Landing<'_> {
 pub(crate) struct Route {
     /// The pipeline whose entry the path reaches.
     pub(crate) pipeline: PipelineId,
-    /// Whether every operator on the path keeps the pushing pipeline's keys, restated as its own
-    /// or under a tag, so that a push of some keys reaches the entry as those keys.
-    pub(crate) keeps_keys: bool,
-    /// Whether the complete region the path passes on names only part of what a row it reaches
-    /// depends on ([`Landing::completing_part`]).
-    pub(crate) completes_part: bool,
-    pub(crate) final_key: Option<Value>,
 }
 
 /// The consumer at the input of a pipeline's breaker: a push that reaches it is queued as a work
@@ -2902,14 +1972,30 @@ pub struct Entry {
     completes: CompletionTarget,
 }
 
-/// The pipeline an unplaced [`Entry`] records a complete push at, and that pipeline's input, which
-/// the entry's input keys name the same rows of: a loop's drive reads its source by pull, so the
-/// entry in front of the source queues nothing, but the positions the drive emits are the
-/// source's keys, so what the source completes of its keys the scope's input has completed of its
-/// positions. `None` where nothing records it, as in front of any other pulled input.
+/// The scope an unplaced [`Entry`] offers a push to, and the scope's input, which the entry's input
+/// keys name the same rows of: a scope's drive reads its source by pull, so the entry in front of
+/// the source queues nothing, but the positions or items the drive emits are the source's keys,
+/// so what the source pushes of its keys is what the scope's input can take. `None` where nothing
+/// is offered, as in front of any other pulled input.
 // shared-state-ok: the drive and the entry in front of its source both hold it, the planner
-// writes it before the run, and what crosses it is a pipeline's index and a tiling, never a tile.
-pub type CompletionTarget = Arc<RwLock<Option<(PipelineId, Tiling)>>>;
+// writes it before the run, and what crosses it is a scope's intake and a tiling, never a tile.
+pub type CompletionTarget = Arc<RwLock<Option<(Offers, Tiling)>>>;
+
+/// What a scope's input has offered it and the scope has not queued yet: a scope queues a request
+/// only where it can run ([`Body::queue_offered`](loop_scope::Body::queue_offered)), and holds
+/// the rest here.
+#[derive(Default)]
+pub struct Offered {
+    /// The region of the scope's input offered and not queued yet.
+    pub region: Option<TileGuard>,
+    /// Whether the scope's pipeline closes once everything offered is queued.
+    pub closing: bool,
+}
+
+/// A scope's [`Offered`], shared with the entry in front of its drive's source.
+// shared-state-ok: the scope and the entry in front of its drive's source both hold it; what
+// crosses it is a guard of the scope's input, never a tile.
+pub type Offers = Arc<Mutex<Offered>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
@@ -3006,28 +2092,27 @@ impl Consumer for Entry {
             }
             return;
         }
-        if self.pipeline.get().is_none() && landing.is_delivery() && !landing.is_complete() {
-            if let Some(inline) = &self.inline {
-                inline.notify(region, landing);
-            }
+        if self.pipeline.get().is_some() {
             return;
         }
-        if !landing.is_complete() {
-            return;
-        }
-        if let Some((pipeline, input)) = &*self
-            .completes
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+        // In front of a drive's source, a push offers its keys to the scope the drive runs in.
+        if landing.queues()
+            && let Some((offers, input)) = &*self
+                .completes
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
             && let Some(guard) = pushed_guard(region, input)
         {
-            // The drive's positions are its source's keys, so a region of the source's keys is
-            // one of the store's input.
-            debug_assert!(
-                guard.check_from(input),
-                "a drive's source completes positions of its store's input: {region:?}"
-            );
-            landing.queue(*pipeline, &guard);
+            let mut offered = offers.lock().unwrap_or_else(PoisonError::into_inner);
+            offered.region = Some(match offered.region.take() {
+                Some(before) => before.union(&guard),
+                None => guard,
+            });
+        }
+        if landing.is_delivery()
+            && let Some(inline) = &self.inline
+        {
+            inline.notify(region, landing);
         }
     }
 }
@@ -3060,7 +2145,8 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
         }
         Projection::Nothing => None,
         Projection::Everything => Some(input.universal_guard()),
-        Projection::Keys { .. } => Some(region.guard(input).closed_over(input)),
+        // A push of a row's remainder lands as itself: it states the row's end.
+        Projection::Keys { .. } => Some(closed_keeping_row_ends(region.guard(input), input)),
         // Each field is closed over its own tiling, as a push of that field alone would be.
         Projection::Fields { .. } => {
             let Tiling::Record(fields) = input else {
@@ -3078,54 +2164,6 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
             ))
         }
     }
-}
-
-/// `held`, a breaker's complete region of its output `tiling`, as a projection: every key where it
-/// names every position of the finite range of positions the output's outermost keys range over,
-/// each field of a record of values closed so and the record whole where every field is,
-/// as a store or an aggregate under a loop of positions `0..n` states the positions it completed,
-/// which `TileGuard::closed_over` leaves as they are. `None` where no projection spells it.
-fn complete_projection(held: TileGuard, tiling: &Tiling) -> Option<Projection> {
-    // A record of values is complete field by field, each field as its own tiling closes it, and
-    // whole where every field is.
-    if let (Tiling::Record(fields), TileGuard::Record(held)) = (tiling, &held) {
-        // A field no projection spells is pushed as nothing complete, which keeps the other fields'
-        // completeness.
-        let parts = fields
-            .iter()
-            .map(|(name, field)| {
-                let part = held
-                    .get(name)
-                    .and_then(|guard| complete_projection(guard.clone(), field))
-                    .unwrap_or(Projection::Nothing);
-                (name.clone(), part)
-            })
-            .collect();
-        return Some(Projection::fields(parts, Projection::Nothing).over_fields(fields.keys()));
-    }
-    if names_every_position(&held, tiling) {
-        return Some(Projection::Everything);
-    }
-    // Rows whose whole value is complete, at any level; a part of a value completes no row.
-    Projection::of(&held).ok().map(|held| match held {
-        Projection::Or(arms) => {
-            Projection::any_of(arms.into_iter().filter(|arm| !arm.names_part_of_values()))
-        }
-        Projection::Within { .. } => Projection::Nothing,
-        whole => whole,
-    })
-}
-
-/// Whether `held`, a guard of `tiling`, names every position of the finite range of positions
-/// `tiling`'s outermost keys range over: it names every key there is, though it is not universal.
-fn names_every_position(held: &TileGuard, tiling: &Tiling) -> bool {
-    matches!(
-        (tiling.domain_extent(), held),
-        (
-            Some(Extent::UIntRange(positions)),
-            TileGuard::Function(FunctionGuard::Domain(region @ Predicate::Intervals(_))),
-        ) if region.covers_positions(&positions)
-    )
 }
 
 /// `input`'s universal guard cut as [`seed_within`] cuts a region: every `rows` keys where the
@@ -3412,9 +2450,7 @@ fn drive(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
     loop {
         match dispatcher.try_claim(None) {
             Next::Package(package) => consume_with(dispatcher, reach, package),
-            Next::Finish { pipeline, consumed } => {
-                finish_with(dispatcher, reach, pipeline, consumed)
-            }
+            Next::Finish { pipeline } => finish_with(dispatcher, reach, pipeline),
             Next::Wait(_) => {
                 panic!("an acyclic graph with nothing queued has a pipeline that may finish")
             }
@@ -3523,45 +2559,19 @@ fn push_held(
 /// not released every guard the pipeline consumed. Also where the guard algebra has no exact
 /// difference of a consumed guard and the guard the input released ([`guard_minus`]).
 pub fn finish_pipeline(dispatcher: &Dispatcher, breakers: &[BreakerHandle], pipeline: PipelineId) {
-    let consumed = dispatcher.begin_finish(pipeline);
-    finish_with(dispatcher, &mut handles(breakers), pipeline, consumed);
+    dispatcher.begin_finish(pipeline);
+    finish_with(dispatcher, &mut handles(breakers), pipeline);
 }
 
-/// Finish `pipeline`, which has begun after consuming `consumed`: push what it completed and no
+/// Finish `pipeline`, which has begun: push what it completed and no
 /// consume pushed, through the breaker's [`finish`][Breaker::finish], then mark it finished.
 ///
 /// [Breaker::finish]: crate::interpreter::tile_operators::Breaker::finish
-fn finish_with(
-    dispatcher: &Dispatcher,
-    reach: &mut Reach<'_>,
-    pipeline: PipelineId,
-    consumed: Option<TileGuard>,
-) {
+fn finish_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, pipeline: PipelineId) {
     let p = pipeline.0;
-    let mut consumed = Some(consumed);
     // As in `consume_with`, the pushes land once the reach has returned.
     let mut finished = None;
     reach(pipeline, &mut |breaker, input| {
-        let consumed = consumed
-            .take()
-            .expect("a reach calls the breaker it reaches once");
-        let released = breaker.input_released(input);
-        let asked = consumed.clone();
-        dispatcher.ensure(
-            consumed.is_none_or(|consumed| {
-                unreleased(&consumed, &released, &breaker.input_tiling(input)).is_none()
-            }),
-            || {
-                format!(
-                    "pipeline {p} finishes after its input has released every guard the \
-                     pipeline consumed: {} released {released:?}, consumed {asked:?}",
-                    breaker
-                        .as_producer()
-                        .map(|producer| producer.name())
-                        .unwrap_or_else(|| "sink".to_owned())
-                )
-            },
-        );
         let mut pushes = dispatcher.pushes(pipeline);
         breaker.finish(input, &mut pushes);
         dispatcher.ensure(!pushes.unspelled, || {
@@ -3577,17 +2587,6 @@ fn finish_with(
 
 #[cfg(test)]
 mod tests {
-
-    /// Pushes that carry only completed store keys, and no morsel or completed region, land the
-    /// keys a reader waits on, so dropping them unlanded fails the run.
-    #[test]
-    #[should_panic(expected = "pipeline 0 lands its pushes through Dispatcher::land")]
-    fn pushes_dropped_with_only_completed_keys_are_refused() {
-        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
-        let mut pushes = dispatcher.pushes(PipelineId(0));
-        pushes.completed_keys.push(Value::Int(1));
-        drop(pushes);
-    }
 
     /// A chain of diamonds: each layer's two pipelines read the one below, and the pipeline
     /// above reads both. A path of reads to the bottom doubles at each layer, and a quiescence
@@ -3777,30 +2776,6 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    fn final_read_completion_depends_on_its_required_keys() {
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![0]], 1);
-        let a = Value::String("a".into());
-        let b = Value::String("b".into());
-        dispatcher.require_final_keys(PipelineId(1), PipelineId(0), vec![a.clone()]);
-        dispatcher.require_final_keys(PipelineId(2), PipelineId(0), vec![a.clone(), b.clone()]);
-        dispatcher.land_completed_keys(0, std::slice::from_ref(&a));
-        assert!(matches!(
-            dispatcher.complete_of(PipelineId(1), PipelineId(0)),
-            Completion::Whole
-        ));
-        assert!(matches!(
-            dispatcher.complete_of(PipelineId(2), PipelineId(0)),
-            Completion::Nothing
-        ));
-        dispatcher.land_completed_keys(0, &[a, b]);
-        assert!(matches!(
-            dispatcher.complete_of(PipelineId(2), PipelineId(0)),
-            Completion::Whole
-        ));
-    }
-
     use intervalsets::{Interval, IntervalSet};
 
     use super::*;
@@ -3834,150 +2809,6 @@ mod tests {
             closed_runs(&runs, uint_position, unbounded),
             expected.map(|run| vec![run])
         );
-    }
-
-    /// An append reserves its indices only once nothing left can panic: an append of a guard the
-    /// region has no union with panics and leaves the queue as it was.
-    #[test]
-    fn an_append_that_panics_reserves_nothing() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        let queue = Queue::new();
-        let mut state = QueueState::default();
-        assert!(queue.append_locked(&mut state, 0, &[keys_between(0, 1)]));
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            queue.append_locked(&mut state, 0, &[TileGuard::Scalar(Predicate::True)])
-        }));
-        assert!(
-            unwound.is_err(),
-            "a scalar guard has no union with a region of keys"
-        );
-        assert_eq!(queue.reserved(), 1);
-        assert_eq!(state.ready.len(), 1);
-        assert_eq!(state.region, Some(keys_between(0, 1)));
-    }
-
-    /// A repeated read of a row appends a package of its own, but an append of a guard the region
-    /// has no union with panics and leaves the queue as it was.
-    #[test]
-    fn a_repeated_read_that_panics_reserves_nothing() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        let queue = Queue::new();
-        assert!(queue.append_again(&keys_between(0, 1)));
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            queue.append_again(&TileGuard::Scalar(Predicate::True))
-        }));
-        assert!(
-            unwound.is_err(),
-            "a scalar guard has no union with a region of keys"
-        );
-        assert_eq!(queue.reserved(), 1);
-        let state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(state.ready.len(), 1);
-        assert_eq!(state.region, Some(keys_between(0, 1)));
-    }
-
-    /// A loop's rounds read one row again and again, and each round's package leaves no entry once
-    /// it is acknowledged; the region stays the row.
-    #[test]
-    fn rounds_of_a_row_leave_no_queue_history() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX).unrecorded();
-        let reader = PipelineId(1);
-        dispatcher.wait_for_inputs(reader);
-        let row = keys_between(0, 3);
-        dispatcher.record_complete(1, 0, Some(&row));
-        for _ in 0..1024 {
-            dispatcher.queue_round(reader, &row);
-            let package = dispatcher.claim_of(reader).expect("the round's package");
-            assert_eq!(retained_package_guards(&dispatcher.states[1].queue), 1);
-            dispatcher.acknowledge(package);
-            assert_eq!(retained_package_guards(&dispatcher.states[1].queue), 0);
-        }
-        let state = dispatcher.states[1]
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(state.region, Some(row));
-    }
-
-    fn retained_package_guards(queue: &Queue) -> usize {
-        let state = queue.state.lock().unwrap();
-        state.ready.len() + state.in_flight.len()
-    }
-
-    #[test]
-    fn concurrent_admission_and_completion_queue_each_region_once() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        use std::sync::Barrier;
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
-        let reader = PipelineId(1);
-        dispatcher.wait_for_inputs(reader);
-        let start = Barrier::new(9);
-        thread::scope(|scope| {
-            for worker in 0..8 {
-                let dispatcher = &dispatcher;
-                let start = &start;
-                scope.spawn(move || {
-                    start.wait();
-                    for key in 0..32 {
-                        let guard = keys_between(key, key);
-                        if worker % 2 == 0 {
-                            dispatcher.queue_for(reader, &guard);
-                            dispatcher.record_complete(1, 0, Some(&guard));
-                        } else {
-                            dispatcher.record_complete(1, 0, Some(&guard));
-                            dispatcher.queue_for(reader, &guard);
-                        }
-                    }
-                });
-            }
-            start.wait();
-        });
-        let mut regions = Vec::new();
-        while let Some(package) = dispatcher.claim_of(reader) {
-            regions.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(regions.len(), 32);
-        assert_eq!(partition_gap(&keys_between(0, 31), &regions), None);
-        assert!(
-            dispatcher.states[1]
-                .queue
-                .state
-                .lock()
-                .unwrap()
-                .waiting_for_inputs
-                .is_none()
-        );
-        // Acknowledgement does not erase admission history. A round still repeats the region.
-        dispatcher.queue_for(reader, &keys_between(0, 31));
-        assert!(dispatcher.claim_of(reader).is_none());
-        dispatcher.queue_round(reader, &keys_between(0, 31));
-        let repeated = dispatcher
-            .claim_of(reader)
-            .expect("an explicit repeated round");
-        assert_eq!(repeated.guard, keys_between(0, 31));
-        dispatcher.acknowledge(repeated);
-    }
-
-    #[rstest::rstest]
-    fn waiting_rows_form_one_region_released_once_complete(#[values(100, 1000, 10000)] count: u64) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
-        let reader = PipelineId(1);
-        dispatcher.wait_for_inputs(reader);
-        for key in 0..count {
-            dispatcher.queue_for(reader, &keys_between(key, key));
-        }
-        {
-            let state = dispatcher.states[1].queue.state.lock().unwrap();
-            assert_eq!(state.waiting_for_inputs, Some(keys_between(0, count - 1)));
-        }
-        dispatcher.record_complete(1, 0, None);
-        let state = dispatcher.states[1].queue.state.lock().unwrap();
-        assert!(state.waiting_for_inputs.is_none());
-        assert_eq!(state.ready.len(), 1);
     }
 
     #[test]
@@ -4031,38 +2862,6 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    fn acknowledged_packages_leave_no_queue_history(#[values(false, true)] ordered: bool) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let mut dispatcher = Dispatcher::new(vec![vec![]], 1).unrecorded();
-        let source = PipelineId(0);
-        dispatcher.limit(source, 1);
-        if ordered {
-            dispatcher.order(source);
-        }
-        for index in 0..4096 {
-            let guard = keys_between(index, index);
-            assert!(dispatcher.try_notify(source, &guard));
-            assert_eq!(retained_package_guards(&dispatcher.states[0].queue), 1);
-            let package = dispatcher.claim_of(source).expect("the delivered package");
-            assert_eq!(package.index, index as usize);
-            assert_eq!(package.guard, guard);
-            assert!(!dispatcher.try_notify(source, &keys_between(index + 1, index + 1)));
-            dispatcher.acknowledge(package);
-            assert_eq!(retained_package_guards(&dispatcher.states[0].queue), 0);
-            assert_eq!(dispatcher.outstanding(source), 0);
-        }
-        dispatcher.close(source);
-        let Next::Finish { pipeline, consumed } = dispatcher.try_claim(None) else {
-            panic!("the drained source finishes")
-        };
-        assert_eq!(pipeline, source);
-        assert_eq!(consumed, Some(keys_between(0, 4095)));
-        dispatcher.finish(dispatcher.pushes(pipeline));
-        assert!(matches!(dispatcher.try_claim(None), Next::Done));
-    }
-
     /// A package claimed and not acknowledged, and a finish claimed and not completed, are each in
     /// flight; nothing is once each completes.
     #[test]
@@ -4087,82 +2886,6 @@ mod tests {
     }
 
     #[test]
-    fn a_held_package_does_not_retain_later_acknowledged_packages() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let mut dispatcher = Dispatcher::new(vec![vec![]], 1).unrecorded();
-        let source = PipelineId(0);
-        dispatcher.limit(source, 2);
-        dispatcher.notify(source, &keys_between(0, 0));
-        let first = dispatcher.claim_of(source).expect("the held package");
-        for index in 1..1024 {
-            let guard = keys_between(index, index);
-            assert!(dispatcher.try_notify(source, &guard));
-            let package = dispatcher.claim_of(source).expect("a later package");
-            assert_eq!(package.index, index as usize);
-            assert_eq!(retained_package_guards(&dispatcher.states[0].queue), 2);
-            dispatcher.acknowledge(package);
-            assert_eq!(retained_package_guards(&dispatcher.states[0].queue), 1);
-            assert_eq!(dispatcher.outstanding(source), 1);
-        }
-        dispatcher.close(source);
-        assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-        dispatcher.acknowledge(first);
-        assert_eq!(retained_package_guards(&dispatcher.states[0].queue), 0);
-        let Next::Finish { consumed, .. } = dispatcher.try_claim(None) else {
-            panic!("the source finishes after the held acknowledgement")
-        };
-        assert_eq!(consumed, Some(keys_between(0, 1023)));
-        dispatcher.finish(dispatcher.pushes(source));
-        assert!(matches!(dispatcher.try_claim(None), Next::Done));
-    }
-
-    #[test]
-    fn repeated_rounds_reject_stale_or_mismatched_acknowledgements() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let queue = Queue::new();
-        let guard = keys_between(0, 0);
-        assert!(queue.append_again(&guard));
-        let first = queue.claim(0, false, || true).unwrap();
-        assert!(queue.acknowledge(&first, || {}));
-        assert!(queue.append_again(&guard));
-        let second = queue.claim(0, false, || true).unwrap();
-        assert!(second.index > first.index);
-        assert!(!queue.acknowledge(&first, || {}));
-        let mut wrong = second.clone();
-        wrong.guard = keys_between(1, 1);
-        assert!(!queue.acknowledge(&wrong, || {}));
-        assert_eq!(retained_package_guards(&queue), 1);
-        assert!(queue.acknowledge(&second, || {}));
-        assert!(!queue.acknowledge(&second, || {}));
-        assert_eq!(retained_package_guards(&queue), 0);
-        assert_eq!(queue.region(), Some(guard));
-    }
-
-    #[test]
-    fn acknowledgement_keeps_the_region_used_for_deduplication() {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let queue = Queue::new();
-        assert!(queue.append_unqueued(&keys_between(0, 2)));
-        let first = queue.claim(0, false, || true).unwrap();
-        assert!(queue.acknowledge(&first, || {}));
-        assert_eq!(retained_package_guards(&queue), 0);
-        assert!(queue.append_unqueued(&keys_between(1, 4)));
-        let second = queue.claim(0, false, || true).unwrap();
-        assert_eq!(second.guard, keys_between(3, 4));
-        assert!(queue.acknowledge(&second, || {}));
-        assert!(queue.append_unqueued(&keys_between(0, 4)));
-        assert!(queue.state.lock().unwrap().ready.is_empty());
-        assert_eq!(queue.reserved(), 2);
-        assert!(queue.close());
-        assert!(!queue.append_unqueued(&keys_between(0, 4)));
-        assert!(!queue.append_again(&keys_between(0, 0)));
-        assert_eq!(queue.region(), Some(keys_between(0, 4)));
-    }
-
-    #[test]
     fn an_empty_dispatcher_is_done_until_a_pipeline_is_added() {
         let mut dispatcher = Dispatcher::new(vec![], 1);
         assert!(matches!(dispatcher.try_claim(None), Next::Done));
@@ -4172,29 +2895,6 @@ mod tests {
         assert!(matches!(dispatcher.try_claim(None), Next::Finish { .. }));
         dispatcher.finish(dispatcher.pushes(source));
         assert!(matches!(dispatcher.try_claim(None), Next::Done));
-    }
-
-    #[rstest::rstest]
-    fn manual_finish_respects_the_serial_coordinators_hold(#[values(false, true)] released: bool) {
-        let dispatcher = Dispatcher::new(vec![vec![]], 1);
-        let source = PipelineId(0);
-        dispatcher.close(source);
-        dispatcher.hold_pipeline(source, true);
-        if released {
-            dispatcher.hold_pipeline(source, false);
-            assert!(dispatcher.begin_finish(source).is_none());
-            dispatcher.finish(dispatcher.pushes(source));
-            assert!(matches!(dispatcher.try_claim(None), Next::Done));
-        } else {
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    dispatcher.begin_finish(source);
-                }))
-                .is_err()
-            );
-            assert!(dispatcher.states[0].phase.load() == Phase::Running);
-            assert!(matches!(dispatcher.try_claim(None), Next::Failed));
-        }
     }
 
     #[rstest::rstest]
@@ -4244,188 +2944,6 @@ mod tests {
             dispatcher.finish(dispatcher.pushes(PipelineId(0)));
             assert!(matches!(dispatcher.try_claim(None), Next::Done));
         }
-    }
-
-    #[rstest::rstest]
-    fn an_admitted_arrival_precedes_concurrent_close(
-        #[values(false, true)] waits_for_inputs: bool,
-    ) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        use std::sync::{Arc, Barrier};
-
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1).unrecorded();
-        let reader = PipelineId(1);
-        dispatcher.take_arrivals(reader);
-        if waits_for_inputs {
-            dispatcher.wait_for_inputs(reader);
-        } else {
-            dispatcher.follow(reader, PipelineId(0));
-        }
-        let admitted = Arc::new(Barrier::new(2));
-        let resume = Arc::new(Barrier::new(2));
-        let (seen, go) = (admitted.clone(), resume.clone());
-        *dispatcher.transition_hooks[0]
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap() = Some(Box::new(move || {
-            seen.wait();
-            go.wait();
-        }));
-        let guard = keys_between(0, 0);
-        thread::scope(|scope| {
-            let notify = scope.spawn(|| dispatcher.notify(reader, &guard));
-            admitted.wait();
-            // Closure must acquire the same lock as an admission not yet published to the queue.
-            assert!(matches!(
-                dispatcher.states[1].queue.state.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            ));
-            let close = scope.spawn(|| dispatcher.close(reader));
-            resume.wait();
-            notify.join().unwrap();
-            close.join().unwrap();
-        });
-        assert_eq!(
-            dispatcher.states[1]
-                .queue
-                .state
-                .lock()
-                .unwrap()
-                .waiting_for_inputs
-                .is_some(),
-            waits_for_inputs
-        );
-        dispatcher.record_complete(1, 0, None);
-        let package = dispatcher
-            .claim_of(reader)
-            .expect("the admitted arrival survives closure");
-        assert_eq!(package.guard, guard);
-        dispatcher.acknowledge(package);
-        dispatcher.close(PipelineId(0));
-        dispatcher.begin_finish(PipelineId(0));
-        dispatcher.finish(dispatcher.pushes(PipelineId(0)));
-        dispatcher.begin_finish(reader);
-        dispatcher.finish(dispatcher.pushes(reader));
-        assert!(matches!(dispatcher.try_claim(None), Next::Done));
-    }
-
-    #[rstest::rstest]
-    fn a_closed_arrival_feed_rejects_both_queued_and_waiting_for_inputs_input(
-        #[values(false, true)] complete: bool,
-    ) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
-        let reader = PipelineId(1);
-        dispatcher.take_arrivals(reader);
-        dispatcher.wait_for_inputs(reader);
-        if complete {
-            dispatcher.record_complete(1, 0, None);
-        }
-        dispatcher.close(reader);
-        assert!(!dispatcher.states[1].queue.is_closed());
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                dispatcher.notify(reader, &keys_between(0, 0));
-            }))
-            .is_err()
-        );
-        assert_eq!(dispatcher.states[1].queue.reserved(), 0);
-        assert!(
-            dispatcher.states[1]
-                .queue
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .waiting_for_inputs
-                .is_none()
-        );
-        assert!(matches!(dispatcher.try_claim(None), Next::Failed));
-    }
-
-    #[rstest::rstest]
-    fn overlapping_rows_are_queued_once_as_their_read_decides(
-        #[values(false, true)] complete_first: bool,
-    ) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        let reader = PipelineId(1);
-        dispatcher.wait_for_inputs(reader);
-        let first = keys_between(0, 2);
-        let second = keys_between(1, 3);
-        let beginning = keys_between(0, 0);
-        let rest = keys_between(1, 3);
-        let mut claimed = Vec::new();
-        if complete_first {
-            dispatcher.record_complete(1, 0, Some(&beginning));
-        }
-        dispatcher.queue_for(reader, &first);
-        dispatcher.queue_for(reader, &second);
-        while let Some(package) = dispatcher.claim_of(reader) {
-            claimed.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(claimed.len(), usize::from(complete_first));
-        if complete_first {
-            assert_eq!(claimed[0], beginning);
-        }
-        dispatcher.record_complete(1, 0, Some(&beginning));
-        while let Some(package) = dispatcher.claim_of(reader) {
-            claimed.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(claimed, [beginning]);
-        let before = dispatcher.changes();
-        dispatcher.record_complete(1, 0, Some(&keys_between(0, 0)));
-        assert_eq!(dispatcher.changes(), before);
-        assert!(dispatcher.claim_of(reader).is_none());
-        dispatcher.record_complete(1, 0, Some(&rest));
-        while let Some(package) = dispatcher.claim_of(reader) {
-            claimed.push(package.guard.clone());
-            dispatcher.acknowledge(package);
-        }
-        assert_eq!(partition_gap(&keys_between(0, 3), &claimed), None);
-    }
-
-    /// A round's row is queued part by part as the pipelines its reader reads complete it, and a
-    /// later round reads the whole row again.
-    #[rstest::rstest]
-    fn repeated_rounds_queue_each_part_once_complete(#[values(false, true)] complete_first: bool) {
-        use crate::interpreter::tile_operators::test_helpers::keys_between;
-
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        let reader = PipelineId(1);
-        dispatcher.wait_for_inputs(reader);
-        let row = keys_between(0, 3);
-        dispatcher.record_complete(1, 0, Some(&keys_between(0, 1)));
-        if complete_first {
-            dispatcher.record_complete(1, 0, Some(&keys_between(2, 3)));
-            dispatcher.queue_round(reader, &row);
-            let package = dispatcher.claim_of(reader).expect("the row is complete");
-            assert_eq!(package.guard, row);
-            dispatcher.acknowledge(package);
-        } else {
-            dispatcher.queue_round(reader, &row);
-            for (from, to) in [(0, 1), (2, 2), (3, 3)] {
-                if from > 0 {
-                    assert!(dispatcher.claim_of(reader).is_none());
-                    dispatcher.record_complete(1, 0, Some(&keys_between(0, to)));
-                }
-                let package = dispatcher
-                    .claim_of(reader)
-                    .expect("the part its reads completed");
-                assert_eq!(package.guard, keys_between(from, to));
-                dispatcher.acknowledge(package);
-            }
-        }
-        assert!(dispatcher.claim_of(reader).is_none());
-        dispatcher.queue_round(reader, &row);
-        let package = dispatcher
-            .claim_of(reader)
-            .expect("a round reads the row again");
-        assert_eq!(package.guard, row);
-        dispatcher.acknowledge(package);
-        assert!(dispatcher.claim_of(reader).is_none());
     }
 
     /// A source over a million positions with all but its last two released is cut into the

@@ -1469,19 +1469,6 @@ impl CommitProducer {
 }
 
 impl BreakingProducer for CommitProducer {
-    fn completed_keys(&self) -> Vec<Value> {
-        let mut state_guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = &mut *state_guard;
-
-        match state.breaker.snapshot.as_ref() {
-            Some(Tile::Store { closed_keys, .. }) => closed_keys.clone(),
-            _ => Vec::new(),
-        }
-    }
-
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
     /// decided, and a reader of its final value takes it once the store is terminal.
@@ -2522,6 +2509,11 @@ impl CommitOperator {
 }
 
 impl TileOperator for CommitOperator {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -2919,6 +2911,16 @@ impl CommitProducer {
     /// Open the store on the pull its whole seed has arrived, and answer whether it is open.
     /// Until then it is undecided — no tick 0, so no frontier — and a writer reads nothing to
     /// build an attempt against, which is why nothing is attempted before it opens either.
+    /// Whether the store is open: every seed key's value is final, so an attempt can read it. It
+    /// opens the store where it can ([`open_store`](Self::open_store)).
+    pub(crate) fn is_open(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.open_store(&mut state)
+    }
+
     fn open_store(&self, state: &mut CommitState) -> bool {
         if state.engine.is_none() {
             let mut seed = state.seed.clone();
@@ -3430,6 +3432,11 @@ impl InductionStore {
 }
 
 impl TileOperator for InductionStore {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -3459,7 +3466,7 @@ impl TileOperator for InductionStore {
         // The body is the store's input as a pipeline breaker: the entry in front of it queues
         // what a pipeline beneath pushes for the store's pipeline once a planner places it, and
         // stops every push before then.
-        let (body_producer, placement) = subscribe_behind_entry(&body_op, cx);
+        let (body_producer, placement, body_target) = subscribe_deciding(&body_op, None, None, cx);
         // A seed stays subscribed rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -3486,6 +3493,7 @@ impl TileOperator for InductionStore {
             )
             .breaking(consumer.clone(), placement),
             seed_placements,
+            body_target,
             resumed_after: self.resumed_after.clone(),
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
@@ -3516,6 +3524,10 @@ pub struct InductionStoreProducer {
     /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
     /// to the pipeline of the loop's scope.
     seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
+    /// Where the entry in front of the body offers what the body pushes while positions wait for
+    /// inputs ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)): the scope
+    /// runs the body in rounds, so the entry queues nothing.
+    pub(crate) body_target: crate::interpreter::dispatcher::CompletionTarget,
     /// The last position a predecessor store reached, which this one's store is decided
     /// through from the moment it opens. Only an induction store with no rows above it resumes —
     /// a nested one's rows belong to the store around it — so this is `None` wherever the
@@ -4493,15 +4505,11 @@ impl TileOperator for StoreFinalRead {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // A final read requires completion of this key, even when other store keys remain live.
         let consumer = shared_consumer(consumer);
 
         let forward = forwarding_consumer_keeping_keys(&consumer);
         let forward: Box<dyn Consumer> = if self.levels_above == 0 {
-            Box::new(FinalKeyConsumer {
-                key: self.key.clone(),
-                downstream: crate::interpreter::widening(forward),
-            })
+            crate::interpreter::widening(forward)
         } else {
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(self.levels_above),
@@ -4526,21 +4534,6 @@ impl TileOperator for StoreFinalRead {
             value_extent: self.value_extent.clone(),
             levels_above: self.levels_above,
         })
-    }
-}
-
-struct FinalKeyConsumer {
-    key: Value,
-    downstream: Box<dyn Consumer>,
-}
-
-impl Consumer for FinalKeyConsumer {
-    fn notify(
-        &self,
-        region: &Projection,
-        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
-    ) {
-        landing.requiring_final_key(&self.key, |landing| self.downstream.notify(region, landing));
     }
 }
 
@@ -5948,6 +5941,11 @@ impl InductionDriver {
 }
 
 impl TileOperator for InductionDriver {
+    /// The drive's positions arrive one per round, whether or not its source reads a source.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -6911,6 +6909,11 @@ impl TransactDriver {
 }
 
 impl TileOperator for TransactDriver {
+    /// The drive's positions arrive one per round, whether or not its source reads a source.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -7904,6 +7907,11 @@ impl TransactWriter {
 }
 
 impl TileOperator for TransactWriter {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {

@@ -129,6 +129,19 @@ impl CommitProducer {
             .expect("a transaction run is planned")
             .writers[writer]
     }
+    /// Queue the requests offered to writer `writer` on its pipeline, and close the pipeline once
+    /// asked, where the store is open: an attempt reads the store, which exists once every seed
+    /// key's value is final ([`Body::queue_offered`]). Whether it queued or closed anything.
+    pub(super) fn queue_requests(&mut self, dispatcher: &Dispatcher, writer: usize) -> bool {
+        if !self.writer_run(writer).body.has_offers() {
+            return false;
+        }
+        let open = self.is_open();
+        self.writer_run_mut(writer)
+            .body
+            .queue_offered(dispatcher, open)
+    }
+
     pub(super) fn begin_request(
         &mut self,
         dispatcher: &Dispatcher,
@@ -195,7 +208,6 @@ impl CommitProducer {
         &mut self,
         dispatcher: &Dispatcher,
         writer: usize,
-        consumed: Option<TileGuard>,
     ) -> RoundWork {
         assert!(
             matches!(self.writer_run(writer).attempt, Attempt::Idle),
@@ -207,7 +219,7 @@ impl CommitProducer {
         self.begin_attempt();
         let run = self.writer_run_mut(writer);
         run.attempt = Attempt::Finishing;
-        run.body.begin_finish(consumed);
+        run.body.begin_finish();
         run.queue(dispatcher, &whole)
     }
 }

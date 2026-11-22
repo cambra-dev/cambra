@@ -99,72 +99,38 @@ pub fn widening(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
 /// Changes below it name their enclosing rows; completion passes only for whole values.
 pub(crate) fn through_values(
     level: CurryLevel,
-    output: &crate::interpreter::Tiling,
+    _output: &crate::interpreter::Tiling,
     downstream: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     if level == CurryLevel::OUTERMOST {
         return widening(downstream);
     }
-    Box::new(ThroughValues {
-        level,
-        output: output.clone(),
-        downstream,
-    })
+    Box::new(ThroughValues { level, downstream })
 }
 
 struct ThroughValues {
     level: CurryLevel,
-    output: crate::interpreter::Tiling,
     downstream: Box<dyn Consumer>,
 }
 
 impl Consumer for ThroughValues {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        let already_whole = *region == Projection::Everything;
-        let region = if landing.is_complete() {
-            // A complete part of some values completes no value this operator reshapes: only the
-            // arms naming whole keys pass.
-            let whole = Projection::any_of(
-                region_arms(region)
-                    .into_iter()
-                    .filter(|arm| !matches!(arm, Projection::Within { .. })),
-            );
-            let guard = crate::interpreter::tiling::through_shared_levels(
-                whole.collection_guard(),
-                self.level.index(),
-                &self.output,
-            );
-            Projection::of(&guard).expect("completed shared rows name output rows")
-        } else {
-            region.above(self.level)
-        };
-        if !landing.is_complete() && !already_whole && region == Projection::Everything {
-            landing.widened(|landing| self.downstream.notify(&region, landing));
-        } else {
-            self.downstream.notify(&region, landing);
-        }
+        self.downstream.notify(&region.above(self.level), landing);
     }
 }
 
 struct Widening(Box<dyn Consumer>);
 
 impl Consumer for Widening {
-    /// A change widens to every key. A complete region passes as every key where its source is
-    /// wholly complete, and not at all otherwise: each output key depends on every input key, so
-    /// the path completes only part of what a row depends on.
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| match region {
-            Projection::Everything => self.0.notify(region, landing),
-            _ if landing.is_wholly_complete() => self.0.notify(&Projection::Everything, landing),
-            _ if landing.is_complete() => {}
-            _ => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
-        });
+    /// A change widens to every key.
+    fn notify(&self, _region: &Projection, landing: &mut Landing<'_>) {
+        self.0.notify(&Projection::Everything, landing);
     }
 }
 
 /// [`restating`] for a lookup's collection operand: the rows a key of the operand names read that
 /// key and also their input's value, so the complete region it passes names only part of what
-/// those rows depend on ([`Landing::completing_part`]).
+/// those rows depend on.
 pub fn restating_lookup(
     restate: Box<dyn Fn(&Projection) -> Projection + Send + Sync>,
     consumer: Box<dyn Consumer>,
@@ -176,7 +142,7 @@ struct RestatingLookup(Restating);
 
 impl Consumer for RestatingLookup {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.0.notify(region, landing));
+        self.0.notify(region, landing);
     }
 }
 
@@ -303,22 +269,9 @@ impl OneLevelIn {
 
     /// [`notify`](Consumer::notify) inside the path's completes-part mark.
     fn pass_on(&self, region: &Projection, landing: &mut Landing<'_>) {
-        if landing.is_complete() {
-            match region {
-                Projection::Keys { level, .. } if *level >= self.at => {
-                    if landing.is_wholly_complete() {
-                        self.consumer.notify(&Projection::Everything, landing);
-                    }
-                }
-                standing => self.consumer.notify(standing, landing),
-            }
-            return;
-        }
         match self.restated(region) {
             Some(restated) => self.consumer.notify(&restated, landing),
-            None => {
-                landing.widened(|landing| self.consumer.notify(&Projection::Everything, landing))
-            }
+            None => self.consumer.notify(&Projection::Everything, landing),
         }
     }
 }
@@ -329,7 +282,7 @@ impl Consumer for OneLevelIn {
     /// otherwise: which output keys an input row stands beneath depends on its values, which no
     /// region carries, so the path completes only part of what a row depends on.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        landing.completing_part(|landing| self.pass_on(region, landing));
+        self.pass_on(region, landing);
     }
 }
 
@@ -396,83 +349,6 @@ mod tests {
         );
         let reached = landing.routes();
         assert_eq!(reached.len(), 1);
-        assert!(!reached[0].keeps_keys);
-        assert!(reached[0].completes_part);
-    }
-
-    /// A value replaced beneath the outermost level widens a change only where it names keys of
-    /// that level: a route walk of a path through it keeps the keys of a push of one outer key, and
-    /// widens a push of an inner key beneath every outer one, as a group's row is pushed.
-    #[test]
-    fn a_replaced_inner_value_widens_only_a_push_beneath_its_level() {
-        use crate::interpreter::dispatcher::PipelineId;
-        use crate::interpreter::{BaseType, Extent, Predicate, TileGuard, Tiling, Value};
-        struct Entry;
-        impl Consumer for Entry {
-            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
-                landing.queue(PipelineId(0), &TileGuard::Scalar(Predicate::True));
-            }
-        }
-        let uint = || Extent::Base(BaseType::UInt);
-        let output = Tiling::data_function(
-            uint(),
-            Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
-        );
-        let consumer = through_values(CurryLevel::new(1), &output, Box::new(Entry));
-        let keeps = |region: Projection| {
-            let mut landing = Landing::route();
-            consumer.notify(&region, &mut landing);
-            let routes = landing.routes();
-            assert_eq!(routes.len(), 1, "{region:?}");
-            routes[0].keeps_keys
-        };
-        assert!(keeps(Projection::of_path(&[Value::UInt(0)])));
-        assert!(!keeps(Projection::keys_at(
-            CurryLevel::new(1),
-            Predicate::point(Value::UInt(0))
-        )));
-    }
-
-    #[test]
-    fn replaced_values_pass_changes_but_only_whole_value_completion() {
-        use crate::interpreter::dispatcher::PipelineId;
-        use crate::interpreter::{BaseType, Extent, Predicate, Tiling, Value};
-        struct Received(Arc<RwLock<Vec<Projection>>>);
-        impl Consumer for Received {
-            fn notify(&self, region: &Projection, _: &mut Landing<'_>) {
-                self.0
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(region.clone());
-            }
-        }
-        let received = Arc::new(RwLock::new(Vec::new()));
-        let tiling = Tiling::data_function(
-            Extent::Base(BaseType::UInt),
-            Tiling::Scalar(Extent::Base(BaseType::Int)),
-        );
-        let consumer = through_values(
-            CurryLevel::new(1),
-            &tiling,
-            Box::new(Received(received.clone())),
-        );
-        let row = Predicate::point(Value::UInt(4));
-        let part = Projection::keys_at(
-            CurryLevel::new(1),
-            Predicate::qualified(row.clone(), Predicate::point(Value::UInt(7))),
-        );
-        consumer.notify(&part, &mut Landing::probe(PipelineId(0)));
-        consumer.notify(&part, &mut Landing::probe_complete(PipelineId(0)));
-        let whole = Projection::keys_at(
-            CurryLevel::new(1),
-            Predicate::qualified(row.clone(), Predicate::True),
-        );
-        consumer.notify(&whole, &mut Landing::probe_complete(PipelineId(0)));
-        let outer = Projection::admitting(row);
-        assert_eq!(
-            *received.read().unwrap_or_else(PoisonError::into_inner),
-            vec![outer.clone(), Projection::Nothing, outer]
-        );
     }
 
     #[test]
@@ -511,9 +387,9 @@ pub(crate) struct Delivered {
 /// [`Delivered`], shared by the consumers in front of one pairing operator's inputs.
 pub(crate) type SharedDelivered = Arc<std::sync::Mutex<Delivered>>;
 
-/// A [`Delivered`] with nothing delivered yet of a side whose keys arrive from a source, and
-/// everything of a side that reads none, which holds all its keys from the start
-/// ([`TileOperator::arrives_from_a_source`](crate::interpreter::tile_operators::TileOperator::arrives_from_a_source)).
+/// A [`Delivered`] with nothing delivered yet of a side whose keys arrive by a push, and
+/// everything of a side no push reaches, which holds all its keys from the start
+/// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
 pub(crate) fn nothing_delivered(rows_arrive: bool, partners_arrive: bool) -> SharedDelivered {
     let held = |arrive: bool| match arrive {
         true => crate::interpreter::Predicate::False,
@@ -570,6 +446,121 @@ struct Pairing {
     at: CurryLevel,
     delivered: SharedDelivered,
     consumer: Box<dyn Consumer>,
+}
+
+/// What each arm of a row-aligned operator has delivered of the keys its arms share, as paths of
+/// that level. A row of the output exists once every arm has delivered it, so a delivery on one
+/// arm announces the part of its region under the rows every other arm has delivered: Δ𝑅ᵢ ∩
+/// ⋂ⱼ≠ᵢ 𝑅ⱼ. The arm that delivers a row last announces it. An arm no push reaches holds every
+/// row from the start
+/// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
+/// Each arm's record grows only on a delivery ([`Landing::queues`]).
+pub(crate) struct AlignedDelivered {
+    arms: Vec<crate::interpreter::Predicate>,
+}
+
+/// [`AlignedDelivered`], shared by the consumers in front of one operator's arms.
+pub(crate) type SharedAligned = Arc<std::sync::Mutex<AlignedDelivered>>;
+
+/// An [`AlignedDelivered`] with nothing delivered of each arm whose keys arrive from a source, and
+/// every row of each arm that reads none, in arm order.
+pub(crate) fn nothing_aligned(arrive: impl IntoIterator<Item = bool>) -> SharedAligned {
+    let arms = arrive
+        .into_iter()
+        .map(|arrives| match arrives {
+            true => crate::interpreter::Predicate::False,
+            false => crate::interpreter::Predicate::True,
+        })
+        .collect();
+    Arc::new(std::sync::Mutex::new(AlignedDelivered { arms }))
+}
+
+/// `consumer` behind a consumer that passes on a delivery of arm `arm` only under the rows of
+/// level `at` that every other arm has delivered ([`AlignedDelivered`]).
+pub(crate) fn aligned(
+    arm: usize,
+    at: CurryLevel,
+    delivered: SharedAligned,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Aligned {
+        arm,
+        at,
+        delivered,
+        consumer,
+    })
+}
+
+struct Aligned {
+    arm: usize,
+    at: CurryLevel,
+    delivered: SharedAligned,
+    consumer: Box<dyn Consumer>,
+}
+
+/// The rows of level `at` that `region` reaches, as paths of that level: its keys at `at`, the
+/// paths beneath its keys above `at`, and the paths its keys beneath `at` run through. `None` where
+/// the region names fields of a record, which name no row.
+fn rows_reached(region: &Projection, at: CurryLevel) -> Option<crate::interpreter::Predicate> {
+    use crate::interpreter::Predicate;
+    match region {
+        Projection::Everything => Some(Predicate::True),
+        Projection::Nothing => Some(Predicate::False),
+        Projection::Fields { .. } => None,
+        Projection::Or(arms) => arms.iter().try_fold(Predicate::False, |rows, arm| {
+            Some(rows.union(&rows_reached(arm, at)?))
+        }),
+        Projection::Keys { level, keys } | Projection::Within { level, keys, .. } => {
+            match *level > at {
+                true => rows_reached(
+                    &Projection::keys_at(*level, keys.clone())
+                        .above(CurryLevel::new(at.index() + 1)),
+                    at,
+                ),
+                false => paths_at(&Projection::keys_at(*level, keys.clone()), at),
+            }
+        }
+    }
+}
+
+impl Consumer for Aligned {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        // A landing that queues nothing states what is decided rather than what arrived, so it is
+        // cut by nothing.
+        if !landing.queues() {
+            self.consumer.notify(region, landing);
+            return;
+        }
+        let Some(delta) = rows_reached(region, self.at) else {
+            self.consumer.notify(region, landing);
+            return;
+        };
+        // The other arms are read and the delta recorded under one lock, so of two deliveries on
+        // different threads the later one announces each row they complete.
+        let mut delivered = self
+            .delivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let others = delivered
+            .arms
+            .iter()
+            .enumerate()
+            .filter(|(arm, _)| *arm != self.arm)
+            .fold(crate::interpreter::Predicate::True, |rows, (_, arm)| {
+                rows.intersect(arm)
+            });
+        let own = &mut delivered.arms[self.arm];
+        *own = own.union(&delta);
+        drop(delivered);
+        let restated = match others.is_true() {
+            true => region.clone(),
+            false => region.intersect(&Projection::keys_at(self.at, others)),
+        };
+        if restated == Projection::Nothing {
+            return;
+        }
+        self.consumer.notify(&restated, landing);
+    }
 }
 
 /// `consumer` behind a consumer that forwards a region of a stream of records as the region of the
@@ -704,23 +695,7 @@ impl FieldBeneathRows {
     }
 }
 
-impl FieldBeneathRows {
-    /// The rows `restated`, a region of the rows, names this arm's field of whole: the arm's part
-    /// of those rows.
-    fn whole_field_rows(&self, restated: &Projection) -> Projection {
-        Projection::any_of(region_arms(restated).into_iter().filter_map(|arm| {
-            match arm {
-                Projection::Within {
-                    level,
-                    keys,
-                    values,
-                } => (values.field(&self.name) == Projection::Everything)
-                    .then(|| Projection::keys_at(level, keys)),
-                whole => Some(whole),
-            }
-        }))
-    }
-}
+impl FieldBeneathRows {}
 
 impl Consumer for FieldBeneathRows {
     /// A notification names keys, and what of each row's value is final is stated in the tiles
@@ -729,10 +704,7 @@ impl Consumer for FieldBeneathRows {
     /// rows is final; the reader joins it with the other inputs it reads.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
         let restated = self.restated(region);
-        let rows = match landing.is_complete() {
-            false => restated.rows(),
-            true => self.whole_field_rows(&restated),
-        };
+        let rows = restated.rows();
         if rows == Projection::Nothing && landing.queues() {
             return;
         }
@@ -780,27 +752,11 @@ impl Consumer for WholeValuesAt {
     /// the function replaces, so it passes on as the rows it runs through: the value there is
     /// read again whole, and what of it is final is stated in the tile the reader pulls.
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        match (region.names_part_of_values(), landing.is_complete()) {
-            (false, _) => self.0.notify(region, landing),
-            (true, false) => self.0.notify(&region.rows(), landing),
-            // A complete part of the input's value completes none of the value computed from all
-            // of it.
-            (true, true) => self.0.notify(&whole_rows_of(region), landing),
+        match region.names_part_of_values() {
+            false => self.0.notify(region, landing),
+            true => self.0.notify(&region.rows(), landing),
         }
     }
-}
-
-/// The rows `region` names whole: its arms of keys, and of each arm within some values the keys
-/// where the part it names is all of the values ([`Projection::Everything`]).
-fn whole_rows_of(region: &Projection) -> Projection {
-    Projection::any_of(region_arms(region).into_iter().filter_map(|arm| match arm {
-        Projection::Within {
-            level,
-            keys,
-            values,
-        } => (*values == Projection::Everything).then(|| Projection::keys_at(level, keys)),
-        whole => Some(whole),
-    }))
 }
 
 /// The outermost keys the paths `keys`, `levels` levels beneath them, run through.
@@ -906,15 +862,12 @@ impl Pairing {
 
 impl Pairing {
     /// Pass `restated` on. A change of one input names pairs whose other half may still change,
-    /// so it completes part of what a pair depends on ([`Landing::completing_part`]). A complete
+    /// so it completes part of what a pair depends on. A complete
     /// region is passed on unmarked: both inputs of a pairing read what one push brings in the
     /// same landing, so each pair's halves complete together, and halves from different
     /// pipelines are joined by the reader's record per read.
     fn pass_on(&self, restated: &Projection, landing: &mut Landing<'_>) {
-        match landing.is_complete() {
-            true => self.consumer.notify(restated, landing),
-            false => landing.completing_part(|landing| self.consumer.notify(restated, landing)),
-        }
+        self.consumer.notify(restated, landing);
     }
 }
 
@@ -940,14 +893,7 @@ impl Consumer for Pairing {
         let whole_rows;
         let region = match (self.side, region.names_part_of_values()) {
             (PairingSide::Rows(_), true) => {
-                whole_rows = match landing.is_complete() {
-                    false => region.rows(),
-                    true => Projection::any_of(
-                        region_arms(region)
-                            .into_iter()
-                            .filter(|arm| !arm.names_part_of_values()),
-                    ),
-                };
+                whole_rows = region.rows();
                 &whole_rows
             }
             _ => region,
@@ -1051,10 +997,7 @@ impl Consumer for Pairing {
             drop(delivered);
             match self.side {
                 // A constant's region beneath its outermost keys names no key of the pairs.
-                PairingSide::ConstantKeys => landing.completing_part(|landing| {
-                    landing
-                        .widened(|landing| self.consumer.notify(&Projection::Everything, landing))
-                }),
+                PairingSide::ConstantKeys => self.consumer.notify(&Projection::Everything, landing),
                 _ => self.consumer.notify(region, landing),
             }
             return;

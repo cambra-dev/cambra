@@ -369,17 +369,22 @@ mod tests {
         )
     }
     fn deliver(head: &dyn TileProducer) {
-        // Exercise the same completion delivery that source polling uses, before reading.
+        // Deliver the sources' keys as source polling does, a push of the yielded region through
+        // the iterator's consumer, before reading.
         let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);
         let consumer = head
             .base()
             .downstream
             .clone()
             .expect("an iterator's source consumer");
-        dispatcher.land_range_complete(
+        let mut landing = crate::interpreter::dispatcher::Landing::push(
+            &dispatcher,
             crate::interpreter::dispatcher::PipelineId(0),
-            &Projection::Everything,
+        );
+        crate::interpreter::notifications::notify_shared(
             &consumer,
+            &Projection::Everything,
+            &mut landing,
         );
     }
     fn rows(head: &mut dyn TileProducer) -> usize {
