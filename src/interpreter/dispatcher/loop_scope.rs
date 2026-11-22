@@ -708,12 +708,23 @@ impl InductionStoreProducer {
         });
     }
 
+    /// The inner pipelines a closing round gives its row: each one no other inner pipeline feeds,
+    /// and each nested loop. A pipeline that reads another inner pipeline takes the row from that
+    /// pipeline's push, once the pipeline it reads has finished the row. A nested loop holds the
+    /// row until its drive's source offers it, which that push does.
     fn closing_readers(&self, dispatcher: &Dispatcher) -> Vec<PipelineId> {
-        (0..self.run().body.members.len())
+        let count = self.run().body.members.len();
+        let inner: Vec<usize> = (0..count)
+            .map(|local| self.pipeline(PipelineId(local)).0)
+            .collect();
+        (0..count)
             .map(PipelineId)
             .filter(|&pipeline| {
-                !(dispatcher.is_source(self.pipeline(pipeline))
-                    && matches!(self.run().body.members[pipeline.0], Member::Chain(_)))
+                matches!(self.run().body.members[pipeline.0], Member::Scope(_))
+                    || !dispatcher.infos[self.pipeline(pipeline).0]
+                        .reads
+                        .iter()
+                        .any(|read| inner.contains(read))
             })
             .collect()
     }

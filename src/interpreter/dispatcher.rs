@@ -26,11 +26,11 @@ use std::thread;
 
 use intervalsets::Bounding;
 
-use crate::interpreter::tile_operators::InputId;
 use crate::interpreter::tile_operators::{
     Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
     spelled_part,
 };
+use crate::interpreter::tile_operators::{InputId, closed_keeping_row_ends};
 use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
 };
@@ -2146,7 +2146,8 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
         }
         Projection::Nothing => None,
         Projection::Everything => Some(input.universal_guard()),
-        Projection::Keys { .. } => Some(region.guard(input).closed_over(input)),
+        // A push of a row's remainder lands as itself: it states the row's end.
+        Projection::Keys { .. } => Some(closed_keeping_row_ends(region.guard(input), input)),
         // Each field is closed over its own tiling, as a push of that field alone would be.
         Projection::Fields { .. } => {
             let Tiling::Record(fields) = input else {

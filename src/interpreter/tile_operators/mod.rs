@@ -1484,6 +1484,37 @@ fn names_whole_keys(guard: &TileGuard) -> bool {
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
 /// them. [`Projection::of`] reads any universal or empty guard as everything or nothing, whatever
 /// it is spelled of, and a difference of a collection's keys with a scalar's is a bug.
+/// `guard`, a guard of `tiling`, closed over it ([`TileGuard::closed_over`]), or `guard` itself
+/// where the closure names nothing: a guard wholly past the positions `tiling` ranges over is
+/// a row's remainder, and it states that row's end, which a push carries to the readers.
+pub(crate) fn closed_keeping_row_ends(guard: TileGuard, tiling: &Tiling) -> TileGuard {
+    if let TileGuard::Or(arms) = guard {
+        return TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| closed_keeping_row_ends(arm, tiling))
+                .collect(),
+        );
+    }
+    let closed = guard.clone().closed_over(tiling);
+    match closed.is_empty() {
+        true => guard,
+        false => closed,
+    }
+}
+
+fn held_final_guard<P: BreakingProducer + ?Sized>(producer: &P) -> TileGuard {
+    let held = producer.complete();
+    let obsolete = producer.obsolete_guard();
+    let left = match names_collection_keys(&obsolete) {
+        true => match keys_released_whole(&obsolete) {
+            Some(released) if !held.is_empty() => guard_minus(&held, &released),
+            _ => held,
+        },
+        false => guard_minus(&held, &obsolete),
+    };
+    closed_keeping_row_ends(left, producer.tiling())
+}
+
 fn names_collection_keys(guard: &TileGuard) -> bool {
     match guard {
         TileGuard::Function(_) => true,
@@ -1728,16 +1759,7 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// ([`guard_minus`]), or a release of a collection's keys has an arm that is no region of keys
     /// and no codomain guard ([`keys_released_whole`]).
     fn final_guard(&self) -> TileGuard {
-        let held = self.complete();
-        let obsolete = self.obsolete_guard();
-        let left = match names_collection_keys(&obsolete) {
-            true => match keys_released_whole(&obsolete) {
-                Some(released) if !held.is_empty() => guard_minus(&held, &released),
-                _ => held,
-            },
-            false => guard_minus(&held, &obsolete),
-        };
-        left.closed_over(self.tiling())
+        held_final_guard(self)
     }
 
     /// `guard`, a guard of this producer's tiling it pushes, cut into morsels that target `rows`
