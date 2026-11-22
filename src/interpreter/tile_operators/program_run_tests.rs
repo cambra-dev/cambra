@@ -4932,43 +4932,69 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
     assert_eq!(written, expected, "{body}");
 }
 
-/// A row whose value is a record decides its fields together: a collection in one of its fields
-/// is part of the record, and a record row is published once its whole value is final. A sink
-/// over rows whose collection field grows with a live source therefore holds nothing at each idle
-/// and writes the rows whole once the source closes.
+/// A row whose value is a record decides its fields one by one: a field that is final is
+/// published under the row while a collection in another field still grows with a live source. A
+/// sink over such rows therefore holds the rows at each idle, each collection field as far as the
+/// source has delivered, and the value is complete once the source closes. How many idles a run
+/// has depends on the batch size and the workers, so an idle's rows are those after one of the
+/// deliveries before the last.
 #[rstest_log::rstest]
 #[case::collection_in_a_tuple_row(
     "out << [(x, [y * x for y in source1()]) for x in [1, 2]]",
+    &[
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
+    ],
     "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
       u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]"
 )]
 #[case::a_bound_tuple_row(
     "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
+    &[
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
+    ],
     "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
       u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]"
 )]
 #[case::the_collection_field_of_a_bound_tuple_row(
     "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.1 for p in xs]",
+    &[
+        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
+    ],
     "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
       u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]"
 )]
-fn a_sink_over_live_tuple_rows_writes_them_once_the_source_closes(
+fn a_sink_over_live_tuple_rows_writes_each_delivery_before_the_source_closes(
     #[case] body: &str,
+    #[case] at_idle: &[&str],
     #[case] expected: &str,
     #[values(1, usize::MAX)] rows: usize,
     #[values(1, 4)] workers: usize,
 ) {
     let source = format!("out = test_sink()\n{body}\n");
+    let mut idles = 0;
     let (value, _) =
         dispatched_live_observed_on(&source, rows, workers, three_batches(), |sink, _| {
+            idles += 1;
+            assert_eq!(
+                sink.value(),
+                Err(crate::interpreter::SinkReadError::Incomplete),
+                "{body}: the value stays open until the source closes"
+            );
+            let written = sink.written_so_far().unwrap_or_else(|error| {
+                panic!("{body}: the delivered rows reach the sink: {error}")
+            });
+            let written = canonical(&single_value(&written));
             assert!(
-                matches!(
-                    sink.written_so_far(),
-                    Err(crate::interpreter::test_sink::SinkReadError::NothingWritten)
-                ),
-                "{body}: no record row is whole before the source closes"
+                at_idle.contains(&written.as_str()),
+                "{body}: an idle holds the rows after a delivery, not {written}"
             );
         });
+    assert!(idles > 0, "{body}: the run idles before the source closes");
     assert_eq!(canonical(&single_value(&value)), expected, "{body}");
 }
 

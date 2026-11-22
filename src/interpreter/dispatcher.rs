@@ -299,7 +299,6 @@ struct PipelineState {
     /// the low bit, and how many holds it has taken, in the bits above: a release that read the
     /// count before a later hold fails ([`Dispatcher::release_followers_if`]).
     followers_hold: AtomicU64,
-    held: AtomicBool,
 }
 
 impl PipelineState {
@@ -311,7 +310,6 @@ impl PipelineState {
             pushed: Mutex::new(None),
             acknowledged: AtomicUsize::new(0),
             followers_hold: AtomicU64::new(0),
-            held: AtomicBool::new(false),
         }
     }
 
@@ -531,14 +529,6 @@ impl Dispatcher {
             "an ingress range names planned pipelines"
         );
         self.infos[pipeline.0].ingress = Some(from);
-    }
-
-    /// Hold a pipeline's packages and finish until it is activated by its execution handler.
-    /// The serial coordinator changes holds between claims; a hold does not revoke a claim.
-    pub(crate) fn hold_pipeline(&self, pipeline: PipelineId, held: bool) {
-        if self.state(pipeline).held.swap(held, Ordering::SeqCst) != held {
-            self.advance();
-        }
     }
 
     /// The count of the dispatcher's changes so far ([`Generation`]): an equal count read twice
@@ -1124,9 +1114,6 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one. An ordered pipeline has at most one package in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
-        if self.states[pipeline].held.load(Ordering::SeqCst) {
-            return None;
-        }
         self.claim_in(pipeline)
     }
 
@@ -1150,8 +1137,7 @@ impl Dispatcher {
         let reserved = state.queue.reserved.load(Ordering::Acquire);
         #[cfg(test)]
         self.run_transition_hook(true);
-        !state.held.load(Ordering::SeqCst)
-            && state.phase.load() == Phase::Running
+        state.phase.load() == Phase::Running
             && reserved & CLOSED != 0
             && state.acknowledged.load(Ordering::Acquire) == reserved & !CLOSED
     }
@@ -1259,10 +1245,7 @@ impl Dispatcher {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 // With nothing in flight, an ordered pipeline claims as any other does.
-                !queue.in_flight.is_empty()
-                    || (!queue.ready.is_empty()
-                        && !self.states[p].held.load(Ordering::SeqCst)
-                        && self.takes_from(p))
+                !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
             })
     }
 
@@ -1990,14 +1973,30 @@ pub struct Entry {
     completes: CompletionTarget,
 }
 
-/// The pipeline an unplaced [`Entry`] records a complete push at, and that pipeline's input, which
-/// the entry's input keys name the same rows of: a loop's drive reads its source by pull, so the
-/// entry in front of the source queues nothing, but the positions the drive emits are the
-/// source's keys, so what the source completes of its keys the scope's input has completed of its
-/// positions. `None` where nothing records it, as in front of any other pulled input.
+/// The scope an unplaced [`Entry`] offers a push to, and the scope's input, which the entry's input
+/// keys name the same rows of: a scope's drive reads its source by pull, so the entry in front of
+/// the source queues nothing, but the positions or items the drive emits are the source's keys,
+/// so what the source pushes of its keys is what the scope's input can take. `None` where nothing
+/// is offered, as in front of any other pulled input.
 // shared-state-ok: the drive and the entry in front of its source both hold it, the planner
-// writes it before the run, and what crosses it is a pipeline's index and a tiling, never a tile.
-pub type CompletionTarget = Arc<RwLock<Option<(PipelineId, Tiling)>>>;
+// writes it before the run, and what crosses it is a scope's intake and a tiling, never a tile.
+pub type CompletionTarget = Arc<RwLock<Option<(Offers, Tiling)>>>;
+
+/// What a scope's input has offered it and the scope has not queued yet: a scope queues a request
+/// only where it can run ([`Body::queue_offered`](loop_scope::Body::queue_offered)), and holds
+/// the rest here.
+#[derive(Default)]
+pub struct Offered {
+    /// The region of the scope's input offered and not queued yet.
+    pub region: Option<TileGuard>,
+    /// Whether the scope's pipeline closes once everything offered is queued.
+    pub closing: bool,
+}
+
+/// A scope's [`Offered`], shared with the entry in front of its drive's source.
+// shared-state-ok: the scope and the entry in front of its drive's source both hold it; what
+// crosses it is a guard of the scope's input, never a tile.
+pub type Offers = Arc<Mutex<Offered>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
@@ -2094,8 +2093,24 @@ impl Consumer for Entry {
             }
             return;
         }
-        if self.pipeline.get().is_none()
-            && landing.is_delivery()
+        if self.pipeline.get().is_some() {
+            return;
+        }
+        // In front of a drive's source, a push offers its keys to the scope the drive runs in.
+        if landing.queues()
+            && let Some((offers, input)) = &*self
+                .completes
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+            && let Some(guard) = pushed_guard(region, input)
+        {
+            let mut offered = offers.lock().unwrap_or_else(PoisonError::into_inner);
+            offered.region = Some(match offered.region.take() {
+                Some(before) => before.union(&guard),
+                None => guard,
+            });
+        }
+        if landing.is_delivery()
             && let Some(inline) = &self.inline
         {
             inline.notify(region, landing);
@@ -2880,29 +2895,6 @@ mod tests {
         assert!(matches!(dispatcher.try_claim(None), Next::Finish { .. }));
         dispatcher.finish(dispatcher.pushes(source));
         assert!(matches!(dispatcher.try_claim(None), Next::Done));
-    }
-
-    #[rstest::rstest]
-    fn manual_finish_respects_the_serial_coordinators_hold(#[values(false, true)] released: bool) {
-        let dispatcher = Dispatcher::new(vec![vec![]], 1);
-        let source = PipelineId(0);
-        dispatcher.close(source);
-        dispatcher.hold_pipeline(source, true);
-        if released {
-            dispatcher.hold_pipeline(source, false);
-            dispatcher.begin_finish(source);
-            dispatcher.finish(dispatcher.pushes(source));
-            assert!(matches!(dispatcher.try_claim(None), Next::Done));
-        } else {
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    dispatcher.begin_finish(source);
-                }))
-                .is_err()
-            );
-            assert!(dispatcher.states[0].phase.load() == Phase::Running);
-            assert!(matches!(dispatcher.try_claim(None), Next::Failed));
-        }
     }
 
     #[rstest::rstest]

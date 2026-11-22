@@ -94,6 +94,9 @@ pub(super) struct Body {
     /// The guard of the step's package for the open round or attempt, which the scope queues once
     /// the inner pipelines are quiescent ([`Body::queue_step_when_quiescent`]).
     pending_step: Option<TileGuard>,
+    /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
+    /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
+    offers: Offers,
 }
 
 /// Where a body sits in the run's shared dispatcher.
@@ -124,6 +127,7 @@ impl Body {
             active: false,
             finishing: false,
             pending_step: None,
+            offers: Offers::default(),
         }
     }
 
@@ -187,8 +191,8 @@ impl Body {
         self.pipelines().into_iter().chain(std::iter::once(step))
     }
 
-    /// Place each inner pipeline's entries at its global id, except a source's, and let the inner
-    /// pipelines and the step run. Whether this call activated the body: it does so once.
+    /// Place each inner pipeline's entries at its global id, except a source's. Whether this call
+    /// activated the body: it does so once.
     pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
         if self.active {
             return false;
@@ -199,9 +203,7 @@ impl Body {
             for placement in placements {
                 placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
             }
-            dispatcher.hold_pipeline(pipeline, false);
         }
-        dispatcher.hold_pipeline(self.attached().step, false);
         true
     }
 
@@ -241,9 +243,11 @@ impl Body {
     /// pipeline one reads, has consumed every package queued for it: the round's work has run,
     /// pushes it brought included. Whether it queued the package.
     pub(super) fn queue_step_when_quiescent(&mut self, dispatcher: &Dispatcher) -> bool {
+        // Quiescence is read before the hold: a worker holds the followers before it acknowledges
+        // a body's package, so a quiescence that sees the acknowledgement sees the hold too.
         if self.pending_step.is_none()
-            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|pipeline| pipeline.0))
+            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
         {
             return false;
         }
@@ -305,18 +309,50 @@ impl Body {
         target
     }
 
-    /// Have the driver's source record its complete pushes at `pipeline`, the scope's pipeline,
-    /// as complete regions of the driver's input ([`CompletionTarget`]).
-    pub(super) fn complete_driver_through(&self, pipeline: PipelineId) {
-        self.reach(self.driver, &mut |breaker, _| {
-            if let Some(target) = breaker
-                .as_producer()
-                .and_then(|producer| producer.completes_through())
-            {
-                *target.write().unwrap_or_else(PoisonError::into_inner) =
-                    Some((pipeline, breaker.input_tiling(InputId::ONLY)));
-            }
+    /// Add `guard`, a region of the scope's input, to what is offered and not queued yet.
+    pub(super) fn offer(&self, guard: &TileGuard) {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        offered.region = Some(match offered.region.take() {
+            Some(before) => before.union(guard),
+            None => guard.clone(),
         });
+    }
+
+    /// Close the scope's pipeline once everything offered to it is queued.
+    pub(super) fn close_offers(&self) {
+        self.offers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closing = true;
+    }
+
+    /// Queue what was offered on the scope's pipeline, and close the pipeline once asked, where
+    /// `ready` says a request can run: a writer's attempt reads its store, which must be open.
+    /// Whether it queued or closed anything.
+    pub(super) fn queue_offered(&self, dispatcher: &Dispatcher, ready: bool) -> bool {
+        let Some(attached) = self.attached.as_ref() else {
+            return false;
+        };
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        if !ready || (offered.region.is_none() && !offered.closing) {
+            return false;
+        }
+        let region = offered.region.take();
+        let closing = std::mem::take(&mut offered.closing);
+        drop(offered);
+        if let Some(region) = region {
+            dispatcher.queue_for(attached.pipeline, &region);
+        }
+        if closing {
+            dispatcher.close(attached.pipeline);
+        }
+        true
+    }
+
+    /// Whether anything offered is not queued yet.
+    pub(super) fn has_offers(&self) -> bool {
+        let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        offered.region.is_some() || offered.closing
     }
 
     /// Clear every inner pipeline's entries.
@@ -527,12 +563,13 @@ impl InductionStoreProducer {
     /// at `pipeline`, this scope's pipeline in the dispatcher around it, as complete positions of
     /// the store's input: the drive reads its source by pull, so no push of the source reaches the
     /// scope's entry otherwise, and the scope would park each round until the source is whole.
-    pub(super) fn decide_through_drive(&mut self, pipeline: PipelineId) {
+    pub(super) fn decide_through_drive(&mut self) {
         let input = self.input_tiling(InputId::ONLY);
         let target = self
             .drive_target()
-            .expect("a loop's drive records its source's complete pushes");
-        *target.write().unwrap_or_else(PoisonError::into_inner) = Some((pipeline, input));
+            .expect("a loop's drive offers its source's pushes");
+        let offers = self.run().body.offers.clone();
+        *target.write().unwrap_or_else(PoisonError::into_inner) = Some((offers, input));
     }
 
     /// Undo [`decide_through_drive`](Self::decide_through_drive): the drive's source's complete

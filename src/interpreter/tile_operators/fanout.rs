@@ -1650,15 +1650,37 @@ impl MemoProducer {
 /// beneath a level of its own states that level complete only where the collection states
 /// `True`, so the cache states it once it can.
 fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
-    if let (
-        Some(Extent::UIntRange(positions)),
-        Tile::DataFunction {
-            domain_predicate, ..
-        },
-    ) = (tiling.domain_extent(), tile)
-        && !domain_predicate.is_true()
-        && domain_predicate.covers_positions(&positions)
+    let Tile::DataFunction {
+        domain,
+        codomain,
+        domain_predicate,
+        ..
+    } = tile
+    else {
+        return;
+    };
+    // A level beneath that states every key complete under every row makes each held row whole.
+    if let Some(beneath) = tiling.codomain() {
+        close_over_positions(codomain, &beneath);
+    }
+    if !domain_predicate.is_true()
+        && let Tile::DataFunction {
+            domain_predicate: rows_beneath,
+            ..
+        } = codomain.as_ref()
+        && rows_beneath.is_true()
     {
+        *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+    }
+    let covered = match tiling.domain_extent() {
+        Some(Extent::UIntRange(positions)) => domain_predicate.covers_positions(&positions),
+        // A level of one key, as a value's outermost level is, is complete once that key is.
+        Some(Extent::Base(crate::interpreter::BaseType::Unit)) => {
+            domain_predicate.contains(&Value::Unit)
+        }
+        _ => false,
+    };
+    if covered {
         *domain_predicate = Predicate::True;
     }
 }

@@ -2906,6 +2906,16 @@ impl CommitProducer {
     /// Open the store on the pull its whole seed has arrived, and answer whether it is open.
     /// Until then it is undecided — no tick 0, so no frontier — and a writer reads nothing to
     /// build an attempt against, which is why nothing is attempted before it opens either.
+    /// Whether the store is open: every seed key's value is final, so an attempt can read it. It
+    /// opens the store where it can ([`open_store`](Self::open_store)).
+    pub(crate) fn is_open(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.open_store(&mut state)
+    }
+
     fn open_store(&self, state: &mut CommitState) -> bool {
         if state.engine.is_none() {
             let mut seed = state.seed.clone();
