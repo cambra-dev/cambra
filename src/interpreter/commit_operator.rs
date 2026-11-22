@@ -2509,6 +2509,11 @@ impl CommitOperator {
 }
 
 impl TileOperator for CommitOperator {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -2580,6 +2585,7 @@ impl TileOperator for CommitOperator {
         Box::new(CommitProducer {
             base,
             seed_placements,
+            writer_placements: placements.clone(),
             writer_write_keys: self.writer_write_keys.clone(),
             state: std::sync::Mutex::new(CommitState {
                 queued: (0..n).map(|_| BTreeMap::new()).collect(),
@@ -2610,6 +2616,9 @@ pub struct CommitProducer {
     /// to the pipeline of the store's input 0 ([`Self::writer_of`]). Empty where the store has no
     /// seed stream, and then it has no seed input.
     seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
+    /// Per writer, the placement of the entry in front of it, which a planner sets to the writer's
+    /// pipeline.
+    pub(crate) writer_placements: Vec<crate::interpreter::dispatcher::Placement>,
     /// Per writer, the keys it may write ([`CommitOperator::writer_write_keys`]),
     /// aligned with [`Self::writer_terminal`]. The two together give per-key
     /// closure: a key is closed once every writer listing it is terminal.
@@ -2906,6 +2915,16 @@ impl CommitProducer {
     /// Open the store on the pull its whole seed has arrived, and answer whether it is open.
     /// Until then it is undecided — no tick 0, so no frontier — and a writer reads nothing to
     /// build an attempt against, which is why nothing is attempted before it opens either.
+    /// Whether the store is open: every seed key's value is final, so an attempt can read it. It
+    /// opens the store where it can ([`open_store`](Self::open_store)).
+    pub(crate) fn is_open(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.open_store(&mut state)
+    }
+
     fn open_store(&self, state: &mut CommitState) -> bool {
         if state.engine.is_none() {
             let mut seed = state.seed.clone();
@@ -3417,6 +3436,11 @@ impl InductionStore {
 }
 
 impl TileOperator for InductionStore {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -5916,6 +5940,11 @@ impl InductionDriver {
 }
 
 impl TileOperator for InductionDriver {
+    /// The drive's positions arrive one per round, whether or not its source reads a source.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -6879,6 +6908,11 @@ impl TransactDriver {
 }
 
 impl TileOperator for TransactDriver {
+    /// The drive's positions arrive one per round, whether or not its source reads a source.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -7872,6 +7906,11 @@ impl TransactWriter {
 }
 
 impl TileOperator for TransactWriter {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {

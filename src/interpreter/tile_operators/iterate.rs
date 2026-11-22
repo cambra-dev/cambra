@@ -51,7 +51,7 @@ impl IterateExtent {
 impl TileOperator for IterateExtent {
     impl_operator_base!();
 
-    fn arrives_from_a_source(&self) -> bool {
+    fn keys_arrive_by_push(&self) -> bool {
         self.extent.reads_a_source()
     }
 

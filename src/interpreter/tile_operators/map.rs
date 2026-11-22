@@ -273,15 +273,33 @@ impl TileOperator for MapResult {
                 self.function.tiling()
             );
         }
-        let function_producer = match looked_up_at_keys {
-            Some(at) => self.function.clone().subscribe(
-                self.function.tiling().universal_guard(),
-                crate::interpreter::notifications::restating_lookup(
-                    Box::new(move |region| keys_looked_up(region, at)),
-                    forwarding_consumer_keeping_keys(&shared),
-                ),
-                cx,
-            ),
+        // A row of a lookup at its own key exists once the input has delivered the row and the
+        // operand the key, so each operand's delivery is passed on under the rows the other has
+        // delivered (`notifications::aligned`): the input is arm 0 and the operand arm 1.
+        let lookup = looked_up_at_keys.map(|at| {
+            let delivered = crate::interpreter::notifications::nothing_aligned([
+                self.input.keys_arrive_by_push(),
+                self.function.keys_arrive_by_push(),
+            ]);
+            (at, delivered)
+        });
+        let function_producer = match &lookup {
+            Some((at, delivered)) => {
+                let at = *at;
+                self.function.clone().subscribe(
+                    self.function.tiling().universal_guard(),
+                    crate::interpreter::notifications::restating_lookup(
+                        Box::new(move |region| keys_looked_up(region, at)),
+                        crate::interpreter::notifications::aligned(
+                            1,
+                            at,
+                            delivered.clone(),
+                            forwarding_consumer_keeping_keys(&shared),
+                        ),
+                    ),
+                    cx,
+                )
+            }
             None => subscribe_forwarding(&self.function, &shared, cx),
         };
         // The result's outermost keys are the input's where the function applies to the input's
@@ -296,13 +314,23 @@ impl TileOperator for MapResult {
         // The function computes each value anew from the input's value there, so a part of that
         // value names the rows holding it (`whole_values_at`).
         let input_producer = match keeps_keys {
-            true => self.input.clone().subscribe(
-                self.input.tiling().universal_guard(),
-                crate::interpreter::notifications::whole_values_at(
-                    forwarding_consumer_keeping_keys(&shared),
-                ),
-                cx,
-            ),
+            true => {
+                let forward = forwarding_consumer_keeping_keys(&shared);
+                let forward = match &lookup {
+                    Some((at, delivered)) => crate::interpreter::notifications::aligned(
+                        0,
+                        *at,
+                        delivered.clone(),
+                        forward,
+                    ),
+                    None => forward,
+                };
+                self.input.clone().subscribe(
+                    self.input.tiling().universal_guard(),
+                    crate::interpreter::notifications::whole_values_at(forward),
+                    cx,
+                )
+            }
             false => subscribe_forwarding(&self.input, &shared, cx),
         };
         Box::new(MapResultProducer {
@@ -901,8 +929,8 @@ impl TileOperator for MapResultToConst {
                     PairingSide, Partners, nothing_delivered, pairing,
                 };
                 let delivered = nothing_delivered(
-                    self.input.arrives_from_a_source(),
-                    self.constant.arrives_from_a_source(),
+                    self.input.keys_arrive_by_push(),
+                    self.constant.keys_arrive_by_push(),
                 );
                 let universal = self.constant.tiling().universal_guard();
                 let constant = self.constant.clone().subscribe(

@@ -387,9 +387,9 @@ pub(crate) struct Delivered {
 /// [`Delivered`], shared by the consumers in front of one pairing operator's inputs.
 pub(crate) type SharedDelivered = Arc<std::sync::Mutex<Delivered>>;
 
-/// A [`Delivered`] with nothing delivered yet of a side whose keys arrive from a source, and
-/// everything of a side that reads none, which holds all its keys from the start
-/// ([`TileOperator::arrives_from_a_source`](crate::interpreter::tile_operators::TileOperator::arrives_from_a_source)).
+/// A [`Delivered`] with nothing delivered yet of a side whose keys arrive by a push, and
+/// everything of a side no push reaches, which holds all its keys from the start
+/// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
 pub(crate) fn nothing_delivered(rows_arrive: bool, partners_arrive: bool) -> SharedDelivered {
     let held = |arrive: bool| match arrive {
         true => crate::interpreter::Predicate::False,
@@ -451,9 +451,9 @@ struct Pairing {
 /// What each arm of a row-aligned operator has delivered of the keys its arms share, as paths of
 /// that level. A row of the output exists once every arm has delivered it, so a delivery on one
 /// arm announces the part of its region under the rows every other arm has delivered: Δ𝑅ᵢ ∩
-/// ⋂ⱼ≠ᵢ 𝑅ⱼ. The arm that delivers a row last announces it. An arm that reads no source holds every
+/// ⋂ⱼ≠ᵢ 𝑅ⱼ. The arm that delivers a row last announces it. An arm no push reaches holds every
 /// row from the start
-/// ([`TileOperator::arrives_from_a_source`](crate::interpreter::tile_operators::TileOperator::arrives_from_a_source)).
+/// ([`TileOperator::keys_arrive_by_push`](crate::interpreter::tile_operators::TileOperator::keys_arrive_by_push)).
 /// Each arm's record grows only on a delivery ([`Landing::queues`]).
 pub(crate) struct AlignedDelivered {
     arms: Vec<crate::interpreter::Predicate>,

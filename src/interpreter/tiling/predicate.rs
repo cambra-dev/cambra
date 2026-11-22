@@ -1704,28 +1704,44 @@ fn joined(a: &Interval<Value>, b: &Interval<Value>) -> Option<Interval<Value>> {
 
 /// Sort a one-level `Tile::DataFunction` by its domain values for deterministic comparison.
 ///
-/// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all other tile
-/// forms are returned unchanged, a deeper function among them — reordering its outermost
-/// level would have to carry every group with it. This is needed wherever key order depends
-/// on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
+/// Handles `Ints`, `UInts` and record domains paired with a scalar codomain of `Ints`,
+/// `UInts`, `Strings` or `Bools`; all other tile forms are returned unchanged, a deeper
+/// function among them — reordering its outermost level would have to carry every group with
+/// it. This is needed wherever row order depends on [`HashMap`] iteration order (e.g. GroupBy,
+/// MapSource) or on the order a breaker took its rows in.
 pub fn sort_function_by_domain(tile: Tile) -> Tile {
-    /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
-    /// then rebuild the tile.
+    /// `column` with its rows in `order`, or `None` for a column this helper does not reorder.
+    fn permuted(column: &ColumnValue, order: &[usize]) -> Option<ColumnValue> {
+        fn pick<T: Clone>(values: &[T], order: &[usize]) -> Vec<T> {
+            order.iter().map(|&row| values[row].clone()).collect()
+        }
+        Some(match column {
+            ColumnValue::Ints(values) => ColumnValue::Ints(pick(values, order)),
+            ColumnValue::UInts(values) => ColumnValue::UInts(pick(values, order)),
+            ColumnValue::Strings(values) => ColumnValue::Strings(pick(values, order)),
+            ColumnValue::Bools(values) => ColumnValue::Bools(pick(values, order)),
+            _ => return None,
+        })
+    }
+
+    /// Sort the rows by `domain_vals`, carrying the codomain `cod` along, then rebuild the tile.
+    /// `None` where the codomain is a column [`permuted`] does not reorder.
     fn sort_and_rebuild<K: PartialOrd + Clone>(
         domain_vals: Vec<K>,
-        cod_ints: Vec<i64>,
+        cod: &ColumnValue,
         domain_predicate: Predicate,
         mk_domain: impl Fn(Vec<K>) -> ColumnValue,
-    ) -> Tile {
-        let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
-        pairs.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
-        let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
-        Tile::data_function(
+    ) -> Option<Tile> {
+        let mut order: Vec<usize> = (0..domain_vals.len()).collect();
+        order.sort_by(|&a, &b| domain_vals[a].partial_cmp(&domain_vals[b]).unwrap());
+        let codomain = permuted(cod, &order)?;
+        let sorted_d = order.iter().map(|&row| domain_vals[row].clone()).collect();
+        Some(Tile::data_function(
             mk_domain(sorted_d),
-            Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
+            Box::new(Tile::Scalar(codomain)),
             domain_predicate,
             BitSet::new(),
-        )
+        ))
     }
 
     fn record_cv_to_extent(fields: &HashMap<SmolStr, ColumnValue>) -> Extent {
@@ -1745,22 +1761,31 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
             deleted,
             ..
         } if row_starts.len() == 1 && !codomain.is_data_function() => {
-            match (*codomain, domain) {
-                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
-                }
-                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
-                }
-                (
-                    Tile::Scalar(ColumnValue::Ints(cod_ints)),
-                    ref r @ ColumnValue::Records(ref fields),
-                ) => sort_and_rebuild(
+            let sorted = match (&*codomain, &domain) {
+                (Tile::Scalar(cod), ColumnValue::Ints(dom)) => sort_and_rebuild(
+                    dom.clone(),
+                    cod,
+                    domain_predicate.clone(),
+                    ColumnValue::Ints,
+                ),
+                (Tile::Scalar(cod), ColumnValue::UInts(dom)) => sort_and_rebuild(
+                    dom.clone(),
+                    cod,
+                    domain_predicate.clone(),
+                    ColumnValue::UInts,
+                ),
+                (Tile::Scalar(cod), r @ ColumnValue::Records(fields)) => sort_and_rebuild(
                     r.clone().drain_to_value_iter().collect(),
-                    cod_ints,
-                    domain_predicate,
+                    cod,
+                    domain_predicate.clone(),
                     |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
                 ),
+                _ => None,
+            };
+            if let Some(sorted) = sorted {
+                return sorted;
+            }
+            match (*codomain, domain) {
                 // Union domain: canonicalize entries by `(tag, slot)` so two tiles
                 // representing the same multiset of `(tag, payload) → cod` entries
                 // compare equal regardless of the order the arms happened to be

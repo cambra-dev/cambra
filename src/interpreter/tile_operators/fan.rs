@@ -303,9 +303,7 @@ impl TileOperator for Zip {
         // delivered it, so each arm's delivery is passed on under the rows the others delivered
         // (`notifications::aligned`).
         let delivered = crate::interpreter::notifications::nothing_aligned(
-            self.inputs
-                .iter()
-                .map(|input| input.arrives_from_a_source()),
+            self.inputs.iter().map(|input| input.keys_arrive_by_push()),
         );
         let inputs = self
             .inputs

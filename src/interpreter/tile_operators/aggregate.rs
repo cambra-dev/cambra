@@ -48,6 +48,11 @@ impl Aggregate {
 }
 
 impl TileOperator for Aggregate {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -390,6 +395,11 @@ impl ExtractAggregate {
 }
 
 impl TileOperator for ExtractAggregate {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -910,6 +920,11 @@ fn folded_shape(tiling: &Tiling) -> (Vec<Extent>, Tiling) {
 }
 
 impl TileOperator for MapAggregate {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
