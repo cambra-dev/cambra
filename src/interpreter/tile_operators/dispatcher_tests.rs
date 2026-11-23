@@ -412,13 +412,16 @@ fn a_reader_takes_nothing_before_the_pipeline_it_follows_is_quiescent() {
 #[test]
 fn loop_steps_are_held_independently_in_one_dispatcher() {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0], vec![1]], 1);
+    let [first, second] = [2, 3].map(|step| dispatcher.add_hold_group([PipelineId(step)]));
     for (step, body) in [(2, 0), (3, 1)] {
         dispatcher.order(PipelineId(step));
         dispatcher.follow(PipelineId(step), PipelineId(body));
         dispatcher.notify(PipelineId(body), &keys_between(0, 0));
         dispatcher.queue_for(PipelineId(step), &keys_between(0, 0));
     }
-    dispatcher.hold_followers([PipelineId(2), PipelineId(3)], true);
+    for group in [first, second] {
+        dispatcher.hold_followers(group);
+    }
     for body in [0, 1] {
         let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(body))) else {
             panic!("each loop's body is claimable while its step is held");
@@ -428,7 +431,7 @@ fn loop_steps_are_held_independently_in_one_dispatcher() {
     }
     assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
 
-    dispatcher.hold_followers([PipelineId(3)], false);
+    assert!(dispatcher.release_followers_if(second, dispatcher.followers_hold(second)));
     let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(2))) else {
         panic!("the second loop's step is released");
     };
@@ -436,7 +439,7 @@ fn loop_steps_are_held_independently_in_one_dispatcher() {
     dispatcher.acknowledge(package);
     assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
 
-    dispatcher.hold_followers([PipelineId(2)], false);
+    assert!(dispatcher.release_followers_if(first, dispatcher.followers_hold(first)));
     let Next::Package(package) = dispatcher.try_claim(None) else {
         panic!("the first loop's step is released");
     };
