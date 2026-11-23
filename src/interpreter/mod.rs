@@ -39,7 +39,7 @@ pub use unary_op::*;
 
 use smol_str::{SmolStr, format_smolstr};
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 // ============================================================================
 // Consumer Protocol
@@ -63,6 +63,17 @@ pub trait Consumer {
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
     fn notify(&mut self, arrived: &Projection) {
         self.borrow_mut().notify(arrived)
+    }
+}
+
+/// A weak handle notifies its consumer while some owner keeps the consumer alive, and does
+/// nothing once it is gone: a subscription that does not keep its subscriber alive
+/// (`src/ccl/design/program-evolution.md`, "A subscription lasts as long as its producer").
+impl<C: Consumer> Consumer for Weak<RefCell<C>> {
+    fn notify(&mut self, arrived: &Projection) {
+        if let Some(consumer) = self.upgrade() {
+            consumer.borrow_mut().notify(arrived);
+        }
     }
 }
 

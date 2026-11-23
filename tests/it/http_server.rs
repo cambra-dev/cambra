@@ -142,7 +142,7 @@ fn test_http_serve_echo() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send one POST request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -171,7 +171,7 @@ fn test_http_serve_const() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send one GET request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -202,7 +202,7 @@ fn test_http_serve_two_sequential_requests() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send two requests sequentially; each blocks until the server responds.
     let (tx, rx) = mpsc::channel::<Vec<String>>();
@@ -240,7 +240,7 @@ fn test_http_serve_two_paths() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send requests sequentially: each http_post/http_get blocks until the
     // server responds, so the second request is only sent after the first
@@ -279,7 +279,7 @@ fn test_http_serve_two_paths_shared_outer_let() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -311,7 +311,7 @@ fn test_http_serve_echo_with_outer_let() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -337,7 +337,7 @@ fn test_http_serve_with_a_parenthesised_pattern() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -376,7 +376,7 @@ fn test_http_serve_bound_to_one_name() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -581,7 +581,7 @@ fn test_http_serve_wrong_path_gets_404() {
 
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     // Send to a path that doesn't match — expect a 404 status line.
     let request = format!(
@@ -618,7 +618,7 @@ fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<(String, TcpStream)>();
     thread::spawn(move || {
@@ -705,7 +705,7 @@ fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> St
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -769,7 +769,7 @@ fn a_reply_inside_a_writing_block_answers_each_request_with_its_own_value() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -810,7 +810,7 @@ fn two_runs_serve_the_routes_their_arguments_give() {
     );
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {

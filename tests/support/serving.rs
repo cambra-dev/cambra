@@ -18,7 +18,7 @@ use std::{
 
 use cambra::ccl::load::LoadedProgram;
 use cambra::{
-    ccl::context::{CompileResultExt, GlobalContext, compile_program},
+    ccl::context::{CompileResultExt, CompiledProgram, GlobalContext, compile_program},
     interpreter::Consumer,
     live_program::LiveProgram,
 };
@@ -28,20 +28,21 @@ use cambra::{
 // ---------------------------------------------------------------------------
 
 /// Compile `source` for a sink program and return the surrounding
-/// [`GlobalContext`].  Sink programs (e.g. `http_serve`) have no `main`
+/// [`GlobalContext`] and the program.  Sink programs (e.g. `http_serve`) have no `main`
 /// output; their sinks bind their resources during `compile_program` and
 /// then await scheduler ticks to dispatch values.
 ///
-/// The caller must keep the returned context alive (and drive its scheduler
-/// via [`drive_until`]) for the duration of the test — sinks are only
-/// serviced while the scheduler is running.
+/// The caller keeps the returned context and program alive, and drives the
+/// context's scheduler via [`drive_until`], for the duration of the test. The
+/// sinks are serviced only while the scheduler runs, and they stop when the
+/// program is dropped.
 // The gallery's: a suite that replaces a version wants `start_sink`.
-pub fn compile_sink(source: &str) -> GlobalContext {
+pub fn compile_sink(source: &str) -> (GlobalContext, CompiledProgram) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let loaded = LoadedProgram::test(source);
-    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
-    ctx
+    let program = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    (ctx, program)
 }
 
 /// Start `source` as a [`LiveProgram`], for a test that replaces it with

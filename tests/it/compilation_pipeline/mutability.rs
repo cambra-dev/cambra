@@ -1479,7 +1479,7 @@ fn tuple_of_mut_reads_compiles_as_values() {
         (x, y)"#};
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::from_text("<tuple-mut-reads>", code);
-    compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let _ = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
 }
 
 /// A top-level mutable write as the program's *final* statement — no trailing
@@ -1494,7 +1494,7 @@ fn final_mutable_write_with_no_read_compiles_as_unit() {
         cnt += 1"#};
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::from_text("<final-mutable-write>", code);
-    compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let _ = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
 }
 
 /// I1(a): a `Mut(…)` accumulator loop as the program's *final* statement, with
@@ -1511,7 +1511,7 @@ fn final_mutation_loop_with_no_read_compiles_as_unit() {
             total += i"#};
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::from_text("<final-mutation-loop>", code);
-    compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let _ = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
 }
 
 // ===== Bottom-PR review regressions: Mut scoping / guards =====

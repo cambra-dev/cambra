@@ -269,9 +269,11 @@ it](#nothing-inside-a-fan-out-owns-it). Dropping an operator from one entry ther
 when no other entry holds it.
 
 **A sink consumer belongs to exactly one entry.** It is built by the compile that installs one
-entry's version, branch-and-reload's included, and only that entry holds it. A sink consumer needs
-an explicit `SinkConsumer::detach` to stop dispatch, and a teardown detaches every sink consumer of
-its branch (`Branch::tear_down`).
+entry's version, branch-and-reload's included, and only that entry's outputs hold it strongly, per
+[A subscription lasts as long as its producer](#a-subscription-lasts-as-long-as-its-producer). A
+teardown clears the branch's outputs, which stops every sink consumer of the branch
+(`Branch::tear_down`). A dropped `CompiledProgram` drops its outputs, so a dropped `LiveProgram`
+stops every branch.
 
 ![An operator graph beside its branch table: main holds r1, r2 and r3; v1, v2 and v3 each hold the part of that chain they share with it and their own ember nodes g1, b1 to b2, and o1](img/branch-table.svg)
 
@@ -369,8 +371,8 @@ outputs have signalled completion, which a sink program serving a route never do
 
 ### Deleting a branch
 
-**Deleting a branch removes its entry and leaves its tombstone.** Its outputs are dropped and every
-sink consumer it holds is detached. Its operators are freed where no other entry holds them, and a
+**Deleting a branch removes its entry and leaves its tombstone.** Its outputs are dropped, which
+stops every sink consumer it holds. Its operators are freed where no other entry holds them, and a
 freed producer's `Drop` returns its release record to the source it read, per [Retention is the
 agreement, and a record dies with its
 producer](#retention-is-the-agreement-and-a-record-dies-with-its-producer). Each route no remaining
@@ -1084,8 +1086,8 @@ one.
 3. Record, for each source, where producers registering from then on start
    (`GlobalContext::carry_release_from`, `carry_release_to_new_producers`): where the predecessor's
    producers stopped, per [Routes across branches](#routes-across-branches). This runs while the
-   predecessor's producers all exist. Then tear down the branch's graph: detach every sink consumer
-   it holds and drop its outputs. A sink consumer belongs to the compile that built it, so to
+   predecessor's producers all exist. Then tear down the branch's graph: drop its outputs, which
+   stops every sink consumer it holds. A sink consumer belongs to the compile that built it, so to
    exactly one entry, per [The branch table](#the-branch-table). Branch-and-reload tears nothing
    down: it builds no copy of the parent's entry, and the parent's sink consumers stay the
    parent's.
@@ -1252,11 +1254,14 @@ holds a weak reference.
   and the `IterateExtentProducer` that registered it owns the strong side. A source handle outlives
   a version and the subscriptions against it do not. A strong registration would keep every operator
   any version ever subscribed alive and notified.
-- **Sink dispatch.** `SinkConsumer::detach` clears the producer slot at teardown. An operator the
-  next version carries forward still holds the notification closure that reaches the old sink
-  consumers, so without the clear they would keep being woken and keep writing to sinks the new
-  version now feeds. Clearing the slot also drops the operators behind it, which lets the fan-outs
-  they subscribed to see those subscriptions end.
+- **Sink dispatch.** `compile_program` subscribes a sink's operator with a weak handle on the
+  `SinkConsumer`, and the program's `CompiledOutput::sink_consumer` owns the strong side. The
+  consumer owns its producer slot, and the pull it schedules reads the slot weakly. Dropping the
+  output, at teardown or with its `CompiledProgram`, therefore ends dispatch. An operator the next
+  version carries forward still reaches the old consumer, but only through the weak handle, so it
+  wakes nothing, and a pull queued before the drop finds no producer. Dropping the consumer also
+  drops the operators behind it, which lets the fan-outs they subscribed to see those
+  subscriptions end.
 
 ### Nothing inside a fan-out owns it
 

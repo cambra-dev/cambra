@@ -2695,7 +2695,7 @@ mod tests {
         for (name, code) in pipeline_corpus() {
             let mut ctx = GlobalContext::default();
             let consumer: Box<dyn Consumer> = Box::new(|| {});
-            compile_program(&mut ctx, &LoadedProgram::from_text(name, &code), consumer)
+            let _ = compile_program(&mut ctx, &LoadedProgram::from_text(name, &code), consumer)
                 .unwrap_or_else(|e| panic!("{name}: expected a successful compile, got {e:?}"));
             total += take_predicate_sweep_skips();
         }

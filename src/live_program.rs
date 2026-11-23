@@ -152,29 +152,23 @@ impl Branch {
 
     /// Drop this version's subscriptions, keeping the tree it was built from.
     ///
-    /// Detaching the sinks is what ends this version's dispatch, and dropping
-    /// the outputs alone does not achieve it: an operator the next version
-    /// carries forward still holds the notification closure that reaches this
-    /// version's sink consumers, so they would keep being woken and keep writing
-    /// to sinks the next version now owns
-    /// ([`SinkConsumer::detach`](crate::interpreter::SinkConsumer::detach)).
+    /// Clearing the outputs ends this version's dispatch. The outputs are the
+    /// only strong owners of this version's sink consumers: an operator the next
+    /// version carries forward reaches them only through a weak handle, so once
+    /// they are dropped it wakes nothing, and a pull already queued finds no
+    /// producer ([`SinkConsumer`](crate::interpreter::SinkConsumer)).
     ///
     /// Each sink consumer belongs to exactly one entry, because it is built by
     /// the compilation of one version and branch-and-reload builds the new
     /// branch's own rather than sharing its parent's
     /// (`src/ccl/design/program-evolution.md`, "A branch is created by
-    /// branch-and-reload"). So a teardown detaches all of this entry's.
+    /// branch-and-reload"). So a teardown drops all of this entry's.
     /// [`LiveProgram::debug_assert_sink_consumers_unshared`] checks that.
     ///
     /// The tree stays because the reload diffs against it and the compile of
     /// the replacement keys reuse on it.
     fn tear_down(&mut self) {
         self.main_producer = None;
-        for output in &self.program.outputs {
-            if let Some(consumer) = &output.sink_consumer {
-                consumer.borrow_mut().detach();
-            }
-        }
         self.program.outputs.clear();
     }
 
@@ -308,6 +302,9 @@ impl From<Vec<CompileError>> for BranchError {
 ///
 /// Every branch runs from the moment it is created. The table is never empty:
 /// `main@1` is created with the process, and the last branch cannot be deleted.
+/// Dropping the table drops every branch's program, which stops its sinks.
+#[must_use = "dropping a `LiveProgram` stops every branch's sinks: hold it for as long as the \
+              program should run"]
 pub struct LiveProgram {
     /// Every branch the table holds, in creation order.
     branches: Vec<Branch>,
@@ -639,8 +636,8 @@ impl LiveProgram {
     }
 
     /// Check that no other entry's outputs hold a sink consumer entry `at`'s
-    /// outputs hold, which is what lets [`Branch::tear_down`] detach all of its
-    /// own.
+    /// outputs hold, which is what lets [`Branch::tear_down`] stop all of its
+    /// own by dropping them.
     fn debug_assert_sink_consumers_unshared(&self, at: usize) {
         if !cfg!(debug_assertions) {
             return;
@@ -1065,7 +1062,7 @@ the lagging branch first"
     /// Delete branch `name`'s entry and leave its tombstone
     /// (`src/ccl/design/program-evolution.md`, "Deleting a branch").
     ///
-    /// Its sink consumers are detached and its outputs dropped, and its
+    /// Its outputs are dropped, which stops its sink consumers, and its
     /// operators are freed where no other entry holds them; a freed producer's
     /// `Drop` returns its release record to the source it read. Every route no
     /// remaining branch binds is retired. The branches created from it keep

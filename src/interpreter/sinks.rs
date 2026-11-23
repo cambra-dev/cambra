@@ -89,8 +89,18 @@ impl DoneNotifier {
 /// loop — waits on that queue and runs at the scheduler's next delivery, by which time the
 /// slot is filled. [`pull_now`](Self::pull_now) pulls at once instead, which is what
 /// [`crate::ccl::context::compile_program`] does once it has filled the slot.
+///
+/// The consumer is its producer slot's only strong owner: the pull reads the slot through a
+/// weak handle, and the operator the consumer subscribes to holds the consumer weakly
+/// ([`crate::ccl::context::compile_program`]). Dropping the consumer therefore ends its dispatch,
+/// a pull already queued included, and frees the producer chain behind it. A [`DataSink`]
+/// outlives any one version of a program, and the consumer that feeds it does not.
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
+    #[expect(
+        dead_code,
+        reason = "the consumer owns the slot, and the pull reads it through a weak handle"
+    )]
     producer: ProducerSlot,
     /// The pull a notification schedules: one `get` of the producer, handed to the sink.
     pull: SharedConsumer,
@@ -111,9 +121,12 @@ impl SinkConsumer {
         wakeups: WakeupQueue,
     ) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
-        let producer = slot.clone();
+        let producer = Rc::downgrade(&slot);
         let mut done = Some(done);
         let pull: SharedConsumer = Rc::new(RefCell::new(move || {
+            let Some(producer) = producer.upgrade() else {
+                return;
+            };
             if let Some(prod) = producer.borrow_mut().as_mut() {
                 let guard = prod.tiling().universal_guard();
                 let tile = prod.get(guard);
@@ -140,20 +153,6 @@ impl SinkConsumer {
     /// replaced before it was ever pulled has opened none to hand on.
     pub fn pull_now(&self) {
         self.pull.borrow_mut().notify(&Projection::Everything);
-    }
-
-    /// Stop dispatching and release the producer chain behind this consumer.
-    ///
-    /// A [`DataSink`] outlives any one version of a program; the subscription
-    /// that feeds it does not. Detaching is what ends a replaced version's
-    /// dispatch, and it is not achieved by dropping the consumer alone: an
-    /// operator carried across the replacement still holds the notification
-    /// closure that reaches this consumer, so the replaced version would keep
-    /// being woken and keep writing to a sink its successor now owns. Clearing
-    /// the producer slot also drops the operators behind it, which is what lets
-    /// the fan-outs they subscribed to see those subscriptions end.
-    pub fn detach(&mut self) {
-        *self.producer.borrow_mut() = None;
     }
 }
 

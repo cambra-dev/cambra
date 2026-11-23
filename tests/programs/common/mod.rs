@@ -56,7 +56,7 @@
 //! fn http_greeter() {
 //!     let port = reserve_test_port();
 //!     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
-//!     let mut ctx = compile_sink(&source);
+//!     let (mut ctx, _program) = compile_sink(&source);
 //!     // …send requests on a background thread, drive_until the responses arrive…
 //! }
 //! ```
