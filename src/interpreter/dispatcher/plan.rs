@@ -2856,42 +2856,31 @@ impl Planner {
         let pipelines = self.members(Some(scope));
         let members = self.body_members(&pipelines, morsel_rows, runs);
         let store = self.scopes[scope].store.clone();
-        let kept: Vec<usize> = (0..members.len()).collect();
-        let (inner, planned, reads) = {
-            let reads = reads_of_kept(&pipelines.reads, &kept);
-            // A breaker in no pipeline keeps no entry: an id the planner gave it may be a kept
-            // pipeline's here, and a probe would take it for an arrival there.
-            for placement in pipelines.placements.iter().flatten() {
-                placement.set(None);
-            }
+        let (inner, planned) = {
+            // Each pipeline's entries name its local index while the body is planned, so a probe
+            // takes a push for an arrival at the pipeline it reaches. `ClearsPlacements` unplaces
+            // them once planning is done; execution places them again at their global ids.
             let placed = ClearsPlacements(&pipelines.placements);
-            for (at, &pipeline) in kept.iter().enumerate() {
-                for placement in &pipelines.placements[pipeline] {
-                    placement.set(Some(PipelineId(at)));
+            for (local, placements) in pipelines.placements.iter().enumerate() {
+                for placement in placements {
+                    placement.set(Some(PipelineId(local)));
                 }
             }
             let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-                loop_scope::reach_member(&members[kept[pipeline.0]], call)
+                loop_scope::reach_member(&members[pipeline.0], call)
             };
-            let names: Vec<String> = kept.iter().map(|&at| pipelines.names[at].clone()).collect();
-            let leaves: Vec<_> = kept
-                .iter()
-                .map(|&at| pipelines.leaves[at].clone())
-                .collect();
-            let kinds: Vec<Consumes> = kept.iter().map(|&at| pipelines.kinds[at]).collect();
             // A nested loop's drive records its source's complete pushes at the loop's pipeline,
             // which execution sets once the body is attached (`Execution::attach_store`). The
             // body's route walks pass that record, so it names the loop's pipeline here while they
             // run.
-            let nested: Vec<(usize, StoreCell)> = kept
+            let nested: Vec<&StoreCell> = members
                 .iter()
-                .enumerate()
-                .filter_map(|(at, &member)| match &members[member] {
-                    Member::Scope(scope) => Some((at, scope.clone())),
+                .filter_map(|member| match member {
+                    Member::Scope(scope) => Some(scope),
                     Member::Chain(_) => None,
                 })
                 .collect();
-            for (_, scope) in &nested {
+            for scope in &nested {
                 let mut scope = induction(scope);
                 debug_assert!(
                     !scope.decides_through_drive(),
@@ -2905,37 +2894,33 @@ impl Planner {
             // A store inside a scope is a nested loop's, whose scope is one pipeline, so no two
             // inner pipelines share a breaker's pushes.
             let (inner, planned, starts) = plan_edges(
-                &reads,
-                &names,
-                &leaves,
-                &vec![false; names.len()],
+                &pipelines.reads,
+                &pipelines.names,
+                &pipelines.leaves,
+                &vec![false; members.len()],
                 false,
-                &kinds,
-                &(0..names.len()).collect::<Vec<_>>(),
+                &pipelines.kinds,
+                &(0..members.len()).collect::<Vec<_>>(),
                 morsel_rows,
                 &mut reach,
-                &mut |pipeline| match &members[kept[pipeline.0]] {
+                &mut |pipeline| match &members[pipeline.0] {
                     Member::Scope(scope) => Some(induction(scope).pushing_end()),
                     Member::Chain(_) => None,
                 },
             );
             queue_starts(&inner, &starts);
-            for (_, scope) in &nested {
+            for scope in &nested {
                 induction(scope).forget_through_drive();
             }
             drop(placed);
-            (inner, planned, reads)
+            (inner, planned)
         };
+        let reads = &pipelines.reads;
         assert!(
             reads.iter().any(Vec::is_empty),
             "{} has a pipeline inside its cycle that reads none, the drive's",
             store.read().name()
         );
-        let mut members: Vec<Option<Member>> = members.into_iter().map(Some).collect();
-        let members: Vec<Member> = kept
-            .iter()
-            .map(|&at| members[at].take().expect("a pipeline is kept once"))
-            .collect();
         // Reporting preserves the scope hierarchy; execution later remaps every body graph.
         let mut planned = planned;
         for (plan, member) in planned.iter_mut().zip(&members) {
@@ -2947,10 +2932,7 @@ impl Planner {
             .filter(|&at| reads[at].is_empty() || !matches!(members[at], Member::Chain(_)))
             .map(PipelineId)
             .collect();
-        let placements = kept
-            .iter()
-            .map(|&at| pipelines.placements[at].clone())
-            .collect();
+        let placements = pipelines.placements.clone();
         let drive = driver_of(&members);
         debug_assert!(
             inner.is_source(drive),
@@ -3103,31 +3085,6 @@ fn consumes_at_once(breaker: &dyn Breaker) -> bool {
             .input_tiling(InputId::ONLY)
             .domain_extent()
             .is_some_and(|keys| crate::interpreter::tile_operators::keys_have_order(&keys))
-}
-
-/// The reads of the pipelines `kept` holds, numbered by their place in it: a read of a pipeline
-/// that is not kept is a read of the pipelines it reads.
-fn reads_of_kept(reads: &[Vec<usize>], kept: &[usize]) -> Vec<Vec<usize>> {
-    fn expand(reads: &[Vec<usize>], kept: &[usize], read: usize, into: &mut Vec<usize>) {
-        match kept.iter().position(|&pipeline| pipeline == read) {
-            Some(at) if !into.contains(&at) => into.push(at),
-            Some(_) => {}
-            None => {
-                for &beneath in &reads[read] {
-                    expand(reads, kept, beneath, into);
-                }
-            }
-        }
-    }
-    kept.iter()
-        .map(|&pipeline| {
-            let mut into = Vec::new();
-            for &read in &reads[pipeline] {
-                expand(reads, kept, read, &mut into);
-            }
-            into
-        })
-        .collect()
 }
 
 /// Whether the chain under `producer` reads the fan-out `fan` through a recurrence slot: whether
