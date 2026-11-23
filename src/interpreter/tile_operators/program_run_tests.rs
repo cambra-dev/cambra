@@ -5129,6 +5129,42 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
     assert_eq!(written, expected, "{body}");
 }
 
+/// A live source read beneath the outermost keys, as a nest's inner range is, answers at morsels of
+/// `rows` keys as at one whole push, with one worker or four. A sink's concurrent breaker takes
+/// the inner range cut into morsels (`LivePipeline::poll`). The pieces of an inner loop's range do
+/// not land as disjoint regions of its scope's input (`lands_as_morsels`), so the scope takes each
+/// arrival whole.
+#[rstest_log::rstest]
+#[case::a_concurrent_breaker(
+    "out << [sum([y * x for y in source1()]) for x in [1, 2]]",
+    "[u0 -> 15, u1 -> 30]"
+)]
+#[case::an_ordered_store(
+    indoc! {"
+        total := 0
+        for x in [1, 2]:
+            for y in source1():
+                total += x * y
+        out << total
+    "},
+    "45"
+)]
+fn a_live_inner_range_cut_into_morsels_answers_as_a_whole_push(
+    #[case] body: &str,
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(1, 4)] workers: usize,
+) {
+    let source = format!("out = test_sink()\n{body}");
+    let (value, _) =
+        dispatched_live_observed_on(&source, rows, workers, three_batches(), |_, _| {});
+    assert_eq!(
+        canonical(&single_value(&value)),
+        expected,
+        "{body} at morsels of {rows}, {workers} workers"
+    );
+}
+
 /// A row whose value is a record decides its fields one by one: a field that is final is
 /// published under the row while a collection in another field still grows with a live source. A
 /// sink over such rows therefore holds the rows at each idle, each collection field as far as the

@@ -3221,6 +3221,46 @@ fn driver_of(members: &[Member]) -> PipelineId {
     PipelineId(*driver)
 }
 
+/// Whether `pieces`, keys a range in `pipeline`'s chain yielded, reach `pipeline`'s own entry as
+/// disjoint regions of its input, at whatever level they land. A range beneath the pipeline's
+/// outermost keys, as a nest's inner range is, lands each piece beneath the rows it reaches: the
+/// pieces are disjoint where they name different inner keys, and they run alone or beside each
+/// other as their pipeline admits ([`consumes_at_once`]). Pieces that land on the same
+/// region, as a range re-keyed onto values its pieces share would, are pushed whole.
+///
+/// The first two pieces decide for all of them: every piece is a region of the same range pushed
+/// through the same consumers, so the chain maps each piece's keys to the pipeline's keys the same
+/// way. They are pushed through a probe landing, which records where they arrive and queues and
+/// records nothing else ([`Landing::probe`]).
+fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[Predicate]) -> bool {
+    let landed = |piece: &Predicate| -> Option<TileGuard> {
+        let mut landing = Landing::probe(pipeline);
+        crate::interpreter::notifications::notify_shared(
+            consumer,
+            &Projection::admitting(piece.clone()),
+            &mut landing,
+        );
+        let guards: Vec<TileGuard> = landing
+            .arrivals()
+            .into_iter()
+            .filter(|arrival| arrival.pipeline.0 == pipeline.0)
+            .map(|arrival| arrival.guard)
+            .collect();
+        if guards.is_empty() {
+            return None;
+        }
+        let guard = TileGuard::flatten_or(guards);
+        (!guard.is_empty()).then_some(guard)
+    };
+    let [first, second, ..] = pieces else {
+        return true;
+    };
+    match (landed(first), landed(second)) {
+        (Some(first), Some(second)) => first.intersect(&second).is_empty(),
+        _ => false,
+    }
+}
+
 /// Whether packages of `breaker`'s pipeline run beside each other: the breaker consumes
 /// concurrently ([`Breaker::consumes_concurrently`]) and its input is keyed by ordered keys. A
 /// package names keys at any level of the input, since every producer answers a projection at every
@@ -3505,6 +3545,8 @@ impl LivePipeline {
             }
         }
         let mut complete = true;
+        // What the pipeline's own ranges newly yielded, one guard per morsel its source cut.
+        let mut morsels: Vec<TileGuard> = Vec::new();
         // Several ranges can read one source, so a scope or a store is notified of the positions
         // they gained together, once.
         let mut positions = Predicate::False;
@@ -3521,21 +3563,46 @@ impl LivePipeline {
                 continue;
             }
             changed = true;
+            // The pipeline's own range takes the fresh keys in the morsels its source cuts them
+            // into, each pushed on its own, so the pipeline's packages are those morsels.
+            let own = matches!(self.notifies, Notifies::Arrivals) && holder.0 == self.pipeline.0;
+            let pieces = match own {
+                true => leaf.extent.morsels(&fresh, dispatcher.morsel_rows),
+                false => vec![fresh.clone()],
+            };
+            // Pieces that land on one region of the pipeline's input would run one at a time, each
+            // releasing what the others still read, so such a range's keys are pushed whole.
+            let pieces = match !lands_as_morsels(&leaf.consumer, self.pipeline, &pieces) {
+                true => vec![fresh.clone()],
+                false => pieces,
+            };
             // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
             // them, so an operator that pairs them with another input's rows records them.
-            let delivered = push_region(
-                dispatcher,
-                &leaf.consumer,
-                *holder,
-                &Projection::admitting(fresh.clone()),
-            );
+            // Only the pipeline's own entry lands guards of its input, so only those are collected.
+            let delivered: Vec<TileGuard> = pieces
+                .iter()
+                .map(|piece| {
+                    let landed = push_region(
+                        dispatcher,
+                        &leaf.consumer,
+                        *holder,
+                        &Projection::admitting(piece.clone()),
+                    );
+                    match own {
+                        true => landed
+                            .iter()
+                            .fold(self.input.empty_guard(), |morsel, guard| {
+                                morsel.union(guard)
+                            }),
+                        false => self.input.empty_guard(),
+                    }
+                })
+                .collect();
             match self.notifies {
                 // What reaches another pipeline's entry is that pipeline's: a scope that inherits
                 // a read pipeline's ranges takes their keys through its rounds.
-                Notifies::Arrivals if holder.0 == self.pipeline.0 => {
-                    for guard in delivered {
-                        arrivals = arrivals.union(&guard);
-                    }
+                Notifies::Arrivals if own => {
+                    morsels.extend(delivered.into_iter().filter(|morsel| !morsel.is_empty()));
                 }
                 Notifies::Items {
                     arms: Some(ref arms),
@@ -3590,10 +3657,25 @@ impl LivePipeline {
                 arrivals = arrivals.union(&region);
             }
         }
-        // Each poll announces what its ranges newly yielded, and the first poll also what its
-        // constants and starts bring.
+        // Each poll announces what its ranges newly yielded, morsel by morsel, and the first poll
+        // also what its constants and starts bring.
         if !arrivals.is_empty() {
             notify_unreleased(dispatcher, execution, reach, self.pipeline, &arrivals);
+        }
+        // Two ranges of one pipeline, as the two sides of a join are, can deliver the same rows,
+        // and two packages naming a row read it twice when they run at once. Each morsel is
+        // queued less what the poll queued before it.
+        let mut queued = arrivals;
+        let morsels: Vec<TileGuard> = morsels
+            .into_iter()
+            .filter_map(|morsel| {
+                let fresh = guard_minus(&morsel, &queued);
+                queued = queued.union(&morsel);
+                (!fresh.is_empty()).then_some(fresh)
+            })
+            .collect();
+        for morsel in &morsels {
+            notify_unreleased(dispatcher, execution, reach, self.pipeline, morsel);
         }
         if !positions.is_false() {
             notify_unreleased(
