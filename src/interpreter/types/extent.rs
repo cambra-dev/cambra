@@ -95,6 +95,19 @@ pub struct NotifyOrSubscribeResult {
 }
 
 impl Extent {
+    /// `region`, a region of this extent's keys a source has yielded, cut into the morsels the
+    /// source queues it as (`DataSourceDomainExtentImpl::morsels`). An extent that is no source's
+    /// domain answers `region` whole.
+    pub(crate) fn morsels(&self, region: &Predicate, rows: usize) -> Vec<Predicate> {
+        match self {
+            Self::DataSourceDomain(source) => source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .morsels(region, rows),
+            _ => vec![region.clone()],
+        }
+    }
+
     /// The iteration region whose presence or absence is decided by every source it reads.
     pub(crate) fn complete_region(&self) -> Predicate {
         match self {
@@ -377,6 +390,15 @@ pub trait DataSourceDomainExtentImpl: Send + Sync {
     /// Returns the current yield predicate: the region of domain values
     /// available to consume.
     fn get_yield_predicate(&self) -> Predicate;
+    /// `region`, a region of the keys this source has yielded, cut into the morsels it is queued
+    /// as: at most `rows` of the keys it holds each, in key order. The pieces partition `region`.
+    /// A source pushes each morsel separately, so the pipeline reading it takes them in parallel,
+    /// or in key order where it is ordered. The default answers `region` whole, which every source
+    /// but the test source (`TestDataSource`) does: the HTTP and stdin sources queue each arrival
+    /// as one package.
+    fn morsels(&self, region: &Predicate, _rows: usize) -> Vec<Predicate> {
+        vec![region.clone()]
+    }
     /// Returns the current set of domain elements as a ColumnValue, according to the stored
     /// obsolete predicate of the producer.
     fn get_elements(&self, producer: &str) -> ColumnValue;
