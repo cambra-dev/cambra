@@ -15,7 +15,7 @@ Cambra removes those boundaries, and the design aims at three results:
 - **One program instead of a stack.** One language, one type system, one execution model and
   whole-program tooling. A feature that would touch several services is one change to one program.
 - **Changes that are checked before they run.** The type system is built on refinement types:
-  types carry predicates (`{q: Int | q >= 0}`), and because the whole application lives in one
+  types carry predicates (`{Int where _ >= 0}`), and because the whole application lives in one
   model, those predicates compose across what would otherwise be component boundaries. This is
   end-to-end, low-overhead checking of application invariants, not full formal verification of
   the program. A running program can also be replaced in place: the control port's `/reload`
@@ -56,8 +56,8 @@ The aim is to abstract over memory, threads, and connections the way garbage col
 
 ```python
 products = [
-    {sku: "espresso", price: 3},
-    {sku: "latte",    price: 5},
+    (sku="espresso", price=3),
+    (sku="latte",    price=5),
 ]
 
 # Orders arrive over HTTP: each POST body is an order record.
@@ -70,7 +70,7 @@ for o in orders:
 revenue_reqs, revenue_resps = http_serve("8080", "GET", "/revenue")
 for req in revenue_reqs:
     with txn = begin():
-        so_far = orders.restrict(lambda o: o.time < txn::now())
+        so_far = orders.restrict(\o -> o.time < txn::now())
         revenue = sum([p.price * o.qty for p in products for o in so_far if p.sku == o.sku])
         revenue_resps[req.id] = str(revenue) + "\n"
 ```
