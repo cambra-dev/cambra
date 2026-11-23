@@ -91,7 +91,7 @@ impl WriterRun {
         self.open() && self.body.release_followers(dispatcher, read)
     }
 
-    /// The step's follower hold, read before a publication pass, or `None` before the writer is
+    /// The body's follower hold, read before a publication pass, or `None` before the writer is
     /// attached.
     pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
         self.body.followers_hold(dispatcher)

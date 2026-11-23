@@ -136,6 +136,8 @@ pub(super) struct Attached {
     base: usize,
     /// The pipeline that follows every inner one, whose claim ends a round or an attempt.
     pub(super) step: PipelineId,
+    /// The follower hold of the inner pipelines and the step.
+    pub(super) hold: HoldGroup,
 }
 
 impl Body {
@@ -170,7 +172,13 @@ impl Body {
 
     /// Record where execution appended the graph: after the scope's pipeline `pipeline`, from
     /// global id `base`, with the step `step`.
-    pub(super) fn attach(&mut self, pipeline: PipelineId, base: usize, step: PipelineId) {
+    pub(super) fn attach(
+        &mut self,
+        pipeline: PipelineId,
+        base: usize,
+        step: PipelineId,
+        hold: HoldGroup,
+    ) {
         debug_assert!(
             self.graph.is_none() && self.attached.is_none(),
             "a body's graph is taken, then attached, once"
@@ -179,6 +187,7 @@ impl Body {
             pipeline,
             base,
             step,
+            hold,
         });
     }
 
@@ -245,21 +254,21 @@ impl Body {
         if !self.active {
             return;
         }
-        dispatcher.hold_followers(self.with_step(), true);
+        dispatcher.hold_followers(self.attached().hold);
     }
 
-    /// Let the pipelines that follow the inner pipelines and the step run, where the body runs and
-    /// the step's hold is still `read`, taken before the publication pass that decided the release:
-    /// held, and held again by no claim since ([`Dispatcher::release_followers_if`]). Whether this
-    /// call released them.
+    /// Let the inner pipelines and the step follow their reads, where the body runs and its hold
+    /// is still `read`, taken before the publication pass that decided the release: held, and held
+    /// again by no claim since ([`Dispatcher::release_followers_if`]). Whether this call released
+    /// them.
     pub(super) fn release_followers(&self, dispatcher: &Dispatcher, read: FollowersHold) -> bool {
-        self.active && dispatcher.release_followers_if(self.with_step(), self.attached().step, read)
+        self.active && dispatcher.release_followers_if(self.attached().hold, read)
     }
 
-    /// The step's follower hold, read before a publication pass, or `None` before the body is
+    /// The body's follower hold, read before a publication pass, or `None` before the body is
     /// attached.
     pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
-        Some(dispatcher.followers_hold(self.attached.as_ref()?.step))
+        Some(dispatcher.followers_hold(self.attached.as_ref()?.hold))
     }
 
     /// End the open round or attempt with a step package of `guard` once the inner pipelines are
@@ -281,7 +290,7 @@ impl Body {
         // here is the one that acknowledgement set.
         if self.pending_step.is_none()
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|pipeline| pipeline.0))
-            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
+            || dispatcher.followers_hold(self.attached().hold).0 & 1 == 1
             || self.members_hold_rows()
         {
             return false;
@@ -711,7 +720,7 @@ impl InductionStoreProducer {
             && run.body.release_followers(dispatcher, read)
     }
 
-    /// The step's follower hold, read before a publication pass, or `None` before the scope is
+    /// The body's follower hold, read before a publication pass, or `None` before the scope is
     /// attached.
     pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
         self.run().body.followers_hold(dispatcher)
