@@ -3306,7 +3306,10 @@ fn chain_restated_level(
     let restates = |level: CurryLevel| {
         let mut refused = false;
         producer.visit_input_producers(&mut |_, input| {
-            refused |= unrestated(input, Some(level), consuming, false).is_some();
+            // The breaker's own input answers the package as it is: the walk below stops at a
+            // recurrence slot or a store read, which the input itself may be.
+            refused |= input.restates().refuses(level)
+                || unrestated(input, Some(level), consuming, false).is_some();
         });
         !refused
     };
