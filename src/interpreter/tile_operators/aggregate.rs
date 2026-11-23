@@ -296,15 +296,11 @@ impl Breaker for AggregateProducer {
         self.mark_terminal();
     }
     fn parallel_level(&self) -> Option<CurryLevel> {
-        if self.kind == AggregateKind::Sum
-            || matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
+        if matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
         {
             return None;
         }
-        parallel_input_level(&*self.input, false)
-    }
-    fn requires_ordered_input(&self) -> bool {
-        self.kind == AggregateKind::Sum
+        parallel_input_level(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1415,18 +1411,10 @@ impl Breaker for MapAggregateProducer {
         self.input.release(self.input.tiling().universal_guard());
     }
     fn parallel_level(&self) -> Option<CurryLevel> {
-        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
-        if state.kind == AggregateKind::Sum || folded_shape(self.tiling()).1.holds_a_level() {
+        if folded_shape(self.tiling()).1.holds_a_level() {
             return None;
         }
-        parallel_input_level(&*self.input, true)
-    }
-    fn requires_ordered_input(&self) -> bool {
-        self.state
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .kind
-            == AggregateKind::Sum
+        parallel_input_level(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {

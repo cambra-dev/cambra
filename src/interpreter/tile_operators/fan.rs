@@ -294,34 +294,36 @@ impl TileOperator for Zip {
             true => consumer,
             false => crate::interpreter::notifications::through_values(self.level, consumer),
         });
-        // Beneath rows the arms share the rows' keys, and a row exists once every arm has
-        // delivered it, so each arm's delivery is passed on under the rows the others delivered
-        // (`notifications::aligned`).
-        let delivered = crate::interpreter::notifications::nothing_aligned(
-            self.inputs.iter().map(|input| input.keys_arrive_by_push()),
-        );
+        // The arms share the rows' keys, beneath rows and at the outermost level alike, and a
+        // row exists once every arm has delivered it (`AlignedInputs`).
+        let rows = self
+            .level
+            .enclosing()
+            .filter(|_| beneath_rows)
+            .unwrap_or(CurryLevel::OUTERMOST);
+        let aligned = crate::interpreter::notifications::AlignedInputs::new(rows, &self.inputs);
+        let keys = crate::interpreter::notifications::InputRows::Keys;
         let inputs = self
             .inputs
             .iter()
             .zip(&self.names)
             .enumerate()
             // Every arm is pulled at the projection: the arms share the pair's keys.
-            .map(|(arm, (input, name))| match self.level.enclosing() {
-                Some(rows) if beneath_rows => input.clone().subscribe(
-                    input.tiling().universal_guard(),
-                    crate::interpreter::notifications::aligned(
-                        arm,
-                        rows,
-                        delivered.clone(),
-                        crate::interpreter::notifications::field_beneath_rows(
-                            name.clone(),
-                            self.level,
-                            forwarding_consumer_keeping_keys(&shared),
-                        ),
+            .map(|(arm, (input, name))| {
+                let forward = forwarding_consumer_keeping_keys(&shared);
+                let forward = match beneath_rows {
+                    true => crate::interpreter::notifications::field_beneath_rows(
+                        name.clone(),
+                        self.level,
+                        forward,
                     ),
+                    false => forward,
+                };
+                input.clone().subscribe(
+                    input.tiling().universal_guard(),
+                    aligned.consumer(arm, keys, forward),
                     cx,
-                ),
-                _ => subscribe_forwarding_keeping_keys(input, &shared, cx),
+                )
             })
             .collect();
         Box::new(ZipProducer {
@@ -961,6 +963,16 @@ impl TileOperator for MakeRecord {
         for (i, input) in self.inputs.iter().enumerate() {
             visit(value_at(i, &**input));
         }
+    }
+
+    fn fields_arrive_by_push(&self) -> Option<Vec<(SmolStr, bool)>> {
+        Some(
+            self.names
+                .iter()
+                .zip(&self.inputs)
+                .map(|(name, input)| (name.clone(), input.keys_arrive_by_push()))
+                .collect(),
+        )
     }
 
     fn subscribe(

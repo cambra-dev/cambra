@@ -121,6 +121,17 @@ pub trait TileOperator: Send + Sync {
         arrives
     }
 
+    /// Per field of the record this operator builds from operands of its own, the field's name
+    /// and whether its value reaches readers by a push ([`keys_arrive_by_push`]); `None` for an
+    /// operator that builds no record from operands. Such a record's fields arrive
+    /// independently, so a reader of the whole record waits for all of them
+    /// (`notifications::whole_once_complete`).
+    ///
+    /// [`keys_arrive_by_push`]: Self::keys_arrive_by_push
+    fn fields_arrive_by_push(&self) -> Option<Vec<(SmolStr, bool)>> {
+        None
+    }
+
     /// Return the [`Tiling`] that describes this operator's output shape.
     /// If the operator has unbound arguments, the tiling will be a curried function
     /// from inputs to the output.
@@ -270,19 +281,6 @@ pub(crate) fn subscribe_forwarding_keeping_keys(
         forwarding_consumer_keeping_keys(shared),
         cx,
     )
-}
-
-/// [`subscribe_forwarding_keeping_keys`] where `keeps_keys`, and [`subscribe_forwarding`] where not.
-pub(crate) fn subscribe_forwarding_keeping_keys_if(
-    keeps_keys: bool,
-    op: &Arc<dyn TileOperator>,
-    shared: &SharedConsumer,
-    cx: &mut SubscribeContext,
-) -> Box<dyn TileProducer> {
-    match keeps_keys {
-        true => subscribe_forwarding_keeping_keys(op, shared, cx),
-        false => subscribe_forwarding(op, shared, cx),
-    }
 }
 
 /// What a pipeline breaker's operator passes its input, and what the breaker keeps. The breaker
@@ -880,6 +878,12 @@ pub struct ProducerBase {
     // shared-state-ok: this producer's debug record of its last output, which `get` changes
     // through `&self` on any worker thread; no other operator holds it.
     pub(crate) last_output: RwLock<Option<Tile>>,
+    /// How many answers `last_output` has recorded. A pull compares its answer with the record
+    /// only where no other pull recorded one while it ran: two pulls on two threads at once have
+    /// no order, and the one that finishes later may hold the older state.
+    // shared-state-ok: part of this producer's debug record of its last output; no other operator
+    // holds it.
+    pub(crate) answers_recorded: std::sync::atomic::AtomicU64,
     /// For a pipeline breaker, the consumer its pushes climb (`dispatcher::Pushes`), which is
     /// its reader's chain; for a range (`IterateExtent`), the consumer a planner pushes its region
     /// through once. `None` for every other producer.
@@ -908,6 +912,7 @@ impl ProducerBase {
             #[cfg(test)]
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_output: RwLock::new(None),
+            answers_recorded: std::sync::atomic::AtomicU64::new(0),
             downstream: None,
             placement: None,
         }
@@ -952,6 +957,7 @@ impl ProducerBase {
             #[cfg(test)]
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_output: RwLock::new(None),
+            answers_recorded: std::sync::atomic::AtomicU64::new(0),
             downstream: None,
             placement: Some(crate::interpreter::dispatcher::Placement::default()),
         }
@@ -1542,7 +1548,6 @@ pub(crate) fn cut_at_keys(
     rows: usize,
     tiling: &Tiling,
 ) -> Vec<TileGuard> {
-    assert!(rows > 0, "a morsel holds at least one row");
     let (TileGuard::Function(FunctionGuard::Domain(region)), Some(domain)) =
         (guard, tiling.domain_extent())
     else {
@@ -1551,12 +1556,33 @@ pub(crate) fn cut_at_keys(
     if region.qualifies() {
         return vec![guard.clone()];
     }
+    cut_region_at_keys(region, held, rows, &domain)
+        .into_iter()
+        .map(|morsel| TileGuard::Function(FunctionGuard::Domain(morsel)))
+        .collect()
+}
+
+/// `region`, a region of keys over `domain`, cut into morsels of at most `rows` of the `held`
+/// keys each, in key order, as [`cut_at_keys`] cuts a guard: a region naming no more than `rows`
+/// held keys is one morsel. A source cuts the keys it yields with it
+/// (`DataSourceDomainExtentImpl::morsels`).
+///
+/// # Panics
+///
+/// When a cut is needed and a held key has no order, such as a function value.
+pub(crate) fn cut_region_at_keys(
+    region: &Predicate,
+    held: impl IntoIterator<Item = Value>,
+    rows: usize,
+    domain: &Extent,
+) -> Vec<Predicate> {
+    assert!(rows > 0, "a morsel holds at least one row");
     let mut keys: Vec<Value> = held
         .into_iter()
         .filter(|key| region.contains(key))
         .collect();
     if keys.len() <= rows {
-        return vec![guard.clone()];
+        return vec![region.clone()];
     }
     if let Some(key) = keys.iter().find(|key| !has_order(key)) {
         panic!("a collection is cut into morsels in key order, which the key {key:?} has none of");
@@ -1567,7 +1593,13 @@ pub(crate) fn cut_at_keys(
     });
     keys.dedup();
     let cuts: Vec<Value> = keys.into_iter().skip(rows).step_by(rows).collect();
-    cut_before(region, &cuts, &domain)
+    cut_before(region, &cuts, domain)
+        .into_iter()
+        .map(|morsel| match morsel {
+            TileGuard::Function(FunctionGuard::Domain(keys)) => keys,
+            _ => unreachable!("a cut of keys is a region of keys"),
+        })
+        .collect()
 }
 
 /// Whether `key` has an order among the keys of its type: every value but a function, as
@@ -1967,6 +1999,14 @@ pub trait TileProducer: Send + Sync {
                 self.restates()
             );
         }
+        // What the producer released before the pull began, which the answer must not hold. A
+        // release that lands while the pull runs comes from another package's thread; the answer
+        // can predate it.
+        let released_before = cfg!(debug_assertions).then(|| self.withheld_guard());
+        let recorded_before = self
+            .base()
+            .answers_recorded
+            .load(std::sync::atomic::Ordering::SeqCst);
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
@@ -1979,10 +2019,10 @@ pub trait TileProducer: Send + Sync {
         // Computed only in a debug build, where the checks read it: a current-value slot's
         // withheld guard locks the fan-out's shared state.
         let withheld = cfg!(debug_assertions).then(|| self.withheld_guard());
-        if let Some(withheld) = &withheld {
+        if let Some(released_before) = &released_before {
             assert!(
-                !result.contains_guarded(withheld),
-                "{} returned data it had released: {result:?} overlaps {withheld:?}",
+                !result.contains_guarded(released_before),
+                "{} returned data it had released: {result:?} overlaps {released_before:?}",
                 self.name(),
             );
         }
@@ -2019,6 +2059,13 @@ pub trait TileProducer: Send + Sync {
                 .last_output
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
+            // Another pull recorded an answer while this one ran, so the two have no order and
+            // neither holds the other to its statement.
+            let concurrent = self
+                .base()
+                .answers_recorded
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != recorded_before;
             let last_in_region = history.as_ref().map(|last| {
                 let mut last = last.clone();
                 if let Some(region) = &region {
@@ -2026,7 +2073,8 @@ pub trait TileProducer: Send + Sync {
                 }
                 last
             });
-            if let Some(last) = &last_in_region
+            if !concurrent
+                && let Some(last) = &last_in_region
                 && let Some(violation) =
                     completeness_violation(&self.name(), last, &result, withheld)
             {
@@ -2055,7 +2103,12 @@ pub trait TileProducer: Send + Sync {
                 }
                 _ => result.clone(),
             };
+            // The answer that finishes last is recorded whatever its order: a record that skips
+            // it would hold a later pull to a statement older than one already made.
             *history = Some(stated);
+            self.base()
+                .answers_recorded
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         assert!(
             result.check_from(self.tiling()),
@@ -3932,19 +3985,10 @@ mod tests {
     }
 }
 
-/// Independent position claims of a native input. Nested materialization retains whole rows.
-fn parallel_input_level(input: &dyn TileProducer, inner: bool) -> Option<CurryLevel> {
-    let tiling = input.tiling();
-    let level = if matches!(tiling.domain_extent(), Some(Extent::UIntRange(_))) {
-        CurryLevel::OUTERMOST
-    } else if inner
-        && matches!(tiling,
-        Tiling::DataFunction { codomain, .. }
-        if matches!(&**codomain, Tiling::DataFunction { domain: Extent::UIntRange(_), .. }))
-    {
-        CurryLevel::new(1)
-    } else {
-        return None;
-    };
-    (!input.restates().refuses(level)).then_some(level)
+/// The level at which independent claims of `input` split it: its outermost keys, whatever their
+/// extent, since each claim is a projection of those keys disjoint from every other claim. `None`
+/// for an input with no keys.
+pub(crate) fn parallel_input_level(input: &dyn TileProducer) -> Option<CurryLevel> {
+    let level = CurryLevel::OUTERMOST;
+    (input.tiling().is_data_function() && !input.restates().refuses(level)).then_some(level)
 }

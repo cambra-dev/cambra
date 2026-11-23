@@ -1572,6 +1572,10 @@ pub(crate) struct MemoProducer {
     // shared-state-ok: this producer's own state, which `get`, `consume_impl` and `release` change
     // through `&self` on any worker thread; no other operator holds it.
     cached_tile: RwLock<Tile>,
+    // shared-state-ok: held shared by each consume while it reads the input and exclusively by a
+    // release of the input, so a release waits for the consumes in flight; no other operator
+    // holds it.
+    reading_input: RwLock<()>,
 }
 
 impl MemoProducer {
@@ -1582,6 +1586,7 @@ impl MemoProducer {
             base,
             input,
             cached_tile: RwLock::new(cached_tile),
+            reading_input: RwLock::new(()),
         }
     }
 
@@ -1700,6 +1705,14 @@ impl Breaker for MemoProducer {
     fn consume_impl(&self, _: InputId, guard: TileGuard) {
         assert!(guard.check_from(self.input.tiling()));
         let projection = guard.projection_for(self);
+        // A reader of the cache can release it while the memo's own pipeline still consumes, and
+        // the release reaches the input (`release_impl`). Workers consume packages at once, so
+        // the input is read under a shared hold that a release waits for: a consume either
+        // finishes before the release or finds the region released and reads nothing.
+        let _reading = self
+            .reading_input
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         if projection == Projection::Nothing || guard_covers(&self.input.obsolete_guard(), &guard) {
             return;
         }
@@ -1729,6 +1742,8 @@ impl Breaker for MemoProducer {
     fn finish_parallel_input(&mut self) {
         self.input.release(self.input.tiling().universal_guard());
     }
+    /// Rows of nested collections are not split: a merge of the packages' answers loses the
+    /// completion each states of its rows' inner collections.
     fn parallel_level(&self) -> Option<CurryLevel> {
         let Tiling::DataFunction { codomain, .. } = self.input.tiling() else {
             return None;
@@ -1736,7 +1751,7 @@ impl Breaker for MemoProducer {
         if codomain.holds_a_level() {
             return None;
         }
-        parallel_input_level(&*self.input, false)
+        parallel_input_level(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1827,6 +1842,10 @@ impl TileProducer for MemoProducer {
     }
 
     fn release_impl(&self, guard: TileGuard) {
+        let _no_reads = self
+            .reading_input
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut cache = self
             .cached_tile
             .write()

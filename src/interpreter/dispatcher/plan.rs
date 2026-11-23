@@ -9,7 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
-use super::workers::WorkerPool;
+use super::workers::{WorkerPool, WorkerTarget};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -886,12 +886,32 @@ fn run_targets(
         })
         .collect();
     let consuming: Vec<BreakerHandle> = worker_targets.iter().flatten().cloned().collect();
+    // A push into a scope's pipeline offers the scope requests, which the coordinator queues after
+    // the consume or the finish that pushed them (`Execution::consume`, `Execution::finish`).
+    let mut read_by_scope = vec![false; execution.handlers.len()];
+    for (pipeline, handler) in execution.handlers.iter().enumerate() {
+        if matches!(handler, Handler::Request(_)) {
+            for &read in &dispatcher.infos[pipeline].reads {
+                read_by_scope[read] = true;
+            }
+        }
+    }
     let worker_targets = worker_targets
         .into_iter()
-        .map(|target| target.filter(|handle| chain_restates_parallel_level(handle, &consuming)))
+        .zip(read_by_scope)
+        .map(|(target, read_by_scope)| {
+            target.map(|handle| WorkerTarget {
+                parallel: chain_restates_parallel_level(&handle, &consuming),
+                serial: !read_by_scope,
+                handle,
+            })
+        })
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
     let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
+    for pipeline in workers.serial() {
+        dispatcher.order(pipeline);
+    }
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher);
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
@@ -1153,6 +1173,11 @@ impl Scope {
         if self.queue_requests(dispatcher) {
             return true;
         }
+        if matches!(self, Scope::Loop(_))
+            && self.with_body(|body| body.close_step_when_settled(dispatcher))
+        {
+            return true;
+        }
         if let Some(pipeline) = self.with_body(|body| body.take_finish(dispatcher)) {
             finish_with(dispatcher, reach, pipeline);
             self.with_body(|body| body.unplace());
@@ -1324,7 +1349,10 @@ impl Execution {
         dispatcher: &mut Dispatcher,
         pipeline: PipelineId,
     ) {
-        self.attach_body(Scope::Loop(store.clone()), pipeline, dispatcher);
+        let step = self.attach_body(Scope::Loop(store.clone()), pipeline, dispatcher);
+        // A loop's step is closed by its scope once the last round's step is queued
+        // (`Body::close_step_when_settled`).
+        dispatcher.take_arrivals(step);
         // A drive's source offers its pushes only to a scope that takes its positions from them,
         // which the run sets once its scopes are attached.
         induction(store).forget_through_drive();
@@ -1565,7 +1593,13 @@ impl Execution {
         }
         loop {
             match workers.next(dispatcher) {
+                Next::Package(package) if workers.admits(package.pipeline) => {
+                    workers.consume_on_coordinator(dispatcher, package)
+                }
                 Next::Package(package) => self.consume(dispatcher, reach, package),
+                Next::Finish { pipeline } if workers.finishes(pipeline) => {
+                    workers.finish(dispatcher, pipeline)
+                }
                 Next::Finish { pipeline } => {
                     workers.finishing(pipeline, reach);
                     self.finish(dispatcher, reach, pipeline)
@@ -1574,6 +1608,9 @@ impl Execution {
                     dispatcher.wait(generation)
                 }
                 Next::Wait(_) if self.resume(dispatcher, reach) => {}
+                // A worker's claim can become ready while the pass runs, so the workers are asked
+                // again after it.
+                Next::Wait(_) if workers.may_progress(dispatcher) => {}
                 Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
                 Next::Wait(_) => {
                     panic!("an acyclic run with no pending loop has a pipeline that may finish")
@@ -3583,6 +3620,8 @@ impl LivePipeline {
             }
         }
         let mut complete = true;
+        // What the pipeline's own ranges newly yielded, one guard per morsel its source cut.
+        let mut morsels: Vec<TileGuard> = Vec::new();
         // Several ranges can read one source, so a scope or a store is notified of the positions
         // they gained together, once.
         let mut positions = Predicate::False;
@@ -3599,21 +3638,41 @@ impl LivePipeline {
                 continue;
             }
             changed = true;
+            // The pipeline's own range takes the fresh keys in the morsels its source cuts them
+            // into, each pushed on its own, so the pipeline's packages are those morsels.
+            let own = matches!(self.notifies, Notifies::Arrivals) && holder.0 == self.pipeline.0;
+            let pieces = match own {
+                true => leaf.extent.morsels(&fresh, dispatcher.morsel_rows),
+                false => vec![fresh.clone()],
+            };
+            // A range beneath the pipeline's outermost keys, as the inner range of a nest is, names
+            // part of each row it reaches, so its pieces are no morsels of the pipeline's rows.
+            let pieces = match !lands_as_morsels(&leaf.consumer, self.pipeline, &pieces) {
+                true => vec![fresh.clone()],
+                false => pieces,
+            };
             // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
             // them, so an operator that pairs them with another input's rows records them.
-            let delivered = push_region(
-                dispatcher,
-                &leaf.consumer,
-                *holder,
-                &Projection::admitting(fresh.clone()),
-            );
+            let delivered: Vec<TileGuard> = pieces
+                .iter()
+                .map(|piece| {
+                    push_region(
+                        dispatcher,
+                        &leaf.consumer,
+                        *holder,
+                        &Projection::admitting(piece.clone()),
+                    )
+                    .iter()
+                    .fold(self.input.empty_guard(), |morsel, guard| {
+                        morsel.union(guard)
+                    })
+                })
+                .collect();
             match self.notifies {
                 // What reaches another pipeline's entry is that pipeline's: a scope that inherits
                 // a read pipeline's ranges takes their keys through its rounds.
-                Notifies::Arrivals if holder.0 == self.pipeline.0 => {
-                    for guard in delivered {
-                        arrivals = arrivals.union(&guard);
-                    }
+                Notifies::Arrivals if own => {
+                    morsels.extend(delivered.into_iter().filter(|morsel| !morsel.is_empty()));
                 }
                 Notifies::Items {
                     arms: Some(ref arms),
@@ -3668,10 +3727,25 @@ impl LivePipeline {
                 arrivals = arrivals.union(&region);
             }
         }
-        // Each poll announces what its ranges newly yielded, and the first poll also what its
-        // constants and starts bring.
+        // Each poll announces what its ranges newly yielded, morsel by morsel, and the first poll
+        // also what its constants and starts bring.
         if !arrivals.is_empty() {
             notify_unreleased(dispatcher, execution, reach, self.pipeline, &arrivals);
+        }
+        // Two ranges of one pipeline, as the two sides of a join are, can deliver the same rows,
+        // and two packages naming a row read it twice when they run at once. Each morsel is
+        // queued less what the poll queued before it.
+        let mut queued = arrivals;
+        let morsels: Vec<TileGuard> = morsels
+            .into_iter()
+            .filter_map(|morsel| {
+                let fresh = guard_minus(&morsel, &queued);
+                queued = queued.union(&morsel);
+                (!fresh.is_empty()).then_some(fresh)
+            })
+            .collect();
+        for morsel in &morsels {
+            notify_unreleased(dispatcher, execution, reach, self.pipeline, morsel);
         }
         if !positions.is_false() {
             notify_unreleased(
@@ -3690,6 +3764,39 @@ impl LivePipeline {
             changed = true;
         }
         changed
+    }
+}
+
+/// Whether the first two of `pieces`, keys a range in `pipeline`'s chain yielded, reach
+/// `pipeline`'s own entry as disjoint regions of the outermost keys of its input, read off a probe,
+/// which grows no cache. A range beneath those keys, as the inner range of a nest is, reaches each
+/// row whole or in part, and its pieces then name the same rows.
+fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[Predicate]) -> bool {
+    let landed = |piece: &Predicate| -> Option<Predicate> {
+        let mut landing = Landing::probe(pipeline);
+        crate::interpreter::notifications::notify_shared(
+            consumer,
+            &Projection::admitting(piece.clone()),
+            &mut landing,
+        );
+        landing
+            .arrivals()
+            .into_iter()
+            .filter(|arrival| arrival.pipeline.0 == pipeline.0)
+            .try_fold(Predicate::False, |keys, arrival| match arrival.guard {
+                TileGuard::Function(FunctionGuard::Domain(landed)) if !landed.qualifies() => {
+                    Some(keys.union(&landed))
+                }
+                _ => None,
+            })
+            .filter(|keys| !keys.is_false())
+    };
+    let [first, second, ..] = pieces else {
+        return true;
+    };
+    match (landed(first), landed(second)) {
+        (Some(first), Some(second)) => first.intersect(&second).is_false(),
+        _ => false,
     }
 }
 
@@ -3731,6 +3838,11 @@ fn drive_live(
     live: &mut [LivePipeline],
     observer: &mut dyn RunObserver,
 ) -> bool {
+    // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
+    // and the run has no finish before its sources close, so each pushes what it holds first. The
+    // workers already claim, so this comes before any source starts: until then no pipeline can
+    // finish, and a pipeline a worker finishes between the check and the landing takes no push.
+    execution.push_held(dispatcher, reach);
     for (pipeline, info) in dispatcher.infos.iter().take(execution.roots).enumerate() {
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
             let mut input = None;
@@ -3741,9 +3853,6 @@ fn drive_live(
             dispatcher.start_source(PipelineId(pipeline), &input, &released);
         }
     }
-    // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
-    // and the run has no finish before its sources close, so each pushes what it holds first.
-    execution.push_held(dispatcher, reach);
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
         for (_, leaf, _) in live.iter().flat_map(|at| &at.leaves) {
@@ -3766,7 +3875,13 @@ fn drive_live(
         }
         loop {
             match workers.next(dispatcher) {
+                Next::Package(package) if workers.admits(package.pipeline) => {
+                    workers.consume_on_coordinator(dispatcher, package)
+                }
                 Next::Package(package) => execution.consume(dispatcher, reach, package),
+                Next::Finish { pipeline } if workers.finishes(pipeline) => {
+                    workers.finish(dispatcher, pipeline)
+                }
                 Next::Finish { pipeline } => {
                     workers.finishing(pipeline, reach);
                     execution.finish(dispatcher, reach, pipeline)
@@ -3775,6 +3890,9 @@ fn drive_live(
                     dispatcher.wait(generation)
                 }
                 Next::Wait(_) if execution.resume(dispatcher, reach) => {}
+                // A worker's claim can become ready while the pass runs, so the workers are asked
+                // again after it.
+                Next::Wait(_) if workers.may_progress(dispatcher) => {}
                 Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
