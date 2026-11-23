@@ -68,7 +68,10 @@ impl RoundWork {
     pub(super) fn queue(self, dispatcher: &Dispatcher) {
         for item in self.0 {
             match item {
-                RoundItem::Notify(pipeline, guard) => dispatcher.notify(pipeline, &guard),
+                // After the run's claims stop a notify queues nothing; the round ends with the run.
+                RoundItem::Notify(pipeline, guard) => {
+                    dispatcher.notify(pipeline, &guard);
+                }
                 RoundItem::Queue(pipeline, guard) => dispatcher.queue_for(pipeline, &guard),
                 RoundItem::Hold(scope, guard) => {
                     let mut scope = induction(&scope);
