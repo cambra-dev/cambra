@@ -105,6 +105,15 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         Extent::Base(BaseType::UInt)
     }
 
+    fn morsels(&self, region: &Predicate, rows: usize) -> Vec<Predicate> {
+        crate::interpreter::tile_operators::cut_region_at_keys(
+            region,
+            self.data.keys().cloned(),
+            rows,
+            &self.element_extent(),
+        )
+    }
+
     fn get(&self, mut keys: ColumnValue) -> ColumnValue {
         ColumnValue::from_values(
             keys.drain_to_value_iter()
