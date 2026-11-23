@@ -252,6 +252,22 @@ it, which steps and leaves its own position waiting.
 
 Waiting positions are scope state, which a pause or reload does not keep.
 
+## Morsels of a live source
+
+A pusher cuts what it pushes into morsels of at most the run's morsel size, by its own keys: a
+breaker's final push (`Pushes::push_final`, through `BreakingProducer::morsels`) and a live
+source's arrivals alike. Each morsel is a package of its own, so the pipeline that reads it takes
+them in parallel, or one at a time in key order where it is ordered.
+
+A live pipeline's poll cuts the keys each of its own ranges newly yielded at the keys the range's
+source holds (`DataSourceDomainExtentImpl::morsels`, `LivePipeline::poll`), pushes each piece
+through the range's consumer, and queues each landing as one package. Only the test source
+(`TestDataSource`) cuts; the HTTP and stdin sources queue each arrival as one package. A range
+beneath the pipeline's outermost keys, as a nest's inner range is, reaches each row whole or in
+part, so its pieces would name the same rows: the poll pushes such a range's keys whole
+(`lands_as_morsels`). Two ranges of one pipeline, as a join's two sides are, can deliver the same
+rows, so each morsel is queued less what the poll queued before it.
+
 ## Completeness in pushes
 
 Publication communicates two facts: which output regions can supply work, and which regions are
