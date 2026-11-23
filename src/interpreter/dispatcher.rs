@@ -160,9 +160,18 @@ struct Queue {
 struct QueueState {
     /// External arrivals have ended; upstream pipelines may still append work.
     arrivals_closed: bool,
-    ready: VecDeque<(usize, TileGuard)>,
+    /// Each ready package's index, guard, and whether it runs alone ([`PackageRule`]).
+    ready: VecDeque<(usize, TileGuard, bool)>,
     in_flight: HashMap<usize, TileGuard>,
+    /// The in-flight package that runs alone, if one does.
+    alone_in_flight: Option<usize>,
 }
+
+/// Whether a package of a pipeline must run alone: its chain answers the region it names only
+/// wider than it names, so it reads what the pipeline's other packages name. A planner derives it
+/// from the chain ([`Dispatcher::classify`]); the queue applies it to each package once, as it is
+/// queued, and a claim honours the flag.
+pub(crate) type PackageRule = Arc<dyn Fn(&TileGuard) -> bool + Send + Sync>;
 
 impl Queue {
     fn new() -> Self {
@@ -174,7 +183,12 @@ impl Queue {
 
     /// Append each of `morsels` as a package. An empty morsel is no package. A closed queue takes
     /// nothing.
-    fn append_locked(&self, state: &mut QueueState, morsels: &[TileGuard]) -> bool {
+    fn append_locked(
+        &self,
+        state: &mut QueueState,
+        morsels: &[TileGuard],
+        rule: Option<&PackageRule>,
+    ) -> bool {
         let morsels: Vec<&TileGuard> = morsels.iter().filter(|morsel| !morsel.is_empty()).collect();
         if morsels.is_empty() {
             return !self.is_closed();
@@ -183,15 +197,16 @@ impl Queue {
             return false;
         };
         for (index, morsel) in (first..).zip(morsels) {
-            state.ready.push_back((index, morsel.clone()));
+            let alone = rule.is_some_and(|rule| rule(morsel));
+            state.ready.push_back((index, morsel.clone(), alone));
         }
         true
     }
 
     /// [`append_locked`](Self::append_locked) under the queue's lock.
-    fn append(&self, morsels: &[TileGuard]) -> bool {
+    fn append(&self, morsels: &[TileGuard], rule: Option<&PackageRule>) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        self.append_locked(&mut state, morsels)
+        self.append_locked(&mut state, morsels, rule)
     }
 
     /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
@@ -200,7 +215,6 @@ impl Queue {
         &self,
         pipeline: usize,
         ordered: bool,
-        widens: &dyn Fn(&TileGuard) -> bool,
         can_claim: impl FnOnce() -> bool,
     ) -> Option<WorkPackage> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -209,7 +223,7 @@ impl Queue {
         // packages naming one region would read it at once, and the first to finish releases what
         // the other still reads, so the later one waits, and the packages behind it with it.
         let overlaps = |state: &QueueState| {
-            state.ready.front().is_some_and(|(_, next)| {
+            state.ready.front().is_some_and(|(_, next, _)| {
                 state
                     .in_flight
                     .values()
@@ -218,10 +232,10 @@ impl Queue {
         };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
         // after observing it under the lock; the check reads counters and takes no queue lock.
-        // A package that widens runs alone: it waits for the packages in flight, and they for it.
+        // A package flagged to run alone waits for the packages in flight, and they for it.
         let alone = !state.in_flight.is_empty()
-            && (state.ready.front().is_some_and(|(_, next)| widens(next))
-                || state.in_flight.values().any(widens));
+            && (state.ready.front().is_some_and(|(_, _, alone)| *alone)
+                || state.alone_in_flight.is_some());
         if state.ready.is_empty()
             || (ordered && !state.in_flight.is_empty())
             || overlaps(&state)
@@ -230,8 +244,11 @@ impl Queue {
         {
             return None;
         }
-        let (index, guard) = state.ready.pop_front()?;
+        let (index, guard, alone) = state.ready.pop_front()?;
         state.in_flight.insert(index, guard.clone());
+        if alone {
+            state.alone_in_flight = Some(index);
+        }
         Some(WorkPackage {
             pipeline: PipelineId(pipeline),
             guard,
@@ -250,10 +267,17 @@ impl Queue {
         }
         on_ack();
         state.in_flight.remove(&package.index);
-        let freed_head = state
-            .ready
-            .front()
-            .is_some_and(|(_, next)| !next.intersect(&package.guard).is_empty());
+        // A package flagged to run alone holds back every claim while it is in flight, and one at
+        // the head waits for the packages in flight to finish: either way its claim may now go.
+        let finished_alone = state.alone_in_flight == Some(package.index);
+        if finished_alone {
+            state.alone_in_flight = None;
+        }
+        let freed_head = state.ready.front().is_some_and(|(_, next, alone)| {
+            finished_alone
+                || (*alone && state.in_flight.is_empty())
+                || !next.intersect(&package.guard).is_empty()
+        });
         Some(freed_head)
     }
 
@@ -313,9 +337,9 @@ struct PipelineInfo {
     /// first of the pipelines whose breaker this one shares
     /// ([`share_pushes`](Dispatcher::share_pushes)).
     pushes_with: usize,
-    /// The deepest level whose keys the pipeline's chain restates, where its packages run at
-    /// once ([`restate`](Dispatcher::restate)); `None` otherwise.
-    restated: Option<crate::interpreter::CurryLevel>,
+    /// Which of its packages run alone ([`classify`](Dispatcher::classify)); `None` where none
+    /// does.
+    widens: Option<PackageRule>,
     /// Whether it takes the arrivals of live sources although it reads pipelines
     /// ([`take_arrivals`](Dispatcher::take_arrivals)).
     arrivals: bool,
@@ -475,7 +499,7 @@ impl Dispatcher {
                 follows: Vec::new(),
                 limit: usize::MAX,
                 pushes_with: pipeline,
-                restated: None,
+                widens: None,
                 arrivals: false,
                 input: None,
                 ingress: None,
@@ -576,7 +600,7 @@ impl Dispatcher {
             follows: Vec::new(),
             limit: usize::MAX,
             pushes_with: pipeline,
-            restated: None,
+            widens: None,
             arrivals: false,
             input: None,
             ingress: None,
@@ -683,7 +707,10 @@ impl Dispatcher {
     fn queue_in_current(&self, reader: PipelineId, guard: &TileGuard) {
         let _publisher = self.publisher();
         let queue = &self.states[reader.0].queue;
-        let appended = queue.append(std::slice::from_ref(guard));
+        let appended = queue.append(
+            std::slice::from_ref(guard),
+            self.infos[reader.0].widens.as_ref(),
+        );
         assert!(
             appended,
             "pipeline {} takes packages before the last pipeline it reads finishes",
@@ -901,12 +928,11 @@ impl Dispatcher {
         self.infos[pipeline.0].ordered = true;
     }
 
-    /// Mark `pipeline`'s packages as running at once where they name keys at or above `level`,
-    /// the deepest level its chain restates. A package naming keys beneath it, or no projection,
-    /// would be read wider than it names, so it runs only with no other package of the pipeline
-    /// in flight, and none runs beside it ([`Queue::claim`]).
-    pub(crate) fn restate(&mut self, pipeline: PipelineId, level: crate::interpreter::CurryLevel) {
-        self.infos[pipeline.0].restated = Some(level);
+    /// Classify each package queued for `pipeline` by `rule` as it is queued: a package the rule
+    /// flags runs with no other package of the pipeline in flight, and none runs beside it
+    /// ([`Queue::claim`]).
+    pub(crate) fn classify(&mut self, pipeline: PipelineId, rule: PackageRule) {
+        self.infos[pipeline.0].widens = Some(rule);
     }
 
     /// Mark `pipelines` as the pipelines of one breaker, each consuming an input of its own: their
@@ -1145,7 +1171,7 @@ impl Dispatcher {
         if morsels.is_empty() {
             return;
         }
-        let appended = queue.append_locked(&mut admission, morsels);
+        let appended = queue.append_locked(&mut admission, morsels, self.infos[p].widens.as_ref());
         self.ensure(appended, || {
             format!("pipeline {p} is queued nothing once it is closed")
         });
@@ -1189,17 +1215,9 @@ impl Dispatcher {
     /// in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
         let state = &self.states[pipeline];
-        let restated = self.infos[pipeline].restated;
-        // A package the chain answers only wider than it names reads what other packages name.
-        let widens = |guard: &TileGuard| match restated {
-            None => false,
-            Some(level) => Projection::of(guard)
-                .ok()
-                .is_none_or(|projection| projection.level().is_some_and(|at| at > level)),
-        };
         state
             .queue
-            .claim(pipeline, self.infos[pipeline].ordered, &widens, || {
+            .claim(pipeline, self.infos[pipeline].ordered, || {
                 self.takes_from(pipeline)
             })
     }
@@ -2041,9 +2059,12 @@ impl Landing<'_> {
         dispatcher.ensure(queue.phase.load() == Phase::Running, || {
             format!("pipeline {r} receives packages before it finishes")
         });
-        dispatcher.ensure(queue.queue.append(std::slice::from_ref(guard)), || {
-            format!("pipeline {r} receives packages before the last pipeline it reads finishes")
-        });
+        dispatcher.ensure(
+            queue
+                .queue
+                .append(std::slice::from_ref(guard), info.widens.as_ref()),
+            || format!("pipeline {r} receives packages before the last pipeline it reads finishes"),
+        );
     }
 
     /// Fail the run: the push re-entered a consumer it is passing through, so its chain is a
