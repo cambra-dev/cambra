@@ -1540,7 +1540,6 @@ pub(crate) fn cut_at_keys(
     rows: usize,
     tiling: &Tiling,
 ) -> Vec<TileGuard> {
-    assert!(rows > 0, "a morsel holds at least one row");
     let (TileGuard::Function(FunctionGuard::Domain(region)), Some(domain)) =
         (guard, tiling.domain_extent())
     else {
@@ -1549,12 +1548,33 @@ pub(crate) fn cut_at_keys(
     if region.qualifies() {
         return vec![guard.clone()];
     }
+    cut_region_at_keys(region, held, rows, &domain)
+        .into_iter()
+        .map(|morsel| TileGuard::Function(FunctionGuard::Domain(morsel)))
+        .collect()
+}
+
+/// `region`, a region of keys over `domain`, cut into morsels of at most `rows` of the `held`
+/// keys each, in key order, as [`cut_at_keys`] cuts a guard: a region naming no more than `rows`
+/// held keys is one morsel. A source cuts the keys it yields with it
+/// (`DataSourceDomainExtentImpl::morsels`).
+///
+/// # Panics
+///
+/// When a cut is needed and a held key has no order, such as a function value.
+pub(crate) fn cut_region_at_keys(
+    region: &Predicate,
+    held: impl IntoIterator<Item = Value>,
+    rows: usize,
+    domain: &Extent,
+) -> Vec<Predicate> {
+    assert!(rows > 0, "a morsel holds at least one row");
     let mut keys: Vec<Value> = held
         .into_iter()
         .filter(|key| region.contains(key))
         .collect();
     if keys.len() <= rows {
-        return vec![guard.clone()];
+        return vec![region.clone()];
     }
     if let Some(key) = keys.iter().find(|key| !has_order(key)) {
         panic!("a collection is cut into morsels in key order, which the key {key:?} has none of");
@@ -1565,7 +1585,13 @@ pub(crate) fn cut_at_keys(
     });
     keys.dedup();
     let cuts: Vec<Value> = keys.into_iter().skip(rows).step_by(rows).collect();
-    cut_before(region, &cuts, &domain)
+    cut_before(region, &cuts, domain)
+        .into_iter()
+        .map(|morsel| match morsel {
+            TileGuard::Function(FunctionGuard::Domain(keys)) => keys,
+            _ => unreachable!("a cut of keys is a region of keys"),
+        })
+        .collect()
 }
 
 /// Whether `key` has an order among the keys of its type: every value but a function, as

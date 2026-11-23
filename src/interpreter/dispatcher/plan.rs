@@ -3606,6 +3606,17 @@ impl LivePipeline {
             }
         }
         let mut complete = true;
+        // A pipeline whose chain reads one range takes its keys in the morsels its source cuts.
+        // One that reads several, as a nest or a join of sources does, takes them whole: a
+        // morsel of one range read before another range's keys arrive states rows complete that
+        // the other range still grows.
+        let own_ranges = self
+            .leaves
+            .iter()
+            .filter(|(holder, ..)| holder.0 == self.pipeline.0)
+            .count();
+        // What the pipeline's own ranges newly yielded, one guard per morsel its source cut.
+        let mut morsels: Vec<TileGuard> = Vec::new();
         // Several ranges can read one source, so a scope or a store is notified of the positions
         // they gained together, once.
         let mut positions = Predicate::False;
@@ -3622,21 +3633,41 @@ impl LivePipeline {
                 continue;
             }
             changed = true;
+            // The pipeline's own range takes the fresh keys in the morsels its source cuts them
+            // into, each pushed on its own, so the pipeline's packages are those morsels.
+            let own = matches!(self.notifies, Notifies::Arrivals) && holder.0 == self.pipeline.0;
+            let pieces = match own && own_ranges == 1 {
+                true => leaf.extent.morsels(&fresh, dispatcher.morsel_rows),
+                false => vec![fresh.clone()],
+            };
+            // A range beneath the pipeline's outermost keys, as the inner range of a nest is, names
+            // part of each row it reaches, so its pieces are no morsels of the pipeline's rows.
+            let pieces = match !lands_as_morsels(&leaf.consumer, self.pipeline, &pieces) {
+                true => vec![fresh.clone()],
+                false => pieces,
+            };
             // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
             // them, so an operator that pairs them with another input's rows records them.
-            let delivered = push_region(
-                dispatcher,
-                &leaf.consumer,
-                *holder,
-                &Projection::admitting(fresh.clone()),
-            );
+            let delivered: Vec<TileGuard> = pieces
+                .iter()
+                .map(|piece| {
+                    push_region(
+                        dispatcher,
+                        &leaf.consumer,
+                        *holder,
+                        &Projection::admitting(piece.clone()),
+                    )
+                    .iter()
+                    .fold(self.input.empty_guard(), |morsel, guard| {
+                        morsel.union(guard)
+                    })
+                })
+                .collect();
             match self.notifies {
                 // What reaches another pipeline's entry is that pipeline's: a scope that inherits
                 // a read pipeline's ranges takes their keys through its rounds.
-                Notifies::Arrivals if holder.0 == self.pipeline.0 => {
-                    for guard in delivered {
-                        arrivals = arrivals.union(&guard);
-                    }
+                Notifies::Arrivals if own => {
+                    morsels.extend(delivered.into_iter().filter(|morsel| !morsel.is_empty()));
                 }
                 Notifies::Items {
                     arms: Some(ref arms),
@@ -3691,10 +3722,25 @@ impl LivePipeline {
                 arrivals = arrivals.union(&region);
             }
         }
-        // Each poll announces what its ranges newly yielded, and the first poll also what its
-        // constants and starts bring.
+        // Each poll announces what its ranges newly yielded, morsel by morsel, and the first poll
+        // also what its constants and starts bring.
         if !arrivals.is_empty() {
             notify_unreleased(dispatcher, execution, reach, self.pipeline, &arrivals);
+        }
+        // Two ranges of one pipeline, as the two sides of a join are, can deliver the same rows,
+        // and two packages naming a row read it twice when they run at once. Each morsel is
+        // queued less what the poll queued before it.
+        let mut queued = arrivals;
+        let morsels: Vec<TileGuard> = morsels
+            .into_iter()
+            .filter_map(|morsel| {
+                let fresh = guard_minus(&morsel, &queued);
+                queued = queued.union(&morsel);
+                (!fresh.is_empty()).then_some(fresh)
+            })
+            .collect();
+        for morsel in &morsels {
+            notify_unreleased(dispatcher, execution, reach, self.pipeline, morsel);
         }
         if !positions.is_false() {
             notify_unreleased(
@@ -3713,6 +3759,39 @@ impl LivePipeline {
             changed = true;
         }
         changed
+    }
+}
+
+/// Whether the first two of `pieces`, keys a range in `pipeline`'s chain yielded, reach
+/// `pipeline`'s own entry as disjoint regions of the outermost keys of its input, read off a probe,
+/// which grows no cache. A range beneath those keys, as the inner range of a nest is, reaches each
+/// row whole or in part, and its pieces then name the same rows.
+fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[Predicate]) -> bool {
+    let landed = |piece: &Predicate| -> Option<Predicate> {
+        let mut landing = Landing::probe(pipeline);
+        crate::interpreter::notifications::notify_shared(
+            consumer,
+            &Projection::admitting(piece.clone()),
+            &mut landing,
+        );
+        landing
+            .arrivals()
+            .into_iter()
+            .filter(|arrival| arrival.pipeline.0 == pipeline.0)
+            .try_fold(Predicate::False, |keys, arrival| match arrival.guard {
+                TileGuard::Function(FunctionGuard::Domain(landed)) if !landed.qualifies() => {
+                    Some(keys.union(&landed))
+                }
+                _ => None,
+            })
+            .filter(|keys| !keys.is_false())
+    };
+    let [first, second, ..] = pieces else {
+        return true;
+    };
+    match (landed(first), landed(second)) {
+        (Some(first), Some(second)) => first.intersect(&second).is_false(),
+        _ => false,
     }
 }
 

@@ -177,7 +177,8 @@ impl Queue {
         self.append_locked(&mut state, morsels)
     }
 
-    /// Move the oldest ready package to in-flight while its dependencies permit the claim.
+    /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
+    /// names no region a package in flight names.
     fn claim(
         &self,
         pipeline: usize,
@@ -185,9 +186,25 @@ impl Queue {
         can_claim: impl FnOnce() -> bool,
     ) -> Option<WorkPackage> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // A pipeline can be notified of a region again before its package for the region is
+        // acknowledged, as a reader keyed by one row is at each push of what it reads. Two
+        // packages naming one region would read it at once, and the first to finish releases what
+        // the other still reads, so the later one waits, and the packages behind it with it.
+        let overlaps = |state: &QueueState| {
+            state.ready.front().is_some_and(|(_, next)| {
+                state
+                    .in_flight
+                    .values()
+                    .any(|running| !next.intersect(running).is_empty())
+            })
+        };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
         // after observing it under the lock; the check reads counters and takes no queue lock.
-        if state.ready.is_empty() || (ordered && !state.in_flight.is_empty()) || !can_claim() {
+        if state.ready.is_empty()
+            || (ordered && !state.in_flight.is_empty())
+            || overlaps(&state)
+            || !can_claim()
+        {
             return None;
         }
         let (index, guard) = state.ready.pop_front()?;

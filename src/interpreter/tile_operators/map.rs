@@ -2,7 +2,7 @@
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -1725,6 +1725,12 @@ impl TileProducer for MapResultWithSourceProducer {
     }
 
     fn release_impl(&self, obsolete_guard: TileGuard) {
+        // Scratch benchmark switch: a release does nothing, so a profile shows the run without
+        // the cost of freeing source rows.
+        static SKIP: OnceLock<bool> = OnceLock::new();
+        if *SKIP.get_or_init(|| std::env::var_os("BENCH_SKIP_SOURCE_RELEASE").is_some()) {
+            return;
+        }
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
