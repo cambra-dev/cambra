@@ -1402,8 +1402,28 @@ impl Execution {
                 dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
             }
         }
-        workers.begin_drain(dispatcher, false);
-        loop {
+        match self.claim_until_quiescent(dispatcher, reach, workers, false) {
+            Claimed::Done | Claimed::Failed => {}
+            Claimed::Quiescent => {
+                panic!("an acyclic run with no pending loop has a pipeline that may finish")
+            }
+        }
+    }
+
+    /// Consume and finish what the dispatcher hands out, on the coordinator or through the
+    /// `workers`, until every pipeline has finished, the run has failed, or the run is
+    /// quiescent. A quiet pass has no claimable work, active handlers or pending publication, and
+    /// its generation still matches the claim. [`drive`](Self::drive) runs this once for a batch
+    /// and [`drive_live`] runs it between polls.
+    fn claim_until_quiescent(
+        &self,
+        dispatcher: &Dispatcher,
+        reach: &mut Reach<'_>,
+        workers: &WorkerPool,
+        live: bool,
+    ) -> Claimed {
+        workers.begin_drain(dispatcher, live);
+        let outcome = loop {
             let (next, (mut reserved, _activity)) = workers.next(dispatcher, None, &|_| true);
             let mut claim_reach = |id: PipelineId, call: &mut Call<'_>| {
                 if let Some(seed) = reserved.take() {
@@ -1429,15 +1449,26 @@ impl Execution {
                     dispatcher.wait(generation)
                 }
                 Next::Wait(generation) if workers.drained(dispatcher, &generation) => {
-                    panic!("an acyclic run with no pending loop has a pipeline that may finish")
+                    return Claimed::Quiescent;
                 }
                 Next::Wait(_) => {}
-                // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Done | Next::Failed => break,
+                Next::Done => break Claimed::Done,
+                Next::Failed => break Claimed::Failed,
             }
-        }
+        };
         workers.end_drain();
+        outcome
     }
+}
+
+/// How [`Execution::claim_until_quiescent`] ended.
+enum Claimed {
+    /// Every pipeline has finished.
+    Done,
+    /// The run failed.
+    Failed,
+    /// Nothing is claimable and nothing has changed since the last claim.
+    Quiescent,
 }
 
 /// Whether `pipeline` reads a loop's scope, directly or through the pipelines it reads.
@@ -3539,50 +3570,13 @@ fn drive_live(
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, execution, reach);
         }
-        workers.begin_drain(dispatcher, true);
-        loop {
-            let (next, (mut reserved, _activity)) = workers.next(dispatcher, None, &|_| true);
-            let mut claim_reach = |id: PipelineId, call: &mut Call<'_>| {
-                if let Some(seed) = reserved.take() {
-                    seed.reach(call);
-                } else {
-                    reach(id, call);
-                }
-            };
-            match next {
-                Next::Package(package) if workers.admits(package.pipeline) => {
-                    workers.consume_on_coordinator(dispatcher, package, &mut claim_reach)
-                }
-                Next::Package(package) => execution.consume(dispatcher, &mut claim_reach, package),
-                Next::Finish { pipeline } if workers.admits(pipeline) => {
-                    workers.finish(dispatcher, pipeline, &mut claim_reach)
-                }
-                Next::Finish { pipeline } => {
-                    workers.finishing(pipeline, &mut claim_reach);
-                    execution.finish(dispatcher, &mut claim_reach, pipeline)
-                }
-                Next::Wait(_) if workers.help_active_claim(dispatcher) => {}
-                Next::Wait(generation) if workers.may_progress(dispatcher) => {
-                    dispatcher.wait(generation)
-                }
-                Next::Wait(generation) if workers.drained(dispatcher, &generation) => {
-                    assert!(
-                        live.iter().any(|at| !at.closed),
-                        "a run whose live pipelines have all closed has a pipeline that may finish"
-                    );
-                    break;
-                }
-                Next::Wait(_) => {}
-                Next::Done => {
-                    workers.end_drain();
-                    return true;
-                }
-                // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Failed => {
-                    workers.end_drain();
-                    return false;
-                }
-            }
+        match execution.claim_until_quiescent(dispatcher, reach, workers, true) {
+            Claimed::Done => return true,
+            Claimed::Failed => return false,
+            Claimed::Quiescent => assert!(
+                live.iter().any(|at| !at.closed),
+                "a run whose live pipelines have all closed has a pipeline that may finish"
+            ),
         }
         #[cfg(debug_assertions)]
         execution.assert_nothing_in_flight(dispatcher);
