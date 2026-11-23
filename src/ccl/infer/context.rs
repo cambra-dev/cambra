@@ -2286,13 +2286,9 @@ impl InferCtx {
     ) -> (Binding, ScopeExit) {
         let (name, bound_ty) = (&binding.name, &binding.ty);
         // An opaque binder carries no definiens, so a type lifted past it keeps
-        // the name (`close_let_type`) and what the name means there is the type
-        // it is bound at — a fact with no scope, recorded once here. Recorded on
-        // entry rather than on exit because a bound naming it is recorded
-        // *inside* the scope, on a variable that may have been minted outside
-        // (see [`Telescope`]).
+        // the name (`close_let_type`), and what the name means there is the type
+        // it is bound at, recorded here.
         let exit = if binding.transparency == BindingTransparency::Opaque {
-            self.telescope.enter_opaque(name);
             self.opaque_binders.insert(name.clone(), bound_ty.clone());
             ScopeExit::Keep
         } else {
@@ -2678,7 +2674,7 @@ impl InferCtx {
                 )))
             }
             crate::ccl::ty::FunKind::Var(v) if v.home().is_none() => {
-                crate::ccl::ty::FunKind::fresh_data_at(&mut self.solver, self.level)
+                crate::ccl::ty::FunKind::fresh_data_at(&mut self.solver, self.level, telescope)
             }
             other => other.clone(),
         }
@@ -3814,6 +3810,20 @@ impl Typing for InferCtx {
             self.place_reads.insert(variable.uid, value);
         }
         Ok(())
+    }
+
+    fn under_opaque_binders<R>(&mut self, names: &[Name], f: impl FnOnce(&mut Self) -> R) -> R {
+        for name in names {
+            self.scope_exits
+                .entry(name.clone())
+                .or_default()
+                .push(ScopeExit::Keep);
+        }
+        let r = self.under_binders(names, f);
+        for name in names {
+            self.scope_exits.get_mut(name).and_then(Vec::pop);
+        }
+        r
     }
 
     fn solver(&mut self) -> &mut Solver {
@@ -5108,7 +5118,8 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         // The parts of whatever function `t` is, a sum's included: under the binders of the
         // demand's kind, which the edge relates to `t`'s.
-        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level);
+        let kind =
+            crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level, &self.telescope);
         let d = self.fresh_part(&kind);
         let c = self.fresh_part(&kind);
         // Destructuring is kind-agnostic: `Data` and `Compute` are incomparable, so the
@@ -5134,7 +5145,8 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         // A named demand, as `apply`'s: the codomain edge relates `t`'s binder to `binder`,
         // and the codomain is minted where `binder` is in scope.
-        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level);
+        let kind =
+            crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level, &self.telescope);
         let d = self.fresh_part(&kind);
         let c = self.scoped(binder, &d, |ctx| ctx.fresh_part(&kind));
         let shape =
@@ -5237,7 +5249,7 @@ impl Typing for InferCtx {
         // second variable describes one consumption twice; see [`Typing::apply`].
         let demand_kind = match kind {
             Some(k @ crate::ccl::ty::FunKind::Var(_)) => k.clone(),
-            _ => crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level),
+            _ => crate::ccl::ty::FunKind::fresh_var(&mut self.solver, self.level, &self.telescope),
         };
         // A call of one argument expects a function of one parameter, its binder the whole
         // input; an argument list expects a parameter list as long, each parameter named

@@ -491,6 +491,50 @@ pub struct CompactWitness {
     pub type_kind: CompactTypeKind,
 }
 
+/// Whether `b`, a bound recorded on `v`, is a fact about `v` itself.
+///
+/// **A bound under a discharge states a fact about an instance.** `𝐿 <: 𝑉‹[𝑘 ↦ 𝑎]›` is a fact
+/// about `𝑉[𝑘 ↦ 𝑎]`, already checked at the edge that recorded it. It is a fact about `𝑉`
+/// exactly where the discharge leaves `𝑉`'s content unchanged: where the binder is outside `𝑉`'s
+/// scope, or `𝑉`'s own content does not name it ([`content_mentions`]). Elsewhere it stays out of
+/// `𝑉`'s answer, and the variable that stands for the instance reads it. Every reader of `𝑉`'s
+/// bounds asks this, so a compaction and a specialization key read the same bounds.
+pub(crate) fn bound_is_own(
+    solver: &mut Solver,
+    v: &Rc<crate::ccl::infer_var::InferVar>,
+    b: &crate::ccl::Bound,
+    own_content: &mut ContentWalk,
+) -> bool {
+    if b.self_subst.invert().is_some() {
+        return true;
+    }
+    let (_, discharged) = b.self_subst.split_renames();
+    let acting = discharged.acting_on(solver, v);
+    if acting.is_id() {
+        return true;
+    }
+    // An elimination acts on `𝑉` exactly where `𝑉` is a sum, which its kind says once
+    // the graph is closed: on a plain collection it eliminates nothing.
+    if acting.eliminates_top() && !matches!(v.fun_kind().resolved_in(solver), KindPin::Plain) {
+        return false;
+    }
+    // A bound on an instance of `𝑉` is `𝑉`'s own only if its content names nothing outside
+    // `𝑉`'s context: its own names, and what each variable it holds reads, in the edge's frame.
+    if b.self_subst.discharges_binder_of(v) {
+        let mut names = b.content_names(solver);
+        let mut held = Vec::new();
+        b.ty.walk_infer_vars(&mut |u| held.push(Rc::clone(u)));
+        for u in &held {
+            let reads = own_content.reads_of(solver, u);
+            names.extend(b.ty_subst.names_after(reads.names.iter().cloned()));
+        }
+        if !names.iter().all(|n| v.telescope.contains(n)) {
+            return false;
+        }
+    }
+    !content_mentions(solver, v, &acting, own_content)
+}
+
 /// Whether `acting` maps a name or witness `v`'s own content reads ([`ContentWalk::reads_of`]).
 fn content_mentions(
     solver: &mut Solver,
@@ -521,7 +565,7 @@ struct OwnReads {
 /// What [`content_mentions`] has computed in one compaction, whose graph does not change while
 /// it runs.
 #[derive(Default)]
-struct ContentWalk {
+pub(crate) struct ContentWalk {
     /// Each variable's own reads.
     reads: HashMap<InferVarId, Rc<OwnReads>>,
 }
@@ -3369,13 +3413,12 @@ fn join_barrier_lowers(
         return (CompactType::from_var(placeholder), Vec::new());
     }
     st.barriers_in_process.insert(barrier.uid);
+    // As [`expand_variable`] reads a variable, in its scope.
+    let subst_acc = &*subst_acc.binders_in(&barrier.telescope);
     let lowers = barrier.bounds(solver).lower().to_vec();
     let mut joined = CompactType::empty();
     for b in &lowers {
-        let inner_acc = {
-            let rendered = b.render_subst(solver);
-            Subst::then(solver, &rendered, subst_acc)
-        };
+        let inner_acc = b.reading_subst(solver, subst_acc);
         let bc = compact_bound(solver, &b.ty, true, &inner_acc, Position::default(), st);
         joined = CompactType::merge(solver, true, joined, bc);
     }
@@ -3450,6 +3493,8 @@ fn var_binder_kind(
         return None;
     }
     seen.push(k.uid);
+    // The walk reads `k`'s edges in `k`'s scope, so it carries only the entries acting there.
+    let subst_acc = &*subst_acc.binders_in(&k.telescope);
     let mut offset = 0;
     for src in k.built_over(solver) {
         let n = src.arity(solver).unwrap_or(0);
@@ -4544,6 +4589,9 @@ fn expand_variable(
     // puts those binders in correspondence with the position's. Applied on the way
     // in, exactly as a function's own kind is, so every bound below arrives spelled
     // in the position's binders.
+    // The walk reads this variable's bounds in its scope, so it carries only the entries acting
+    // there: an entry for a binder outside the telescope is from a scope the walk has left.
+    let subst_acc = &*subst_acc.binders_in(&state.telescope);
     let mut owned_acc = fun_kind_correspondence(
         solver,
         &crate::ccl::ty::FunKind::Var(Rc::clone(state.fun_kind())),
@@ -4611,46 +4659,12 @@ fn expand_variable(
     // pass)").
     let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
     let type_kinds = s.type_kinds.clone();
-    // **A bound under a discharge states a fact about an instance.** `𝐿 <: 𝑉‹[𝑘 ↦ 𝑎]›` is a
-    // fact about `𝑉[𝑘 ↦ 𝑎]`, already checked at the edge that recorded it, and it is a
-    // fact about `𝑉` exactly where the discharge leaves `𝑉`'s content unchanged: where
-    // the binder is outside `𝑉`'s scope, or `𝑉`'s own content does not name it
-    // ([`content_mentions`]). Elsewhere it stays out of `𝑉`'s answer; the variable that
-    // stands for the instance reads it.
     let holder = solver.lookup(&uid);
     let own_content = Rc::clone(&st.own_content);
     let renders_as_own = |solver: &mut Solver, b: &crate::ccl::Bound| -> bool {
-        if b.self_subst.invert().is_some() {
-            return true;
-        }
-        let Some(v) = holder.as_ref() else {
-            return true;
-        };
-        let (_, discharged) = b.self_subst.split_renames();
-        let acting = discharged.acting_on(solver, v);
-        if acting.is_id() {
-            return true;
-        }
-        // An elimination acts on `𝑉` exactly where `𝑉` is a sum, which its kind says once
-        // the graph is closed: on a plain collection it eliminates nothing.
-        if acting.eliminates_top() && !matches!(v.fun_kind().resolved_in(solver), KindPin::Plain) {
-            return false;
-        }
-        // A bound on an instance of `𝑉` is `𝑉`'s own only if its content names nothing outside
-        // `𝑉`'s context: its own names, and what each variable it holds reads, in the edge's frame.
-        if b.self_subst.discharges_binder_of(v) {
-            let mut names = b.content_names(solver);
-            let mut held = Vec::new();
-            b.ty.walk_infer_vars(&mut |u| held.push(Rc::clone(u)));
-            for u in &held {
-                let reads = own_content.borrow_mut().reads_of(solver, u);
-                names.extend(b.ty_subst.names_after(reads.names.iter().cloned()));
-            }
-            if !names.iter().all(|n| v.telescope.contains(n)) {
-                return false;
-            }
-        }
-        !content_mentions(solver, v, &acting, &mut own_content.borrow_mut())
+        holder
+            .as_ref()
+            .is_none_or(|v| bound_is_own(solver, v, b, &mut own_content.borrow_mut()))
     };
     // Walk bounds, transitively expanding, seeded from the variable's own
     // identity: `from_var` is not a value, so it imposes nothing at any
@@ -4676,10 +4690,7 @@ fn expand_variable(
         // descending: a bound reached transitively through `v → w → …`
         // arrives with every edge's morphism composed (design §3.6).
         // Identity edges leave `subst_acc` unchanged (the common case).
-        let inner_acc = {
-            let rendered = b.render_subst(solver);
-            Subst::then(solver, &rendered, subst_acc)
-        };
+        let inner_acc = b.reading_subst(solver, subst_acc);
         let mut bc = compact_bound(solver, &b.ty, pol, &inner_acc, pos.under(&new_parents), st);
         if st.origins && !stands_for_a_variable(&b.ty) {
             bc.origins = ContributionOrigins::born_at(b.origin, &b.ty);
@@ -5261,10 +5272,20 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
         constrain_subtype(solver, &lower, &b, &mut cache).expect("the lower flows in");
-        let v = fresh_var(solver, 0);
+        // `?v` stands under `x` too, which what flows into it names.
+        let v = Type::Infer(crate::ccl::InferVar::fresh_in(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(Name::raw("x")),
+        ));
         constrain_subtype(solver, &b, &v, &mut cache).expect("the barrier flows into ?v");
-        let mut below = |subst: Subst| {
-            let w = fresh_var(solver, 0);
+        // Each `?w` stands under the binder its substitution leaves `?v`'s `x` as.
+        let mut below = |subst: Subst, binder: &str| {
+            let w = Type::Infer(crate::ccl::InferVar::fresh_in(
+                solver,
+                0,
+                &crate::ccl::infer_var::Telescope::empty().extended(Name::raw(binder)),
+            ));
             let Type::Infer(state) = &w else {
                 unreachable!()
             };
@@ -5272,7 +5293,7 @@ mod tests {
             state.bounds_mut(solver).lower_mut().push(bound);
             w
         };
-        let (w1, w2) = (below(Subst::id()), below(Subst::rename("x", "y")));
+        let (w1, w2) = (below(Subst::id(), "x"), below(Subst::rename("x", "y"), "y"));
         let mut read = |ty: &Type| {
             {
                 let c = compact_type(solver, ty);
@@ -5353,7 +5374,11 @@ mod tests {
     #[test]
     fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
+        let kind = crate::ccl::ty::FunKindVar::fresh(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty(),
+        );
         let collection = Rc::new(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
         let (root, nodes) = super::super::test_helpers::diamond_bound_graph(
@@ -5387,7 +5412,11 @@ mod tests {
         let Type::Infer(v) = &shared else {
             unreachable!()
         };
-        let fun_kind = crate::ccl::ty::FunKind::fresh_var(solver, 0);
+        let fun_kind = crate::ccl::ty::FunKind::fresh_var(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty(),
+        );
         v.bounds_mut(solver)
             .lower_mut()
             .push(crate::ccl::Bound::conc(Type::Fun {

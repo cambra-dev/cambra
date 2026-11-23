@@ -257,6 +257,21 @@ impl Bound {
             .clone()
     }
 
+    /// The substitution a walk reading this bound's holder under `acc` carries into the bound's
+    /// type: the rendering ([`Self::render_subst`]), then `acc` without its entries for the
+    /// binders the holder side discharges. Where the holder side discharges a binder, the bound
+    /// is a fact about an instance, whose context holds the binder's image and not the binder
+    /// ([`subst::Subst::instance_telescope`]), so `acc` has nothing there to act on. A binder
+    /// the holder side renames, itself included, is still in that context, and `acc` acts on it.
+    pub(crate) fn reading_subst(&self, solver: &mut Solver, acc: &subst::Subst) -> subst::Subst {
+        let rendered = self.render_subst(solver);
+        if self.self_subst.is_id() || !acc.binders().any(|k| self.self_subst.discharges(k)) {
+            return subst::Subst::then(solver, &rendered, acc);
+        }
+        let acc = acc.without_binders(|k| self.self_subst.discharges(k));
+        subst::Subst::then(solver, &rendered, &acc)
+    }
+
     /// The holder side of [`render_subst`](Self::render_subst): `self_subst` inverted where
     /// it is invertible, and otherwise its rename part inverted, its term part acting as the
     /// identity.
@@ -513,9 +528,9 @@ impl InferBounds {
 }
 
 /// The binders a bound recorded on an inference variable may close against:
-/// the ones in lexical scope at the variable's creation, innermost first, plus
-/// the walk's opaque binders. See `src/ccl/design/type-inference.md`, "Scoped
-/// inference variables: a stored bound closes against a telescope".
+/// the ones in scope at the variable's creation, innermost first. See
+/// `src/ccl/design/type-inference.md`, "Scoped inference variables: a stored bound
+/// closes against a telescope".
 ///
 /// The lexical half is a persistent cons list: extending shares the tail, so
 /// every variable minted under one scope holds the same nodes and entering a
@@ -523,22 +538,11 @@ impl InferBounds {
 /// [`Name`](Name)s — uniquified, so membership is a name lookup; a shadowing
 /// binder is a separate entry with a distinct uid and shadows nothing here.
 ///
-/// The opaque half is a set shared by every telescope derived from one root,
-/// and it only grows ([`enter_opaque`](Self::enter_opaque)). An
-/// [opaque](crate::ccl::BindingTransparency::Opaque) binder carries no
-/// definiens, so a type lifted past it keeps the name rather than reading the
-/// definiens back in its place (`Typing::close_let_type`) — the name outlives
-/// its lexical scope, and so does a bound that mentions it. Sharing is what
-/// admits the bound whose *holder* was minted before the binder was entered: a
-/// write to a mutable variable declared outside contributes
-/// `{Int | __elem == __read + 1}` to a value variable minted at the
-/// declaration. The end-of-inference check states the same rule tree-wide, by
-/// seeding its root scope with every opaque binder the tree holds
-/// (`infer::solve`'s `check_scope_valid`).
+/// An [opaque](crate::ccl::BindingTransparency::Opaque) binder is entered where its function
+/// body's walk starts, not at its `let` ([`body_opaque_binders`]).
 #[derive(Clone, Default)]
 pub struct Telescope {
     lexical: Option<Rc<TelescopeNode>>,
-    opaque: Rc<RefCell<BTreeSet<Name>>>,
 }
 
 struct TelescopeNode {
@@ -549,14 +553,14 @@ struct TelescopeNode {
 }
 
 impl Telescope {
-    /// The empty scope — no binders, and an opaque set of its own. What
-    /// test-minted and solver-internal placeholder variables carry.
+    /// The empty scope, with no binders. What test-minted and solver-internal placeholder
+    /// variables carry.
     pub fn empty() -> Self {
         Telescope::default()
     }
 
     /// This scope with `binder` entered — the innermost lexical entry of the
-    /// result. The opaque set is shared, not copied.
+    /// result.
     pub fn extended(&self, binder: Name) -> Self {
         Telescope {
             lexical: Some(Rc::new(TelescopeNode {
@@ -564,33 +568,17 @@ impl Telescope {
                 depth: self.depth() + 1,
                 parent: self.clone(),
             })),
-            opaque: Rc::clone(&self.opaque),
         }
     }
 
-    /// Record `binder` as opaque, in this scope and in every other telescope
-    /// sharing this root — including those already stamped on variables.
-    pub fn enter_opaque(&self, binder: &Name) {
-        self.opaque.borrow_mut().insert(binder.clone());
-    }
-
-    /// Whether `name` is a binder this scope accounts for: a lexical entry, or
-    /// an opaque binder the walk has entered.
+    /// Whether `name` is one of this scope's binders.
     pub fn contains(&self, name: &Name) -> bool {
-        let mut cur = &self.lexical;
-        while let Some(node) = cur {
-            if node.binder == *name {
-                return true;
-            }
-            cur = &node.parent.lexical;
-        }
-        self.opaque.borrow().contains(name)
+        self.iter().any(|binder| binder == name)
     }
 
     /// Add to `out` every name [`contains`](Self::contains) answers for.
     pub fn extend_with_accounted(&self, out: &mut BTreeSet<Name>) {
         out.extend(self.iter().cloned());
-        out.extend(self.opaque.borrow().iter().cloned());
     }
 
     /// This scope cut at `binder`'s entry: the scope whose innermost lexical entry is
@@ -610,8 +598,7 @@ impl Telescope {
     }
 
     /// This scope without the lexical entries `dropped` names, with `added` entered innermost
-    /// (each that is not already an entry). The opaque set is shared, as [`Self::extended`]
-    /// shares it.
+    /// (each that is not already an entry).
     pub fn rescoped(
         &self,
         dropped: impl Fn(&Name) -> bool,
@@ -619,12 +606,8 @@ impl Telescope {
     ) -> Telescope {
         let mut kept: Vec<Name> = self.iter().filter(|n| !dropped(n)).cloned().collect();
         kept.reverse();
-        let root = Telescope {
-            lexical: None,
-            opaque: Rc::clone(&self.opaque),
-        };
         kept.into_iter()
-            .fold(root, |t, n| t.extended(n))
+            .fold(Telescope::empty(), |t, n| t.extended(n))
             .entered(added)
     }
 
@@ -645,6 +628,17 @@ impl Telescope {
     /// holds above that node are looked up. Finding the node walks each scope down from its
     /// innermost entry to the node's depth.
     pub fn entered_from(&self, other: &Telescope) -> Telescope {
+        self.entered_from_as(other, |n| n.clone())
+    }
+
+    /// [`entered_from`](Self::entered_from), entering each of `other`'s entries under the name
+    /// `name` gives it: an instance of a definition binds its own copy of each binder the
+    /// definition binds.
+    pub fn entered_from_as(
+        &self,
+        other: &Telescope,
+        mut name: impl FnMut(&Name) -> Name,
+    ) -> Telescope {
         let mut ours = self.lexical.as_ref();
         let mut theirs = other.lexical.as_ref();
         let mut above = Vec::new();
@@ -653,7 +647,7 @@ impl Telescope {
                 Some(mine) if Rc::ptr_eq(mine, node) => break,
                 Some(mine) if mine.depth > node.depth => ours = mine.parent.lexical.as_ref(),
                 _ => {
-                    above.push(node.binder.clone());
+                    above.push(name(&node.binder));
                     theirs = node.parent.lexical.as_ref();
                 }
             }
@@ -679,14 +673,9 @@ impl Telescope {
 }
 
 impl fmt::Debug for Telescope {
-    /// Everything [`contains`](Telescope::contains) answers for: the lexical
-    /// entries innermost first, then the opaque binders. A diagnostic naming a
-    /// gap is read against the whole account, so both halves appear.
+    /// The binders, innermost first.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.iter())
-            .entries(self.opaque.borrow().iter())
-            .finish()
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -697,10 +686,6 @@ impl fmt::Debug for Telescope {
 /// restoring it leaves every later variable recording a scope it does not sit in,
 /// and the closure check then admits a bound that references a binder out of scope.
 /// One implementation of the save/restore is one place that can get it wrong.
-///
-/// An opaque binder goes in through [`Telescope::enter_opaque`] instead, which has
-/// no restore: its name outlives its lexical scope, so there is no position to
-/// take it back out at.
 pub(crate) trait TelescopeWalk {
     /// The walk's live scope.
     fn telescope_mut(&mut self) -> &mut Telescope;
@@ -716,6 +701,48 @@ pub(crate) trait TelescopeWalk {
         *self.telescope_mut() = saved;
         r
     }
+
+    /// Run `f` with each of `binders` entered, outermost first, restoring the scope on the way
+    /// out.
+    fn under_binders<R>(&mut self, binders: &[Name], f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        let extended = binders
+            .iter()
+            .fold(self.telescope_mut().clone(), |t, b| t.extended(b.clone()));
+        let saved = std::mem::replace(self.telescope_mut(), extended);
+        let r = f(self);
+        *self.telescope_mut() = saved;
+        r
+    }
+}
+
+/// The opaque binders `body` binds outside every function inside it: the binders a function
+/// body, or a run's top level, binds for the whole of itself.
+///
+/// An opaque binder carries no definiens, so a type lifted past its `let` keeps the name
+/// (`Typing::close_let_type`), and a variable minted earlier in the body can receive a bound
+/// naming it. The body's walk enters each of these binders where it starts, so every variable
+/// minted in the body stands under them; a type naming one outside the function is out of
+/// scope there. Each function body is a scope of its own, so a nested function's opaque
+/// binders are its own.
+pub(crate) fn body_opaque_binders(body: &crate::ccl::TypedExpr) -> Vec<Name> {
+    fn go(e: &crate::ccl::TypedExpr, out: &mut Vec<Name>) {
+        match &e.node {
+            crate::ccl::TypedExprNode::Lambda { .. } => {}
+            crate::ccl::TypedExprNode::Let { binding, .. }
+                if binding.transparency == crate::ccl::BindingTransparency::Opaque =>
+            {
+                out.push(binding.name.clone());
+                e.walk_children(|c| go(c, out));
+            }
+            _ => e.walk_children(|c| go(c, out)),
+        }
+    }
+    let mut out = Vec::new();
+    go(body, &mut out);
+    out
 }
 
 /// The term names a bound puts in its holder that the holder's telescope does not account
@@ -1054,7 +1081,7 @@ impl InferVar {
 
     /// Mint a fresh variable carrying `telescope` as its scope, over a fresh kind.
     pub fn fresh_in(solver: &mut Solver, level: Level, telescope: &Telescope) -> Rc<InferVar> {
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver, level);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, level, telescope);
         Self::fresh_over(solver, level, telescope, kind)
     }
 
@@ -1092,7 +1119,7 @@ impl InferVar {
         telescope: &Telescope,
         opaque: Rc<[Name]>,
     ) -> Rc<InferVar> {
-        let fun_kind = crate::ccl::ty::FunKindVar::fresh(solver, level);
+        let fun_kind = crate::ccl::ty::FunKindVar::fresh(solver, level, telescope);
         Self::barrier_over(solver, level, telescope, fun_kind, opaque)
     }
 
@@ -1594,28 +1621,38 @@ mod tests {
         );
     }
 
-    /// An opaque binder covers a reference wherever it stands, including on a
-    /// holder minted before the binder was entered — the mutable-variable write
-    /// whose contribution names a read binder
-    /// (`tests/it/compilation_pipeline/mutability.rs`,
-    /// `snapshot_write_to_an_unannotated_mut_var`).
+    /// A function body's opaque binders are its own `let`s', a definiens' included, and not a
+    /// nested function's, which binds its own.
     #[test]
-    fn an_opaque_binder_covers_a_reference_on_a_holder_minted_before_it() {
-        let solver = &mut Solver::new();
-        use crate::ccl::{Name, Refinement, TypedExpr};
-        use std::rc::Rc as StdRc;
-        let read = Name::mut_read();
-        let dep = Type::refined_one(
-            Type::Base(BaseType::Int),
-            Refinement::born(StdRc::new(TypedExpr::var(read.clone()))),
+    fn a_body_binds_the_opaque_binders_outside_its_nested_functions() {
+        use crate::ccl::{BindingTransparency, Lit, Occurrence, TypedBinding, TypedExpr};
+        let opaque_let = |name: &Name, bound: TypedExpr, body: TypedExpr| {
+            let mut binding = TypedBinding::new_unannotated(name.clone(), Occurrence::mint());
+            binding.transparency = BindingTransparency::Opaque;
+            TypedExpr::let_in(binding, bound, body)
+        };
+        let (outer, in_definiens, nested) = (
+            Name::fresh("outer"),
+            Name::fresh("in_definiens"),
+            Name::fresh("nested"),
         );
-        let root = Telescope::empty();
-        let holder = InferVar::fresh_in(solver, 0, &root);
-        assert!(!bound_scope_gaps(solver, &holder.telescope, &Bound::conc(dep.clone())).is_empty());
-        // Entering the binder reaches the telescope already stamped on `holder`:
-        // the opaque set is shared by every telescope derived from `root`.
-        root.extended(Name::raw("elsewhere")).enter_opaque(&read);
-        assert!(bound_scope_gaps(solver, &holder.telescope, &Bound::conc(dep)).is_empty());
+        let lambda = TypedExpr::lambda(
+            Name::fresh("y"),
+            Occurrence::mint(),
+            Type::Hole,
+            opaque_let(
+                &nested,
+                TypedExpr::lit(Lit::Int(1)),
+                TypedExpr::var(nested.clone()),
+            ),
+        );
+        let definiens = opaque_let(
+            &in_definiens,
+            TypedExpr::lit(Lit::Int(2)),
+            TypedExpr::var(in_definiens.clone()),
+        );
+        let body = opaque_let(&outer, definiens, lambda);
+        assert_eq!(body_opaque_binders(&body), vec![outer, in_definiens]);
     }
 
     /// The record-time closure invariant is an internal error on the live

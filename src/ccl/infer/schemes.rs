@@ -268,7 +268,13 @@ impl OperatorSchemes {
         let aggregate_sum = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                Type::consumer_fun(solver, BODY_LEVEL, alpha.clone(), prim(BaseType::Int)),
+                Type::consumer_fun(
+                    solver,
+                    BODY_LEVEL,
+                    &crate::ccl::infer_var::Telescope::empty(),
+                    alpha.clone(),
+                    prim(BaseType::Int),
+                ),
                 prim(BaseType::Int),
             ),
         );
@@ -280,7 +286,13 @@ impl OperatorSchemes {
         let aggregate_max = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                Type::consumer_fun(solver, BODY_LEVEL, alpha, gamma.clone()),
+                Type::consumer_fun(
+                    solver,
+                    BODY_LEVEL,
+                    &crate::ccl::infer_var::Telescope::empty(),
+                    alpha,
+                    gamma.clone(),
+                ),
                 gamma,
             ),
         );
@@ -292,7 +304,13 @@ impl OperatorSchemes {
         let aggregate_min = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
-                Type::consumer_fun(solver, BODY_LEVEL, alpha, gamma.clone()),
+                Type::consumer_fun(
+                    solver,
+                    BODY_LEVEL,
+                    &crate::ccl::infer_var::Telescope::empty(),
+                    alpha,
+                    gamma.clone(),
+                ),
                 gamma,
             ),
         );

@@ -1758,6 +1758,10 @@ fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64)
     "sum([1 for x in [Money::new(1), Money::new(2)] if x == Money::new(2)]) == 1",
     true
 )]
+#[case::groupby_keys(
+    "sum([max(g) for g in groupby([1, 2, 3], \\x -> Money::new(x // 2))]) == 4",
+    true
+)]
 #[case::a_join(
     indoc! {"
         xs = [Money::new(1), Money::new(2), Money::new(3)]
@@ -1797,20 +1801,6 @@ fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64)
 )]
 fn a_nominal_type_compares_by_value(#[case] code: &str, #[case] expected: bool) {
     check_scalar(&with_money(code), Value::Bool(expected));
-}
-
-/// Not compiled yet: [`a_nominal_type_compares_by_value`] as a group-by's key. Running the plan
-/// panics. It answers `true`.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[should_panic(
-    expected = "Cannot apply Fn(0..3 → Int) to the values of Fn({`new{Int}} → {`new{Int}})"
-)]
-fn a_nominal_type_as_a_groupby_key_is_not_compiled_yet() {
-    check_scalar(
-        &with_money("sum([max(g) for g in groupby([1, 2, 3], \\x -> Money::new(x // 2))]) == 4"),
-        Value::Bool(true),
-    );
 }
 
 /// A nominal type's order is its declaration's: a constructor's parameters as written, and

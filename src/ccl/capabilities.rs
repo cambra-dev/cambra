@@ -1961,6 +1961,26 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// This with each variable it names mapped by `map`: a requirement's terms, and the
+    /// variable an effect names. A copy of a definition renames the binders it binds in what
+    /// its capabilities name, as in its types.
+    pub(crate) fn renamed(&self, map: &impl Fn(&Name) -> Name) -> Capability {
+        match self {
+            Capability::Requires(r) => {
+                let terms: Vec<Name> = r.requirement().terms.iter().map(map).collect();
+                if terms == r.requirement().terms {
+                    return self.clone();
+                }
+                Capability::Requires(Requirement::of(r.requirement().trait_.clone(), terms))
+            }
+            Capability::Causes(e) => match e.variable() {
+                Some(x) => Capability::Causes(e.naming(map(x))),
+                None => self.clone(),
+            },
+            Capability::Param(_) | Capability::Every(_) => self.clone(),
+        }
+    }
+
     /// Whether this is an effect rather than a requirement.
     pub fn of_causes(&self) -> bool {
         match self {
@@ -2527,6 +2547,7 @@ pub(crate) fn exceeded_uppers(solver: &mut Solver) -> Vec<Exceeded> {
 }
 
 impl CapabilityVar {
+    /// Mint a capability variable at `level`, standing in `telescope`.
     pub fn fresh(solver: &mut Solver, level: Level, telescope: &Telescope) -> Rc<CapabilityVar> {
         CapabilityVar::mint(
             solver,
@@ -4054,7 +4075,7 @@ mod tests {
     #[test]
     fn stamping_a_kind_unsettles_a_resolution_read_before() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0, &Telescope::empty());
         // Both stand in the scope of `x`, the place the recorded write names.
         let scope = Telescope::empty().extended(Name::from("x"));
         let source = CapabilityVar::fresh(solver, 0, &scope);

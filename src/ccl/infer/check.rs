@@ -713,10 +713,8 @@ impl Typing for CheckCtx {
         _scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        // The opaque binder's standing fact, recorded on the way in for the
-        // reason emission records it there (`InferCtx::scoped_let`).
+        // The opaque binder's type, recorded as emission records it (`InferCtx::scoped_let`).
         if binding.transparency == BindingTransparency::Opaque {
-            self.telescope.enter_opaque(&binding.name);
             self.opaque_binders
                 .insert(binding.name.clone(), binding.ty.clone());
         }
@@ -1741,7 +1739,10 @@ fn check_located_memoized(
     // reported the only way it could was reporting into the void: an empty `Case`
     // reaching here was silently accepted, and any future rule that returns instead
     // of accumulating would join it.
-    if let Err(e) = check_node(&mut cloned, &mut ctx) {
+    let opaque = crate::ccl::infer_var::body_opaque_binders(&cloned);
+    let checked =
+        Typing::under_opaque_binders(&mut ctx, &opaque, |ctx| check_node(&mut cloned, ctx));
+    if let Err(e) = checked {
         ctx.errors.push(e);
     }
     if ctx.errors.is_empty() {

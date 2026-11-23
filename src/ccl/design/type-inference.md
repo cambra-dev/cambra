@@ -1105,7 +1105,8 @@ An ordering requirement is the exception to the order of step 3: it is built fro
 positions, source and capabilities, so it records itself once built. A cycle back to it from those
 parts would copy it twice. In debug builds, `FreshenCache::record_copy` asserts that one freshening
 records one copy per original. Two copies of one original would leave one of them out of the map,
-and that copy apart from the instance the map describes.
+and `rename_instance_binders`, which renames what the map holds, would leave that copy naming the
+definition's binders.
 
 A solver variable, an inference, barrier, funkind or capability variable, stands above the cutoff
 where its level is above it. A handle with no level is copied wherever freshening reaches it: an
@@ -1912,8 +1913,7 @@ instances. What every variable has is written once:
 - its level: the level it was minted at, and the level a binding lowered it to, which the run
   records (`SolverVar::level`, `SolverVar::lower_level`). A variable minted outside every run
   stands at level 0;
-- its telescope, the binders in scope where it stands. Only an inference variable's is read: no
-  fact recorded on a funkind variable or a capability variable is read against a scope.
+- its telescope, the binders in scope where it stands.
 
 A sort supplies the rest (`Solved`): its identities, and what its handle carries besides, which is
 an inference variable's funkind variable and opaque binders (`TypeVarFixed`) and a funkind
@@ -2651,6 +2651,25 @@ for two binders. Every binding site inference sees binds a name that no other si
   Linking renames the function's binder in the copy and records the copy against the instance's
   declared binding (`InstanceTable::note_copy`). A call the instance answers takes the innermost
   copy in scope.
+- Each instantiation of a let-generalized binding binds its own copy of each binder the definition
+  binds. The use stands under every binder bound outside the definition, so each other `Unique` or
+  synthetic binder an instantiation reads is the definition's (`is_definition_binder`). The
+  instantiation gives each such binder a fresh name (`FreshenCache::binder_name`). The fresh name
+  replaces the binder in each copied variable's telescope, in each function, dependent-tuple and
+  family binder it copies, in each capability it copies (`Capability::renamed`), and in each
+  substitution it copies, a binder that a discharged term introduces included
+  (`Subst::mentioned_names`). Once the copy is complete, `rename_instance_binders` renames the
+  binders in every copied bound, kinding constraint, guarded bound, funkind edge and trait
+  obligation. A variable at or below the cutoff is not copied, and its bounds keep the
+  definition's names, so the instance reads it as `𝑉‹ρ›`, its suspension under the renames `ρ` of
+  the binders it stands under. An operator scheme's instantiation names its binders the same way.
+- A specialization clone binds its own copy of each binder its definition binds, as an
+  instantiation does. Its freshening names each binder the clone's tree binds afresh
+  (`FreshenCache::name_definition_binders`), and `scope::rename_binders` renames them in the
+  tree. Each type slot of the clone reads a variable the clone shares with the definition as its
+  suspension under the renames. What coalescing records of a binding by its name
+  (`definition_telescopes`, `bound_at_annotation`, `instance_functions`) is recorded again under
+  the clone's name (`specialize_use`).
 - A copy shares its origin's inference variables, and a variable's telescope names the origin's
   binders. A discharge copy placed during inference is therefore well scoped only while no
   variable it holds has a bound that names a binder the copy renamed. In debug builds,
@@ -2701,10 +2720,27 @@ several paths, each composing the binders of the dependent applications and lamb
 through, is one edge, recorded once.
 
 The restriction reads the variable's scopes when the edge arrives, and nothing restores a dropped
-entry. It is exact under two premises: an opaque binder is entered into the shared opaque set before
-any substitution names it, and a witness entry or respelling reaches a variable only after the kind
-edge that puts its witness or kind in the variable's scope. Debug builds record every dropped entry
-and assert, when the run's solver drops, that none acts on its variable then.
+entry. It is exact under two premises: an opaque binder is entered where its function body's walk
+starts, before any variable of the body is minted, and a witness entry or respelling reaches a
+variable only after the kind edge that puts its witness or kind in the variable's scope. Debug
+builds record every dropped entry and assert, when the run's solver drops, that none acts on its
+variable then.
+
+A side that is not a variable keeps the entries for the names its type reads and those that act on
+a variable it holds (`Subst::acting_on_type`), where a variable arm records the edge and closes it.
+Each half of a bridge (below) acts in its own edge's frame, the holder read through that edge's
+holder side (`Subst::instance_telescope`), and keeps only the entries for that frame's binders.
+
+A walk over the bound graph carries a substitution from the position it started at: compaction,
+a specialization key, a barrier variable's lower bounds, and a walk over funkind edges. At each
+variable it keeps only the entries for that variable's telescope (`Subst::binders_in`). An entry
+for any other binder is from a scope the walk has left, and composing it with the variable's own
+bounds would map one name two ways. At a bound whose holder side discharges a binder, the walk also
+drops its entry for that binder before composing (`Bound::reading_subst`). The bound states a fact
+about an instance, whose context holds the binder's image and not the binder
+([An edge through a discharge is a fact about an instance](#an-edge-through-a-discharge-is-a-fact-about-an-instance)).
+A binder the holder side renames, itself included, is still in that context, and the walk's entry
+for it acts there.
 
 When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
 
@@ -2762,16 +2798,17 @@ holds for an upper edge. Each reader of a variable's bounds treats such an edge 
   telescope with `σ`'s binders removed and the names their images read added, as a suspension's
   telescope is
   ([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
-- **Compaction** reads it as `𝑉`'s own content only where `𝑉[σ]` is `𝑉`, and where its content
-  names nothing outside `𝑉`'s context. `𝑉[σ]` is `𝑉` where `σ`'s binders are outside `𝑉`'s scope,
-  or where `𝑉`'s own content does not name them. `content_mentions` decides the second by walking
-  `𝑉`'s own bounds and mapping the queried names back through each bound's rendering
-  substitution. It applies nothing, so it mints no suspension. An elimination
+- **Compaction and the specialization key** read it as `𝑉`'s own content only where `𝑉[σ]` is `𝑉`,
+  and where its content names nothing outside `𝑉`'s context (`bound_is_own`). `𝑉[σ]` is `𝑉` where
+  `σ`'s binders are outside `𝑉`'s scope, or where `𝑉`'s own content does not name them.
+  `content_mentions` decides the second by walking `𝑉`'s own bounds and mapping the queried names
+  back through each bound's rendering substitution. It applies nothing, so it mints no suspension.
+  An elimination
   ([An elimination reads a sum through a term](#an-elimination-reads-a-sum-through-a-term)) acts
   on `𝑉` unless `𝑉`'s funkind settled plain. The content's names are its own names and what each
   variable it holds reads (`ContentWalk::reads_of`), both in the edge's frame. A fact about `𝑉[σ]`
-  that compaction does not read stays out of `𝑉`'s answer and reaches the variable that stands
-  for the instance.
+  that these walks do not read stays out of `𝑉`'s answer and reaches the variable that stands for
+  the instance.
 - **The domain join** over `𝑉`'s lower bounds (`distinct_data_domains`) skips it: its domain is the
   instance's, another type.
 
@@ -2915,15 +2952,16 @@ stands under `__box_k`. Instantiation names each such binder afresh, and a copy 
 site's telescope with its template binders entered after it, as that instantiation names them
 (`FreshenCache::site_telescope`).
 
-Each telescope also shares a growing set of opaque binders with the other telescopes from its
-root. `enter_opaque` adds a name to that set, including for variables created before entry.
-This permits a mutable variable declared outside a read binder to receive a refinement naming
-that read: `x := x + 1` contributes `__elem == __read + 1` to the variable created for `x`.
-A transparent let is discharged instead; a `for` target has no such exemption.
-
-`check_scope_valid` likewise seeds its root with every opaque binder present in the tree.
-Neither check establishes lexical containment for those names. TODO: enforce opaque-binder
-escape restrictions at record time instead of relying on later consumers to expose invalid uses.
+An opaque binder is bound by the function body, or the program's top level, whose `let` binds it.
+The walk enters each such binder where that body's walk starts (`body_opaque_binders`), so every
+variable minted in the body stands under it, one minted before the binder's `let` included. A
+mutable variable declared before a read binder therefore receives a refinement naming that read:
+`x := x + 1` contributes `__elem == __read + 1` to the variable created for `x`. A nested function's
+opaque binders are its own. A function's result passes through a barrier variable that hides its
+body's opaque binders (`opaque_output`), and a type naming one outside the function is out of scope
+there, as any other binder's name is. An instantiation renames a definition's opaque binders with
+its other binders, its barrier variables' opaque binders included. `check_scope_valid` enters them
+at the same places. A transparent let is discharged instead; a `for` target has no such exemption.
 The read-binder contract is described under
 [A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs).
 
@@ -4211,6 +4249,13 @@ the freshening's cutoff and leaves one at or below it in place, as freshening tr
 variable.
 `lower_levels` and extrusion also lower a function type's funkind variable to the destination
 level, including when its domain and codomain contain no variable above that level.
+
+A funkind variable also stands in a telescope, given when it is minted: a type variable's own
+funkind variable in the variable's telescope, and a demand's or an annotation's in the walk's scope
+where the function is built. The candidates recorded on it read only that telescope's binders, as a
+type variable's bounds read its telescope. A copy stands where a type variable's copy of the same
+original would (`FreshenCache::copied_telescope`), so an instantiation renames the definition's
+binders in funkind telescopes as in type variables'.
 
 A copy carries the data stamp, both bound lists and the source relations, with fresh binder IDs.
 An edge to a neighboring funkind variable left in place is recorded on both ends: the neighbor

@@ -550,13 +550,12 @@ fn this_qualifies_the_current_modules_label() {
     check_program_scalar(&program("(this::a=1).a\n", &[]), Value::Int(1));
 }
 
-/// Not compiled yet: `Option` is one type in every module, so a library's lookup result
-/// matches the root's `Option::some`. The library's checked lookup is refused: the
-/// collection's type is not resolved when the lookup is typed. It answers `10`.
+/// `Option` is one type in every module, so a library's lookup result matches the
+/// root's `Option::some`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn option_is_one_type_in_every_module_is_not_compiled_yet() {
-    assert_refused(
+fn option_is_one_type_in_every_module() {
+    check_program_scalar(
         &program(
             indoc! {"
                 import prices
@@ -575,7 +574,7 @@ fn option_is_one_type_in_every_module_is_not_compiled_yet() {
                 "},
             )],
         ),
-        "checked lookup `c[k]` needs the collection's type at this point",
+        Value::Int(10),
     );
 }
 

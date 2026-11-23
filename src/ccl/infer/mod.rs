@@ -1548,7 +1548,10 @@ fn attempt_run(
     // After any error the passes below do not run: the graph holds whatever
     // constraints the failed statements wrote before they failed, and lacks the
     // rest. `run_with_params` starts over without those statements instead.
-    let emitted = emit_node(expr, sub_ctx);
+    let emitted = {
+        let opaque = crate::ccl::infer_var::body_opaque_binders(expr);
+        typing::Typing::under_opaque_binders(sub_ctx, &opaque, |ctx| emit_node(expr, ctx))
+    };
     if emitted.is_err() || typing::Typing::recoveries(&*sub_ctx) != 0 {
         solver::traits::clear_held_answers(&mut sub_ctx.solver);
     }

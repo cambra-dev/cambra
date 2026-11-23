@@ -8,11 +8,4 @@ large-error-threshold = 152
 #
 # `NominalDecl` hashes and orders on its module path and name. Its constructors sit in a
 # `OnceCell` set once, after the head is declared, and no hash or comparison reads them.
-#
-# `SolverVar` hashes and compares on its `uid` alone. Its telescope holds the scope's opaque set in
-# a `RefCell`, which no hash or comparison reads.
-ignore-interior-mutability = [
-    "cambra::ccl::ty::WitnessId",
-    "cambra::ccl::nominal::NominalDecl",
-    "cambra::ccl::infer::solver::var::SolverVar",
-]
+ignore-interior-mutability = ["cambra::ccl::ty::WitnessId", "cambra::ccl::nominal::NominalDecl"]

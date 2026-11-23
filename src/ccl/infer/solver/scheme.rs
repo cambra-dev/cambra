@@ -153,6 +153,7 @@ impl PolyScheme {
         cache.use_assumptions = assumptions.to_vec();
         cache.param_telescope = Some(telescope.clone());
         cache.use_telescope = Some(telescope.clone());
+        cache.definition_site = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
         let ty = freshen_above(solver, self.level, &self.body, at, &mut cache);
         let requires: Vec<TraitRequirement> = self
@@ -198,6 +199,30 @@ impl PolyScheme {
                 bounds.push((var, bound, param.bound_at));
             }
         }
+        let (ty, requires, bounds) = if cache.binders.is_empty() {
+            (ty, requires, bounds)
+        } else {
+            rename_instance_binders(solver, &cache);
+            let _f = crate::ccl::provenance::copy_frame("infer.instance_binders");
+            let renames: crate::ccl::scope::Renames = cache.binders.clone().into_iter().collect();
+            (
+                instance_type(solver, &ty, &renames),
+                requires
+                    .iter()
+                    .map(|r| instance_requirement(solver, r, &renames))
+                    .collect(),
+                bounds
+                    .iter()
+                    .map(|(v, b, at)| {
+                        (
+                            instance_type(solver, v, &renames),
+                            instance_type(solver, b, &renames),
+                            *at,
+                        )
+                    })
+                    .collect(),
+            )
+        };
         // The instance is the body, each bound with its instantiation, and each requirement.
         #[cfg(debug_assertions)]
         assert_copied_apart_from(solver, self.level, &cache, before, &mut |visit| {
@@ -496,6 +521,12 @@ pub struct FreshenCache {
     /// entered after it, so an argument whose type reads a binder of the use site flows into
     /// the instance ([`PolyScheme::instantiate_with_params`]).
     pub use_telescope: Option<Telescope>,
+    /// The scope outside which a binder is the copied definition's own: the use site's for an
+    /// instantiation, and the one the clone stands in for a specialization clone. Each binder a
+    /// copy reads that this scope does not hold is the definition's, and the copy names it
+    /// afresh ([`Self::binders`], [`is_definition_binder`]). `None` for a copy that keeps its
+    /// original's names.
+    pub definition_site: Option<Telescope>,
     /// The binders a specialization clone stands under besides its definition's: those
     /// between the definition and the use that the use's instance reads, which the clone is
     /// placed under (`infer::solve::specialize_use`). Each variable minted stands where its
@@ -520,6 +551,8 @@ pub struct FreshenCache {
     pub use_assumptions: Vec<Rc<TraitRequirement>>,
     /// An operator scheme's Pi binder → the name this instantiation gives it.
     pub binders: HashMap<crate::ccl::Name, crate::ccl::Name>,
+    /// The names in `binders`' values: each a name [`Self::binder_name`] minted.
+    pub(crate) minted_binders: std::collections::HashSet<crate::ccl::Name>,
     /// Opened family parameter → what this instantiation stands it at: a variable that may
     /// read the binders beside it, one per term the parameter is applied to. An application
     /// is the variable with those binders discharged to its terms
@@ -535,28 +568,55 @@ impl FreshenCache {
         Self::default()
     }
 
-    /// The scope a copy of a variable minted in `original` stands in. A freshened clone stands
-    /// where its original stood: the bounds copied onto it were recorded against that scope. An
-    /// operator-scheme instantiation's template stands nowhere but under its own functions, so
-    /// its copy takes the site's scope with those functions' binders entered after it
-    /// ([`site_telescope`](Self::site_telescope)). A let-generalized instantiation stands at the use
-    /// with the binders its original stood under entered after it
-    /// ([`use_telescope`](Self::use_telescope)), and a specialization clone where its original
-    /// stood with the binders its use entered ([`entered_binders`](Self::entered_binders)).
+    /// The scope a copy of a variable standing in `original` stands in.
+    ///
+    /// An operator scheme's template stands nowhere but under its own functions' binders, so the
+    /// copy enters each, as this instantiation names it, after the site's
+    /// ([`Self::site_telescope`]). A let-generalized binding's instance stands at the use with
+    /// the binders its original stood under inside the definition entered after it, each of the
+    /// definition's own under the instance's name ([`Self::binders`]);
+    /// [`rename_instance_binders`] carries the renames into what the copies' bounds read. A
+    /// specialization clone stands where its original did, each of the definition's own binders
+    /// under the clone's name, with the binders its use entered ([`Self::entered_binders`]).
     pub(crate) fn copied_telescope(&mut self, original: &Telescope) -> Telescope {
-        match &self.site_telescope {
-            Some(site) => {
-                let site = site.clone();
-                let mut template: Vec<_> = original.iter().cloned().collect();
-                template.reverse();
-                template
-                    .into_iter()
-                    .fold(site, |t, n| t.extended(self.binder_name(&n)))
+        if let Some(site) = self.site_telescope.clone() {
+            let mut template: Vec<_> = original.iter().cloned().collect();
+            template.reverse();
+            return template
+                .into_iter()
+                .fold(site, |t, n| t.extended(self.binder_name(&n)));
+        }
+        match self.use_telescope.clone() {
+            Some(site) => site.entered_from_as(original, |n| {
+                if is_definition_binder(&site, n) && !self.names_instance_binder(n) {
+                    self.binder_name(n)
+                } else {
+                    n.clone()
+                }
+            }),
+            None => {
+                let renamed = match self.definition_site.clone() {
+                    Some(site) => {
+                        let mut entries: Vec<crate::ccl::Name> = original
+                            .iter()
+                            .map(|n| {
+                                if is_definition_binder(&site, n) && !self.names_instance_binder(n)
+                                {
+                                    self.binder_name(n)
+                                } else {
+                                    n.clone()
+                                }
+                            })
+                            .collect();
+                        entries.reverse();
+                        entries
+                            .into_iter()
+                            .fold(Telescope::empty(), |t, n| t.extended(n))
+                    }
+                    None => original.clone(),
+                };
+                renamed.entered(self.entered_binders.iter().cloned())
             }
-            None => match &self.use_telescope {
-                Some(site) => site.entered_from(original),
-                None => original.entered(self.entered_binders.iter().cloned()),
-            },
         }
     }
 
@@ -586,15 +646,99 @@ impl FreshenCache {
             .filter_map(|(key, held)| K::from_held(held).map(|k| (*key, k.clone())))
     }
 
-    /// The name a copied function binder `n` takes in this copy, minted on first use. The copy's
-    /// `Type::Fun` binder and the telescopes of the variables standing under it must agree on
-    /// it, so both ask here.
+    /// The name a copied function, dependent-tuple or family binder `n` takes in this copy. An
+    /// operator scheme's template binds every binder it names, so each is named afresh. A
+    /// definition's copy names afresh only the definition's own binders
+    /// ([`is_definition_binder`]), as it does in telescopes and substitutions: a label naming a
+    /// binder bound outside the definition stays the one variables and substitutions read.
+    fn label_name(&mut self, n: &crate::ccl::Name) -> crate::ccl::Name {
+        if self.site_telescope.is_some() {
+            return self.binder_name(n);
+        }
+        match self.definition_site.clone() {
+            Some(site) if is_definition_binder(&site, n) => self.binder_name(n),
+            _ => n.clone(),
+        }
+    }
+
+    /// The renames this instance owes `names`: each of the definition's binders among them, to
+    /// the name this instance gives it ([`is_definition_binder`]). Empty for a freshening that
+    /// keeps its definition's names.
+    fn instance_renames(
+        &mut self,
+        names: impl IntoIterator<Item = crate::ccl::Name>,
+    ) -> crate::ccl::scope::Renames {
+        let Some(site) = self.definition_site.clone() else {
+            return crate::ccl::scope::Renames::new();
+        };
+        let owed: Vec<crate::ccl::Name> = names
+            .into_iter()
+            .filter(|n| is_definition_binder(&site, n) && !self.names_instance_binder(n))
+            .collect();
+        owed.into_iter()
+            .map(|n| {
+                let to = self.binder_name(&n);
+                (n, to)
+            })
+            .collect()
+    }
+
+    /// Whether `n` is a name this freshening gave one of the definition's binders: the
+    /// instance's own, already renamed.
+    fn names_instance_binder(&self, n: &crate::ccl::Name) -> bool {
+        self.minted_binders.contains(n)
+    }
+
+    /// `item` with each of the copied definition's own binders it names under this copy's name
+    /// for it ([`Self::instance_renames`]).
+    fn renamed_capability(&mut self, item: &Capability) -> Capability {
+        let names: Vec<crate::ccl::Name> = match item {
+            Capability::Requires(r) => r.requirement().terms.clone(),
+            Capability::Causes(e) => e.variable().cloned().into_iter().collect(),
+            Capability::Param(_) | Capability::Every(_) => Vec::new(),
+        };
+        let renames = self.instance_renames(names);
+        if renames.is_empty() {
+            return item.clone();
+        }
+        item.renamed(&|n| renames.get(n).cloned().unwrap_or_else(|| n.clone()))
+    }
+
+    /// Name afresh each of `names` that is the copied definition's own binder
+    /// ([`is_definition_binder`]): a clone's term binders, named before its types are copied so
+    /// the two agree.
+    pub fn name_definition_binders(&mut self, names: impl IntoIterator<Item = crate::ccl::Name>) {
+        self.instance_renames(names);
+    }
+
+    /// The name this freshening gives the binder `n`, minted the first time it is asked. A name
+    /// this freshening minted is already the instance's and is its own.
     fn binder_name(&mut self, n: &crate::ccl::Name) -> crate::ccl::Name {
+        if self.names_instance_binder(n) {
+            return n.clone();
+        }
+        let minted = &mut self.minted_binders;
         self.binders
             .entry(n.clone())
-            .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
+            .or_insert_with(|| {
+                let to = crate::ccl::Name::fresh_like(n);
+                minted.insert(to.clone());
+                to
+            })
             .clone()
     }
+}
+
+/// Whether `n`, read in a let-generalized binding's instantiation for a use standing in `site`, is
+/// a binder the definition binds. Each binder is bound in one place, so one the use stands under
+/// is bound outside the definition, and every other binder an instantiation reads is the
+/// definition's own. An element reference is a refinement's and a de Bruijn reference a function
+/// type's, not binders; a raw name is a builtin's or a fixture's and is not re-minted.
+fn is_definition_binder(site: &Telescope, n: &crate::ccl::Name) -> bool {
+    matches!(
+        n,
+        crate::ccl::Name::Unique { .. } | crate::ccl::Name::Synthetic { .. }
+    ) && !site.contains(n)
 }
 
 /// The level [`freshen_above`] assigns to each fresh variable it mints.
@@ -874,7 +1018,13 @@ impl Copied for Capabilities {
                         },
                     );
                 }
-                _ => copy.record(solver, capability),
+                _ => {
+                    let item = cache.renamed_capability(&capability.item);
+                    copy.record(
+                        solver,
+                        crate::ccl::capabilities::LocatedCapability { item, ..capability },
+                    );
+                }
             }
         }
         for (source, mut filter) in original.incoming(solver) {
@@ -896,7 +1046,7 @@ impl Copied for Capabilities {
                     Capability::Requires(r) => {
                         Capability::Requires(freshen_requirement(solver, lim, &r, target, cache))
                     }
-                    item => item,
+                    item => cache.renamed_capability(&item),
                 })
                 .collect();
             copy.flows_from(solver, &source, filter);
@@ -1114,15 +1264,43 @@ impl Copied for FunKind {
             (false, original.upper_edges(solver)),
         ] {
             for (k, edge) in edges {
-                let edge = freshen_subst_payloads(solver, lim, &edge, target, cache);
                 let neighbor = freshen_fun_kind(solver, &k, lim, target, cache);
+                let kept_neighbor = match (&k, &neighbor) {
+                    (FunKind::Var(original), FunKind::Var(kept)) if Rc::ptr_eq(original, kept) => {
+                        Some(Rc::clone(kept))
+                    }
+                    _ => None,
+                };
+                // The edge takes the neighbor's frame into `original`'s. A copied neighbor's frame
+                // is renamed as `original`'s is, so the whole edge is; one left in place keeps its
+                // names, so only what the edge maps into the copy's frame is renamed, and each of
+                // the definition's binders the neighbor stands under is read under the copy's name
+                // for it.
+                let edge = match &kept_neighbor {
+                    None => freshen_subst_payloads(solver, lim, &edge, target, cache),
+                    Some(kept) => {
+                        let edge = freshen_subst_payload_terms(solver, lim, &edge, target, cache);
+                        let renames = cache.instance_renames(
+                            edge.mentioned_names()
+                                .into_iter()
+                                .chain(kept.telescope.iter().cloned()),
+                        );
+                        let mut edge = edge.rename_images(&renames, crate::ccl::Ids::Fresh);
+                        for n in kept.telescope.iter() {
+                            if let Some(to) = renames.get(n)
+                                && !edge.binders().any(|b| b == n)
+                            {
+                                edge = edge.extended_rename(n.clone(), to.clone());
+                            }
+                        }
+                        edge
+                    }
+                };
                 // A neighbor this freshening leaves in place, an enclosing scope's funkind
                 // variable, is not copied, so its side of the edge is recorded here: the edge is
                 // recorded on both ends, and `original`'s neighbor reads it as it reads its edge to
                 // `original`.
-                if let (FunKind::Var(in_place), FunKind::Var(kept)) = (&k, &neighbor)
-                    && Rc::ptr_eq(in_place, kept)
-                {
+                if let Some(kept) = &kept_neighbor {
                     let reverse = if lower {
                         kept.upper_edges(solver)
                     } else {
@@ -1130,8 +1308,25 @@ impl Copied for FunKind {
                     };
                     for (back, back_edge) in reverse {
                         if matches!(&back, FunKind::Var(b) if b.uid == original.uid) {
+                            // Read from the copy's frame into the neighbor's: the keys take the
+                            // copy's names, and each of the definition's binders `original` stands
+                            // under is read back as itself.
                             let back_edge =
-                                freshen_subst_payloads(solver, lim, &back_edge, target, cache);
+                                freshen_subst_payload_terms(solver, lim, &back_edge, target, cache);
+                            let renames = cache.instance_renames(
+                                back_edge
+                                    .mentioned_names()
+                                    .into_iter()
+                                    .chain(original.telescope.iter().cloned()),
+                            );
+                            let mut back_edge = back_edge.rename_keys(&renames);
+                            for (from, to) in &renames {
+                                if original.telescope.contains(from)
+                                    && !back_edge.binders().any(|b| b == to)
+                                {
+                                    back_edge = back_edge.extended_rename(to.clone(), from.clone());
+                                }
+                            }
                             kept.record_under(
                                 solver,
                                 FunKind::Var(Rc::clone(copy)),
@@ -1364,14 +1559,7 @@ pub fn freshen_above(
                     let n = n
                         .clone()
                         .unwrap_or_else(|| crate::ccl::Name::fresh("__family_k"));
-                    match &cache.site_telescope {
-                        Some(_) => cache
-                            .binders
-                            .entry(n.clone())
-                            .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
-                            .clone(),
-                        None => n,
-                    }
+                    cache.label_name(&n)
                 })
                 .collect();
             let opened = crate::ccl::subst::open_family_body(
@@ -1396,14 +1584,8 @@ pub fn freshen_above(
             components
                 .iter()
                 .map(|(name, t)| {
-                    let name = match (name, &cache.site_telescope) {
-                        (Some(n), Some(_)) => Some(
-                            cache
-                                .binders
-                                .entry(n.clone())
-                                .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
-                                .clone(),
-                        ),
+                    let name = match name {
+                        Some(n) => Some(cache.label_name(n)),
                         _ => name.clone(),
                     };
                     (name, freshen_above(solver, lim, t, target, cache))
@@ -1442,15 +1624,7 @@ pub fn freshen_above(
             // binder at two scopes. Cache-consistent, so the functions a scheme names alike
             // stay alike. A specialization clone keeps its definition's names; it stands
             // where the definition stood ([`FreshenCache::site_telescope`]).
-            let binder = match (binder, &cache.site_telescope) {
-                (crate::ccl::FunBinder::Whole(n), Some(_)) => {
-                    crate::ccl::FunBinder::Whole(cache.binder_name(n))
-                }
-                (crate::ccl::FunBinder::Parameters(_), Some(_)) => {
-                    binder.map_names(|n| cache.binder_name(n))
-                }
-                _ => binder.clone(),
-            };
+            let binder = binder.map_names(|n| cache.label_name(n));
             let fun_kind = freshen_fun_kind(solver, fun_kind, lim, target, cache);
             let domain = freshen_above(solver, lim, d, target, cache);
             let codomain = if !binder.is_none() && holds_family_app(c) {
@@ -1643,6 +1817,170 @@ pub fn freshen_above(
     }
 }
 
+/// Rename, in every variable `cache` copied, each binder the definition binds to the name this
+/// instance gives it ([`FreshenCache::binders`]): in each bound's type and substitutions, in each
+/// kinding constraint and in each guarded bound.
+///
+/// A copy's telescope enters the instance's names as the copy is minted, but its bounds are
+/// copied before every binder they read is known, so the renames run once the copy is complete.
+/// Each binder is bound in one place, so every mention of a definition's binder is the
+/// definition's, and the rename needs no scope (`src/ccl/design/type-inference.md`, "Every binder
+/// is bound in one place").
+pub(crate) fn rename_instance_binders(solver: &mut Solver, cache: &FreshenCache) {
+    let _f = crate::ccl::provenance::copy_frame("infer.instance_binders");
+    let renames: crate::ccl::scope::Renames = cache.binders.clone().into_iter().collect();
+    let copies: Vec<Rc<InferVar>> = cache.copies::<Rc<InferVar>>().map(|(_, v)| v).collect();
+    for v in copies {
+        let (lows, ups, kinds, guarded) = {
+            let s = v.bounds(solver);
+            (
+                Rc::clone(s.lower()),
+                Rc::clone(s.upper()),
+                s.type_kinds.clone(),
+                s.guarded_upper.clone(),
+            )
+        };
+        let lows = lows
+            .iter()
+            .map(|b| instance_bound(solver, b, &renames))
+            .collect();
+        let ups = ups
+            .iter()
+            .map(|b| instance_bound(solver, b, &renames))
+            .collect();
+        let kinds = kinds
+            .iter()
+            .map(|k| k.map_children(|t| instance_type(solver, t, &renames)))
+            .collect();
+        let guarded = guarded
+            .iter()
+            .map(|g| crate::ccl::infer_var::GuardedBound {
+                guard: {
+                    let refined = Type::refined(Type::Hole, g.guard.clone());
+                    instance_type(solver, &refined, &renames)
+                        .refinements()
+                        .iter()
+                        .cloned()
+                        .collect()
+                },
+                bound: instance_bound(solver, &g.bound, &renames),
+            })
+            .collect();
+        let s = v.bounds_mut(solver);
+        s.set_lower(lows);
+        s.set_upper(ups);
+        s.type_kinds = kinds;
+        s.guarded_upper = guarded;
+    }
+    // A funkind copy's candidates read the definition's binders as the bounds do.
+    let kinds: Vec<Rc<FunKindVar>> = cache.copies::<Rc<FunKindVar>>().map(|(_, k)| k).collect();
+    for k in kinds {
+        k.map_edge_kinds(solver, |solver, kind| match kind {
+            FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
+                ws.iter()
+                    .map(|w| w.map_types(|t| instance_type(solver, t, &renames)))
+                    .collect(),
+            ))),
+            other => other.clone(),
+        });
+    }
+    // An obligation's copy builds what it deposits from its refinement operands and its
+    // associated types, which read the definition's binders as the bounds do.
+    let obligations: Vec<Rc<TraitObligation>> = cache
+        .copies::<Rc<TraitObligation>>()
+        .map(|(_, o)| o)
+        .collect();
+    for o in obligations {
+        o.map_assumption_rows(|r| instance_requirement(solver, r, &renames));
+        o.map_frames(|frame| frame.rename_names(&renames, crate::ccl::Ids::Fresh));
+        o.map_held_apps(|app| {
+            match instance_type(solver, &Type::FamilyApp(app.clone()), &renames) {
+                Type::FamilyApp(renamed) => renamed,
+                other => unreachable!("renaming names keeps a family application one: {other}"),
+            }
+        });
+        let assoc = o
+            .assoc_types()
+            .iter()
+            .map(|t| instance_type(solver, t, &renames))
+            .collect();
+        o.set_assoc_types(assoc);
+        if let Some(operands) = o.refinement_operands() {
+            o.set_refinement_operands(
+                operands
+                    .into_iter()
+                    .map(|mut expr| {
+                        crate::ccl::scope::rename_names_in_term(
+                            &mut expr,
+                            &renames,
+                            crate::ccl::Ids::Fresh,
+                        );
+                        expr
+                    })
+                    .collect(),
+            );
+        }
+    }
+}
+
+/// `r` as an instance reads it: its types as [`instance_type`] reads them, and the names it reads
+/// and binds renamed.
+fn instance_requirement(
+    solver: &mut Solver,
+    r: &TraitRequirement,
+    renames: &crate::ccl::scope::Renames,
+) -> TraitRequirement {
+    r.map_types(|t| instance_type(solver, t, renames))
+        .map_names(|n| renames.get(n).cloned().unwrap_or_else(|| n.clone()))
+}
+
+/// `b` as an instance reads it ([`instance_type`]), its substitutions' binders renamed.
+fn instance_bound(solver: &mut Solver, b: &Bound, renames: &crate::ccl::scope::Renames) -> Bound {
+    let ids = crate::ccl::Ids::Fresh;
+    Bound {
+        origin: b.origin,
+        self_subst: b.self_subst.rename_names(renames, ids),
+        ty: instance_type(solver, &b.ty, renames),
+        ty_subst: b.ty_subst.rename_names(renames, ids),
+        rendered: Default::default(),
+    }
+}
+
+/// `ty` as an instance reads it: each binder of the definition renamed to the instance's, and
+/// each variable the instance shares with the definition read under the renames of the binders
+/// it stands under.
+///
+/// A variable at or below the cutoff is not copied, so it keeps the definition's binders in its
+/// telescope and its bounds. The instance reads it as `𝑉‹ρ›`, the suspension of the renames on
+/// it, so that what the instance relates it to is spelled in the instance's binders.
+pub(crate) fn instance_type(
+    solver: &mut Solver,
+    ty: &Type,
+    renames: &crate::ccl::scope::Renames,
+) -> Type {
+    let mut ty = ty.clone();
+    crate::ccl::scope::rename_names_in_type(&mut ty, renames, crate::ccl::Ids::Fresh);
+    read_shared_under(solver, &mut ty, renames);
+    ty
+}
+
+/// Replace each variable in `ty` whose telescope holds a binder `renames` maps by its suspension
+/// under those renames ([`instance_type`]).
+fn read_shared_under(solver: &mut Solver, ty: &mut Type, renames: &crate::ccl::scope::Renames) {
+    if let Type::Infer(v) = ty {
+        let under = v
+            .telescope
+            .iter()
+            .filter_map(|n| renames.get(n).map(|to| (n.clone(), to.clone())))
+            .fold(Subst::id(), |s, (from, to)| s.extended_rename(from, to));
+        if !under.is_id() {
+            *ty = under.apply_type_in(solver, &Type::Infer(Rc::clone(v)));
+        }
+        return;
+    }
+    ty.walk_children_mut(|c| read_shared_under(solver, c, renames));
+}
+
 /// A copy of a type variable carries its funkind variable's copy, made before the copy is
 /// minted, and its bounds, kinding constraints, watches and suspended memberships, copied once
 /// it is registered.
@@ -1652,7 +1990,7 @@ impl Copied for Type {
         lim: Level,
         original: &Rc<InferVar>,
         level: Level,
-        _telescope: &Telescope,
+        telescope: &Telescope,
         _target: FreshenLevel,
         cache: &mut FreshenCache,
     ) -> crate::ccl::infer_var::TypeVarFixed {
@@ -1707,13 +2045,26 @@ impl Copied for Type {
         let fun_kind = match cache.copy_of(original.fun_kind()) {
             Some(existing) => existing,
             None => {
-                let f = FunKindVar::fresh(solver, level);
+                let kind_telescope = cache.copied_telescope(&original.fun_kind().telescope);
+                let f = FunKindVar::fresh(solver, level, &kind_telescope);
                 cache.record_copy(original.fun_kind(), Rc::clone(&f));
                 f
             }
         };
-        // A barrier variable's copy is one, standing under the same opaque binders.
-        let opaque = original.opaque().cloned();
+        // A barrier variable's copy is one, standing under the copies of its opaque binders: an
+        // instance binds its own copy of each binder its definition binds. The copied telescope
+        // holds them, as the original's holds the originals.
+        let opaque = original.opaque().map(|opaque| {
+            let opaque: Rc<[crate::ccl::Name]> = opaque
+                .iter()
+                .map(|n| cache.binders.get(n).cloned().unwrap_or_else(|| n.clone()))
+                .collect();
+            debug_assert!(
+                opaque.iter().all(|n| telescope.contains(n)),
+                "a barrier variable's copy stands under the copies of its opaque binders"
+            );
+            opaque
+        });
         crate::ccl::infer_var::TypeVarFixed::new(fun_kind, opaque)
     }
 
@@ -2325,6 +2676,24 @@ fn freshen_subst_payloads(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Subst {
+    let renames = cache.instance_renames(subst.mentioned_names());
+    let subst = if renames.is_empty() {
+        subst.clone()
+    } else {
+        subst.rename_names(&renames, crate::ccl::Ids::Fresh)
+    };
+    freshen_subst_payload_terms(solver, lim, &subst, target, cache)
+}
+
+/// [`freshen_subst_payloads`] with no binder renamed: the payloads' type slots and the witness
+/// half freshened through `cache`.
+fn freshen_subst_payload_terms(
+    solver: &mut Solver,
+    lim: Level,
+    subst: &Subst,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Subst {
     let mut subst = subst.clone();
     subst.for_each_discharge_term_mut(&mut |t| {
         freshen_expr_type_slots(solver, t, lim, target, cache)
@@ -2357,7 +2726,7 @@ mod tests {
         // a Fun whose kind is an unpinned var must mint a *new* FunKindVar (the pin
         // copied), not share the original — otherwise pinning one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
-        let kv = FunKindVar::fresh(solver, 5);
+        let kv = FunKindVar::fresh(solver, 5, &Telescope::empty());
         kv.stamp_data(solver); // a def-intrinsic answer to carry onto each instantiation
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
@@ -2400,7 +2769,7 @@ mod tests {
     #[test]
     fn a_capability_variable_beside_a_shared_funkind_variable_is_copied() {
         let solver = &mut Solver::new();
-        let kind = FunKindVar::fresh(solver, 0);
+        let kind = FunKindVar::fresh(solver, 0, &Telescope::empty());
         let quantified = CapabilityVar::fresh(solver, 1, &Telescope::empty());
         let ty = Type::Fun {
             binder: crate::ccl::FunBinder::None,
@@ -2533,7 +2902,7 @@ mod copy_audit_tests {
             None,
             Type::Base(BaseType::Int),
         );
-        let kind = FunKind::fresh_var(solver, 1);
+        let kind = FunKind::fresh_var(solver, 1, &Telescope::empty());
         let FunKind::Var(k) = &kind else {
             unreachable!()
         };
@@ -2582,7 +2951,7 @@ mod copy_audit_tests {
         let quantified = InferVar::fresh(solver, 1);
         let ty = Type::Fun {
             binder: crate::ccl::FunBinder::None,
-            fun_kind: FunKind::fresh_var(solver, 1),
+            fun_kind: FunKind::fresh_var(solver, 1, &Telescope::empty()),
             domain: Box::new(Type::Tuple(vec![
                 Type::Infer(Rc::clone(&captured)),
                 Type::Infer(quantified),
@@ -2618,7 +2987,7 @@ mod copy_audit_tests {
     #[test]
     fn a_funkind_is_copied_even_when_its_function_has_no_type_variables() {
         let solver = &mut Solver::new();
-        let kind = FunKind::fresh_var(solver, 1);
+        let kind = FunKind::fresh_var(solver, 1, &Telescope::empty());
         let int = Type::Base(BaseType::Int);
         let ty = Type::fun_over(Name::fresh("x"), int.clone(), int, kind.clone());
         let scheme = PolyScheme::poly(0, ty);
