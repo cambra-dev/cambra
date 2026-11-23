@@ -1744,14 +1744,8 @@ impl Breaker for MemoProducer {
     }
     /// Rows of nested collections are not split: a merge of the packages' answers loses the
     /// completion each states of its rows' inner collections.
-    fn parallel_level(&self) -> Option<CurryLevel> {
-        let Tiling::DataFunction { codomain, .. } = self.input.tiling() else {
-            return None;
-        };
-        if codomain.holds_a_level() {
-            return None;
-        }
-        parallel_input_level(&*self.input)
+    fn consumes_concurrently(&self) -> bool {
+        has_keys(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {

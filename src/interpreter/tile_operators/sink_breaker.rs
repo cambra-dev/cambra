@@ -155,15 +155,15 @@ impl Breaker for SinkBreaker {
         self.deliver(tile);
     }
 
-    fn parallel_level(&self) -> Option<CurryLevel> {
+    fn consumes_concurrently(&self) -> bool {
         if !matches!(
             *self.hands.lock().unwrap_or_else(PoisonError::into_inner),
             Hands::EachPackage
         ) {
-            return None;
+            return false;
         }
         let slot = Self::reading(&self.producer);
-        parallel_input_level(&**slot.as_ref()?)
+        slot.as_ref().is_some_and(|producer| has_keys(&**producer))
     }
 
     fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {

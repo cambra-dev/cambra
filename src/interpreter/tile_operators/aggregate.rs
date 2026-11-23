@@ -295,12 +295,9 @@ impl Breaker for AggregateProducer {
         self.input.release(self.input.tiling().universal_guard());
         self.mark_terminal();
     }
-    fn parallel_level(&self) -> Option<CurryLevel> {
-        if matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
-        {
-            return None;
-        }
-        parallel_input_level(&*self.input)
+    fn consumes_concurrently(&self) -> bool {
+        !matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
+            && has_keys(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1410,11 +1407,8 @@ impl Breaker for MapAggregateProducer {
     fn finish_parallel_input(&mut self) {
         self.input.release(self.input.tiling().universal_guard());
     }
-    fn parallel_level(&self) -> Option<CurryLevel> {
-        if folded_shape(self.tiling()).1.holds_a_level() {
-            return None;
-        }
-        parallel_input_level(&*self.input)
+    fn consumes_concurrently(&self) -> bool {
+        !folded_shape(self.tiling()).1.holds_a_level() && has_keys(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
