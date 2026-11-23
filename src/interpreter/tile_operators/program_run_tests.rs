@@ -2480,6 +2480,103 @@ fn dispatched_live_observed_on(
     (written, planned)
 }
 
+/// A poll of a channel-fed source stops at its budget (`POLL_BUDGET`), so the run reaches a
+/// drained boundary, where a pause or a reload is serviced (`RunObserver::drained`), while the
+/// source still has a backlog: stdin holds three polls' worth of lines, and at the run's first
+/// boundary the other source's rows are out and stdin's backlog is still waiting. The channel is
+/// filled before the run, so the test pins the budget rather than a sender that refills the
+/// channel during a poll. The workers are `CAMBRA_LOCAL_DOP`'s.
+#[test]
+fn a_drained_boundary_comes_while_a_busy_source_still_has_a_backlog() {
+    use crate::interpreter::dispatcher::{RunObserver, Targets};
+    use crate::interpreter::stdio::{StdinDataSource, StdinMessage};
+    use crate::interpreter::stream_buffer::POLL_BUDGET;
+    /// Records the rows each sink holds at the first drained boundary.
+    struct FirstBoundary<'a> {
+        busy: &'a crate::interpreter::TestSink,
+        served: &'a crate::interpreter::TestSink,
+        rows: Option<(usize, usize)>,
+    }
+    impl RunObserver for FirstBoundary<'_> {
+        fn drained(&mut self, _: bool) -> std::ops::ControlFlow<()> {
+            let rows = |sink: &crate::interpreter::TestSink| {
+                sink.written_so_far()
+                    .map(|value| single_value(&value).as_function().len())
+                    .unwrap_or(0)
+            };
+            self.rows
+                .get_or_insert_with(|| (rows(self.busy), rows(self.served)));
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let lines = 3 * POLL_BUDGET;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    for line in 0..lines {
+        sender
+            .send(StdinMessage::Line(line.to_string().into()))
+            .expect("the source holds the receiver");
+    }
+    sender
+        .send(StdinMessage::Eof)
+        .expect("the source holds the receiver");
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(std::sync::Arc::new(std::sync::RwLock::new(
+        StdinDataSource::reading(receiver),
+    )));
+    let other = TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+        crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+    );
+    {
+        let mut other = other.write().unwrap_or_else(PoisonError::into_inner);
+        other.add_data(&[
+            (Value::UInt(0), Value::Int(1)),
+            (Value::UInt(1), Value::Int(2)),
+        ]);
+        other.set_yield_predicate(crate::interpreter::Predicate::True);
+    }
+    ctx.register_source(other.clone());
+    let busy = ctx.register_test_sink("busy");
+    let served = ctx.register_test_sink("served");
+    let source = indoc! {"
+        busy = test_sink()
+        served = test_sink()
+        busy << [line for line in stdin()]
+        served << [x * 10 for x in source1()]
+    "};
+    let program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let mut targets = Targets::default();
+    targets.add_sinks(&program);
+    let mut first = FirstBoundary {
+        busy: &busy,
+        served: &served,
+        rows: None,
+    };
+    targets
+        .run(usize::MAX, &mut first)
+        .unwrap_or_else(|refused| panic!("{refused}"));
+    let Some((busy_rows, served_rows)) = first.rows else {
+        panic!("the run reached no drained boundary")
+    };
+    assert_eq!(
+        served_rows, 2,
+        "the other source's rows are out at the first boundary"
+    );
+    assert!(
+        busy_rows < lines,
+        "stdin's backlog is still waiting at the first boundary: {busy_rows} of {lines} rows out"
+    );
+    assert_eq!(
+        single_value(&busy.value().expect("stdin ends"))
+            .as_function()
+            .len(),
+        lines
+    );
+    drop(program);
+}
+
 /// The entries of `value`, a collection of `Int` keyed by `UInt`s, a source's keys or commit
 /// times, in key order.
 fn keyed_ints(value: &Value) -> Vec<(u64, i64)> {
