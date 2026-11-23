@@ -1586,6 +1586,26 @@ impl Execution {
                 dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
             }
         }
+        match self.claim_until_quiescent(dispatcher, reach, workers) {
+            Claimed::Done | Claimed::Failed => {}
+            Claimed::Quiescent => {
+                panic!("an acyclic run with no pending loop has a pipeline that may finish")
+            }
+        }
+    }
+
+    /// Consume and finish what the dispatcher hands out, on the coordinator or through the
+    /// `workers`, until every pipeline has finished, the run has failed, or the run is
+    /// quiescent: nothing is claimable, no worker can progress, no scope resumes
+    /// ([`resume`](Self::resume)), and nothing has changed since the last claim. Both drivers
+    /// run their claims through it: [`drive`](Self::drive) over a run with no live source, and
+    /// [`drive_live`] between its polls.
+    fn claim_until_quiescent(
+        &self,
+        dispatcher: &Dispatcher,
+        reach: &mut Reach<'_>,
+        workers: &WorkerPool,
+    ) -> Claimed {
         loop {
             match workers.next(dispatcher) {
                 Next::Package(package) if workers.admits(package.pipeline) => {
@@ -1607,14 +1627,23 @@ impl Execution {
                 // again after it.
                 Next::Wait(_) if workers.may_progress(dispatcher) => {}
                 Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
-                Next::Wait(_) => {
-                    panic!("an acyclic run with no pending loop has a pipeline that may finish")
-                }
+                Next::Wait(_) => return Claimed::Quiescent,
+                Next::Done => return Claimed::Done,
                 // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Done | Next::Failed => return,
+                Next::Failed => return Claimed::Failed,
             }
         }
     }
+}
+
+/// How [`Execution::claim_until_quiescent`] ended.
+enum Claimed {
+    /// Every pipeline has finished.
+    Done,
+    /// The run failed.
+    Failed,
+    /// Nothing is claimable and nothing has changed since the last claim.
+    Quiescent,
 }
 
 /// Whether `pipeline` reads a loop's scope, directly or through the pipelines it reads.
@@ -3837,27 +3866,11 @@ fn drive_live(
             changed |= at.poll(dispatcher, execution, reach);
         }
         loop {
-            match workers.next(dispatcher) {
-                Next::Package(package) if workers.admits(package.pipeline) => {
-                    workers.consume_on_coordinator(dispatcher, package)
-                }
-                Next::Package(package) => execution.consume(dispatcher, reach, package),
-                Next::Finish { pipeline } if workers.finishes(pipeline) => {
-                    workers.finish_on_coordinator(dispatcher, pipeline)
-                }
-                Next::Finish { pipeline } => {
-                    workers.finishing(pipeline, reach);
-                    execution.finish(dispatcher, reach, pipeline)
-                }
-                Next::Wait(generation) if workers.may_progress(dispatcher) => {
-                    dispatcher.wait(generation)
-                }
-                Next::Wait(_) if execution.resume(dispatcher, reach) => {}
-                // A worker's claim can become ready while the pass runs, so the workers are asked
-                // again after it.
-                Next::Wait(_) if workers.may_progress(dispatcher) => {}
-                Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
-                Next::Wait(_) => {
+            match execution.claim_until_quiescent(dispatcher, reach, workers) {
+                Claimed::Done => return true,
+                // A worker's panic failed the run; the pool resumes it once it joins.
+                Claimed::Failed => return false,
+                Claimed::Quiescent => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
                     // once every source yields everything: it pushes what it completed here, and the
                     // pass runs on while that brings anything.
@@ -3872,9 +3885,6 @@ fn drive_live(
                     );
                     break;
                 }
-                Next::Done => return true,
-                // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Failed => return false,
             }
         }
         #[cfg(debug_assertions)]
