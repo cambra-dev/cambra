@@ -98,7 +98,7 @@ impl Scope {
         &self,
         dispatcher: &Dispatcher,
         request: PipelineId,
-        body: impl IntoIterator<Item = PipelineId>,
+        group: HoldGroup,
     ) {
         if dispatcher.states[request.0].phase.load() == Phase::Finished {
             return;
@@ -108,7 +108,7 @@ impl Scope {
         {
             return;
         }
-        dispatcher.hold_followers(body, true);
+        dispatcher.hold_followers(group);
     }
 
     /// Open the request `package`, a claim of the scope's own pipeline.
@@ -492,7 +492,8 @@ impl LocalSteps {
         if !publishing || !body.is_active() || dispatcher.outstanding(self.step) != 0 {
             return admitted;
         }
-        let held = dispatcher.followers_hold(self.step);
+        let hold = body.attached().hold;
+        let held = dispatcher.followers_hold(hold);
         if held.0 & 1 == 0 {
             return admitted || guard.is_some_and(|g| body.queue_step(dispatcher, g));
         }
@@ -506,7 +507,7 @@ impl LocalSteps {
             return admitted;
         }
         let members = self.base..self.base + self.members.len();
-        match try_push_held(dispatcher, members.clone().map(PipelineId), |id, call| {
+        match try_push_held(dispatcher, members.map(PipelineId), |id, call| {
             match &self.members[id.0 - self.base] {
                 PublicationTarget::Chain(handle) => {
                     let Ok(mut breaker) = handle.try_write() else {
@@ -537,8 +538,7 @@ impl LocalSteps {
             Publication::Busy => admitted,
             Publication::Published => true,
             Publication::Settled => {
-                let body = members.map(PipelineId).chain([self.step]);
-                let released = dispatcher.release_followers_if(body, self.step, held);
+                let released = dispatcher.release_followers_if(hold, held);
                 let queued = guard.is_some_and(|g| self.queue_step(dispatcher, g));
                 queued || released || admitted
             }
