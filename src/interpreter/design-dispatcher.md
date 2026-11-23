@@ -625,15 +625,19 @@ before a worker's consume published fails, and the step waits for the next pass.
 
 ### Waiting and stalls
 
-A coordinator claim that answers `Next::Wait` goes on in this order:
+Both drivers claim through one routine (`Execution::claim_until_quiescent`), which ends once every
+pipeline has finished, the run has failed, or the run is quiescent. A coordinator claim that answers
+`Next::Wait` goes on in this order:
 
 1. While a worker holds a claim, or a package or finish of an admitted pipeline is in flight,
    claimable or finishing (`WorkerPool::may_progress`), the coordinator sleeps in
    `Dispatcher::wait`. A worker counts itself busy once its claim returns; until then the package
    in flight or the pipeline finishing shows the claim.
 2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
-3. Otherwise, where the generation has not moved since the claim, no claimant can progress. A run
-   with no live source panics. A live run has reached a drained boundary.
+3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
+   the routine answers that the run is quiescent. A run with no live source panics. A live run
+   pushes what its breakers hold and claims again where that changed anything; otherwise it has
+   reached a drained boundary, where its driver polls the sources and tells its observer.
 
 A worker's publication can advance the generation during the resume pass, which then counts as
 progress. The coordinator claims again and reaches the same fixed point.
