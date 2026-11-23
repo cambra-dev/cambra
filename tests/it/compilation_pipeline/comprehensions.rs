@@ -1732,3 +1732,16 @@ fn a_bound_fused_product_is_read_by_field() {
         Tile::Scalar(ColumnValue::Ints(vec![21])),
     );
 }
+
+/// SCRATCH: the `rec_with_coll_scalar_field/rec_with_map` grid cell, alone.
+#[test]
+fn zz_rec_with_map_scalar_field() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            r = (xs=map([("a", 1), ("b", 2)]), n=3)
+            out << r.n
+        "#},
+        "[() -> 3]",
+    );
+}

@@ -106,4 +106,3 @@ pub(crate) mod cli {
         std::process::exit(status);
     }
 }
-

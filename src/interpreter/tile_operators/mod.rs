@@ -1699,9 +1699,13 @@ impl InputId {
 ///
 /// [`consume_impl`]: Self::consume_impl
 pub trait Breaker {
-    /// Projection level at which independent dispatcher claims may consume this breaker.
-    fn parallel_level(&self) -> Option<CurryLevel> {
-        None
+    /// Whether packages naming disjoint regions of the input may run this breaker's consume at
+    /// once. Which packages are disjoint, and at which level, is the chain's to say: the
+    /// dispatcher runs a package beside others only where every operator the chain pulls
+    /// restates the keys it names (`src/interpreter/design-dispatcher.md`, "Shared native
+    /// pipeline execution").
+    fn consumes_concurrently(&self) -> bool {
+        false
     }
 
     /// Read the existing input, integrate into synchronized native state, and release
@@ -3985,10 +3989,7 @@ mod tests {
     }
 }
 
-/// The level at which independent claims of `input` split it: its outermost keys, whatever their
-/// extent, since each claim is a projection of those keys disjoint from every other claim. `None`
-/// for an input with no keys.
-pub(crate) fn parallel_input_level(input: &dyn TileProducer) -> Option<CurryLevel> {
-    let level = CurryLevel::OUTERMOST;
-    (input.tiling().is_data_function() && !input.restates().refuses(level)).then_some(level)
+/// Whether `input` has keys that packages can name disjoint regions of.
+pub(crate) fn has_keys(input: &dyn TileProducer) -> bool {
+    input.tiling().is_data_function()
 }

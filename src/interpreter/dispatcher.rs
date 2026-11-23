@@ -183,6 +183,7 @@ impl Queue {
         &self,
         pipeline: usize,
         ordered: bool,
+        widens: &dyn Fn(&TileGuard) -> bool,
         can_claim: impl FnOnce() -> bool,
     ) -> Option<WorkPackage> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -200,9 +201,14 @@ impl Queue {
         };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
         // after observing it under the lock; the check reads counters and takes no queue lock.
+        // A package that widens runs alone: it waits for the packages in flight, and they for it.
+        let alone = !state.in_flight.is_empty()
+            && (state.ready.front().is_some_and(|(_, next)| widens(next))
+                || state.in_flight.values().any(widens));
         if state.ready.is_empty()
             || (ordered && !state.in_flight.is_empty())
             || overlaps(&state)
+            || alone
             || !can_claim()
         {
             return None;
@@ -283,6 +289,9 @@ struct PipelineInfo {
     /// first of the pipelines whose breaker this one shares
     /// ([`share_pushes`](Dispatcher::share_pushes)).
     pushes_with: usize,
+    /// The deepest level whose keys the pipeline's chain restates, where its packages run at
+    /// once ([`restate`](Dispatcher::restate)); `None` otherwise.
+    restated: Option<crate::interpreter::CurryLevel>,
     /// Whether it takes the arrivals of live sources although it reads pipelines
     /// ([`take_arrivals`](Dispatcher::take_arrivals)).
     arrivals: bool,
@@ -436,6 +445,7 @@ impl Dispatcher {
                 follows: Vec::new(),
                 limit: usize::MAX,
                 pushes_with: pipeline,
+                restated: None,
                 arrivals: false,
                 input: None,
                 ingress: None,
@@ -526,6 +536,7 @@ impl Dispatcher {
             follows: Vec::new(),
             limit: usize::MAX,
             pushes_with: pipeline,
+            restated: None,
             arrivals: false,
             input: None,
             ingress: None,
@@ -838,6 +849,14 @@ impl Dispatcher {
         self.infos[pipeline.0].ordered = true;
     }
 
+    /// Mark `pipeline`'s packages as running at once where they name keys at or above `level`,
+    /// the deepest level its chain restates. A package naming keys beneath it, or no projection,
+    /// would be read wider than it names, so it runs only with no other package of the pipeline
+    /// in flight, and none runs beside it ([`Queue::claim`]).
+    pub(crate) fn restate(&mut self, pipeline: PipelineId, level: crate::interpreter::CurryLevel) {
+        self.infos[pipeline.0].restated = Some(level);
+    }
+
     /// Mark `pipelines` as the pipelines of one breaker, each consuming an input of its own: their
     /// pushes read and grow one record of what the breaker pushed, the first pipeline's, so a
     /// region one of them pushed is pushed by none of the others.
@@ -1108,9 +1127,17 @@ impl Dispatcher {
     /// in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
         let state = &self.states[pipeline];
+        let restated = self.infos[pipeline].restated;
+        // A package the chain answers only wider than it names reads what other packages name.
+        let widens = |guard: &TileGuard| match restated {
+            None => false,
+            Some(level) => Projection::of(guard)
+                .ok()
+                .is_none_or(|projection| projection.level().is_some_and(|at| at > level)),
+        };
         state
             .queue
-            .claim(pipeline, self.infos[pipeline].ordered, || {
+            .claim(pipeline, self.infos[pipeline].ordered, &widens, || {
                 self.takes_from(pipeline)
             })
     }
@@ -2252,6 +2279,7 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
 /// `input`'s universal guard cut as [`seed_within`] cuts a region: every `rows` keys where the
 /// input's tiling states a finite range of positions for its outermost keys, and one morsel
 /// otherwise.
+#[cfg(test)]
 fn seed(input: &Tiling, rows: usize) -> Vec<TileGuard> {
     seed_within(input, &input.universal_guard(), rows)
 }

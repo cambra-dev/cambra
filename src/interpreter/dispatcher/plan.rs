@@ -901,7 +901,7 @@ fn run_targets(
         .zip(read_by_scope)
         .map(|(target, read_by_scope)| {
             target.map(|handle| WorkerTarget {
-                parallel: chain_restates_parallel_level(&handle, &consuming),
+                restated: chain_restated_level(&handle, &consuming),
                 serial: !read_by_scope,
                 handle,
             })
@@ -911,6 +911,9 @@ fn run_targets(
     let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
     for pipeline in workers.serial() {
         dispatcher.order(pipeline);
+    }
+    for (pipeline, level) in workers.restated() {
+        dispatcher.restate(pipeline, level);
     }
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher);
@@ -3300,21 +3303,34 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
     tiling.levels()
 }
 
-/// Whether every operator the chain under `breaker` pulls restates the keys of the breaker's
-/// [`Breaker::parallel_level`](crate::interpreter::tile_operators::Breaker::parallel_level). The
-/// worker pool seeds an admitted pipeline at that level (`WorkerPool::start_source`), and the
-/// level answers for the breaker's immediate input only: an operator deeper in the chain can
-/// refuse the keys its consumer restates. `true` for a breaker with no parallel level.
-fn chain_restates_parallel_level(breaker: &BreakerHandle, consuming: &[BreakerHandle]) -> bool {
+/// The deepest level whose keys every operator the chain under `breaker` pulls restates, for a
+/// breaker whose consume runs concurrently
+/// ([`Breaker::consumes_concurrently`](crate::interpreter::tile_operators::Breaker::consumes_concurrently)).
+/// A package naming keys at or above it is answered exactly, so it runs beside the pipeline's
+/// other packages; one naming keys beneath it would widen, and runs alone
+/// ([`Dispatcher::restate`]). `None` where the breaker consumes one package at a time or the chain
+/// restates not even the outermost keys.
+fn chain_restated_level(
+    breaker: &BreakerHandle,
+    consuming: &[BreakerHandle],
+) -> Option<CurryLevel> {
     let breaker = breaker.read().unwrap_or_else(PoisonError::into_inner);
-    let (Some(level), Some(producer)) = (breaker.parallel_level(), breaker.as_producer()) else {
-        return true;
+    let producer = breaker.as_producer()?;
+    if !breaker.consumes_concurrently() {
+        return None;
+    }
+    let levels = breaker.input_tiling(InputId::ONLY).levels();
+    let restates = |level: CurryLevel| {
+        let mut refused = false;
+        producer.visit_input_producers(&mut |_, input| {
+            refused |= unrestated(input, Some(level), consuming, false).is_some();
+        });
+        !refused
     };
-    let mut refused = false;
-    producer.visit_input_producers(&mut |_, input| {
-        refused |= unrestated(input, Some(level), consuming, false).is_some();
-    });
-    !refused
+    (0..levels)
+        .map(CurryLevel::new)
+        .take_while(|&level| restates(level))
+        .last()
 }
 
 /// Why a round of a loop's scope cannot pull the chain at `producer`, or `None` where every
@@ -3645,12 +3661,6 @@ impl LivePipeline {
                 true => leaf.extent.morsels(&fresh, dispatcher.morsel_rows),
                 false => vec![fresh.clone()],
             };
-            // A range beneath the pipeline's outermost keys, as the inner range of a nest is, names
-            // part of each row it reaches, so its pieces are no morsels of the pipeline's rows.
-            let pieces = match !lands_as_morsels(&leaf.consumer, self.pipeline, &pieces) {
-                true => vec![fresh.clone()],
-                false => pieces,
-            };
             // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
             // them, so an operator that pairs them with another input's rows records them.
             let delivered: Vec<TileGuard> = pieces
@@ -3764,39 +3774,6 @@ impl LivePipeline {
             changed = true;
         }
         changed
-    }
-}
-
-/// Whether the first two of `pieces`, keys a range in `pipeline`'s chain yielded, reach
-/// `pipeline`'s own entry as disjoint regions of the outermost keys of its input, read off a probe,
-/// which grows no cache. A range beneath those keys, as the inner range of a nest is, reaches each
-/// row whole or in part, and its pieces then name the same rows.
-fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[Predicate]) -> bool {
-    let landed = |piece: &Predicate| -> Option<Predicate> {
-        let mut landing = Landing::probe(pipeline);
-        crate::interpreter::notifications::notify_shared(
-            consumer,
-            &Projection::admitting(piece.clone()),
-            &mut landing,
-        );
-        landing
-            .arrivals()
-            .into_iter()
-            .filter(|arrival| arrival.pipeline.0 == pipeline.0)
-            .try_fold(Predicate::False, |keys, arrival| match arrival.guard {
-                TileGuard::Function(FunctionGuard::Domain(landed)) if !landed.qualifies() => {
-                    Some(keys.union(&landed))
-                }
-                _ => None,
-            })
-            .filter(|keys| !keys.is_false())
-    };
-    let [first, second, ..] = pieces else {
-        return true;
-    };
-    match (landed(first), landed(second)) {
-        (Some(first), Some(second)) => first.intersect(&second).is_false(),
-        _ => false,
     }
 }
 
