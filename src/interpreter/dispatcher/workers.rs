@@ -195,9 +195,8 @@ impl WorkerPool {
                         #[cfg(test)]
                         self.count_claim(dispatcher, &package, worker);
                         self.consume(dispatcher, package);
-                        // An acknowledgement advances the generation only where it frees or
-                        // completes a queue; a coordinator asleep because this package was in
-                        // flight wakes to see the claim ended.
+                        // A coordinator asleep because this package was in flight wakes to see the
+                        // claim ended, whether or not the acknowledgement advanced the generation.
                         self.busy.fetch_sub(1, Ordering::SeqCst);
                         dispatcher.wake_claimants();
                     }
@@ -215,9 +214,8 @@ impl WorkerPool {
     }
 
     /// [`consume`](Self::consume) on the coordinator, which claims as worker 0. It wakes the
-    /// claimants after, as a worker thread does: an acknowledgement advances the generation only
-    /// where it frees or completes a queue, and a worker waiting behind the package's region
-    /// ([`Dispatcher::claim`](super::Dispatcher)) can claim once it is acknowledged.
+    /// claimants after, as a worker thread does, so a claimant that waits on the pool's busy count
+    /// sees the claim end.
     pub(super) fn consume_on_coordinator(&self, dispatcher: &Dispatcher, package: WorkPackage) {
         #[cfg(test)]
         self.count_claim(dispatcher, &package, 0);
