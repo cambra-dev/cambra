@@ -2,7 +2,7 @@
 use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -797,6 +797,12 @@ impl MapResultProducer {
         // function that takes one is applied to the tile instead ([`FunctionDef::apply_tile`]
         // — `insert`, whose collection operand reaches it opened).
         let level = self.level;
+        // The rows above `level` the input calls complete, which bound what a computed value
+        // beneath them states.
+        let complete_rows = level
+            .index()
+            .checked_sub(1)
+            .map(|innermost| input_tile.completion_at(CurryLevel::new(innermost)));
         input_tile.unfollow_values_at(level);
         let arguments = std::mem::replace(
             input_tile.values_at_mut(level),
@@ -813,7 +819,17 @@ impl MapResultProducer {
             && let Tile::Scalar(f) = &function_tile
             && let Some(Value::ComputableFunction(f)) = f.as_single()
         {
-            f.apply_tile(arguments, f_domain_extent)
+            let mut applied = f.apply_tile(arguments, f_domain_extent);
+            // Each row's value is computed whole, so its levels are complete beneath that row,
+            // but the function states them over its own paths: unqualified, a statement claims
+            // every row, held or not. Beneath rows the input calls complete they are restated
+            // over those rows' paths, as a gathered value is ([`restate_gathered`]).
+            if let Some(complete) = &complete_rows {
+                applied.map_level_predicates(&mut |depth, stated| {
+                    stated.intersect(&Predicate::True.qualified_by(complete, depth))
+                });
+            }
+            applied
         } else {
             // Standard logic for non-Function outputs
             process_tile_result(self.tiling().values_at(level), arguments, move |values| {
@@ -1225,8 +1241,14 @@ impl MapResultToConstProducer {
         // A scalar input has no keys to project, so it is read whole and the answer cut. Applied
         // at the outermost level the constant replaces the whole input, so the output's keys are
         // the constant's and the projection names none of the input's.
+        // The input is read at the nearest level above it restates, as a union reads an arm: a
+        // region with part of a row released names keys beneath the outermost, which an input
+        // restating only its outermost keys has no exact answer to.
         let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
-            true => projection.above(self.level).guard(&i_tiling),
+            true => projection
+                .above(self.level)
+                .restated_by(&self.input.restates())
+                .guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);
@@ -1725,6 +1747,12 @@ impl TileProducer for MapResultWithSourceProducer {
     }
 
     fn release_impl(&self, obsolete_guard: TileGuard) {
+        // Scratch benchmark switch: a release does nothing, so a profile shows the run without
+        // the cost of freeing source rows.
+        static SKIP: OnceLock<bool> = OnceLock::new();
+        if *SKIP.get_or_init(|| std::env::var_os("BENCH_SKIP_SOURCE_RELEASE").is_some()) {
+            return;
+        }
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
