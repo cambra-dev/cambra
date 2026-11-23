@@ -631,12 +631,13 @@ answered from the snapshot the store published after its last step (`consume_sto
 store's state until its next step. A reader of the round's first packages therefore finds the store
 free and pulls the round's state, not the snapshot from before the round.
 
-A round's step passes only output the resume pass has published. The coordinator re-holds a scope's
-followers after each of its own claims (`Execution::consume`). A worker re-holds the followers of
-the body it consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass
-reads the step's follower hold before it publishes and releases the followers only where that hold
-is unchanged (`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release
-decided before a worker's consume published fails, and the step waits for the next pass.
+A round's step passes only output the resume pass has published. Each scope body has one follower
+hold over its inner pipelines and its step (`Dispatcher::add_hold_group`). The coordinator re-holds
+a scope's body after each of its own claims (`Execution::consume`). A worker re-holds the body it
+consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass reads the
+body's hold before it publishes and releases it only where the hold is unchanged
+(`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release decided
+before a worker's consume published fails, and the step waits for the next pass.
 
 ### Waiting and stalls
 
