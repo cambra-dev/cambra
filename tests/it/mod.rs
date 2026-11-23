@@ -106,3 +106,5 @@ pub(crate) mod cli {
         std::process::exit(status);
     }
 }
+
+mod zz_dop_bench;
