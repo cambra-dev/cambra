@@ -22,8 +22,9 @@ use crate::interpreter::{
 /// one buffer. The gallery programs `source_shared` and `source_two_runs` pin
 /// the two cases.
 ///
-/// Lines are read by a background thread so that `check_for_new_data` never
-/// blocks — it simply drains whatever the reader thread has buffered so far.
+/// Lines are read by a background thread, so `check_for_new_data` never blocks. It takes at most
+/// [`POLL_BUDGET`](crate::interpreter::stream_buffer::POLL_BUDGET) of the lines the thread has
+/// buffered, and leaves the rest to the next poll.
 pub struct StdinDataSource {
     /// Shared buffer, indexing, and predicate bookkeeping.
     buf: UIntStreamBuffer,

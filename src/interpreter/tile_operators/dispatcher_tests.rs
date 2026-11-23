@@ -19,7 +19,8 @@ use super::*;
 use crate::ccl::AggregateKind;
 use crate::interpreter::dispatcher::consume as hand_over;
 use crate::interpreter::dispatcher::{
-    BreakerHandle, Dispatcher, Event, Next, PipelineId, WorkPackage, finish_pipeline, run,
+    Admission, BreakerHandle, Dispatcher, Event, Next, PipelineId, WorkPackage, finish_pipeline,
+    run,
 };
 use crate::interpreter::{
     BaseType, ColumnValue, Extent, domain_prefix, forwarding_consumer_tagging, shared_consumer,
@@ -1428,19 +1429,34 @@ fn a_second_close_is_refused() {
 fn a_limited_source_takes_a_notify_below_its_limit() {
     let mut dispatcher = Dispatcher::new(vec![vec![]], 1);
     dispatcher.limit(PipelineId(0), 2);
-    assert!(dispatcher.try_notify(PipelineId(0), &keys_between(0, 0)));
-    assert!(dispatcher.try_notify(PipelineId(0), &keys_between(1, 1)));
+    assert!(matches!(
+        dispatcher.try_notify(PipelineId(0), &keys_between(0, 0)),
+        Admission::Queued
+    ));
+    assert!(matches!(
+        dispatcher.try_notify(PipelineId(0), &keys_between(1, 1)),
+        Admission::Queued
+    ));
     assert!(
-        !dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)),
+        matches!(
+            dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)),
+            Admission::Full
+        ),
         "two packages are outstanding"
     );
     let package = dispatcher.claim_of(PipelineId(0)).expect("a package");
     assert!(
-        !dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)),
+        matches!(
+            dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)),
+            Admission::Full
+        ),
         "a claimed package is outstanding until it is acknowledged"
     );
     dispatcher.acknowledge(package);
-    assert!(dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)));
+    assert!(matches!(
+        dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)),
+        Admission::Queued
+    ));
     assert_eq!(dispatcher.outstanding(PipelineId(0)), 2);
 }
 
@@ -1450,7 +1466,10 @@ fn a_limited_source_takes_a_notify_below_its_limit() {
 fn a_notify_below_the_limit_queues_all_its_morsels() {
     let mut dispatcher = Dispatcher::new(vec![vec![]], 1);
     dispatcher.limit(PipelineId(0), 1);
-    assert!(dispatcher.try_notify(PipelineId(0), &keys_between(0, 3)));
+    assert!(matches!(
+        dispatcher.try_notify(PipelineId(0), &keys_between(0, 3)),
+        Admission::Queued
+    ));
     dispatcher.notify(PipelineId(0), &ints().empty_guard());
     assert_eq!(dispatcher.outstanding(PipelineId(0)), 4);
 }
