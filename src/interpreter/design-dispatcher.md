@@ -458,10 +458,12 @@ only after every step that can panic, so the reservation count never exceeds the
 
 A waiter observes a generation before scanning for work. Every transition that can make work
 claimable or end the run advances that generation and wakes sleepers. A change between scanning and
-waiting therefore cannot be lost. An acknowledgement advances the generation only where it frees or
-completes a queue, so every claimant wakes the others once its claim ends
-(`Dispatcher::wake_claimants`): the package held back behind an acknowledged one becomes claimable
-then. A worker failure wakes waiters and stops further claims, and so
+waiting therefore cannot be lost. An acknowledgement advances the generation where it frees an
+ordered pipeline's next package or a package held back behind the acknowledged one's region,
+returns a limited source's credit, or completes a queue (`Dispatcher::acknowledge`). A pool's
+claimant also wakes the others once its claim ends (`Dispatcher::wake_claimants`), so a claimant
+that waits on the pool's busy count sees the claim end. A worker failure wakes waiters and stops
+further claims, and so
 does a panic in a thread that publishes (`notify`, `start_source`, `close`, `land`, `finish`,
 queueing a reader), worker or not.
 
