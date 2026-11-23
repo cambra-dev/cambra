@@ -17,6 +17,14 @@ use crate::interpreter::{
     ColumnValue, Value, producer_releases::ProducerReleases, row_index, tiling::Predicate,
 };
 
+/// The most messages a channel-fed source takes in one poll
+/// ([`check_for_new_data`](crate::interpreter::DataSourceDomainExtentImpl::check_for_new_data)).
+/// Without a bound, a sender that keeps the channel full keeps the poll draining it. The other
+/// sources then get no poll, the rows the poll took get no execution, and a pause or reload waits
+/// for a drained boundary that does not come. What a poll leaves waits in the channel for the next
+/// one.
+pub(crate) const POLL_BUDGET: usize = 256;
+
 /// Buffer and predicate bookkeeping for a uint-indexed string stream.
 ///
 /// Maintains a sliding window of [`SmolStr`] values indexed by monotonically
