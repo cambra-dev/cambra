@@ -107,6 +107,9 @@ pub(super) struct Body {
     /// Whether the scope's pipeline is finishing: from the scope's finish until the inner pipelines
     /// and the step have finished.
     finishing: bool,
+    /// Whether a loop's scope has closed its step's arrivals
+    /// ([`close_step_when_settled`](Self::close_step_when_settled)).
+    step_closed: bool,
     /// The guard of the step's package for the open round or attempt, which the scope queues once
     /// the inner pipelines are quiescent ([`Body::queue_step_when_quiescent`]).
     pending_step: Option<TileGuard>,
@@ -149,6 +152,7 @@ impl Body {
             attached: None,
             active: false,
             finishing: false,
+            step_closed: false,
             pending_step: None,
             offers: Offers::default(),
             rows_from_outer: false,
@@ -302,6 +306,30 @@ impl Body {
                 dispatcher.close(pipeline);
             }
         }
+    }
+
+    /// Close a loop's step once the scope is finishing, its last round's step is queued and every
+    /// inner pipeline has finished. Whether it closed it.
+    ///
+    /// The step reads the inner pipelines, and closing on their finish alone would let it finish
+    /// before the scope queues the last round's step: a worker finishes an inner pipeline while
+    /// the coordinator still holds that step, which waits for the round to publish. So the step
+    /// takes arrivals, and its scope closes them. A transaction writer's step closes once the
+    /// finish's attempt has run (`WriterRun::close`).
+    pub(super) fn close_step_when_settled(&mut self, dispatcher: &Dispatcher) -> bool {
+        if !self.finishing
+            || self.step_closed
+            || self.pending_step.is_some()
+            || !self
+                .pipelines()
+                .iter()
+                .all(|pipeline| dispatcher.states[pipeline.0].phase.load() == Phase::Finished)
+        {
+            return false;
+        }
+        self.step_closed = true;
+        dispatcher.close(self.attached().step);
+        true
     }
 
     /// The scope's pipeline, once its finish has begun and the inner pipelines and the step have
@@ -614,8 +642,11 @@ impl InductionStoreProducer {
         dispatcher: &Dispatcher,
         read: FollowersHold,
     ) -> bool {
+        // A finish activates the body and holds its followers with no request open, and the step
+        // must run before the scope finishes, so a finishing body releases them as a request does.
         let run = self.run();
-        run.request.is_some() && run.body.release_followers(dispatcher, read)
+        (run.request.is_some() || run.body.is_finishing())
+            && run.body.release_followers(dispatcher, read)
     }
 
     /// The step's follower hold, read before a publication pass, or `None` before the scope is
