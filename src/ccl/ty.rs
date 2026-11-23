@@ -339,6 +339,36 @@ pub enum FunKind {
     Var(Rc<FunKindVar>),
 }
 
+/// The entries of `subst` that act on `k`, the far side of a funkind edge, as a type edge keeps
+/// the entries that act on its content (`Subst::acting_on_type`): the entries for a variable's
+/// telescope, and the entries acting on the types a sum's binders range over. A compute function
+/// and a plain collection hold no type, so no binder entry acts on them. The witness half and the
+/// eliminations are kept whole.
+fn acting_on_kind(
+    solver: &mut Solver,
+    k: &FunKind,
+    subst: &crate::ccl::subst::Subst,
+) -> crate::ccl::subst::Subst {
+    match k {
+        FunKind::Var(v) => subst.binders_in(&v.telescope).into_owned(),
+        FunKind::Data(Some(ws)) => {
+            let mut tys = Vec::new();
+            for w in ws.iter() {
+                w.map_types(|t| {
+                    tys.push(t.clone());
+                    t.clone()
+                });
+            }
+            let mut keep = std::collections::BTreeSet::new();
+            for t in &tys {
+                keep.extend(subst.acting_on_type(solver, t).binders().cloned());
+            }
+            subst.without_binders(|b| !keep.contains(b))
+        }
+        FunKind::Compute | FunKind::Data(None) => subst.without_binders(|_| true),
+    }
+}
+
 impl FunKind {
     /// The Σ binders this kind carries — empty for everything but a sum-carrying
     /// [`FunKind::Data`]. Outermost first.
@@ -906,6 +936,7 @@ impl FunKindVar {
         if matches!(&k, FunKind::Var(v) if v.uid == self.uid) {
             return;
         }
+        let subst = acting_on_kind(solver, &k, &subst);
         let b = self.bounds(solver);
         let side = if lower { &b.lower } else { &b.upper };
         if side

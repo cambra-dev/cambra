@@ -2690,6 +2690,26 @@ A refinement's discharge postcondition uses the substitution inside its predicat
 indices shifted by one. A discharged name can remain when a replacement term introduces it from
 the destination scope. Simultaneous substitutions insert their replacement terms as written.
 
+#### A composition maps each binder one way
+
+`Subst::then(𝑎, 𝑏)` applies `𝑎`, then `𝑏`, so `𝑏` acts on the frame `𝑎` maps into. A binder that `𝑎`
+discharges, or renames to another binder, is not in that frame, so `𝑏` has no entry that sends it
+elsewhere. An identity rename on either side leaves the binder in the frame. In debug builds,
+`then` panics on a binder for which `𝑎`'s mapping, carried through `𝑏`, and `𝑏`'s own entry
+disagree.
+
+A contribution's join can leave its binder in the frame. A place received through a parameter
+crosses the signature's earlier parameters, which the history's type stands under ([A contribution
+crosses the binders after its target](#a-contribution-crosses-the-binders-after-its-target)). The
+join reads no value of the binder, so `𝑏`'s entry for it acts only on what `𝑎`'s other entries map
+to it, and `then` carries each of those through `𝑏` under its own key. `then` does not check the
+binder unless `𝑎`'s eliminations or witness discharges read it. Every other join is checked.
+
+A composition meets this where each half is read in the frame it acts on. A walk over the bound
+graph keeps the entries for the frame it reads in: `Subst::binders_in` at each variable, and
+`Bound::reading_subst` at a bound on an instance. Each half of a closure bridge keeps the entries
+for its own edge's frame ([Native bound edges and closure](#native-bound-edges-and-closure)).
+
 #### Native bound edges and closure
 
 A stored `Bound` has a type and a substitution on each side of its relation:
@@ -3936,8 +3956,11 @@ The choice of lower versus upper list determines the operation at either occurre
 polarity. An upper demand reaches concrete values through ordinary bound closure.
 
 A kind edge carries the substitution of the type edge it was recorded at, rendered as the
-bound recorded beside it renders (`FunKindVar::record_under`). A candidate read across the
-edge is read under it, composed before the walk's own, as that bound's content is. A
+bound recorded beside it renders (`FunKindVar::record_under`). It keeps the entries that act on its
+far side, as a type edge keeps those acting on its content: the entries for a funkind variable's
+telescope, and those acting on the types a sum's binders range over. A compute function or a
+plain collection keeps no binder entry. A candidate read across the edge is read under the edge's
+substitution, composed before the walk's own, as that bound's content is. A
 contribution leaving a scope relates its kind to the channel's under its exits, so a boxed row
 whose candidate names a loop variable is read with that variable joined over, as its domain
 would be.
