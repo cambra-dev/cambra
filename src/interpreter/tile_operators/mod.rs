@@ -3932,19 +3932,10 @@ mod tests {
     }
 }
 
-/// Independent position claims of a native input. Nested materialization retains whole rows.
-fn parallel_input_level(input: &dyn TileProducer, inner: bool) -> Option<CurryLevel> {
-    let tiling = input.tiling();
-    let level = if matches!(tiling.domain_extent(), Some(Extent::UIntRange(_))) {
-        CurryLevel::OUTERMOST
-    } else if inner
-        && matches!(tiling,
-        Tiling::DataFunction { codomain, .. }
-        if matches!(&**codomain, Tiling::DataFunction { domain: Extent::UIntRange(_), .. }))
-    {
-        CurryLevel::new(1)
-    } else {
-        return None;
-    };
-    (!input.restates().refuses(level)).then_some(level)
+/// The level at which independent claims of `input` split it: its outermost keys, whatever their
+/// extent, since each claim is a projection of those keys disjoint from every other claim. `None`
+/// for an input with no keys.
+pub(crate) fn parallel_input_level(input: &dyn TileProducer) -> Option<CurryLevel> {
+    let level = CurryLevel::OUTERMOST;
+    (input.tiling().is_data_function() && !input.restates().refuses(level)).then_some(level)
 }

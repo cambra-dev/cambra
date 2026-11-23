@@ -145,12 +145,25 @@ impl Breaker for SinkBreaker {
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
     fn consume_impl(&self, _: InputId, guard: TileGuard) {
-        let mut slot = Self::input(&self.producer);
-        let producer = slot.as_mut().expect("a sink has subscribed its producer");
+        // `get` and `release` take the producer shared, so workers consume several packages at
+        // once.
+        let slot = Self::reading(&self.producer);
+        let producer = slot.as_ref().expect("a sink has subscribed its producer");
         let tile = producer.get(guard);
         producer.release(tile.to_guard());
         drop(slot);
         self.deliver(tile);
+    }
+
+    fn parallel_level(&self) -> Option<CurryLevel> {
+        if !matches!(
+            *self.hands.lock().unwrap_or_else(PoisonError::into_inner),
+            Hands::EachPackage
+        ) {
+            return None;
+        }
+        let slot = Self::reading(&self.producer);
+        parallel_input_level(&**slot.as_ref()?)
     }
 
     fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {

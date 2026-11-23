@@ -9,8 +9,44 @@ use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{BaseType, Consumer, Extent, Predicate, TestDataSource, Value};
 
+// `{XS}` is a list literal of ROWS values and `{YS}` one of INNER values: a literal's domain is a
+// range of positions, which a pipeline needs to run on several workers.
 const PROGRAMS: &[(&str, &str, usize)] = &[
-    ("map_max", "out = test_sink()\nout << max([x * 2 for x in source1()])\n", 1),
+    (
+        "lit_map_max",
+        "out = test_sink()\nxs = [{XS}]\nout << max([x * 2 for x in xs])\n",
+        0,
+    ),
+    (
+        "lit_map_sum",
+        "out = test_sink()\nxs = [{XS}]\nout << sum([x * 2 for x in xs])\n",
+        0,
+    ),
+    (
+        "lit_filter_sum",
+        "out = test_sink()\nxs = [{XS}]\nout << sum([x for x in xs if x > 1500])\n",
+        0,
+    ),
+    (
+        "lit_groupby_sum",
+        "out = test_sink()\nxs = [{XS}]\nout << [sum(g) for g in groupby(xs, \\x -> x // 30)]\n",
+        0,
+    ),
+    (
+        "lit_cross_max",
+        "out = test_sink()\nxs = [{XS}]\nys = [{YS}]\nout << max([x * y + x for x in xs for y in ys])\n",
+        0,
+    ),
+    (
+        "lit_nest_sum",
+        "out = test_sink()\nxs = [{XS}]\nys = [{YS}]\nout << [sum([x * y for y in ys]) for x in xs]\n",
+        0,
+    ),
+    (
+        "map_max",
+        "out = test_sink()\nout << max([x * 2 for x in source1()])\n",
+        1,
+    ),
     (
         "filter_max",
         "out = test_sink()\nout << max([x for x in source1() if x > 1500])\n",
@@ -31,8 +67,16 @@ const PROGRAMS: &[(&str, &str, usize)] = &[
         "out = test_sink()\nout << max([max([y * x for y in source2()]) for x in source1()])\n",
         2,
     ),
-    ("map_list", "out = test_sink()\nout << [x * 2 for x in source1()]\n", 1),
-    ("map_sum", "out = test_sink()\nout << sum([x * 2 for x in source1()])\n", 1),
+    (
+        "map_list",
+        "out = test_sink()\nout << [x * 2 for x in source1()]\n",
+        1,
+    ),
+    (
+        "map_sum",
+        "out = test_sink()\nout << sum([x * 2 for x in source1()])\n",
+        1,
+    ),
     (
         "filter_sum",
         "out = test_sink()\nout << sum([x for x in source1() if x > 1500])\n",
@@ -59,6 +103,13 @@ const PROGRAMS: &[(&str, &str, usize)] = &[
         2,
     ),
 ];
+
+fn literal(rows: usize, salt: i64) -> String {
+    (0..rows)
+        .map(|i| ((i as i64 + salt).wrapping_mul(2654435761) % 3000).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn env(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -103,12 +154,17 @@ fn dop_bench() {
     let morsel = env("MORSEL", 1024);
     let mut ctx = GlobalContext::default();
     let sink = ctx.register_test_sink("out");
-    load(&mut ctx, "source1", rows, 3000);
+    if *sources > 0 {
+        load(&mut ctx, "source1", rows, 3000);
+    }
     if *sources > 1 {
         load(&mut ctx, "source2", inner, 3000);
     }
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let loaded = LoadedProgram::test(*code);
+    let code = code
+        .replace("{XS}", &literal(rows, 0))
+        .replace("{YS}", &literal(inner, 7));
+    let loaded = LoadedProgram::test(code);
     let t = Instant::now();
     let mut program = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
     let compile = t.elapsed();

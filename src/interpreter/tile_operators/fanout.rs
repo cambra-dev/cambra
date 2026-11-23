@@ -1730,13 +1730,7 @@ impl Breaker for MemoProducer {
         self.input.release(self.input.tiling().universal_guard());
     }
     fn parallel_level(&self) -> Option<CurryLevel> {
-        let Tiling::DataFunction { codomain, .. } = self.input.tiling() else {
-            return None;
-        };
-        if codomain.holds_a_level() {
-            return None;
-        }
-        parallel_input_level(&*self.input, false)
+        parallel_input_level(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
