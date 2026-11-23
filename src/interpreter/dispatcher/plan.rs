@@ -9,7 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
-use super::workers::WorkerPool;
+use super::workers::{WorkerPool, WorkerTarget};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -886,12 +886,32 @@ fn run_targets(
         })
         .collect();
     let consuming: Vec<BreakerHandle> = worker_targets.iter().flatten().cloned().collect();
+    // A push into a scope's pipeline offers the scope requests, which the coordinator queues after
+    // the consume or the finish that pushed them (`Execution::consume`, `Execution::finish`).
+    let mut read_by_scope = vec![false; execution.handlers.len()];
+    for (pipeline, handler) in execution.handlers.iter().enumerate() {
+        if matches!(handler, Handler::Request(_)) {
+            for &read in &dispatcher.infos[pipeline].reads {
+                read_by_scope[read] = true;
+            }
+        }
+    }
     let worker_targets = worker_targets
         .into_iter()
-        .map(|target| target.filter(|handle| chain_restates_parallel_level(handle, &consuming)))
+        .zip(read_by_scope)
+        .map(|(target, read_by_scope)| {
+            target.map(|handle| WorkerTarget {
+                parallel: chain_restates_parallel_level(&handle, &consuming),
+                serial: !read_by_scope,
+                handle,
+            })
+        })
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
     let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
+    for pipeline in workers.serial() {
+        dispatcher.order(pipeline);
+    }
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher);
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
@@ -1574,6 +1594,9 @@ impl Execution {
                     dispatcher.wait(generation)
                 }
                 Next::Wait(_) if self.resume(dispatcher, reach) => {}
+                // A worker's claim can become ready while the pass runs, so the workers are asked
+                // again after it.
+                Next::Wait(_) if workers.may_progress(dispatcher) => {}
                 Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
                 Next::Wait(_) => {
                     panic!("an acyclic run with no pending loop has a pipeline that may finish")
@@ -3775,6 +3798,9 @@ fn drive_live(
                     dispatcher.wait(generation)
                 }
                 Next::Wait(_) if execution.resume(dispatcher, reach) => {}
+                // A worker's claim can become ready while the pass runs, so the workers are asked
+                // again after it.
+                Next::Wait(_) if workers.may_progress(dispatcher) => {}
                 Next::Wait(generation) if dispatcher.changed_since(&generation) => {}
                 Next::Wait(_) => {
                     // A breaker that pushes only at its finish, as `MapAggregate`, finishes only

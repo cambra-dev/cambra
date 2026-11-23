@@ -456,12 +456,25 @@ impl TileOperator for UnionOperator {
         // The arms of a flat union are disjoint slices of one collection, pulled at the
         // projection. A tagged union keys an arm's rows by the arm's keys under its tag.
         let flat = self.flat;
+        // The arms of a flat union share the merged keys, and which arm holds a key is decided
+        // once every arm has delivered it (`AlignedInputs`).
+        let aligned =
+            crate::interpreter::notifications::AlignedInputs::new(self.level, &self.inputs);
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter()
             .zip(&self.tags)
-            .map(|(op, tag)| match flat {
-                true => subscribe_forwarding_keeping_keys(op, &shared, cx),
+            .enumerate()
+            .map(|(arm, (op, tag))| match flat {
+                true => op.clone().subscribe(
+                    op.tiling().universal_guard(),
+                    aligned.consumer(
+                        arm,
+                        crate::interpreter::notifications::InputRows::Keys,
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                ),
                 false => {
                     let consumer =
                         crate::interpreter::forwarding_consumer_tagging(&shared, tag.clone());

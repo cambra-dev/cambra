@@ -194,9 +194,27 @@ impl TileOperator for CheckedLookup {
                 // A stream of keys is pulled at the projection, and each answer sits at its key's
                 // position; the collection is read whole, since every key is answered against
                 // all of it.
-                let keeps_keys = keys.tiling().is_data_function();
-                let keys = subscribe_forwarding_keeping_keys_if(keeps_keys, keys, &shared, cx);
-                let collection = subscribe_forwarding(collection, &shared, cx);
+                // An answer exists once both have delivered (`AlignedInputs`).
+                use crate::interpreter::notifications::{AlignedInputs, InputRows};
+                let aligned = AlignedInputs::new(CurryLevel::OUTERMOST, [keys, collection]);
+                let rows = match keys.tiling().is_data_function() {
+                    true => InputRows::Keys,
+                    false => InputRows::Whole,
+                };
+                let keys = keys.clone().subscribe(
+                    keys.tiling().universal_guard(),
+                    aligned.consumer(0, rows, forwarding_consumer_keeping_keys(&shared)),
+                    cx,
+                );
+                let collection = collection.clone().subscribe(
+                    collection.tiling().universal_guard(),
+                    aligned.consumer(
+                        1,
+                        InputRows::Whole,
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                );
                 ProducerSource::Split { collection, keys }
             }
             // One input, carrying both operands, so there is nothing to share.

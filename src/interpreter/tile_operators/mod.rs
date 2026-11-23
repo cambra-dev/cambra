@@ -121,6 +121,17 @@ pub trait TileOperator: Send + Sync {
         arrives
     }
 
+    /// Per field of the record this operator builds from operands of its own, the field's name
+    /// and whether its value reaches readers by a push ([`keys_arrive_by_push`]); `None` for an
+    /// operator that builds no record from operands. Such a record's fields arrive
+    /// independently, so a reader of the whole record waits for all of them
+    /// (`notifications::whole_once_complete`).
+    ///
+    /// [`keys_arrive_by_push`]: Self::keys_arrive_by_push
+    fn fields_arrive_by_push(&self) -> Option<Vec<(SmolStr, bool)>> {
+        None
+    }
+
     /// Return the [`Tiling`] that describes this operator's output shape.
     /// If the operator has unbound arguments, the tiling will be a curried function
     /// from inputs to the output.
@@ -270,19 +281,6 @@ pub(crate) fn subscribe_forwarding_keeping_keys(
         forwarding_consumer_keeping_keys(shared),
         cx,
     )
-}
-
-/// [`subscribe_forwarding_keeping_keys`] where `keeps_keys`, and [`subscribe_forwarding`] where not.
-pub(crate) fn subscribe_forwarding_keeping_keys_if(
-    keeps_keys: bool,
-    op: &Arc<dyn TileOperator>,
-    shared: &SharedConsumer,
-    cx: &mut SubscribeContext,
-) -> Box<dyn TileProducer> {
-    match keeps_keys {
-        true => subscribe_forwarding_keeping_keys(op, shared, cx),
-        false => subscribe_forwarding(op, shared, cx),
-    }
 }
 
 /// What a pipeline breaker's operator passes its input, and what the breaker keeps. The breaker

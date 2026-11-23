@@ -1189,19 +1189,23 @@ impl TileOperator for Filter {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         // A side that is a collection is pulled at the projection and shares the mask's keys; a
-        // side that is not is read whole.
-        let predicate_producer = subscribe_forwarding_keeping_keys_if(
-            self.predicate.tiling().is_data_function(),
-            &self.predicate,
-            &shared,
-            cx,
-        );
-        let input_producer = subscribe_forwarding_keeping_keys_if(
-            self.input.tiling().is_data_function(),
-            &self.input,
-            &shared,
-            cx,
-        );
+        // side that is not is read whole. An entry exists once both sides have delivered it
+        // (`AlignedInputs`).
+        use crate::interpreter::notifications::{AlignedInputs, InputRows};
+        let aligned = AlignedInputs::new(self.level, [&self.input, &self.predicate]);
+        let side = |arm: usize, op: &Arc<dyn TileOperator>, cx: &mut SubscribeContext| {
+            let rows = match op.tiling().is_data_function() {
+                true => InputRows::Keys,
+                false => InputRows::Whole,
+            };
+            op.clone().subscribe(
+                op.tiling().universal_guard(),
+                aligned.consumer(arm, rows, forwarding_consumer_keeping_keys(&shared)),
+                cx,
+            )
+        };
+        let input_producer = side(0, &self.input, cx);
+        let predicate_producer = side(1, &self.predicate, cx);
         Box::new(FilterProducer {
             base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling(), self.clone(), cx),
             input: input_producer,

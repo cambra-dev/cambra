@@ -1129,18 +1129,18 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_where(preferred, &|_| true, true)
+        self.try_claim_where(preferred, &|_| true, &|_| true)
     }
 
     /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
-    /// and to no finish where `finishes` is false: a claimant that runs only some breakers, as a
-    /// worker of the pool runs the admitted ones. After [`stop_claims`](Self::stop_claims) it
-    /// answers [`Next::Done`].
+    /// and to the finishes of the pipelines `finishes` admits: a claimant that runs only some
+    /// breakers, as a worker of the pool runs the admitted ones. After
+    /// [`stop_claims`](Self::stop_claims) it answers [`Next::Done`].
     pub(crate) fn try_claim_where(
         &self,
         preferred: Option<PipelineId>,
         takes: &dyn Fn(PipelineId) -> bool,
-        finishes: bool,
+        finishes: &dyn Fn(PipelineId) -> bool,
     ) -> Next {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
@@ -1162,7 +1162,7 @@ impl Dispatcher {
         {
             return Next::Package(package);
         }
-        for p in (0..count).filter(|_| finishes) {
+        for p in (0..count).filter(|&p| finishes(PipelineId(p))) {
             let begun = self.try_begin_finish(p);
             if begun {
                 return Next::Finish {
@@ -1187,15 +1187,16 @@ impl Dispatcher {
         }
     }
 
-    /// [`try_claim_where`](Self::try_claim_where) with no finish, blocking while there is nothing
-    /// to claim, as [`claim`](Self::claim) does.
+    /// [`try_claim_where`](Self::try_claim_where), blocking while there is nothing to claim, as
+    /// [`claim`](Self::claim) does.
     pub(crate) fn claim_where(
         &self,
         preferred: Option<PipelineId>,
         takes: &dyn Fn(PipelineId) -> bool,
+        finishes: &dyn Fn(PipelineId) -> bool,
     ) -> Next {
         loop {
-            match self.try_claim_where(preferred, takes, false) {
+            match self.try_claim_where(preferred, takes, finishes) {
                 Next::Wait(generation) => self.wait(generation),
                 next => return next,
             }
@@ -1218,6 +1219,14 @@ impl Dispatcher {
                 // With nothing in flight, an ordered pipeline claims as any other does.
                 !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
             })
+    }
+
+    /// Whether a pipeline `finishes` admits is finishing, or may begin to: a claimant restricted to
+    /// those finishes may still change the run.
+    pub(crate) fn may_finish_where(&self, finishes: &dyn Fn(PipelineId) -> bool) -> bool {
+        (0..self.infos.len())
+            .filter(|&p| finishes(PipelineId(p)))
+            .any(|p| self.states[p].phase.load() == Phase::Finishing || self.ready_to_finish(p))
     }
 
     /// Whether the generation has advanced past `generation`: something changed that can make a
@@ -1740,6 +1749,9 @@ impl Drop for Pushes<'_> {
 pub struct Landing<'d> {
     target: Target<'d>,
     from: usize,
+    /// Per shared consumer this landing has notified, by address, the region it passed on
+    /// ([`unjoined`](Self::unjoined)).
+    joined: Vec<(usize, Projection)>,
 }
 
 /// What a [`Landing`] does with the regions that reach an [`Entry`].
@@ -1788,7 +1800,33 @@ impl Landing<'_> {
     }
 
     fn new(target: Target<'_>, from: usize) -> Landing<'_> {
-        Landing { target, from }
+        Landing {
+            target,
+            from,
+            joined: Vec::new(),
+        }
+    }
+
+    /// The part of `region` that the shared consumer at address `join` has not passed on in this
+    /// landing, recorded as passed on; `None` where that part is empty. A push that fans out and
+    /// meets again at one shared consumer reaches it once per path, and a reader reads its
+    /// package only once the landing has ended, so a region repeated within one landing names
+    /// nothing new. A landing that queues nothing passes every region on: a planner's probe or
+    /// route walk reads every path.
+    pub(crate) fn unjoined(&mut self, join: usize, region: &Projection) -> Option<Projection> {
+        if !self.is_delivery() {
+            return Some(region.clone());
+        }
+        let Some((_, passed)) = self.joined.iter_mut().find(|(at, _)| *at == join) else {
+            self.joined.push((join, region.clone()));
+            return Some(region.clone());
+        };
+        let new = region.minus(passed);
+        if new == Projection::Nothing {
+            return None;
+        }
+        *passed = passed.union(region);
+        Some(new)
     }
 
     /// A landing that records where `from`'s push arrives, and queues nothing.
