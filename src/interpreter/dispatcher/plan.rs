@@ -912,8 +912,17 @@ fn run_targets(
     for pipeline in workers.serial() {
         dispatcher.order(pipeline);
     }
+    // A package naming keys beneath the deepest level its chain restates, or no projection, is
+    // read wider than it names, so it runs alone.
     for (pipeline, level) in workers.restated() {
-        dispatcher.restate(pipeline, level);
+        dispatcher.classify(
+            pipeline,
+            Arc::new(move |guard: &TileGuard| {
+                Projection::of(guard)
+                    .ok()
+                    .is_none_or(|projection| projection.level().is_some_and(|at| at > level))
+            }),
+        );
     }
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher);
