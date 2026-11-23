@@ -102,7 +102,12 @@ impl LoopSchedule {
 
     /// The guard of the open round's step package.
     pub(super) fn step_guard(&self) -> Option<&TileGuard> {
-        self.request.as_ref()?.round.as_ref()
+        let request = self.request.as_ref()?;
+        match &request.round {
+            Round::Position(guard) => Some(guard),
+            Round::Closing => Some(&request.covers),
+            Round::Selecting | Round::Closed | Round::Undecided => None,
+        }
     }
 
     /// Whether the body's held output is published and its follower hold settled: from the first
@@ -695,20 +700,41 @@ impl Drop for Body {
 }
 
 struct Request {
+    /// Whether the request has read the drive's source for newly delivered positions.
     read: bool,
+    /// Whether the request has run a position round.
     emitted: bool,
-    closing: bool,
-    /// The last round's position is one the store could not decide: what the body read there is
-    /// not final yet. The request ends with that position unreleased, and a push from a pipeline
-    /// the scope reads brings the next request, which runs it again.
-    undecided: bool,
     /// The positions the request runs: its package's, and those an earlier request left waiting
     /// for inputs.
     covers: TileGuard,
-    /// Whether positions waited at the start of this request.
+    /// Whether positions waited for inputs when the request began ([`Body::take_waited`]).
     waited: bool,
-    round: Option<TileGuard>,
+    round: Round,
     package: WorkPackage,
+}
+
+/// Where a request stands between its rounds, which decides what
+/// [`queue_package_round`](InductionStoreProducer::queue_package_round) does next.
+enum Round {
+    /// No round is queued: the next call runs the next position the request covers, or the
+    /// closing round, or ends the request.
+    Selecting,
+    /// The round at this position is queued, and [`complete_round`] steps the store over it.
+    ///
+    /// [`complete_round`]: InductionStoreProducer::complete_round
+    Position(TileGuard),
+    /// The closing round over the request's positions is queued.
+    Closing,
+    /// The closing round has run: the next call ends the request, keeping the positions the
+    /// store has not decided waiting for inputs ([`keep_undecided`]).
+    ///
+    /// [`keep_undecided`]: InductionStoreProducer::keep_undecided
+    Closed,
+    /// The last position round did not decide its position: what the body read there is not final
+    /// yet. The next call ends the request with the positions it covers and the store has not
+    /// decided waiting for inputs, and a push from a pipeline the scope reads brings the next
+    /// request, which runs that position again.
+    Undecided,
 }
 
 impl InductionRun {
@@ -1026,11 +1052,9 @@ impl InductionStoreProducer {
         schedule.request = Some(Request {
             read: rows,
             emitted: false,
-            closing: false,
-            undecided: false,
             covers,
             waited: waited.is_some(),
-            round: None,
+            round: Round::Selecting,
             package,
         });
     }
@@ -1076,18 +1100,20 @@ impl InductionStoreProducer {
             .request
             .take()
             .expect("a loop has a pending request");
-        assert!(
-            request.round.is_none(),
-            "the body and store step complete before the next round"
-        );
-        if request.undecided {
-            let waiting = guard_minus(&request.covers, &self.input_released(InputId::ONLY));
-            self.wait_for_inputs(waiting);
-            return (Some(request.package), RoundWork::default());
-        }
-        if request.closing {
-            self.keep_undecided(&request.covers, request.waited);
-            return (Some(request.package), RoundWork::default());
+        match request.round {
+            Round::Selecting => {}
+            Round::Undecided => {
+                let waiting = guard_minus(&request.covers, &self.input_released(InputId::ONLY));
+                self.wait_for_inputs(waiting);
+                return (Some(request.package), RoundWork::default());
+            }
+            Round::Closed => {
+                self.keep_undecided(&request.covers, request.waited);
+                return (Some(request.package), RoundWork::default());
+            }
+            Round::Position(_) | Round::Closing => {
+                unreachable!("the body and store step complete before the next round")
+            }
         }
         // A round an earlier request left undecided runs again first: what it read has grown.
         if let Some(guard) = schedule.rerun.take()
@@ -1097,7 +1123,7 @@ impl InductionStoreProducer {
             let mut work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
             self.run().body.queue_grown(&mut work);
             request.emitted = true;
-            request.round = Some(guard);
+            request.round = Round::Position(guard);
             schedule.request = Some(request);
             return (None, work);
         }
@@ -1111,7 +1137,7 @@ impl InductionStoreProducer {
                 let mut work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
                 self.run().body.queue_grown(&mut work);
                 request.emitted = true;
-                request.round = Some(guard);
+                request.round = Round::Position(guard);
                 schedule.request = Some(request);
                 return (None, work);
             }
@@ -1148,29 +1174,49 @@ impl InductionStoreProducer {
         // readers, a nested loop's among them, and a reader that has not read what grew would
         // offer the nested loop none of the positions it brings.
         self.run().body.queue_grown(&mut work);
-        request.closing = true;
-        request.round = Some(request.covers.clone());
+        request.round = Round::Closing;
         schedule.request = Some(request);
         (None, work)
     }
 
     /// Step the queued round after its body and held pushes settle.
     pub(super) fn complete_round(&mut self, schedule: &mut LoopSchedule) {
-        let (guard, closing) = schedule
+        let request = schedule
             .request
             .as_mut()
-            .and_then(|request| Some((request.round.take()?, request.closing)))
             .expect("a loop steps one queued round");
-        self.placed(|scope| scope.step_round(&guard));
-        // A position round the store did not decide stays unreleased: running it again before
-        // what the body read changes would decide nothing again.
-        if !closing && !guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty() {
-            schedule
-                .request
-                .as_mut()
-                .expect("a loop steps one queued round")
-                .undecided = true;
-            schedule.rerun = Some(guard);
+        let round = std::mem::replace(&mut request.round, Round::Selecting);
+        match round {
+            Round::Position(guard) => {
+                self.placed(|scope| scope.step_round(&guard));
+                // A position round the store did not decide stays unreleased: running it again
+                // before what the body read changes would decide nothing again.
+                if !guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty() {
+                    schedule
+                        .request
+                        .as_mut()
+                        .expect("a loop steps one queued round")
+                        .round = Round::Undecided;
+                    schedule.rerun = Some(guard);
+                }
+            }
+            Round::Closing => {
+                let covers = schedule
+                    .request
+                    .as_ref()
+                    .expect("a loop steps one queued round")
+                    .covers
+                    .clone();
+                self.placed(|scope| scope.step_round(&covers));
+                schedule
+                    .request
+                    .as_mut()
+                    .expect("a loop steps one queued round")
+                    .round = Round::Closed;
+            }
+            Round::Selecting | Round::Closed | Round::Undecided => {
+                unreachable!("a loop steps one queued round")
+            }
         }
     }
 
