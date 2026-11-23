@@ -215,15 +215,22 @@ impl Queue {
         })
     }
 
-    /// Remove a matching claim. Monotonic indices distinguish repeated reads of the same guard.
-    fn acknowledge(&self, package: &WorkPackage, on_ack: impl FnOnce()) -> bool {
+    /// Remove a matching claim, and answer whether it was one: `None` where no claim matches, and
+    /// otherwise whether the package at the head of the queue met the removed one, which
+    /// [`claim`](Self::claim) holds back while they overlap. Monotonic indices distinguish
+    /// repeated reads of the same guard.
+    fn acknowledge(&self, package: &WorkPackage, on_ack: impl FnOnce()) -> Option<bool> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.in_flight.get(&package.index) != Some(&package.guard) {
-            return false;
+            return None;
         }
         on_ack();
         state.in_flight.remove(&package.index);
-        true
+        let freed_head = state
+            .ready
+            .front()
+            .is_some_and(|(_, next)| !next.intersect(&package.guard).is_empty());
+        Some(freed_head)
     }
 
     /// Reserve `count` indices while the queue is open, and answer the first; `None` once it is
@@ -1266,8 +1273,7 @@ impl Dispatcher {
     /// [`changed_since`](Self::changed_since), it misses no package: one that becomes claimable
     /// after it advances the generation. A package held back because its region meets one in
     /// flight becomes claimable at that package's acknowledgement, which advances the generation
-    /// only where it frees or completes a queue, so every claimant wakes the others once its claim
-    /// ends ([`wake_claimants`](Self::wake_claimants)).
+    /// ([`acknowledge`](Self::acknowledge)).
     pub(crate) fn may_claim_where(&self, takes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| takes(PipelineId(p)))
@@ -1348,7 +1354,7 @@ impl Dispatcher {
         let p = package.pipeline.0;
         let state = self.state(package.pipeline);
         let mut acknowledged = 0;
-        let held = state.queue.acknowledge(&package, || {
+        let freed_head = state.queue.acknowledge(&package, || {
             // Record consumption before unlocking the next ordered claim or publishing finish.
             #[cfg(test)]
             self.record(Event::Consume {
@@ -1378,12 +1384,14 @@ impl Dispatcher {
                 package.guard
             ),
         };
-        self.ensure(held, refused);
-        // An acknowledgement frees an ordered pipeline's next package, may let the pipeline
-        // finish or a pipeline that follows it claim, and returns credit to a limited source's
-        // notify.
+        self.ensure(freed_head.is_some(), refused);
+        // An acknowledgement frees an ordered pipeline's next package or a package that waited
+        // on the acknowledged one's region, may let the pipeline finish or a pipeline that follows
+        // it claim, and returns credit to a limited source's notify. A claimant asleep on the
+        // generation wakes only where it advances.
         if self.infos[p].ordered
             || self.infos[p].limit != usize::MAX
+            || freed_head == Some(true)
             || acknowledged == state.queue.reserved()
         {
             self.advance();
@@ -3007,6 +3015,46 @@ mod tests {
         for package in [disjoint, overlapping] {
             dispatcher.acknowledge(package);
         }
+    }
+
+    /// The acknowledgement that frees a package waiting on an overlapping one wakes a claimant
+    /// asleep on the pipeline, with no other change to the dispatcher. The claimant is asleep in
+    /// [`Dispatcher::wait`] before the acknowledgement, and must return within a bounded wait.
+    #[test]
+    fn acknowledging_an_overlap_wakes_a_sleeping_claimant() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::time::{Duration, Instant};
+        let dispatcher = Dispatcher::new(vec![vec![]], 1 << 20).unrecorded();
+        let source = PipelineId(0);
+        dispatcher.notify(source, &keys_between(0, 9));
+        let first = dispatcher
+            .claim_of(source)
+            .expect("the first package claims");
+        dispatcher.notify(source, &keys_between(5, 14));
+        let (claimed, woke) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let next = dispatcher.claim(None);
+                claimed.send(next).expect("the test waits for the claim");
+            });
+            // The claimant finds only the overlapping package and sleeps.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while dispatcher.sleepers.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline, "the claimant never slept");
+                thread::sleep(Duration::from_millis(1));
+            }
+            dispatcher.acknowledge(first);
+            let next = woke.recv_timeout(Duration::from_secs(5));
+            if next.is_err() {
+                // Release the claimant so the scope can end, then report the missed wake.
+                dispatcher.fail();
+            }
+            let Ok(Next::Package(package)) = next else {
+                panic!("the acknowledgement left the claimant asleep: {next:?}")
+            };
+            assert_eq!(package.guard, keys_between(5, 14));
+            dispatcher.acknowledge(package);
+        });
     }
 
     #[test]
