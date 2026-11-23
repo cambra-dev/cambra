@@ -15,8 +15,6 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::BarrierVar;
-use crate::ccl::infer_var::BarrierVarId;
 use crate::ccl::subst::{JoinSite, RefinementScope, Subst};
 
 use crate::ccl::{
@@ -2807,7 +2805,7 @@ fn consulted_in(
     ty: &Type,
     pol: bool,
     at: (bool, bool),
-    barriers: &mut HashSet<BarrierVarId>,
+    barriers: &mut HashSet<InferVarId>,
 ) -> Option<ConsultedInputs> {
     let fresh = (true, false);
     match ty {
@@ -2867,20 +2865,11 @@ fn consulted_in(
             }
             Some(out)
         }
-        Type::Infer(state) => Some(ConsultedInputs {
-            edges: vec![ConsultedEdge {
-                var: Rc::clone(state),
-                pol,
-                at,
-                image: NameImage::default(),
-            }],
-            ..Default::default()
-        }),
-        Type::BarrierVar(barrier) => {
+        Type::Infer(barrier) if barrier.is_barrier() => {
             if !barriers.insert(barrier.uid) {
                 return None;
             }
-            let lowers = barrier.lowers(solver).to_vec();
+            let lowers = barrier.bounds(solver).lower().to_vec();
             let out = lowers
                 .iter()
                 .try_fold(ConsultedInputs::default(), |mut out, b| {
@@ -2891,6 +2880,15 @@ fn consulted_in(
             barriers.remove(&barrier.uid);
             out
         }
+        Type::Infer(state) => Some(ConsultedInputs {
+            edges: vec![ConsultedEdge {
+                var: Rc::clone(state),
+                pol,
+                at,
+                image: NameImage::default(),
+            }],
+            ..Default::default()
+        }),
         Type::WitnessRef(_) => Some(ConsultedInputs {
             reads: ConsultedReads {
                 witnesses: true,
@@ -3174,10 +3172,10 @@ struct CompactState {
     recursive: HashMap<(InferVarId, bool), InferVarId>,
     /// Barrier variables whose lower bounds are currently being joined. Keyed on the
     /// barrier alone: its lowers are read at positive polarity whatever the reference's.
-    barriers_in_process: HashSet<BarrierVarId>,
+    barriers_in_process: HashSet<InferVarId>,
     /// Placeholder ids minted for a barrier variable revisited while its lowers are being
     /// joined, which the walk records in `rec_vars` as `recursive`'s are.
-    barrier_recursive: HashMap<BarrierVarId, InferVarId>,
+    barrier_recursive: HashMap<InferVarId, InferVarId>,
     /// Bounds of recursive variables (surfaced as `RecursiveType` errors by
     /// `coalesce_compact`).
     rec_vars: BTreeMap<InferVarId, CompactType>,
@@ -3358,7 +3356,7 @@ fn capabilities_at(
 /// and the `Infer` arm treats a cycle through a barrier the same way.
 fn join_barrier_lowers(
     solver: &mut Solver,
-    barrier: &BarrierVar,
+    barrier: &crate::ccl::InferVar,
     subst_acc: &Subst,
     st: &mut CompactState,
 ) -> (CompactType, Vec<Name>) {
@@ -3371,7 +3369,7 @@ fn join_barrier_lowers(
         return (CompactType::from_var(placeholder), Vec::new());
     }
     st.barriers_in_process.insert(barrier.uid);
-    let lowers = barrier.lowers(solver).to_vec();
+    let lowers = barrier.bounds(solver).lower().to_vec();
     let mut joined = CompactType::empty();
     for b in &lowers {
         let inner_acc = {
@@ -3382,7 +3380,10 @@ fn join_barrier_lowers(
         joined = CompactType::merge(solver, true, joined, bc);
     }
     let mut escaped = Vec::new();
-    joined.resolve_barrier_refinements(Variance::Covariant, barrier.opaque(), &mut escaped);
+    let opaque = barrier
+        .opaque()
+        .expect("only a barrier variable's lowers are joined as a barrier's");
+    joined.resolve_barrier_refinements(Variance::Covariant, opaque, &mut escaped);
     st.barriers_in_process.remove(&barrier.uid);
     if let Some(rec_uid) = st.barrier_recursive.remove(&barrier.uid) {
         st.impure += 1;
@@ -3400,7 +3401,7 @@ fn join_barrier_lowers(
 /// recursive type, whose bounds are in `rec_vars`.
 pub(super) fn barrier_resolution(
     solver: &mut Solver,
-    barrier: &BarrierVar,
+    barrier: &crate::ccl::InferVar,
 ) -> (CompactGraph, Vec<Name>) {
     let mut st = CompactState::new(true);
     let (term, escaped) = join_barrier_lowers(solver, barrier, &Subst::id(), &mut st);
@@ -3860,10 +3861,8 @@ fn compact_go_inner(
     match ty {
         // Not a type — an annotation-position obligation, erased by
         // `normalize_annotation` before any constraint is emitted (see `Type::BoundedHole`).
-        Type::BoundedHole(_) => {
-            unreachable!(
-                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
-            )
+        Type::BoundedHole(_) | Type::BarrierHole(_) => {
+            unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
         }
         // Atomic types contribute a single atom. A term substitution never
         // touches an atom, so `subst_acc` is irrelevant here.
@@ -4347,7 +4346,9 @@ fn compact_go_inner(
         // position is kept, and `solve_barrier_vars` reports one naming such a binder. The
         // upper bounds are not read here: `solve_barrier_vars` checks them before any
         // compaction, so this walk leaves the graph as it found it.
-        Type::BarrierVar(barrier) => join_barrier_lowers(solver, barrier, subst_acc, st).0,
+        Type::Infer(barrier) if barrier.is_barrier() => {
+            join_barrier_lowers(solver, barrier, subst_acc, st).0
+        }
         Type::Infer(state) => {
             let uid = state.uid;
             let at = (fallback_allowed(pos, st), pos.invariant);
@@ -5232,8 +5233,14 @@ mod tests {
         use crate::ccl::infer::solver::test_helpers::dep_pred;
         let solver = &mut Solver::new();
         let int = || Type::Base(BaseType::Int);
-        let barrier = BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
-        let b = Type::BarrierVar(Rc::clone(&barrier));
+        // The barrier stands under `x`, which its lower bound names.
+        let barrier = crate::ccl::InferVar::barrier(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(Name::raw("x")),
+            Rc::from([]),
+        );
+        let b = Type::Infer(Rc::clone(&barrier));
         let lower = Type::fun(
             Type::refined_one(int(), Refinement::born(dep_pred("x"))),
             int(),
@@ -6427,21 +6434,22 @@ mod tests {
     /// that records a barrier's lower bound runs no occurs check, so nothing keeps this
     /// graph from forming. Compacting `𝐵` terminates, and coalescing reports the cycle as
     /// a recursive type.
-    fn barrier_with_a_self_reaching_lower(solver: &mut Solver) -> Rc<BarrierVar> {
-        let barrier = BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
-        let b = Type::BarrierVar(Rc::clone(&barrier));
+    fn barrier_with_a_self_reaching_lower(solver: &mut Solver) -> Rc<crate::ccl::InferVar> {
+        let barrier =
+            crate::ccl::infer_var::test_barrier(solver, Rc::from([]), Vec::new(), Vec::new());
+        let b = Type::Infer(Rc::clone(&barrier));
         let lower = Type::fun(Type::Base(BaseType::Int), b.clone());
         constrain_subtype(solver, &lower, &b, &mut ConstrainCache::new())
             .expect("the lower flows in");
         barrier
     }
 
-    /// The `BarrierVar` arm of `compact_go`.
+    /// The barrier arm of `compact_go`.
     #[test]
     fn a_barrier_reaching_itself_through_its_lower_is_a_recursive_type() {
         let solver = &mut Solver::new();
         let barrier = barrier_with_a_self_reaching_lower(solver);
-        let compact = compact_type(solver, &Type::BarrierVar(barrier));
+        let compact = compact_type(solver, &Type::Infer(barrier));
         assert!(
             matches!(
                 coalesce_compact(solver, &compact),

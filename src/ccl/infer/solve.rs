@@ -986,7 +986,7 @@ fn for_each_positioned_var(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
-        | Type::BarrierVar(_)
+        | Type::BarrierHole(_)
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::WitnessRef(_)
@@ -1518,7 +1518,7 @@ pub(super) fn assert_settled(
                     "an ordering requirement is not closed once inference has closed \
                      capabilities"
                 ),
-                Held::Infer(_) | Held::Barrier(_) | Held::FunKind(_) | Held::Obligation(_) => {}
+                Held::Infer(_) | Held::FunKind(_) | Held::Obligation(_) => {}
             }
         }
 
@@ -1725,8 +1725,6 @@ impl crate::ccl::infer::solver::held::HeldRewriter for Settler<'_> {
 pub(super) struct Closer<'m> {
     memo: &'m PredMemo,
     kinds: HashMap<crate::ccl::ty::FunKindVarId, Rc<crate::ccl::ty::FunKindVar>>,
-    /// The id each barrier variable closes to, minted for it.
-    barriers: HashMap<crate::ccl::BarrierVarId, InferVarId>,
 }
 
 impl<'m> Closer<'m> {
@@ -1734,7 +1732,6 @@ impl<'m> Closer<'m> {
         Closer {
             memo,
             kinds: HashMap::new(),
-            barriers: HashMap::new(),
         }
     }
 
@@ -1776,12 +1773,6 @@ impl crate::ccl::infer::solver::held::HeldRewriter for Closer<'_> {
     fn type_variable(&mut self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Infer(v) => Some(Type::Undetermined(v.uid)),
-            Type::BarrierVar(b) => Some(Type::Undetermined(
-                *self
-                    .barriers
-                    .entry(b.uid)
-                    .or_insert_with(crate::ccl::infer_var::next_infer_var_id),
-            )),
             _ => None,
         }
     }
@@ -3857,7 +3848,7 @@ fn coalesce_type_predicates_go(
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and
         // `resolve_binder_slot` has already reported that failure.
-        Type::BarrierVar(_)
+        Type::BarrierHole(_)
         | Type::Undetermined(_)
         | Type::Base(_)
         | Type::UIntRange(_)

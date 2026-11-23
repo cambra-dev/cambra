@@ -20,11 +20,8 @@ use crate::ccl::capabilities::{
     Capabilities, CapabilityRun, CapabilityState, CapabilityVar, OrderableIfRequiredBy,
     OrderingState,
 };
-use crate::ccl::infer::solver::var::{Recorded, Solved, SolverVar, VarTable};
-use crate::ccl::infer_var::{
-    Barrier, BarrierState, BarrierVar, InferBounds, InferState, InferVar, InferVarId,
-    SuspendedMemberships,
-};
+use crate::ccl::infer::solver::var::{Recorded, Solved, SolverVar, VarState, VarTable};
+use crate::ccl::infer_var::{InferBounds, InferState, InferVar, InferVarId, SuspendedMemberships};
 use crate::ccl::ty::{FunKind, FunKindState, FunKindVar, RenderCtx};
 
 /// Identity of a [`Solver`], so a handle can tell the solver that minted it from any other.
@@ -41,8 +38,7 @@ static SOLVER_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Every write to such state goes through an accessor on [`Solver`] that moves its count: a
 /// solver variable's [`Solver::var_state_mut`], through its sort's [`Recorded::note_write`],
 /// [`Solver::funkind_names_mut`] for the binder names a funkind variable settles on, which
-/// [`FunKindVar::resolved`] does not read, and [`Solver::capability_run_mut`]. No cached answer
-/// reads a barrier variable's state, so it has no count; a cache that does would add one there. A cached answer
+/// [`FunKindVar::resolved`] does not read, and [`Solver::capability_run_mut`]. A cached answer
 /// records the counts of everything it reads ([`Solver::funkind_revision`],
 /// [`Solver::capability_revision`]) and is reused only while they stand, so no write it reads
 /// can outlive it, while a write to state it does not read leaves it standing. Caches live
@@ -231,8 +227,6 @@ pub struct Solver {
     infer_slots: HashMap<InferVarId, usize>,
     /// What is recorded on each funkind variable.
     funkinds: VarTable<FunKind>,
-    /// What is recorded on each barrier variable.
-    barriers: VarTable<Barrier>,
     /// What is recorded on each capability variable.
     capabilities: VarTable<Capabilities>,
     /// What is recorded on each ordering requirement the run made.
@@ -323,7 +317,6 @@ impl Solver {
             infer: Table::default(),
             infer_slots: HashMap::new(),
             funkinds: Table::default(),
-            barriers: Table::default(),
             capabilities: Table::default(),
             orderings: Table::default(),
             reading: 0,
@@ -373,7 +366,7 @@ impl Solver {
     /// count as [`Self::var_state_mut`] does ([`Revisions`]).
     fn swap_bounds_at(&mut self, slot: Slot, bounds: &mut InferBounds) {
         self.revisions.infer += 1;
-        std::mem::swap(&mut self.infer.at_slot_mut(slot).bounds, bounds);
+        std::mem::swap(&mut self.infer.at_slot_mut(slot).own.bounds, bounds);
     }
 
     /// Before `var`'s bounds are written: keep them as they stand, the first time while bounds
@@ -386,7 +379,7 @@ impl Solver {
         if kept.contains_key(&slot) {
             return;
         }
-        let bounds = self.infer.get(self.id, var).bounds.clone();
+        let bounds = self.infer.get(self.id, var).own.bounds.clone();
         if let Some(kept) = &mut self.bounds_before {
             kept.insert(slot, bounds);
         }
@@ -519,13 +512,13 @@ impl Solver {
 
     /// What has been recorded on the solver variable `var`: nothing, for a foreign handle this
     /// run has not recorded on.
-    pub(crate) fn var_state<V: Recorded>(&self, var: &SolverVar<V>) -> &V::State {
+    pub(crate) fn var_state<V: Recorded>(&self, var: &SolverVar<V>) -> &VarState<V> {
         V::check_read(self, var);
         V::table(self).get(self.id, var)
     }
 
-    /// What has been recorded on the solver variable `var`, for recording more.
-    pub(crate) fn var_state_mut<V: Recorded>(&mut self, var: &SolverVar<V>) -> &mut V::State {
+    /// What has been recorded on the solver variable `var`, for recording more ([`Revisions`]).
+    pub(crate) fn var_state_mut<V: Recorded>(&mut self, var: &SolverVar<V>) -> &mut VarState<V> {
         V::note_write(self, var);
         let id = self.id;
         V::table_mut(self).get_mut(id, var)
@@ -546,39 +539,33 @@ impl Solver {
     /// What has been recorded on `var`: nothing, for a foreign handle this run has not
     /// recorded on.
     pub(crate) fn infer_state(&self, var: &InferVar) -> &InferState {
-        self.var_state(var)
+        &self.var_state(var).own
     }
 
     /// What has been recorded on `var`, for recording more ([`Revisions`]).
     pub(crate) fn infer_state_mut(&mut self, var: &InferVar) -> &mut InferState {
-        self.var_state_mut(var)
+        &mut self.var_state_mut(var).own
     }
 
-    /// Every barrier variable this solver minted, in minting order.
-    pub(crate) fn barrier_vars(&self) -> &[Rc<BarrierVar>] {
-        &self.barriers.handles
-    }
-
-    /// What has been recorded on the barrier `var`.
-    pub(crate) fn barrier_state(&self, var: &BarrierVar) -> &BarrierState {
-        self.var_state(var)
-    }
-
-    /// What has been recorded on the barrier `var`, for recording more. No cached answer reads
-    /// it, so no revision moves ([`Revisions`]).
-    pub(crate) fn barrier_state_mut(&mut self, var: &BarrierVar) -> &mut BarrierState {
-        self.var_state_mut(var)
+    /// Every barrier variable this solver minted ([`InferVar::opaque`]), in minting order.
+    pub(crate) fn barrier_vars(&self) -> Vec<Rc<InferVar>> {
+        self.infer
+            .handles
+            .iter()
+            .filter(|v| v.is_barrier())
+            .cloned()
+            .collect()
     }
 
     /// What has been recorded on the capability `var`. Only the solver that minted it reads
     /// it: a capability variable never leaves the run that minted it.
     pub(crate) fn capability_state(&self, var: &CapabilityVar) -> &CapabilityState {
-        self.var_state(var)
+        &self.var_state(var).own
     }
 
     /// What has been recorded on the capability `var`, for recording more ([`Revisions`]).
     pub(crate) fn capability_state_mut(&mut self, var: &CapabilityVar) -> &mut CapabilityState {
-        self.var_state_mut(var)
+        &mut self.var_state_mut(var).own
     }
 
     /// The home the ordering requirement this solver makes next gets.
@@ -631,7 +618,7 @@ impl Solver {
     /// What has been recorded on the kind `var`. A kind no solver minted, as lowering mints
     /// one, reads as unrecorded even here: no run's facts are at stake.
     pub(crate) fn funkind_state(&self, var: &FunKindVar) -> &FunKindState {
-        self.var_state(var)
+        &self.var_state(var).own
     }
 
     /// The binder names the kind `var` has settled on, for settling more: a name is no fact
@@ -643,12 +630,12 @@ impl Solver {
         self.reach(format_args!("{var:?}"));
         assert_records_on_a_run_kind(var);
         self.revisions.funkind_names += 1;
-        self.funkinds.get_mut(self.id, var).names_mut()
+        self.funkinds.get_mut(self.id, var).own.names_mut()
     }
 
     /// What has been recorded on the kind `var`, for recording more ([`Revisions`]).
     pub(crate) fn funkind_state_mut(&mut self, var: &FunKindVar) -> &mut FunKindState {
-        self.var_state_mut(var)
+        &mut self.var_state_mut(var).own
     }
 }
 
@@ -685,7 +672,12 @@ impl Recorded for Type {
         }
         solver.revisions.infer += 1;
     }
-    fn adopt(solver: &mut Solver, var: &Rc<InferVar>, state: InferState) {
+    fn lowered(solver: &mut Solver, var: &InferVar, level: crate::ccl::Level) {
+        if var.fun_kind().home().is_some() {
+            var.fun_kind().lower_level(solver, level);
+        }
+    }
+    fn adopt(solver: &mut Solver, var: &Rc<InferVar>, state: VarState<Self>) {
         solver.mint(format_args!("a fresh inference variable"));
         solver
             .infer_slots
@@ -715,32 +707,10 @@ impl Recorded for FunKind {
         assert_records_on_a_run_kind(var);
         solver.revisions.funkind += 1;
     }
-    fn adopt(solver: &mut Solver, var: &Rc<FunKindVar>, state: FunKindState) {
+    fn adopt(solver: &mut Solver, var: &Rc<FunKindVar>, state: VarState<Self>) {
         solver.mint(format_args!("a fresh funkind variable"));
         let id = solver.id;
         solver.funkinds.adopt(id, var, state);
-    }
-}
-
-impl Recorded for Barrier {
-    type State = BarrierState;
-    fn table(solver: &Solver) -> &VarTable<Self> {
-        &solver.barriers
-    }
-    fn table_mut(solver: &mut Solver) -> &mut VarTable<Self> {
-        &mut solver.barriers
-    }
-    fn check_read(solver: &Solver, var: &BarrierVar) {
-        solver.reach(format_args!("{var:?}"));
-    }
-    /// No cached answer reads a barrier variable's state, so no revision moves ([`Revisions`]).
-    fn note_write(solver: &mut Solver, var: &BarrierVar) {
-        solver.record(var.home(), format_args!("{var:?}"));
-    }
-    fn adopt(solver: &mut Solver, var: &Rc<BarrierVar>, state: BarrierState) {
-        solver.mint(format_args!("a fresh barrier variable"));
-        let id = solver.id;
-        solver.barriers.adopt(id, var, state);
     }
 }
 
@@ -761,7 +731,7 @@ impl Recorded for Capabilities {
         own_capability(solver, var);
         solver.revisions.capability += 1;
     }
-    fn adopt(solver: &mut Solver, var: &Rc<CapabilityVar>, state: CapabilityState) {
+    fn adopt(solver: &mut Solver, var: &Rc<CapabilityVar>, state: VarState<Self>) {
         solver.mint(format_args!("a fresh capability variable"));
         let id = solver.id;
         solver.capabilities.adopt(id, var, state);

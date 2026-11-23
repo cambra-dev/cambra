@@ -2,7 +2,7 @@
 //! type-blind structural equality / hashing on refinement predicate terms.
 
 use crate::ccl::infer::solver::Solver;
-use crate::ccl::infer::solver::var::{Solved, SolverVar};
+use crate::ccl::infer::solver::var::{Solved, SolverVar, VarState};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use smol_str::SmolStr;
 
 use crate::ccl::{
-    BarrierVar, BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils,
-    symbolic,
+    BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic,
 };
 
 /// The introduction level riding a [`Type::ChanDom`] — deliberately
@@ -671,7 +670,7 @@ struct FunKindBounds {
     ///
     /// Not a bound, and not a pair of them. Mutual bounds would say the two kinds are equal,
     /// which recouples the pins that freshening exists to separate — "a pin the definition
-    /// site acquires later must not reach this instantiation" (`freshen_kind_var`). What a
+    /// site acquires later must not reach this instantiation" (`copy_var`). What a
     /// copy shares is *which binder each position is*, not what the kind resolves to, and a
     /// bound cannot say the first without saying the second.
     instantiated_from: Option<Rc<FunKindVar>>,
@@ -730,7 +729,9 @@ impl Solved for FunKind {
     }
 }
 
-/// What a funkind variable carries besides what every solver variable has.
+/// What a funkind variable carries besides what every solver variable has, fixed where it is
+/// minted.
+#[derive(Clone)]
 pub struct FunKindVarFixed {
     /// Whether this is an annotation's **funkind hole** ([`FunKind::data_hole`]): a funkind the
     /// program left to inference, which normalization replaces with a fresh data funkind at
@@ -745,13 +746,6 @@ pub struct FunKindVarFixed {
 /// What a run has recorded on a [`FunKindVar`].
 #[derive(Default)]
 pub(crate) struct FunKindState {
-    /// The scope level of what owns this funkind variable, the variable it is the funkind of or
-    /// the annotation's function it was minted for, where that is known: a freshening copies it
-    /// only above its cutoff, as it copies a variable, so an instantiation leaves an outer
-    /// definition's funkind variable its own (`src/ccl/design/type-inference.md`, "Funkind
-    /// variables are copied by level"). `None` where nothing records an owner's level, and such
-    /// a funkind variable is copied by every freshening that reaches it.
-    level: Option<crate::ccl::infer_var::Level>,
     bounds: FunKindBounds,
     /// [`FunKindVar::resolved`]'s answer, at the funkind revision it was computed at
     /// ([`Solver::funkind_revision`](crate::ccl::infer::solver::Solver::funkind_revision)).
@@ -805,11 +799,15 @@ impl FunKindVar {
         let SolverVar {
             uid: _,
             home: _,
+            initial_level: _,
             telescope: _,
             fixed: FunKindVarFixed { hole: _, minted: _ },
         } = self;
+        let VarState {
+            lowered_to: _,
+            own: _,
+        } = solver.var_state(self);
         let FunKindState {
-            level: _,
             bounds: _,
             resolved_at: _,
             component_at: _,
@@ -831,19 +829,22 @@ impl FunKindVar {
 
 impl FunKindVar {
     /// Mint a fresh funkind variable owned by `solver`, with nothing recorded, for an owner
-    /// standing at `level` ([`FunKindState`]'s `level`).
+    /// standing at `level`. The owner is the variable it is the funkind of, or the annotation's
+    /// function it was minted for: a freshening copies a funkind variable only above its cutoff,
+    /// as it copies a type variable, so an instantiation leaves an outer definition's funkind
+    /// variable its own (`src/ccl/design/type-inference.md`, "Funkind variables are copied by
+    /// level").
     pub fn fresh(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> Rc<FunKindVar> {
-        let v = FunKindVar::mint(
+        FunKindVar::mint(
             solver,
+            level,
             crate::ccl::infer_var::Telescope::empty(),
             FunKindVarFixed {
                 hole: false,
                 minted: KindPin::Unpinned,
             },
             FunKindState::default(),
-        );
-        v.place_at(solver, level);
-        v
+        )
     }
 
     /// Mint a data funkind variable outside every run, as lowering does: a mark in the program
@@ -864,18 +865,6 @@ impl FunKindVar {
             hole: self.fixed.hole,
             minted: self.fixed.minted.clone(),
         })
-    }
-    /// The scope level of what owns this funkind variable ([`FunKindState`]'s `level`).
-    pub fn level(&self, solver: &Solver) -> Option<crate::ccl::infer_var::Level> {
-        solver.funkind_state(self).level
-    }
-
-    /// Record that what owns this funkind variable stands at `level`, or lower it there: it
-    /// stands as low as its lowest owner.
-    pub fn place_at(&self, solver: &mut Solver, level: crate::ccl::infer_var::Level) {
-        if self.level(solver).is_none_or(|l| l > level) {
-            solver.funkind_state_mut(self).level = Some(level);
-        }
     }
 
     fn bounds<'s>(&self, solver: &'s Solver) -> &'s FunKindBounds {
@@ -1631,10 +1620,12 @@ pub enum Type {
     ///
     /// See `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
     BoundedHole(Box<Type>),
-    /// Unresolved type that needs to hide opaque variables from the
-    /// outer scope, identified by a unique [`crate::ccl::BarrierVarId`].
-    /// Gathers its lower bounds.
-    BarrierVar(Rc<BarrierVar>),
+    /// A lambda body's output annotation, which hides the opaque binders `opaque_output` found
+    /// the body binding: what the body produces with the refinements naming them dropped
+    /// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's opaque
+    /// binders"). A pre-inference marker, as [`Type::Hole`] is: normalization replaces it
+    /// with a barrier variable ([`InferVar::barrier`]), so the solver never meets one.
+    BarrierHole(Rc<[crate::ccl::Name]>),
     /// An inference variable of a typing run, identified by a unique
     /// [`crate::ccl::InferVarId`]. What is recorded on it lives in its run's
     /// [`Solver`]. No `Infer` outlives its run: the run closes each one it hands back to
@@ -3458,7 +3449,7 @@ fn fmt_type(
         // The mirror of `BoundedHole`'s `<:𝑇`. Rendered by identity like
         // `Infer`'s `?N`, never by reading `lowers`, which may be cyclic or
         // mutably borrowed.
-        Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
+        Type::BarrierHole(_) => write!(f, "_"),
         Type::UIntRange(n) => write!(f, "0..{n}"),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
         // function (and an unresolved kind var), `⤇` for a data collection
@@ -4673,7 +4664,7 @@ impl Type {
     pub fn names_no_variable(&self) -> bool {
         if matches!(
             self,
-            Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
+            Type::Infer(_) | Type::Param(_) | Type::BarrierHole(_) | Type::Hole
         ) {
             return false;
         }
@@ -5183,7 +5174,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::Undetermined(_)
@@ -5230,7 +5221,7 @@ impl Type {
                     | Type::Hole
                     | Type::SharedHole(_)
                     | Type::BoundedHole(_)
-                    | Type::BarrierVar(_)
+                    | Type::BarrierHole(_)
                     | Type::Refinement(..)
             )
         })
@@ -5304,7 +5295,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::Undetermined(_)
@@ -5382,7 +5373,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::BarrierVar(_)
+            | Type::BarrierHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::Undetermined(_)

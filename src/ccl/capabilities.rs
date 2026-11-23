@@ -2354,6 +2354,7 @@ pub type CapabilityVar = SolverVar<Capabilities>;
 
 impl Solved for Capabilities {
     type Id = CapabilityVarId;
+    /// A capability variable carries nothing besides what every solver variable has.
     type Fixed = ();
     fn next_id() -> CapabilityVarId {
         CapabilityVarId(CAPABILITY_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -2369,7 +2370,6 @@ impl Solved for Capabilities {
 /// What a run has recorded on a [`CapabilityVar`].
 #[derive(Default)]
 pub(crate) struct CapabilityState {
-    level: Level,
     own: BTreeSet<LocatedCapability>,
     incoming: Vec<(Rc<CapabilityVar>, Filter)>,
     /// [`CapabilityVar::resolved`]'s answer, at the revision it was computed at
@@ -2525,12 +2525,10 @@ impl CapabilityVar {
     pub fn fresh(solver: &mut Solver, level: Level, telescope: &Telescope) -> Rc<CapabilityVar> {
         CapabilityVar::mint(
             solver,
+            level,
             telescope.clone(),
             (),
-            CapabilityState {
-                level,
-                ..CapabilityState::default()
-            },
+            CapabilityState::default(),
         )
     }
 
@@ -2714,20 +2712,6 @@ impl CapabilityVar {
             {
                 *used_at = Some(at);
             }
-        }
-    }
-
-    pub fn level(&self, solver: &Solver) -> Level {
-        self.state(solver).level
-    }
-
-    /// Lower this variable's level to `level`, when a type at a shallower level comes to
-    /// hold it: it is no longer local to the scope it was minted in, so an instantiation
-    /// of that scope's scheme shares it rather than copying it.
-    pub fn lower_level(&self, solver: &mut Solver, level: Level) {
-        let state = self.state_mut(solver);
-        if level < state.level {
-            state.level = level;
         }
     }
 

@@ -1101,17 +1101,25 @@ above the binding's cutoff (`FreshenCache`). Every handle goes through one rule 
 3. otherwise a new copy, which records itself in the map before the original's recorded state
    is copied into it, so a cycle through the handle reaches the copy.
 
-A handle with a level of its own, an inference, barrier, kind or capability variable, stands above
-the cutoff where that level is above it. One with none is copied wherever freshening reaches it: an
+An ordering requirement is the exception to the order of step 3: it is built from its copied
+positions, source and capabilities, so it records itself once built. A cycle back to it from those
+parts would copy it twice. In debug builds, `FreshenCache::record_copy` asserts that one freshening
+records one copy per original. Two copies of one original would leave one of them out of the map,
+and that copy apart from the instance the map describes.
+
+A solver variable, an inference, barrier, funkind or capability variable, stands above the cutoff
+where its level is above it. A handle with no level is copied wherever freshening reaches it: an
 ordering requirement, and a trait obligation, which a watch of a copied variable reaches whichever
-scope minted it. A kind lowering minted is the program's, not a run's: it has no home, so no run
-records on it (`Solver::funkind_state_mut` panics on one), and a copy keeps it. A copy of an
-ordering requirement its run has decided holds that decision. What each kind's copy carries is its
-own (`copy_infer_var`, `copy_barrier_var`, `copy_kind_var`, `copy_capability_var`, `copy_ordering`,
-`copy_obligation`): what is recorded on the original, copied through the same rule. A capability set
-a type or a node states is copied through the rule too (`freshen_capabilities`): its variables, and
-a known set's requirements and raised types, as a copied variable's own capabilities are. Written
-clauses hold nothing of a run and are kept.
+scope minted it. A funkind variable lowering minted is the program's, not a run's: it has no home,
+so no run records on it (`Solver::funkind_state_mut` panics on one), and it stands at level 0, so a
+copy keeps it. A copy of an ordering requirement its run has decided holds that decision. A solver
+variable's copy is minted and registered by one function for every sort, and carries what its sort
+records (`copy_var`, [One solver variable](#one-solver-variable)). An ordering requirement's copy
+and an obligation's are their own (`copy_ordering`, `copy_obligation`). Each carries what is
+recorded on the original, copied through the same rule. A capability set a type or a node states is
+copied through the rule too (`freshen_capabilities`): its variables, and a known set's requirements
+and raised types, as a copied variable's own capabilities are. Written clauses hold nothing of a run
+and are kept.
 
 `freshen_level` returns a type unchanged when nothing it holds is above the cutoff, so it reads the
 same state the rule copies: a function's kind and capabilities, a known set's contents, where an
@@ -1780,32 +1788,34 @@ Each inference run owns a `Solver` (`infer/solver/state.rs`), which holds what t
 its variables. `run_once` creates the run's solver. A typing run of its own creates another:
 `case_result_ty`, and each check in `infer/check.rs`.
 
-An inference, funkind, barrier or capability variable is a handle: `InferVar`, `FunKindVar`,
-`BarrierVar`, `CapabilityVar` ([One solver variable](#one-solver-variable)). The handle holds what
-is fixed when the variable is minted: its identity, its telescope, its sort's own part, and its
-home, which is the solver that minted it and the variable's slot in that solver's tables. What the
-run learns is the state at that slot: an inference variable's bounds, trait watches and
-suspensions, a funkind variable's facts, a barrier variable's bounds, and a capability variable's
-capabilities, the edges into it and its upper bounds. A function that records takes `&mut Solver`,
-and so does one that resolves a type or a capability variable, which can record as it reads: a
-suspension, a funkind variable's binder ids. A read that records nothing takes `&Solver`.
+An inference, funkind or capability variable is a handle: `InferVar`, `FunKindVar`,
+`CapabilityVar`, each a solver variable of its sort ([One solver variable](#one-solver-variable)).
+A barrier variable is an inference variable (`InferVar::opaque`). The handle holds what is fixed
+when the variable is minted: its identity, its level, its telescope, what its sort carries besides,
+and its home, which is the solver that minted it and the variable's slot in that solver's tables.
+What the run learns is the state at that slot: the level a binding lowered the variable to, an
+inference variable's bounds, trait watches and suspensions, with a barrier variable's check record,
+a funkind variable's facts, and a capability variable's capabilities, the edges into it and its
+upper bounds. A function that records takes `&mut Solver`, and so does one that resolves a type or
+a capability variable, which can record as it reads: a suspension, a funkind variable's binder ids.
+A read that records nothing takes `&Solver`.
 
 Every write to state a cached answer reads goes through an accessor that moves that state's count
 of facts: a solver variable's `Solver::var_state_mut`, through its sort's `Recorded::note_write`,
 `Solver::funkind_names_mut` for the binder names a funkind variable settles on, and
 `Solver::capability_run_mut` for the run's own record of capabilities (`state::Revisions`). No
-write is counted by a line of its own beside it. No cached answer reads a barrier variable's state,
-so it has no count. A cached answer records the counts of every kind of state it reads and is
-reused only while they stand. A funkind variable's resolution reads funkind state alone
-(`Solver::funkind_revision`), and not its binder names, which only its binder positions and a
-component's names read (`Solver::funkind_names_revision`). A capability variable's reads capability
-state, funkind state, since an edge's filter can hold only while a kind is data, inference state,
-since a bound compares exception and position types, ordering requirements' proof state, since a
-bound admits one that is satisfied, and the run's record of capabilities, among them whether the
-exceptions' types a `try` reads are settled (`Solver::capability_revision`). A write to state an
-answer does not read leaves it standing: a funkind variable's resolution survives every capability
-write. Caches live apart from the facts (`state::Stamped`), in cells read through `&Solver`, since
-storing an answer records nothing, and each is stored at the counts taken before it was computed.
+write is counted by a line of its own beside it. A cached answer records the counts of every kind
+of state it reads and is reused only while they stand. A funkind variable's resolution reads
+funkind state alone (`Solver::funkind_revision`), and not its binder names, which only its binder
+positions and a component's names read (`Solver::funkind_names_revision`). A capability variable's
+reads capability state, funkind state, since an edge's filter can hold only while a kind is data,
+inference state, since a bound compares exception and position types, ordering requirements' proof
+state, since a bound admits one that is satisfied, and the run's record of capabilities, among them
+whether the exceptions' types a `try` reads are settled (`Solver::capability_revision`). A write to
+state an answer does not read leaves it standing: a funkind variable's resolution survives every
+capability write. Caches live apart from the facts (`state::Stamped`), in cells read through
+`&Solver`, since storing an answer records nothing, and each is stored at the counts taken before it
+was computed.
 
 Bounds and watches form cycles. A bound names another variable, and a variable watches an obligation
 whose output type names a variable. Each cycle runs through the solver's tables rather than through
@@ -1815,18 +1825,18 @@ acyclic chain, so the watches the solver drops release the copies and the parent
 (`copied_requirements_release_their_ancestors_with_the_solver`).
 
 A handle the solver did not mint is foreign: one minted outside every run
-(`FunKindVar::unowned_data`, `BarrierVar::placeholder`). A foreign handle reads as unrecorded until
-this run records on it, and what this run records stays in this solver. A type operation outside
-every run takes `Solver::none()`, which panics on reaching an inference or barrier variable, or a
-funkind variable that a solver minted. A funkind variable no solver minted reads as unrecorded
-through it. The type operations most used outside a run have a form that passes it: `Type::pi`
-takes no solver, and `Type::pi_in` takes the run's. A rendering takes a `RenderCtx` (`ty.rs`),
-which reads through a solver for each rendering question and never hands the solver out. Inside a
-run it reads through the run's, so a type renders what the run has recorded on its variables
-(`symbolic_in`, `Type::rendered_in`, `chl_print::Writer::ty_with`). A rendering without its run,
-a type's `Display`, takes `RenderCtx::detached()`. Its solver is detached: each variable reads
-through it as minted, with nothing recorded on it. The rendering may mint variables of its own, as
-resolving a type does, and record on those; recording on any other variable through it panics.
+(`FunKindVar::unowned_data`). A foreign handle reads as unrecorded until this run records on it,
+and what this run records stays in this solver. A type operation outside every run takes
+`Solver::none()`, which panics on reaching an inference variable, or a funkind variable that a
+solver minted. A funkind variable no solver minted reads as unrecorded through it. The type
+operations most used outside a run have a form that passes it: `Type::pi` takes no solver, and
+`Type::pi_in` takes the run's. A rendering takes a `RenderCtx` (`ty.rs`), which reads through a
+solver for each rendering question and never hands the solver out. Inside a run it reads through
+the run's, so a type renders what the run has recorded on its variables (`symbolic_in`,
+`Type::rendered_in`, `chl_print::Writer::ty_with`). A rendering without its run, a type's
+`Display`, takes `RenderCtx::detached()`. Its solver is detached: each variable reads through it as
+minted, with nothing recorded on it. The rendering may mint variables of its own, as resolving a
+type does, and record on those; recording on any other variable through it panics.
 `RenderCtx::detached` is the only code that makes a detached solver, so no pass other than a
 rendering reads through one.
 
@@ -1834,13 +1844,13 @@ rendering reads through one.
 
 No variable of a run outlives it. As a run ends, on success and on failure, it closes what it hands
 back (`solve::Closer`): its tree, its errors with their labels, its type, its schemes and its top
-level's capabilities. Each inference or barrier variable left in them becomes the
-`Type::Undetermined` it stands for, and each funkind variable the run minted an unowned one minted
-alike, which every solver reads as nothing recorded. Closing reads nothing a run recorded: coalesce
-has decided every type a node holds, and an error's types are reported as found. So a pass after
-inference, and a respelling of a failed run's errors, takes `Solver::none()`. Closing is a rewrite
-of held state ([Solver state a value holds](#solver-state-a-value-holds)), so it reaches every
-handle a walk of what a value holds reports.
+level's capabilities. Each inference variable left in them becomes the `Type::Undetermined` it
+stands for, and each funkind variable the run minted an unowned one minted alike, which every
+solver reads as nothing recorded. Closing reads nothing a run recorded: coalesce has decided every
+type a node holds, and an error's types are reported as found. So a pass after inference, and a
+respelling of a failed run's errors, takes `Solver::none()`. Closing is a rewrite of held state
+([Solver state a value holds](#solver-state-a-value-holds)), so it reaches every handle a walk of
+what a value holds reports.
 
 A run leaves a type undetermined where nothing in the program fixes it: an induction accumulator's
 domain, which the unified phase erases unread; a definition nothing applies; a feed nothing feeds; a
@@ -1888,27 +1898,35 @@ made.
 
 #### One solver variable
 
-An inference variable, a funkind variable, a barrier variable and a capability variable are one
-structure, `SolverVar<𝑉>` (`infer/solver/var.rs`), whose parameter is the variable's sort: `Type`,
-`FunKind`, `Barrier` or `Capabilities`. `InferVar`, `FunKindVar`, `BarrierVar` and `CapabilityVar`
-name its four instances. What every variable has is written once:
+An inference variable, a funkind variable and a capability variable are one structure,
+`SolverVar<𝑉>` (`infer/solver/var.rs`), whose parameter is the value the variable stands for:
+`Type`, `FunKind` or `Capabilities`. `InferVar`, `FunKindVar` and `CapabilityVar` name its three
+instances. What every variable has is written once:
 
-- an identity, printed by its sort's sigil (`?3`, `κ3`, `:>3`, `ε3`), and equality and hashing by
+- an identity, printed by its sort's sigil (`?3`, `κ3`, `ε3`), and equality and hashing by
   identity alone;
 - its home, which is `None` for a variable minted outside every run (`SolverVar::unowned`, as
   lowering mints a funkind variable);
-- its telescope, the binders in scope where it stands. A funkind variable's, a barrier variable's
-  and a capability variable's are empty: no fact recorded on one is read against a scope.
+- its level: the level it was minted at, and the level a binding lowered it to, which the run
+  records (`SolverVar::level`, `SolverVar::lower_level`). A variable minted outside every run
+  stands at level 0;
+- its telescope, the binders in scope where it stands. Only an inference variable's is read: no
+  fact recorded on a funkind variable or a capability variable is read against a scope.
 
-A sort supplies the rest (`Solved`): its identities, and what its handle carries besides. That is
-an inference variable's level and funkind variable (`TypeVarFixed`), a funkind variable's hole mark
-and construction stamp (`FunKindVarFixed`), and a barrier variable's opaque binders
-(`BarrierVarFixed`). A capability variable carries nothing besides. A sort a run records on
-supplies its table in the solver, what a read and a write of it check, and the count a write moves
-(`Recorded`). `Solver::var_state` and `Solver::var_state_mut` reach any sort's state.
+A sort supplies the rest (`Solved`): its identities, and what its handle carries besides, which is
+an inference variable's funkind variable and opaque binders (`TypeVarFixed`) and a funkind
+variable's hole mark and construction stamp (`FunKindVarFixed`). A capability variable carries
+nothing besides. A sort a run records on supplies its table in the solver, what a read and a write
+of it check, the count a write moves, and what lowering the variable lowers with it (`Recorded`).
+An inference variable's funkind variable stands where the variable does, so lowering one lowers
+the other. `Solver::var_state` and `Solver::var_state_mut` reach any sort's state, and the per-sort
+accessors read the sort's own part of it.
 
-A barrier variable stands for a type, as an inference variable does, and is a sort of its own: its
-upper bounds are checked against its resolution rather than closed against its lower bounds.
+A copy of a variable is one function for every sort (`copy_var` in `infer/solver/scheme.rs`). It
+mints the copy at the target's level for the original's, in the copy of the original's telescope,
+registers it, and then carries what the run recorded on the original (`Copied`). Registration comes
+before any of the original's state is freshened, so a cycle back to the original finds the copy;
+no sort orders the two itself.
 
 ---
 
@@ -3117,13 +3135,20 @@ that names no such binder (`return_opaque_annotated_function_from_unannotated_fu
 `tests/it/compilation_pipeline/type_annotations.rs`).
 
 `opaque_output::run` runs before inference and rewrites such a lambda to
-`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::BarrierVar` recording
-the opaque binders the body binds. Inference records each edge into the barrier variable from a type
-other than an inference variable as a lower bound and each such edge out of it as an upper bound,
-and closes neither against the other. An edge between the barrier variable and an inference variable
-is recorded on the inference variable. The barrier variable resolves to the join of its lower bounds
-with the refinements at positive positions dropped
-(`CompactType::resolve_barrier_refinements` in `solver/compact.rs`).
+`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a `Type::BarrierHole` naming the
+opaque binders the body binds. Normalization replaces it with a barrier variable: an inference
+variable at the annotation's level that stands in the annotation's telescope with those binders
+entered (`InferVar::barrier`, `InferVar::opaque`). Its bounds are closed against that telescope
+when recorded, as any variable's are, so its lower bounds name the opaque binders and nothing out
+of scope. A substitution acting on a binder in its telescope suspends on it, as on any variable.
+
+Inference records each edge into a barrier variable from a type other than an ordinary inference
+variable as a lower bound and each such edge out of it as an upper bound, and closes neither
+against the other. An edge between a barrier variable and an ordinary inference variable is
+recorded on the ordinary one, which closes it against its own bounds. A barrier variable resolves to
+the join of its lower bounds with the refinements at positive positions dropped
+(`CompactType::resolve_barrier_refinements` in `solver/compact.rs`). Its proxy in an extrusion and
+its copy in a freshening are barrier variables over the same opaque binders.
 
 `solver::barrier::solve_barrier_vars` checks each barrier variable against its resolution. It
 reports the escape above, or checks each upper bound against the resolution. A failed check is
@@ -3137,7 +3162,7 @@ ordinary edge does (`the_resolution_of_a_function_result_barrier` in
 `tests/it/compilation_pipeline/secondary_labels.rs`). A check is a
 `constrain`, so it adds bounds to the variables it reaches, other barrier variables' lower bounds
 included. The phase therefore repeats until a round checks nothing, and each variable records what
-it was last checked against (`BarrierVar::checked`), so an unchanged resolution has only its newly
+it was last checked against (`InferVar::checked`), so an unchanged resolution has only its newly
 arrived upper bounds checked. The phase runs once after emission and again after each
 specialization pin in `solve::specialize_use`, which gives the clone's copies of the barrier
 variables new bounds. Both runs precede every compaction that reads the bounds they add, so
@@ -4127,7 +4152,7 @@ annotation's normalization mints stands at the level the annotation is normalize
 mints data funkind variables outside every run, a consumer's and an annotation's hole
 (`FunKind::fresh_data`, `FunKind::data_hole`). Normalization replaces each with a fresh one of the
 run's per occurrence (`InferCtx::normalize_fun_kind_in`), for an annotation and for a cast's
-target alike, so no run records on lowering's. `freshen_kind_var` copies a funkind variable above
+target alike, so no run records on lowering's. `copy_var` copies a funkind variable above
 the freshening's cutoff and leaves one at or below it in place, as freshening treats a type
 variable.
 `lower_levels` and extrusion also lower a function type's funkind variable to the destination
@@ -4136,7 +4161,7 @@ level, including when its domain and codomain contain no variable above that lev
 A copy carries the data stamp, both bound lists and the source relations, with fresh binder IDs.
 An edge to a neighboring funkind variable left in place is recorded on both ends: the neighbor
 gains the copy beside the original, through the edge it already had to the original
-(`freshen_kind_var`). So a closure's scheme instantiated inside a definition relates its copies
+(`copy_var`). So a closure's scheme instantiated inside a definition relates its copies
 to the funkind variables the definition owns, the bound `_ |=> 𝑉` on an associated type among
 them, and a specialization of the definition copies both sides with the correspondence between
 them.
@@ -4941,7 +4966,7 @@ A variable's lower bounds are written in exactly four places, and delivery is wi
 * `extrude`'s proxy seeding, and `freshen_above`'s clone — both seed bounds by direct writes rather than through `constrain_go`.
 
 A barrier variable's lower bounds are not closed against the variable it flows into, so the
-barrier variable holds the watches it receives (`BarrierVar::watches`) and delivers each lower bound
+barrier variable holds the watches it receives (`InferVar::watches`) and delivers each lower bound
 recorded afterwards (`notify_barrier_lower`). Its resolution has the base of a lower bound, so the
 base a lower bound offers is the base the watched variable resolves to. `extrude` and
 `freshen_above` copy a barrier variable's watches with it.
@@ -5262,7 +5287,7 @@ body's. The edge into the parameter's variable leaves out the items the written 
 besides `RunTransaction`, so a construct that discharges a listed item from a call of `h` leaves
 none of it in `E`. So `causes only E` is checked once, at the definition, against what any use may
 pass. Instantiation drops the rigid capability, and a copied bound no longer bounds the part the
-parameter stands in (`freshen_capability_var`), so a use's copy holds what its arguments bring.
+parameter stands in (`copy_var`), so a use's copy holds what its arguments bring.
 
 **Tops.** A written clause's `Effect` or `Context`, and a family's top such as `Write(*)`, is an
 `Capability::Every`: its direction, its `Family` or none, and what its `except` takes away. A
@@ -5276,7 +5301,7 @@ variables (`Filter::except`), and an upper bound holding a top admits what the t
 `except` in parentheses, takes from it (`ClauseParam::except`), and an edge's `except` adds to it as
 it crosses, so a contract prints `E except X`. A top holds a clause variable only where the
 variable's bound and its `except` take away all the top does; a written clause bounds a use's copy
-of a variable by the top less its `except` (`bound_written`, `freshen_capability_var`). A variable
+of a variable by the top less its `except` (`bound_written`, `copy_var`). A variable
 or a top taking away other than what the rest of its clause shares prints in parentheses
 (`capabilities::clauses`). A top holding writes or reads names every mutable variable, and one
 holding appends every feed (`Every::names_mutable_variables`, `Every::names_feeds`), so a function
@@ -5459,7 +5484,7 @@ type variable does (`capabilities::input_capability_level` in `should_generalize
 calls the parameter leaves it open. A type becoming a bound of a variable at a shallower level
 lowers its capability variables to that level (`lower_capability_levels`, at bound recording and at
 extrusion). Instantiation copies a capability variable above the scheme's cutoff with its
-capabilities, its upper bounds and the edges into it (`freshen_capability_var`), so two uses of one
+capabilities, its upper bounds and the edges into it (`copy_var`), so two uses of one
 polymorphic function collect their capabilities apart. `freshen_level` counts a function type's
 capability variable, so a type whose only quantified part is its capabilities is copied rather than
 shared.
