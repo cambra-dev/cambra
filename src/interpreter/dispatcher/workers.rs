@@ -27,9 +27,9 @@ struct Spec {
     concurrent: bool,
     /// Whether a worker runs the pipeline's finish.
     finishes: bool,
-    /// For a pipeline of a loop's or transaction writer's body, the body's pipelines and step,
-    /// whose followers a claim holds again before it is acknowledged.
-    body: Option<Vec<PipelineId>>,
+    /// For a pipeline of a loop's or transaction writer's body, the body's follower hold, which a
+    /// claim holds again before it is acknowledged.
+    body: Option<HoldGroup>,
 }
 
 /// What each pipeline's claims did on the pool, for the tests below ([`WorkerPool::report`]).
@@ -72,7 +72,7 @@ impl WorkerPool {
     pub(super) fn new(
         count: usize,
         targets: Vec<Option<WorkerTarget>>,
-        bodies: Vec<Option<Vec<PipelineId>>>,
+        bodies: Vec<Option<HoldGroup>>,
     ) -> Self {
         assert!(count > 0, "a run has at least one worker");
         debug_assert_eq!(
@@ -279,7 +279,7 @@ impl WorkerPool {
                 dispatcher.land(pushes);
             }
             if let Some(body) = &spec.body {
-                dispatcher.hold_followers(body.iter().copied(), true);
+                dispatcher.hold_followers(*body);
             }
             dispatcher.acknowledge(package);
             return;
@@ -326,7 +326,7 @@ impl WorkerPool {
         // for the coordinator to publish what this consume left held, as it does after a claim
         // of its own (`Execution::consume`).
         if let Some(body) = &spec.body {
-            dispatcher.hold_followers(body.iter().copied(), true);
+            dispatcher.hold_followers(*body);
         }
         dispatcher.acknowledge(package);
     }
