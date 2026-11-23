@@ -101,8 +101,13 @@ pub enum Next {
 #[cfg_attr(test, derive(Debug))]
 pub struct Generation(u64);
 
-/// A pipeline's follower hold, read before a publication pass ([`Dispatcher::followers_hold`]).
+/// A scope body's follower hold, read before a publication pass ([`Dispatcher::followers_hold`]).
 pub(crate) struct FollowersHold(u64);
+
+/// One scope body's follower hold: its inner pipelines and step, which a hold stops from taking
+/// a package while the round's pushes settle ([`Dispatcher::add_hold_group`]).
+#[derive(Clone, Copy)]
+pub(crate) struct HoldGroup(usize);
 
 /// Where a pipeline is in the run. It is `Finishing` from the claim, or the
 /// [`Dispatcher::begin_finish`], that moves it there until [`Dispatcher::finish`].
@@ -315,6 +320,9 @@ struct PipelineInfo {
     /// The pipelines it reads whose pushes the planner walked, each with whether the walk reached
     /// this pipeline's entry ([`plan_route`](Dispatcher::plan_route)).
     walked: Vec<(usize, bool)>,
+    /// The follower hold of the scope body it is in, inner pipeline or step
+    /// ([`add_hold_group`](Dispatcher::add_hold_group)); `None` outside a body.
+    hold: Option<HoldGroup>,
 }
 
 /// A pipeline's queue, progress counters, and published regions, completion and input waits for one run.
@@ -332,10 +340,6 @@ struct PipelineState {
     pushed: Mutex<Option<TileGuard>>,
     /// How many of the pipeline's packages have been acknowledged.
     acknowledged: AtomicUsize,
-    /// Whether this pipeline waits for its loop's round to settle before following its reads, in
-    /// the low bit, and how many holds it has taken, in the bits above: a release that read the
-    /// count before a later hold fails ([`Dispatcher::release_followers_if`]).
-    followers_hold: AtomicU64,
     /// The union of the guards of the packages acknowledged, which a finish checks its breaker's
     /// input has released ([`finish_with`]).
     // shared-state-ok: a debug build's record of what was acknowledged, grown under the queue's
@@ -353,7 +357,6 @@ impl PipelineState {
             unfinished: AtomicUsize::new(reads),
             pushed: Mutex::new(None),
             acknowledged: AtomicUsize::new(0),
-            followers_hold: AtomicU64::new(0),
             #[cfg(debug_assertions)]
             consumed: Mutex::new(None),
         }
@@ -386,6 +389,11 @@ pub struct Dispatcher {
     infos: Vec<PipelineInfo>,
     /// What each pipeline has done, which the workers change.
     states: Vec<PipelineState>,
+    /// Per scope body ([`HoldGroup`]), whether its pipelines wait for the round to settle before
+    /// following their reads, in the low bit, and how many holds it has taken, in the bits above:
+    /// a release that read the count before a later hold fails
+    /// ([`release_followers_if`](Self::release_followers_if)).
+    holds: Vec<AtomicU64>,
     /// How many pipelines have not finished. The finish that brings it to zero ends the run.
     unfinished: AtomicUsize,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
@@ -482,6 +490,7 @@ impl Dispatcher {
                 input: None,
                 ingress: None,
                 walked: Vec::new(),
+                hold: None,
             })
             .collect();
         let states = infos
@@ -493,6 +502,7 @@ impl Dispatcher {
             unfinished: AtomicUsize::new(infos.len()),
             infos,
             states,
+            holds: Vec::new(),
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -529,6 +539,10 @@ impl Dispatcher {
                     .len()
                 && state.phase.load() == Phase::Running),
             "a graph is composed before it executes"
+        );
+        assert!(
+            graph.holds.is_empty(),
+            "a body's hold is added once it is appended to the run's dispatcher"
         );
         let offset = self.infos.len();
         for info in &mut graph.infos {
@@ -578,9 +592,35 @@ impl Dispatcher {
             input: None,
             ingress: None,
             walked: Vec::new(),
+            hold: None,
         });
         *self.unfinished.get_mut() += 1;
         PipelineId(pipeline)
+    }
+
+    /// Add one follower hold over `pipelines`, a scope body's inner pipelines and step, before
+    /// execution starts: [`hold_followers`](Self::hold_followers) stops every one of them from
+    /// taking a package that follows its reads, and a release lets every one go.
+    ///
+    /// # Panics
+    ///
+    /// When a pipeline is in another hold already.
+    pub(crate) fn add_hold_group(
+        &mut self,
+        pipelines: impl IntoIterator<Item = PipelineId>,
+    ) -> HoldGroup {
+        let group = HoldGroup(self.holds.len());
+        self.holds.push(AtomicU64::new(0));
+        for pipeline in pipelines {
+            let hold = &mut self.infos[pipeline.0].hold;
+            assert!(
+                hold.is_none(),
+                "pipeline {} is in one scope body's hold",
+                pipeline.0
+            );
+            *hold = Some(group);
+        }
+        group
     }
 
     /// Accept pushes at this entry only from the configured input graph.
@@ -815,89 +855,49 @@ impl Dispatcher {
     /// acknowledgement also sees the hold. Read the other way round, a hold taken between the two
     /// reads goes unseen.
     fn takes_from(&self, pipeline: usize) -> bool {
-        let follows = &self.infos[pipeline].follows;
-        follows.is_empty()
-            || (self.quiescent(follows.iter().copied())
-                && self.states[pipeline].followers_hold.load(Ordering::SeqCst) & 1 == 0)
+        let info = &self.infos[pipeline];
+        info.follows.is_empty()
+            || (self.quiescent(info.follows.iter().copied())
+                && info
+                    .hold
+                    .is_none_or(|group| self.holds[group.0].load(Ordering::SeqCst) & 1 == 0))
     }
 
     /// Claimants release these holds after settling held pushes.
     /// A hold does not revoke a claim or wait for a worker already consuming a package.
     ///
-    /// Hold the given pipelines that follow others ([`follow`](Self::follow)) from taking a
-    /// package, or release them. A loop's round holds them while the pipelines they follow push
-    /// what they complete. A breaker that pushes only what `try_push_held` asks it to, as
-    /// `MapAggregate`, is quiescent before its readers have taken what it completed. See
+    /// Hold the pipelines of `group`, a scope body's, from taking a package that follows its
+    /// reads ([`follow`](Self::follow)). A loop's round holds them while the pipelines they follow
+    /// push what they complete. A breaker that pushes only what `try_push_held` asks it to, as
+    /// `MapAggregate`, is quiescent before its readers have taken what it completed. Each hold is
+    /// counted, so a release that read the hold before this one fails
+    /// ([`release_followers_if`](Self::release_followers_if)). See
     /// `src/interpreter/design-dispatcher.md`, "A loop in rounds".
-    pub(crate) fn hold_followers(
-        &self,
-        pipelines: impl IntoIterator<Item = PipelineId>,
-        held: bool,
-    ) {
-        for pipeline in pipelines {
-            let hold = &self.state(pipeline).followers_hold;
-            match held {
-                // Counted, so a release that read the hold before this one fails.
-                true => {
-                    let _ = hold.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |hold| {
-                        Some((((hold >> 1) + 1) << 1) | 1)
-                    });
-                }
-                false => {
-                    hold.fetch_and(!1, Ordering::SeqCst);
-                }
-            }
-        }
+    pub(crate) fn hold_followers(&self, group: HoldGroup) {
+        let _ = self.holds[group.0].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |hold| {
+            Some((((hold >> 1) + 1) << 1) | 1)
+        });
         self.advance();
     }
 
-    /// `pipeline`'s follower hold as it stands, for a later
+    /// `group`'s follower hold as it stands, for a later
     /// [`release_followers_if`](Self::release_followers_if).
-    pub(crate) fn followers_hold(&self, pipeline: PipelineId) -> FollowersHold {
-        FollowersHold(self.state(pipeline).followers_hold.load(Ordering::SeqCst))
+    pub(crate) fn followers_hold(&self, group: HoldGroup) -> FollowersHold {
+        FollowersHold(self.holds[group.0].load(Ordering::SeqCst))
     }
 
-    /// Release the followers `pipelines`, as [`hold_followers`](Self::hold_followers) with
-    /// `false`, where `gate`'s hold is still `read`: held, and held by no hold taken since. A worker
-    /// that consumes a package of a loop's or transaction writer's body holds the body's followers
+    /// Release `group` where its hold is still `read`: held, and held by no hold taken since. A
+    /// worker that consumes a package of a loop's or transaction writer's body holds the body
     /// again before it acknowledges the package, so a release decided before that consume
     /// published fails, and the round's step waits for the next publication. Whether it released
-    /// `gate`.
-    ///
-    /// The other pipelines are released first and `gate` last, by its compare-and-swap alone: a
-    /// hold a worker takes after the gate's release stays, where a plain clear of the gate after it
-    /// would erase it. Where the compare-and-swap fails, the other pipelines are held again, since
-    /// the hold that made it fail may have landed on them before their release.
-    pub(crate) fn release_followers_if(
-        &self,
-        pipelines: impl IntoIterator<Item = PipelineId>,
-        gate: PipelineId,
-        read: FollowersHold,
-    ) -> bool {
+    /// the group. One compare-and-swap of the group's hold releases every pipeline of it at once.
+    pub(crate) fn release_followers_if(&self, group: HoldGroup, read: FollowersHold) -> bool {
         if read.0 & 1 == 0 {
             return false;
         }
-        let others: Vec<PipelineId> = pipelines
-            .into_iter()
-            .filter(|pipeline| pipeline.0 != gate.0)
-            .collect();
-        for &pipeline in &others {
-            self.state(pipeline)
-                .followers_hold
-                .fetch_and(!1, Ordering::SeqCst);
-        }
-        let released = self
-            .state(gate)
-            .followers_hold
+        let released = self.holds[group.0]
             .compare_exchange(read.0, read.0 & !1, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
-        if !released {
-            for &pipeline in &others {
-                self.state(pipeline)
-                    .followers_hold
-                    .fetch_or(1, Ordering::SeqCst);
-            }
-        }
         self.advance();
         released
     }
@@ -2899,26 +2899,24 @@ mod tests {
     }
 
     /// A release decided against the hold read before a publication pass fails where a hold was
-    /// taken since, as a worker's after a claim of the body, and leaves every pipeline it names
-    /// held. It succeeds against the hold as it stands; a released hold is not released twice.
+    /// taken since, as a worker's after a claim of the body, and leaves the body held. It succeeds
+    /// against the hold as it stands; a released hold is not released twice.
     #[test]
     fn a_release_fails_after_a_hold_taken_since_it_read_the_hold() {
-        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
         let (body, step) = (PipelineId(0), PipelineId(1));
-        let held = |pipeline| dispatcher.followers_hold(pipeline).0 & 1 == 1;
-        dispatcher.hold_followers([body, step], true);
-        let read = dispatcher.followers_hold(step);
-        dispatcher.hold_followers([body, step], true);
-        assert!(!dispatcher.release_followers_if([body, step], step, read));
-        assert!(
-            held(body) && held(step),
-            "a failed release releases nothing"
-        );
-        let read = dispatcher.followers_hold(step);
-        assert!(dispatcher.release_followers_if([body, step], step, read));
-        assert!(!held(body) && !held(step));
-        let read = dispatcher.followers_hold(step);
-        assert!(!dispatcher.release_followers_if([body, step], step, read));
+        let group = dispatcher.add_hold_group([body, step]);
+        let held = || dispatcher.followers_hold(group).0 & 1 == 1;
+        dispatcher.hold_followers(group);
+        let read = dispatcher.followers_hold(group);
+        dispatcher.hold_followers(group);
+        assert!(!dispatcher.release_followers_if(group, read));
+        assert!(held(), "a failed release releases nothing");
+        let read = dispatcher.followers_hold(group);
+        assert!(dispatcher.release_followers_if(group, read));
+        assert!(!held());
+        let read = dispatcher.followers_hold(group);
+        assert!(!dispatcher.release_followers_if(group, read));
     }
 
     /// The placements a planning pass sets are cleared when a probe in the pass unwinds.

@@ -288,6 +288,8 @@ pub(super) struct Attached {
     base: usize,
     /// The pipeline that follows every inner one, whose claim ends a round or an attempt.
     pub(super) step: PipelineId,
+    /// The follower hold of the inner pipelines and the step.
+    pub(super) hold: HoldGroup,
 }
 
 impl Body {
@@ -319,7 +321,13 @@ impl Body {
 
     /// Record where execution appended the graph: after the scope's pipeline `pipeline`, from
     /// global id `base`, with the step `step`.
-    pub(super) fn attach(&mut self, pipeline: PipelineId, base: usize, step: PipelineId) {
+    pub(super) fn attach(
+        &mut self,
+        pipeline: PipelineId,
+        base: usize,
+        step: PipelineId,
+        hold: HoldGroup,
+    ) {
         debug_assert!(
             self.graph.is_none() && self.attached.is_none(),
             "a body's graph is taken, then attached, once"
@@ -328,6 +336,7 @@ impl Body {
             pipeline,
             base,
             step,
+            hold,
         });
     }
 
@@ -362,12 +371,6 @@ impl Body {
         }
     }
 
-    /// The inner pipelines and the step.
-    fn with_step(&self) -> impl Iterator<Item = PipelineId> + use<> {
-        let step = self.attached().step;
-        self.pipelines().into_iter().chain(std::iter::once(step))
-    }
-
     /// Place each inner pipeline's entries at its global id, except a source's. Whether this call
     /// activated the body: it does so once.
     pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
@@ -390,7 +393,7 @@ impl Body {
         if !self.active {
             return;
         }
-        dispatcher.hold_followers(self.with_step(), true);
+        dispatcher.hold_followers(self.attached().hold);
     }
 
     /// A step reads the active round's guard. Its outstanding dispatcher claim prevents
@@ -399,7 +402,7 @@ impl Body {
         let step = self.attached().step;
         if dispatcher.outstanding(step) != 0
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|id| id.0))
-            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
+            || dispatcher.followers_hold(self.attached().hold).0 & 1 == 1
             || self.children_have_work(dispatcher)
         {
             return false;
