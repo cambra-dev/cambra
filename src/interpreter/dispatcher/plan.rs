@@ -1187,7 +1187,7 @@ impl Scope {
             return true;
         }
         // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
-        // The step's hold is read first: a worker's claim of the body after it holds the
+        // The body's hold is read first: a worker's claim of the body after it holds the
         // followers again, so the release below fails rather than pass output this pass missed.
         let (pipelines, hold) = match self {
             Scope::Loop(store) => {
@@ -1240,8 +1240,9 @@ impl Scope {
 pub(super) struct Execution {
     handlers: Vec<Handler>,
     roots: usize,
-    /// Each scope's inner pipelines, its step and its own pipeline, as attached.
-    bodies: Vec<(std::ops::Range<usize>, PipelineId, PipelineId)>,
+    /// Each scope's inner pipelines, its step, its own pipeline and its body's follower hold, as
+    /// attached.
+    bodies: Vec<(std::ops::Range<usize>, PipelineId, PipelineId, HoldGroup)>,
     /// The scopes' pipelines, loops' and writers', that read pipelines and no live source, which
     /// their scope closes once those reads have finished
     /// ([`close_scopes_reading`](Self::close_scopes_reading)).
@@ -1311,7 +1312,8 @@ impl Execution {
         let step = dispatcher.add_pipeline(body.clone());
         dispatcher.order(step);
         assert_eq!(step.0, self.handlers.len(), "each step has one handler");
-        scope.with_body(|body| body.attach(pipeline, base, step));
+        let hold = dispatcher.add_hold_group(body.iter().copied().chain([step]));
+        scope.with_body(|body| body.attach(pipeline, base, step, hold));
         // The body's entries are placed, and marked the scope's, for the whole run: a push from
         // outside the body that arrives before the scope's first request, as a live source's
         // first poll of the run does, wakes the scope and is read with its next round.
@@ -1321,7 +1323,7 @@ impl Execution {
             }
         });
         self.bodies
-            .push((base..base + members.len(), step, pipeline));
+            .push((base..base + members.len(), step, pipeline, hold));
         self.handlers.push(Handler::Step(scope));
         step
     }
@@ -1372,22 +1374,17 @@ impl Execution {
         }
     }
 
-    /// Per pipeline, the inner pipelines and step of the scope whose body it is in: a worker that
-    /// consumes a package of the body holds them as followers again before it acknowledges it.
-    fn bodies_by_pipeline(&self) -> Vec<Option<Vec<PipelineId>>> {
+    /// Per pipeline, the follower hold of the scope whose body it is in: a worker that consumes a
+    /// package of the body holds it again before it acknowledges the package.
+    fn bodies_by_pipeline(&self) -> Vec<Option<HoldGroup>> {
         let mut bodies = vec![None; self.handlers.len()];
-        for (pipelines, step, _) in &self.bodies {
-            let group: Vec<PipelineId> = pipelines
-                .clone()
-                .map(PipelineId)
-                .chain(std::iter::once(*step))
-                .collect();
+        for (pipelines, _, _, hold) in &self.bodies {
             for pipeline in pipelines.clone() {
                 debug_assert!(
                     bodies[pipeline].is_none(),
                     "pipeline {pipeline} is in one scope's body"
                 );
-                bodies[pipeline] = Some(group.clone());
+                bodies[pipeline] = Some(*hold);
             }
         }
         bodies
@@ -1408,8 +1405,8 @@ impl Execution {
         let scope_of = |pipeline: usize| {
             self.bodies
                 .iter()
-                .find(|(body, step, _)| body.contains(&pipeline) || step.0 == pipeline)
-                .map(|(_, _, scope)| scope.0)
+                .find(|(body, step, _, _)| body.contains(&pipeline) || step.0 == pipeline)
+                .map(|(_, _, scope, _)| scope.0)
         };
         (0..self.handlers.len())
             .map(|pipeline| {
