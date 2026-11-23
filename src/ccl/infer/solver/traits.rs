@@ -2066,6 +2066,16 @@ impl TraitObligation {
             && !self.has_variable_at(pos)
     }
 
+    /// Whether an assumption answers operand `pos` at an application of a bounded family, held
+    /// or settled ([`Held`]): the candidates are not the answer there.
+    #[cfg(debug_assertions)]
+    fn holds_answer_at(&self, pos: u8) -> bool {
+        matches!(
+            self.held.borrow().get(&pos),
+            Some(Held::AtOneKey { .. } | Held::Settled { .. })
+        )
+    }
+
     /// The earliest copy with the same candidates, before this use narrowed them.
     fn requirement_source(&self, pos: u8) -> TraitObligationId {
         let mut source = self;
@@ -3860,6 +3870,13 @@ pub fn settle_held_answers(
 /// have narrowed its obligation. A fifth writer added later surfaces here, on
 /// whichever program exercises it, naming the operand and the stale candidate set.
 ///
+/// A position whose answer an assumption holds is not checked ([`Held`]). An application
+/// of a bounded family that an assumption answers leaves the candidates as they are, and
+/// the held answer is what the obligation settles on, so a base the operand resolves to is
+/// nothing narrowing owes the candidates. A use's copy of the obligation holds the answer
+/// the definition's did, while its operand reads the variable the use stands the family
+/// at, which resolves to the use's base.
+///
 /// `resolve` is passed in because resolution lives above this module; it must be a
 /// *read* of the graph (`compact` → `simplify` → `coalesce`), never something that
 /// records a bound, or the check would perturb what it is checking.
@@ -3870,6 +3887,9 @@ pub fn verify_narrowing_is_complete(
 ) {
     let log = solver.watch_log.clone();
     for (obligation, pos, operand) in &log {
+        if obligation.holds_answer_at(*pos) {
+            continue;
+        }
         let Some(resolved) = resolve(solver, operand) else {
             // A position the program left conflicting: coalesce reports it, and
             // there is no single base narrowing could have been offered.

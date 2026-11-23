@@ -2397,6 +2397,10 @@ impl Solved for Capabilities {
 pub(crate) struct CapabilityState {
     own: BTreeSet<LocatedCapability>,
     incoming: Vec<(Rc<CapabilityVar>, Filter)>,
+    /// The variables this one flows into, each with the edge's filter: the other end of an
+    /// entry in each one's `incoming`. A copy reads it to keep the edges into variables the
+    /// freshening leaves in place, as a copied inference variable keeps its bounds on them.
+    outgoing: Vec<(Rc<CapabilityVar>, Filter)>,
     /// [`CapabilityVar::resolved`]'s answer, at the revision it was computed at
     /// ([`Solver::capability_revision`]).
     resolved_at: crate::ccl::infer::solver::state::Stamped<
@@ -2767,7 +2771,12 @@ impl CapabilityVar {
     }
 
     /// Record that what `source` holds, through `filter`, is held here too.
-    pub fn flows_from(&self, solver: &mut Solver, source: &Rc<CapabilityVar>, filter: Filter) {
+    pub fn flows_from(
+        self: &Rc<Self>,
+        solver: &mut Solver,
+        source: &Rc<CapabilityVar>,
+        filter: Filter,
+    ) {
         if source.uid == self.uid && filter.discharges.is_empty() {
             return;
         }
@@ -2783,6 +2792,10 @@ impl CapabilityVar {
                     .try_edges
                     .push((Rc::clone(catch), Rc::clone(source)));
             }
+            source
+                .state_mut(solver)
+                .outgoing
+                .push((Rc::clone(self), filter.clone()));
             self.state_mut(solver)
                 .incoming
                 .push((Rc::clone(source), filter));
@@ -3097,6 +3110,12 @@ impl CapabilityVar {
     /// The edges into this variable.
     pub fn incoming(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Filter)> {
         self.state(solver).incoming.clone()
+    }
+
+    /// The variables this one flows into, each with the edge's filter
+    /// ([`CapabilityState`]'s `outgoing`).
+    pub fn outgoing(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Filter)> {
+        self.state(solver).outgoing.clone()
     }
 }
 
@@ -3788,21 +3807,6 @@ pub fn input_capability_level(solver: &Solver, ty: &crate::ccl::Type) -> Level {
         }
     }
     go(solver, ty, true)
-}
-
-/// Lower every capability variable in `ty` to at most `level`: `ty` is becoming a bound of a
-/// variable at `level`, so its capability variables are no longer local to a deeper scope.
-///
-/// Separate from [`crate::ccl::infer::solver::type_level`], which leaves capabilities out: an
-/// capability variable decides nothing about whether a definition is polymorphic, and counting it
-/// there would generalize every function.
-pub fn lower_capability_levels(solver: &mut Solver, ty: &crate::ccl::Type, level: Level) {
-    if let crate::ccl::Type::Fun { capabilities, .. } = ty
-        && let Repr::Var(v) = capabilities.repr()
-    {
-        v.lower_level(solver, level);
-    }
-    ty.walk_children(|child| lower_capability_levels(solver, child, level));
 }
 
 impl crate::ccl::infer::solver::held::HoldsSolverState for Capabilities {

@@ -1471,17 +1471,13 @@ fn an_inherited_family_bound_passes_through_two_generic_definitions_through_an_a
 }
 
 /// The defs restate the family bound in their `requires` clauses.
-///
-/// TODO(peeled-family-specialization): false rejection; the program computes 12.
-/// A-normalization peels the temporaries of `total`'s body onto the spine ahead of its `=> Int`
-/// result annotation.
 #[rstest]
 #[case::an_expression(TOTAL_EXPRESSION)]
 #[case::an_annotated_statement(TOTAL_STATEMENT)]
 fn a_restated_family_bound_passes_through_two_generic_definitions(#[case] body: &[&str]) {
-    check_compile_error(
+    check_scalar(
         &two_generic_definitions(" requires forall (k: K) V(k) <: _ |=> Int", body),
-        "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
+        Value::Int(12),
     );
 }
 

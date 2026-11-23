@@ -179,10 +179,6 @@ pub(super) struct InferCtx {
     /// Each `raise`'s node and the type of what it raises, which must be one the compiler carries
     /// as an exception ([`InferCtx::uncompiled_exceptions`]).
     effect_raises: Vec<(NodeId, Type)>,
-    /// Each call whose callee's type was an inference variable when the call was emitted, by
-    /// the variable collecting what the call causes, with that type. The callee may be a
-    /// parameter, whose function each use of the definition passes ([`Self::settle_catches`]).
-    capability_calls_of_variables: Vec<(Rc<CapabilityVar>, Type)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
     /// is refused among, or a sink binding, which causes `AffectWorld`.
     pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
@@ -192,8 +188,6 @@ pub(super) struct InferCtx {
     /// it generalized at, the trait requirements it writes, where its clauses are written,
     /// and its node ([`InferCtx::requirements_beyond_clauses`]).
     bounded_requires: Vec<BoundedRequires>,
-    /// The variable of every call site ([`InferCtx::call_capabilities`]).
-    capability_calls: HashSet<CapabilityVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -672,25 +666,6 @@ fn receives_a_value(solver: &mut Solver, ty: &Type) -> bool {
     false
 }
 
-/// Whether one of `targets` flows into `var`, through any edge whatever it filters.
-fn reaches_any(
-    solver: &Solver,
-    var: &Rc<CapabilityVar>,
-    targets: &HashSet<CapabilityVarId>,
-) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![Rc::clone(var)];
-    while let Some(v) = stack.pop() {
-        if targets.contains(&v.uid) {
-            return true;
-        }
-        if seen.insert(v.uid) {
-            stack.extend(v.incoming(solver).into_iter().map(|(source, _)| source));
-        }
-    }
-    false
-}
-
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
 /// function or a use of a definition requiring the trait: it holds what the instance the
 /// obligation selects does, or the requirement in scope that answers it.
@@ -951,9 +926,7 @@ impl InferCtx {
             capability_transactions: Vec::new(),
             capability_tries: Vec::new(),
             effect_raises: Vec::new(),
-            capability_calls_of_variables: Vec::new(),
             marks: HashMap::new(),
-            capability_calls: HashSet::new(),
             capability_public: Vec::new(),
             bounded_requires: Vec::new(),
         }
@@ -1011,24 +984,16 @@ impl InferCtx {
     pub(super) fn settle_catches(&mut self) -> Vec<LocatedInferError> {
         crate::ccl::capabilities::exceptions_settled(&mut self.solver);
         // A call of a function no value of the definition's own flows into, such as a
-        // parameter's, causes what each use passes. A `try` reaching one may catch at any use,
-        // so none of its clauses is dead at the definition.
-        let open: HashSet<CapabilityVarId> = self
-            .capability_calls_of_variables
-            .iter()
-            .filter(|(_, callee)| !receives_a_value(&mut self.solver, callee))
-            .map(|(call, _)| call.uid)
-            .collect();
+        // parameter's, causes what each use passes (`CapabilityVar::open_input`). A `try`
+        // reaching one may catch at any use, so none of its clauses is dead at the definition.
         let mut errors = Vec::new();
         for t in &self.capability_tries {
-            if reaches_any(&self.solver, &t.var, &open)
-                || t.var.reaches(&self.solver, &|solver, v| {
-                    v.open_input(solver)
-                        && v.incoming(solver).is_empty()
-                        && v.own(solver).is_empty()
-                        && !v.closed(solver).1
-                })
-            {
+            if t.var.reaches(&self.solver, &|solver, v| {
+                v.open_input(solver)
+                    && v.incoming(solver).is_empty()
+                    && v.own(solver).is_empty()
+                    && !v.closed(solver).1
+            }) {
                 continue;
             }
             // A clause catches a type the compiler carries as an exception.
@@ -1698,14 +1663,12 @@ impl InferCtx {
     /// so [`Typing::transaction_body`] does not record one.
     ///
     /// A statement in a polymorphic definition can call a function that only each use of the
-    /// definition determines: a parameter's. That call's variable has nothing flowing into it
-    /// at the definition, where each use fills a copy of its own, so a statement or a block
-    /// reaching one may do something and is not reported.
+    /// definition determines: a parameter's. What that call causes is an input each use supplies
+    /// ([`CapabilityVar::open_input`]), with nothing flowing into it at the definition, so a
+    /// statement or a block reaching one may do something and is not reported.
     pub(super) fn does_nothing(&mut self) -> Vec<(NodeId, InferError)> {
         let undetermined = |solver: &Solver, v: &CapabilityVar| {
-            self.capability_calls.contains(&v.uid)
-                && v.incoming(solver).is_empty()
-                && v.own(solver).is_empty()
+            v.open_input(solver) && v.incoming(solver).is_empty() && v.own(solver).is_empty()
         };
         let mut idle = |var: &CapabilityVar| {
             var.resolved_set(&mut self.solver).causes_nothing()
@@ -2178,7 +2141,6 @@ impl InferCtx {
     /// into the enclosing function body's, through the body's filter.
     fn call_capabilities(&mut self) -> Capabilities {
         let call = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
-        self.capability_calls.insert(call.uid);
         let at = Some(self.current_node_id);
         let node = Rc::clone(self.node_capability_var());
         node.flows_from(
@@ -5324,8 +5286,6 @@ impl Typing for InferCtx {
             let open = !receives_a_value(&mut self.solver, fn_ty)
                 && !kind.is_some_and(|k| k.resolved_in(&self.solver).is_data());
             call.set_open_input(&mut self.solver, open);
-            self.capability_calls_of_variables
-                .push((Rc::clone(call), fn_ty.clone()));
         }
         let expected = expected.with_capabilities(capabilities);
         self.require_sub(fn_ty, &expected, at)?;

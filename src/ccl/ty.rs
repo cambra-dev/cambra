@@ -779,6 +779,25 @@ pub struct FunKindVarFixed {
     /// ([`FunKind::fresh_data`]) and an annotation's funkind hole, which lowering mints before
     /// any run. A run can stamp it data later ([`FunKindVar::stamp_data`]).
     minted: KindPin,
+    /// The kind whose binders this one binds, where it binds another's: an extrusion's proxy
+    /// binds its original's ([`FunKindVar::proxy`]), so the function type it stands in, whose
+    /// parts name those binders, stays closed. `None` for a kind naming its own.
+    binders_of: Option<Rc<FunKindVar>>,
+}
+
+impl FunKindVarFixed {
+    /// These facts, binding `owner`'s binders: a copy of a proxy binds the binders of its
+    /// original's copy, or of its original where the copy leaves that in place.
+    pub(crate) fn binding_binders_of(self, owner: Rc<FunKindVar>) -> Self {
+        debug_assert!(
+            owner.fixed.binders_of.is_none(),
+            "the kind a kind binds the binders of binds its own"
+        );
+        FunKindVarFixed {
+            binders_of: Some(owner),
+            ..self
+        }
+    }
 }
 
 /// What a run has recorded on a [`FunKindVar`].
@@ -822,6 +841,7 @@ pub(crate) struct FunKindVarFields {
     pub(crate) uid: (),
     pub(crate) hole: (),
     pub(crate) minted: (),
+    pub(crate) binders_of: (),
     pub(crate) home: (),
     pub(crate) level: (),
     pub(crate) bounds: (),
@@ -839,7 +859,12 @@ impl FunKindVar {
             home: _,
             initial_level: _,
             telescope: _,
-            fixed: FunKindVarFixed { hole: _, minted: _ },
+            fixed:
+                FunKindVarFixed {
+                    hole: _,
+                    minted: _,
+                    binders_of: _,
+                },
         } = self;
         let VarState {
             lowered_to: _,
@@ -855,6 +880,7 @@ impl FunKindVar {
             uid: (),
             hole: (),
             minted: (),
+            binders_of: (),
             home: (),
             level: (),
             bounds: (),
@@ -884,9 +910,53 @@ impl FunKindVar {
             FunKindVarFixed {
                 hole: false,
                 minted: KindPin::Unpinned,
+                binders_of: None,
             },
             FunKindState::default(),
         )
+    }
+
+    /// Mint a proxy of `original` at `level`: a fresh funkind variable in `original`'s
+    /// telescope that binds `original`'s binders ([`FunKindVarFixed::binders_of`]). The caller
+    /// relates the two by the edges the extrusion's polarity draws.
+    pub fn proxy(
+        solver: &mut Solver,
+        level: crate::ccl::infer_var::Level,
+        original: &Rc<FunKindVar>,
+    ) -> Rc<FunKindVar> {
+        FunKindVar::mint(
+            solver,
+            level,
+            original.telescope.clone(),
+            FunKindVarFixed {
+                hole: false,
+                minted: KindPin::Unpinned,
+                binders_of: Some(Rc::clone(original.binders_owner())),
+            },
+            FunKindState::default(),
+        )
+    }
+
+    /// The kind naming this one's binders: this one, or the kind it binds the binders of.
+    pub(crate) fn binders_owner(self: &Rc<Self>) -> &Rc<FunKindVar> {
+        self.fixed.binders_of.as_ref().unwrap_or(self)
+    }
+
+    /// [`Self::binders_owner`], borrowed. One step reaches it: a proxy takes its original's
+    /// owner ([`Self::proxy`]), so an owner binds its own binders.
+    fn names_owner(&self) -> &FunKindVar {
+        let owner = self.fixed.binders_of.as_deref().unwrap_or(self);
+        debug_assert!(
+            owner.fixed.binders_of.is_none(),
+            "the kind a kind binds the binders of binds its own"
+        );
+        owner
+    }
+
+    /// The kind whose binders this one binds where it is not their owner
+    /// ([`FunKindVarFixed::binders_of`]).
+    pub(crate) fn binders_of(&self) -> Option<&Rc<FunKindVar>> {
+        self.fixed.binders_of.as_ref()
     }
 
     /// Mint a data funkind variable outside every run, as lowering does: a mark in the program
@@ -896,16 +966,19 @@ impl FunKindVar {
         SolverVar::unowned(FunKindVarFixed {
             hole,
             minted: KindPin::Data,
+            binders_of: None,
         })
     }
 
     /// This variable as its run closes it ([`crate::ccl::infer`]'s `Closer`): a variable no run
     /// minted, minted alike, which every solver reads as nothing recorded, as it reads
-    /// lowering's marks.
-    pub(crate) fn closed(&self) -> Rc<FunKindVar> {
+    /// lowering's marks. Where this one binds another's binders, the copy binds those of
+    /// `binders_of`, the other's closed copy.
+    pub(crate) fn closed(&self, binders_of: Option<Rc<FunKindVar>>) -> Rc<FunKindVar> {
         SolverVar::unowned(FunKindVarFixed {
             hole: self.fixed.hole,
             minted: self.fixed.minted.clone(),
+            binders_of,
         })
     }
 
@@ -1056,12 +1129,13 @@ impl FunKindVar {
         let Some(arity) = self.arity(solver) else {
             return Vec::new();
         };
-        if self.bounds(solver).settled.len() < arity {
+        let owner = self.names_owner();
+        if owner.bounds(solver).settled.len() < arity {
             solver
-                .funkind_names_mut(self)
+                .funkind_names_mut(owner)
                 .resize_with(arity, crate::ccl::infer_var::fresh_witness_binder_id);
         }
-        self.bounds(solver).settled[..arity]
+        owner.bounds(solver).settled[..arity]
             .iter()
             .copied()
             .map(WitnessId)
@@ -1076,17 +1150,19 @@ impl FunKindVar {
     /// The name of this funkind's binder at `position`, minted now whatever its arity
     /// turns out to be. A position past the arity is never bound.
     pub fn binder_id_at(&self, solver: &mut Solver, position: usize) -> WitnessId {
-        if self.bounds(solver).settled.len() <= position {
+        let owner = self.names_owner();
+        if owner.bounds(solver).settled.len() <= position {
             solver
-                .funkind_names_mut(self)
+                .funkind_names_mut(owner)
                 .resize_with(position + 1, crate::ccl::infer_var::fresh_witness_binder_id);
         }
-        WitnessId(self.bounds(solver).settled[position])
+        WitnessId(owner.bounds(solver).settled[position])
     }
 
     /// Every binder name minted so far, arity known or not.
     pub fn named_binder_ids(&self, solver: &Solver) -> Vec<WitnessId> {
-        self.bounds(solver)
+        self.names_owner()
+            .bounds(solver)
             .settled
             .iter()
             .copied()
@@ -1125,10 +1201,10 @@ impl FunKindVar {
         };
         // The names this kind has picked, where it has picked any: a reader comparing a
         // dump against a rendered type needs to know which `σ@n` belongs to which kind.
-        let names = b
-            .settled
+        let names = self
+            .named_binder_ids(solver)
             .iter()
-            .map(|b| format!("\u{03c3}@{b}"))
+            .map(|b| format!("\u{03c3}@{}", b.0))
             .collect::<Vec<_>>()
             .join(",");
         let from = match self.instantiated_from(solver) {
