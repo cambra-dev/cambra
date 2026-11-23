@@ -1,13 +1,40 @@
 # Cambra
 
-Cambra is a programming language for building data-intensive applications — transaction processing, streaming, analytics, serving — as **one coherent program** rather than a stack of separately-modeled components. The premise (argued at length in [Composition Shouldn't be this Hard](https://cambra.dev/blog/announcement/)) is that systems turn brittle when their components interact through a model lower than the one they're written in: tooling loses its leverage at exactly the boundaries where the hard bugs live. Cambra collapses those boundaries — one language, one type system, one execution model, whole-program tooling.
+Cambra is a language and runtime for distributed applications. A Cambra program is the whole
+backend (transaction processing, streaming, analytics, serving) written as **one program**. The
+compiler checks and optimizes that program as a whole, and the runtime executes it as one system.
 
-The audience for that leverage now includes machines. Cambra treats **coding agents as first-class programmers**: an agent converges on a correct system only as fast as the feedback it gets, and Cambra's job is to maximize the quality of that feedback. Two loops organize the design:
+Applications grow brittle as they sprawl across a database, queues, caches, a stream processor and
+the services between them. The components interact through a model lower than the one they are
+written in, so tooling loses its leverage at exactly the boundaries where the hard bugs live. Coding
+agents make that sprawl cheap to produce, but no easier to get right. The argument is made at length
+in [Composition Shouldn't be this Hard](https://cambra.dev/blog/announcement/).
 
-- **Verification — does the program provably satisfy its invariants?** The type system is built on refinement types: types carry semantic predicates (`{q: Int | q >= 0}`), and because the whole application lives in one model, those predicates can compose across what would otherwise be component boundaries. The core machinery — refinement inference, constraint solving, explicit refinement acquisition — is in the CCL type system today; whole-application contracts on top of it are the driving design direction.
-- **Validation — does the program do what its author intended?** The runtime primitive is **program branching**: a candidate version branches off the running application — logic and state together, not just the code or the data — gets exercised under a realistic workload, and has its behavior compared against production before anything ships. The language is designed from the ground up to make this tractable: the surface syntax lowers to a referentially-transparent intermediate representation, so different versions of programs can be compared syntactically with well-defined semantics.
- 
-These features are landing incrementally; the [demo program library](docs/demo-programs.md) tracks exactly what runs today.
+Cambra removes those boundaries, and the design aims at three results:
+
+- **One program instead of a stack.** One language, one type system, one execution model and
+  whole-program tooling. A feature that would touch several services is one change to one program.
+- **Changes that are checked before they run.** The type system is built on refinement types:
+  types carry predicates (`{Int where _ >= 0}`), and because the whole application lives in one
+  model, those predicates compose across what would otherwise be component boundaries. This is
+  end-to-end, low-overhead checking of application invariants, not full formal verification of
+  the program. A running program can also be replaced in place: the control port's `/reload`
+  keeps every unchanged computation running and carries state across the change (see
+  [Control port](#control-port)). **Program branching**, which forks the running application,
+  logic and state together, to exercise a candidate version before it ships, is the direction
+  that builds on this.
+- **Performance from the whole program.** Programs compile to a dataflow operator graph, so
+  pipelining, incremental computation, parallelization and vectorization are properties of the
+  execution model. The planner sees every query and every handler at once. The aim is the
+  performance of a hand-tuned system without hand-tuning it; today's runtime is single-node.
+
+Cambra treats **coding agents as first-class programmers**. An agent converges on a correct system
+only as fast as the feedback it gets, and the compiler, the refinement checker and the inspector are
+built to give it precise feedback on the whole application, not one component at a time.
+
+These features are landing incrementally. Refinement inference and constraint solving are in the CCL
+type system today; whole-application contracts on top of them are the driving design direction. The
+[demo program library](docs/demo-programs.md) tracks exactly what runs today.
 
 ## Status: research preview
 
@@ -29,8 +56,8 @@ The aim is to abstract over memory, threads, and connections the way garbage col
 
 ```python
 products = [
-    {sku: "espresso", price: 3},
-    {sku: "latte",    price: 5},
+    (sku="espresso", price=3),
+    (sku="latte",    price=5),
 ]
 
 # Orders arrive over HTTP: each POST body is an order record.
@@ -43,7 +70,7 @@ for o in orders:
 revenue_reqs, revenue_resps = http_serve("8080", "GET", "/revenue")
 for req in revenue_reqs:
     with txn = begin():
-        so_far = orders.restrict(lambda o: o.time < txn::now())
+        so_far = orders.restrict(\o -> o.time < txn::now())
         revenue = sum([p.price * o.qty for p in products for o in so_far if p.sku == o.sku])
         revenue_resps[req.id] = str(revenue) + "\n"
 ```
