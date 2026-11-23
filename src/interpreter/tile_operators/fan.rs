@@ -287,20 +287,54 @@ impl TileOperator for Zip {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let consumer =
-            crate::interpreter::notifications::through_values(self.level, self.tiling(), consumer);
-        let shared = shared_consumer(consumer);
+        // Beneath rows each arm is one field of the pair, so a region of an arm names that field
+        // of the rows it reaches and nothing of another arm's (`field_beneath_rows`). At the
+        // outermost level the pair is one record, whose regions widen.
+        let beneath_rows = self.level != CurryLevel::OUTERMOST;
+        let shared = shared_consumer(match beneath_rows {
+            true => consumer,
+            false => crate::interpreter::notifications::through_values(
+                self.level,
+                self.tiling(),
+                consumer,
+            ),
+        });
+        // Beneath rows the arms share the rows' keys, and a row exists once every arm has
+        // delivered it, so each arm's delivery is passed on under the rows the others delivered
+        // (`notifications::aligned`).
+        let delivered = crate::interpreter::notifications::nothing_aligned(
+            self.inputs.iter().map(|input| input.keys_arrive_by_push()),
+        );
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&self.names)
+            .enumerate()
+            // Every arm is pulled at the projection: the arms share the pair's keys.
+            .map(|(arm, (input, name))| match self.level.enclosing() {
+                Some(rows) if beneath_rows => input.clone().subscribe(
+                    input.tiling().universal_guard(),
+                    crate::interpreter::notifications::aligned(
+                        arm,
+                        rows,
+                        delivered.clone(),
+                        crate::interpreter::notifications::field_beneath_rows(
+                            name.clone(),
+                            self.level,
+                            forwarding_consumer_keeping_keys(&shared),
+                        ),
+                    ),
+                    cx,
+                ),
+                _ => subscribe_forwarding_keeping_keys(input, &shared, cx),
+            })
+            .collect();
         Box::new(ZipProducer {
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), self.clone(), cx),
             names: self.names.clone(),
             level: self.level,
             state: Mutex::new(ZipState::new(self.inputs.len())),
-            inputs: self
-                .inputs
-                .iter()
-                // Every arm is pulled at the projection: the arms share the pair's keys.
-                .map(|i| subscribe_forwarding_keeping_keys(i, &shared, cx))
-                .collect(),
+            inputs,
         })
     }
 }
@@ -949,10 +983,22 @@ impl TileOperator for MakeRecord {
                 cx,
             ),
             names: self.names.clone(),
+            // A region of an operand names that field of the record.
             inputs: self
-                .inputs
+                .names
                 .iter()
-                .map(|i| subscribe_forwarding(i, &shared, cx))
+                .zip(&self.inputs)
+                .map(|(name, input)| {
+                    input.clone().subscribe(
+                        input.tiling().universal_guard(),
+                        crate::interpreter::notifications::fielding(
+                            name.clone(),
+                            self.names.clone(),
+                            forwarding_consumer_keeping_keys(&shared),
+                        ),
+                        cx,
+                    )
+                })
                 .collect(),
         })
     }
@@ -981,26 +1027,28 @@ impl TileProducer for MakeRecordProducer {
         }
     }
 
-    /// A record of values has no keys to project: the projection is the whole record or
-    /// nothing, and a guard naming keys is a consumer's bug.
+    /// A record of values has no keys to project: the projection names each field's part, and
+    /// each operand is pulled at its field's part. A guard naming keys is a consumer's bug.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
-        match projection_guard.projection(&self.name()) {
-            Projection::Everything => {}
-            Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys { .. } => panic!(
+        let projection = projection_guard.projection(&self.name());
+        if let Projection::Keys { .. } = projection {
+            panic!(
                 "{} is a record of values, which has no keys to project: {projection_guard:?}",
                 self.name()
-            ),
+            );
         }
-        // Every operand is pulled whole ([`SelectFieldProducer`] says why a pull naming one
-        // field is unsound). An operand withholds what [`Self::release_impl`] told it a
-        // consumer finished with, so a field that settled early is not re-delivered.
+        // An operand withholds what [`Self::release_impl`] told it a consumer finished with, so a
+        // field that settled early is not re-delivered.
         let fields: HashMap<SmolStr, Tile> = self
             .names
             .iter()
             .zip(self.inputs.iter())
             .map(|(name, input)| {
-                let tile = input.get(input.tiling().universal_guard());
+                let field = projection.field(name);
+                let tile = match field {
+                    Projection::Nothing => input.tiling().empty_tile(),
+                    field => input.get(field.guard(input.tiling())),
+                };
                 (name.clone(), tile)
             })
             .collect();
@@ -1149,16 +1197,25 @@ impl TileOperator for SelectField {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // A stream of records is pulled at the projection; a product of collections is read whole.
-        let keeps_keys = self.input.tiling().is_data_function();
+        // A stream of records is pulled at the projection, and a record of values at the part of
+        // the selected field the projection names, whose regions are the selected field's part of
+        // the record's.
+        let consumer = match self.input.tiling().is_data_function() {
+            true => crate::interpreter::notifications::selecting_field_beneath_keys(
+                self.name.clone(),
+                consumer,
+            ),
+            false => {
+                crate::interpreter::notifications::selecting_field(self.name.clone(), consumer)
+            }
+        };
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
-        let input_producer = self.input.clone().subscribe(
-            input_tiling.universal_guard(),
-            consumer_keeping_keys_if(keeps_keys, consumer),
-            cx,
-        );
+        let input_producer =
+            self.input
+                .clone()
+                .subscribe(input_tiling.universal_guard(), consumer, cx);
         Box::new(SelectFieldProducer {
             dropped_rows: Default::default(),
             base: ProducerBase::new(
@@ -1184,12 +1241,13 @@ impl TileOperator for SelectField {
 
 /// Producer for [`SelectField`].
 ///
-/// **A pull reads every field of the product.** A pull that names one field is unsound through
-/// a cumulative cache: [`Memo`] merges what a pull returned and answers later pulls from it
-/// without going below, so a pull naming one field would record a partial answer as the
-/// whole one, and a sibling selector would read a field never fetched. A pull may name keys
-/// of the stream the field sits under, since a key brings every field of its record. A
-/// release names this field's part; enclosing keys release their whole records
+/// **A pull of a record of values names the selected field.** A [`Memo`] over the record answers
+/// a pull from what it has read, so a pull naming one field reads only what the memo was consumed
+/// at. Every field reaches the memo: a field's change and completion arrive as that part of the
+/// record (`notifications::fielding`), and a field nothing pushes is read at the start
+/// (`src/interpreter/design-dispatcher.md`, "Running a compiled program"). A pull of a stream of
+/// records may name keys of the stream the field sits under, since a key brings every field of
+/// its record. A release names this field's part; enclosing keys release their whole records
 /// ([`guard_at_field`]).
 struct SelectFieldProducer {
     dropped_rows: DroppedRows,
@@ -1211,7 +1269,8 @@ impl TileProducer for SelectFieldProducer {
 
     /// A stream of records keeps its keys at every level above the record, so its input is pulled
     /// at a projection there; the levels of a field that is itself a collection are inside the
-    /// record's values. A product of collections is pulled whole and cut at the projection.
+    /// record's values. A product of collections is pulled at the selected field's part, at any
+    /// level of the field.
     fn restates(&self) -> Restates {
         match self.input.tiling().is_data_function() {
             true => Restates::Above(CurryLevel::values_of(self.input.tiling())),
@@ -1228,8 +1287,8 @@ impl TileProducer for SelectFieldProducer {
     }
 
     /// A stream of records keeps its keys under the field, so the input is pulled at the
-    /// projection. A product of collections has no projection guard of its own: it is pulled
-    /// whole, and the field cut after.
+    /// projection. A product of collections has no keys of its own: it is pulled at the selected
+    /// field's part of the projection ([`Projection::of_field`]), and the field cut after.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
@@ -1237,7 +1296,9 @@ impl TileProducer for SelectFieldProducer {
         }
         let input_guard = match self.input.tiling().is_data_function() {
             true => projection.guard(self.input.tiling()),
-            false => self.input.tiling().universal_guard(),
+            false => {
+                Projection::of_field(&self.name, projection.clone()).guard(self.input.tiling())
+            }
         };
         let mut tile = self.input.get(input_guard);
         // A row holding no cell of this field gave that cell back to this reader's release
@@ -1314,73 +1375,6 @@ mod nested_projection_tests {
         assert_conforms_beneath(|| {
             Arc::new(RecordWrap::new_at("a".into(), spy(), CurryLevel::new(2)))
         });
-    }
-
-    /// A `Zip` pairing beneath its outermost level passes what an arm notifies through
-    /// `through_values`: a change of an inner row reaches its consumer as that row's group, and a
-    /// complete region passes only the groups it names whole. `through_values` itself is tested in
-    /// `notifications.rs`; this pins that the `Zip` subscribes its arms through it. Forwarded
-    /// unchanged, an inner row's region names keys beneath the pair, which are no keys of the
-    /// `Zip` (`a_tuple_of_a_fold_and_a_collection_the_filter_empties_for_some_groups`).
-    #[test]
-    fn a_zip_restates_an_arms_inner_rows_as_the_groups_it_pairs() {
-        use crate::interpreter::tile_operators::test_helpers::{
-            InputConsumer, NotifyingOp, RegionLog, notify_input, subscribed,
-        };
-        use crate::interpreter::{Predicate, Value};
-        let (tile, tiling) = two_levels_of_ints();
-        let (left, left_consumer) = NotifyingOp::new(tile.clone(), tiling.clone());
-        let (right, _) = NotifyingOp::new(tile, tiling.clone());
-        let zip = Arc::new(Zip::new_at(
-            vec!["a".into(), "b".into()],
-            vec![Arc::new(left), Arc::new(right)],
-            CurryLevel::new(1),
-        ));
-        let (log, regions) = RegionLog::new();
-        let mut cx = SubscribeContext::new();
-        let _producer = zip
-            .clone()
-            .subscribe(tiling.empty_guard(), Box::new(log), &mut cx);
-        let row = Projection::of_path(&[Value::UInt(0), Value::UInt(1)]);
-        let group = Projection::admitting(Predicate::point(Value::UInt(0)));
-
-        regions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        notify_input(&left_consumer, &row);
-        assert_eq!(
-            *regions.read().unwrap_or_else(PoisonError::into_inner),
-            std::slice::from_ref(&group),
-            "a change of a row names its group"
-        );
-
-        let complete = |consumer: &InputConsumer, region: &Projection| {
-            let mut landing = crate::interpreter::dispatcher::Landing::probe_complete(
-                crate::interpreter::dispatcher::PipelineId(0),
-            );
-            subscribed(consumer).notify(region, &mut landing);
-        };
-        regions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        complete(&left_consumer, &row);
-        assert_eq!(
-            *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [Projection::Nothing],
-            "a complete row of a group completes no group"
-        );
-        regions
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        complete(&left_consumer, &group);
-        assert_eq!(
-            *regions.read().unwrap_or_else(PoisonError::into_inner),
-            [group],
-            "a complete group completes the pair's group"
-        );
     }
 
     #[test]
@@ -2799,10 +2793,10 @@ mod projection_tests {
         }
     }
 
-    /// A product of two collections, as a `Let` or a record of comprehensions makes it, has no
-    /// projection guard of its own: the field is read whole from the product and cut after.
+    /// A product of two collections, as a `Let` or a record of comprehensions makes it, is pulled
+    /// at the selected field's part of the projection, and the field is cut after.
     #[test]
-    fn a_field_of_a_product_is_pulled_whole_and_cut() {
+    fn a_field_of_a_product_is_pulled_at_its_part_of_the_product() {
         let product_tiling = Tiling::Record(
             ["a", "b"]
                 .into_iter()
@@ -2837,7 +2831,10 @@ mod projection_tests {
         assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
         assert_eq!(
             *pulled.read().unwrap_or_else(PoisonError::into_inner),
-            [product_tiling.universal_guard()]
+            [
+                Projection::of_field("a", Projection::of(&keys_between(2, 3)).unwrap())
+                    .guard(&product_tiling)
+            ]
         );
         assert_conforms(|| Box::new(make().0), keys_between(2, 3));
     }

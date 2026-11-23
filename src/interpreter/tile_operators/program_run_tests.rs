@@ -337,7 +337,7 @@ fn a_sum_over_a_list_concatenated_with_a_literal() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Aggregate") && !plan.whole && plan.started),
+            .any(|plan| plan.name.starts_with("Aggregate") && plan.started),
         "the sum reads the memo's pushes and the literal's region: {planned:?}"
     );
 }
@@ -418,7 +418,7 @@ fn a_group_by() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
+            .any(|plan| plan.name.starts_with("Memo") && plan.held),
         "the group-by's memo holds its rows until their inputs complete: {planned:?}"
     );
 }
@@ -436,10 +436,9 @@ fn a_sum_over_two_concatenated_comprehensions() {
     answers(source, "15", &["Memo", "Aggregate"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
-        planned.iter().any(|plan| plan.name.starts_with("Aggregate")
-            && !plan.whole
-            && plan.held
-            && !plan.started),
+        planned
+            .iter()
+            .any(|plan| plan.name.starts_with("Aggregate") && plan.held && !plan.started),
         "the sum reads both arms' pushes: {planned:?}"
     );
 }
@@ -472,8 +471,8 @@ fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
         rows,
     );
     assert!(
-        planned.iter().any(|plan| plan.held) && !planned.iter().any(|plan| plan.whole),
-        "the outer sum holds its rows until their inputs complete, and no pipeline reads its input whole: {planned:?}"
+        planned.iter().any(|plan| plan.held),
+        "the outer sum holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -488,7 +487,7 @@ fn a_sink_reads_the_pushes_of_a_values_output_memo() {
     answers(source, "3", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.held, "{sink:?}");
+    assert!(sink.held, "{sink:?}");
 }
 
 /// The sink of a collection reads the pushes of the collection's output memo.
@@ -502,7 +501,7 @@ fn a_sink_of_a_collection() {
     answers(source, "Function [ 2, 3, 4 ]", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.held, "{sink:?}");
+    assert!(sink.held, "{sink:?}");
 }
 
 /// Two sinks each run as a pipeline of their own, and the program is done once both are.
@@ -664,13 +663,6 @@ fn a_loop_over_a_let_bound_list() {
         out << total
     "};
     answers(source, "6", &["Memo", "InductionRequest", "SinkBreaker"]);
-    let (_, planned) = dispatched(source, 1);
-    assert!(
-        planned
-            .iter()
-            .any(|plan| plan.name.starts_with("InductionRequest") && plan.whole),
-        "the loop's scope reads the list's memo whole: {planned:?}"
-    );
 }
 
 /// A loop's total and a sum both feed the sink.
@@ -707,8 +699,8 @@ fn a_reader_inside_a_loops_scope_waits_for_inputs() {
     let (_, planned) = dispatched(source, 1);
     let inner = rounds(&planned);
     assert!(
-        inner.iter().any(|plan| plan.held) && !inner.iter().any(|plan| plan.whole),
-        "a reader in the outer loop's scope waits_for_inputs, and none reads whole: {planned:?}"
+        inner.iter().any(|plan| plan.held),
+        "a reader in the outer loop's scope waits_for_inputs: {planned:?}"
     );
 }
 
@@ -1737,10 +1729,7 @@ fn a_loop_over_a_let_bound_map_of_a_live_source(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("InductionRequest")
-                && plan.live
-                && !plan.whole
-                && plan.held),
+            .any(|plan| plan.name.starts_with("InductionRequest") && plan.live && plan.held),
         "the loop's scope takes the deliveries as rounds, waiting for inputs on the `Memo`: {planned:?}"
     );
 }
@@ -2023,7 +2012,7 @@ fn deliver_one(source: &crate::ccl::SourceDefinition<TestDataSource>, key: u64, 
 }
 
 /// A ready writer commits its whole source while its sibling's live source is idle, and the
-/// store stays unsettled: `await_final` answers nothing until the sibling's source yields
+/// store stays unsettled: `await_final` writes nothing until the sibling's source yields
 /// everything. The sibling's delivery and close then commit the rest and settle the store.
 #[rstest_log::rstest]
 fn a_ready_writer_commits_beside_an_idle_sibling_and_the_last_to_finish_settles_the_store(
@@ -2064,17 +2053,12 @@ fn a_ready_writer_commits_beside_an_idle_sibling_and_the_last_to_finish_settles_
                     .collect();
                 pools.sort();
                 assert_eq!(pools, [70, 90], "{written:?}");
+                // The store is not final while a writer's source is open, so `await_final` has
+                // nothing complete to write.
                 assert_eq!(
-                    settled.value(),
-                    Err(crate::interpreter::SinkReadError::Incomplete),
+                    settled.written_so_far().map(|written| written.to_string()),
+                    Err(crate::interpreter::SinkReadError::NothingWritten),
                     "the store is not settled while a writer's source is open"
-                );
-                assert!(
-                    settled
-                        .written_so_far()
-                        .is_ok_and(|written| written.as_function().is_empty()),
-                    "the settled sink holds no row while a writer's source is open: {:?}",
-                    settled.written_so_far()
                 );
                 deliver_one(&feeds[0], 0, 5);
             }
@@ -2713,7 +2697,7 @@ fn a_loop_over_a_source_completed_in_one_delivery(#[values(1, usize::MAX)] rows:
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("InductionRequest")),
+            .any(|plan| plan.live && plan.name.starts_with("InductionRequest")),
         "the loop's scope is the live source pipeline, read in rounds: {planned:?}"
     );
 }
@@ -2877,7 +2861,7 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     assert!(
         planned
             .iter()
-            .any(|plan| !plan.live && !plan.whole && plan.held && plan.name.starts_with("Memo")),
+            .any(|plan| !plan.live && plan.held && plan.name.starts_with("Memo")),
         "the feed's `Memo` holds its rows until their inputs complete: {planned:?}"
     );
 }
@@ -2907,7 +2891,7 @@ fn a_feed_of_a_map_over_a_live_source(
     #[values(1, usize::MAX)] rows: usize,
 ) {
     let mut written_before_next_delivery = Vec::new();
-    let (value, planned) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
+    let (value, _) = dispatched_live_observed(source, rows, three_batches(), |sink, _| {
         assert_eq!(
             sink.value(),
             Err(crate::interpreter::SinkReadError::Incomplete),
@@ -2932,10 +2916,6 @@ fn a_feed_of_a_map_over_a_live_source(
         written_before_next_delivery,
         vec![delivered_through(1), delivered_through(3)],
         "each delivery's rows reach the sink before the next, each once"
-    );
-    assert!(
-        planned.iter().any(|plan| plan.live && plan.whole),
-        "a live pipeline reads its input whole: {planned:?}"
     );
 }
 
@@ -3353,7 +3333,7 @@ fn a_reader_of_a_live_pipeline_through_a_build_edge(
 }
 
 /// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and holds
-/// them (`Dispatcher::wait_for_inputs`): each row adds the sum of `ys`, and a row arriving before the sum is
+/// them: each row adds the sum of `ys`, and a row arriving before the sum is
 /// decided waits for it.
 #[rstest_log::rstest]
 fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize) {
@@ -3714,7 +3694,7 @@ fn a_map_over_a_live_source_at_main(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("SinkBreaker")),
+            .any(|plan| plan.live && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline is notified of each delivery: {planned:?}"
     );
 }
@@ -3743,7 +3723,7 @@ fn an_aggregate_per_row_over_a_live_source_at_main(#[values(1, usize::MAX)] rows
 }
 
 /// A filter over a live source that reads a sum takes the source's arrivals and holds them
-/// (`Dispatcher::wait_for_inputs`). A sum over a literal is decided before the first delivery, so the first
+/// until the sum is decided. A sum over a literal is decided before the first delivery, so the first
 /// delivery's rows are answered as they arrive. A sum over the live source is decided only at the
 /// last delivery, so the first delivery's rows stay waiting for inputs until then.
 #[rstest_log::rstest]
@@ -3770,10 +3750,9 @@ fn a_filter_over_a_live_source_reading_a_sum(
         "the `main` output is handed the first delivery's rows once the sum is final"
     );
     assert!(
-        planned.iter().any(|plan| plan.live
-            && !plan.whole
-            && plan.held
-            && plan.name.starts_with("SinkBreaker")),
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.held && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline takes arrivals and holds them until their inputs complete: {planned:?}"
     );
 }
@@ -3791,10 +3770,6 @@ fn readers_over_a_live_pipeline_wait_for_inputs(#[values(1, usize::MAX)] rows: u
     "};
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), vec![(0, 15), (1, 30)]);
-    assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
     assert!(
         planned
             .iter()
@@ -3846,10 +3821,6 @@ fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), expected);
     assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
-    assert!(
         planned
             .iter()
             .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
@@ -3893,10 +3864,6 @@ fn a_sum_over_live_rows_carrying_a_constant(
             .any(|plan| plan.live && plan.name.starts_with("Memo")),
         "the source's `Memo` is the live pipeline: {planned:?}"
     );
-    assert!(
-        !planned.iter().any(|plan| plan.whole),
-        "no pipeline reads its input whole: {planned:?}"
-    );
 }
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
@@ -3925,10 +3892,8 @@ fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)
     assert_eq!(written_before_next_delivery, vec![through(1), through(3)]);
     assert_eq!(keyed_ints(&single_value(&value)), through(4));
     assert!(
-        planned
-            .iter()
-            .any(|plan| plan.live && plan.whole && plan.held),
-        "a pipeline over the source reads it whole and holds its rows until their inputs complete: {planned:?}"
+        planned.iter().any(|plan| plan.live && plan.held),
+        "a pipeline over the source holds its rows until their inputs complete: {planned:?}"
     );
 }
 
@@ -4154,10 +4119,9 @@ fn a_store_over_a_live_source_reading_a_pipeline(
     assert_eq!(
         following
             .iter()
-            .map(|plan| match (plan.whole, plan.held) {
-                (true, _) => "whole",
-                (false, true) => "held",
-                (false, false) => "neither",
+            .map(|plan| match plan.held {
+                true => "held",
+                false => "neither",
             })
             .collect::<Vec<_>>(),
         plans,
@@ -4191,7 +4155,7 @@ fn a_writer_over_a_concatenation_with_a_live_source(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("Commit")),
+            .any(|plan| plan.live && plan.name.starts_with("Commit")),
         "the store takes its items as they arrive: {planned:?}"
     );
 }
@@ -4939,35 +4903,6 @@ fn canonical(value: &Value) -> String {
         "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]",
     ],
 )]
-#[case::collection_in_a_tuple_row(
-    "out << [(x, [y * x for y in source1()]) for x in [1, 2]]",
-    &[
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
-    ],
-)]
-#[case::a_bound_tuple_row(
-    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
-    &[
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
-        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
-          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]",
-    ],
-)]
-#[case::the_collection_field_of_a_bound_tuple_row(
-    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.1 for p in xs]",
-    &[
-        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
-        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
-        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
-          u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]",
-    ],
-)]
 fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
     #[case] body: &str,
     #[case] expected: &[&str],
@@ -4976,7 +4911,7 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
 ) {
     let source = format!("out = test_sink()\n{body}\n");
     let mut written = Vec::new();
-    let (value, planned) =
+    let (value, _) =
         dispatched_live_observed_on(&source, rows, workers, three_batches(), |sink, _| {
             assert_eq!(
                 sink.value(),
@@ -4990,12 +4925,72 @@ fn a_sink_over_a_widened_live_read_holds_each_delivery_before_the_next(
         });
     written.push(canonical(&single_value(&value)));
     assert_eq!(written, expected, "{body}");
-    // Each case's only pipeline with a parallel level is the memo over the live source, which is
-    // queued reads again, so the pool admits nothing and no package runs on a worker.
-    assert!(
-        planned.iter().all(|planned| planned.worker_claims == 0),
-        "{body}: a pipeline queued reads again runs on the coordinator: {planned:?}"
-    );
+}
+
+/// A row whose value is a record decides its fields one by one: a field that is final is
+/// published under the row while a collection in another field still grows with a live source. A
+/// sink over such rows therefore holds the rows at each idle, each collection field as far as the
+/// source has delivered, and the value is complete once the source closes. How many idles a run
+/// has depends on the batch size and the workers, so an idle's rows are those after one of the
+/// deliveries before the last.
+#[rstest_log::rstest]
+#[case::collection_in_a_tuple_row(
+    "out << [(x, [y * x for y in source1()]) for x in [1, 2]]",
+    &[
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
+    ],
+    "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
+      u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]"
+)]
+#[case::a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << xs",
+    &[
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2]), u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4])]",
+        "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4]), \
+          u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8])]",
+    ],
+    "[u0 -> (_0: 1, _1: [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]), \
+      u1 -> (_0: 2, _1: [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10])]"
+)]
+#[case::the_collection_field_of_a_bound_tuple_row(
+    "xs = [(x, [y * x for y in source1()]) for x in [1, 2]]\nout << [p.1 for p in xs]",
+    &[
+        "[u0 -> [u0 -> 1, u1 -> 2], u1 -> [u0 -> 2, u1 -> 4]]",
+        "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4], u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8]]",
+    ],
+    "[u0 -> [u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5], \
+      u1 -> [u0 -> 2, u1 -> 4, u2 -> 6, u3 -> 8, u4 -> 10]]"
+)]
+fn a_sink_over_live_tuple_rows_writes_each_delivery_before_the_source_closes(
+    #[case] body: &str,
+    #[case] at_idle: &[&str],
+    #[case] expected: &str,
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(1, 4)] workers: usize,
+) {
+    let source = format!("out = test_sink()\n{body}\n");
+    let mut idles = 0;
+    let (value, _) =
+        dispatched_live_observed_on(&source, rows, workers, three_batches(), |sink, _| {
+            idles += 1;
+            assert_eq!(
+                sink.value(),
+                Err(crate::interpreter::SinkReadError::Incomplete),
+                "{body}: the value stays open until the source closes"
+            );
+            let written = sink.written_so_far().unwrap_or_else(|error| {
+                panic!("{body}: the delivered rows reach the sink: {error}")
+            });
+            let written = canonical(&single_value(&written));
+            assert!(
+                at_idle.contains(&written.as_str()),
+                "{body}: an idle holds the rows after a delivery, not {written}"
+            );
+        });
+    assert!(idles > 0, "{body}: the run idles before the source closes");
+    assert_eq!(canonical(&single_value(&value)), expected, "{body}");
 }
 
 /// A loop over a map literal inside another loop: the inner loop's `MapAggregate` reads a

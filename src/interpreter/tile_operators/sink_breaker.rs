@@ -141,13 +141,7 @@ impl Breaker for SinkBreaker {
     /// A consume hands the sink what the answer holds and releases it, so a row is handed once. A
     /// `main` output that merges its answers and hands them once, at its finish, publishes
     /// nothing a read before its finish could bring forward.
-    fn reads_open_input(&self) -> bool {
-        match &*self.hands.lock().unwrap_or_else(PoisonError::into_inner) {
-            Hands::EachPackage => true,
-            Hands::Main { each_package, .. } => *each_package,
-        }
-    }
-
+    ///
     /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
     /// only.
     fn consume_impl(&self, _: InputId, guard: TileGuard) {

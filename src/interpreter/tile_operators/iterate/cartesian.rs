@@ -129,9 +129,13 @@ impl CartesianIteration {
         for side in &mut self.sides {
             let known = side.tile.to_guard().projection("IterateExtent");
             let known = match known {
+                Projection::Within { .. } | Projection::Or(_) => panic!("this reading has no part of some values: a projection within values or an `Or` reaches it"),
                 Projection::Everything => Predicate::True,
                 Projection::Nothing => Predicate::False,
                 Projection::Keys { keys, .. } => keys,
+                Projection::Fields { .. } => {
+                    unreachable!("an extent's keys are no record of values")
+                }
             }
             .union(&side.released);
             let pending = Predicate::True.minus(&known);
@@ -172,9 +176,13 @@ impl CartesianIteration {
             }
         }
         let region = match guard.projection("IterateExtent") {
+            Projection::Within { .. } | Projection::Or(_) => panic!(
+                "this reading has no part of some values: a projection within values or an `Or` reaches it"
+            ),
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys { keys, .. } => keys,
+            Projection::Fields { .. } => unreachable!("an extent's keys are no record of values"),
         };
         let fields: HashMap<_, _> = self
             .sides
@@ -290,9 +298,13 @@ impl CartesianIteration {
 
     fn offer(&self, guard: TileGuard, tiling: &Tiling, obsolete: &TileGuard) -> Tile {
         let region = match guard.projection("IterateExtent") {
+            Projection::Within { .. } | Projection::Or(_) => panic!(
+                "this reading has no part of some values: a projection within values or an `Or` reaches it"
+            ),
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys { keys, .. } => keys,
+            Projection::Fields { .. } => unreachable!("an extent's keys are no record of values"),
         };
         let pending = Projection::admitting(region.minus(&obsolete.whole_keys())).guard(tiling);
         let keys = self.keys(&pending, tiling);
@@ -357,17 +369,22 @@ mod tests {
         )
     }
     fn deliver(head: &dyn TileProducer) {
-        // Exercise the same completion delivery that source polling uses, before reading.
+        // Deliver the sources' keys as source polling does, a push of the yielded region through
+        // the iterator's consumer, before reading.
         let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);
         let consumer = head
             .base()
             .downstream
             .clone()
             .expect("an iterator's source consumer");
-        dispatcher.land_range_complete(
+        let mut landing = crate::interpreter::dispatcher::Landing::push(
+            &dispatcher,
             crate::interpreter::dispatcher::PipelineId(0),
-            &Projection::Everything,
+        );
+        crate::interpreter::notifications::notify_shared(
             &consumer,
+            &Projection::Everything,
+            &mut landing,
         );
     }
     fn rows(head: &mut dyn TileProducer) -> usize {

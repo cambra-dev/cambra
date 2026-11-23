@@ -24,8 +24,9 @@ pub(super) struct WriterRun {
 enum Attempt {
     /// No request is open and no finish has begun.
     Idle,
-    /// Attempts toward this request run until it completes.
-    Request(WorkPackage),
+    /// Attempts toward this request run until it completes, over the request's positions and
+    /// those an earlier request left waiting for inputs.
+    Request(WorkPackage, TileGuard),
     /// The finish's attempt runs. Once it has, the sources close and the body finishes
     /// ([`Body::take_finish`]).
     Finishing,
@@ -40,7 +41,7 @@ impl WriterRun {
     }
 
     pub(super) fn has_request(&self) -> bool {
-        matches!(self.attempt, Attempt::Request(_))
+        matches!(self.attempt, Attempt::Request(..))
     }
 
     /// Whether the writer's followers wait on it: a request or a finish is open.
@@ -85,8 +86,9 @@ impl WriterRun {
                 });
             }
         }
+        self.body.queue_grown(&mut work);
         work.queue_round(self.body.global(self.body.driver), guard);
-        work.queue_round(self.body.attached().step, guard);
+        self.body.end_round_with(guard);
         work
     }
 
@@ -129,6 +131,19 @@ impl CommitProducer {
             .expect("a transaction run is planned")
             .writers[writer]
     }
+    /// Queue the requests offered to writer `writer` on its pipeline, and close the pipeline once
+    /// asked, where the store is open: an attempt reads the store, which exists once every seed
+    /// key's value is final ([`Body::queue_offered`]). Whether it queued or closed anything.
+    pub(super) fn queue_requests(&mut self, dispatcher: &Dispatcher, writer: usize) -> bool {
+        if !self.writer_run(writer).body.has_offers() {
+            return false;
+        }
+        let open = self.open_if_ready();
+        self.writer_run_mut(writer)
+            .body
+            .queue_offered(dispatcher, open)
+    }
+
     pub(super) fn begin_request(
         &mut self,
         dispatcher: &Dispatcher,
@@ -142,9 +157,12 @@ impl CommitProducer {
         );
         self.begin_delivery(input);
         self.begin_attempt();
-        let guard = package.guard.clone();
         let run = self.writer_run_mut(writer);
-        run.attempt = Attempt::Request(package);
+        let guard = match run.body.waiting() {
+            Some(waiting) => package.guard.union(&waiting),
+            None => package.guard.clone(),
+        };
+        run.attempt = Attempt::Request(package, guard.clone());
         run.queue(dispatcher, &guard)
     }
     pub(super) fn finish_request(
@@ -165,29 +183,41 @@ impl CommitProducer {
                 run.close(dispatcher);
                 return (None, RoundWork::default());
             }
-            Attempt::Request(package) => {
-                let guard = package.guard.clone();
-                run.attempt = Attempt::Request(package);
+            Attempt::Request(package, guard) => {
+                run.attempt = Attempt::Request(package, guard.clone());
                 guard
             }
             Attempt::Idle => unreachable!("a writer's step completes an attempt it queued"),
         };
         if self.request_complete(self.writer_input(writer), &guard) {
             let run = self.writer_run_mut(writer);
-            let Attempt::Request(package) = std::mem::replace(&mut run.attempt, Attempt::Idle)
+            run.body.set_waiting(None, None);
+            let Attempt::Request(package, _) = std::mem::replace(&mut run.attempt, Attempt::Idle)
             else {
                 unreachable!("matched a request above")
             };
             return (Some(package), RoundWork::default());
         }
         // An attempt reads the store, its inputs and the decisions to attempt again. Once every
-        // writer has attempted with none of those changed, no further attempt differs.
-        assert!(
-            stalled <= writers,
-            "a transaction request is attempted again only while an attempt changes the store, \
-             an input's release or the decisions to retry: writer {writer} is queued {guard:?} \
-             after {stalled} attempts that changed none of them"
-        );
+        // writer has attempted with none of those changed, no further attempt differs: the
+        // request ends with what it has not decided waiting for inputs, and what the writer
+        // pushes once an input grows is offered to its scope, which queues the next request.
+        if stalled > writers {
+            let input = self.writer_input(writer);
+            let waiting = guard_minus(&guard, &self.input_released(input));
+            let entry = self.writer_placements[writer].clone();
+            let run = self.writer_run_mut(writer);
+            run.body.set_waiting(Some(waiting), Some(&entry));
+            let Attempt::Request(package, _) = std::mem::replace(&mut run.attempt, Attempt::Idle)
+            else {
+                unreachable!("matched a request above")
+            };
+            self.run
+                .as_mut()
+                .expect("a transaction run is planned")
+                .stalled = 0;
+            return (Some(package), RoundWork::default());
+        }
         self.begin_attempt();
         (None, self.writer_run_mut(writer).queue(dispatcher, &guard))
     }
@@ -195,7 +225,6 @@ impl CommitProducer {
         &mut self,
         dispatcher: &Dispatcher,
         writer: usize,
-        consumed: Option<TileGuard>,
     ) -> RoundWork {
         assert!(
             matches!(self.writer_run(writer).attempt, Attempt::Idle),
@@ -207,7 +236,7 @@ impl CommitProducer {
         self.begin_attempt();
         let run = self.writer_run_mut(writer);
         run.attempt = Attempt::Finishing;
-        run.body.begin_finish(consumed);
+        run.body.begin_finish();
         run.queue(dispatcher, &whole)
     }
 }

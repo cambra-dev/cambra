@@ -642,14 +642,14 @@ fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
     };
 
     crate::it::serving::dispatch_until_idle(&mut program);
-    // The sink holds the rows of `i` with no sum yet: a sum over a source that may still
-    // deliver is not complete, and the read of the open input hands its empty feed.
+    // A sum over a source that may still deliver is not complete, so no row of the feed is, and
+    // the sink is written nothing.
     assert_eq!(
         sink.written_so_far().map(|written| written.to_string()),
-        Ok("Function [  ]".to_string()),
+        Err(SinkReadError::NothingWritten),
         "a sum over a source that may still deliver writes no value"
     );
-    assert_eq!(sink.value(), Err(SinkReadError::Incomplete));
+    assert_eq!(sink.value(), Err(SinkReadError::NothingWritten));
 
     src.write()
         .unwrap_or_else(PoisonError::into_inner)

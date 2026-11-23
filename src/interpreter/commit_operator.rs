@@ -856,9 +856,16 @@ trait SteppedStore: BreakingProducer {
     fn input_released_in_state(&self, state: &mut Self::State, input: InputId) -> TileGuard;
     fn inputs_in_state(&self, state: &mut Self::State) -> usize;
     fn read_cycle_inputs(&self, state: &mut Self::State, cycle: &Cycle);
+    /// Open the store where it can open, and answer whether it is open: a transaction store opens
+    /// once its whole seed has arrived, and steps nothing before.
+    fn opened(&self, _state: &mut Self::State) -> bool {
+        true
+    }
 }
 
-/// Step `store` until its input `input` has released `guard`. Before each step the store has the
+/// Step `store` until its input `input` has released `guard`, or until a step changes neither the
+/// store nor its input's release: the next position `guard` names is not decided yet, and the rest
+/// of `guard` stays unreleased until a later consume. Before each step the store has the
 /// operators inside its cycle read again ([`SteppedStore::read_cycle_inputs`]), and after it publishes the
 /// snapshot a re-entrant pull reads. The first consume opens the store with a step, so a pull
 /// answers from the snapshot from then on, whatever the morsel names.
@@ -871,9 +878,7 @@ trait SteppedStore: BreakingProducer {
 /// # Panics
 ///
 /// For a store that is no cyclic fan-out's input, whose cycle no step can read again or publish
-/// to, and for a step that changes neither the store nor its input's release: the positions
-/// `guard` names have not arrived, and a store is queued a morsel only once its input can release
-/// it.
+/// to.
 fn consume_store<S: SteppedStore>(
     store: &S,
     state: &mut S::State,
@@ -886,6 +891,10 @@ fn consume_store<S: SteppedStore>(
             S::STORE
         )
     });
+    // A store not yet open steps nothing, and the package stays unreleased until it is.
+    if !store.opened(state) {
+        return;
+    }
     let step = |state: &mut S::State| {
         store.read_cycle_inputs(state, &cycle);
         let tile = store.step_store(state, input);
@@ -904,12 +913,13 @@ fn consume_store<S: SteppedStore>(
         let tile = step(state);
         let progressed = S::breaker(state).snapshot.as_ref() != Some(&tile)
             || store.input_released_in_state(state, input) != released;
-        assert!(
-            progressed,
-            "{} is consumed only for positions its input releases: {guard:?} names positions beyond {released:?}, which a step does not reach",
-            S::STORE
-        );
         S::breaker_mut(state).snapshot = Some(tile);
+        // A position its input has not decided yet stops the steps: the package's rest stays
+        // unreleased, and the scope keeps it waiting for inputs until a push brings what decides
+        // it (`Body::waiting`).
+        if !progressed {
+            return;
+        }
     }
 }
 
@@ -1246,6 +1256,9 @@ impl SteppedStore for CommitProducer {
     fn read_cycle_inputs(&self, state: &mut Self::State, cycle: &Cycle) {
         CommitProducer::read_cycle_inputs(self, state, cycle);
     }
+    fn opened(&self, state: &mut Self::State) -> bool {
+        self.open_store(state)
+    }
     fn step_store(&self, state: &mut Self::State, input: InputId) -> Tile {
         match self.writer_of(input) {
             Some(_) => unreachable!("writer attempts are dispatcher pipelines"),
@@ -1456,23 +1469,9 @@ impl CommitProducer {
 }
 
 impl BreakingProducer for CommitProducer {
-    fn completed_keys(&self) -> Vec<Value> {
-        let mut state_guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = &mut *state_guard;
-
-        match state.breaker.snapshot.as_ref() {
-            Some(Tile::Store { closed_keys, .. }) => closed_keys.clone(),
-            _ => Vec::new(),
-        }
-    }
-
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
-    /// decided, and a reader of its final value takes it once the store is terminal
-    /// (`Dispatcher::read_whole`).
+    /// decided, and a reader of its final value takes it once the store is terminal.
     fn complete(&self) -> TileGuard {
         let mut state_guard = self
             .state
@@ -2510,6 +2509,11 @@ impl CommitOperator {
 }
 
 impl TileOperator for CommitOperator {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -2581,6 +2585,7 @@ impl TileOperator for CommitOperator {
         Box::new(CommitProducer {
             base,
             seed_placements,
+            writer_placements: placements.clone(),
             writer_write_keys: self.writer_write_keys.clone(),
             state: std::sync::Mutex::new(CommitState {
                 queued: (0..n).map(|_| BTreeMap::new()).collect(),
@@ -2611,6 +2616,9 @@ pub struct CommitProducer {
     /// to the pipeline of the store's input 0 ([`Self::writer_of`]). Empty where the store has no
     /// seed stream, and then it has no seed input.
     seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
+    /// Per writer, the placement of the entry in front of it, which a planner sets to the writer's
+    /// pipeline.
+    pub(crate) writer_placements: Vec<crate::interpreter::dispatcher::Placement>,
     /// Per writer, the keys it may write ([`CommitOperator::writer_write_keys`]),
     /// aligned with [`Self::writer_terminal`]. The two together give per-key
     /// closure: a key is closed once every writer listing it is terminal.
@@ -2904,9 +2912,17 @@ impl CommitProducer {
 }
 
 impl CommitProducer {
-    /// Open the store on the pull its whole seed has arrived, and answer whether it is open.
-    /// Until then it is undecided — no tick 0, so no frontier — and a writer reads nothing to
-    /// build an attempt against, which is why nothing is attempted before it opens either.
+    /// Open the store once every seed key's value is final ([`open_store`](Self::open_store)), and
+    /// answer whether it is open. Before it opens the store has no tick 0 and no frontier, so a
+    /// writer has nothing to build an attempt against.
+    pub(crate) fn open_if_ready(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.open_store(&mut state)
+    }
+
     fn open_store(&self, state: &mut CommitState) -> bool {
         if state.engine.is_none() {
             let mut seed = state.seed.clone();
@@ -3418,6 +3434,11 @@ impl InductionStore {
 }
 
 impl TileOperator for InductionStore {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -3868,7 +3889,7 @@ impl InductionStoreProducer {
         // the row has ended, and a release of the row whole then leaves the store no step that
         // would read that.
         for level in (0..state.complete_rows.len().saturating_sub(1)).rev() {
-            let whole = rows_whole_beneath(&state.complete_rows[level + 1]);
+            let whole = state.complete_rows[level + 1].rows_whole_beneath();
             state.complete_rows[level] = state.complete_rows[level].union(&whole);
         }
         // Reading a terminal body stream as "the whole extent is decided" rests on the loop
@@ -4481,15 +4502,11 @@ impl TileOperator for StoreFinalRead {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        // A final read requires completion of this key, even when other store keys remain live.
         let consumer = shared_consumer(consumer);
 
         let forward = forwarding_consumer_keeping_keys(&consumer);
         let forward: Box<dyn Consumer> = if self.levels_above == 0 {
-            Box::new(FinalKeyConsumer {
-                key: self.key.clone(),
-                downstream: crate::interpreter::widening(forward),
-            })
+            crate::interpreter::widening(forward)
         } else {
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(self.levels_above),
@@ -4514,21 +4531,6 @@ impl TileOperator for StoreFinalRead {
             value_extent: self.value_extent.clone(),
             levels_above: self.levels_above,
         })
-    }
-}
-
-struct FinalKeyConsumer {
-    key: Value,
-    downstream: Box<dyn Consumer>,
-}
-
-impl Consumer for FinalKeyConsumer {
-    fn notify(
-        &self,
-        region: &Projection,
-        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
-    ) {
-        landing.requiring_final_key(&self.key, |landing| self.downstream.notify(region, landing));
     }
 }
 
@@ -5936,6 +5938,11 @@ impl InductionDriver {
 }
 
 impl TileOperator for InductionDriver {
+    /// The drive's positions arrive one per round, whether or not its source reads a source.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -6349,25 +6356,6 @@ impl TileProducer for InductionDriverProducer {
     }
 }
 
-/// The rows `beneath`, a statement of the level beneath them, calls complete in full: the
-/// enclosing paths of its arms that admit every key under them.
-fn rows_whole_beneath(beneath: &Predicate) -> Predicate {
-    let arms: Vec<&Predicate> = match beneath {
-        Predicate::Or(arms) => arms.iter().collect(),
-        one => vec![one],
-    };
-    Predicate::union_all(
-        arms.into_iter()
-            .filter_map(|arm| match arm {
-                Predicate::Qualified { enclosing, here } if here.is_true() => {
-                    Some((**enclosing).clone())
-                }
-                _ => None,
-            })
-            .collect(),
-    )
-}
-
 /// The drive of a loop run in rounds is the pipeline breaker a round starts: a package names
 /// the position the round runs, the next its source delivers, and a consume emits it where the
 /// store has decided the position before it. See `src/interpreter/design-dispatcher.md`, "A loop in
@@ -6491,7 +6479,7 @@ impl InductionDriverProducer {
             // that completion only at the deeper level.
             for level in (0..state.source_complete.len().saturating_sub(1)).rev() {
                 state.source_complete[level] = state.source_complete[level]
-                    .union(&rows_whole_beneath(&state.source_complete[level + 1]));
+                    .union(&state.source_complete[level + 1].rows_whole_beneath());
             }
             state.source.terminal |= state
                 .source_complete
@@ -6616,10 +6604,16 @@ impl InductionDriverProducer {
                 .next_delivered(state.emitted_through.as_ref())
                 .cloned()
             && match asked {
+                Projection::Within { .. } | Projection::Or(_) => panic!(
+                    "this reading has no part of some values: a projection within values or an `Or` reaches it"
+                ),
                 Projection::Everything => true,
                 Projection::Nothing => false,
                 Projection::Keys { level, keys } => {
                     level.index() + 1 == pos.len() && keys.contains_path(&pos)
+                }
+                Projection::Fields { .. } => {
+                    unreachable!("a drive's positions are keys, not the fields of a record")
                 }
             }
         {
@@ -6919,6 +6913,11 @@ impl TransactDriver {
 }
 
 impl TileOperator for TransactDriver {
+    /// The drive's positions arrive one per round, whether or not its source reads a source.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -7912,6 +7911,11 @@ impl TransactWriter {
 }
 
 impl TileOperator for TransactWriter {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {

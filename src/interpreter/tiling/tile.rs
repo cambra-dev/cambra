@@ -399,7 +399,24 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record { fields: m, .. } => m.values().all(Tile::is_terminal),
-            Tile::DataFunction { .. } => self.level_statement().is_true(),
+            // Where the held keys' predicate is `True`, as for the one key of a `Unit` domain or
+            // both keys of a `Bool` one, keys held with whole values close the collection.
+            // `Tile::merge` extends a value with parts that arrive later, so a held key stays held. A value that is a collection states
+            // whether it is whole; a scalar value states nothing, so only the level statement
+            // closes a collection of scalars.
+            Tile::DataFunction {
+                domain, codomain, ..
+            } => {
+                let stated = self.level_statement();
+                stated.is_true()
+                    || matches!(&**codomain, Tile::DataFunction { .. })
+                        && stated
+                            .union(
+                                &Predicate::from_column_value(domain)
+                                    .intersect(&codomain.level_statement().rows_whole_beneath()),
+                            )
+                            .is_true()
+            }
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
@@ -5543,6 +5560,32 @@ mod tests {
             BitSet::new(),
         );
         assert!(tile.is_terminal());
+    }
+
+    /// A collection whose held keys hold whole values is terminal where the held keys' predicate
+    /// is `True`, as for a `Unit` key or both `Bool` keys, and not where more keys may arrive.
+    #[test]
+    fn held_keys_with_whole_values_close_a_unit_domain_only() {
+        // Each held key holds the list `[1, 2]`, stated whole.
+        let held = |domain: ColumnValue| {
+            let rows = domain.len();
+            Tile::data_function(
+                domain,
+                Box::new(Tile::grouped(
+                    (0..rows).map(|row| 2 * row).collect(),
+                    ColumnValue::UInts([0, 1].repeat(rows)),
+                    Box::new(Tile::Scalar(ColumnValue::Ints([1, 2].repeat(rows)))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        assert!(held(ColumnValue::Units(1)).is_terminal());
+        assert!(held(ColumnValue::Bools(vec![false, true])).is_terminal());
+        assert!(!held(ColumnValue::Bools(vec![true])).is_terminal());
+        assert!(!held(ColumnValue::Ints(vec![7])).is_terminal());
     }
 
     #[test]

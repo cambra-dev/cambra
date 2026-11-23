@@ -9,7 +9,9 @@ use std::sync::PoisonError;
 
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
-use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, SubscribeContext, Tiling};
+use crate::interpreter::{
+    BaseType, CurryLevel, Extent, Predicate, Projection, SubscribeContext, Tiling,
+};
 
 /// An operator and the consumers it installed on its inputs, which a test notifies through.
 type Built = (Arc<dyn TileOperator>, Vec<InputConsumer>);
@@ -231,15 +233,31 @@ fn zip() -> Built {
     (Arc::new(op), vec![first, second])
 }
 
+/// The region of arm `name`'s rows `keys` admits, as a zip beneath rows restates it: those rows.
+/// A notification names keys; what of a row's value is final the row's tile states.
+fn zip_field(_name: &str, keys: Predicate) -> Projection {
+    Projection::admitting(keys)
+}
+
+/// Each arm of a zip beneath rows is one field of them, so a region of an arm's rows names those
+/// rows.
 #[test]
-fn zip_forwards_the_region_of_its_first_arm() {
-    assert_keeps(&zip, 0);
+fn zip_forwards_the_region_of_its_first_arm_as_its_rows() {
+    assert_eq!(
+        received(&zip, 0, &region()),
+        [zip_field("_0", keys_of(&region()))]
+    );
 }
 
 #[test]
-fn zip_forwards_the_region_of_its_second_arm_without_state() {
-    assert_keeps(&zip, 1);
-    assert_keeps_without_state(&zip, 1);
+fn zip_forwards_the_region_of_its_second_arm_as_its_rows_without_state() {
+    for sent in [region(), Projection::Everything, another_region()] {
+        assert_eq!(
+            received(&zip, 1, &sent),
+            [zip_field("_1", keys_of(&sent))],
+            "{sent:?}"
+        );
+    }
 }
 
 fn product() -> Built {
@@ -305,6 +323,7 @@ fn under_arm(arm: usize, keys: Predicate) -> Projection {
 /// The keys of a region of the test streams.
 fn keys_of(region: &Projection) -> Predicate {
     match region {
+        Projection::Everything => Predicate::True,
         Projection::Keys { keys, .. } => keys.clone(),
         other => panic!("a region of keys: {other:?}"),
     }
@@ -523,16 +542,38 @@ fn select_field_forwards_the_region_of_a_stream_of_records() {
     assert_keeps_without_state(&a_stream_of_records, 0);
 }
 
-/// A product of collections is read whole and its field cut, so a region of one collection's keys
-/// is not a region of the field's.
+fn a_product_of_collections() -> Built {
+    select_field(Tiling::Record(
+        [(SmolStr::new("a"), ints()), (SmolStr::new("b"), ints())]
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// A region of the selected field of a record of values is the field's own region, and a region
+/// of another field names none of it.
 #[test]
-fn select_field_over_a_product_of_collections_sends_everything() {
-    let product = || {
-        select_field(Tiling::Record(
-            [(SmolStr::new("a"), ints())].into_iter().collect(),
-        ))
-    };
-    assert_widens(&product, 0);
+fn select_field_over_a_product_of_collections_forwards_the_part_of_its_field() {
+    assert_eq!(
+        received(
+            &a_product_of_collections,
+            0,
+            &Projection::of_field("a", region())
+        ),
+        [region()]
+    );
+    assert_eq!(
+        received(
+            &a_product_of_collections,
+            0,
+            &Projection::of_field("b", region())
+        ),
+        []
+    );
+    assert_eq!(
+        received(&a_product_of_collections, 0, &Projection::Everything),
+        [Projection::Everything]
+    );
 }
 
 fn variant_wrap(input: Tiling, level: CurryLevel) -> Built {
@@ -693,10 +734,22 @@ fn uncurry_beneath_a_standing_level_forwards_the_region() {
     assert_keeps_without_state(&beneath, 0);
 }
 
-/// Pairing the whole tile re-keys it.
+/// Pairing the whole tile names a region of outer keys as the pairs whose first field they are.
 #[test]
-fn uncurry_at_the_outermost_level_sends_everything() {
-    assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
+fn uncurry_at_the_outermost_level_restates_outer_keys_as_the_pairs_they_head() {
+    let Projection::Keys { keys: outer, .. } = region() else {
+        unreachable!("the region names keys")
+    };
+    let pairs = Projection::admitting(Predicate::Record(HashMap::from([
+        (crate::interpreter::tuple_field(0), outer),
+        (crate::interpreter::tuple_field(1), Predicate::True),
+    ])));
+    let outermost = || uncurry(CurryLevel::OUTERMOST);
+    assert_eq!(received(&outermost, 0, &region()), [pairs]);
+    assert_eq!(
+        received(&outermost, 0, &Projection::Everything),
+        [Projection::Everything]
+    );
 }
 
 fn aggregate() -> Built {
@@ -849,19 +902,18 @@ fn make_record() -> Built {
     (Arc::new(op), vec![first, second])
 }
 
-/// A record of values has no keys of its own.
+/// A record of values has no keys of its own, so a region of a field names that field of it.
 #[test]
-fn make_record_sends_everything_for_a_region_of_either_field() {
-    assert_widens(&make_record, 0);
-    assert_widens(&make_record, 1);
-}
-
-#[test]
-fn make_record_sends_everything_for_a_later_region() {
-    assert_eq!(
-        received(&make_record, 1, &another_region()),
-        [Projection::Everything]
-    );
+fn make_record_names_a_region_of_a_field_as_that_part_of_the_record() {
+    for (field, name) in [(0, "_0"), (1, "_1")] {
+        for sent in [region(), another_region(), Projection::Everything] {
+            assert_eq!(
+                received(&make_record, field, &sent),
+                [Projection::of_field(name, sent.clone())],
+                "{sent:?}"
+            );
+        }
+    }
 }
 
 /// Every key is answered against all of the collection.
@@ -940,8 +992,8 @@ fn a_fan_out_passes_each_notification_to_its_readers() {
     );
 }
 
-/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each: a memo
-/// above it marks both regions dirty.
+/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each as those
+/// rows: a memo above it marks both regions dirty.
 #[test]
 fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     let (operator, inputs) = zip();
@@ -958,7 +1010,10 @@ fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
     notify_input(&inputs[1], &another_region());
     assert_eq!(
         *regions.write().unwrap_or_else(PoisonError::into_inner),
-        [region(), another_region()]
+        [
+            zip_field("_0", keys_of(&region())),
+            zip_field("_1", keys_of(&another_region()))
+        ]
     );
 }
 

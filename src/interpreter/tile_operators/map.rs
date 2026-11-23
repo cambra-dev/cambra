@@ -319,15 +319,33 @@ impl TileOperator for MapResult {
                 self.function.tiling()
             );
         }
-        let function_producer = match looked_up_at_keys {
-            Some(at) => self.function.clone().subscribe(
-                self.function.tiling().universal_guard(),
-                crate::interpreter::notifications::restating_lookup(
-                    Box::new(move |region| keys_looked_up(region, at)),
-                    forwarding_consumer_keeping_keys(&shared),
-                ),
-                cx,
-            ),
+        // A row of a lookup at its own key exists once the input has delivered the row and the
+        // operand the key, so each operand's delivery is passed on under the rows the other has
+        // delivered (`notifications::aligned`): the input is arm 0 and the operand arm 1.
+        let lookup = looked_up_at_keys.map(|at| {
+            let delivered = crate::interpreter::notifications::nothing_aligned([
+                self.input.keys_arrive_by_push(),
+                self.function.keys_arrive_by_push(),
+            ]);
+            (at, delivered)
+        });
+        let function_producer = match &lookup {
+            Some((at, delivered)) => {
+                let at = *at;
+                self.function.clone().subscribe(
+                    self.function.tiling().universal_guard(),
+                    crate::interpreter::notifications::restating_lookup(
+                        Box::new(move |region| keys_looked_up(region, at)),
+                        crate::interpreter::notifications::aligned(
+                            1,
+                            at,
+                            delivered.clone(),
+                            forwarding_consumer_keeping_keys(&shared),
+                        ),
+                    ),
+                    cx,
+                )
+            }
             None => subscribe_forwarding(&self.function, &shared, cx),
         };
         // The result's outermost keys are the input's where the function applies to the input's
@@ -339,8 +357,28 @@ impl TileOperator for MapResult {
         // `subscribe_forwarding` sends as `Everything`.
         let keeps_keys =
             self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
-        let input_producer =
-            subscribe_forwarding_keeping_keys_if(keeps_keys, &self.input, &shared, cx);
+        // The function computes each value anew from the input's value there, so a part of that
+        // value names the rows holding it (`whole_values_at`).
+        let input_producer = match keeps_keys {
+            true => {
+                let forward = forwarding_consumer_keeping_keys(&shared);
+                let forward = match &lookup {
+                    Some((at, delivered)) => crate::interpreter::notifications::aligned(
+                        0,
+                        *at,
+                        delivered.clone(),
+                        forward,
+                    ),
+                    None => forward,
+                };
+                self.input.clone().subscribe(
+                    self.input.tiling().universal_guard(),
+                    crate::interpreter::notifications::whole_values_at(forward),
+                    cx,
+                )
+            }
+            false => subscribe_forwarding(&self.input, &shared, cx),
+        };
         Box::new(MapResultProducer {
             dropped_rows: Default::default(),
             base: ProducerBase::new(
@@ -357,6 +395,13 @@ impl TileOperator for MapResult {
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        // A function selecting a field of record values answers what that field equals, as a
+        // product pair's second field equals the key it pairs.
+        if let Some([TilePathStep::Record(field)]) = self.function.result_correlation().as_deref()
+            && let Some(correlation) = self.input.field_correlation(field)
+        {
+            return Some(correlation);
+        }
         if let Some(mut input_corr) = self.input.result_correlation()
             && let Some(transform) = self.function.result_correlation()
         {
@@ -929,6 +974,17 @@ impl MapResultToConst {
 impl TileOperator for MapResultToConst {
     impl_operator_base!();
 
+    /// The constant replaces the collection at `level`, so its own keys are that level's keys,
+    /// and what its values equal is shifted down to that level.
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        let MapResultToConstMode::Replace = self.mode else {
+            return None;
+        };
+        let mut correlation = vec![TilePathStep::Codomain; self.level.index()];
+        correlation.extend(self.constant.result_correlation()?);
+        Some(correlation)
+    }
+
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
         visit(value("constant", &*self.constant));
@@ -941,15 +997,49 @@ impl TileOperator for MapResultToConst {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
-        let constant_producer = subscribe_forwarding(&self.constant, &shared, cx);
-        // The constant is read whole, since every row reads all of it, so its notification
-        // widens; the input is pulled at the projection.
-        let input_consumer = forwarding_consumer_keeping_keys(&shared);
-        let input_consumer = crate::interpreter::notifications::through_values(
-            self.level,
-            self.tiling(),
-            input_consumer,
-        );
+        // Beneath the outermost level a collection constant pairs every row with each of its
+        // keys, so each input's delta is restated as the pairs it creates with what the other
+        // input has delivered (`notifications::Delivered`). At the outermost level the constant
+        // replaces the input, and a scalar constant has no keys: its notification widens.
+        let (constant_producer, input_consumer) = match self.level != CurryLevel::OUTERMOST
+            && self.constant.tiling().is_data_function()
+        {
+            true => {
+                use crate::interpreter::notifications::{
+                    PairingSide, Partners, nothing_delivered, pairing,
+                };
+                let delivered = nothing_delivered(
+                    self.input.keys_arrive_by_push(),
+                    self.constant.keys_arrive_by_push(),
+                );
+                let universal = self.constant.tiling().universal_guard();
+                let constant = self.constant.clone().subscribe(
+                    universal,
+                    pairing(
+                        PairingSide::ConstantKeys,
+                        self.level,
+                        delivered.clone(),
+                        forwarding_consumer_keeping_keys(&shared),
+                    ),
+                    cx,
+                );
+                let input = pairing(
+                    PairingSide::Rows(Partners::ConstantKeys),
+                    self.level,
+                    delivered,
+                    forwarding_consumer_keeping_keys(&shared),
+                );
+                (constant, input)
+            }
+            false => (
+                subscribe_forwarding(&self.constant, &shared, cx),
+                crate::interpreter::notifications::through_values(
+                    self.level,
+                    self.tiling(),
+                    forwarding_consumer_keeping_keys(&shared),
+                ),
+            ),
+        };
         let input_producer =
             self.input
                 .clone()
@@ -1047,9 +1137,14 @@ impl TileProducer for MapResultToConstProducer {
         visit("constant", &mut *self.constant);
     }
 
-    /// It keeps its input's keys above its level and computes the values beneath it.
+    /// It keeps its input's keys above its level and computes the values beneath it. Beneath
+    /// the outermost level a collection constant's keys stand at its level under every row, so
+    /// it restates those too: the input is pulled at the rows and the answer cut.
     fn restates(&self) -> Restates {
-        Restates::Above(self.level)
+        match self.level != CurryLevel::OUTERMOST && self.constant.tiling().is_data_function() {
+            true => Restates::Above(CurryLevel::new(self.level.index() + 1)),
+            false => Restates::Above(self.level),
+        }
     }
 
     /// The constant is read whole, since every row reads all of it.
@@ -1110,7 +1205,7 @@ impl MapResultToConstProducer {
         // at the outermost level the constant replaces the whole input, so the output's keys are
         // the constant's and the projection names none of the input's.
         let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
-            true => projection.guard(&i_tiling),
+            true => projection.above(self.level).guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);
@@ -1634,7 +1729,7 @@ impl TileProducer for MapResultWithSourceProducer {
 mod nested_projection_tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{
-        ProjectionSpyOp, assert_conforms_beneath, paths_guard, two_levels_of_ints,
+        ProjectionSpyOp, assert_conforms_beneath, two_levels_of_ints,
     };
     use crate::interpreter::{BaseType, Extent, FunctionDef, Predicate, UnaryOpKind, Value};
 
@@ -1705,10 +1800,9 @@ mod nested_projection_tests {
     }
 
     /// A collection constant that replaces each row's collection holds the keys beneath the row,
-    /// so a projection of them names nothing of the input.
+    /// so a pull of some of them pulls the rows holding them and answers the cut of those rows.
     #[test]
-    #[should_panic(expected = "restates the outermost keys and the keys above level 1")]
-    fn a_constant_refuses_a_projection_of_the_keys_it_replaces() {
+    fn a_constant_answers_a_projection_of_the_keys_it_replaces_from_their_rows() {
         use crate::interpreter::tile_operators::test_helpers::ints_by_position;
         let constant_tiling = Tiling::data_function(Extent::uint_range(2), Tiling::Scalar(int()));
         let map = Arc::new(MapResultToConst::new_at(
@@ -1720,14 +1814,17 @@ mod nested_projection_tests {
             MapResultToConstMode::Replace,
             CurryLevel::new(1),
         ));
-        let guard = map.tiling().universal_guard();
-        let producer = map
-            .clone()
-            .subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
-        producer.get(paths_guard(Predicate::qualified(
-            Predicate::point(Value::UInt(0)),
-            Predicate::point(Value::UInt(1)),
-        )));
+        let tiling = map.tiling();
+        let mut producer = map.clone().subscribe(
+            tiling.universal_guard(),
+            Box::new(|| {}),
+            &mut SubscribeContext::new(),
+        );
+        let projection = Projection::of_path(&[Value::UInt(0), Value::UInt(1)]);
+        let actual = producer.read_in_pipeline(projection.guard(tiling));
+        let mut expected = producer.read_in_pipeline(tiling.universal_guard());
+        expected.restrict_to(&projection, tiling);
+        assert_eq!(actual, expected);
     }
 }
 

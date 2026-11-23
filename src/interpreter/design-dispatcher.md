@@ -54,25 +54,29 @@ or widen a change to the whole input. A widened change supplies no claim that ou
 The planner records both the dependencies and the part of the input each dependency can decide.
 Operators without their own pipeline read their inputs inside a scheduled pipeline's chain.
 
-A route is what `Consumer::notify` does to a push. The planner walks each read's pushing consumer
-with a routing landing (`Landing::route`) over the regions `pushes_of` builds from the pusher's
-output: at each collection level the path of one key per level, and beneath the outermost level one
-key under every key above it. It walks them as changes, adding a change of every key, and twice as
-complete regions, of a source not yet wholly complete and of one that is, adding `Everything` of the
-latter (`walk_routes`). The
-landing records each entry a walk reaches, whether a consumer on the way widened the push, and the
-two marks a consumer sets inside `notify`: a complete region naming only part of what a row depends
-on (`Landing::completing_part`), and a key read only once final (`Landing::requiring_final_key`).
-The dispatcher keeps the routes per read (`Dispatcher::plan_routes`). A nested loop's drive records
-its source's complete regions at the loop's pipeline; the walks of the body around the loop pass it
-while they run (`build_scope`).
+A route is what `Consumer::notify` does to a push. The planner walks a pushing consumer with a
+routing landing (`Landing::route`) over the regions `pushes_of` builds from the pusher's output: at
+each collection level the path of one key per level, and beneath the outermost level one key under
+every key above it (`routes_to`). The walk records each entry a push reaches. The planner reads the
+routes for two decisions. A pipeline that no route reaches takes no push of that read, so it is
+queued its whole input once every source yields everything. A loop's scope whose reads' pushes reach
+its drive as the drive's own positions takes its positions from those pushes
+(`keys_arrive_as_themselves`). A probe landing (`Landing::probe`) records where a region lands
+without queuing it; a loop's round uses one to name the row each inner pipeline takes (`row_for`).
+The dispatcher does not check queued packages against the routes.
 
-Each package the dispatcher queues must match a change route with the same marks, widened exactly
-as the package's push is, and each complete region a read records must match a complete route with
-the same marks (`Landing::queue`). A push that queues nothing is not checked, and nor is a store's
-complete region that reaches its own pipelines around its recurrence. A consumer that delivers a
-push along a path its walk did not take fails the run where the push is queued
-(`a_push_along_a_route_its_planner_did_not_walk_fails_the_run`).
+A breaker publishes only rows whose whole value it has decided, at any level of keys: a package
+names keys, never part of a value (`spelled_part`, `complete_projection`). A record decides its
+fields together, so a record row whose collection field is still growing is published once the
+record is whole. A reader takes each row once. A store steps only the positions its input has
+decided and leaves the rest of a package unreleased.
+
+A pipeline consumes one breaker input, and an entry lands regions of its own input's tiling. A
+breaker with several inputs, as a loop's scope with its seed, has entries of an input its pipeline
+does not consume. Such a region names the consumed input's rows (`rows_named_in`): a change of it
+changes every row, a completion of all of it completes every row, and a completion of part of it
+completes none. The planner records each pipeline's consumed input (`Dispatcher::consumes_input`)
+and reads arrivals by the same rule.
 
 Compilation builds the subscribed graph without executing its outputs. A planning refusal occurs
 before execution consumes anything. Refusals include an unsupported store shape,
@@ -86,9 +90,12 @@ extent, including previously yielded regions when a run starts. The pipeline que
 breaker's input has not released. Subsequent polls announce additional progress. Several appearances
 of one source do not turn one delivered position into several loop requests.
 
+A record of values is read field by field, so a pipeline whose input is one is queued, at the
+start, each field that no push, arrival or range names (`unnamed_fields`): such a field holds values
+its own chain computes, as a constant does, and nothing else reads it.
+
 A route that preserves source positions can admit them as they arrive. A route that widens them
-reads its whole input again after each delivery and once more after the source closes ([Reading a
-widened input again](#reading-a-widened-input-again)). A loop or transaction whose source is
+names every row of the input ([A widened push](#a-widened-push)). A loop or transaction whose source is
 supplied through another pipeline also waits for that pipeline to decide each admitted region.
 Compound source regions are retained as regions; they are not converted into an invented ordering of
 rows.
@@ -122,8 +129,8 @@ delivery is one package of the store at any morsel size. A store with an arm of 
 a union nested under a tag, takes its input whole once its sources close. A store that reads its
 items through another pipeline takes them as that pipeline's positions where its route to the store
 is an identity. Rebuilding a feed reader across reload can replay values emitted before the cut. A
-live collection inside a record or a nested row reaches its reader before the source closes through
-a read of a widened input ([Reading a widened input again](#reading-a-widened-input-again)).
+live collection inside a record or a nested row reaches its reader once that row is whole
+([A widened push](#a-widened-push)).
 
 ### Pause and reload
 
@@ -205,16 +212,33 @@ paused run unplaces them ([Pause and reload](#pause-and-reload)).
 
 ## Waiting for input completion
 
-An admitted region waits until every dependency has completed the part of that region it supplies.
-For example, a loop seeded by `sum(source1())` cannot start from a partial sum. Its source positions
-remain waiting for inputs until the seed is complete.
+A scope holds the positions a round or attempt could not decide as waiting for inputs
+(`Offered::waiting`). A loop's round decides nothing at a position whose body read an input that is
+not final yet, as a sum over a live source. A writer's attempt is held the same way once every
+writer has attempted without changing the store, an input's release or the decisions to retry. The
+request then ends with those positions unreleased, so a drained boundary holds no claim of it.
 
-Work awaiting input completion contains guards, not copies of rows. The producers retain those rows until consumption
-releases them. A region contributed by a push may be split as its dependencies decide parts of it.
-A source morsel or a loop's closing row waits whole: its completion is part of the work requested.
+A scope's body entries are placed, and marked the scope's, when the scope is attached for a run
+(`Execution::attach_body`), so a push that arrives before the scope's first request, as a live
+source's first poll of the run does, reaches them.
 
-A source that never closes can keep a whole-input dependency unresolved indefinitely. This is a
-consequence of the computation's dependency, not evidence that the region awaiting input completion has been consumed.
+A push that reaches one of the scope's entries and that no pipeline there takes wakes the scope
+(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake offers
+the scope its waiting positions, and a placed entry records what reached it (`Offered::grown`). The
+next request runs the waiting positions, and its first round or attempt queues what grew on the
+pipelines it reached, so they read it. A closing round queues what grew too: it runs its rows'
+readers, a nested loop's among them, and a nested loop is offered only the positions its readers
+have read. A loop first steps its store over the waiting positions, so its drive emits past the ones
+now decided, and runs again the round it left undecided. A push that wakes the scope while no
+position waits (`Offered::woken`) arrived before the request then running leaves its positions
+waiting, so they are offered once, when they begin to wait (`Body::set_waiting`). The scope's
+pipeline stays open while positions wait (`Body::queue_offered`).
+
+A nested loop holds each row the round around it gives it until its drive's source delivers the row
+(`Body::ready_rows`). A held row the source has not delivered does not hold back the round around
+it, which steps and leaves its own position waiting.
+
+Waiting positions are scope state, which a pause or reload does not keep.
 
 ## Completeness in pushes
 
@@ -229,9 +253,7 @@ than it still holds because readers have released some of its output.
 | Depends on the whole input | Whole output | Nothing until the input is wholly complete |
 | Depends on several inputs | Regions contributed by each input | Their required contributions must all be complete |
 
-The dispatcher records completeness per dependency and intersects it with that dependency's reach.
-A region outside a dependency's reach need not wait for it. A dependency read only by pull must be
-whole before it can establish completeness for its reader.
+A dependency read only by pull must be whole before it can establish completeness for its reader.
 
 Where one dependency reaches a reader through several paths and a path decides only part of each
 row's prerequisites, one union of path regions cannot establish readiness. That dependency must be
@@ -248,54 +270,18 @@ Breakers that publish while consuming announce their complete regions after each
 that hold output announce them in a later publication pass. Completion publishes final progress.
 Notifications queue dispatcher work; no deferred wakeup schedules work.
 
-## Reading a widened input again
+## A widened push
 
-A pipeline that a live source reaches widened reads all of its input again after each change,
-where its breaker reads an open input (`Breaker::reads_open_input`). A sink does, a memo does, and
-so does a `main` output that hands each package's answer. Such a breaker releases what each answer
-makes releasable (`Tile::to_guard`), and the next read answers the rest; a memo also caches the
-open keys it read and merges what they gained.
-
-A read again is a package of the universal guard that records no region
-(`Queue::append_read_again_locked`). It discharges what its breaker releases, not its guard, so
-neither deduplication nor the finish check counts it, and the next read takes what it left open.
-It asks for the universal guard rather than for what is unreleased, because the unreleased region
-can name keys beneath the outermost level or within a record, where a widened operator cannot be
-pulled.
-
-Three events queue a read again:
-
-| Event | Pipeline | Entry point |
-| --- | --- | --- |
-| A delivery | A source pipeline notified of its whole input | `Dispatcher::notify_again` |
-| A push that reaches it widened | A reader that waits for its inputs and takes no arrivals | `Dispatcher::read_again_on_widened_push` |
-| A change | Either, where the consume of a read again in a pipeline it reads pushed one | `Dispatcher::land_change` |
-
-The consume of a read again pushes a change through its breaker's consumer, because what the
-breaker answers may have grown where it completed nothing, or in a region no projection spells,
-such as a record whose collection field grows. The change queues a read again for each reader that
-reads its input again and does not follow the pipeline that pushed, and nothing else; it records
-nothing as pushed. The operators on its way learn of it as of a delivery and mark inline caches
-dirty.
-
-No read again is queued while one of the same pipeline waits unclaimed, since that one reads
-whatever arrived before its claim. The coordinator consumes every pipeline that is queued reads
-again and every pipeline such a pipeline reads, transitively, one package at a time; the worker pool
-admits none of them ([Who claims what](#who-claims-what)). So no two reads of one open row run at
-once. The pipelines beneath stay off the pool too because a read again reads its input whole, and
-what lies beneath it reaches it through the regions those pipelines push, which a worker's packages
-push keyed rather than widened.
-
-Every widened pipeline also reads its input once every source yields everything, held until the
-inputs it waits for have completed it. That read carries the obligation the finish checks: it takes
-what no read again took, such as rows an input that reaches it widened completes after the last
-delivery.
+A push widened on its way to an entry names every row of the reader's input, and the entry queues
+it as it queues any push, named as the rows of that input (`Landing::queue`,
+`Dispatcher::rows_named`). No pipeline reads its input again. A reader takes each row once and
+final, so a live collection inside a record or a nested row reaches its reader once that row is
+whole.
 
 A push names a projection of the breaker's keys. Where the region a breaker completed holds cells
 beneath a row besides whole keys, the push names the keys (`spelled_part`). A region no projection
 spells is pushed once one does, at the latest once it is whole (`Pushes::push_final`), and a finish
-that leaves one fails the run. Before then only a reader that reads its input again learns of it,
-through the change.
+that leaves one fails the run.
 
 A sink's release follows the release contract: a plain value held under a key is complete once
 there, so a read can release a row whole. A field selector states complete each row it holds where
@@ -323,10 +309,6 @@ Releases of the breaker's input record which consumed regions remain unnecessary
 
 Closing rounds are explicit repeated reads. The last value of a nested row does not establish the
 row's end, and an empty row still has completeness to deliver.
-
-A read of a widened input again is a repeated read too, and admits no region
-([Reading a widened input again](#reading-a-widened-input-again)): the regions recorded as admitted
-stay those of the packages whose guard is their obligation.
 
 A breaker's `complete()` is authoritative. It preserves completion after payload reclamation.
 `final_guard()` derives the region available for publication, accounting for release and resumed
@@ -485,11 +467,6 @@ A pipeline is **admitted** when all of these hold:
   body.
 - Its breaker answers `Breaker::parallel_level`, and every operator its chain pulls restates the
   keys of that level (`chain_restates_parallel_level`).
-- No pipeline queued a read again
-  ([Reading a widened input again](#reading-a-widened-input-again)) reads it, directly or
-  transitively, and it is queued none itself. The pipelines queued reads again are the readers that
-  read their input again at a widened push, and the live pipelines notified of their whole input
-  whose breaker reads an open input.
 
 With more than one worker, the run starts that many worker threads, and two kinds of claimant share
 the dispatcher:

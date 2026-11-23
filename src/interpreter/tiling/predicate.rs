@@ -1153,6 +1153,49 @@ impl Predicate {
         Predicate::Intervals(set)
     }
 
+    /// The rows this predicate, a statement of the level beneath them, calls complete in full:
+    /// every row where it is `True`, and the enclosing rows of each arm that the arms covering
+    /// those rows together state complete. A row stated in parts, such as its positions in one arm
+    /// and the keys past its last position in another, is whole where one arm's enclosing rows lie
+    /// within every other's; parts under overlapping row sets that neither contains are not
+    /// united. A whole child domain closes its enclosing row, so a reader uniting statements made
+    /// at the level beneath reads them there.
+    pub(crate) fn rows_whole_beneath(&self) -> Predicate {
+        let arms: Vec<&Predicate> = match self {
+            Predicate::Or(arms) => arms.iter().collect(),
+            one => vec![one],
+        };
+        // An unqualified statement stands under every row.
+        if arms.iter().any(|arm| arm.is_true()) {
+            return Predicate::True;
+        }
+        let qualified: Vec<(&Predicate, &Predicate)> = arms
+            .iter()
+            .filter_map(|arm| match arm {
+                Predicate::Qualified { enclosing, here } => Some((&**enclosing, &**here)),
+                _ => None,
+            })
+            .collect();
+        Predicate::union_all(
+            qualified
+                .iter()
+                .filter(|(row, here)| {
+                    let mut keys = (*here).clone();
+                    for (covering, more) in &qualified {
+                        if keys.is_true() {
+                            break;
+                        }
+                        if !std::ptr::eq(*covering, *row) && covering.subsumes(row) {
+                            keys = keys.union(more);
+                        }
+                    }
+                    keys.is_true()
+                })
+                .map(|(row, _)| (*row).clone())
+                .collect(),
+        )
+    }
+
     /// Whether this predicate admits every position of `positions`, a set of `UInt` positions
     /// whose every run is bounded: the region states every key of a domain whose extent is
     /// `positions` (`Extent::UIntRange`), though it is not `True`.
@@ -1681,28 +1724,44 @@ fn joined(a: &Interval<Value>, b: &Interval<Value>) -> Option<Interval<Value>> {
 
 /// Sort a one-level `Tile::DataFunction` by its domain values for deterministic comparison.
 ///
-/// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all other tile
-/// forms are returned unchanged, a deeper function among them — reordering its outermost
-/// level would have to carry every group with it. This is needed wherever key order depends
-/// on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
+/// Handles `Ints`, `UInts` and record domains paired with a scalar codomain of `Ints`,
+/// `UInts`, `Strings` or `Bools`; all other tile forms are returned unchanged, a deeper
+/// function among them — reordering its outermost level would have to carry every group with
+/// it. This is needed wherever row order depends on [`HashMap`] iteration order (e.g. GroupBy,
+/// MapSource) or on the order a breaker took its rows in.
 pub fn sort_function_by_domain(tile: Tile) -> Tile {
-    /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
-    /// then rebuild the tile.
+    /// `column` with its rows in `order`, or `None` for a column this helper does not reorder.
+    fn permuted(column: &ColumnValue, order: &[usize]) -> Option<ColumnValue> {
+        fn pick<T: Clone>(values: &[T], order: &[usize]) -> Vec<T> {
+            order.iter().map(|&row| values[row].clone()).collect()
+        }
+        Some(match column {
+            ColumnValue::Ints(values) => ColumnValue::Ints(pick(values, order)),
+            ColumnValue::UInts(values) => ColumnValue::UInts(pick(values, order)),
+            ColumnValue::Strings(values) => ColumnValue::Strings(pick(values, order)),
+            ColumnValue::Bools(values) => ColumnValue::Bools(pick(values, order)),
+            _ => return None,
+        })
+    }
+
+    /// Sort the rows by `domain_vals`, carrying the codomain `cod` along, then rebuild the tile.
+    /// `None` where the codomain is a column [`permuted`] does not reorder.
     fn sort_and_rebuild<K: PartialOrd + Clone>(
         domain_vals: Vec<K>,
-        cod_ints: Vec<i64>,
+        cod: &ColumnValue,
         domain_predicate: Predicate,
         mk_domain: impl Fn(Vec<K>) -> ColumnValue,
-    ) -> Tile {
-        let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
-        pairs.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
-        let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
-        Tile::data_function(
+    ) -> Option<Tile> {
+        let mut order: Vec<usize> = (0..domain_vals.len()).collect();
+        order.sort_by(|&a, &b| domain_vals[a].partial_cmp(&domain_vals[b]).unwrap());
+        let codomain = permuted(cod, &order)?;
+        let sorted_d = order.iter().map(|&row| domain_vals[row].clone()).collect();
+        Some(Tile::data_function(
             mk_domain(sorted_d),
-            Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
+            Box::new(Tile::Scalar(codomain)),
             domain_predicate,
             BitSet::new(),
-        )
+        ))
     }
 
     fn record_cv_to_extent(fields: &HashMap<SmolStr, ColumnValue>) -> Extent {
@@ -1722,22 +1781,31 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
             deleted,
             ..
         } if row_starts.len() == 1 && !codomain.is_data_function() => {
-            match (*codomain, domain) {
-                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
-                }
-                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
-                }
-                (
-                    Tile::Scalar(ColumnValue::Ints(cod_ints)),
-                    ref r @ ColumnValue::Records(ref fields),
-                ) => sort_and_rebuild(
+            let sorted = match (&*codomain, &domain) {
+                (Tile::Scalar(cod), ColumnValue::Ints(dom)) => sort_and_rebuild(
+                    dom.clone(),
+                    cod,
+                    domain_predicate.clone(),
+                    ColumnValue::Ints,
+                ),
+                (Tile::Scalar(cod), ColumnValue::UInts(dom)) => sort_and_rebuild(
+                    dom.clone(),
+                    cod,
+                    domain_predicate.clone(),
+                    ColumnValue::UInts,
+                ),
+                (Tile::Scalar(cod), r @ ColumnValue::Records(fields)) => sort_and_rebuild(
                     r.clone().drain_to_value_iter().collect(),
-                    cod_ints,
-                    domain_predicate,
+                    cod,
+                    domain_predicate.clone(),
                     |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
                 ),
+                _ => None,
+            };
+            if let Some(sorted) = sorted {
+                return sorted;
+            }
+            match (*codomain, domain) {
                 // Union domain: canonicalize entries by `(tag, slot)` so two tiles
                 // representing the same multiset of `(tag, payload) → cod` entries
                 // compare equal regardless of the order the arms happened to be
@@ -1787,6 +1855,36 @@ mod tests {
         BaseType, ColumnValue, Extent, Value,
         tiling::tests::{bool_ext, int, range},
     };
+
+    /// A row stated in parts across arms, its positions under rows `0..=1` and the keys past its
+    /// last position under row 1 alone, is whole; row 0, whose keys past the last position no arm
+    /// states, is not.
+    #[test]
+    fn a_row_stated_complete_in_parts_is_whole() {
+        let uint = |n: u64| Value::UInt(n);
+        let through_two = Predicate::at_or_below(uint(2));
+        let past_two = Predicate::True.minus(&through_two);
+        let rows = Predicate::at_or_below(uint(1));
+        let stated = Predicate::Or(vec![
+            Predicate::qualified(rows, through_two),
+            Predicate::qualified(Predicate::point(uint(1)), past_two),
+        ]);
+        assert_eq!(stated.rows_whole_beneath(), Predicate::point(uint(1)));
+        let short = Predicate::Or(vec![
+            Predicate::qualified(
+                Predicate::at_or_below(uint(1)),
+                Predicate::at_or_below(uint(2)),
+            ),
+            Predicate::qualified(
+                Predicate::point(uint(1)),
+                Predicate::True.minus(&Predicate::at_or_below(uint(3))),
+            ),
+        ]);
+        assert!(
+            short.rows_whole_beneath().is_false(),
+            "key 3 of row 1 is not stated"
+        );
+    }
 
     /// A region is a prefix exactly where it equals every position through its last: `{0, 2}`
     /// is not one, and neither is a point above an empty start.

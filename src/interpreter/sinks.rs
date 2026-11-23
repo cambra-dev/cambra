@@ -119,7 +119,7 @@ impl SinkConsumer {
         // A producer released whole answers nothing more, and the run's finish states what it
         // handed complete: under the release contract a plain value held under a key is complete
         // once there, so a release can name a row whole before any answer states the row complete
-        // (`src/interpreter/design-dispatcher.md`, "Reading a widened input again").
+        // (`src/interpreter/design-dispatcher.md`, "A widened push").
         let tile = pull_at_finish(&mut **producer);
         self.sink.process(&tile);
         producer.release(tile.to_guard());
@@ -180,8 +180,8 @@ impl Consumer for SinkConsumer {
 /// universal guard, closed over its tiling. A producer its reader released whole has handed all it
 /// holds, and the run has finished every pipeline, so where that pull does not state the producer
 /// complete the finish states it complete with an empty collection that states every key
-/// complete ([`complete_and_empty`]) (`src/interpreter/design-dispatcher.md`, "Reading a widened
-/// input again").
+/// complete ([`complete_and_empty`]) (`src/interpreter/design-dispatcher.md`, "A widened
+/// push").
 pub(crate) fn pull_at_finish(producer: &mut dyn TileProducer) -> Tile {
     let tiling = producer.tiling().clone();
     let pulled = producer.get(tiling.universal_guard()).closed_over(&tiling);
