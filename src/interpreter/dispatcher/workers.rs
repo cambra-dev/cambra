@@ -441,9 +441,8 @@ impl WorkerPool {
     }
 
     /// [`consume`](Self::consume) on the coordinator, which claims as worker 0. It wakes the
-    /// claimants after, as a worker thread does: an acknowledgement advances the generation only
-    /// where it frees or completes a queue, and a worker waiting behind the package's region
-    /// ([`Dispatcher::claim`](super::Dispatcher)) can claim once it is acknowledged.
+    /// claimants after, as a worker thread does, so a claimant that waits on the pool's busy count
+    /// sees the claim end.
     pub(super) fn consume_on_coordinator(
         &self,
         dispatcher: &Dispatcher,
