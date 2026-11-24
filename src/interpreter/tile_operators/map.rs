@@ -1467,84 +1467,107 @@ struct MapResultWithSourceProducer {
     nested_input: RwLock<Option<HeldBeneathKeys>>,
 }
 
-/// The parts of a two-level input a release beneath particular keys is read against, kept
-/// in place of the input itself so a pull does not copy its values.
+/// The parts of an input a release beneath particular keys is read against, where the source's
+/// key stands `depth` levels beneath the outermost: the rows above the key, at `depth - 1`, and the
+/// paths through the key, at `depth`. Kept in place of the input itself so a pull does not copy its
+/// values.
 struct HeldBeneathKeys {
-    /// The outermost level's own completeness.
-    outer_stated: Predicate,
-    /// The inner level's own completeness.
-    inner_stated: Predicate,
-    /// Which inner paths are complete, from any level on the path ([`Tile::completion_at`]).
+    /// The level of the source's key.
+    depth: usize,
+    /// Which rows above the key are complete, from any level on the path
+    /// ([`Tile::completion_at`]): every one, once no row above can still arrive.
+    rows_stated: Predicate,
+    /// The key level's own completeness.
+    keys_stated: Predicate,
+    /// Which paths through a key are complete, from any level on the path.
     complete: Predicate,
-    /// Outer rows still requiring occurrence-completeness checks, as one-component paths.
-    outer_keys: HashSet<Vec<Value>>,
+    /// Rows above the key still requiring occurrence-completeness checks.
+    rows: HashSet<Vec<Value>>,
     /// Unreleased paths through source keys, retained across overlapping or disjoint reads.
-    inner_paths: HashSet<Vec<Value>>,
+    key_paths: HashSet<Vec<Value>>,
     /// Keys remain candidates after their current paths are released, until completeness proves
     /// that no future occurrence can need their source values.
-    inner_keys: HashSet<Value>,
+    keys: HashSet<Value>,
 }
 
 impl HeldBeneathKeys {
-    /// What `input` holds beneath its keys, or `None` for an input that is not a two-level
-    /// collection.
-    fn of(input: &Tile) -> Option<Self> {
+    /// What `input` holds beneath its keys, with the source's key `depth` levels beneath the
+    /// outermost, or `None` for an input that holds no collection at that level.
+    fn of(input: &Tile, depth: usize) -> Option<Self> {
+        debug_assert!(
+            depth >= 1,
+            "a key beneath the outermost keys stands at level 1 or deeper"
+        );
+        // A collection at each level down to the key's.
+        let mut level = input;
+        for _ in 0..=depth {
+            let Tile::DataFunction { codomain, .. } = level else {
+                return None;
+            };
+            level = codomain;
+        }
         let Tile::DataFunction {
-            domain_predicate: outer_stated,
+            domain_predicate: keys_stated,
             ..
-        } = input
+        } = input.values_at(CurryLevel::new(depth))
         else {
             return None;
         };
-        let Tile::DataFunction {
-            domain_predicate: inner_stated,
-            ..
-        } = input.values_at(CurryLevel::new(1))
-        else {
-            return None;
-        };
-        let inner_paths: HashSet<Vec<Value>> =
-            input.paths_at(CurryLevel::new(1)).into_iter().collect();
-        let inner_keys = inner_paths
+        let key_paths: HashSet<Vec<Value>> =
+            input.paths_at(CurryLevel::new(depth)).into_iter().collect();
+        let keys = key_paths
             .iter()
             .map(|path| path.last().unwrap().clone())
             .collect();
         Some(HeldBeneathKeys {
-            outer_stated: outer_stated.clone(),
-            inner_stated: inner_stated.clone(),
-            complete: input.completion_at(CurryLevel::new(1)),
-            outer_keys: input.paths_at(CurryLevel::OUTERMOST).into_iter().collect(),
-            inner_paths,
-            inner_keys,
+            depth,
+            rows_stated: input.completion_at(CurryLevel::new(depth - 1)),
+            keys_stated: keys_stated.clone(),
+            complete: input.completion_at(CurryLevel::new(depth)),
+            rows: input
+                .paths_at(CurryLevel::new(depth - 1))
+                .into_iter()
+                .collect(),
+            key_paths,
+            keys,
         })
     }
+
     fn merge(&mut self, other: Self) {
-        self.outer_stated = self.outer_stated.union(&other.outer_stated);
-        self.inner_stated = self.inner_stated.union(&other.inner_stated);
+        debug_assert_eq!(
+            self.depth, other.depth,
+            "one producer reads its source at one level"
+        );
+        self.rows_stated = self.rows_stated.union(&other.rows_stated);
+        self.keys_stated = self.keys_stated.union(&other.keys_stated);
         self.complete = self.complete.union(&other.complete);
-        self.outer_keys.extend(other.outer_keys);
-        self.inner_paths.extend(other.inner_paths);
-        self.inner_keys.extend(other.inner_keys);
+        self.rows.extend(other.rows);
+        self.key_paths.extend(other.key_paths);
+        self.keys.extend(other.keys);
     }
 
+    /// The keys `released`, the accumulated release, frees for good: every path held through the
+    /// key is released, and no path through it can still arrive, since the key is complete
+    /// beneath every row above it, or beneath each row that is not itself released.
     fn releasable(&self, released: &TileGuard) -> Predicate {
-        let everywhere_complete = self.inner_stated.unqualified_arms();
-        self.inner_keys
+        let everywhere_complete = self.keys_stated.unqualified_arms();
+        self.keys
             .iter()
             .filter(|key| {
                 let all_released = self
-                    .inner_paths
+                    .key_paths
                     .iter()
                     .filter(|path| path.last() == Some(*key))
                     .all(|path| released.covers_path(path));
                 all_released
                     && (everywhere_complete.contains(key)
-                        || (self.outer_stated.is_true()
-                            && self.outer_keys.iter().all(|outer| {
-                                released.covers_path(outer)
-                                    || self
-                                        .complete
-                                        .contains_path(&[outer[0].clone(), (*key).clone()])
+                        || (self.rows_stated.is_true()
+                            && self.rows.iter().all(|row| {
+                                released.covers_path(row) || {
+                                    let mut path = row.clone();
+                                    path.push((*key).clone());
+                                    self.complete.contains_path(&path)
+                                }
                             })))
             })
             .fold(Predicate::False, |all, key| {
@@ -1553,16 +1576,16 @@ impl HeldBeneathKeys {
     }
 
     fn reclaim(&mut self, released: &TileGuard, freed: &Predicate) {
-        self.inner_paths
+        self.key_paths
             .retain(|path| !released.covers_path(path) && !freed.contains(path.last().unwrap()));
-        let complete = &self.outer_stated;
-        let pending = &self.inner_paths;
-        self.outer_keys.retain(|path| {
-            !released.covers_path(path)
-                && (!complete.contains_path(path)
-                    || pending.iter().any(|inner| inner.starts_with(path)))
+        let complete = &self.rows_stated;
+        let pending = &self.key_paths;
+        self.rows.retain(|row| {
+            !released.covers_path(row)
+                && (!complete.contains_path(row)
+                    || pending.iter().any(|path| path.starts_with(row)))
         });
-        self.inner_keys.retain(|key| !freed.contains(key));
+        self.keys.retain(|key| !freed.contains(key));
     }
 }
 
@@ -1596,15 +1619,14 @@ impl MapResultWithSourceProducer {
 }
 
 impl MapResultWithSourceProducer {
-    /// The inner keys a release of paths `[k, d]` frees for good: those released beneath
-    /// every outer key, since the source row a value reads is read wherever that key stands.
+    /// The source keys a release of paths through them, `pred` at the key's level, frees for
+    /// good: those released beneath every row above, since the source row a value reads is read
+    /// wherever that key stands.
     ///
-    /// An unqualified release already says the same beneath every outer key. Otherwise `d` is
-    /// free once every path this producer holds through `d` is released — by this release or
-    /// an earlier one, so the accumulated `obsolete_guard` is what is read — and no path
-    /// through `d` can still arrive: the input calls `d` complete beneath every outer key,
-    /// either unqualified at the inner level or beneath each outer key of a complete outer
-    /// level ([`Tile::completion_at`]).
+    /// An unqualified release already says the same beneath every row. Otherwise a key is free
+    /// once every path this producer holds through it is released — by this release or an
+    /// earlier one, so the accumulated `obsolete_guard` is what is read — and no path through it
+    /// can still arrive ([`HeldBeneathKeys::releasable`]).
     fn released_beneath_every_key(&self, pred: &Predicate) -> Predicate {
         let everywhere = pred.unqualified_arms();
         let mut held = self
@@ -1623,57 +1645,38 @@ impl MapResultWithSourceProducer {
 
 impl MapResultWithSourceProducer {
     /// The source rows freed by `released`, a release of this producer's output, read through
-    /// `correlation`. An `Or` frees what its arms free.
+    /// `correlation`. Where the source's key stands at the outermost level, an `Or` frees what its
+    /// arms free. Where it stands `depth` levels beneath, the release frees the keys it names
+    /// beneath every row above and the keys the accumulated release frees for good
+    /// ([`released_beneath_every_key`](Self::released_beneath_every_key)).
     ///
     /// # Panics
     ///
-    /// Where an arm is no region of keys at the outermost level or one beneath it, or a release
-    /// beneath the outermost keys reaches a source correlated more than one level in.
+    /// Where an arm is no region of keys.
     fn freed(&self, released: &TileGuard, correlation: &[TilePathStep]) -> Predicate {
+        let depth = correlation
+            .iter()
+            .take_while(|step| **step == TilePathStep::Codomain)
+            .count();
+        if released.is_universal() {
+            return Predicate::True;
+        }
+        if depth > 0 {
+            let at_keys = keys_released_at(released, depth);
+            let keys = self.released_beneath_every_key(&at_keys);
+            return extract_predicate(&keys, &correlation[depth..]);
+        }
         match released {
             TileGuard::Or(arms) => arms
                 .iter()
                 .map(|arm| self.freed(arm, correlation))
                 .fold(Predicate::False, |all, one| all.union(&one)),
-            g if g.is_universal() => Predicate::True,
             g if g.is_empty() => Predicate::False,
-            // Values correlated one level in are freed where a release beneath every outer key
-            // names them, and a release of whole outer keys names every path beneath them.
-            TileGuard::Function(FunctionGuard::Domain(pred))
-                if correlation.first() == Some(&TilePathStep::Codomain) =>
-            {
-                self.freed_beneath(
-                    &Predicate::qualified(pred.clone(), Predicate::True),
-                    correlation,
-                )
-            }
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 extract_predicate(pred, correlation)
             }
-            TileGuard::Function(FunctionGuard::Codomain(g)) => match &**g {
-                TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                    self.freed_beneath(pred, correlation)
-                }
-                _ => panic!("{} releases a guard of keys, got {released:?}", self.name()),
-            },
             _ => panic!("{} releases a guard of keys, got {released:?}", self.name()),
         }
-    }
-
-    /// The source rows a release of the paths `pred` one level beneath the outermost keys frees
-    /// ([`released_beneath_every_key`](Self::released_beneath_every_key)).
-    fn freed_beneath(&self, pred: &Predicate, correlation: &[TilePathStep]) -> Predicate {
-        assert_eq!(correlation.first(), Some(&TilePathStep::Codomain));
-        // `released_beneath_every_key` reads the release at the level one beneath the
-        // outermost, which is where a source correlated through one codomain step stands. One
-        // correlated deeper has no reading here yet.
-        assert!(
-            !correlation[1..].contains(&TilePathStep::Codomain),
-            "a release beneath particular keys reaches a source correlated more than one level \
-             in, which nothing reads yet: {correlation:?}"
-        );
-        let keys = self.released_beneath_every_key(pred);
-        extract_predicate(&keys, &correlation[1..])
     }
 }
 
@@ -1715,10 +1718,14 @@ impl TileProducer for MapResultWithSourceProducer {
             return self.tiling().empty_tile();
         }
         let input_tile = self.input.get(projection.guard(self.input.tiling()));
-        if matches!(
-            self.result_correlation.as_deref(),
-            Some([TilePathStep::Codomain, ..])
-        ) && let Some(next) = HeldBeneathKeys::of(&input_tile)
+        let depth = self.result_correlation.as_deref().map_or(0, |correlation| {
+            correlation
+                .iter()
+                .take_while(|step| **step == TilePathStep::Codomain)
+                .count()
+        });
+        if depth > 0
+            && let Some(next) = HeldBeneathKeys::of(&input_tile, depth)
         {
             let mut held = self
                 .nested_input
@@ -3685,5 +3692,22 @@ mod source_projection_tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_empty()
         );
+    }
+}
+
+/// The keys `released` names at level `depth`, beneath the paths above them: the domain guards of
+/// each arm that steps `depth` codomains in. An arm releasing whole rows above names no key there
+/// on its own; the accumulated release reads it ([`HeldBeneathKeys::releasable`]).
+fn keys_released_at(released: &TileGuard, depth: usize) -> Predicate {
+    match released {
+        TileGuard::Or(arms) => arms
+            .iter()
+            .map(|arm| keys_released_at(arm, depth))
+            .fold(Predicate::False, |all, one| all.union(&one)),
+        TileGuard::Function(FunctionGuard::Codomain(inner)) if depth > 0 => {
+            keys_released_at(inner, depth - 1)
+        }
+        TileGuard::Function(FunctionGuard::Domain(pred)) if depth == 0 => pred.clone(),
+        _ => Predicate::False,
     }
 }
