@@ -62,7 +62,7 @@ use crate::interpreter::{
     forwarding_consumer_keeping_keys, shared_consumer,
     tile_operators::{
         Breaker, BreakingProducer, Cycle, CycleSlot, Memo, ProducerBase, TileOperator,
-        TileProducer, guard_minus, materialize_collections, materialized_row, subscribe_forwarding,
+        TileProducer, guard_minus, materialized_row, subscribe_forwarding,
         subscribe_forwarding_keeping_keys,
     },
     tuple_field, uint_of_row,
@@ -1748,58 +1748,22 @@ fn next_commit_tick(t: &Position) -> Position {
     Position::new(Value::UInt(n + 1))
 }
 
-/// Why one pull of a seed stream carries no value.
-enum SeedNotReady {
-    /// A value-shaped tile holding no row: nothing has arrived under it yet, and a later
-    /// pull may carry it.
-    Empty,
-    /// A tile that is not yet the whole seed — a collection whose key set is still open,
-    /// or a shape no value has been folded out of.
-    Undecided,
-}
-
-/// One pull of a seed stream as the value the store holds before any of its positions.
+/// One pull of a seed stream as the value the store holds before any of its positions, or
+/// `None` while the pull is not yet the whole of it.
 ///
-/// A seed is one value per key however the producer that supplied it was shaped: a scalar,
-/// a struct-of-arrays record, or a collection-valued variable's whole map
-/// ([`materialized_row`] is what reads each as one). Only a **decided** collection is the
-/// whole of it — an open one would seed the store with whichever keys had arrived, which
-/// is a partial map presented as the value before any position.
-fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
-    if !is_whole_value(tile) {
-        return Err(SeedNotReady::Undecided);
-    }
+/// A seed is one value per key however the producer that supplied it was shaped: a scalar, a
+/// struct-of-arrays record, or a collection-valued variable's whole map ([`materialized_row`]
+/// reads each as one). A one-row tile of one of these shapes is the whole value when
+/// [`Tile::is_terminal`] holds of it. In a one-row record a released cell leaves its field's
+/// column empty, and an empty column is not terminal. An open collection would seed the store
+/// with whichever keys had arrived, which is a partial map presented as the value before any
+/// position.
+fn seed_value(tile: &Tile) -> Option<Value> {
     match tile {
-        // A decided collection is a value at every row it has, the empty map included, so
-        // there is no emptiness to test past the domain being closed.
-        Tile::DataFunction { .. } => Ok(materialized_row(tile.clone())),
-        Tile::Scalar(_) | Tile::Record { .. } => {
-            let column = materialize_collections(tile.clone());
-            if column.is_empty() {
-                Err(SeedNotReady::Empty)
-            } else {
-                Ok(column.index_at(0))
-            }
-        }
-        // A store, an aggregation or a grouping is not something a store holds: whatever
-        // reduces it to a value has not run yet.
-        _ => Err(SeedNotReady::Undecided),
-    }
-}
-
-/// Whether every collection in a one-row value tile is complete, so the tile is the whole
-/// value rather than part of it. A collection is whole when [`Tile::is_terminal`] holds of it.
-/// That test reads only the outermost level: completeness is downward-closed, so a collection
-/// closed at its outermost level is closed beneath. Its outermost level may be closed through the
-/// level beneath (`src/interpreter/design-operators.md`, "Keys that follow the level beneath"). A
-/// record's fields stand over the same row, so each must be whole on its own.
-fn is_whole_value(tile: &Tile) -> bool {
-    match tile {
-        Tile::DataFunction { .. } => tile.is_terminal(),
-        Tile::Scalar(_) => true,
-        // A row holding no cell of a field gave that cell back, so the value is not whole.
-        Tile::Record { fields, absent } => absent.is_empty() && fields.values().all(is_whole_value),
-        _ => false,
+        // A store or an aggregation is not something a store holds: whatever reduces it to a
+        // value has not run yet.
+        Tile::Aggregation { .. } | Tile::Store { .. } => None,
+        _ => tile.is_terminal().then(|| materialized_row(tile.clone())),
     }
 }
 
@@ -2915,7 +2879,8 @@ impl CommitProducer {
             let mut seed = state.seed.clone();
             let mut resolved = 0;
             for (key, producer) in &mut state.seed_producers {
-                if let Ok(value) = seed_value(&producer.get(producer.tiling().universal_guard())) {
+                if let Some(value) = seed_value(&producer.get(producer.tiling().universal_guard()))
+                {
                     seed.insert(key.clone(), value);
                     resolved += 1;
                 }
@@ -3275,16 +3240,11 @@ fn decode_row_seeds(tile: &Tile, levels_above: usize) -> Vec<(Path, Value)> {
             .into_iter()
             .collect();
     }
+    // A seed holding a collection still arriving is part of a value, not one: the row opens
+    // once it is whole, as it does once a missing seed arrives.
     decode_source_paths(tile, levels_above)
         .into_iter()
-        .filter_map(|(row, value)| {
-            // A seed holding a collection still arriving is part of a value, not one: the
-            // row opens once it is whole, as it does once a missing seed arrives.
-            if !is_whole_value(&value) {
-                return None;
-            }
-            Some((row, materialized_row(value)))
-        })
+        .filter_map(|(row, value)| seed_value(&value).map(|value| (row, value)))
         .collect()
 }
 
@@ -6484,8 +6444,7 @@ impl InductionDriverProducer {
                             // value, not one, so it is absent until it is whole, as the
                             // store's seed is: the position waits with the ones whose
                             // reseed has not arrived.
-                            .filter(|(_, seed)| is_whole_value(seed))
-                            .map(|(path, seed)| (path, materialized_row(seed)))
+                            .filter_map(|(path, seed)| seed_value(&seed).map(|seed| (path, seed)))
                             .collect()
                     })
                     .collect(),
@@ -11510,20 +11469,17 @@ mod tests {
         assert_eq!(store_frontier(&undecided), None);
     }
 
-    /// `seed_value` distinguishes a value-shaped tile that is carrying nothing yet from a
-    /// collection whose key set is still open — a store seeded from either would hold a
-    /// value the program never had.
+    /// `seed_value` refuses a value-shaped tile that is carrying nothing yet and a collection
+    /// whose key set is still open: a store seeded from either would hold a value the program
+    /// never had.
     #[test]
-    fn seed_value_reports_why_a_pull_carries_no_value() {
+    fn seed_value_refuses_a_pull_that_is_not_the_whole_value() {
         // A non-empty scalar is the value.
         assert!(
-            matches!(seed_value(&Tile::Scalar(ColumnValue::from_ints(vec![7]))), Ok(v) if v == int(7))
+            matches!(seed_value(&Tile::Scalar(ColumnValue::from_ints(vec![7]))), Some(v) if v == int(7))
         );
         // An empty one has not arrived.
-        assert!(matches!(
-            seed_value(&Tile::Scalar(ColumnValue::from_ints(vec![]))),
-            Err(SeedNotReady::Empty)
-        ));
+        assert!(seed_value(&Tile::Scalar(ColumnValue::from_ints(vec![]))).is_none());
         // A collection is the whole map only once its domain is closed: an open one is a
         // partial map presented as the value before any position.
         let open = Tile::data_function(
@@ -11532,14 +11488,14 @@ mod tests {
             Predicate::at_or_below(Value::UInt(1)),
             BitSet::new(),
         );
-        assert!(matches!(seed_value(&open), Err(SeedNotReady::Undecided)));
+        assert!(seed_value(&open).is_none());
         let closed = Tile::data_function(
             ColumnValue::from_uints(vec![1]),
             Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10]))),
             Predicate::True,
             BitSet::new(),
         );
-        let Ok(Value::Function(bindings)) = seed_value(&closed) else {
+        let Some(Value::Function(bindings)) = seed_value(&closed) else {
             panic!("a decided collection seeds as the one map it is")
         };
         assert_eq!(bindings.len(), 1);
@@ -11550,7 +11506,28 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         );
-        assert!(matches!(seed_value(&empty_map), Ok(Value::Function(b)) if b.is_empty()));
+        assert!(matches!(seed_value(&empty_map), Some(Value::Function(b)) if b.is_empty()));
+        // A record is the value once every field is: a scalar beside a collection that has
+        // its row may still be unfilled, and a released cell leaves its field without one.
+        let record = |n: Vec<i64>| {
+            Tile::record(HashMap::from([
+                (SmolStr::new("xs"), closed.clone()),
+                (SmolStr::new("n"), Tile::Scalar(ColumnValue::from_ints(n))),
+            ]))
+        };
+        assert!(seed_value(&record(vec![])).is_none());
+        assert!(matches!(
+            seed_value(&record(vec![3])),
+            Some(Value::Record(_))
+        ));
+        let released = Tile::Record {
+            fields: HashMap::from([(
+                SmolStr::new("n"),
+                Tile::Scalar(ColumnValue::from_ints(vec![])),
+            )]),
+            absent: HashMap::from([(SmolStr::new("n"), BitSet::from_iter([0]))]),
+        };
+        assert!(seed_value(&released).is_none());
     }
 
     /// A collection-valued final read keeps projected completeness bounded and released keys absent.
@@ -11570,7 +11547,7 @@ mod tests {
         let key = acct("xs");
         let engine = CommitEngine::new(HashMap::from([(
             key.clone(),
-            seed_value(&value).unwrap_or_else(|_| panic!("a closed collection is a value")),
+            seed_value(&value).expect("a closed collection is a value"),
         )]));
         let store_tiling = full_store_tiling(
             commit_clock_domain(),
@@ -11718,10 +11695,7 @@ mod tests {
                 Predicate::True,
                 BitSet::new(),
             );
-            let Ok(value) = seed_value(&tile) else {
-                panic!("a decided seed is a value");
-            };
-            value
+            seed_value(&tile).expect("a decided seed is a value")
         };
 
         fn field<T>(t: T) -> HashMap<SmolStr, T> {
@@ -12937,9 +12911,8 @@ mod tests {
         ]));
         let got = seed_value(&seed);
         assert!(
-            got.is_err(),
-            "a record seed with an open collection field seeded as {:?}",
-            got.ok()
+            got.is_none(),
+            "a record seed with an open collection field seeded as {got:?}"
         );
     }
 
@@ -12977,5 +12950,33 @@ mod tests {
         let first = Predicate::from_column_value(&ColumnValue::from_uints(vec![0]));
         assert_eq!(rows(&seeds(first)), vec![row(0)]);
         assert_eq!(rows(&seeds(Predicate::False)), Vec::<Path>::new());
+    }
+
+    /// A row's record seed waits for its scalar field although its collection field is whole:
+    /// a scalar beside a collection that has its rows may still be unfilled.
+    #[test]
+    fn a_row_record_seed_waits_for_its_scalar_field() {
+        let seeds = |n: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::record(HashMap::from([
+                    (
+                        SmolStr::new("xs"),
+                        Tile::grouped(
+                            vec![0, 1],
+                            ColumnValue::from_uints(vec![0, 0]),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                            Predicate::True,
+                            BitSet::new(),
+                        ),
+                    ),
+                    (SmolStr::new("n"), Tile::Scalar(ColumnValue::from_ints(n))),
+                ]))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        assert!(decode_row_seeds(&seeds(vec![]), 1).is_empty());
+        assert_eq!(decode_row_seeds(&seeds(vec![3, 4]), 1).len(), 2);
     }
 }
