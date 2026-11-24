@@ -7,10 +7,43 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::thread::{Scope, ScopedJoinHandle};
 
+/// The breaker a worker consumes with: a chain's, which pushes what it produces, or a sink's at
+/// the root of the run, which hands each package's answer to its sink and pushes nothing.
+pub(super) enum WorkerBreaker {
+    Chain(BreakerHandle),
+    // shared-state-ok: as `BreakerHandle`, the workers' handle on a sink breaker they call; no tile
+    // passes between operators through it.
+    Sink(Arc<RwLock<crate::interpreter::tile_operators::SinkBreaker>>),
+}
+
+impl WorkerBreaker {
+    /// `f` on the breaker, held shared.
+    fn read<R>(&self, f: impl FnOnce(&dyn Breaker) -> R) -> R {
+        match self {
+            WorkerBreaker::Chain(handle) => {
+                f(&*handle.read().unwrap_or_else(PoisonError::into_inner))
+            }
+            WorkerBreaker::Sink(sink) => f(&*sink.read().unwrap_or_else(PoisonError::into_inner)),
+        }
+    }
+
+    /// `f` on the breaker, held exclusively.
+    fn write<R>(&self, f: impl FnOnce(&mut dyn Breaker) -> R) -> R {
+        match self {
+            WorkerBreaker::Chain(handle) => {
+                f(&mut *handle.write().unwrap_or_else(PoisonError::into_inner))
+            }
+            WorkerBreaker::Sink(sink) => {
+                f(&mut *sink.write().unwrap_or_else(PoisonError::into_inner))
+            }
+        }
+    }
+}
+
 /// A pipeline the workers may run: its breaker, whether its packages run beside each other, and
 /// whether a worker runs its finish.
 pub(super) struct WorkerTarget {
-    pub(super) handle: BreakerHandle,
+    pub(super) handle: WorkerBreaker,
     /// Whether packages run beside each other: the breaker consumes concurrently over keyed input.
     pub(super) concurrent: bool,
     /// Whether the workers consume the pipeline although its packages do not run beside each
@@ -21,7 +54,7 @@ pub(super) struct WorkerTarget {
 
 /// An admitted pipeline's breaker and whether its packages run beside each other.
 struct Spec {
-    target: BreakerHandle,
+    target: WorkerBreaker,
     /// Whether its packages run beside each other ([`WorkerTarget::concurrent`]); otherwise they
     /// are consumed one at a time, in queue order.
     concurrent: bool,
@@ -255,8 +288,7 @@ impl WorkerPool {
         if !spec.concurrent {
             // One package at a time, under the handle held exclusively, as on the coordinator
             // (`consume_with`).
-            let pushes = {
-                let breaker = target.write().unwrap_or_else(PoisonError::into_inner);
+            let pushes = target.write(|breaker| {
                 debug_assert!(
                     package
                         .guard
@@ -274,7 +306,7 @@ impl WorkerPool {
                         pushes.push_final(producer);
                         pushes
                     })
-            };
+            });
             if let Some(pushes) = pushes {
                 dispatcher.land(pushes);
             }
@@ -292,8 +324,7 @@ impl WorkerPool {
             pipeline.0,
             package.guard
         );
-        {
-            let breaker = target.read().unwrap_or_else(PoisonError::into_inner);
+        target.read(|breaker| {
             debug_assert!(
                 package
                     .guard
@@ -303,13 +334,12 @@ impl WorkerPool {
                 package.guard
             );
             breaker.consume_impl(InputId::ONLY, package.guard.clone());
-        }
+        });
         // Exclusive, so the push sees no consume between the merge of its rows and the release of
         // its input, which the readers it wakes rely on. A breaker that publishes only at its
         // finish or in the resume pass pushes nothing here, as on the coordinator
         // (`consume_with`).
-        let pushes = {
-            let breaker = target.write().unwrap_or_else(PoisonError::into_inner);
+        let pushes = target.write(|breaker| {
             breaker
                 .as_producer()
                 .filter(|producer| producer.pushes_while_consuming())
@@ -318,7 +348,7 @@ impl WorkerPool {
                     pushes.push_final(producer);
                     pushes
                 })
-        };
+        });
         if let Some(pushes) = pushes {
             dispatcher.land(pushes);
         }
@@ -342,10 +372,7 @@ impl WorkerPool {
                 reached.0, pipeline.0,
                 "a worker's finish reaches its own breaker"
             );
-            call(
-                &mut *spec.target.write().unwrap_or_else(PoisonError::into_inner),
-                InputId::ONLY,
-            )
+            spec.target.write(|breaker| call(breaker, InputId::ONLY))
         };
         if spec.concurrent {
             reach(pipeline, &mut |breaker, _| breaker.finish_parallel_input());

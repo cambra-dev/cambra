@@ -111,10 +111,10 @@ breaker output and continues if that makes more work available. A live source ca
 the run is quiescent. Quiescence permits an idle callback or pause; it does not imply completion.
 The run completes only after every pipeline finishes.
 
-A sink receives each consumed answer. A finite main output collects its packages and emits its final
-answer at completion. A live main output emits package answers as they arrive and emits completion
-when its sources close. Main-output packages are ordered. Returning several tiles does not change
-the collection's value or imply an order among its elements.
+A sink receives each consumed answer. A finite main output collects its packages and emits its
+final answer at completion. A live main output emits package answers as they arrive and emits
+completion when its sources close. Main-output packages are not ordered. Returning several tiles
+does not change the collection's value or imply an order among its elements.
 
 The binary runs every program through the dispatcher, including under `--inspect` and `--control`.
 `CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 65,536. Compilation builds the
@@ -522,13 +522,14 @@ canonical breaker handles. Workers retain those handles and call the existing br
 `consume_impl`; they construct no operator chains, input readers, or secondary topology.
 `get` and `get_impl` read the existing operands directly.
 
-A breaker consumes packages at once where it answers `Breaker::consumes_concurrently`: a memo
-whose rows hold no nested collection, an aggregate and a map-aggregate whose accumulator holds no
-collection level, and a final-value extraction. Each requires keyed input whose keys have an order
-(`consumes_at_once`), since a push is cut into morsels in key order, and a function value has none.
-A memo whose rows hold a nested collection consumes one package at a time: a merge of its packages'
-answers loses the completion each states of its rows' inner collections. A final-value extraction
-keeps the row at the greatest key whatever order its packages merge in. A sum folds its packages in
+A breaker consumes packages at once where it answers `Breaker::consumes_concurrently`: a memo, an
+aggregate, a map-aggregate, a final-value extraction, and a sink. Each requires keyed input whose
+keys have an order (`consumes_at_once`), since a push is cut into morsels in key order, and a
+function value has none. A memo merges its packages' answers, nested rows included: a merge unions
+each level's statement and states a path once, at the outermost level that settles it
+(`Tile::merge`). An aggregate and a map-aggregate fold each package under their accumulator's lock,
+an accumulator that holds a collection included. A final-value extraction keeps the row at the
+greatest key whatever order its packages merge in. A sum folds its packages in
 any order by wrapping addition, which a release build's `+` already does, so a sum is the same in
 every build and every order. A breaker that requires ordered input (`requires_ordered_input`), as a
 store does, and its producing dependencies preserve input order: the planner orders every pipeline
@@ -536,13 +537,15 @@ such a breaker reads (`order_inputs_of_ordered_breakers`). So do a loop's store 
 pipeline it reads, transitively: a loop runs its positions in order and takes a request none of
 whose positions is next as one that only closes absent positions, so its input is published in
 position order, one package in flight per pipeline. The store's step reads the body and seeds no
-ordering, so the body is not ordered by this. Control scopes, sinks, and shapes without independent
-position projections keep their coordinator handlers.
+ordering, so the body is not ordered by this. Control scopes, a sink whose input has no ordered
+keys, and shapes without independent position projections keep their coordinator handlers.
 
 A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
 `TestSink` merges them in arrival order and reads the merged value in key order
-(`Value::in_key_order`), since a collection's binding order states nothing. A `main` output's
-pipeline is ordered and needs no sort.
+(`Value::in_key_order`), since a collection's binding order states nothing. A `main` output merges
+its packages' answers under its own lock, and its finish answer is put in key order
+(`Tile::in_key_order`). A live `main` output prints each package's answer as the package lands, so
+its rows print in package order.
 
 A worker reads and computes its claimed region before taking the output-state lock. Memo merges
 under its cache lock. Aggregates fold received values under the shared accumulator lock.
@@ -556,15 +559,14 @@ consumed input through the existing producer chain.
 
 A pipeline is **admitted** when all of these hold:
 
-- It is a pipeline of the program over a chain or a pipeline of a loop's or transaction writer's
-  body.
+- It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
+  loop's or transaction writer's body. A sink is admitted only where its packages run at once.
 - Its packages run at once, or no scope's pipeline reads it.
 
 A pipeline's packages run beside each other where its breaker consumes concurrently and its input is
 keyed by ordered keys (`consumes_at_once`). A breaker consumes concurrently unless it opts out
 (`Breaker::consumes_concurrently`), as a store, a commit, a loop's or a transaction's driver, a
-transaction writer, a commit store's reply tap, a memo whose rows hold a nested collection and an
-aggregate whose accumulator holds a collection level do. A package may name keys at any level of
+transaction writer and a commit store's reply tap do. A package may name keys at any level of
 the input. Every producer answers a projection at every level: a pull at keys of a level the
 producer does not restate (`TileProducer::restates`) pulls the keys above them at the nearest level
 it restates, and the answer is cut to the keys asked for (`TileProducer::get`). A package is always

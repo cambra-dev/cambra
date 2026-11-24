@@ -10,7 +10,7 @@ use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, LoopSchedule, Member, induction};
 use super::transaction_scope::WriterPhase;
-use super::workers::{WorkerPool, WorkerTarget};
+use super::workers::{WorkerBreaker, WorkerPool, WorkerTarget};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -423,7 +423,7 @@ fn run_targets(
         };
         let pipeline = planner.add(Located::Sink(at), format!("SinkBreaker#{at}"), None, under);
         sink_pipelines.push(pipeline);
-        sink_breakers.push(RwLock::new(breaker));
+        sink_breakers.push(Arc::new(RwLock::new(breaker)));
     }
     planner.check_direct();
     if let Some(refused) = planner.refused.take() {
@@ -625,14 +625,14 @@ fn run_targets(
         &mut reach,
         &mut end_of,
     );
-    // A `main` output's pipeline consumes its packages in queue order.
+    // A `main` output merges its packages' answers under its own lock, so its pipeline consumes
+    // them in any order.
     for ((_, _, entry), (pipeline, breaker)) in targets
         .iter()
         .zip(sink_pipelines.iter().zip(&sink_breakers))
     {
         if let TargetEntry::Main(_) = entry {
             let local = planner.local[*pipeline];
-            dispatcher.order(PipelineId(local));
             if reads_a_scope(&members.located, &members.reads, local) {
                 breaker
                     .write()
@@ -867,16 +867,17 @@ fn run_targets(
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
     };
-    let worker_targets: Vec<Option<BreakerHandle>> = execution
+    let worker_targets: Vec<Option<WorkerBreaker>> = execution
         .handlers
         .iter()
         .enumerate()
         .map(|(pipeline, handler)| match handler {
-            Handler::Root => match members.located[pipeline] {
-                Located::Chain(handle) => Some(handle.clone()),
+            Handler::Root => match &members.located[pipeline] {
+                Located::Chain(handle) => Some(WorkerBreaker::Chain(handle.clone())),
+                Located::Sink(sink) => Some(WorkerBreaker::Sink(sink_breakers[*sink].clone())),
                 _ => None,
             },
-            Handler::Body(handle) => Some(handle.clone()),
+            Handler::Body(handle) => Some(WorkerBreaker::Chain(handle.clone())),
             _ => None,
         })
         .collect();
@@ -897,16 +898,27 @@ fn run_targets(
         .into_iter()
         .zip(read_by_scope)
         .map(|(target, read_by_scope)| {
-            target.map(|handle| {
-                let concurrent = {
-                    let chain = handle.read().unwrap_or_else(PoisonError::into_inner);
-                    chain.as_producer().is_some() && consumes_at_once(&*chain)
+            target.and_then(|handle| {
+                let concurrent = match &handle {
+                    WorkerBreaker::Chain(chain) => {
+                        let chain = chain.read().unwrap_or_else(PoisonError::into_inner);
+                        chain.as_producer().is_some() && consumes_at_once(&*chain)
+                    }
+                    WorkerBreaker::Sink(sink) => {
+                        // A sink is the workers' only where its packages run at once: one handed
+                        // a package at a time stays on the coordinator.
+                        if !consumes_at_once(&*sink.read().unwrap_or_else(PoisonError::into_inner))
+                        {
+                            return None;
+                        }
+                        true
+                    }
                 };
-                WorkerTarget {
+                Some(WorkerTarget {
                     concurrent,
                     serial: !read_by_scope,
                     handle,
-                }
+                })
             })
         })
         .collect();

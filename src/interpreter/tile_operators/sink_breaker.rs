@@ -32,12 +32,8 @@ pub(crate) struct SinkBreaker {
 enum Hands {
     /// Each package's answer, as the package is consumed: a sink output's breaker.
     EachPackage,
-    /// A `main` output's breaker, whose driver prints each answer. Its pipeline is ordered
-    /// (`Dispatcher::order`): a package is claimed only while none is in flight, so the answers
-    /// are handed in queue order, the order in which the pushes reaching the pipeline arrived.
-    /// With several workers, the pushes of concurrent packages upstream arrive in the order those
-    /// packages complete, not in key order. At its finish it pulls the producer at the universal
-    /// guard, which states what the producer states complete.
+    /// A `main` output's breaker, whose driver prints each answer. At its finish it pulls the
+    /// producer at the universal guard, which states what the producer states complete.
     Main {
         /// Whether it hands each package's answer as it consumes it, and at its finish the answer
         /// that states it complete where no answer before was terminal
@@ -199,7 +195,8 @@ impl Breaker for SinkBreaker {
             }
             return;
         }
-        let answer = merged.unwrap_or(rest);
+        // Packages merge in the order they finish, so the answer is put in key order once, here.
+        let answer = merged.unwrap_or(rest).in_key_order();
         debug_assert!(
             answer.is_terminal(),
             "a `main` output is handed a terminal answer at its finish"

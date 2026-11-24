@@ -35,7 +35,6 @@ use bit_set::BitSet;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
 use cambra::ccl::{Expr, FieldKey, Label, TagMap};
-use cambra::interpreter::KeysFollow;
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     ColumnValue, Consumer, Predicate, Tile, Value, sort_function_by_domain, tuple_field,
@@ -331,38 +330,57 @@ pub(crate) fn sort_collection_bindings(value: Value) -> Value {
     }
 }
 
-/// Whether `actual` and `expected` are one tile, with each collection's domain predicate compared
-/// by the region it admits rather than by its spelling: `True` and `Record({_0: True, _1: True})`
-/// name the same region of a record domain. Each level's `keys_follow_beneath` is compared by
-/// whether it follows, the only state `Tile::level_statement` reads: `KeysFollow::DoesNot` and
-/// `KeysFollow::Unstated` state the same keys complete.
+/// Whether `actual` and `expected` are one tile, with each collection level compared by the paths
+/// it holds complete rather than by how its statement is spelled: `True` and
+/// `Record({_0: True, _1: True})` name the same region of a record domain, and a path beneath a key
+/// a level above calls complete is complete whether or not its own level repeats it. A merge of
+/// several packages' answers states such a path once, at the outermost level that settles it
+/// (`Tile::merge`), and one package's answer may state it at every level. The closure is the one
+/// `Tile::completion_at` reads, carried through record fields, which stand over their record's
+/// rows.
 pub(crate) fn same_tile(actual: &Tile, expected: &Tile) -> bool {
-    fn same_regions(actual: &mut Tile, expected: &mut Tile) -> bool {
-        match (actual, expected) {
-            (
-                Tile::DataFunction {
-                    domain_predicate: actual_region,
-                    codomain: actual_codomain,
-                    keys_follow_beneath: actual_follow,
-                    ..
-                },
-                Tile::DataFunction {
-                    domain_predicate: expected_region,
-                    codomain: expected_codomain,
-                    keys_follow_beneath: expected_follow,
-                    ..
-                },
-            ) => {
-                if !(actual_region.subsumes(expected_region)
-                    && expected_region.subsumes(actual_region))
-                    || (*actual_follow == KeysFollow::Follows)
-                        != (*expected_follow == KeysFollow::Follows)
+    fn same_regions(
+        actual: &mut Tile,
+        expected: &mut Tile,
+        above: Option<(&Predicate, &Predicate)>,
+    ) -> bool {
+        let closed = |tile: &Tile, above: Option<&Predicate>| match above {
+            None => tile.level_statement(),
+            Some(above) => above.descend(1).union(&tile.level_statement()),
+        };
+        match (&mut *actual, &mut *expected) {
+            (Tile::DataFunction { .. }, Tile::DataFunction { .. }) => {
+                let actual_complete = closed(actual, above.map(|(a, _)| a));
+                let expected_complete = closed(expected, above.map(|(_, e)| e));
+                if !(actual_complete.subsumes(&expected_complete)
+                    && expected_complete.subsumes(&actual_complete))
                 {
                     return false;
                 }
+                let (
+                    Tile::DataFunction {
+                        domain_predicate: actual_region,
+                        codomain: actual_codomain,
+                        keys_follow_beneath: actual_follow,
+                        ..
+                    },
+                    Tile::DataFunction {
+                        domain_predicate: expected_region,
+                        codomain: expected_codomain,
+                        keys_follow_beneath: expected_follow,
+                        ..
+                    },
+                ) = (actual, expected)
+                else {
+                    unreachable!("matched as collections above")
+                };
                 *expected_region = actual_region.clone();
                 *expected_follow = *actual_follow;
-                same_regions(actual_codomain, expected_codomain)
+                same_regions(
+                    actual_codomain,
+                    expected_codomain,
+                    Some((&actual_complete, &expected_complete)),
+                )
             }
             (
                 Tile::Record { fields: actual, .. },
@@ -372,61 +390,13 @@ pub(crate) fn same_tile(actual: &Tile, expected: &Tile) -> bool {
             ) => actual.iter_mut().all(|(name, actual)| {
                 expected
                     .get_mut(name)
-                    .is_some_and(|expected| same_regions(actual, expected))
+                    .is_some_and(|expected| same_regions(actual, expected, above))
             }),
             _ => true,
         }
     }
-    let (mut actual, mut expected) = (in_key_order(actual), in_key_order(expected));
-    same_regions(&mut actual, &mut expected) && actual == expected
-}
-
-/// `tile` with each row's keys in key order, at every level, each key's rows beneath moving with
-/// it. A collection's key order states nothing, and with more than one worker a collection's rows
-/// arrive in the order their packages land.
-fn in_key_order(tile: &Tile) -> Tile {
-    let mut tile = tile.clone();
-    match &mut tile {
-        Tile::DataFunction {
-            row_starts,
-            domain,
-            codomain,
-            deleted,
-            ..
-        } => {
-            let keys = domain.len();
-            let mut order = Vec::with_capacity(keys);
-            for (row, &start) in row_starts.iter().enumerate() {
-                let end = row_starts.get(row + 1).copied().unwrap_or(keys);
-                let mut run: Vec<usize> = (start..end).collect();
-                run.sort_by(|&a, &b| {
-                    domain
-                        .index_at(a)
-                        .partial_cmp(&domain.index_at(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                order.extend(run);
-            }
-            *deleted = deleted
-                .iter()
-                .map(|old| {
-                    order
-                        .iter()
-                        .position(|&at| at == old)
-                        .expect("a deleted key")
-                })
-                .collect();
-            *domain = domain.select_indices(order.iter().copied(), keys);
-            **codomain = in_key_order(&codomain.select_rows(&order));
-        }
-        Tile::Record { fields, .. } => {
-            for field in fields.values_mut() {
-                *field = in_key_order(field);
-            }
-        }
-        _ => {}
-    }
-    tile
+    let (mut actual, mut expected) = (actual.in_key_order(), expected.in_key_order());
+    same_regions(&mut actual, &mut expected, None) && actual == expected
 }
 
 /// [`sort_collection_bindings`] over every scalar cell of a tile.

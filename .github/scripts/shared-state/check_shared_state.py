@@ -111,6 +111,9 @@ EXPECTED_EXCEPTIONS = [
     # `BreakerHandle`, the dispatcher's handle on a pipeline's breaker; see its type doc. The
     # driver calls the breaker through it, and what crosses it is a call, never a tile.
     ("src/interpreter/dispatcher.rs", "shared cell of `dyn BreakingProducer`"),
+    # A worker's handle on a `main` or tap sink's breaker, as `BreakerHandle` is on a chain's: the
+    # workers call it, and what crosses it is a call, never a tile.
+    ("src/interpreter/dispatcher/workers.rs", "shared cell of `crate::interpreter::tile_operators::SinkBreaker`"),
     # A pipeline's queue: its unclaimed and in-flight packages and the region they partition, which
     # appends grow and claims and acknowledgements take from under the lock, on any thread. What
     # crosses it is guards naming regions of the pipeline's input, never a tile.
