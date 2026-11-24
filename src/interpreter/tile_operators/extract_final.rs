@@ -384,24 +384,64 @@ impl Breaker for ExtractFinalProducer {
     /// the order they arrive, so the last row is not the final one: the key says which is. Once
     /// the source has been released whole the value is extracted, or the default read when the
     /// source held nothing.
+    ///
+    /// The source is pulled with no lock held, so packages of disjoint keys pull at once. The
+    /// merge, the release and the extraction run under the state's lock, so the consume that
+    /// sees the source released whole has merged every row another consume released.
     fn consume_impl(&self, _: InputId, guard: TileGuard) {
-        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let state = &mut *state_guard;
-
         debug_assert!(
             guard.check_from(self.source.tiling()),
             "{} consumes a guard of its source's tiling: {guard:?}",
             self.name()
         );
-        if self.obsolete_guard().is_universal() || state.final_tile.is_some() || guard.is_empty() {
+        if self.obsolete_guard().is_universal() || guard.is_empty() || self.extracted() {
             return;
         }
         let mut answered = self.source.get(guard);
         let upstream_guard = answered.to_guard();
         answered.compact();
+        let mut state_guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state_guard;
+        if state.final_tile.is_some() {
+            self.source.release(upstream_guard);
+            return;
+        }
         state.merged.merge(answered);
         self.keep_greatest_key(state);
         self.source.release(upstream_guard);
+        self.extract_once_released(state);
+    }
+
+    fn finish_parallel_input(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.obsolete_guard().is_universal() || state.final_tile.is_some() {
+            return;
+        }
+        self.source.release(self.source.tiling().universal_guard());
+        self.extract_once_released(&mut state);
+    }
+
+    /// The source is keyed by position, and the row at the greatest key wins whatever order the
+    /// packages merge in.
+    fn consumes_concurrently(&self) -> bool {
+        has_keys(&*self.source)
+    }
+}
+
+impl ExtractFinalProducer {
+    /// Whether the value has been extracted.
+    fn extracted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .final_tile
+            .is_some()
+    }
+
+    /// Release the rows beneath the greatest key merged, while the source is not released whole;
+    /// once it is, extract the row at the greatest key, or read the default where the source held
+    /// nothing.
+    fn extract_once_released(&self, state: &mut FinalValueState) {
         if !self.source.obsolete_guard().is_universal() {
             let greatest = state
                 .merged
