@@ -1742,13 +1742,6 @@ impl Breaker for MemoProducer {
     fn finish_parallel_input(&mut self) {
         self.input.release(self.input.tiling().universal_guard());
     }
-    /// Packages of disjoint keys merge into the cache, nested rows included: a merge unions each
-    /// level's statement and states a path once, at the outermost level that settles it
-    /// (`Tile::merge`).
-    fn consumes_concurrently(&self) -> bool {
-        has_keys(&*self.input)
-    }
-
     fn input_tiling(&self, _: InputId) -> Tiling {
         self.input.tiling().clone()
     }

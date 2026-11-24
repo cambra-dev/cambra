@@ -904,23 +904,23 @@ fn run_targets(
         .zip(read_by_scope)
         .map(|(target, read_by_scope)| {
             target.and_then(|handle| {
-                let restated = match &handle {
+                let concurrent = match &handle {
                     WorkerBreaker::Chain(chain) => {
                         let chain = chain.read().unwrap_or_else(PoisonError::into_inner);
-                        chain.as_producer()?;
-                        concurrent_level(&*chain)
+                        chain.as_producer().is_some() && consumes_at_once(&*chain)
                     }
                     WorkerBreaker::Sink(sink) => {
                         // A sink is the workers' only where its packages run at once: one handed
-                        // a package at a time stays on the coordinator, which hands a `main`
-                        // output its answers.
-                        Some(concurrent_level(
-                            &*sink.read().unwrap_or_else(PoisonError::into_inner),
-                        )?)
+                        // a package at a time stays on the coordinator.
+                        if !consumes_at_once(&*sink.read().unwrap_or_else(PoisonError::into_inner))
+                        {
+                            return None;
+                        }
+                        true
                     }
                 };
                 Some(WorkerTarget {
-                    restated,
+                    concurrent,
                     serial: !read_by_scope,
                     handle,
                 })
@@ -931,25 +931,6 @@ fn run_targets(
     let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
     for pipeline in workers.serial() {
         dispatcher.order(pipeline);
-    }
-    // A package naming keys beneath the deepest level its chain restates is read wider than it
-    // names, so it runs alone. Every pusher queues a projection of its reader's input; a guard
-    // that names none would be read wider still, and runs alone in a release build.
-    for (pipeline, level) in workers.restated() {
-        dispatcher.classify(
-            pipeline,
-            Arc::new(move |guard: &TileGuard| match Projection::of(guard) {
-                Ok(projection) => projection.level().is_some_and(|at| at > level),
-                Err(why) => {
-                    debug_assert!(
-                        false,
-                        "pipeline {} is queued a package that names no projection: {why}",
-                        pipeline.0
-                    );
-                    true
-                }
-            }),
-        );
     }
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher);
@@ -3323,7 +3304,7 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
 /// disjoint regions of its input, at whatever level they land. A range beneath the pipeline's
 /// outermost keys, as a nest's inner range is, lands each piece beneath the rows it reaches: the
 /// pieces are disjoint where they name different inner keys, and they run alone or beside each
-/// other as their pipeline admits ([`concurrent_level`]). Pieces that land on the same
+/// other as their pipeline admits ([`consumes_at_once`]). Pieces that land on the same
 /// region, as a range re-keyed onto values its pieces share would, are pushed whole.
 ///
 /// The first two pieces decide for all of them: every piece is a region of the same range pushed
@@ -3359,22 +3340,18 @@ fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[P
     }
 }
 
-/// The deepest level whose keys a package of `breaker`'s pipeline may name and still run beside
-/// the pipeline's other packages: the innermost level of its input, where the breaker consumes
-/// concurrently ([`Breaker::consumes_concurrently`]) and its input is keyed by ordered keys. Every
-/// producer answers a projection at every level, widening a pull at keys it does not restate and
-/// cutting the answer after (`TileProducer::get`). `None` where the breaker consumes one package
-/// at a time, or its input has no ordered keys to cut.
-fn concurrent_level(breaker: &dyn Breaker) -> Option<CurryLevel> {
-    let input = breaker.input_tiling(InputId::ONLY);
+/// Whether packages of `breaker`'s pipeline run beside each other: the breaker consumes
+/// concurrently ([`Breaker::consumes_concurrently`]) and its input is keyed by ordered keys. A
+/// package names keys at any level of the input, since every producer answers a projection at every
+/// level, widening a pull at keys it does not restate and cutting the answer after
+/// (`TileProducer::get`).
+fn consumes_at_once(breaker: &dyn Breaker) -> bool {
     // A push is cut into morsels in key order, which a function value has none of.
-    let ordered = input
-        .domain_extent()
-        .is_some_and(|keys| crate::interpreter::tile_operators::keys_have_order(&keys));
-    if !breaker.consumes_concurrently() || !ordered {
-        return None;
-    }
-    input.levels().checked_sub(1).map(CurryLevel::new)
+    breaker.consumes_concurrently()
+        && breaker
+            .input_tiling(InputId::ONLY)
+            .domain_extent()
+            .is_some_and(|keys| crate::interpreter::tile_operators::keys_have_order(&keys))
 }
 
 /// Why a round of a loop's scope cannot pull the chain at `producer`, or `None` where every

@@ -264,8 +264,8 @@ source holds (`DataSourceDomainExtentImpl::morsels`, `LivePipeline::poll`), push
 through the range's consumer, and queues each landing as one package. Only the test source
 (`TestDataSource`) cuts; the HTTP and stdin sources queue each arrival as one package. A range
 beneath the pipeline's outermost keys, as a nest's inner range is, is cut too: its pieces land as
-packages beneath the outermost keys, which run alone unless the chain restates their level
-([Who claims what](#who-claims-what)). Two ranges of one pipeline, as a join's two sides are, can
+packages beneath the outermost keys ([Who claims what](#who-claims-what)). A range whose pieces land
+on one region of the pipeline's input is queued whole (`lands_as_morsels`). Two ranges of one pipeline, as a join's two sides are, can
 deliver the same rows, so each morsel is queued less what the poll queued before it.
 
 ## Completeness in pushes
@@ -488,7 +488,7 @@ canonical breaker handles. Workers retain those handles and call the existing br
 A breaker consumes packages at once where it answers `Breaker::consumes_concurrently`: a memo, an
 aggregate and a map-aggregate whose accumulator holds no collection level, a final-value extraction,
 and a sink that hands each package's answer. Each requires keyed input whose keys have an order
-(`has_keys`), since a push is cut into morsels in key order, and a function value has none. A memo
+(`consumes_at_once`), since a push is cut into morsels in key order, and a function value has none. A memo
 merges its packages' answers, nested rows included: a merge unions each level's statement and states
 a path once, at the outermost level that settles it (`Tile::merge`). A final-value extraction keeps
 the row at the greatest key whatever order its packages merge in. A sum folds its packages in any
@@ -521,18 +521,17 @@ A pipeline is **admitted** when all of these hold:
 
 - It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
   loop's or transaction writer's body. A sink is admitted only where its packages run at once.
-- Its packages run at once at some level, or no scope's pipeline reads it.
+- Its packages run at once, or no scope's pipeline reads it.
 
-A pipeline's packages run beside each other at any level of its input where its breaker consumes
-concurrently and its input is keyed by ordered keys (`concurrent_level`). Every producer answers a
-projection at every level: a pull at keys of a level the producer does not restate
-(`TileProducer::restates`) pulls the keys above them at the nearest level it restates, and the
-answer is cut to the keys asked for (`TileProducer::get`). The planner registers a rule with the
-dispatcher (`Dispatcher::classify`) that flags each package as it is queued: a package naming keys
-beneath that level runs **alone**, waiting until no package of the pipeline is in flight, and no
-package is claimed beside it (`Queue::claim`). A package is always a projection, which a debug build
-asserts. Every other package runs beside the pipeline's others, except one whose guard overlaps a
-package in flight.
+A pipeline's packages run beside each other where its breaker consumes concurrently and its input is
+keyed by ordered keys (`consumes_at_once`). A breaker consumes concurrently unless it opts out
+(`Breaker::consumes_concurrently`), as a store, a commit, a loop's or a transaction's driver, a
+transaction writer, a commit store's reply tap and an aggregate whose accumulator holds a collection
+level do. A package may name keys at any level of the input: every producer answers a projection at
+every level, and a pull at keys of a level the producer does not restate (`TileProducer::restates`)
+pulls the keys above them at the nearest level it restates, and the answer is cut to the keys asked
+for (`TileProducer::get`). A package is always a projection, which a debug build asserts. A package
+runs beside the pipeline's others except where its guard overlaps a package in flight.
 
 A pipeline admitted for the second reason alone is **serial**: the planner orders it, so one package
 of it is in flight at a time, on any thread. A worker runs the finish of every admitted pipeline no

@@ -3998,17 +3998,6 @@ mod tests {
     }
 }
 
-/// Whether `input` has keys that packages can name disjoint regions of: a collection whose keys
-/// all have an order, since a push is cut into morsels in key order ([`cut_at_keys`]), which a
-/// function value has none of.
-pub(crate) fn has_keys(input: &dyn TileProducer) -> bool {
-    let tiling = input.tiling();
-    tiling.is_data_function()
-        && tiling
-            .domain_extent()
-            .is_some_and(|keys| keys_have_order(&keys))
-}
-
 /// Whether every key of `extent` has an order ([`has_order`]): no key holds a function value.
 pub(crate) fn keys_have_order(extent: &Extent) -> bool {
     match extent {

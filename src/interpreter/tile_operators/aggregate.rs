@@ -297,7 +297,6 @@ impl Breaker for AggregateProducer {
     }
     fn consumes_concurrently(&self) -> bool {
         !matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
-            && has_keys(&*self.input)
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1408,7 +1407,7 @@ impl Breaker for MapAggregateProducer {
         self.input.release(self.input.tiling().universal_guard());
     }
     fn consumes_concurrently(&self) -> bool {
-        !folded_shape(self.tiling()).1.holds_a_level() && has_keys(&*self.input)
+        !folded_shape(self.tiling()).1.holds_a_level()
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {

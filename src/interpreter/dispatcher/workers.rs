@@ -2,7 +2,6 @@
 //! from the run's dispatcher. See `src/interpreter/design-dispatcher.md`, "Shared native pipeline
 //! execution".
 use super::*;
-use crate::interpreter::CurryLevel;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -43,9 +42,8 @@ impl WorkerBreaker {
 /// its finish.
 pub(super) struct WorkerTarget {
     pub(super) handle: WorkerBreaker,
-    /// The deepest level whose keys the chain beneath the breaker restates, where the breaker's
-    /// consume runs concurrently: a package naming keys at or above it runs beside others.
-    pub(super) restated: Option<CurryLevel>,
+    /// Whether packages run beside each other: the breaker consumes concurrently over keyed input.
+    pub(super) concurrent: bool,
     /// Whether the workers consume the pipeline although it has no parallel level, one package at
     /// a time, and run its finish: no scope's pipeline reads it, so no consume or finish of it
     /// offers a scope requests.
@@ -55,9 +53,9 @@ pub(super) struct WorkerTarget {
 /// An admitted pipeline's breaker and the level its claims partition.
 struct Spec {
     target: WorkerBreaker,
-    /// The deepest level whose keys its chain restates ([`WorkerTarget::restated`]); `None` for a
-    /// pipeline whose packages are consumed one at a time, in queue order.
-    restated: Option<CurryLevel>,
+    /// Whether its packages run beside each other ([`WorkerTarget::concurrent`]); otherwise they
+    /// are consumed one at a time, in queue order.
+    concurrent: bool,
     /// Whether a worker runs the pipeline's finish.
     finishes: bool,
     /// For a pipeline of a loop's or transaction writer's body, the body's follower hold, which a
@@ -112,12 +110,12 @@ impl WorkerPool {
             .map(|(target, body)| {
                 let WorkerTarget {
                     handle,
-                    restated,
+                    concurrent,
                     serial,
                 } = target?;
-                (restated.is_some() || serial).then_some(Spec {
+                (concurrent || serial).then_some(Spec {
                     target: handle,
-                    restated,
+                    concurrent,
                     finishes: serial,
                     body,
                 })
@@ -162,21 +160,8 @@ impl WorkerPool {
         self.specs
             .iter()
             .enumerate()
-            .filter(|(_, spec)| spec.as_ref().is_some_and(|spec| spec.restated.is_none()))
+            .filter(|(_, spec)| spec.as_ref().is_some_and(|spec| !spec.concurrent))
             .map(|(pipeline, _)| PipelineId(pipeline))
-            .collect()
-    }
-
-    /// The admitted pipelines whose packages run at once, with the deepest level their chains
-    /// restate. None where the run starts no worker.
-    pub(super) fn restated(&self) -> Vec<(PipelineId, CurryLevel)> {
-        if !self.threaded() {
-            return Vec::new();
-        }
-        self.specs
-            .iter()
-            .enumerate()
-            .filter_map(|(pipeline, spec)| Some((PipelineId(pipeline), spec.as_ref()?.restated?)))
             .collect()
     }
 
@@ -274,7 +259,7 @@ impl WorkerPool {
             .as_ref()
             .expect("a worker claims only admitted pipelines");
         let target = &spec.target;
-        if spec.restated.is_none() {
+        if !spec.concurrent {
             // One package at a time, under the handle held exclusively, as on the coordinator
             // (`consume_with`).
             let pushes = target.write(|breaker| {
@@ -305,6 +290,14 @@ impl WorkerPool {
             dispatcher.acknowledge(package);
             return;
         }
+        // A package beside others names its region exactly: every pusher queues a projection of
+        // its reader's input.
+        debug_assert!(
+            Projection::of(&package.guard).is_ok(),
+            "pipeline {} runs a package beside others that names no projection: {:?}",
+            pipeline.0,
+            package.guard
+        );
         target.read(|breaker| {
             debug_assert!(
                 package
@@ -355,7 +348,7 @@ impl WorkerPool {
             );
             spec.target.write(|breaker| call(breaker, InputId::ONLY))
         };
-        if spec.restated.is_some() {
+        if spec.concurrent {
             reach(pipeline, &mut |breaker, _| breaker.finish_parallel_input());
         }
         // No follower hold, unlike a consume: the finish lands everything the breaker completed,
@@ -400,7 +393,7 @@ impl WorkerPool {
             .specs
             .get(p.0)
             .and_then(Option::as_ref)
-            .is_some_and(|spec| spec.restated.is_some())
+            .is_some_and(|spec| spec.concurrent)
         {
             reach(p, &mut |breaker, _| breaker.finish_parallel_input());
         }
