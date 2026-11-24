@@ -3314,6 +3314,43 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
     tiling.levels()
 }
 
+/// Whether `pieces`, keys a range in `pipeline`'s chain yielded, reach `pipeline`'s own entry as
+/// disjoint regions of the outermost keys of its input. A range beneath those keys, as the inner
+/// range of a nest is, reaches each row whole or in part, and its pieces then name the same rows.
+///
+/// The first two pieces decide for all of them: every piece is a region of the same range pushed
+/// through the same consumers, so the chain maps each piece's keys to the pipeline's keys the same
+/// way. They are pushed through a probe landing, which records where they arrive and queues and
+/// records nothing else ([`Landing::probe`]).
+fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[Predicate]) -> bool {
+    let landed = |piece: &Predicate| -> Option<Predicate> {
+        let mut landing = Landing::probe(pipeline);
+        crate::interpreter::notifications::notify_shared(
+            consumer,
+            &Projection::admitting(piece.clone()),
+            &mut landing,
+        );
+        landing
+            .arrivals()
+            .into_iter()
+            .filter(|arrival| arrival.pipeline.0 == pipeline.0)
+            .try_fold(Predicate::False, |keys, arrival| match arrival.guard {
+                TileGuard::Function(FunctionGuard::Domain(landed)) if !landed.qualifies() => {
+                    Some(keys.union(&landed))
+                }
+                _ => None,
+            })
+            .filter(|keys| !keys.is_false())
+    };
+    let [first, second, ..] = pieces else {
+        return true;
+    };
+    match (landed(first), landed(second)) {
+        (Some(first), Some(second)) => first.intersect(&second).is_false(),
+        _ => false,
+    }
+}
+
 /// The deepest level whose keys every operator the chain under `breaker` pulls restates, for a
 /// breaker whose consume runs concurrently
 /// ([`Breaker::consumes_concurrently`](crate::interpreter::tile_operators::Breaker::consumes_concurrently)).
@@ -3697,6 +3734,13 @@ impl LivePipeline {
             let pieces = match own {
                 true => leaf.extent.morsels(&fresh, dispatcher.morsel_rows),
                 false => vec![fresh.clone()],
+            };
+            // Pieces that land on overlapping keys of the pipeline, as a range beneath its outermost
+            // keys or a range re-keyed on its way does, would run one at a time, each releasing
+            // what the others still read, so the range's keys are pushed whole.
+            let pieces = match !lands_as_morsels(&leaf.consumer, self.pipeline, &pieces) {
+                true => vec![fresh.clone()],
+                false => pieces,
             };
             // The fresh keys are pushed through the range's consumer whatever the pipeline takes of
             // them, so an operator that pairs them with another input's rows records them.
