@@ -3040,14 +3040,25 @@ impl InferCtx {
             let group = self.parameter_groups.get(origin).unwrap_or(origin);
             let named = crate::ccl::subst::type_free_vars(history);
             let mut parameters = Vec::new();
+            let mut reached_group = false;
             for name in scope.iter() {
+                debug_assert!(
+                    !self.parameter_groups.contains_key(origin)
+                        || self.parameter_groups.get(name) == Some(group),
+                    "a source signature contains only parameters in its group",
+                );
                 if name == origin || !named.contains(name) {
                     parameters.push(name.clone());
                 }
                 if name == group {
+                    reached_group = true;
                     break;
                 }
             }
+            debug_assert!(
+                reached_group,
+                "the first parameter of a source signature is in its telescope"
+            );
             crossed.extend(parameters.iter().cloned());
             Some((
                 scope.rescoped(|name| parameters.contains(name), []),

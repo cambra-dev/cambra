@@ -1315,22 +1315,27 @@ fn a_product_projection_selects_one_of_two_channels() {
 
 /// A handle chosen at run time has no declaration to gather its contributions at
 /// (`docs/chl-spec.md`, "A deferred collection inside a data structure \[Open\]").
-#[test]
-fn a_feed_chosen_at_run_time_is_refused() {
-    check_compile_error(
-        indoc! {r#"
-            def emit(condition, first, second):
-                chosen = first if condition else second
-                chosen << 3
-            first: Feed(_)
-            second: Feed(_)
-            first << 1
-            second << 2
-            emit(sum([1, 2]) > 0, first, second)
-            sum(first) + sum(second)
-        "#},
-        "No type meets every requirement on this value",
-    );
+#[rstest]
+#[case::static_target("first", true)]
+#[case::runtime_target("first if condition else second", false)]
+fn a_feed_chosen_at_run_time_is_refused(#[case] choice: &str, #[case] accepts: bool) {
+    let program = indoc! {r#"
+        def emit(condition, first, second):
+            chosen = CHOICE
+            chosen << 3
+        first: Feed(_)
+        second: Feed(_)
+        first << 1
+        second << 2
+        emit(sum([1, 2]) > 0, first, second)
+        sum(first) + sum(second)
+    "#}
+    .replace("CHOICE", choice);
+    if accepts {
+        check_scalar(&program, Value::Int(6));
+    } else {
+        check_compile_error(&program, "No type meets every requirement on this value");
+    }
 }
 
 /// A handle projected out of a tuple that is also used whole, here as a list element, does not
