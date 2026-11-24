@@ -740,6 +740,11 @@ impl Qualifier {
             substitute(ty, &self.types);
             super::super::http::rename_source_type(ty, &sources);
         });
+        // A direct alias of the domain is written through this public member, even where
+        // its underlying source is declared by a private nested run.
+        if let AliasType::Type(Type::DataSource(source)) = &mut ty {
+            source.set_spelling(self.name.child(member).to_string());
+        }
         Ok(Some(ty))
     }
 

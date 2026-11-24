@@ -265,7 +265,7 @@ impl HttpRoute {
 /// The names a run gives its module's route sources, and the run's name, which qualifies a
 /// renamed key type's spelling. The root's defaults rename with no run.
 pub(in crate::ccl::lower) struct SourceRenames<'a> {
-    pub(in crate::ccl::lower) names: HashMap<String, String>,
+    pub(in crate::ccl::lower) names: HashMap<String, SourceName>,
     pub(in crate::ccl::lower) run: Option<&'a str>,
 }
 
@@ -273,25 +273,52 @@ pub(super) fn rename_source_type(ty: &mut Type, renames: &SourceRenames) -> bool
     fn atoms(ty: &mut Type, renames: &SourceRenames) -> bool {
         if let Type::DataSource(name) = ty
             && let Some(to) = renames.names.get(name.as_str())
-            && name.as_str() != to
         {
-            name.renamed(to, renames.run);
-            return true;
+            let mut changed = false;
+            if name.as_str() != to.as_str() {
+                name.renamed(to.as_str(), renames.run);
+                changed = true;
+            }
+            if let Some(spelling) = to.spelling()
+                && name.spelling() != Some(spelling)
+            {
+                name.set_spelling(spelling);
+                changed = true;
+            }
+            return changed;
         }
         let mut changed = false;
         ty.walk_children_mut(|t| changed |= atoms(t, renames));
+        if let Type::Nominal(decl, _) = ty {
+            changed |= rename_source_decl(decl, renames);
+        }
         changed
     }
     if renames.names.is_empty() {
         return false;
     }
     let mut changed = atoms(ty, renames);
-    changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
+    changed |= crate::ccl::ccl_utils::walk_held_terms_mut(
         ty,
         &crate::ccl::ccl_utils::PredMemo::new(),
         &(),
         &mut |expr, _| rename_source_expr(expr, renames),
     );
+    changed
+}
+
+pub(super) fn rename_source_decl(decl: &mut Rc<NominalDecl>, renames: &SourceRenames) -> bool {
+    let mut changed = false;
+    if let Some(renamed) = decl.substituted(&mut |ty| {
+        rename_source_type(ty, renames);
+    }) {
+        *decl = renamed;
+        changed = true;
+    }
+    if let Some(renamed) = decl.map_declared_types(&mut |ty| rename_source_type(ty, renames)) {
+        *decl = renamed;
+        changed = true;
+    }
     changed
 }
 
@@ -302,10 +329,19 @@ pub(super) fn rename_source_expr(expr: &mut Expr, renames: &SourceRenames) -> bo
     let mut changed = false;
     if let TypedExprNode::Source(name, _) = &mut expr.node
         && let Some(to) = renames.names.get(name)
-        && name != to
+        && name.as_str() != to.as_str()
     {
-        *name = to.clone();
+        *name = to.as_str().to_string();
         changed = true;
+    }
+    match &mut expr.node {
+        TypedExprNode::NominalCtor { decl, .. } => changed |= rename_source_decl(decl, renames),
+        TypedExprNode::Method { candidates, .. } => {
+            for candidate in candidates {
+                changed |= rename_source_decl(&mut candidate.decl, renames);
+            }
+        }
+        _ => {}
     }
     expr.walk_type_slots_mut(|ty| changed |= rename_source_type(ty, renames));
     expr.walk_children_mut(|e| changed |= rename_source_expr(e, renames));

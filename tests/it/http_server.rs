@@ -6,6 +6,8 @@
 //! caller.
 
 use cambra::ccl::load::LoadedProgram;
+use cambra::chl_parser::FileId;
+use cambra::interpreter::Value;
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -175,7 +177,7 @@ fn a_request_reaches_the_route_its_path_spells_equivalently(#[case] target: &str
     );
     let mut ctx = GlobalContext::default();
     let loaded = LoadedProgram::test(&code);
-    let _ = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let _program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let (tx, rx) = mpsc::channel::<String>();
     let sent = target.to_string();
     thread::spawn(move || {
@@ -504,7 +506,6 @@ fn spellings_of_one_port_are_one_route() {
     }
 }
 
-
 /// Non-matching paths receive a 404 and do not produce a domain element.
 #[rstest]
 fn test_http_serve_wrong_path_gets_404() {
@@ -767,6 +768,16 @@ struct HttpReply {
 }
 
 fn exchange(port: u16, path: &str, body: &[u8], headers: &[(&str, &str)]) -> HttpReply {
+    exchange_method(port, "POST", path, body, headers)
+}
+
+fn exchange_method(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> HttpReply {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -776,7 +787,7 @@ fn exchange(port: u16, path: &str, body: &[u8], headers: &[(&str, &str)]) -> Htt
         .unwrap();
     write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     )
     .unwrap();
@@ -873,6 +884,18 @@ fn typed_http_rejects_non_utf8_without_poisoning_the_route() {
     assert_eq!(bad.status, 400);
     assert_eq!(good.status, 200);
     assert_eq!(good.body, "λ");
+    let source = ctx
+        .conversion_ctx()
+        .get_source(&cambra::ccl::lower::http_requests_source_name(
+            port, "POST", "/text",
+        ))
+        .unwrap();
+    let admitted = source.borrow().get_yield_predicate();
+    assert!(admitted.contains_path(&[Value::UInt(0)]));
+    assert!(
+        !admitted.contains_path(&[Value::UInt(1)]),
+        "only the valid request gets a key"
+    );
 }
 
 #[rstest]
@@ -912,6 +935,44 @@ fn typed_http_rejects_non_utf8_without_poisoning_the_route() {
     server::respond([http::ok_text(r.body()) for r in server::requests])
     server::respond([http::ok_text(r.body()) for r in server::requests])
 "#}, "multiple definitions")]
+#[case::two_write_sites(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/twice") as server
+    replies: Feed(http::Response)
+    for req in server::requests:
+        replies << http::ok_text(req.body())
+    for req in server::requests:
+        replies << http::ok_text(req.body())
+    server::respond(replies)
+"#}, "do not answer exactly its requests")]
+#[case::match_filtered_feed(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/match") as server
+    replies: Feed(http::Response)
+    discarded: Feed(Int)
+    for req in server::requests:
+        selected = `yes(req) if req.body() == "only" else `no
+        match selected:
+            case `yes(value):
+                replies << http::ok_text(value.body())
+            case `no:
+                discarded << 0
+    server::respond(replies)
+"#}, "do not answer exactly its requests")]
+#[case::connection_in_a_loop(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/loop") as server
+    for unused in [0]:
+        server::respond([http::ok_text(req.body()) for req in server::requests])
+    0
+"#}, "<<= must occur as a top-level statement")]
+#[case::connection_in_a_transaction(indoc! {r#"
+    import std::http
+    run std::http::serve(port="{PORT}", method="POST", path="/transaction") as server
+    with begin():
+        server::respond([http::ok_text(req.body()) for req in server::requests])
+    0
+"#}, "<<= must occur as a top-level statement")]
 fn typed_http_rejects_invalid_response_contracts(#[case] template: &str, #[case] needle: &str) {
     let code = template.replace("{PORT}", &reserve_test_port().to_string());
     let loaded = LoadedProgram::test(&code);
@@ -957,6 +1018,25 @@ fn a_response_waits_for_its_complete_header_list() {
         tx.send(exchange(port, "/later", b"ready body", &[]))
             .unwrap();
     });
+    let source = ctx
+        .conversion_ctx()
+        .get_source(&cambra::ccl::lower::http_requests_source_name(
+            port, "POST", "/later",
+        ))
+        .unwrap();
+    let admission_deadline = Instant::now() + Duration::from_secs(5);
+    while !source
+        .borrow()
+        .get_yield_predicate()
+        .contains_path(&[Value::UInt(0)])
+    {
+        ctx.scheduler().check_for_notifications();
+        assert!(
+            Instant::now() < admission_deadline,
+            "the request was not admitted"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
     let deadline = Instant::now() + Duration::from_millis(150);
     while Instant::now() < deadline {
         ctx.scheduler().check_for_notifications();
@@ -1017,4 +1097,130 @@ fn invalid_response_headers_fail_one_request_and_leave_the_route_usable() {
             .iter()
             .any(|(n, v)| n.eq_ignore_ascii_case("X-Echo") && v == "valid")
     );
+}
+
+#[rstest]
+#[case::no_content(204, "", 204)]
+#[case::not_modified(304, "", 304)]
+#[case::no_content_with_body(204, "body", 500)]
+#[case::not_modified_with_body(304, "body", 500)]
+fn status_and_body_are_validated_on_the_wire(
+    #[case] status: i64,
+    #[case] body: &str,
+    #[case] expected: u16,
+) {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/status") as server
+        server::respond([http::Response::new({status}, box([]), "{body}") for req in server::requests])
+    "#};
+    let loaded = LoadedProgram::test(&code);
+    let mut ctx = GlobalContext::default();
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || tx.send(exchange(port, "/status", b"", &[])).unwrap());
+    let reply = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(reply.status, expected);
+    if matches!(expected, 204 | 304) {
+        assert!(reply.body.is_empty());
+        assert!(
+            !reply
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Content-Length")
+                    || name.eq_ignore_ascii_case("Transfer-Encoding"))
+        );
+    }
+}
+
+#[rstest]
+#[case("Content-Length")]
+#[case("Transfer-Encoding")]
+#[case("Connection")]
+#[case("Keep-Alive")]
+#[case("TE")]
+#[case("Proxy-Connection")]
+fn framing_headers_fail_one_request_and_leave_the_route_usable(#[case] forbidden: &'static str) {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/headers") as server
+        server::respond([http::Response::new(200, box([
+            http::Header::new(req.body(), "managed") for unused in [0]
+        ]), "ok") for req in server::requests])
+    "#};
+    let loaded = LoadedProgram::test(&code);
+    let mut ctx = GlobalContext::default();
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let invalid = exchange(port, "/headers", forbidden.as_bytes(), &[]);
+        let valid = exchange(port, "/headers", b"X-Safe", &[]);
+        tx.send((invalid, valid)).unwrap();
+    });
+    let (invalid, valid) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(invalid.status, 500);
+    assert_eq!(valid.status, 200);
+    assert_eq!(valid.body, "ok");
+}
+
+#[test]
+fn methods_are_case_sensitive_and_trailing_slashes_distinguish_routes() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/ping") as plain
+        run std::http::serve(port="{port}", method="POST", path="/ping/") as slash
+        plain::respond([http::ok_text("plain") for req in plain::requests])
+        slash::respond([http::ok_text("slash") for req in slash::requests])
+    "#};
+    let loaded = LoadedProgram::test(&code);
+    let mut ctx = GlobalContext::default();
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let wrong = exchange_method(port, "post", "/ping", b"", &[]);
+        let plain = exchange(port, "/ping", b"", &[]);
+        let slash = exchange(port, "/ping/", b"", &[]);
+        tx.send((wrong, plain, slash)).unwrap();
+    });
+    let (wrong, plain, slash) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(wrong.status, 404);
+    assert_eq!(plain.body, "plain");
+    assert_eq!(slash.body, "slash");
+}
+
+#[rstest]
+#[case(199)]
+#[case(600)]
+#[case(-1)]
+fn response_status_literals_must_be_final_statuses(#[case] status: i64) {
+    let code = formatdoc! {r#"
+        import std::http
+        http::Response::new({status}, box([]), "")
+    "#};
+    let loaded = LoadedProgram::test(&code);
+    let Err(errors) = cambra::ccl::context::compile_to(&loaded, cambra::ccl::context::Phase::Infer)
+    else {
+        panic!("invalid status compiled");
+    };
+    let text = cambra::ccl::context::render_errors(&errors, loaded.sources());
+    assert!(
+        text.contains("expected {Int where _ >= 200 and _ <= 599}"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_top_level_helper_can_connect_a_route() {
+    let loaded = LoadedProgram::test(indoc! {r#"
+        import std::http
+        run std::http::serve(port="0", method="POST", path="/function") as server
+        def connect():
+            server::respond([http::ok_text(req.body()) for req in server::requests])
+        connect()
+    "#});
+    cambra::ccl::context::compile_to(&loaded, cambra::ccl::context::Phase::Channelize)
+        .unwrap_or_render(&loaded);
 }

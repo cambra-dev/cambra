@@ -1330,7 +1330,6 @@ fn a_port_a_refused_version_adds_is_released() {
     let adds_a_port = source("guestbook-retypes-state", port).replace(
         "for entry in sign_reqs:",
         indoc! {r#"
-            import std::http as http_api
             run std::http::serve(port="{PORT}", method="GET", path="/other") as http_other_resps
             http_other_resps_replies: Feed(http_api::Response)
             other_reqs = [request.body() for request in http_other_resps::requests]
@@ -1344,9 +1343,11 @@ fn a_port_a_refused_version_adds_is_released() {
         .replace("{PORT}", &added.to_string())
         .trim_end(),
     );
-    live.reload_text(&mut ctx, MAIN_BRANCH, &adds_a_port, &no_main)
+    let error = live
+        .reload_text(&mut ctx, MAIN_BRANCH, &adds_a_port, &no_main)
         .err()
         .expect("`entries` holds a String; the new version declares it an Int");
+    assert!(format!("{error:?}").contains("entries"), "{error:?}");
 
     assert_port_released(added);
     assert_eq!(

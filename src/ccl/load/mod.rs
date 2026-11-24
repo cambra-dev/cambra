@@ -34,7 +34,10 @@ use std::path::Path;
 /// The std root"): each module under `stdlib/src/` that compiles (`stdlib/README.md`).
 const STD_MODULES: &[(&str, &str)] = &[
     ("std", include_str!("../../../stdlib/src/std.cambra")),
-    ("std::http::serve", include_str!("../../../stdlib/src/std/http/serve.cambra")),
+    (
+        "std::http::serve",
+        include_str!("../../../stdlib/src/std/http/serve.cambra"),
+    ),
     (
         "std::http",
         include_str!("../../../stdlib/src/std/http.cambra"),

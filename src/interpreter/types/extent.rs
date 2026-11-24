@@ -7,7 +7,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use intervalsets::{Bounding, Interval, IntervalSet};
 
 use crate::ccl::TagMap;
-use crate::interpreter::{HasDifference, Predicate, Tile};
+use crate::interpreter::{HasDifference, Predicate, Tile, TileGuard};
 use crate::util::fmt_record;
 
 use super::ColumnValue;
@@ -309,8 +309,9 @@ impl Restriction {
 /// Receives a full [`Tile`] so the implementation can apply its own
 /// domain/codomain extraction and deduplication logic.
 pub trait DataSink: Send + Sync {
-    /// Dispatch any not-yet-sent responses contained in `tile`.
-    fn process(&self, tile: &Tile);
+    /// Dispatch responses and return the region consumed. A later pull retains every region
+    /// outside this guard, including response values that are still growing.
+    fn process(&self, tile: &Tile) -> TileGuard;
 }
 
 /// The field names that lead through nested records to a leaf of a source's values.

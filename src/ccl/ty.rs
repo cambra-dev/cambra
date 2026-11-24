@@ -1352,6 +1352,11 @@ impl SourceName {
         self.spelling.as_deref()
     }
 
+    /// Preserve the written alias a type reference uses, independently of its source identity.
+    pub fn set_spelling(&mut self, spelling: impl Into<SmolStr>) {
+        self.spelling = Some(spelling.into());
+    }
+
     /// The source renamed to `name`, reached through the run `run`, which qualifies the
     /// spelling; the root reaches it through none.
     pub fn renamed(&mut self, name: &str, run: Option<&str>) {

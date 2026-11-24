@@ -880,7 +880,10 @@ fn sinks_at(
                     rename_source_expr(
                         chain,
                         &SourceRenames {
-                            names: HashMap::from([(from, at.source_name().to_string())]),
+                            names: HashMap::from([(
+                                from,
+                                crate::ccl::SourceName::from(at.source_name()),
+                            )]),
                             run,
                         },
                     );
@@ -892,13 +895,10 @@ fn sinks_at(
                 }
                 // Missing or refused constant arguments already have a diagnostic at the run.
                 Some(Err(_)) if route.missing_arguments(consts) => {}
-                Some(Err(why)) => errors.push(
-                    LoweringError::unsupported(
-                        statement,
-                        format!("the route declared here has no address in this run: {why}"),
-                    )
-                    .with_related(*span, "the route's address"),
-                ),
+                Some(Err(why)) => errors.push(LoweringError::unsupported(
+                    statement,
+                    format!("the route declared here has no address in this run: {why}"),
+                )),
             },
             #[cfg(test)]
             DeclaredSink::Test { .. } => out.push(sink.clone()),
@@ -1156,7 +1156,8 @@ impl LoweringContext {
                     let output = SinkOutput {
                         subject: match sink {
                             DeclaredSink::Http { route, .. } => Some(format!(
-                                "the response collection for HTTP route {} (call `respond`)", route.describe()
+                                "the response collection for HTTP route `{}` (call `respond`)",
+                                route.describe()
                             )),
                             #[cfg(test)]
                             DeclaredSink::Test { .. } => None,

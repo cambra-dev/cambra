@@ -529,7 +529,8 @@ fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &s
 }
 
 /// A route's address is a string constant: one read from a parameter without `const` is
-/// refused, and so is an argument that is no string in any run, once, at the statement.
+/// refused at its declaration. A non-String constant address is reported at each run that
+/// instantiates it.
 #[rstest]
 #[case::not_a_constant(
     indoc! {r#"
@@ -542,7 +543,8 @@ fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &s
             http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#},
-    "`path` is a parameter without `const`"
+    "`path` is a parameter without `const`",
+    1
 )]
 #[case::not_a_string(
     indoc! {r#"
@@ -555,10 +557,15 @@ fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &s
             http_resps_replies << http_api::ok_text("pong")
         http_resps::respond(http_resps_replies)
     "#},
-    "a route's address is a string, and this run gives `8080`"
+    "a route's address is a string, and this run gives `8080`",
+    2
 )]
 #[timeout(Duration::from_secs(10))]
-fn a_routes_address_is_a_string_constant(#[case] service: &str, #[case] needle: &str) {
+fn a_routes_address_is_a_string_constant(
+    #[case] service: &str,
+    #[case] needle: &str,
+    #[case] reports: usize,
+) {
     let errors = compile_errors(&program(
         indoc! {r#"
             run service(path="/eu") as eu
@@ -566,7 +573,7 @@ fn a_routes_address_is_a_string_constant(#[case] service: &str, #[case] needle: 
         "#},
         &[("service", service)],
     ));
-    assert_eq!(errors.matches(needle).count(), 1, "{errors}");
+    assert_eq!(errors.matches(needle).count(), reports, "{errors}");
 }
 
 /// A module of value parameters: `base` without a default, `step` with one.
@@ -1054,6 +1061,27 @@ fn a_module_borrows_transactional_state_for_its_run() {
 }
 
 #[test]
+fn a_nominal_payload_keeps_the_source_domain_of_its_const_addressed_run() {
+    let loaded = program(
+        "run endpoint(port=\"0\") as route",
+        &[(
+            "endpoint",
+            indoc! {r#"
+        import std::http
+        const param port: String
+        run std::http::serve(port=port, method="POST", path="/batch") as server
+        pub type Batch:
+            new(bodies: server::Reqs |=> String)
+        pub b = Batch::new([r.body() for r in server::requests])
+        server::respond([http::ok_text(r.body()) for r in server::requests])
+    "#},
+        )],
+    );
+    let _ = compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {}))
+        .unwrap_or_render(&loaded);
+}
+
+#[test]
 fn an_http_run_exports_its_source_domain_through_a_forwarding_module() {
     let loaded = program(
         indoc! {r#"
@@ -1093,4 +1121,102 @@ fn a_module_check_reaches_the_imports_of_its_nested_runs() {
     );
     let result = cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded);
     assert!(result.is_ok(), "{result:?}");
+}
+
+const HTTP_ENDPOINT: &str = indoc! {r#"
+    import std::http
+    const param port: String
+    const param method: String = "POST"
+    run std::http::serve(port=port, method=method, path="/forwarded") as server
+    pub Reqs = server::Reqs
+    pub requests = server::requests
+    pub def respond(values: Reqs |=> http::Response):
+        server::respond(values)
+"#};
+
+#[test]
+fn two_forwarding_modules_keep_the_complete_response_domain() {
+    let loaded = program(
+        indoc! {r#"
+            import std::http
+            run gateway(port="0") as route
+            responses: route::Reqs |=> http::Response = [http::ok_text(r.body()) for r in route::requests]
+            route::respond(responses)
+        "#},
+        &[
+            ("endpoint", HTTP_ENDPOINT),
+            (
+                "gateway",
+                indoc! {r#"
+                import std::http
+                const param port: String
+                run endpoint(port=port) as inner
+                pub Reqs = inner::Reqs
+                pub requests = inner::requests
+                pub def respond(values: Reqs |=> http::Response):
+                    inner::respond(values)
+            "#},
+            ),
+        ],
+    );
+    cambra::ccl::context::compile_to(&loaded, cambra::ccl::context::Phase::Channelize)
+        .unwrap_or_render(&loaded);
+}
+
+#[test]
+fn a_forwarded_request_domain_is_named_by_its_public_alias() {
+    let loaded = program(
+        indoc! {r#"
+            run endpoint(port="0") as route
+            values: route::Reqs |=> String = ["wrong"]
+        "#},
+        &[("endpoint", HTTP_ENDPOINT)],
+    );
+    let Err(errors) = cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded)
+    else {
+        panic!("a list has the route's source domain");
+    };
+    let text = cambra::ccl::context::render_errors(&errors.errors, loaded.sources());
+    assert!(text.contains("route::Reqs"), "{text}");
+    assert!(!text.contains("route::server::Reqs"), "{text}");
+}
+
+#[rstest]
+#[case::direct(false)]
+#[case::forwarded(true)]
+fn invalid_route_addresses_point_to_the_root_run(#[case] forwarded: bool) {
+    use cambra::chl_parser::FileId;
+    let root = if forwarded {
+        "run endpoint(port=\"0\", method=\"G T\") as route"
+    } else {
+        "run std::http::serve(port=\"0\", method=\"G T\", path=\"/x\") as route"
+    };
+    let loaded = program(root, &[("endpoint", HTTP_ENDPOINT)]);
+    let Err(errors) = cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded)
+    else {
+        panic!("invalid method compiled");
+    };
+    let text = cambra::ccl::context::render_errors(&errors.errors, loaded.sources());
+    let error = errors
+        .errors
+        .iter()
+        .find(|e| e.message().contains("an HTTP method is a non-empty token"))
+        .unwrap_or_else(|| panic!("{text}"));
+    let span = error.span().unwrap();
+    assert_eq!(span.file, FileId::ROOT, "{text}");
+    assert!(root[span.start..span.end].starts_with("run "), "{text}");
+    assert!(!text.contains("the route's address"), "{text}");
+    if forwarded {
+        assert!(
+            match error {
+                cambra::ccl::context::CompileError::Lower(error) => error.related(),
+                _ => panic!("{text}"),
+            }
+            .iter()
+            .any(|(span, message)| {
+                span.file != FileId::ROOT && message == "the nested route is run here"
+            }),
+            "{text}"
+        );
+    }
 }

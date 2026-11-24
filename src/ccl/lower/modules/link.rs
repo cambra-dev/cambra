@@ -865,10 +865,10 @@ pub(super) struct ProgramLowering<'a> {
     /// interface it runs alone, so its module's own check raises them
     /// ([`ProgramLowering::create`]).
     pub(super) nested: bool,
-    /// The run whose copy's runs are being created, with its statement. An error that a
-    /// copy's arguments give rise to carries a label at it
+    /// The runs whose nested copies are being created, outermost first. An error from a
+    /// copy's arguments carries a label at the innermost run
     /// ([`ProgramLowering::at_enclosing_run`]).
-    pub(super) enclosing: Option<(RunPath, Span)>,
+    pub(super) enclosing: Vec<(RunPath, Span)>,
     /// The checks of each module's imports' type arguments, by the importer
     /// ([`ProgramLowering::import_keys`]).
     pub(super) import_checks: HashMap<FileId, Vec<TypeCheck>>,
@@ -1090,7 +1090,7 @@ impl<'a> ProgramLowering<'a> {
             shared_reached: HashMap::new(),
             checking: false,
             nested: false,
-            enclosing: None,
+            enclosing: Vec::new(),
             import_checks: HashMap::new(),
             errors: Vec::new(),
             method_copies: Vec::new(),
@@ -1142,7 +1142,7 @@ impl<'a> ProgramLowering<'a> {
     /// at the run whose copy that is, when there is one. Each copy of the statement raises
     /// it, and [`in_source_order`] merges them into one error with a label at each.
     fn at_enclosing_run(&self, error: LoweringError) -> LoweringError {
-        match &self.enclosing {
+        match self.enclosing.last() {
             Some((path, statement)) => {
                 error.with_related(*statement, format!("the run `{path}`, whose copy fails"))
             }
@@ -1675,18 +1675,32 @@ impl<'a> ProgramLowering<'a> {
             &mut chain,
             &lowered.interface.source_renames(&arguments.consts, &prefix),
         );
+        let address_statement = self
+            .enclosing
+            .iter()
+            .find_map(|(_, at)| (at.file == self.program.sources().root()).then_some(*at))
+            .unwrap_or(statement);
+        let mut address_errors = Vec::new();
         let declared = sinks_at(
             &lowered.sinks,
             &arguments.consts,
             &mut chain,
             Some(&prefix),
-            statement,
-            &mut self.errors,
+            address_statement,
+            &mut address_errors,
         );
+        self.errors.extend(address_errors.into_iter().map(|error| {
+            if address_statement == statement {
+                error
+            } else {
+                error.with_related(statement, "the nested route is run here")
+            }
+        }));
         ctx.declare_unopened_routes(&declared);
         let mut qualified = own;
         let outer = std::mem::replace(&mut self.nested, true);
-        let enclosing = std::mem::replace(&mut self.enclosing, place.clone());
+        let enclosing_depth = self.enclosing.len();
+        self.enclosing.extend(place.clone());
         let copies = self.method_copies.len();
         let chain = self.expand_runs(
             chain,
@@ -1697,13 +1711,17 @@ impl<'a> ProgramLowering<'a> {
             ctx,
         );
         self.nested = outer;
-        self.enclosing = enclosing;
+        self.enclosing.truncate(enclosing_depth);
         // A copy that a run this one declares recorded reaches this module's type
         // parameters wherever that run's arguments name them, so it takes this run's
         // arguments as its chain does.
         for copy in &mut self.method_copies[copies..] {
             substitute_decl(&mut copy.decl, &defaults);
             substitute_decl(&mut copy.decl, &arguments);
+            super::super::http::rename_source_decl(
+                &mut copy.decl,
+                &lowered.interface.source_renames(&arguments.consts, &prefix),
+            );
         }
         let (sinks, refused) = match &place {
             Some(place) if !self.checking => ctx.register_sinks(&declared, Some(place)),
@@ -1746,6 +1764,11 @@ impl<'a> ProgramLowering<'a> {
             if name.home() == home.as_ref() {
                 names.insert(QualifiedName::new(name.base()), name.clone());
                 if let Some(copy) = method_copy(&lowered.interface, name, &defaults, &arguments) {
+                    let mut copy = copy;
+                    super::super::http::rename_source_decl(
+                        &mut copy.decl,
+                        &lowered.interface.source_renames(&arguments.consts, &prefix),
+                    );
                     self.method_copies.push(copy);
                 }
             }

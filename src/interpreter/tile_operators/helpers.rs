@@ -256,8 +256,9 @@ pub(crate) fn apply_function_tile(
     }
 }
 /// A tile as a column, turning each collection it holds into one map value per row, for the
-/// places one value is required: a store write is one value per key. The inverse of
-/// [`open_collections`].
+/// places one value is required: a store write is one value per key. Collections and
+/// aggregates must be complete; aggregates extract their terminal accumulator. The inverse of
+/// [`open_collections`] on value-shaped tiles.
 ///
 /// Distinct from [`scalar_tile_to_column_value`], which refuses a collection held as a tile:
 /// boxing one is a defect wherever the tile was the point, so the two are separate functions
@@ -265,6 +266,22 @@ pub(crate) fn apply_function_tile(
 pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
     match tile {
         Tile::Scalar(cv) => cv,
+        Tile::Aggregation {
+            kind,
+            accumulator,
+            terminal,
+        } => {
+            assert!(
+                terminal
+                    .as_bools()
+                    .expect("aggregation terminality is Boolean")
+                    .iter()
+                    .all(|v| *v),
+                "a materialized aggregate is complete"
+            );
+            materialize_collections(kind.extract(*accumulator))
+        }
+
         Tile::Record { fields: m, absent } => ColumnValue::Records({
             assert_no_absent_cells(&absent);
             m.into_iter()
@@ -320,6 +337,9 @@ pub(crate) fn materialized_row(tile: Tile) -> Value {
 ///
 /// - `Tiling::Scalar` → `Tile::Scalar(cv)`
 /// - `Tiling::Record` → a [`Tile::Record`] whose fields are each rebuilt recursively
+///
+/// Open a fully materialized value. Nested collections are complete for every supplied row;
+/// a caller fetching only some source rows qualifies their completion by those fetched rows.
 pub(crate) fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
     match tiling {
         Tiling::Scalar(_) => Tile::Scalar(cv),

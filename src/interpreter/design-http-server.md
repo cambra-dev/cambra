@@ -23,11 +23,19 @@ TLS are not implemented.
 
 Response header names are HTTP tokens. Values contain visible ASCII, spaces, and internal tabs;
 leading or trailing whitespace and control characters are rejected. The transport owns
-Content-Length, Transfer-Encoding, Connection, Trailer, and Upgrade; a response that supplies
-those fields receives 500. Repeated Content-Type fields are rejected. Other repeated headers,
+Content-Length, Transfer-Encoding, Connection, Keep-Alive, TE, Proxy-Connection, Trailer, and
+Upgrade; a response that supplies those fields receives 500. Repeated Content-Type fields are rejected. Other repeated headers,
 such as Set-Cookie, retain their order. Field syntax follows
 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-field-values).
 
+A 204 or 304 response has an empty body and omits Content-Length and Transfer-Encoding. A
+nonempty body at either status receives 500. Other final statuses range from 200 through 599.
+
+Checking a module alone verifies its type contracts with its parameters abstract. Response
+completion, response-domain equality after feed assembly, and uniqueness of routes are checked
+when the complete program is assembled from its root
+([Checking a module on its own](../../docs/chl-spec.md#914-checking-a-module-on-its-own)). A module
+may leave a response connection to a caller using its public writer API.
 
 ## How runtime configuration reaches the operators
 
@@ -92,9 +100,10 @@ Request values. Sources continue to return `ColumnValue`; collection-valued fiel
 
 `UIntStreamBuffer<Value>` assigns each admitted request a monotonically increasing key.
 `HttpServerSharedState` retains the corresponding open HTTP request in its pending map.
-The response function preserves those keys. A nominal Response constructor materializes its
-complete payload, including the header list, before emitting the scalar nominal value.
-`SinkConsumer` therefore passes complete response values through the existing `DataSink` protocol.
+The response function preserves those keys. A nominal Response carries its growing payload as a
+union tile. The sink materializes rows only when their payloads, including header lists, are
+complete. It returns the consumed region to `SinkConsumer`, which releases that region to the
+producer. Incomplete rows remain available for later pulls.
 
 The sink decodes the status, repeated headers, and body and removes the pending request before
 sending it. An invalid response header receives 500. Compile-time domain coverage establishes

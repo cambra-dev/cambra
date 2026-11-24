@@ -5,7 +5,7 @@
 use smol_str::SmolStr;
 use std::sync::Mutex;
 
-use crate::interpreter::{DataSink, FuncBinding, Tile, Value, validate_tile};
+use crate::interpreter::{DataSink, FuncBinding, Tile, TileGuard, Value, validate_tile};
 
 /// Why a sink could not state what the program wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,12 +70,13 @@ impl TestSink {
 }
 
 impl DataSink for TestSink {
-    fn process(&self, tile: &Tile) {
+    fn process(&self, tile: &Tile) -> TileGuard {
         let mut slot = self.accumulated.lock().unwrap();
         match slot.as_mut() {
             None => *slot = Some(tile.clone()),
             Some(acc) => acc.merge(tile.clone()),
         }
+        tile.to_guard()
     }
 }
 

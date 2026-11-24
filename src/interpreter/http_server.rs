@@ -28,7 +28,8 @@ use crate::ccl::Type;
 use crate::interpreter::{
     BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent, FuncBinding, Value,
     stream_buffer::UIntStreamBuffer,
-    tiling::{Predicate, Tile},
+    tile_operators::materialize_collections,
+    tiling::{FunctionGuard, Predicate, Tile, TileGuard},
     tuple_field,
 };
 
@@ -105,6 +106,9 @@ fn response_header(name: &str, value: &str) -> Result<Header, String> {
         "Content-Length",
         "Transfer-Encoding",
         "Connection",
+        "Keep-Alive",
+        "TE",
+        "Proxy-Connection",
         "Trailer",
         "Upgrade",
     ]
@@ -145,11 +149,50 @@ fn decode_response(value: &Value) -> Result<(u16, Vec<Header>, String), String> 
     {
         return Err("a response has at most one Content-Type header".into());
     }
-    Ok((
-        status,
-        headers,
-        tuple_part(payload, 2).as_string().to_string(),
-    ))
+    let body = tuple_part(payload, 2).as_string().to_string();
+    if matches!(status, 204 | 304) && !body.is_empty() {
+        return Err("a 204 or 304 response has no body".into());
+    }
+    Ok((status, headers, body))
+}
+
+/// Send a validated response. tiny_http adds Content-Length even for 204, so bodyless
+/// statuses use its raw writer; RFC 9110 section 8.6 forbids that field for 204 and permits
+/// it for 304 only when the corresponding representation's length is known.
+fn send_response(
+    request: tiny_http::Request,
+    status: u16,
+    headers: Vec<Header>,
+    body: String,
+) -> std::io::Result<()> {
+    if matches!(status, 204 | 304) {
+        use std::io::Write;
+        let version = request.http_version().clone();
+        let mut writer = request.into_writer();
+        write!(
+            writer,
+            "HTTP/{version} {status} {}\r\n",
+            tiny_http::StatusCode(status).default_reason_phrase()
+        )?;
+        if !headers.iter().any(|h| h.field.equiv("Date")) {
+            write!(
+                writer,
+                "Date: {}\r\n",
+                httpdate::fmt_http_date(std::time::SystemTime::now())
+            )?;
+        }
+        for header in headers {
+            write!(writer, "{}: {}\r\n", header.field, header.value)?;
+        }
+        writer.write_all(b"\r\n")?;
+        writer.flush()
+    } else {
+        let mut response = Response::from_data(body.into_bytes()).with_status_code(status);
+        for header in headers {
+            response.add_header(header);
+        }
+        request.respond(response)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +518,7 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
 pub struct UnopenedRouteSink;
 
 impl DataSink for UnopenedRouteSink {
-    fn process(&self, _tile: &Tile) {
+    fn process(&self, _tile: &Tile) -> TileGuard {
         unreachable!("a route that was never opened has no client to answer");
     }
 }
@@ -690,6 +733,7 @@ pub fn route_path(path: &str) -> Result<String, String> {
         if b == b'%' {
             let hex = bytes
                 .get(at + 1..at + 3)
+                .filter(|digits| digits.iter().all(u8::is_ascii_hexdigit))
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| format!("`%` in an HTTP path begins two hex digits, in {path:?}"))?;
@@ -771,7 +815,7 @@ impl DataSink for HttpServerSharedState {
     /// Collects request/response pairs from the pending map while holding the
     /// lock, then releases the lock and sends each response outside of it so that
     /// HTTP I/O does not block other threads waiting on the pending map.
-    fn process(&self, tile: &Tile) {
+    fn process(&self, tile: &Tile) -> TileGuard {
         let Tile::DataFunction {
             domain,
             codomain,
@@ -780,44 +824,43 @@ impl DataSink for HttpServerSharedState {
         } = tile
         else {
             debug!("HttpServerSharedState::process: expected a collection, got {tile:?}");
-            return;
+            return tile.to_guard();
         };
         let ColumnValue::UInts(indices) = domain else {
             debug!("HttpServerSharedState::process: expected UInt keys, got {domain:?}");
-            return;
+            return tile.to_guard();
         };
-        let Tile::Scalar(responses) = codomain.as_ref() else {
-            panic!("a nominal HTTP response is a complete value column, got {codomain:?}");
-        };
+        let complete = tile.complete_keys();
+        let ready: Vec<usize> = indices
+            .iter()
+            .enumerate()
+            .filter_map(|(row, key)| {
+                (!deleted.contains(row) && complete.contains_path(&[Value::UInt(*key)]))
+                    .then_some(row)
+            })
+            .collect();
+        let responses = materialize_collections(codomain.select_rows(&ready));
         assert_eq!(
-            indices.len(),
+            ready.len(),
             responses.len(),
             "one response value per request key"
         );
         let to_send: Vec<_> = {
             let mut pending = self.pending.lock().unwrap();
-            indices
+            ready
                 .iter()
                 .enumerate()
-                .filter_map(|(row, idx)| {
-                    if deleted.contains(row) {
-                        return None;
-                    }
+                .filter_map(|(response_row, row)| {
                     pending
-                        .remove(idx)
-                        .map(|req| (req, decode_response(&responses.index_at(row))))
+                        .remove(&indices[*row])
+                        .map(|req| (req, decode_response(&responses.index_at(response_row))))
                 })
                 .collect()
         };
         for (request, response) in to_send {
             match response {
                 Ok((status, headers, body)) => {
-                    let mut response =
-                        Response::from_data(body.into_bytes()).with_status_code(status);
-                    for header in headers {
-                        response.add_header(header);
-                    }
-                    if let Err(e) = request.respond(response) {
+                    if let Err(e) = send_response(request, status, headers, body) {
                         debug!("HTTP respond error: {e}");
                     }
                 }
@@ -829,6 +872,7 @@ impl DataSink for HttpServerSharedState {
                 }
             }
         }
+        TileGuard::Function(FunctionGuard::Domain(complete))
     }
 }
 
@@ -1000,6 +1044,15 @@ mod tests {
 
     /// Equivalent spellings of a path share one normal form, and distinct paths keep distinct
     /// ones (RFC 3986, "6.2.2. Syntax-Based Normalization").
+    #[test]
+    fn percent_encodings_require_two_hexadecimal_digits() {
+        for path in ["/%+1", "/%+e", "/%-1", "/%0g", "/%a"] {
+            assert!(route_path(path).is_err(), "{path}");
+        }
+        assert_eq!(route_path("/%2f").unwrap(), "/%2F");
+        assert_eq!(route_path("/%61").unwrap(), "/a");
+    }
+
     #[test]
     fn a_path_takes_its_normal_form() {
         for (path, normal) in [

@@ -63,7 +63,7 @@ impl LoweringContext {
         program: &Expr,
     ) -> Result<(), crate::ccl::provenance::Located<String>> {
         use crate::ccl::{infer::solver, provenance::Located};
-        let sink_domains = std::mem::take(&mut self.sink_domains);
+        let mut sink_domains = std::mem::take(&mut self.sink_domains);
         if sink_domains.is_empty() {
             return Ok(());
         }
@@ -81,7 +81,7 @@ impl LoweringContext {
             )
         };
         for field in fields {
-            let Some((required, route)) = sink_domains.get(&field.label) else {
+            let Some((required, route)) = sink_domains.remove(&field.label) else {
                 continue;
             };
             let actual = field
@@ -92,10 +92,10 @@ impl LoweringContext {
                 .expect("a sink receives a data function");
             let mut cache = solver::ConstrainCache::new();
             let agrees =
-                solver::constrain_subtype_in(&actual, required, &mut cache, &solver::smt::NoScope)
+                solver::constrain_subtype_in(&actual, &required, &mut cache, &solver::smt::NoScope)
                     .and_then(|()| {
                         solver::constrain_subtype_in(
-                            required,
+                            &required,
                             &actual,
                             &mut cache,
                             &solver::smt::NoScope,
@@ -112,6 +112,10 @@ impl LoweringContext {
                 ));
             }
         }
+        debug_assert!(
+            sink_domains.is_empty(),
+            "every registered sink contract matches an output field"
+        );
         Ok(())
     }
 }

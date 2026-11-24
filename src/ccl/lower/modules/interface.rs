@@ -525,15 +525,31 @@ impl Interface {
         consts: &HashMap<TypeParamId, ConstTerm>,
         run: &'a str,
     ) -> crate::ccl::lower::http::SourceRenames<'a> {
+        let mut names: HashMap<String, crate::ccl::SourceName> = self
+            .routes
+            .iter()
+            .map(|route| match route.at(consts) {
+                Some(Ok((at, from))) => (from, at.source_name().into()),
+                _ => (route.source_name().to_string(), route.source_name().into()),
+            })
+            .collect();
+        let mut aliases: Vec<_> = self
+            .types
+            .iter()
+            .filter(|(_, member)| member.public)
+            .collect();
+        aliases.sort_by_key(|(name, _)| *name);
+        let mut spelled = HashSet::new();
+        for (alias, member) in aliases {
+            if let AliasType::Type(Type::DataSource(source)) = &member.ty
+                && spelled.insert(source.as_str())
+                && let Some(to) = names.get_mut(source.as_str())
+            {
+                to.set_spelling(format!("{run}::{alias}"));
+            }
+        }
         crate::ccl::lower::http::SourceRenames {
-            names: self
-                .routes
-                .iter()
-                .filter_map(|route| match route.at(consts) {
-                    Some(Ok((at, from))) => Some((from, at.source_name().to_string())),
-                    _ => None,
-                })
-                .collect(),
+            names,
             run: Some(run),
         }
     }
@@ -842,7 +858,9 @@ impl Interface {
                     let at = match route.at(&qualifier.types.consts) {
                         Some(Ok((at, _))) => at,
                         None => route.clone(),
-                        Some(Err(_)) => continue,
+                        // Creating the run reports an invalid address. Retain its template
+                        // so forwarding the module does not erase that declaration.
+                        Some(Err(_)) => route.clone(),
                     };
                     if !routes.iter().any(|r| r.source_name() == at.source_name()) {
                         routes.push(at);

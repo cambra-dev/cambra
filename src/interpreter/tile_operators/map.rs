@@ -1435,10 +1435,10 @@ impl TileProducer for MapResultWithSourceProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    /// Each value is the source's at the input's value under the same path, so the output keeps
-    /// the input's keys at every level.
+    /// The input and output share keys through the input's value level. Fields opened from
+    /// the source's returned value have no corresponding input level.
     fn restates(&self) -> Restates {
-        Restates::Every
+        Restates::Above(CurryLevel::values_of(self.input.tiling()))
     }
 
     /// The source is read at the keys the input answers, and the input is pulled at the

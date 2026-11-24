@@ -1816,8 +1816,9 @@ mod tests {
         #[derive(Default)]
         struct Counting(Mutex<usize>);
         impl DataSink for Counting {
-            fn process(&self, _tile: &Tile) {
+            fn process(&self, tile: &Tile) -> TileGuard {
                 *self.0.lock().unwrap() += 1;
+                tile.to_guard()
             }
         }
 

@@ -172,7 +172,7 @@ impl TileProducer for RekeySortedProducer {
             }
             other => panic!("RekeySorted expected pairs, got {other:?}"),
         };
-        let (Some(keys), Some(values)) = (keys, values) else {
+        let (Some(keys), Some(mut values)) = (keys, values) else {
             panic!("RekeySorted expected pairs of a scalar key and a value")
         };
         let rows: Vec<(Value, Value)> = (0..positions.len())
@@ -209,6 +209,28 @@ impl TileProducer for RekeySortedProducer {
                 None => Predicate::False,
             }
         };
+        if values.holds_a_level() {
+            // Nested statements name the input positions. Extracting each value removes
+            // that position; placing it under its new key qualifies the statements there.
+            let source_values = Tile::data_function(
+                positions,
+                Box::new(values),
+                domain_predicate,
+                deleted.clone(),
+            );
+            let level = CurryLevel::new(1);
+            values = self.tiling().values_at(level).empty_at_no_rows();
+            for (row, (key, _)) in self.held.iter().enumerate() {
+                let mut value = source_values
+                    .group_at(level, row)
+                    .expect("a re-keyed value has an input row")
+                    .into_owned();
+                value.map_level_predicates(&mut |depth, pred| {
+                    pred.beneath(std::slice::from_ref(key), depth)
+                });
+                values.merge_rows(value);
+            }
+        }
         let mut out = Tile::data_function(keys, Box::new(values), complete, deleted);
         // The rows above a gap in the released keys, which the input still holds.
         let released = self.obsolete_guard().clone();
@@ -321,6 +343,82 @@ mod tests {
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2]));
         assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30])));
         assert_eq!(domain_predicate, Predicate::at_or_below(uint(1)));
+    }
+
+    #[test]
+    fn nested_variant_statements_follow_the_new_keys() {
+        use crate::ccl::{FieldKey, TagMap};
+        use crate::interpreter::UnionArmTile;
+
+        let tag = FieldKey::Name("payload".into());
+        let value_tiling = Tiling::Union(TagMap::from_arms(vec![(
+            tag.clone(),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        )]));
+        let input_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(Extent::Base(BaseType::UInt))),
+                (tuple_field(1), value_tiling),
+            ])),
+        );
+        let nested = Tile::grouped(
+            vec![0, 1],
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            Predicate::qualified(Predicate::point(uint(7)), Predicate::point(uint(0))).union(
+                &Predicate::qualified(Predicate::point(uint(9)), Predicate::point(uint(1))),
+            ),
+            BitSet::new(),
+        );
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![7, 9]),
+            Box::new(Tile::record(HashMap::from([
+                (tuple_field(0), Tile::Scalar(ColumnValue::UInts(vec![0, 2]))),
+                (
+                    tuple_field(1),
+                    Tile::Union(TagMap::from_arms(vec![(
+                        tag.clone(),
+                        UnionArmTile {
+                            rows: vec![0, 1],
+                            tile: nested,
+                        },
+                    )])),
+                ),
+            ]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let (spy, _) = ReleaseSpy::new(input, input_tiling.clone());
+        let (tiling, key) = rekeyed_tiling(&input_tiling);
+        let mut producer = RekeySortedProducer {
+            base: ProducerBase::unowned(RekeySortedProducer::alloc_id(), &tiling),
+            input: Box::new(spy),
+            held: Vec::new(),
+            complete_through: None,
+            key,
+        };
+        let out = producer.get(tiling.universal_guard());
+        let Tile::DataFunction { codomain, .. } = out else {
+            panic!("a collection")
+        };
+        let Tile::Union(arms) = *codomain else {
+            panic!("a variant")
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &arms.get(&tag).unwrap().tile
+        else {
+            panic!("a collection payload")
+        };
+        assert!(domain_predicate.contains_path(&[uint(0), uint(0)]));
+        assert!(domain_predicate.contains_path(&[uint(2), uint(1)]));
+        assert!(!domain_predicate.contains_path(&[uint(0), uint(1)]));
+        assert!(!domain_predicate.contains_path(&[uint(7), uint(0)]));
+        assert!(!domain_predicate.contains_path(&[uint(9), uint(1)]));
     }
 
     /// A prefix of keys is released as the prefix of positions that carries them.
