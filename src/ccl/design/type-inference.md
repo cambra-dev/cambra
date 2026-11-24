@@ -2979,8 +2979,8 @@ in one source signature share a group. The contribution crosses the
 target and earlier parameters in that group, except names explicitly mentioned in the history
 annotation. Thus `def emit(v: Int, out: Feed(_))` does not infer a write contract depending on the
 particular value of `v`. An explicit dependency in a written element type remains in scope.
-Nested source functions start their own parameter groups. Compiler aliases retain their target's
-origin (`InferCtx::target_origin`); source `=` bindings read values and create no writable aliases.
+Nested source functions start their own parameter groups. A place is identified by its declaration
+or borrowed parameter; source `=` bindings read values and create no writable aliases.
 The same declaration identity determines storage scope and feed-place count. Every feed uses
 `require_feed`; an unknown incoming contract falls back to the ordinary contribution join there.
 

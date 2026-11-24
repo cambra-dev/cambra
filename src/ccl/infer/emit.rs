@@ -1565,7 +1565,10 @@ fn call_arity(function: &Expr, fn_ty: &Type, list: Option<usize>) -> Result<(), 
 /// else (`lower::exprs::lower_call_arg`). A value is never lent, and lending a path from a place
 /// is planned (`docs/chl-spec.md`, "Places and values"), so a borrow lends a whole place variable.
 fn emit_borrow<C: Typing>(place: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
-    let root = path_root(place).expect("lowering lends only a name or a path from one");
+    let Some(root) = path_root(place) else {
+        // Recovery can leave an error placeholder under a borrow's path.
+        return ctx.subexpr(place);
+    };
     let node = place.node_id();
     let refuse = |defect| {
         Err(LocatedInferError::new(
@@ -1585,7 +1588,7 @@ fn emit_borrow<C: Typing>(place: &mut Expr, ctx: &mut C) -> Result<Type, Located
     }
     let ty = ctx.subexpr(place)?;
     // A parameter that borrows has no place type yet where its body is emitted.
-    if !ty.is_place() && !matches!(ty, Type::Infer(_)) {
+    if !ty.is_place() && !(matches!(ty, Type::Infer(_)) && ctx.binds_place(&root)) {
         return refuse(crate::ccl::infer::PlaceDefect::BorrowsAValue);
     }
     Ok(ty)

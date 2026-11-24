@@ -1338,6 +1338,75 @@ fn predicates_hold_type(
     found
 }
 
+/// A definition stays in the scope that declares its Feed. Check after inlining, before
+/// transaction and induction lowering consume statement chains that cannot contain `Define`.
+pub(crate) fn check_definition_scopes(expr: &Expr) -> Result<(), Located<DeferError>> {
+    fn go(
+        expr: &Expr,
+        depth: usize,
+        declarations: &mut HashMap<Name, usize>,
+    ) -> Result<(), Located<DeferError>> {
+        match &expr.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } if matches!(bound_expr.node, TypedExprNode::Defer) => {
+                let previous = declarations.insert(binding.name.clone(), depth);
+                let result = go(body, depth, declarations);
+                if let Some(previous) = previous {
+                    declarations.insert(binding.name.clone(), previous);
+                } else {
+                    declarations.remove(&binding.name);
+                }
+                return result;
+            }
+            TypedExprNode::Define { name, .. }
+                if declarations
+                    .get(name)
+                    .is_some_and(|declared| *declared != depth) =>
+            {
+                return Err(Located::new(
+                    DeferError::NestedDefinition(name.clone()),
+                    expr.node_id(),
+                ));
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                go(iter, depth, declarations)?;
+                return go(body, depth + 1, declarations);
+            }
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+                ..
+            } => {
+                if let Some(scrutinee) = scrutinee {
+                    go(scrutinee, depth, declarations)?;
+                }
+                for branch in branches {
+                    go(&branch.guard, depth + 1, declarations)?;
+                    go(&branch.body, depth + 1, declarations)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        let depth = depth
+            + usize::from(matches!(
+                expr.node,
+                TypedExprNode::Lambda { .. } | TypedExprNode::Begin { .. }
+            ));
+        let mut result = Ok(());
+        expr.walk_children(|child| {
+            if result.is_ok() {
+                result = go(child, depth, declarations);
+            }
+        });
+        result
+    }
+    go(expr, 0, &mut HashMap::new())
+}
+
 /// Report the first error in a `defer` block that a refinement predicate in `expr` holds.
 ///
 /// This pass leaves a predicate holding a `defer` in source form, and planning channelizes

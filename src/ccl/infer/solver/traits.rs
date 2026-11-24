@@ -5000,15 +5000,11 @@ fn offer(
 }
 
 /// Whether `ty`, refinements peeled, is a structural collection: a data function, a sum over
-/// one, or a feed place, which reads as its collection. A function whose kind is not settled
+/// one. A function whose kind is not settled
 /// yet counts, and a compute function does not: a function that is only called is no collection.
 pub fn is_structural_collection(ty: &Type) -> bool {
     match ty.peel_refinements() {
         Type::Fun { fun_kind, .. } => fun_kind.resolved() != crate::ccl::ty::KindPin::Compute,
-        Type::History {
-            history_kind: crate::ccl::HistoryKind::Append,
-            ..
-        } => true,
         _ => false,
     }
 }

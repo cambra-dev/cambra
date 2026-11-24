@@ -717,6 +717,10 @@ pub struct LoweringContext {
     /// on entering its body scope, pop on exit (see [`LoweringContext::with_shadowed`]).
     pub(super) shadow_depth: HashMap<String, usize>,
 
+    /// Unannotated function parameters at the shadow depth of their own binder. A write may
+    /// infer that such a parameter borrows; an inner local with its spelling remains a value.
+    pub(super) unannotated_parameters: HashMap<String, usize>,
+
     /// Whether lowering is currently inside a refinement predicate `{T where p}`
     /// (§6.4). The predicate's anonymous subject is written `_`, and while this
     /// flag is set a bare `_` in *term* position lowers to the reserved
@@ -752,6 +756,9 @@ pub struct LoweringContext {
     pub(super) run_use_reads: HashMap<crate::ccl::provenance::NodeId, Span>,
     /// The compiler reference and output label of each registered sink, by its key.
     pub(super) sink_reads: HashMap<String, (Name, Label)>,
+    /// User-facing subjects for compiler-owned deferred outputs, by declaration identity.
+    pub(super) sink_subjects: HashMap<Name, String>,
+
     /// The sinks the module being lowered declares, in the order lowered, which
     /// each run of it registers ([`Self::register_sinks`]).
     declared_sinks: Vec<DeclaredSink>,
@@ -826,6 +833,7 @@ enum DeclaredSink {
 }
 
 struct SinkOutput {
+    subject: Option<String>,
     key: String,
     binding: String,
     label: Label,
@@ -1145,6 +1153,13 @@ impl LoweringContext {
             };
             match bound.and_then(|sink| self.register_sink_binding(key(name), sink, span)) {
                 Ok(()) => registered.push(SinkOutput {
+                    subject: match sink {
+                        DeclaredSink::Http { route, .. } => Some(format!(
+                            "the response collection for HTTP route `{route}` (call `respond`)"
+                        )),
+                        #[cfg(test)]
+                        DeclaredSink::Test { .. } => None,
+                    },
                     key: key(name),
                     binding: binding.clone(),
                     label: match run {
@@ -1480,6 +1495,12 @@ impl LoweringContext {
         self.shadow_depth.get(name).is_some_and(|&depth| depth > 0)
     }
 
+    pub(super) fn is_unannotated_parameter(&self, name: &str) -> bool {
+        self.unannotated_parameters
+            .get(name)
+            .is_some_and(|depth| self.shadow_depth.get(name) == Some(depth))
+    }
+
     /// Mint a unique `__result_N` name for the feed place a generator function's `Defer`
     /// declares.
     ///
@@ -1553,6 +1574,9 @@ impl LoweringContext {
     /// How a diagnostic names the deferred binding `name`: the call a minted channel stands
     /// for, or the binding the program wrote, `deferred binding 'out'`.
     pub fn deferred_subject(&self, name: &Name) -> String {
+        if let Some(subject) = self.sink_subjects.get(name) {
+            return subject.clone();
+        }
         match self.minted_channels.get(name.base()) {
             Some(spelled) => spelled.clone(),
             None => format!("deferred binding '{}'", name.base()),
@@ -1612,7 +1636,7 @@ fn lower_expr_inner(
     match &expr.node {
         ChlExpr::Borrow(_) => Err(LoweringError::unsupported(
             expr.span,
-            "a borrow is only allowed as an argument to a borrowing parameter or a method receiver",
+            "a borrow is only allowed as an argument to a borrowing parameter",
         )),
         ChlExpr::Lit(lit) => lower_constant(lit),
         ChlExpr::Name(id) => {

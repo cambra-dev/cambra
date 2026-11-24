@@ -1955,18 +1955,8 @@ fn seed_pairings_go(
                 }
             }
         }
-        // A feed place type reads through to its read view, its `function`, during coalescing
-        // (`dissolve_read_feeds`), so the use side may be the dissolved `Fun` where the
-        // definition still carries the `History`, or the other way round. Either way the
-        // functions pair.
         (Type::History { function: uv, .. }, Type::History { function: dv, .. }) => {
             seed_pairings_go(uv, dv, lim, out, seen)
-        }
-        (Type::Fun { .. }, Type::History { function: dv, .. }) => {
-            seed_pairings_go(use_ty, dv, lim, out, seen)
-        }
-        (Type::History { function: uv, .. }, Type::Fun { .. }) => {
-            seed_pairings_go(uv, def_ty, lim, out, seen)
         }
         _ => {}
     }

@@ -280,8 +280,8 @@ a user's `` `some `` builds that module's own tag.
 - **A run performs its module's whole top level**: its state, loops, sources, and sinks. Lowering
   declares a sink (`LoweringContext::declared_sinks`), and creating a run registers it keyed by the
   run path, `eu::out` (`LoweringContext::register_sinks`). The program's tail reads it through the
-  binder the run's chain minted (`LoweringContext::run_sink_names`). A run's mutable variables are
-  labeled by run path in history records, so two runs keep two histories.
+  compiler reference the run's chain binds. A run's mutable variables are labeled by run path
+  in history records, so two runs keep two histories.
 - **A run exports ordinary value bindings.** With a private `out: Feed(_)` and `pub events = out`,
   `a::events` reads the run's final collection. An input function such as `a::emit(e)` contributes
   through the private place. Exporting a writer keeps that Feed's `Append` effect beyond the
@@ -354,7 +354,7 @@ top-level member, public and private, so that `m::hidden` can say the member is 
 
 | Member | Recorded |
 | --- | --- |
-| value, `def`, mutable variable, feed | its visibility, its statement, and for a `def` whether it takes a `Mut` parameter |
+| value, `def`, mutable variable, feed | its visibility and its statement |
 | type alias | its visibility, its statement, and its type as its module lowered it |
 | nominal type | its declaration, whose constructors are its module's alone when it is `abstract` (`NominalDecl::is_abstract`), its visibility and statement, and each associated function's visibility, statement and arity, and whether it is a method (`NominalMember`) |
 | trait | its declaration, visibility and statement (`TraitMember`) |
@@ -703,8 +703,9 @@ linked as though it were the root, with its own parameters abstract:
 - **The module's chain**, copied. A value parameter, and each value entry of a Module-typed
   parameter, is a `let` of `Abstract` at its type, a value known only by its type
   ([ir.md, "`Abstract` — a value known only by its
-  type"](../src/ccl/design/ir.md#abstract--a-value-known-only-by-its-type)). A feed entry is a `let`
-  of `Defer`. A default with an annotation is checked against it.
+  type"](../src/ccl/design/ir.md#abstract--a-value-known-only-by-its-type)). A place parameter is
+  abstract at its place type. Public Module entries are values. A default with an annotation is
+  checked against it.
 - **Its type parameters** are opened for the whole check (`infer::check_module`). `T <: B`, and an
   abstract type member of a Module-typed parameter, is an opened parameter, opaque apart from its
   bound. A bare `T` is one inference variable at the module's level.

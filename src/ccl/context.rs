@@ -442,6 +442,27 @@ impl<'a> Blame<'a> {
             .collect()
     }
 
+    /// The outermost statement that instantiates `name`'s declaration in this program.
+    fn declaration_run(&self, name: &Name) -> Option<Span> {
+        let runs = self.runs?;
+        let mut home = name.home()?;
+        let mut found = None;
+        loop {
+            if let Some(sites) = runs.statements.get(home) {
+                for (span, _) in sites {
+                    found = Some(*span);
+                    if span.file == self.program.file {
+                        return found;
+                    }
+                }
+            }
+            let Some(parent) = runs.parents.get(home) else {
+                return found;
+            };
+            home = parent;
+        }
+    }
+
     /// A blame over the same lowering projection, with no phase projections:
     /// one for another tree, which its own phases derive.
     fn fresh(&self) -> Blame<'a> {
@@ -605,6 +626,31 @@ impl<'a> Blame<'a> {
             }
             error => error,
         }
+    }
+
+    fn channelize(
+        &self,
+        Located { error, node_id, .. }: Located<channelize::DeferError>,
+        lowering: &LoweringContext,
+    ) -> Vec<CompileError> {
+        let declared = self.span(node_id, None);
+        let span = if matches!(error, channelize::DeferError::NoFeedOrDefine(_)) {
+            self.declaration_run(error.defer()).unwrap_or(declared)
+        } else {
+            declared
+        };
+        let subject = lowering.deferred_subject(error.defer());
+        let mut related = self.run_labels(node_id, declared, None);
+        related.retain(|(at, _)| *at != span);
+        if span != declared {
+            related.push((declared, "the unfilled output is declared here".to_string()));
+        }
+        vec![CompileError::ChannelizeDefers {
+            error,
+            subject,
+            span,
+            related,
+        }]
     }
 
     fn unsupported(&self, error: Located<String>, tree: Option<&Expr>) -> Vec<CompileError> {
@@ -3208,6 +3254,8 @@ fn run_passes(
         return Ok(expr);
     }
     inline::check_calls_resolved(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
+    channelize::check_definition_scopes(&expr)
+        .map_err(|error| blame.channelize(error, ctx.lowering_ctx()))?;
 
     // Transactional slice of the unified phase: rewrite every `with begin():`
     // writer of a `Mut(_, Txn)` mutable variable into a `get_prev_txn`-guarded `LetRec`
@@ -3328,16 +3376,7 @@ fn run_passes(
     let channelized = recorded(capture_provenance, Phase::Channelize, || {
         channelize::run(phase_out)
     })
-    .map_err(|Located { error, node_id, .. }| {
-        let span = blame.span(node_id, None);
-        let subject = ctx.lowering_ctx().deferred_subject(error.defer());
-        vec![CompileError::ChannelizeDefers {
-            error,
-            subject,
-            span,
-            related: blame.run_labels(node_id, span, None),
-        }]
-    })?;
+    .map_err(|error| blame.channelize(error, ctx.lowering_ctx()))?;
     settle(
         &channelized,
         "post-channelize",

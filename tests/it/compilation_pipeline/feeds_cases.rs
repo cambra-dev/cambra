@@ -46,6 +46,100 @@ fn induction_parameter_cannot_be_captured_by_writer() {
     );
 }
 
+#[test]
+fn a_captured_callback_separates_transactional_reads() {
+    check_scalar(
+        indoc! {r#"
+        balance: Mut(Int, Txn) := 10
+        def deposit(amount):
+            balance += amount
+        def apply(callback, value):
+            callback(value)
+        difference: Feed(Int)
+        with begin():
+            before = balance
+            apply(deposit, 5)
+            after = balance
+            difference << after - before
+        sum(difference)
+    "#},
+        Value::Int(5),
+    );
+}
+
+#[rstest]
+#[case::effect_top("() => Int causes Effect")]
+#[case::write_top("() => Int causes Write(*)")]
+#[case::append_top("() => Int causes Append(*)")]
+fn a_place_cannot_store_a_function_that_may_act_on_places(#[case] action: &str) {
+    let code = formatdoc! {r#"
+        out: Feed({action})
+        0
+    "#};
+    check_compile_error(&code, "inside a place");
+}
+
+#[test]
+fn an_unannotated_transactional_writer_borrows_its_parameters() {
+    check_scalar(
+        indoc! {r#"
+        def transfer(src, dst, amount):
+            with begin():
+                src := src - amount
+                dst := dst + amount
+        a: Mut(Int, Txn) := 100
+        b: Mut(Int, Txn) := 0
+        transfer(&a, &b, 30)
+        await_final(a) + await_final(b) * 10
+    "#},
+        Value::Int(370),
+    );
+}
+
+#[test]
+fn a_value_argument_is_read_before_the_call_borrows_the_same_place() {
+    check_scalar(
+        indoc! {r#"
+        def bump(value, counter: Mut(Int)):
+            counter += value
+        x := 1
+        bump(x, &x)
+        x
+    "#},
+        Value::Int(2),
+    );
+}
+
+#[test]
+fn a_computed_value_cannot_be_borrowed_while_its_type_is_inferred() {
+    check_compile_error(
+        indoc! {r#"
+        def bump(c):
+            c += 1
+        counter := 1
+        y = counter + 1
+        bump(&y)
+        counter
+    "#},
+        "cannot borrow `y`: it is a value",
+    );
+}
+
+#[test]
+fn iteration_of_a_feed_argument_reads_its_collection() {
+    check_scalar(
+        indoc! {r#"
+        def each(xs):
+            [x + 1 for x in xs]
+        out: Feed(Int)
+        out << 1
+        out << 2
+        sum(each(out))
+    "#},
+        Value::Int(5),
+    );
+}
+
 #[rstest]
 #[case::bare_feed_result(indoc! {r#"
     def make(value):
@@ -183,11 +277,11 @@ fn places_and_values(#[case] code: &str, #[case] expected: i64) {
 
 #[rstest]
 #[case::a_value_parameter_does_not_borrow(indoc! {r#"
-    def identity(value):
-        value
+    def inc(value):
+        value + 1
     counter := 7
-    identity(&counter)
-"#}, "`value` is a value parameter, so it cannot borrow")]
+    inc(&counter)
+"#}, "expected Int, found Mut(")]
 #[case::a_returned_writer_cannot_capture_a_borrow(indoc! {r#"
     def make(out: Feed(Int)):
         def emit(value):
@@ -269,7 +363,7 @@ fn places_and_values(#[case] code: &str, #[case] expected: i64) {
     counter := 7
     saved = &counter
     saved
-"#}, "a borrow is only allowed as an argument to a borrowing parameter or a method receiver")]
+"#}, "a borrow is only allowed as an argument to a borrowing parameter")]
 #[case::a_partial_call_cannot_hold_a_borrow(indoc! {r#"
     def emit(out: Feed(Int), value):
         out << value
@@ -541,10 +635,8 @@ fn a_module_declares_a_feed_for_its_caller() {
         out << value
         sum(saved)
     out: Feed(Int)
-    emit(&out, 1)
-    emit(&out, 2)
-    sum(out)
-"#}, 3)]
+    emit(&out, 1) + sum(out)
+"#}, 2)]
 #[case::plain_parameter(indoc! {r#"
     def identity(value):
         value
@@ -3701,4 +3793,37 @@ fn correlated_inner_payload_keeps_mapped_and_nested_domains(
     #[case] expected: i64,
 ) {
     check_scalar(program, Value::Int(expected));
+}
+
+#[rstest]
+#[case::loop_body(indoc! {r#"
+    for unused in [0]:
+        connect()
+"#})]
+#[case::transaction_body(indoc! {r#"
+    with begin():
+        connect()
+"#})]
+fn a_called_definition_cannot_escape_its_statement_scope(#[case] call: &str) {
+    let code = formatdoc! {r#"
+        out: Feed(Int)
+        def connect():
+            out <<= [1]
+        {call}
+        sum(out)
+    "#};
+    check_compile_error(&code, "<<= must occur as a top-level statement");
+}
+
+#[test]
+fn a_place_cannot_store_a_nominal_writer_payload() {
+    check_compile_error(
+        indoc! {r#"
+        type Callback:
+            new(call: () => Int causes Write(*))
+        out: Feed(Callback)
+        0
+    "#},
+        "inside a place",
+    );
 }

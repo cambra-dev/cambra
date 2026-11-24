@@ -196,10 +196,11 @@ pub fn run(expr: Expr) -> Expr {
     let out = {
         let _g = provenance::enter(root_id, "anf.hoist", Nature::Machinery);
         let mut expr = expr;
+        crate::ccl::place::resolve_borrow_bindings(&mut expr);
         if holds_raise(&expr) {
             short_circuits_as_branches(&mut expr);
         }
-        let muts = Muts::of_program(&expr);
+        let muts = Muts::new();
         let normalized = normalize(expr, &muts);
         share_collection_reads(normalized)
     };
@@ -473,7 +474,12 @@ fn normalize_let(e: Expr, muts: &Muts) -> Expr {
     };
     let bound_expr = normalize(*bound_expr, muts);
     let (binds, bound_expr) = peel(bound_expr);
-    let body = normalize(*body, muts);
+    let inner = if binding.parameter_mode == crate::ccl::place::ParameterMode::Borrow {
+        under_params(muts, std::slice::from_ref(&binding))
+    } else {
+        std::borrow::Cow::Borrowed(muts)
+    };
+    let body = normalize(*body, &inner);
     let_chain(
         binds,
         rebuilt_as(
@@ -874,7 +880,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             init,
             body,
         } => {
-            let inner = with(muts, &binding.name);
+            let inner = with(muts, &binding);
             rebuild(TypedExprNode::MutDecl {
                 init: Box::new(normalize(*init, muts)),
                 body: Box::new(normalize(*body, &inner)),
@@ -1169,26 +1175,8 @@ fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
     }
 }
 
-/// [`atomize`], except at a **place position**: a bare reference to a mutable
-/// variable is left exactly where it stands.
-///
-/// A read is named to put it in sequence with the writes around it
-/// ([`is_atomic`]), but two of the three positions a place variable survives in are not
-/// reads at all (`src/ccl/design/mutability.md`, "A mutable variable read is an
-/// explicit operation"): an application's argument, where `emit_apply` relates
-/// a bare reference to a `Mut` parameter, and an application's function, which
-/// is where a proven keyed read `m[k]!` puts the collection. Naming either leaves
-/// the recognizer a `Var` it cannot read through, so each keeps whatever ordering
-/// it had.
-///
-/// Which argument positions borrow is not knowable here —
-/// it is a question about the callee's parameter, and inference has not run
-/// (`crate::ccl::mut_read`, "What ends a segment"). So a read in an argument
-/// position is still performed at the call, after any write an argument beside
-/// it performs. A call of several arguments to a callee that may borrow one
-/// keeps its argument tuple in place, each component a place position
-/// ([`Muts::borrows`]); any other call's tuple is one compound operand, its
-/// reads named in written order.
+/// Retain a whole mutable place in an explicit borrow or an `await_final` operand.
+/// Ordinary arguments are value positions; [`atomize`] names their reads in source order.
 fn atomize_place(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     if is_mut_var(&e, muts) {
         return (Vec::new(), e);

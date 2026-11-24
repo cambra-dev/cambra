@@ -427,7 +427,7 @@ fn write_or_let(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let occurrence = ctx.occurrence_at(name_span);
-    if ctx.is_shadowed(&name) {
+    if ctx.is_shadowed(&name) && !ctx.is_unannotated_parameter(&name) {
         return Ok(ctx.tag_image(Expr::let_bind(name, occurrence, val, chain), stmt_span));
     }
     let write = ctx.tag_image(Expr::mut_write(name, occurrence, val), stmt_span);

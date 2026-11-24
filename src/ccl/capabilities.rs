@@ -544,6 +544,8 @@ impl Hash for Raised {
 
 impl Effect {
     /// The variable this names, if it names one.
+    /// The variable this names: `x` in `Write(x)`, `WriteTxn(x)`, `Append(x)`, `Read(x)` and
+    /// `ReadTxn(x)`.
     pub fn variable(&self) -> Option<&Name> {
         match self {
             Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
@@ -1624,6 +1626,33 @@ impl Capability {
         }
     }
 
+    /// Whether this may contain `item`, including what a top or clause parameter allows.
+    pub fn may_include(&self, item: &Capability) -> bool {
+        match self {
+            Capability::Every(top) => top.overlaps(item),
+            Capability::Param(param) => Every::of_direction(param.of_causes)
+                .less(
+                    param
+                        .except
+                        .iter()
+                        .chain(&param.param.clause_except)
+                        .cloned(),
+                )
+                .overlaps(item),
+            concrete => match item {
+                Capability::Every(top) => top.holds(concrete),
+                item => concrete == item,
+            },
+        }
+    }
+
+    /// Whether this may write a mutable variable or contribute to a feed.
+    pub fn may_act_on_a_place(&self) -> bool {
+        [Family::Write, Family::WriteTxn, Family::Append]
+            .into_iter()
+            .any(|family| self.may_include(&Capability::Every(family.top())))
+    }
+
     /// The families whose capabilities order a loop whose body causes one (`docs/chl-spec.md`,
     /// "Ordered loops"): a write, and an exception escaping the iteration.
     /// [`Self::orders_a_loop`] and [`Self::may_order_a_loop`] read it.
@@ -1650,14 +1679,9 @@ impl Capability {
     /// [`orders_a_loop`](Self::orders_a_loop), or a clause parameter whose bound, less its
     /// `except`, may hold such a capability.
     pub fn may_order_a_loop(&self) -> bool {
-        match self {
-            Capability::Param(p) if p.of_causes => Self::ORDERING.into_iter().any(|f| {
-                Every::of_direction(true)
-                    .less(p.except.iter().chain(&p.param.clause_except).cloned())
-                    .overlaps(&Capability::Every(f.top()))
-            }),
-            other => other.orders_a_loop(),
-        }
+        Self::ORDERING
+            .into_iter()
+            .any(|family| self.may_include(&Capability::Every(family.top())))
     }
 }
 
@@ -2363,6 +2387,10 @@ impl CapabilityVar {
 
     /// Record `capability` on this variable.
     pub fn record(&self, capability: LocatedCapability) {
+        debug_assert!(
+            self.in_scope(&capability.item),
+            "a capability enters only a variable whose telescope binds its named place"
+        );
         if self.own.borrow_mut().insert(capability) {
             capability_fact_written();
         }

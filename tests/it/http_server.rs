@@ -418,7 +418,14 @@ fn a_route_whose_responses_are_never_fed_names_the_call() {
     };
     let rendered = cambra::ccl::context::render_errors(&errors, loaded.sources());
     assert!(rendered.contains("has no feed or define"), "{rendered}");
-    assert!(rendered.contains("responses"), "{rendered}");
+    let error = errors
+        .iter()
+        .find(|error| error.message().contains("has no feed or define"))
+        .expect("an unfilled response collection is reported");
+    let span = error.span().expect("the error names the run statement");
+    assert_eq!(span.file, FileId::ROOT);
+    assert!(code[span.start..span.end].starts_with("run std::http"));
+    assert!(error.message().contains("call `respond`"), "{rendered}");
 }
 
 /// Two routes whose paths differ only in a character no identifier holds are two routes.
@@ -488,7 +495,7 @@ fn test_http_serve_inside_an_expression_is_error() {
 
 /// `http_serve` inside an if/else branch is rejected at lowering time.
 #[test]
-fn test_http_serve_in_if_branch_is_error() {
+fn the_http_intrinsic_is_private_in_a_branch() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
@@ -507,15 +514,15 @@ fn test_http_serve_in_if_branch_is_error() {
         result
             .errors
             .iter()
-            .any(|e| matches!(e, LoweringError::Unsupported { .. })),
-        "expected Unsupported error, got: {:?}",
+            .any(|e| format!("{e:?}").contains("HTTP routes are declared by running `std::http")),
+        "expected the private-intrinsic refusal, got: {:?}",
         result.errors,
     );
 }
 
 /// `http_serve` inside a function body is rejected at lowering time.
 #[test]
-fn test_http_serve_in_function_body_is_error() {
+fn the_http_intrinsic_is_private_in_a_function() {
     let port = reserve_test_port();
     let code = indoc::formatdoc!(
         r#"
@@ -535,8 +542,8 @@ fn test_http_serve_in_function_body_is_error() {
         result
             .errors
             .iter()
-            .any(|e| matches!(e, LoweringError::Unsupported { .. })),
-        "expected Unsupported error, got: {:?}",
+            .any(|e| format!("{e:?}").contains("HTTP routes are declared by running `std::http")),
+        "expected the private-intrinsic refusal, got: {:?}",
         result.errors,
     );
 }

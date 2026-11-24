@@ -332,8 +332,8 @@ pub(super) fn finish_program(
 ///
 /// Recurses through each of them: a for-loop in the middle
 /// of the program produces an `ExprStmt(effect, continuation)` where the
-/// continuation may contain further `Let` bindings from later `http_serve`
-/// calls.  Stopping at the first `ExprStmt` would place the outputs `Record`
+/// continuation may contain further `Let` bindings from later
+/// statements.  Stopping at the first `ExprStmt` would place the outputs `Record`
 /// outside those inner bindings, making its names unbound.
 ///
 /// The `ExprStmt` node "drives the feed": [`crate::ccl::channelize`] collapses
@@ -754,7 +754,7 @@ pub(super) fn lower_block_value(
 /// `preceding` are the statements that come before `stmt` in the block
 /// `body` is the already-lowered expression for the rest of the block after `stmt`
 /// `outer_bindings` are the names already in scope above this block (e.g., function parameters)
-/// `is_top_level` is `false` inside if/else arms, match arms and function bodies; `http_serve`
+/// `is_top_level` is `false` inside if/else arms, match arms and function bodies; a `@Builtin`
 /// and `test_sink` are only permitted at the top level of a program.
 pub(super) fn lower_middle_stmt(
     stmt: &Spanned<ChlStmt>,
@@ -767,21 +767,46 @@ pub(super) fn lower_middle_stmt(
     match &stmt.node {
         // A statement that declares a sink binds a name the program's sink record reads, so it
         // is lowered only here, at the top level.
-        ChlStmt::Assign {
-            target,
-            value,
-            transparency,
-        } if let Some(decl) = sink_declaration(target, value) => {
+        #[cfg(test)]
+        ChlStmt::Assign { target, value, .. }
+            if let Some(SinkDecl::Test { name }) = sink_declaration(target, value) =>
+        {
             if !is_top_level {
-                return Err(sink_not_top_level(&decl, stmt.span));
+                return Err(sink_not_top_level(stmt.span));
             }
-            match decl {
-                #[cfg(test)]
-                SinkDecl::Test { name } => lower_test_sink(name, target.span, stmt.span, body, ctx),
-                SinkDecl::Http(decl) => {
-                    lower_http_serve(*decl, target, stmt.span, value.span, body, ctx)
+            lower_test_sink(name, target.span, stmt.span, body, ctx)
+        }
+        // `@Builtin x: T` — a value the compiler supplies (`docs/chl-spec.md`, "9.16 The std
+        // root").
+        ChlStmt::Declare {
+            target,
+            annotation,
+            builtin: Some(at),
+        } => {
+            let module = builtin_module(*at, is_top_level, ctx)?;
+            let name = extract_name_target(target, "`@Builtin` declaration")?;
+            match HttpBuiltin::supplied_by(&module, &name) {
+                Some(builtin @ (HttpBuiltin::Requests | HttpBuiltin::Responses)) => {
+                    lower_http_builtin(builtin, target, annotation, stmt.span, body, ctx)
                 }
+                _ => Err(LoweringError::unsupported(
+                    *at,
+                    format!("the compiler supplies no value `{module}::{name}`"),
+                )),
             }
+        }
+        // `@Builtin type T` — `pre_declare_module_types` declared it as an alias for the whole
+        // module, or reported why it could not, and the alias is held where it is declared, as
+        // a written one's is.
+        ChlStmt::BuiltinType { builtin, .. } if !is_top_level => Err(builtin_misplaced(*builtin)),
+        ChlStmt::BuiltinType { name, .. } => {
+            Ok(match ctx.declared_type_alias(&name.node, stmt.span) {
+                Some(ty) => {
+                    let declared = Expr::let_type(name.node.as_str(), ty.clone(), body);
+                    ctx.tag_image(declared, stmt.span)
+                }
+                None => body,
+            })
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // mutable write (the mutation operators are `:=` and `+=`), so even a
@@ -846,7 +871,11 @@ pub(super) fn lower_middle_stmt(
         }
         // `out: Feed(V)` — a feed declaration, the channel its feeds and its
         // `<<=` give a value.
-        ChlStmt::Declare { target, annotation } => {
+        ChlStmt::Declare {
+            target,
+            annotation,
+            builtin: None,
+        } => {
             let (name, occurrence, channel, ty) =
                 feed_declaration(target, annotation, stmt.span, ctx)?;
             Ok(ctx.tag_image(
@@ -1301,7 +1330,7 @@ pub(super) fn lower_middle_stmt(
                         body,
                         Annotation::new(ty, Occurrence::mint()),
                     );
-                    ctx.tag_image(bound.binding_a_place(), stmt.span)
+                    ctx.tag_image(bound, stmt.span)
                 }));
             }
             let value = match default {
@@ -1334,11 +1363,19 @@ pub(super) fn lower_middle_stmt(
             // polymorphic (`docs/chl-spec.md`, "Polymorphic type annotations").
             let annotation = match (annotation, default) {
                 (Some(annotation), Some(default)) => {
-                    let ty = lower_let_annotation(&name.node, annotation, default, ctx)?;
+                    let ty =
+                        match mut_parameter_type(name.node.as_str(), name.span, annotation, ctx) {
+                            Some(result) => result?.0,
+                            None => lower_let_annotation(&name.node, annotation, default, ctx)?,
+                        };
                     Some(Annotation::new(ty, ctx.occurrence_at(annotation.ty.span)))
                 }
                 (Some(annotation), None) => {
-                    let ty = lower_type_expr_or_poly(&annotation.ty, ctx)?;
+                    let ty =
+                        match mut_parameter_type(name.node.as_str(), name.span, annotation, ctx) {
+                            Some(result) => result?.0,
+                            None => lower_type_expr_or_poly(&annotation.ty, ctx)?,
+                        };
                     Some(Annotation::new(ty, ctx.occurrence_at(annotation.ty.span)))
                 }
                 (None, _) => None,
@@ -1353,6 +1390,7 @@ pub(super) fn lower_middle_stmt(
                 },
             });
             let occurrence = ctx.occurrence_at(name.span);
+            let borrows = annotation.as_ref().is_some_and(|a| a.ty.is_place());
             let bound = match annotation {
                 Some(annotation) => Expr::let_bind_annotated(
                     name.node.as_str(),
@@ -1363,7 +1401,14 @@ pub(super) fn lower_middle_stmt(
                 ),
                 None => Expr::let_bind(name.node.as_str(), occurrence, value, body),
             };
-            Ok(ctx.tag_image(bound.binding_a_place(), stmt.span))
+            Ok(ctx.tag_image(
+                if borrows {
+                    bound.binding_a_place()
+                } else {
+                    bound
+                },
+                stmt.span,
+            ))
         }
         // Parse-recovery placeholder: the statement stands in as one lowering failed in
         // does, binding the names its head does. Its parse error reports it.
@@ -1603,7 +1648,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
             | ChlStmt::Define { target, .. } => {
                 names.extend(target.node.bound_names().into_iter().map(|n| n.to_string()));
             }
-            ChlStmt::FunctionDef { name, .. } => {
+            ChlStmt::FunctionDef { name, .. } | ChlStmt::Param { name, .. } => {
                 names.insert(name.node.as_str().to_string());
             }
             ChlStmt::Error { binds, .. } => {
@@ -1951,12 +1996,6 @@ pub(super) fn extract_name_target(
     }
 }
 
-/// Whether a Module type's entry of type `ty` is a transactional variable, `stock: Mut(V, Txn)`.
-pub(super) fn is_mut_entry(ty: &Type) -> bool {
-    ty.history_parts()
-        .is_some_and(|(_, _, kind)| kind == crate::ccl::ty::HistoryKind::Overwrite)
-}
-
 /// The variable a `:=` or a compound assignment writes: [`extract_name_target`]'s name, or
 /// another module's public mutable variable, `inv::stock`, spelled as a reference to it lowers
 /// (`docs/chl-spec.md`, "9.9 Running"). A qualified target is always a write.
@@ -2217,11 +2256,23 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 annotation: Some(annotation),
                 ..
             }
-            | ChlStmt::Declare { target, annotation }
-                if matches!(annotation.ty.node, ChlExpr::Error) =>
-            {
+            | ChlStmt::Declare {
+                target, annotation, ..
+            } if matches!(annotation.ty.node, ChlExpr::Error) => {
                 if let AssignTarget::Name(name) = &target.node {
                     ctx.unreadable.insert(name.to_string());
+                }
+            }
+            ChlStmt::Param {
+                name,
+                annotation: Some(annotation),
+                ..
+            } => {
+                if matches!(
+                    mut_annotation_parts(&annotation.ty, ctx),
+                    Some(Ok((_, true)))
+                ) {
+                    ctx.register_transactional(name.node.as_str());
                 }
             }
             // `x: Mut(V, Txn) := e` — a transactional-variable introduction.
@@ -5096,6 +5147,9 @@ pub(super) fn pre_declare_module_types(
                     errors.extend(ctx.declare_run_types(&name, args, uses));
                 }
             }
+            ChlStmt::BuiltinType { name, builtin } => {
+                errors.extend(pre_declare_builtin_type(name, *builtin, stmt.span, ctx).err());
+            }
             _ => {
                 errors.extend(pre_declare_type_alias(stmt, &mut declared, ctx));
                 errors.extend(ctx.declare_module_binding(stmt));
@@ -5187,7 +5241,11 @@ fn sink_rebindings(stmts: &[Spanned<ChlStmt>], sinks: &HashSet<&str>) -> Vec<Low
     for stmt in stmts {
         let mut bound = Vec::new();
         match &stmt.node {
+            #[cfg(test)]
             ChlStmt::Assign { target, value, .. } if sink_declaration(target, value).is_some() => {}
+            ChlStmt::Declare {
+                builtin: Some(_), ..
+            } => {}
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
@@ -6380,6 +6438,47 @@ pub(super) fn lower_if(
     ))
 }
 
+/// The std module that declares the `@Builtin` marked at `at`, or the refusal of one declared
+/// elsewhere ([`builtin_misplaced`]).
+pub(super) fn builtin_module(
+    at: Span,
+    is_top_level: bool,
+    ctx: &LoweringContext,
+) -> Result<String, LoweringError> {
+    match ctx.module.labels.as_ref().filter(|m| m.is_std()) {
+        Some(module) if is_top_level => Ok(module.to_string()),
+        _ => Err(builtin_misplaced(at)),
+    }
+}
+
+/// The refusal of the `@Builtin` marked at `at` outside a std module's top level, the one place
+/// a `@Builtin` stands (`docs/chl-spec.md`, "9.16 The std root").
+pub(super) fn builtin_misplaced(at: Span) -> LoweringError {
+    LoweringError::unsupported(
+        at,
+        "a `@Builtin` declaration stands only at a std module's top level, and the compiler \
+         supplies its value",
+    )
+}
+
+/// Declare the `@Builtin type` `name`, marked at `at` and declared at `span`, for the whole
+/// module.
+fn pre_declare_builtin_type(
+    name: &Spanned<SmolStr>,
+    at: Span,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    let module = builtin_module(at, true, ctx)?;
+    match HttpBuiltin::supplied_by(&module, &name.node) {
+        Some(HttpBuiltin::Keys) => declare_http_keys(name, span, ctx),
+        _ => Err(LoweringError::unsupported(
+            at,
+            format!("the compiler supplies no type `{module}::{}`", name.node),
+        )),
+    }
+}
+
 /// The body the compiler supplies for the `@Builtin` function `name`, marked at `at`: a reading
 /// keyed by the function's site, for a function of a std module's top level the compiler knows
 /// by its path (`docs/chl-spec.md`, "9.16 The std root").
@@ -6389,15 +6488,8 @@ fn builtin_body(
     is_top_level: bool,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let module = ctx.module.labels.as_ref().filter(|m| m.is_std());
-    let (Some(module), true) = (module, is_top_level) else {
-        return Err(LoweringError::unsupported(
-            at,
-            "a `@Builtin` function is declared at a std module's top level, and the compiler \
-             supplies its body",
-        ));
-    };
-    let Some(kind) = ReadingKind::supplied_by(&module.to_string(), name) else {
+    let module = builtin_module(at, is_top_level, ctx)?;
+    let Some(kind) = ReadingKind::supplied_by(&module, name) else {
         return Err(LoweringError::unsupported(
             at,
             format!("the compiler supplies no function `{module}::{name}`"),

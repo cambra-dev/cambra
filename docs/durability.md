@@ -942,7 +942,7 @@ What a checkpoint holds depends on the producer:
   released points holds their count and their sum, because the count alone does not give the next
   average. A `Memo` holds its cache, because it releases everything it merges
   ([A `Memo` releases everything it takes](../src/interpreter/design-operators.md#a-memo-releases-everything-it-takes)).
-- **A producer that holds rows it has not released**, such as a join's open rows or the alarm pair's
+- **A producer that holds rows it has not released**, such as a join's open rows or an alarm module's
   held rows, checkpoints them and then releases what they cover. Until it does, its inputs keep what
   the rows were computed from. A producer releases a region of its input only once it has produced
   every output that the region and the producer's internal state determine, so a row it holds
@@ -1108,7 +1108,7 @@ either. What the source persists for it depends on what the system it reads give
 | What the system it reads gives back                              | Example                                     | The source position an element takes                   | What the source persists   | A crash before the element's entry is persisted                              |
 | ---------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------ | -------------------------- | ---------------------------------------------------------------------------- |
 | The element at a permanent address, until the source releases it | a topic partition                           | its address, the offset                                | that the position is taken | the source reads the address again, and the element takes the same position  |
-| The element again, until the source acknowledges it              | a message queue; `time::alarms()`           | the position the run recorded for its message identity | the message identity       | the queue delivers it again, and another element may take its position first |
+| The element again, until the source acknowledges it              | a message queue; an alarm module           | the position the run recorded for its message identity | the message identity       | the queue delivers it again, and another element may take its position first |
 | Nothing                                                          | standard input, a UDP feed, an HTTP request | its arrival order                                      | the element                | the element is lost                                                          |
 
 Two rules apply to every kind:
@@ -1143,33 +1143,31 @@ retention has since removed, fails recovery under the rule above.
 
 #### Alarms
 
-An alarm module exposes a sink and a source, called `set_expiry` and `expiries` here
-([chl-spec.md, "Alarms"](chl-spec.md#alarms)). The program feeds alarm rows to `set_expiry`, and
-each
-row comes out of `expiries` once the clock reads at or after the row's `at` field. A row fed to the
-pair does not escape the run. The rows the pair holds, its pending alarms, are its producer state
-and are checkpointed as [Checkpoints](#checkpoints) describes. An alarm row
-is persisted in one of two places:
+An alarm module's public interface remains open
+([chl-spec.md, "Alarms"](chl-spec.md#alarms)). The module holds each alarm row until the clock
+reads at or after its `time::at` field, then yields it. A row fed into the module does not escape
+the run. Pending alarms are producer state, checkpointed as [Checkpoints](#checkpoints) describes.
+An alarm row is persisted in one of two places:
 
-1. **In the pair's checkpoint**, from the checkpoint after the row is fed to `set_expiry`
-   until the row comes out of `expiries`.
-2. **In the observation log**, from when `expiries` takes the row.
+1. **In the module's checkpoint**, from the checkpoint after the row is fed into it until the
+   module yields the row.
+2. **In the observation log**, from when the alarm source takes the row.
 
-The pair is a message queue in the table above: it hands a row back until its entry is persisted,
+The module is a message queue in the table above: it hands a row back until its entry is persisted,
 and the row's message identity is its feed key ([Outputs are keyed](#outputs-are-keyed)). A row
 appended with `<<` has a feed key no other row shares. The rows one `<<=` defines share a site and
 a position, so their feed keys also need each row's key in the defined collection
 ([Consequences for other documents](#consequences-for-other-documents), 4.4). The entry that
-`expiries` appends for a row records the row's feed key. The entry is persisted before the pair
+the alarm source appends for a row records the row's feed key. The entry is persisted before the module
 persists its state without the row, so no alarm is lost between the two writes. A crash between
 them leaves the row in both, and recovery removes from the recovered held rows every row whose feed
 key already has an entry. A crash before the entry is persisted leaves the row only in the held
-rows, and `expiries` takes it again at the next source position. No output depended on the lost
+rows, and the alarm source takes it again at the next source position. No output depended on the lost
 entry, because outputs wait for their entries
 ([The observation log](#the-observation-log)).
 
-Numbering alarms by the order the pair releases them does not work: recovery would bring back the
-held row beside its durable entry at source position `𝑝`, and `expiries` would take it again at a
+Numbering alarms by the order the module releases them does not work: recovery would bring back the
+held row beside its durable entry at source position `𝑝`, and the alarm source would take it again at a
 later position, a second arrival that commits a second time any transaction it drives. Equal row
 values cannot tell the two apart either, because two identical alarms can both be legitimate. The
 feed key identifies the row, so its second appearance is the same message.

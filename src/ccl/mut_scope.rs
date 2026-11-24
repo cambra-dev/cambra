@@ -4,101 +4,68 @@
 //! ask — [`crate::ccl::anf`], to sequence a read against the writes around it,
 //! and [`crate::ccl::mut_read`], to name the value one denotes — and neither can
 //! ask inference, which has not run. The answer is syntactic: a
-//! [`TypedExprNode::MutDecl`] binder or a borrowed `Lambda` parameter whose type is mutable.
+//! [`TypedExprNode::MutDecl`] binder or a borrowed function or module parameter whose type is mutable.
 //! An unresolved borrowed parameter may be mutable, so its reads are named conservatively
 //! until inference distinguishes mutable and deferred places.
 //!
 //! Post-uniquify every binder is globally unique, so membership answers "is this
 //! `Var` a mutable variable?" on the name alone.
 //!
-//! The same scope holds the functions with a borrowed parameter, which a call's arguments
-//! are passed to: an argument there that is a mutable variable is a lent place rather than a
-//! read ([`Muts::borrows`]).
 
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::rc::Rc;
+use std::collections::HashMap;
 
 use crate::ccl::{Expr, Name, TypedBinding, TypedExprNode};
 
-/// The mutable variables in scope, by the binder that introduced them, and the functions of the
-/// program that have a borrowed parameter.
+/// The mutable variables in scope, by the binder that introduced them.
 #[derive(Clone, Default)]
 pub struct Muts {
-    vars: HashSet<Name>,
-    borrowing: Rc<HashSet<Name>>,
+    /// Whether a call can write each variable through a capture.
+    vars: HashMap<Name, bool>,
 }
 
 impl Muts {
-    /// No mutable variable, and no function with a borrowed parameter.
+    /// No mutable variable.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// No mutable variable yet, and the functions `e` binds that have a borrowed parameter:
-    /// the scope a walk of `e` from its root starts in.
-    pub fn of_program(e: &Expr) -> Self {
-        fn go(e: &Expr, out: &mut HashSet<Name>) {
-            let bindings: Vec<(&TypedBinding, &Expr)> = match &e.node {
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    ..
-                } => vec![(binding, bound_expr)],
-                TypedExprNode::LetRec { bindings, .. }
-                | TypedExprNode::DefGroup { bindings, .. } => {
-                    bindings.iter().map(|(b, d)| (b, d)).collect()
-                }
-                _ => Vec::new(),
-            };
-            for (binding, definition) in bindings {
-                if let TypedExprNode::Lambda { params, .. } = &definition.node
-                    && params.iter().any(is_history_param)
-                {
-                    out.insert(binding.name.clone());
-                }
-            }
-            e.walk_children(|c| go(c, out));
-        }
-        let mut borrowing = HashSet::new();
-        go(e, &mut borrowing);
-        Muts {
-            vars: HashSet::new(),
-            borrowing: Rc::new(borrowing),
-        }
-    }
-
     /// Whether `name` is a mutable variable in scope.
     pub fn contains(&self, name: &Name) -> bool {
-        self.vars.contains(name)
+        self.vars.contains_key(name)
     }
 
-    /// The mutable variables in scope.
-    pub fn iter(&self) -> impl Iterator<Item = &Name> {
-        self.vars.iter()
+    /// Mutable variables that an unresolved callback may write through captures.
+    pub fn captured_writers(&self) -> impl Iterator<Item = &Name> {
+        self.vars
+            .iter()
+            .filter_map(|(name, captured)| captured.then_some(name))
     }
 
-    /// Whether a call of `function` may lend a place as an argument: a function the program
-    /// binds with a `Mut(…)` or `Feed(…)` parameter, or a trait's function with one.
-    pub fn borrows(&self, function: &Expr) -> bool {
-        match &function.node {
-            TypedExprNode::Var(f) => self.borrowing.contains(f),
-            TypedExprNode::TraitFn {
-                trait_, function, ..
-            } => trait_.function(function).is_some_and(|f| {
-                f.signature
-                    .inputs
-                    .iter()
-                    .any(|t| t.history_parts().is_some())
-            }),
-            _ => false,
-        }
+    pub fn can_be_written_by_capture(&self, name: &Name) -> bool {
+        self.vars.get(name).copied().unwrap_or(false)
     }
 
-    fn with_vars(&self, names: impl IntoIterator<Item = Name>) -> Self {
+    fn with_bindings<'b>(&self, bindings: impl IntoIterator<Item = &'b TypedBinding>) -> Self {
         let mut out = self.clone();
-        out.vars.extend(names);
+        for binding in bindings {
+            out.insert(binding);
+        }
         out
+    }
+
+    fn insert(&mut self, binding: &TypedBinding) {
+        use crate::ccl::{Type, place::ParameterMode};
+        let ty = binding.annotation_ty().unwrap_or(&binding.ty);
+        let captured = ty
+            .as_place()
+            .is_some_and(|place| place.kind.allows_captured_writes())
+            || (binding.parameter_mode == ParameterMode::Borrow
+                && match ty.history_parts() {
+                    Some((domain, _, _)) => matches!(domain, Type::Hole | Type::Infer(_)),
+                    None => matches!(ty, Type::Hole | Type::Infer(_)),
+                });
+        self.vars.insert(binding.name.clone(), captured);
     }
 }
 
@@ -123,63 +90,65 @@ pub fn is_mut_param(param: &TypedBinding) -> bool {
             && matches!(ty, crate::ccl::Type::Hole | crate::ccl::Type::Infer(_)))
 }
 
-/// Does `param` borrow its argument — a `Mut(…)` or a `Feed(…)` parameter?
-pub fn is_history_param(param: &TypedBinding) -> bool {
-    param
-        .annotation_ty()
-        .unwrap_or(&param.ty)
-        .history_parts()
-        .is_some()
-}
-
 /// Every mutable variable `e` binds: each [`TypedExprNode::MutDecl`] binder, and each `Lambda`
 /// parameter annotated `Mut(…)` ([`is_mut_param`]). Post-uniquify a name is bound once, so the
 /// set answers "is this `Var` a mutable variable?" anywhere in `e`, without walking scopes.
 pub fn bound_in(e: &Expr) -> Muts {
-    fn go(e: &Expr, out: &mut HashSet<Name>) {
+    fn go(e: &Expr, out: &mut Muts) {
         match &e.node {
-            TypedExprNode::MutDecl { binding, .. } => {
-                out.insert(binding.name.clone());
+            TypedExprNode::MutDecl { binding, .. } => out.insert(binding),
+            TypedExprNode::Let { binding, .. }
+                if binding.parameter_mode == crate::ccl::place::ParameterMode::Borrow
+                    && is_mut_param(binding) =>
+            {
+                out.insert(binding)
             }
             TypedExprNode::Lambda { params, .. } => {
-                out.extend(
-                    params
-                        .iter()
-                        .filter(|p| is_mut_param(p))
-                        .map(|p| p.name.clone()),
-                );
+                for param in params.iter().filter(|p| is_mut_param(p)) {
+                    out.insert(param);
+                }
             }
             _ => {}
         }
         e.walk_children(|c| go(c, out));
     }
-    let mut vars = HashSet::new();
-    go(e, &mut vars);
-    Muts {
-        vars,
-        borrowing: Rc::default(),
+    let mut muts = Muts::new();
+    go(e, &mut muts);
+    muts
+}
+
+/// The mutable declaration's body has its variable in scope.
+pub fn with(muts: &Muts, binding: &TypedBinding) -> Muts {
+    muts.with_bindings([binding])
+}
+
+/// A parameter scope: `muts` plus each borrowed mutable parameter, or `muts` itself when none is.
+pub fn under_params<'a>(muts: &'a Muts, params: &[TypedBinding]) -> Cow<'a, Muts> {
+    if params.iter().any(is_mut_param) {
+        Cow::Owned(muts.with_bindings(params.iter().filter(|p| is_mut_param(p))))
+    } else {
+        Cow::Borrowed(muts)
     }
 }
 
-/// `muts` with `name` added — the scope a [`TypedExprNode::MutDecl`]'s body is
-/// walked under.
-pub fn with(muts: &Muts, name: &Name) -> Muts {
-    muts.with_vars([name.clone()])
-}
-
-/// The scope a `Lambda`'s body is walked under: `muts` plus each of `params` that is
-/// borrowed, and `muts` itself when none is.
-pub fn under_params<'a>(muts: &'a Muts, params: &[TypedBinding]) -> Cow<'a, Muts> {
-    if params.iter().any(is_mut_param) {
-        Cow::Owned(
-            muts.with_vars(
-                params
-                    .iter()
-                    .filter(|p| is_mut_param(p))
-                    .map(|p| p.name.clone()),
-            ),
-        )
-    } else {
-        Cow::Borrowed(muts)
+/// Before inference, an ordinary call may write captured transactional state. Primitive
+/// applications expose their operands and cannot call a captured writer.
+pub fn may_call_writer(expr: &Expr) -> bool {
+    let TypedExprNode::Apply { function, .. } = &expr.node else {
+        return false;
+    };
+    match &function.node {
+        TypedExprNode::Builtin(_) | TypedExprNode::Proj(_) => false,
+        TypedExprNode::TraitFn {
+            trait_, function, ..
+        } => trait_.function(function).is_none_or(|f| {
+            use crate::ccl::capabilities::Repr;
+            match f.signature.capabilities.repr() {
+                Repr::Var(_) => true,
+                Repr::Written(w) if w.open_causes => true,
+                _ => !f.signature.capabilities.set().causes_nothing(),
+            }
+        }),
+        _ => true,
     }
 }

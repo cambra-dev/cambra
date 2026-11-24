@@ -29,18 +29,28 @@ pub(crate) const OUTPUT_BINDER: &str = "__output";
 /// unannotated parameter). Mirrors the `Mut(…)` stamping of an induction
 /// introduction (`lower/stmts.rs :: mut_annotation_parts`).
 ///
-/// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
-/// generalized per call site) even for a `Txn` mutable variable param: the call-site
-/// argument's `Mut(_, Txn)` type pins `D = Txn` by the invariant `(Mut, Mut)`
-/// edge, and leaving it open lets one `def bump(c: Mut(Int))` serve both an
-/// induction accumulator and a mutable variable. The transactional flag *is* returned
-/// so the body's `with begin():` writes register as transactional at lowering
-/// time (the block-classification decision runs before inference).
+/// `Mut(V, Txn)` fixes the sequencing domain to `Txn`. `Mut(V)` leaves it inferred per
+/// call, so one helper can serve induction and transactional variables. The transactional
+/// flag also classifies the body's writes before inference.
 fn mut_param_history_type(
     param: &Param,
     ctx: &mut LoweringContext,
 ) -> Option<Result<(Type, bool), LoweringError>> {
-    let annotation = param.annotation.as_ref()?;
+    mut_parameter_type(
+        param.name.as_str(),
+        param.name_span,
+        param.annotation.as_ref()?,
+        ctx,
+    )
+}
+
+/// A function or module parameter's mutable type and whether its domain is transactional.
+pub(super) fn mut_parameter_type(
+    name: &str,
+    at: Span,
+    annotation: &TypeAnnotation,
+    ctx: &mut LoweringContext,
+) -> Option<Result<(Type, bool), LoweringError>> {
     match mut_annotation_parts(&annotation.ty, ctx) {
         // A `Mut(…)` annotation is exact wherever it is written, for the reason it is
         // exact at a `:=` introduction: [`Type::History`] is invariant in both
@@ -48,12 +58,12 @@ fn mut_param_history_type(
         // does not (`lower::stmts::check_mut_decl_annotation`).
         Some(Ok(_)) if annotation.mode == AnnotationMode::Bounded => {
             Some(Err(LoweringError::unsupported(
-                param.name_span,
+                at,
                 format!(
                     "`{} <: Mut(…)` bounds a mutable parameter by its own type: `Mut` is \
                      invariant in its value type, so `<:` claims nothing `:` does not. \
                      Write `{}: Mut(…)`",
-                    param.name, param.name
+                    name, name
                 ),
             )))
         }
@@ -82,6 +92,7 @@ fn history_param_type(
 #[derive(Default)]
 struct ParameterUses {
     mutable: bool,
+    transactional: bool,
     deferred: bool,
     borrow: bool,
 }
@@ -89,7 +100,7 @@ struct ParameterUses {
 fn parameter_uses(body: &Expr, name: &Name) -> ParameterUses {
     use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 
-    fn visit(expr: &Expr, name: &Name, uses: &mut ParameterUses) {
+    fn visit(expr: &Expr, name: &Name, uses: &mut ParameterUses, in_transaction: bool) {
         match &expr.node {
             TypedExprNode::Feed { name: target, .. }
             | TypedExprNode::Define { name: target, .. }
@@ -97,7 +108,10 @@ fn parameter_uses(body: &Expr, name: &Name) -> ParameterUses {
             {
                 uses.deferred = true
             }
-            TypedExprNode::MutWrite { name: target, .. } if target == name => uses.mutable = true,
+            TypedExprNode::MutWrite { name: target, .. } if target == name => {
+                uses.mutable = true;
+                uses.transactional |= in_transaction;
+            }
             TypedExprNode::Borrow(place)
                 if crate::ccl::ccl_utils::is_free_in_value(name, place) =>
             {
@@ -105,16 +119,17 @@ fn parameter_uses(body: &Expr, name: &Name) -> ParameterUses {
             }
             _ => {}
         }
+        let in_transaction = in_transaction || matches!(expr.node, TypedExprNode::Begin { .. });
         for_each_scoped_item(expr, &mut |item| {
             if let ScopedItem::Child { expr, binders } = item
                 && !binders.names().any(|bound| bound == name)
             {
-                visit(expr, name, uses);
+                visit(expr, name, uses, in_transaction);
             }
         });
     }
     let mut uses = ParameterUses::default();
-    visit(body, name, &mut uses);
+    visit(body, name, &mut uses, false);
     uses
 }
 /// If `param` is annotated `Feed(T)` (a borrowed deferred output),
@@ -223,7 +238,14 @@ pub(super) fn lower_params(
             if uses.deferred {
                 Some(Type::feed(Type::Hole, Type::Hole))
             } else if uses.mutable {
-                Some(Type::mutable(Type::Hole, Type::Hole))
+                Some(Type::mutable(
+                    if uses.transactional {
+                        Type::Txn
+                    } else {
+                        Type::Hole
+                    },
+                    Type::Hole,
+                ))
             } else {
                 None
             }
@@ -795,8 +817,14 @@ pub(super) fn lower_function_body(
         .collect();
 
     // A sink declaration is not permitted inside function bodies.
+    let parameter_scope = ctx.unannotated_parameters.clone();
     let body_result = match body {
         DefBody::Written(body) => ctx.with_shadowed(shadowed_params, |ctx| {
+            for param in params.iter().filter(|p| p.annotation.is_none()) {
+                let name = param.name.to_string();
+                let depth = ctx.shadow_depth[&name];
+                ctx.unannotated_parameters.insert(name, depth);
+            }
             lower_stmts_inner(body, &outer_bindings, ctx, false)
         }),
         // The supplied body stands in the lambda once, under the ids lowering recorded for it.
@@ -806,6 +834,7 @@ pub(super) fn lower_function_body(
     // Revert the transactional registry — drop every `Mut(_, Txn)` param
     // registration and any `Mut(_, Txn)` local the body declared, keyed on the
     // pre-uniquify name a sibling function could reuse.
+    ctx.unannotated_parameters = parameter_scope;
     ctx.restore_transactional(snapshot);
 
     // A `=> T` output annotation checks the body's result against `T`. Wrap the

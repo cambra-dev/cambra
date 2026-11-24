@@ -2758,8 +2758,8 @@ fn constrain_go_impl(
         // not discharged across the place type — out of scope alongside the
         // filter-feed-through-UDF gaps (see design/mutability.md §4 and the
         // `ccl/channelize.rs` module docs).)
-        // Nothing but a feed satisfies a feed requirement: a feed reads as its collection,
-        // but a feed place cannot be conjured from a value, a collection included
+        // Nothing but a feed place satisfies a feed requirement. Its explicit read yields a
+        // collection value, which cannot be borrowed as a place
         // (`g(5)` or `g([1, 2])` where `g` feeds its parameter, `x = [1, 2]; x << 3`). A
         // `<<` targeting a `:=` mutable variable lands here
         // too, as the place it is — the left side matches `_`, so the cross-kind pair

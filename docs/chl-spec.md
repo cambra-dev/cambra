@@ -5941,6 +5941,12 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
 
 ### 9.4 Parameters
 
+A parameter annotated `Mut(V)`, `Mut(V, Txn)` or `Feed(V)` borrows a place. Its run argument
+uses `&`, as in `run sinker(sink=&out)`. An unmarked argument is a value read and cannot satisfy
+a borrowing parameter. A value parameter accepts no `&` argument. The borrowed place remains
+in its declaring scope. Direct writes during the run act on that declaration. An exported function
+may contribute to a borrowed Feed; a borrowed mutable place cannot escape in an exported function.
+
 ```ebnf
 param_stmt ::= ["const"] "param" ident ":" type ["=" expr]
              | "param" Ident ["<:" type] ["=" type]      (* Ident: a capitalized identifier *)
@@ -5980,7 +5986,7 @@ param payments: Module{charge: {amount: Int} => Receipt}
   clause does ([Trait requirements](#trait-requirements)). The clause follows a `<:` bound where
   there is one, and may name the module's other type parameters, as
   `requires Convert(Receipt, Price)` does.
-- A value parameter is an immutable value, annotated with its type. A value parameter written
+- A value parameter with a non-place annotation is an immutable value. A value parameter written
   without an annotation is an error, so each module states what its arguments are, if only as `_`.
   Its type is its annotation, with each `_` in it inferred from the module's uses the way a function
   parameter's is: `param k: _` leaves all of it to inference. The annotation is the whole annotation

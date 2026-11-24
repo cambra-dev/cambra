@@ -539,19 +539,18 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 /// Two mentions may be a write, the same two that end a read segment
 /// (`crate::ccl::mut_read`, "What ends a segment"):
 ///
-/// - a [`TypedExprNode::MutWrite`] target, which is the write itself; and
-/// - a **place** mention — a bare reference whose node carries the `Mut` history
-///   rather than the value — in an [`TypedExprNode::Apply`]'s function or
-///   argument position, or a component of a call's argument tuple, which is where a
-///   borrowing call lends it to a writer.
-///   The callee's body is not in hand here: this pass expands a UDF at the
-///   binding that holds it, which is above the call, so a call in `expr` is
-///   still an unexpanded `Apply` when this runs.
-///
-/// Conservative twice over: any such mention anywhere in the body blocks the
-/// substitution, even if every use of the alias precedes it, and a callee that
-/// only reads its parameter blocks it too.
+/// Direct writes, exclusive borrows, and latent write capabilities on calls all prevent
+/// substitution. A captured callback's body need not appear at the call: its capabilities
+/// identify the places it may write. Any such access anywhere in the body blocks the
+/// substitution, including a borrowed parameter whose callee only reads it.
 fn is_mut_written(name: &Name, expr: &Expr) -> bool {
+    use crate::ccl::capabilities::{Capability, Effect};
+    if expr.capabilities.set().items().any(|c| {
+        c.may_include(&Capability::Causes(Effect::Write(name.clone())))
+            || c.may_include(&Capability::Causes(Effect::WriteTxn(name.clone())))
+    }) {
+        return true;
+    }
     match &expr.node {
         TypedExprNode::MutWrite { name: target, .. } if target == name => true,
         TypedExprNode::Borrow(place) => {
@@ -1075,6 +1074,12 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
             bound_expr,
             body,
         } => {
+            if binding.parameter_mode == crate::ccl::place::ParameterMode::Borrow
+                && binding.ty.is_place()
+            {
+                let body = substitute_one(*body, binding, *bound_expr, scope);
+                return inline_impl(body, scope);
+            }
             let bound_expr = inline_impl(*bound_expr, scope);
             let body = scope.under_let(&binding, &bound_expr, |scope| inline_impl(*body, scope));
 

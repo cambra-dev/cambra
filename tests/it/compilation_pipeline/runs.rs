@@ -891,3 +891,117 @@ fn a_run_given_a_run_is_run() {
         Value::Int(4),
     );
 }
+
+#[test]
+fn module_parameters_borrow_feeds_explicitly() {
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        out: Feed(Int)
+        run sinker(sink=&out) as first
+        run sinker(sink=&out) as second
+        first::push(2)
+        second::push(3)
+        sum(out)
+    "#},
+            &[(
+                "sinker",
+                indoc! {r#"
+        param sink: Feed(Int)
+        pub def push(value):
+            sink << value
+    "#},
+            )],
+        ),
+        Value::Int(5),
+    );
+}
+
+#[test]
+fn a_module_borrow_keeps_mutable_reads_at_their_source_positions() {
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        counter := 0
+        run accumulator(counter=&counter) as acc
+        acc::total + counter
+    "#},
+            &[(
+                "accumulator",
+                indoc! {r#"
+        param counter: Mut(Int)
+        for value in [1, 2, 3]:
+            counter += value
+        pub total = counter
+    "#},
+            )],
+        ),
+        Value::Int(12),
+    );
+}
+
+#[rstest]
+#[case::missing_marker("sink=out", "Feed(Int)", "borrows a place; pass it with `&`")]
+#[case::value_parameter(
+    "sink=&out",
+    "List(Int)",
+    "receives a value, so it cannot borrow a place"
+)]
+fn module_place_arguments_require_the_borrow_mode(
+    #[case] argument: &str,
+    #[case] ty: &str,
+    #[case] needle: &str,
+) {
+    let root = formatdoc! {r#"
+        out: Feed(Int)
+        run sinker({argument})
+        0
+    "#};
+    let module = format!("param sink: {ty}");
+    assert_refused(&program(&root, &[("sinker", &module)]), needle);
+}
+
+#[test]
+fn a_module_borrow_cannot_escape_in_an_exported_mutable_writer() {
+    assert_refused(
+        &program(
+            indoc! {r#"
+        counter: Mut(Int, Txn) := 0
+        run holder(state=&counter) as h
+        0
+    "#},
+            &[(
+                "holder",
+                indoc! {r#"
+        param state: Mut(Int, Txn)
+        pub def deposit(value):
+            state += value
+    "#},
+            )],
+        ),
+        "`deposit` is public and its type has `WriteTxn(state)`",
+    );
+}
+
+#[test]
+fn a_module_borrows_transactional_state_for_its_run() {
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        counter: Mut(Int, Txn) := 0
+        run accumulator(counter=&counter)
+        await_final(counter)
+    "#},
+            &[(
+                "accumulator",
+                indoc! {r#"
+        param counter: Mut(Int, Txn)
+        for value in [1, 2, 3]:
+            with begin():
+                counter += value
+    "#},
+            )],
+        ),
+        Value::Int(6),
+    );
+}

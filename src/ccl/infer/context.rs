@@ -1095,8 +1095,7 @@ impl InferCtx {
             .expect("the top level's frame stays open through emission")
     }
 
-    /// Enter into the root scope each run-owned variable `tree`'s top level binds: a public
-    /// feed and a declared transactional variable, whose history no scope ends (`docs/chl-spec.md`,
+    /// Enter into the root scope each transactional variable `tree`'s top level declares, whose history no scope ends (`docs/chl-spec.md`,
     /// "Discharging requirements and effects"). Every telescope of the run extends the root
     /// scope, so a capability naming one enters every capability variable. Run before
     /// anything is minted. Lowering refuses a transactional variable declared anywhere but on
@@ -1104,13 +1103,6 @@ impl InferCtx {
     pub(super) fn enter_run_owned(&mut self, tree: &Expr) {
         for statement in tree.chain_statements() {
             let owned = match &statement.node {
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    ..
-                } => (matches!(bound_expr.node, TypedExprNode::Defer)
-                    && self.public.contains(&binding.name))
-                .then_some(&binding.name),
                 TypedExprNode::MutDecl { binding, .. } => binding
                     .ty
                     .history_parts()
@@ -1209,14 +1201,8 @@ impl InferCtx {
                 "lowering refuses `{name}`, a transactional variable declared below a module's \
                  top level"
             );
-            let public_feed = declares
-                && top_level
-                && matches!(history_kind, crate::ccl::ty::HistoryKind::Append)
-                && self.public.contains(name);
-            // The run's state outlives every scope: the root scope binds it
-            // ([`InferCtx::enter_run_owned`]), so no scope ends the history of what names it.
-            // Any other variable's binder ends it.
-            let run_owned = public_feed || (declares && transactional);
+            // The root scope binds each run-owned transactional variable before emission.
+            let run_owned = declares && transactional;
             assert!(
                 !run_owned || self.capability_frames[0].outer.contains(name),
                 "`{name}` is run-owned, so the root scope binds it before emission"
@@ -1249,14 +1235,9 @@ impl InferCtx {
                     outlived_by,
                 },
             );
-            // Declaring a transactional variable writes it, and other modules append to a
-            // public feed, so declaring one is an output of the top level's too. Neither
-            // capability is discharged where the top level's scope ends.
+            // Declaring transactional state writes it; its capability outlives this scope.
             if declares && transactional {
                 self.record_capability(Capability::Causes(Effect::Write(name.clone())));
-            }
-            if public_feed {
-                self.record_capability(Capability::Causes(Effect::Append(name.clone())));
             }
         }
     }
@@ -1782,10 +1763,9 @@ impl InferCtx {
                 .borrow_mut()
                 .entry(param.param.id)
                 .or_insert_with(|| {
-                    // Minted where it is first named. What reaches it is what the instance's
-                    // functions do, which their own types already keep to the variables in scope
-                    // where they stand.
-                    let var = CapabilityVar::fresh(0, &self.telescope);
+                    // An instance's associated effect is shared by all its uses. Only the
+                    // run's state is in scope for that program-wide variable.
+                    let var = CapabilityVar::fresh(0, &self.capability_frames[0].outer);
                     if !param.param.clause_except.is_empty() {
                         let mut set = CapabilitySet::default();
                         set.add_every(
@@ -1979,6 +1959,13 @@ impl InferCtx {
         blame: Blame,
     ) {
         for item in written.items() {
+            // check_written reports unknown source names. They enter no inference variable.
+            if item
+                .variable()
+                .is_some_and(|name| !self.telescope.contains(name))
+            {
+                continue;
+            }
             if !matches!(item, Capability::Param(_)) {
                 var.record(self.stated_capability(item));
             }
@@ -4788,6 +4775,9 @@ impl Typing for InferCtx {
             .push(exit);
         self.scopes.push_scope();
         self.scopes.bind(binding.name.clone(), entry);
+        if binding.parameter_mode == crate::ccl::place::ParameterMode::Borrow {
+            self.bind_capability_name(&binding.name, &binding.ty, false);
+        }
         let r = self.under_binder(&binding.name, f);
         self.scopes.pop_scope();
         r

@@ -75,11 +75,18 @@ pub fn visit_places<'a>(ty: &'a Type, at_top: bool, visit: &mut impl FnMut(&'a T
             visit_places(domain, false, visit);
         }
         Type::Fun {
-            domain, codomain, ..
+            binder,
+            domain,
+            codomain,
+            ..
         } => {
             match domain.peel_refinements() {
-                Type::Tuple(ts) => ts.iter().for_each(|t| visit_places(t, true, visit)),
-                Type::DepTuple(cs) => cs.iter().for_each(|(_, t)| visit_places(t, true, visit)),
+                Type::Tuple(ts) if binder.parameter_count().is_some() => {
+                    ts.iter().for_each(|t| visit_places(t, true, visit))
+                }
+                Type::DepTuple(cs) if binder.parameter_count().is_some() => {
+                    cs.iter().for_each(|(_, t)| visit_places(t, true, visit))
+                }
                 _ => visit_places(domain, true, visit),
             }
             visit_places(codomain, false, visit);
@@ -106,4 +113,45 @@ pub fn nested_place_message(ty: &str) -> String {
         "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, \
          a feed's values or a function's result: {ty}"
     )
+}
+
+/// Compiler bindings of borrowed places retain their annotation check, while every use
+/// names the lent place's declaration before read naming and capability inference.
+pub(crate) fn resolve_borrow_bindings(expr: &mut crate::ccl::Expr) {
+    use crate::ccl::TypedExprNode;
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &mut expr.node
+        && binding.parameter_mode == ParameterMode::Borrow
+        && binding.annotation_ty().unwrap_or(&binding.ty).is_place()
+    {
+        let place = match &bound_expr.node {
+            TypedExprNode::Borrow(place) => &**place,
+            _ => &**bound_expr,
+        };
+        if let TypedExprNode::Var(root) = &place.node {
+            crate::ccl::subst::Subst::rename(binding.name.clone(), root.clone()).rewrite_expr(body);
+        }
+    }
+    expr.walk_children_mut(resolve_borrow_bindings);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_a_parameter_list_can_contain_several_place_parameters() {
+        let feed = Type::feed(Type::Hole, Type::Base(crate::ccl::BaseType::Int));
+        let unit = Type::Base(crate::ccl::BaseType::Unit);
+        let tuple_argument = Type::fun(Type::tuple(vec![feed.clone(), unit.clone()]), unit.clone());
+        assert!(misplaced(&tuple_argument, false).is_some());
+        let parameters = Type::fun_of_params(
+            vec![("out".into(), feed), ("value".into(), unit.clone())],
+            unit,
+            crate::ccl::FunKind::Compute,
+        );
+        assert!(misplaced(&parameters, false).is_none());
+    }
 }

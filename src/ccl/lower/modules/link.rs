@@ -656,8 +656,6 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             let names = Rc::new(names_under(&qualified, &default));
             let at = (declared, declared);
             chain = lowering.bind_module_parameter(chain, &name, &ty, &names, at, ctx);
-            let entries = mut_entries(&name, &ty, &names);
-            qualified.extend(entries);
             modules.insert(name, names);
         }
         let program_span = ast
@@ -1434,7 +1432,6 @@ impl<'a> ProgramLowering<'a> {
         };
         let own = self.shared_names(&lowered.scope);
         // The argument's variable each transactional entry reaches, spelled as the entry.
-        let mut entry_vars: Vec<(QualifiedName, Name)> = Vec::new();
         let mut modules: HashMap<SmolStr, Rc<HashMap<QualifiedName, Name>>> = HashMap::new();
         // A type parameter's default is its module's own type, so it takes the
         // run's names. An argument is its declaring module's, so it replaces the
@@ -1525,7 +1522,6 @@ impl<'a> ProgramLowering<'a> {
                     };
                     let at = (span, parameter.declared);
                     chain = self.bind_module_parameter(chain, &parameter.name, ty, &names, at, ctx);
-                    entry_vars.extend(mut_entries(&parameter.name, ty, &names));
                     modules.insert(parameter.name.clone(), names);
                     continue;
                 }
@@ -1684,7 +1680,6 @@ impl<'a> ProgramLowering<'a> {
             )
         };
         let mut qualified = own;
-        qualified.extend(entry_vars);
         let outer = std::mem::replace(&mut self.nested, true);
         let enclosing = std::mem::replace(&mut self.enclosing, place.clone());
         let copies = self.method_copies.len();
@@ -1777,6 +1772,9 @@ impl<'a> ProgramLowering<'a> {
                 .unwrap_or_else(|| {
                     panic!("the run `{path}`'s chain binds its sink `{}`", sink.binding)
                 });
+            if let Some(subject) = sink.subject {
+                ctx.sink_subjects.insert(name.clone(), subject);
+            }
             ctx.sink_reads.insert(sink.key, (name.clone(), sink.label));
         }
         Some(Created {
@@ -1801,17 +1799,11 @@ impl<'a> ProgramLowering<'a> {
         let parameter = QualifiedName::new(parameter);
         let mut lets = Vec::new();
         ModuleView::of(&parameter, ty, &mut lets);
-        for (binder, entry_ty) in lets {
+        for (binder, _) in lets {
             let entry = binder
                 .strip_prefix(&parameter)
                 .expect("a parameter's entries are spelled under it");
             match names.get(&entry) {
-                Some(_) if crate::ccl::lower::stmts::is_mut_entry(&entry_ty) => {
-                    let (_, value, _) = entry_ty
-                        .history_parts()
-                        .expect("a transactional variable's entry is a history");
-                    rebind_mut_entry(&mut chain, &binder, value.clone(), span, ctx);
-                }
                 Some(member) => rebind_entry(&mut chain, &binder, member.clone(), span, ctx),
                 // `uncovered` reports known missing members, but creation can continue
                 // for diagnostics. Recovery entries retain their declared constraints;

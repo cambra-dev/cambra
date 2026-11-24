@@ -888,7 +888,7 @@ pub enum InferError {
         /// `result_large_err` budget.
         ty: Box<Type>,
         /// The effect a function type in the value type causes.
-        effect: Box<crate::ccl::capabilities::Effect>,
+        effect: Box<crate::ccl::capabilities::Capability>,
     },
     /// A use of the `Mut` or `Feed` place `name` that breaks the borrowing discipline
     /// (`docs/chl-spec.md`, "Places and values").
@@ -3814,27 +3814,39 @@ fn debug_assert_no_mut_var_let(expr: &Expr) {
 /// The first effect on a place, an append to a feed or a write of a mutable variable, that a
 /// function type in `ty` causes. A collection type's own capabilities state what ran where the
 /// collection was built, so they are not read; the function types inside it are.
-fn effect_on_a_place(ty: &Type) -> Option<crate::ccl::capabilities::Effect> {
-    if let Type::Fun {
-        capabilities,
-        fun_kind,
-        ..
-    } = ty
-        && !fun_kind.resolved().is_data()
-        && let Some(effect) = capabilities
-            .set()
-            .items()
-            .find_map(|c| c.effect_on_a_place().cloned())
-    {
-        return Some(effect);
-    }
-    let mut found = None;
-    ty.walk_children(|t| {
-        if found.is_none() {
-            found = effect_on_a_place(t);
+fn effect_on_a_place(ty: &Type) -> Option<crate::ccl::capabilities::Capability> {
+    fn go(
+        ty: &Type,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<crate::ccl::capabilities::Capability> {
+        if let Type::Fun {
+            capabilities,
+            fun_kind,
+            ..
+        } = ty
+            && !fun_kind.resolved().is_data()
+            && let Some(effect) = capabilities.set().items().find(|c| c.may_act_on_a_place())
+        {
+            return Some(effect);
         }
-    });
-    found
+        let mut found = None;
+        ty.walk_children(|part| {
+            if found.is_none() {
+                found = go(part, visiting);
+            }
+        });
+        if found.is_none()
+            && let Type::Nominal(decl, args) = ty
+        {
+            let identity = Rc::as_ptr(decl) as usize;
+            if visiting.insert(identity) {
+                found = go(&decl.representation(args), visiting);
+                visiting.remove(&identity);
+            }
+        }
+        found
+    }
+    go(ty, &mut HashSet::new())
 }
 
 /// Rule 2 on a type: a place type stands only where [`crate::ccl::place::visit_places`]
