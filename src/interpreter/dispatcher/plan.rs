@@ -808,18 +808,13 @@ fn run_targets(
     // the run finishes it only once every source yields everything. A run with no live source
     // finishes it once its input is whole, so it merges its packages' answers until then and
     // hands one terminal answer.
-    // It hands them in queue order: a pause and a reload cut its output between packages.
     if !live.is_empty() {
-        for ((_, _, entry), (pipeline, breaker)) in targets
-            .iter()
-            .zip(sink_pipelines.iter().zip(&sink_breakers))
-        {
+        for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
             if let TargetEntry::Main(_) = entry {
                 breaker
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .hand_each_package();
-                dispatcher.order(PipelineId(planner.local[*pipeline]));
             }
         }
     }
