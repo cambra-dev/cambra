@@ -23,8 +23,8 @@ use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
 };
 use crate::ccl::{
-    Builtin, Expr, FunKind, Name, Refinement, Type, TypedBinding, TypedExpr,
-    TypedExprNode, provenance::NodeId,
+    Builtin, Expr, FunKind, Name, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
+    provenance::NodeId,
 };
 
 /// A fed value together with the row its contribution is stored at. Every operation

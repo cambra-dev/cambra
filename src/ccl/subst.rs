@@ -2344,7 +2344,10 @@ impl Subst {
         // unrestricted substitution is the right one for it, and the binder
         // crossings below still only guard the children.
         e.walk_ambient_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
-        if let TypedExprNode::For { position, target, .. } = &mut e.node {
+        if let TypedExprNode::For {
+            position, target, ..
+        } = &mut e.node
+        {
             let scoped = self.shadow(position);
             scoped.assert_no_capture(position);
             scoped.rewrite_type_go(&mut target.ty, memo);
