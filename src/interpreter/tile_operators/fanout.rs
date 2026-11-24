@@ -2247,15 +2247,15 @@ mod tests {
         let fan = keyed_fan();
         let mut sched = SubscribeContext::new();
         let (ahead, behind) = (a_reader(), a_reader());
-        let mut ahead_read = read_by(&fan, ahead, None, &mut sched);
-        let mut behind_read = read_by(&fan, behind, None, &mut sched);
+        let ahead_read = read_by(&fan, ahead, None, &mut sched);
+        let behind_read = read_by(&fan, behind, None, &mut sched);
         ahead_read.release(released_through(9));
         behind_read.release(released_through(4));
         fan.reopen();
         drop(ahead_read);
         drop(behind_read);
 
-        let mut ahead_again = read_by(&fan, a_reader(), Some(ahead), &mut sched);
+        let ahead_again = read_by(&fan, a_reader(), Some(ahead), &mut sched);
         ahead_again.release(released_through(10));
         assert_eq!(
             fan.shared
@@ -2265,7 +2265,7 @@ mod tests {
             released_through(4)
         );
         let behind_again = a_reader();
-        let mut behind_read_again = read_by(&fan, behind_again, Some(behind), &mut sched);
+        let behind_read_again = read_by(&fan, behind_again, Some(behind), &mut sched);
         assert_eq!(fan.released_by(behind_again), Some(released_through(4)));
         fan.settle_handover();
         behind_read_again.release(released_through(10));
