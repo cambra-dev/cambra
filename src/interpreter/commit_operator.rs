@@ -973,6 +973,11 @@ impl SteppedStore for InductionStoreProducer {
 /// cover one row and include a closing round before releasing that row. See
 /// `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 impl Breaker for InductionStoreProducer {
+    /// A store steps its positions in order.
+    fn consumes_concurrently(&self) -> bool {
+        false
+    }
+
     /// A loop runs its positions in order, and takes a request none of whose positions is next as
     /// one that only closes positions absent from its source. The store's pipeline and every
     /// pipeline it reads, transitively, therefore publish in position order: each has one package
@@ -1290,6 +1295,11 @@ impl SteppedStore for CommitProducer {
 /// including an empty-write proposal, which takes a tick when it commits
 /// (`src/interpreter/design-operators.md`, "Ready transaction decisions").
 impl Breaker for CommitProducer {
+    /// Commits are decided in transaction order.
+    fn consumes_concurrently(&self) -> bool {
+        false
+    }
+
     /// A transaction's driver holds one item in its live window, the next its source delivers, so
     /// the store's requests arrive in position order: the store's pipeline and every pipeline it
     /// reads, transitively, have one package in flight (`order_inputs_of_ordered_breakers`), as
@@ -6341,6 +6351,11 @@ impl TileProducer for InductionDriverProducer {
 /// store has decided the position before it. See `src/interpreter/design-dispatcher.md`, "A loop in
 /// rounds".
 impl Breaker for InductionDriverProducer {
+    /// A loop drives its positions in order.
+    fn consumes_concurrently(&self) -> bool {
+        false
+    }
+
     /// The source's tiling, which the entry in front of the source and the drive's release of the
     /// source are of. A package names one position's path, or nothing.
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -7283,6 +7298,11 @@ impl TransactDriverProducer {
 }
 
 impl Breaker for TransactDriverProducer {
+    /// Transaction attempts are driven in order.
+    fn consumes_concurrently(&self) -> bool {
+        false
+    }
+
     fn input_tiling(&self, _: InputId) -> Tiling {
         let mut state_guard = self
             .state
@@ -8234,6 +8254,11 @@ impl TransactWriterProducer {
 }
 
 impl Breaker for TransactWriterProducer {
+    /// A writer proposes its attempts in order.
+    fn consumes_concurrently(&self) -> bool {
+        false
+    }
+
     fn input_tiling(&self, _: InputId) -> Tiling {
         let mut state_guard = self
             .state

@@ -934,15 +934,22 @@ fn run_targets(
     for pipeline in workers.serial() {
         dispatcher.order(pipeline);
     }
-    // A package naming keys beneath the deepest level its chain restates, or no projection, is
-    // read wider than it names, so it runs alone.
+    // A package naming keys beneath the deepest level its chain restates is read wider than it
+    // names, so it runs alone. Every pusher queues a projection of its reader's input; a guard
+    // that names none would be read wider still, and runs alone in a release build.
     for (pipeline, level) in workers.restated() {
         dispatcher.classify(
             pipeline,
-            Arc::new(move |guard: &TileGuard| {
-                Projection::of(guard)
-                    .ok()
-                    .is_none_or(|projection| projection.level().is_some_and(|at| at > level))
+            Arc::new(move |guard: &TileGuard| match Projection::of(guard) {
+                Ok(projection) => projection.level().is_some_and(|at| at > level),
+                Err(why) => {
+                    debug_assert!(
+                        false,
+                        "pipeline {} is queued a package that names no projection: {why}",
+                        pipeline.0
+                    );
+                    true
+                }
             }),
         );
     }
@@ -3390,10 +3397,15 @@ fn restated_level(
     consuming: &[BreakerHandle],
     inputs: &mut dyn FnMut(&mut dyn FnMut(&dyn crate::interpreter::tile_operators::TileProducer)),
 ) -> Option<CurryLevel> {
-    if !breaker.consumes_concurrently() {
+    let input = breaker.input_tiling(InputId::ONLY);
+    // A push is cut into morsels in key order, which a function value has none of.
+    let ordered = input
+        .domain_extent()
+        .is_some_and(|keys| crate::interpreter::tile_operators::keys_have_order(&keys));
+    if !breaker.consumes_concurrently() || !ordered {
         return None;
     }
-    let levels = breaker.input_tiling(InputId::ONLY).levels();
+    let levels = input.levels();
     let mut restates = |level: CurryLevel| {
         let mut refused = false;
         inputs(&mut |input| {

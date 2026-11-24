@@ -1701,11 +1701,12 @@ impl InputId {
 pub trait Breaker {
     /// Whether packages naming disjoint regions of the input may run this breaker's consume at
     /// once. Which packages are disjoint, and at which level, is the chain's to say: the
-    /// dispatcher runs a package beside others only where every operator the chain pulls
-    /// restates the keys it names (`src/interpreter/design-dispatcher.md`, "Shared native
-    /// pipeline execution").
+    /// dispatcher runs a package beside others only where its input is keyed by ordered keys and
+    /// every operator the chain pulls restates the keys the package names
+    /// (`src/interpreter/design-dispatcher.md`, "Shared native pipeline execution"). A breaker
+    /// whose consume depends on the order of its packages answers `false`.
     fn consumes_concurrently(&self) -> bool {
-        false
+        true
     }
 
     /// Read the existing input, integrate into synchronized native state, and release
@@ -4003,7 +4004,7 @@ pub(crate) fn has_keys(input: &dyn TileProducer) -> bool {
 }
 
 /// Whether every key of `extent` has an order ([`has_order`]): no key holds a function value.
-fn keys_have_order(extent: &Extent) -> bool {
+pub(crate) fn keys_have_order(extent: &Extent) -> bool {
     match extent {
         Extent::Function { .. } => false,
         Extent::Record(fields) => fields.values().all(keys_have_order),
