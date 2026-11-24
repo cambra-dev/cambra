@@ -90,7 +90,7 @@ fn a_stdin_feed_resumes_after_the_cut_when_its_other_writer_is_edited() {
     // The driver prints each tile's `Debug` form, one string value per line of a `Strings`
     // column. A channel's arm tags print quoted too, outside any `Strings` column.
     let mut in_strings = false;
-    let printed: Vec<&str> = out
+    let mut printed: Vec<&str> = out
         .lines()
         .map(str::trim)
         .filter_map(|l| {
@@ -104,6 +104,14 @@ fn a_stdin_feed_resumes_after_the_cut_when_its_other_writer_is_edited() {
                 .flatten()
         })
         .collect();
+    // A `main` output hands each package's answer as the package finishes, in no order, so the
+    // values are compared sorted. Sorted, each value extends the one before it, as the
+    // accumulation built them.
+    printed.sort_unstable();
+    assert!(
+        printed.windows(2).all(|pair| pair[1].starts_with(pair[0])),
+        "each value extends the one before it: {printed:?}"
+    );
     assert_eq!(
         printed,
         vec!["a", "ab", "abc"],

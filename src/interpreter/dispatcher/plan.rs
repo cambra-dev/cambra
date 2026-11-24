@@ -636,14 +636,14 @@ fn run_targets(
         &mut reach,
         &mut end_of,
     );
-    // A `main` output's pipeline consumes its packages in queue order.
+    // A `main` output merges its packages' answers under its own lock, so its pipeline consumes
+    // them in any order.
     for ((_, _, entry), (pipeline, breaker)) in targets
         .iter()
         .zip(sink_pipelines.iter().zip(&sink_breakers))
     {
         if let TargetEntry::Main(_) = entry {
             let local = planner.local[*pipeline];
-            dispatcher.order(PipelineId(local));
             if reads_a_scope(&members.located, &members.reads, local) {
                 breaker
                     .write()
