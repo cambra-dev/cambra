@@ -1518,3 +1518,33 @@ fn a_caught_value_grouped_into_a_returned_map(
         ),
     );
 }
+
+/// BUG: a `try` around a comprehension whose elements raise, whose value is grouped by `groupby`
+/// into the returned map, is refused by inference: the exception the `try` catches is reported
+/// as escaping the program, at the `groupby` call. The correct result maps `0 -> 0` and
+/// `150 -> 150`. With a second `try` inside each element in place of the one around the
+/// comprehension, the program compiles (`a_caught_value_grouped_into_a_returned_map`). This pins
+/// the refusal, so the test goes red when it changes; then assert the result with `check_tile`.
+#[test]
+fn bug_a_try_around_a_raising_comprehension_grouped_into_a_returned_map() {
+    check_compile_error(
+        indoc! {r#"
+            def g(x):
+                try:
+                    if x > 0:
+                        x
+                    elif x == 0:
+                        raise 1
+                    else:
+                        raise "neg"
+                except Int:
+                    0
+            lines = try:
+                    [(name=s, total=g(s)) for s in [150, 0]]
+                except String:
+                    [(name=1, total=1), (name=2, total=2)]
+            [sum([l.total for l in grp]) for grp in groupby(lines, \l -> l.name)]
+        "#},
+        "which nothing catches: no exception may escape the program",
+    );
+}

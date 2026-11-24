@@ -821,3 +821,56 @@ fn two_runs_serve_the_routes_their_arguments_give() {
     let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(responses, vec!["hello from eu", "hello from us"]);
 }
+
+/// Send a POST and return the response body, or `None` when no response arrives within
+/// `timeout`.
+fn http_post_within(port: u16, path: &str, body: &str, timeout: Duration) -> Option<String> {
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {len}\r\n\
+         Connection: close\r\n\r\n{body}",
+        len = body.len()
+    );
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connects");
+    stream
+        .write_all(request.as_bytes())
+        .expect("writes the request");
+    stream
+        .set_read_timeout(Some(timeout))
+        .expect("sets the timeout");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string())
+}
+
+/// BUG: a response feed fed from two `<<` sites never answers. Each request of `/pick` reaches
+/// exactly one of the two branches, and the correct replies are `big` for `5` and `small` for
+/// `1`; no reply arrives. The same choice written as one `<<` of a ternary answers, and so does
+/// `/echo`, which this program also serves and the test calls first, so a slow start cannot pass
+/// the pin. When this is fixed, assert the two replies.
+#[test]
+fn bug_a_reply_fed_from_two_sites_never_answers() {
+    let port = reserve_test_port();
+    let mut ctx = super::serving::compile_sink(&formatdoc! {r#"
+        echo_reqs, echo_resps = http_serve("{port}", "POST", "/echo")
+        pick_reqs, pick_resps = http_serve("{port}", "POST", "/pick")
+        for r in echo_reqs:
+            echo_resps << r
+        for r in pick_reqs:
+            if r == "5":
+                pick_resps << "big"
+            else:
+                pick_resps << "small"
+    "#});
+    let (echo, pick) = super::serving::exchange(&mut ctx, move || {
+        let wait = Duration::from_secs(2);
+        (
+            http_post_within(port, "/echo", "hi", wait),
+            http_post_within(port, "/pick", "5", wait),
+        )
+    });
+    assert_eq!(echo.as_deref(), Some("hi"), "the control route answers");
+    assert_eq!(
+        pick, None,
+        "a reply arrived, so the bug is fixed: assert `big` and `small`"
+    );
+}
