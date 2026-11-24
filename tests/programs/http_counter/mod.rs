@@ -16,7 +16,7 @@ use super::serving::{compile_sink, exchange, http_get, http_post, reserve_test_p
 fn http_counter() {
     let port = reserve_test_port();
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
-    let mut ctx = compile_sink(&source);
+    let (mut ctx, _program) = compile_sink(&source);
 
     let got = exchange(&mut ctx, move || {
         // Two overwrites, then read: the live mutable variable must reflect the *latest*
@@ -52,7 +52,7 @@ fn http_computed_live_read() {
                     get_resps << latest + "!"
             "#
     );
-    let mut ctx = compile_sink(&source);
+    let (mut ctx, _program) = compile_sink(&source);
 
     let got = exchange(&mut ctx, move || {
         // Overwrite to `bob`, then read the computed reply `bob!`.
@@ -87,7 +87,7 @@ fn http_multi_mut_var_live_read() {
                     get_resps << a + b
             "#
     );
-    let mut ctx = compile_sink(&source);
+    let (mut ctx, _program) = compile_sink(&source);
 
     let got = exchange(&mut ctx, move || {
         http_post(port, "/set", "x");

@@ -2733,7 +2733,7 @@ fn computed_live_cross_endpoint_read_compiles() {
     "#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
+    let _ = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
         .expect("a computed live cross-endpoint read should compile");
 }
 
@@ -2758,7 +2758,7 @@ fn live_read_combining_request_and_store_compiles() {
     "#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
+    let _ = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
         .expect("a live reply combining the request with a mutable variable read should compile");
 }
 

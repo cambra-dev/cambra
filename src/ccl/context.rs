@@ -1288,6 +1288,7 @@ pub struct CompiledOutput {
     pub producer: Option<Box<dyn TileProducer>>,
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
     /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
+    /// This is the consumer's only strong owner: the operator holds it weakly.
     pub sink_consumer: Option<Rc<RefCell<SinkConsumer>>>,
 }
 
@@ -1305,6 +1306,12 @@ impl CompiledOutput {
 /// Programs without sinks get an immediately-dropped sender, so `done.try_recv()`
 /// never returns `Ok`; pure programs are driven entirely by the `main` output's
 /// producer.
+///
+/// Dropping the program stops its sinks. Its outputs are the only strong owners of its sink
+/// consumers ([`CompiledOutput::sink_consumer`]), so the drop ends their dispatch and frees the
+/// producer chain each one owns.
+#[must_use = "dropping a `CompiledProgram` stops its sinks: hold it for as long as the program \
+              should run"]
 pub struct CompiledProgram {
     /// Join-planned CCL expression.  For sink programs this is `Let* Record{…}`;
     /// for pure programs it is the bare lowered expression at the tail of the
@@ -3683,8 +3690,15 @@ fn compile_version(
             let (sink_consumer, producer_slot) =
                 SinkConsumer::new(sink, notifier, ctx.scheduler().sink_pull_queue());
             let consumer_rc = Rc::new(RefCell::new(sink_consumer));
-            let sink_producer =
-                op.subscribe(universal, Box::new(consumer_rc.clone()), ctx.scheduler());
+            // The operator holds the consumer weakly, so the output this pushes is its only
+            // strong owner, and dropping the program stops the sink
+            // (`src/ccl/design/program-evolution.md`, "A subscription lasts as long as its
+            // producer").
+            let sink_producer = op.subscribe(
+                universal,
+                Box::new(Rc::downgrade(&consumer_rc)),
+                ctx.scheduler(),
+            );
             debug!(
                 "Sink producer for {name}:\n{}",
                 pretty_tile_producer_with(
