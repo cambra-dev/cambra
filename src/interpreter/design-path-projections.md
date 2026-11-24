@@ -140,16 +140,11 @@ A loop nested in another runs as a scope inside the outer loop's scope, queued a
 per outer round: the inner scope's rounds are the positions `(k, j)` of row `k` the inner drive
 emits, and a round at the row closes it.
 
-A round of a nested loop pulls each operator beneath the outermost keys at a level it restates,
-and the planner asserts it (`Planner::unrestated_in_rounds`). The check composes the levels along
-each path from an inner pipeline's breaker: `TileProducer::restates` says what an operator accepts,
-and `TileProducer::input_level` the level it pulls each input at.
-
-An operator may pull an input above the round's level, at the nearest level that input restates
-(`Projection::restated_by`), and declares that level (`Restates::nearest`); `Uncurry` and
-`UnionOperator` do. The wider read is cut to the round's paths after. A `Memo` beneath it on a
-path to a recurrence slot caches positions of later rounds from the store's snapshot, and reads them
-again before the store's next step
+A round of a nested loop pulls each operator at the round's paths, beneath the outermost keys. An
+operator that does not restate the level a pull names is pulled at the nearest level it restates
+(`Projection::restated_by`), and the answer is cut to the round's paths (`TileProducer::get`). A
+`Memo` beneath it on a path to a recurrence slot caches positions of later rounds from the store's
+snapshot, and reads them again before the store's next step
 ([A store as a breaker](design-operators.md#a-store-as-a-breaker)).
 
 A live source's arrivals are notified as the region they restate at the entry of the pipeline that

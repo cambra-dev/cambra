@@ -159,8 +159,7 @@ fn collect_run(
 ///
 /// # Panics
 ///
-/// Where a round of a loop's scope pulls an operator beneath the outermost keys at a level it
-/// restates no projection at (`Planner::unrestated_in_rounds`), and where [`run`] panics. In a
+/// Where [`run`] panics. In a
 /// debug build, where a run that returns has not released the `main` output's producer whole, where
 /// the pull at the output's finish answers a key or a value no package consumed, and where the
 /// answers do not add up to a terminal one.
@@ -448,7 +447,6 @@ fn run_targets(
     }
     // The breakers each loop's scope keeps, those of loops nested in a transaction writer's body
     // included, for the check of their rounds below.
-    let mut kept = Vec::new();
     let transactions: Vec<(StoreCell, usize, transaction_scope::WriterRun)> = planner
         .scopes
         .iter()
@@ -462,7 +460,7 @@ fn run_targets(
             (
                 store,
                 writer,
-                planner.build_transaction(scope, morsel_rows, &mut kept, &mut runs),
+                planner.build_transaction(scope, morsel_rows, &mut runs),
             )
         })
         .collect();
@@ -475,14 +473,11 @@ fn run_targets(
         .iter()
         .map(|located| match located {
             Located::Scope { scope, .. } => {
-                Some(planner.build_scope(*scope, morsel_rows, &mut kept, &mut runs))
+                Some(planner.build_scope(*scope, morsel_rows, &mut runs))
             }
             _ => None,
         })
         .collect();
-    if let Some(why) = planner.unrestated_in_rounds(&kept) {
-        panic!("a round of a loop's scope pulls each operator at a level it restates: {why}");
-    }
     let scope_at = |pipeline: PipelineId| {
         scopes[pipeline.0]
             .as_ref()
@@ -2263,9 +2258,6 @@ pub(super) struct PlannedScope {
     pipeline: Option<usize>,
     /// How many pipelines its body graph has before global composition.
     count: usize,
-    /// How many row levels its store has above its positions: its rounds run at paths of
-    /// `depth + 1` keys.
-    depth: usize,
 }
 
 /// One scoped planning graph, with local indices and the inputs [`plan_edges`] configures.
@@ -2654,7 +2646,6 @@ impl Planner {
                 fan: read.fan,
                 pipeline: None,
                 count: 0,
-                depth: 0,
             });
             self.walking.push(scope);
             let body = self.pipelines_under(producer, role);
@@ -2754,7 +2745,6 @@ impl Planner {
             fan: read.fan,
             pipeline: None,
             count: 0,
-            depth: rows_above_positions(read.store.read().tiling()),
         });
         self.walking.push(scope);
         let mut below = Beneath::default();
@@ -3042,7 +3032,6 @@ impl Planner {
         &self,
         pipelines: &Members<'_>,
         morsel_rows: usize,
-        kept_scopes: &mut Vec<(usize, Vec<BreakerHandle>)>,
         runs: &mut ScopeRuns,
     ) -> Vec<Member> {
         pipelines
@@ -3051,7 +3040,7 @@ impl Planner {
             .map(|located| match located {
                 Located::Chain(handle) => Member::Chain(handle.clone()),
                 Located::Scope { scope, .. } => {
-                    Member::Scope(self.build_scope(*scope, morsel_rows, kept_scopes, runs))
+                    Member::Scope(self.build_scope(*scope, morsel_rows, runs))
                 }
                 Located::Store { .. } | Located::Sink(_) => {
                     unreachable!("a scope's body has chains and nested loops")
@@ -3061,17 +3050,14 @@ impl Planner {
     }
 
     /// The loop scope of the planner's scope `scope`.
-    /// Each scope's index and the breaker handles it keeps are added to `kept`: the inner pipelines
-    /// its rounds queue or push packages to ([`unrestated_in_rounds`](Self::unrestated_in_rounds)).
     pub(super) fn build_scope(
         &self,
         scope: usize,
         morsel_rows: usize,
-        kept_scopes: &mut Vec<(usize, Vec<BreakerHandle>)>,
         runs: &mut ScopeRuns,
     ) -> StoreCell {
         let pipelines = self.members(Some(scope));
-        let members = self.body_members(&pipelines, morsel_rows, kept_scopes, runs);
+        let members = self.body_members(&pipelines, morsel_rows, runs);
         let store = self.scopes[scope].store.clone();
         let (inner, planned) = {
             // Each pipeline's entries name its local index while the body is planned, so a probe
@@ -3166,7 +3152,6 @@ impl Planner {
         let body = Body::new(inner, members, placements, planned, drive);
         let run = loop_scope::InductionRun::new(body, starts);
         runs.install(&store, run);
-        kept_scopes.push((scope, induction(&store).chain_breakers()));
         store
     }
 
@@ -3174,11 +3159,10 @@ impl Planner {
         &self,
         scope: usize,
         morsel_rows: usize,
-        kept: &mut Vec<(usize, Vec<BreakerHandle>)>,
         runs: &mut ScopeRuns,
     ) -> transaction_scope::WriterRun {
         let pipelines = self.members(Some(scope));
-        let members = self.body_members(&pipelines, morsel_rows, kept, runs);
+        let members = self.body_members(&pipelines, morsel_rows, runs);
         let placed = ClearsPlacements(&pipelines.placements);
         for (local, placements) in pipelines.placements.iter().enumerate() {
             for placement in placements {
@@ -3224,40 +3208,6 @@ impl Planner {
             driver,
         ))
     }
-
-    /// Why a round of a scope whose store has rows above its positions breaks the invariant that it
-    /// pulls each operator beneath the outermost keys at a level the operator restates
-    /// ([`unrestated`]), naming the operator, or `None` where no round does. Such a store is a
-    /// nested loop's, or one per row of a comprehension. `kept` holds each scope's breakers, as
-    /// [`build_scope`](Self::build_scope) gathers them. The walk starts at each breaker such a
-    /// scope keeps, at the level of its rounds, and ends at every consuming breaker, whose
-    /// consume pulls its own inputs. A breaker removed from its body graph because it would read
-    /// whole remains inline and passes the read on.
-    fn unrestated_in_rounds(&self, kept: &[(usize, Vec<BreakerHandle>)]) -> Option<String> {
-        let consuming: Vec<BreakerHandle> = (0..self.located.len())
-            .filter(|&pipeline| self.within[pipeline].is_none())
-            .filter_map(|pipeline| match &self.located[pipeline] {
-                Located::Chain(handle) => Some(handle.clone()),
-                _ => None,
-            })
-            .chain(kept.iter().flat_map(|(_, handles)| handles.iter().cloned()))
-            .collect();
-        kept.iter().find_map(|(scope, breakers)| {
-            let planned = &self.scopes[*scope];
-            if planned.depth == 0 {
-                return None;
-            }
-            let level = CurryLevel::new(planned.depth);
-            breakers.iter().find_map(|handle| {
-                unrestated(
-                    &*handle.read().unwrap_or_else(PoisonError::into_inner),
-                    Some(level),
-                    &consuming,
-                    true,
-                )
-            })
-        })
-    }
 }
 
 /// The body's driver: the one chain among `members` whose breaker answers
@@ -3284,20 +3234,6 @@ fn driver_of(members: &[Member]) -> PipelineId {
         panic!("a scope's body has one driver, not {drivers:?}")
     };
     PipelineId(*driver)
-}
-
-/// How many row levels a store's tiling has above its positions: the collection levels around its
-/// `Tiling::Store`.
-fn rows_above_positions(tiling: &Tiling) -> usize {
-    let mut beneath = tiling;
-    while let Tiling::DataFunction { codomain, .. } = beneath {
-        beneath = codomain;
-    }
-    debug_assert!(
-        matches!(beneath, Tiling::Store { .. }),
-        "a store's tiling is a store beneath collection levels: {tiling:?}"
-    );
-    tiling.levels()
 }
 
 /// Whether `pieces`, keys a range in `pipeline`'s chain yielded, reach `pipeline`'s own entry as
@@ -3352,64 +3288,6 @@ fn consumes_at_once(breaker: &dyn Breaker) -> bool {
             .input_tiling(InputId::ONLY)
             .domain_extent()
             .is_some_and(|keys| crate::interpreter::tile_operators::keys_have_order(&keys))
-}
-
-/// Why a round of a loop's scope cannot pull the chain at `producer`, or `None` where every
-/// operator it pulls beneath the outermost keys restates the keys it is pulled at. `pulled` is the
-/// level `producer` is pulled at, `None` where it is pulled whole, and each operator passes its
-/// level to its inputs as it declares (`TileProducer::input_level`). A pull at the outermost keys
-/// is walked too: every producer restates those keys, but an operator such as `Uncurry` pulls
-/// its input beneath them. The walk ends at a recurrence slot or another store's read, whose
-/// store answers from its snapshot, and, past the breaker it starts at (`start`), at every breaker
-/// in `consuming`, whose consume pulls its inputs and whose own scope checks them.
-fn unrestated(
-    producer: &dyn crate::interpreter::tile_operators::TileProducer,
-    pulled: Option<CurryLevel>,
-    consuming: &[BreakerHandle],
-    start: bool,
-) -> Option<String> {
-    if producer.recurrence_of().is_some() || producer.store_read().is_some() {
-        return None;
-    }
-    if let Some(pulled) = pulled
-        && producer.restates().refuses(pulled)
-    {
-        let name = producer.name();
-        let kind = name.split('#').next().unwrap_or(&name);
-        return Some(format!(
-            "{kind} in a loop's cycle is pulled at the keys of {pulled} and restates {}",
-            producer.restates()
-        ));
-    }
-    if pulled.is_none()
-        || (!start
-            && producer
-                .base()
-                .breaker_handle
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|handle| consuming.iter().any(|seen| Arc::ptr_eq(seen, &handle))))
-    {
-        return None;
-    }
-    // Visiting a stateful producer holds its retained-state lock. Resolve owner
-    // metadata before descending rather than re-entering it from the callback.
-    let mut roles = Vec::new();
-    producer.visit_input_producers(&mut |role, _| roles.push(role.to_owned()));
-    let levels: Vec<_> = roles
-        .iter()
-        .map(|role| pulled.and_then(|level| producer.input_level(role, level)))
-        .collect();
-    let mut why = None;
-    let mut at = 0;
-    producer.visit_input_producers(&mut |_, input| {
-        let beneath = levels[at];
-        at += 1;
-        why = why
-            .take()
-            .or_else(|| unrestated(input, beneath, consuming, false));
-    });
-    why
 }
 
 /// Whether the chain under `producer` reads the fan-out `fan` through a recurrence slot: whether
@@ -3926,10 +3804,6 @@ fn drive_live(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::{TestTileProducer, two_levels_of_ints};
-    use crate::interpreter::tile_operators::{
-        MemoProducer, ProducerBase, TileProducer, impl_producer_base,
-    };
 
     /// A record range over a source field yields a prefix where that field's yield is every
     /// position at or below one, whatever its other fields hold.
@@ -4098,7 +3972,7 @@ mod tests {
                 fan: fan.id(),
                 store: store.clone(),
             });
-            planner.build_scope(0, usize::MAX, &mut Vec::new(), &mut runs);
+            planner.build_scope(0, usize::MAX, &mut runs);
             assert!(induction(&store).run.is_some());
             Err("a later live-source check refuses the plan")
         };
@@ -4111,300 +3985,5 @@ mod tests {
                 .all(|placement| placement.get().is_none())
         );
         drop(program);
-    }
-
-    /// A memo over a producer that restates the outermost keys only.
-    fn memo_over_outermost() -> MemoProducer {
-        let (tile, tiling) = two_levels_of_ints();
-        MemoProducer::over(
-            Box::new(TestTileProducer::new(tile, tiling.clone())),
-            &tiling,
-        )
-    }
-
-    /// An inner pipeline's breaker is pulled at the paths of its scope's rounds and pulls its
-    /// input there, so `unrestated` names an input that restates only the outermost keys.
-    #[test]
-    fn a_breaker_pulled_beneath_the_outermost_keys_finds_an_input_that_restates_none() {
-        let memo = memo_over_outermost();
-        let why = unrestated(&memo, Some(CurryLevel::new(1)), &[], true);
-        assert_eq!(
-            why.as_deref(),
-            Some(
-                "TestTile in a loop's cycle is pulled at the keys of level 1 and restates \
-                 the outermost keys only"
-            )
-        );
-    }
-
-    /// A breaker that consumes ends the walk: its consume pulls its inputs, and its own scope
-    /// checks them. An inline breaker passes the read on to its inputs.
-    #[test]
-    fn a_placed_breaker_ends_the_walk_and_an_inline_one_passes_it_on() {
-        let (_, tiling) = two_levels_of_ints();
-        let inner = crate::interpreter::tile_operators::share_breaker(memo_over_outermost());
-        let mut handle = None;
-        inner.visit_input_producers(&mut |_, input| {
-            handle = input
-                .base()
-                .breaker_handle
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-        });
-        let outer = MemoProducer::over(inner, &tiling);
-        let level = Some(CurryLevel::new(1));
-        assert_eq!(
-            unrestated(
-                &outer,
-                level,
-                &[handle.expect("the inner breaker has a handle")],
-                true
-            ),
-            None
-        );
-        assert!(
-            unrestated(&outer, level, &[], true)
-                .is_some_and(|why| why.starts_with("TestTile in a loop's cycle"))
-        );
-    }
-
-    /// A breaker in no inner pipeline is pulled whole, so nothing beneath it is pulled at a
-    /// round's paths.
-    #[test]
-    fn a_breaker_pulled_whole_finds_nothing_beneath_it() {
-        let memo = memo_over_outermost();
-        assert_eq!(unrestated(&memo, None, &[], true), None);
-    }
-
-    /// A producer that restates every level and pulls its one input a level beneath the level it
-    /// is pulled at, whatever that input restates.
-    struct Deepens {
-        base: ProducerBase,
-        input: Box<dyn TileProducer>,
-    }
-
-    impl TileProducer for Deepens {
-        impl_producer_base!();
-
-        fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-            visit("input", &*self.input);
-        }
-
-        fn restates(&self) -> crate::interpreter::Restates {
-            crate::interpreter::Restates::Every
-        }
-
-        fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-            Some(CurryLevel::new(level.index() + 1))
-        }
-
-        fn get_impl(&self, _guard: TileGuard) -> Tile {
-            self.tiling().empty_tile()
-        }
-
-        fn release_impl(&self, _guard: TileGuard) {}
-    }
-
-    /// A pull at the outermost keys is walked: an operator that pulls its input beneath the keys
-    /// it is pulled at reaches an input that restates the outermost keys only at level 1.
-    #[test]
-    fn an_outermost_pull_that_an_operator_deepens_finds_an_input_that_restates_none() {
-        let (tile, tiling) = two_levels_of_ints();
-        let deepens = Deepens {
-            base: ProducerBase::unowned(Deepens::alloc_id(), &tiling),
-            input: Box::new(TestTileProducer::new(tile, tiling.clone())),
-        };
-        let memo = MemoProducer::over(Box::new(deepens), &tiling);
-        let why = unrestated(&memo, Some(CurryLevel::OUTERMOST), &[], true);
-        assert_eq!(
-            why.as_deref(),
-            Some(
-                "TestTile in a loop's cycle is pulled at the keys of level 1 and restates the \
-                 outermost keys only"
-            )
-        );
-    }
-
-    /// A collection three levels deep, `0 ↦ {0 ↦ {0 ↦ 10, 1 ↦ 11}, 1 ↦ {0 ↦ 20, 1 ↦ 21}}`, read
-    /// through a producer that restates its outermost keys only and logs the guards it is pulled
-    /// at.
-    struct OutermostOnly {
-        tile: Tile,
-        tiling: Tiling,
-        pulled: Arc<RwLock<Vec<TileGuard>>>,
-    }
-
-    impl OutermostOnly {
-        fn new() -> Self {
-            use crate::interpreter::{BaseType, ColumnValue, Extent, Predicate, Tiling};
-            use bit_set::BitSet;
-            let tiling = Tiling::data_function(
-                Extent::uint_range(1),
-                Tiling::data_function(
-                    Extent::uint_range(2),
-                    Tiling::data_function(
-                        Extent::uint_range(2),
-                        Tiling::Scalar(Extent::Base(BaseType::Int)),
-                    ),
-                ),
-            );
-            let tile = Tile::data_function(
-                ColumnValue::UInts(vec![0]),
-                Box::new(Tile::grouped(
-                    vec![0],
-                    ColumnValue::UInts(vec![0, 1]),
-                    Box::new(Tile::grouped(
-                        vec![0, 2],
-                        ColumnValue::UInts(vec![0, 1, 0, 1]),
-                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 20, 21]))),
-                        Predicate::True,
-                        BitSet::new(),
-                    )),
-                    Predicate::True,
-                    BitSet::new(),
-                )),
-                Predicate::True,
-                BitSet::new(),
-            );
-            Self {
-                tile,
-                tiling,
-                pulled: Default::default(),
-            }
-        }
-    }
-
-    struct OutermostOnlyProducer {
-        base: ProducerBase,
-        tile: Tile,
-        pulled: Arc<RwLock<Vec<TileGuard>>>,
-    }
-
-    impl crate::interpreter::tile_operators::TileOperator for OutermostOnly {
-        // A test double holds no operator, and no session walks one.
-        fn visit_inputs(
-            &self,
-            _visit: &mut dyn FnMut(crate::interpreter::operator_graph::InputEdgeSpec<'_>),
-        ) {
-        }
-
-        fn tiling(&self) -> &Tiling {
-            &self.tiling
-        }
-
-        fn subscribe(
-            self: Arc<Self>,
-            _intent_guard: TileGuard,
-            _consumer: Box<dyn Consumer>,
-            _cx: &mut crate::interpreter::SubscribeContext,
-        ) -> Box<dyn TileProducer> {
-            Box::new(OutermostOnlyProducer {
-                base: ProducerBase::unowned(OutermostOnlyProducer::alloc_id(), &self.tiling),
-                tile: self.tile.clone(),
-                pulled: self.pulled.clone(),
-            })
-        }
-    }
-
-    impl TileProducer for OutermostOnlyProducer {
-        impl_producer_base!();
-
-        fn get_impl(&self, guard: TileGuard) -> Tile {
-            self.pulled
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(guard.clone());
-            let mut tile = self.tile.clone();
-            tile.restrict_to(&guard.projection(&self.name()), self.tiling());
-            tile
-        }
-
-        fn release_impl(&self, _guard: TileGuard) {}
-    }
-
-    /// An `Uncurry` beneath a standing level, over an input that restates its outermost keys
-    /// only, is pulled in a round at the pairs of a row. It pulls its input at the row, the level
-    /// it declares, so the walk accepts it, and the walk and the pull agree on the level.
-    #[test]
-    fn an_uncurry_over_an_input_that_restates_the_outermost_keys_is_walked_at_its_pull() {
-        use crate::interpreter::tile_operators::{TileOperator, Uncurry};
-        use crate::interpreter::{Predicate, Projection, SubscribeContext, Value, tuple_field};
-        let input = OutermostOnly::new();
-        let pulled = input.pulled.clone();
-        let uncurry = Arc::new(Uncurry::new_at(Arc::new(input), CurryLevel::new(1)));
-        let producer = uncurry.clone().subscribe(
-            uncurry.tiling().universal_guard(),
-            Box::new(|| {}),
-            &mut SubscribeContext::new(),
-        );
-        let round = CurryLevel::new(1);
-        assert_eq!(unrestated(&*producer, Some(round), &[], true), None);
-        let declared = producer.input_level("input", round);
-        assert_eq!(declared, Some(CurryLevel::OUTERMOST));
-        let pair = Value::Record(
-            [
-                (tuple_field(0), Value::UInt(1)),
-                (tuple_field(1), Value::UInt(0)),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let path = [Value::UInt(0), pair];
-        let answer = producer
-            .get(Projection::keys_at(round, Predicate::exactly(&path)).guard(producer.tiling()));
-        assert_eq!(answer.paths_at(round), std::slice::from_ref(&path.to_vec()));
-        let [guard] = pulled
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .try_into()
-            .expect("one pull");
-        assert_eq!(
-            Projection::of(&guard).expect("a projection").level(),
-            declared
-        );
-    }
-
-    /// A producer that restates every level and reads its one input whole
-    /// (`TileProducer::input_level` answers `None`).
-    struct ReadsWhole {
-        base: ProducerBase,
-        input: Box<dyn TileProducer>,
-    }
-
-    impl TileProducer for ReadsWhole {
-        impl_producer_base!();
-
-        fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-            visit("input", &*self.input);
-        }
-
-        fn restates(&self) -> crate::interpreter::Restates {
-            crate::interpreter::Restates::Every
-        }
-
-        fn input_level(&self, _role: &str, _level: CurryLevel) -> Option<CurryLevel> {
-            None
-        }
-
-        fn get_impl(&self, _guard: TileGuard) -> Tile {
-            self.tiling().empty_tile()
-        }
-
-        fn release_impl(&self, _guard: TileGuard) {}
-    }
-
-    /// An input a producer reads whole is pulled at no level beneath the outermost keys, so
-    /// `unrestated` names none that restates the outermost keys only.
-    #[test]
-    fn an_input_read_whole_finds_nothing() {
-        let (tile, tiling) = two_levels_of_ints();
-        let reads_whole = ReadsWhole {
-            base: ProducerBase::unowned(ReadsWhole::alloc_id(), &tiling),
-            input: Box::new(TestTileProducer::new(tile, tiling.clone())),
-        };
-        let memo = MemoProducer::over(Box::new(reads_whole), &tiling);
-        let why = unrestated(&memo, Some(CurryLevel::new(1)), &[], true);
-        assert_eq!(why, None);
     }
 }

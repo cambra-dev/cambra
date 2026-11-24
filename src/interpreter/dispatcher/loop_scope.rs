@@ -1181,19 +1181,6 @@ pub(super) fn reach_member(member: &Member, call: &mut Call<'_>) {
 }
 
 impl InductionStoreProducer {
-    /// The breaker subscriptions of the inner pipelines a round queues or publishes.
-    pub(super) fn chain_breakers(&self) -> Vec<BreakerHandle> {
-        self.run()
-            .body
-            .members
-            .iter()
-            .filter_map(|member| match member {
-                Member::Chain(handle) => Some(handle.clone()),
-                Member::Scope(_) => None,
-            })
-            .collect()
-    }
-
     /// The consumer the scope's pipeline pushes to, the store's, and whether the store pushes a
     /// region of its keys: a nested store pushes rows, and a flat store the positions its rounds
     /// decide where it pushes any before it is terminal (`pushes_complete_positions`). Any other
@@ -1304,7 +1291,7 @@ mod tests {
             });
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
             let mut runs = ScopeRuns::new();
-            let scope = planner.build_scope(0, usize::MAX, &mut Vec::new(), &mut runs);
+            let scope = planner.build_scope(0, usize::MAX, &mut runs);
             induction(&scope).begin_run();
             let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
             dispatcher.order(PipelineId(0));
