@@ -295,6 +295,7 @@ impl Breaker for AggregateProducer {
         self.input.release(self.input.tiling().universal_guard());
         self.mark_terminal();
     }
+
     fn consumes_concurrently(&self) -> bool {
         !matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
     }
@@ -1060,6 +1061,11 @@ impl MapAggregateState {
         // element the folded level calls complete.
         let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let values = (**codomain).clone();
+        // A `Sole` group keeps its one element, and an accumulator states a collection it holds
+        // over the paths within it, so the element's statements are restated within the
+        // element's own path (`Predicate::within`).
+        let element_paths = (matches!(self.kind, AggregateKind::Sole) && values.holds_a_level())
+            .then(|| input_tile.paths_at(CurryLevel::new(depth)));
 
         // Fold each group into its row's accumulator. A group is a contiguous run of the
         // folded collection's values, so the fold stays vectorized.
@@ -1073,7 +1079,15 @@ impl MapAggregateState {
             let acc = accumulators
                 .entry(path.clone())
                 .or_insert_with(|| kind.initial_accumulator(&output_tiling));
-            kind.accumulate(acc, &values, start, end);
+            match &element_paths {
+                Some(paths) if start < end => {
+                    let mut element = values.select_rows(&(start..end).collect::<Vec<_>>());
+                    let path = &paths[start];
+                    element.map_level_predicates(&mut |level, stated| stated.within(path, level));
+                    kind.accumulate(acc, &element, 0, end - start);
+                }
+                _ => kind.accumulate(acc, &values, start, end),
+            }
         }
         // A key above the groups' level with nothing beneath it stands over no group, so no
         // accumulator's path reaches it. Its value is the empty collection, which the output
@@ -1406,6 +1420,7 @@ impl Breaker for MapAggregateProducer {
     fn finish_parallel_input(&mut self) {
         self.input.release(self.input.tiling().universal_guard());
     }
+
     fn consumes_concurrently(&self) -> bool {
         !folded_shape(self.tiling()).1.holds_a_level()
     }
