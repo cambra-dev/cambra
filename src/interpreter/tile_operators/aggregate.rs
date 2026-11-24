@@ -710,9 +710,17 @@ impl TileProducer for MapExtractAggregateProducer {
             .unwrap_or_else(|| panic!("Expected bools"));
         *slot = self.kind.extract(*accumulator);
         // One bool per accumulator, so the mask is over the innermost collection's keys.
-        output
-            .values_at_mut(CurryLevel::new(self.input.tiling().levels() - 1))
-            .retain_keys(mask);
+        let keys = CurryLevel::new(self.input.tiling().levels() - 1);
+        let undecided = Predicate::union_all(
+            output
+                .paths_at(keys)
+                .iter()
+                .zip(mask.iter())
+                .filter(|(_, terminal)| !**terminal)
+                .map(|(path, _)| Predicate::exactly(path))
+                .collect(),
+        );
+        output.values_at_mut(keys).retain_keys(mask);
         // Extracted collections are a column over the groups kept, so their statements name
         // only those paths. The input's enclosing completion statements remain unchanged.
         let values = CurryLevel::new(self.input.tiling().levels());
@@ -727,6 +735,15 @@ impl TileProducer for MapExtractAggregateProducer {
             output
                 .values_at_mut(values)
                 .map_level_predicates(&mut |depth, stated| stated.qualified_by(&rows, depth));
+        }
+        // A key whose aggregation is not terminal is held back, not absent: no statement may
+        // call it decided, so the answer is restricted to the other keys, which also cuts a
+        // statement above that would state it ([`Tile::restrict_to`]).
+        if !undecided.is_false() {
+            output.restrict_to(
+                &Projection::keys_at(keys, Predicate::True.minus(&undecided)),
+                self.tiling(),
+            );
         }
         output
     }
@@ -959,6 +976,10 @@ struct MapAggregateProducer {
 pub(crate) struct MapAggregateState {
     kind: AggregateKind,
     accumulators: HashMap<Vec<Value>, Tile>,
+    /// For a `Sole` fold whose element holds a collection, the path of the element each group's
+    /// accumulator holds: a later delivery of that element is the element grown, not a second
+    /// one under the key.
+    sole_elements: HashMap<Vec<Value>, Vec<Value>>,
     keys_with_nothing_beneath: HashSet<Vec<Value>>,
     stated: Option<Stated>,
 }
@@ -993,6 +1014,7 @@ impl MapAggregateState {
         Self {
             kind,
             accumulators: HashMap::new(),
+            sole_elements: HashMap::new(),
             keys_with_nothing_beneath: HashSet::new(),
             stated: None,
         }
@@ -1067,6 +1089,7 @@ impl MapAggregateState {
         // folded collection's values, so the fold stays vectorized.
         let kind = &self.kind;
         let accumulators = &mut self.accumulators;
+        let sole_elements = &mut self.sole_elements;
         for (row, path) in parent_paths.iter().enumerate() {
             if obsolete.covers_path(path) {
                 continue;
@@ -1078,9 +1101,17 @@ impl MapAggregateState {
             match &element_paths {
                 Some(paths) if start < end => {
                     let mut element = values.select_rows(&(start..end).collect::<Vec<_>>());
-                    let path = &paths[start];
-                    element.map_level_predicates(&mut |level, stated| stated.within(path, level));
-                    kind.accumulate(acc, &element, 0, end - start);
+                    let element_path = &paths[start];
+                    element.map_level_predicates(&mut |level, stated| {
+                        stated.within(element_path, level)
+                    });
+                    match sole_elements.get(path) {
+                        Some(held) if held == element_path => merge_grown_element(acc, element),
+                        _ => {
+                            sole_elements.insert(path.clone(), element_path.clone());
+                            kind.accumulate(acc, &element, 0, end - start);
+                        }
+                    }
                 }
                 _ => kind.accumulate(acc, &values, start, end),
             }
@@ -1415,6 +1446,26 @@ impl Breaker for MapAggregateProducer {
 
     fn finish_parallel_input(&mut self) {
         self.input.release(self.input.tiling().universal_guard());
+    }
+
+    /// Every input pipeline is closed and every claim is integrated, so no element reaches a
+    /// group any more: every group is complete, whatever the answers stated of it. An answer
+    /// beneath the groups' keys states only the members it reached, so without this a group
+    /// whose last statement was partial would stay open, held back as undecided above.
+    fn finish(&mut self, _: InputId, pushes: &mut Pushes<'_>) {
+        if let Some(stated) = &mut self
+            .state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stated
+        {
+            for level in &mut stated.level_predicates {
+                *level = Predicate::True;
+            }
+            stated.elements = Predicate::True;
+            stated.complete = Predicate::True;
+        }
+        pushes.push_final(self);
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -4465,5 +4516,23 @@ mod map_aggregate_consuming_tests {
             run.apply(Consume(All));
             run.check();
         }
+    }
+}
+
+/// Merge `grown`, a later delivery of the element `held` holds, into it: the collections the
+/// element holds merge by key, and its plain values, which a later delivery repeats, stay as held.
+fn merge_grown_element(held: &mut Tile, grown: Tile) {
+    match (held, grown) {
+        (Tile::Record { fields, .. }, Tile::Record { fields: grown, .. }) => {
+            for (name, field) in grown {
+                if field.holds_a_level()
+                    && let Some(held) = fields.get_mut(&name)
+                {
+                    held.merge(field);
+                }
+            }
+        }
+        (held, grown) if grown.holds_a_level() => held.merge(grown),
+        _ => {}
     }
 }
