@@ -2666,6 +2666,8 @@ pub(crate) mod test_helpers {
         script: Option<std::sync::Arc<std::sync::RwLock<Tile>>>,
         pub(crate) pulled: GuardLog,
         pub(crate) released: GuardLog,
+        /// The levels it restates, every level unless a test narrows it.
+        pub(crate) restates: crate::interpreter::Restates,
     }
 
     /// The two logs of a [`ProjectionSpy`]: the projection guards it was pulled with, and the
@@ -2683,6 +2685,7 @@ pub(crate) mod test_helpers {
                     script: None,
                     pulled: pulled.clone(),
                     released: released.clone(),
+                    restates: crate::interpreter::Restates::Every,
                 },
                 pulled,
                 released,
@@ -2710,7 +2713,12 @@ pub(crate) mod test_helpers {
         }
 
         fn restates(&self) -> crate::interpreter::Restates {
-            crate::interpreter::Restates::Every
+            use crate::interpreter::Restates;
+            match &self.restates {
+                Restates::Outermost => Restates::Outermost,
+                Restates::Above(level) => Restates::Above(*level),
+                Restates::Every => Restates::Every,
+            }
         }
 
         fn get_impl(&self, projection_guard: TileGuard) -> Tile {
