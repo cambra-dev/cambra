@@ -64,8 +64,9 @@ use crate::control_port::phase_spelling;
 use crate::interpreter::{
     Consumer, Value,
     operator_conversion::{OperatorMap, ReuseTally, StateConflict, UnreadablePrefix, VarPath},
-    tile_operators::{FanOut, TileProducer},
+    tile_operators::{FanOut, FunctionGuard, Tile, TileGuard, TileProducer},
 };
+use log::debug;
 
 /// The branch a request that names none addresses: a control-port verb without
 /// a branch segment, the single-branch accessors, and the unlabelled output of
@@ -129,7 +130,7 @@ struct Branch {
     /// Whether the `main` output has released everything, after which the
     /// driver stops pulling it.
     main_finished: bool,
-    /// Whether every sink output has reached a terminal tile. Latched, because
+    /// Whether every sink output's producer has released everything. Latched, because
     /// [`CompiledProgram::done`] fires once.
     sinks_done: bool,
     /// The operators this branch holds, by the node of its version's tree each
@@ -184,6 +185,36 @@ impl Branch {
         self.sinks_done = false;
         // The new graph has subscribed and nothing has pulled it yet.
         self.main_notified.set(true);
+    }
+}
+
+/// One pull of a branch's `main` output, as [`LiveProgram::pull_mains`] reports it.
+pub struct MainPull<'a> {
+    /// The branch whose output was pulled.
+    pub branch: &'a str,
+    /// What the pull returned, already released.
+    pub tile: &'a Tile,
+    /// Whether this pull finished the output: it is not pulled again.
+    pub finished: bool,
+}
+
+/// What the driver has taken delivery of in `tile`, to release back.
+///
+/// A product value's fields are tiled independently, so the guard is built per field
+/// rather than from the record as a whole.
+fn release_guard_for(tile: &Tile) -> TileGuard {
+    match tile {
+        Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
+        Tile::DataFunction {
+            domain_predicate, ..
+        } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+        Tile::Record { fields, .. } => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(k, t)| (k.clone(), release_guard_for(t)))
+                .collect(),
+        ),
+        other => panic!("Unexpected top-level tile shape: {other:?}"),
     }
 }
 
@@ -583,16 +614,14 @@ impl LiveProgram {
     }
 
     /// Pull every branch's `main` output that has something new, in creation
-    /// order.
+    /// order, and report each pull to `report`. Returns whether anything was
+    /// pulled.
     ///
-    /// `pull` is handed the branch's name and the producer, and answers whether
-    /// that output has now finished. A finished output is not pulled again
-    /// (`src/ccl/design/program-evolution.md`, "A reload changes no other
-    /// branch"). Returns whether anything was pulled.
-    pub fn pull_mains(
-        &mut self,
-        mut pull: impl FnMut(&str, &mut dyn TileProducer) -> bool,
-    ) -> bool {
+    /// Each pull releases what it returned. The output has finished once its
+    /// producer's accumulated release is universal, and a finished output is not
+    /// pulled again (`src/interpreter/design-operators.md`, "A consumer finishes
+    /// once its accumulated release is universal").
+    pub fn pull_mains(&mut self, mut report: impl FnMut(MainPull<'_>)) -> bool {
         let mut pulled = false;
         for branch in &mut self.branches {
             if branch.main_finished || !branch.main_notified.get() {
@@ -603,9 +632,17 @@ impl LiveProgram {
             };
             branch.main_notified.set(false);
             pulled = true;
-            if pull(&branch.name, producer.as_mut()) {
-                branch.main_finished = true;
-            }
+            debug!("Main calling get on {}", branch.name);
+            let tile = producer.get(producer.tiling().universal_guard());
+            let release_guard = release_guard_for(&tile);
+            debug!("Main releasing with {release_guard:?}");
+            producer.release(release_guard);
+            branch.main_finished = producer.obsolete_guard().is_universal();
+            report(MainPull {
+                branch: &branch.name,
+                tile: &tile,
+                finished: branch.main_finished,
+            });
         }
         pulled
     }

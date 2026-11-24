@@ -685,6 +685,15 @@ emitted-key tracking drops a pair once it is released whole, including when accu
 releases together cover the pair, and drops a row an arm deletes where the zip gives the row back
 to that arm.
 
+### A consumer finishes once its accumulated release is universal
+
+A consumer has finished with a producer once the producer's accumulated release
+(`TileProducer::obsolete_guard`) is universal. No single tile or release need be universal. A
+record's fields are tiled independently, so a consumer can release them on different pulls, and a
+field released on an earlier pull is empty in every later tile. A `SinkConsumer` fires its
+`DoneNotifier` by this rule, and `LiveProgram::pull_mains` stops pulling a branch's `main` output
+by it.
+
 ### Guard operations are exact
 
 Guard algebra is exact. `intersect`, `union`, `flatten_or`, and guard restatements must preserve

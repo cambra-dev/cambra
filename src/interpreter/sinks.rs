@@ -33,8 +33,8 @@ pub type ProducerSlot = Rc<RefCell<Option<Box<dyn TileProducer>>>>;
 
 /// Signals one sink's completion to a shared done channel.
 ///
-/// Each [`SinkConsumer`] holds one `DoneNotifier`.  When a terminal tile is
-/// received, [`signal`](Self::signal) decrements the shared `remaining` counter;
+/// Each [`SinkConsumer`] holds one `DoneNotifier`. When the sink's producer has released
+/// everything, [`signal`](Self::signal) decrements the shared `remaining` counter;
 /// the last sink to complete sends `()` on `tx`, firing `SinksHandle::done`.
 pub struct DoneNotifier {
     /// Number of sinks that have not yet completed.
@@ -72,8 +72,9 @@ impl DoneNotifier {
 /// A [`Consumer`] that, on notification, schedules a pull of the wrapped producer on the
 /// scheduler's sink pull queue
 /// ([`Scheduler::sink_pull_queue`](crate::interpreter::Scheduler::sink_pull_queue)). The pull
-/// passes the current tile to the paired [`DataSink`] and fires the [`DoneNotifier`] when a
-/// terminal tile is received.
+/// passes the current tile to the paired [`DataSink`], releases it, and fires the
+/// [`DoneNotifier`] once the producer's accumulated release
+/// ([`TileProducer::obsolete_guard`]) is universal.
 ///
 /// The pull is scheduled rather than made in [`notify`](Consumer::notify) because a change
 /// reaches a sink once along every notification path from where it happened, and the queue
@@ -131,9 +132,13 @@ impl SinkConsumer {
                 let guard = prod.tiling().universal_guard();
                 let tile = prod.get(guard);
                 sink.process(&tile);
-                let is_terminal = tile.is_terminal();
                 prod.release(tile.to_guard());
-                if is_terminal && let Some(notifier) = done.take() {
+                // Finished once the releases so far cover everything, not once one tile is
+                // terminal: a record's fields arrive on different pulls, and a field released
+                // on an earlier pull is empty in every later tile.
+                if prod.obsolete_guard().is_universal()
+                    && let Some(notifier) = done.take()
+                {
                     notifier.signal();
                 }
             }
@@ -161,5 +166,50 @@ impl Consumer for SinkConsumer {
     /// path from where it happened, and the queue holds a pull once however many arrive.
     fn notify(&mut self, _arrived: &Projection) {
         self.wakeups.request(self.pull.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::interpreter::{
+        BaseType, ColumnValue, Extent, TestSink, Tile, Tiling,
+        tile_operators::test_helpers::ScriptedProducer,
+    };
+
+    /// A record whose fields finish on different pulls signals done on the pull that delivers
+    /// the last field. No tile holds both fields: `b` is released on the first pull, so the
+    /// second tile holds only `a`.
+    #[test]
+    fn a_record_finished_across_pulls_signals_done() {
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::Record(HashMap::from([("a".into(), int()), ("b".into(), int())]));
+        let record = |a: Vec<i64>, b: Vec<i64>| {
+            Tile::record(HashMap::from([
+                ("a".into(), Tile::Scalar(ColumnValue::Ints(a))),
+                ("b".into(), Tile::Scalar(ColumnValue::Ints(b))),
+            ]))
+        };
+        let (producer, cell) = ScriptedProducer::new(record(vec![], vec![1]), tiling);
+        let sink = Arc::new(TestSink::default());
+        let (mut notifiers, done) = DoneNotifier::create(1);
+        let (consumer, slot) = SinkConsumer::new(
+            sink.clone(),
+            notifiers.pop().expect("one notifier"),
+            WakeupQueue::default(),
+        );
+        *slot.borrow_mut() = Some(Box::new(producer));
+
+        consumer.pull_now();
+        assert!(done.try_recv().is_err(), "`a` has not arrived");
+        *cell.borrow_mut() = record(vec![3], vec![1]);
+        consumer.pull_now();
+        assert!(done.try_recv().is_ok(), "both fields have been released");
+        assert_eq!(
+            sink.value().map(|v| v.to_string()),
+            Ok("{a: 3, b: 1}".to_string())
+        );
     }
 }

@@ -351,9 +351,7 @@ the `released_position` of every fan-out it reads stops rising, per [Guards inte
 fan-out](#guards-intersect-at-a-fan-out). A reload that keeps such a fan-out as an iteration input
 is refused, per [Routes across branches](#routes-across-branches). A branch's outputs stay
 subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
-`main` output (`LiveProgram::pull_mains`). It prints `main`'s value as `Got value: …` and every
-other branch's as `Got value from <branch>: …`, so a branch created under the name `main` after the
-first one is deleted prints unlabelled. A version whose `main` output has finished is no longer
+`main` output (`LiveProgram::pull_mains`). A version whose `main` output has finished is no longer
 pulled. The process exits when every branch's `main` output has finished and every branch's sink
 outputs have signalled completion, which a sink program serving a route never does.
 
