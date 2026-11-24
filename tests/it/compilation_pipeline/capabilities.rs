@@ -913,7 +913,7 @@ fn a_statement_calling_a_parameter_is_kept() {
             bump(&cnt)
             n
     "},
-    "a function writes the mutable variable `cnt` it captures"
+    "has `Write(cnt)`"
 )]
 fn a_public_function_naming_an_induction_variable_is_refused(
     #[case] code: &str,

@@ -131,7 +131,7 @@ it does not control that level increment (`in_let_rhs` in `infer/context.rs`, `i
 - Bound recording cannot place a deeper variable directly on a shallower variable's bounds.
   **Extrusion** makes a proxy at the shallower level and relates it to the original with a
   polarity-appropriate bound (`infer/solver/constrain.rs`). The level it compares counts each
-  function type's funkind and capability variables (`extrusion_level`), and each of those above
+  function type's funkind and capability variables (`type_level`), and each of those above
   the shallower level gets a proxy too.
 
 For a schematic `let id = λ x → x`, if `x` has type `α` above the binding cutoff, separate uses
@@ -5619,23 +5619,21 @@ in order (`ExceptionInstance`), so the copies one use makes agree without a tabl
 
 ### Polymorphism and materialization
 
-**Levels.** A capability variable is minted at the emission level. `type_level` leaves capabilities
-out: counting the variable of every function body would generalize every function. A capability
-variable at an input, a parameter's function type, decides that a definition is polymorphic as a
-type variable does (`capabilities::input_capability_level` in `should_generalize`): a body that
-calls the parameter leaves it open. A type becoming a bound of a variable at a shallower level
-gives each capability variable above that level a proxy there (`extrude_capabilities`). At a
-positive position the original flows into the proxy, at a negative one the proxy flows into the
-original, and at an invariant one both. A negative proxy of an open input is an open input
-(`CapabilityVar::open_input`): what each use supplies to the original, it supplies to the proxy. A
-monomorphic binding lowers its capability variables with its other variables (`lower_levels`). An
-edge is recorded on both of its variables (`CapabilityVar::flows_from`, `CapabilityVar::outgoing`).
-Instantiation copies a capability variable above the scheme's cutoff with its capabilities, its
-upper bounds, the edges into it, and its edges into variables the copy leaves in place
-(`copy_var`), so two uses of one polymorphic function collect their capabilities
-apart, and a proxy below the cutoff collects both. `freshen_level` counts a function type's
-capability variable, so a type whose only quantified part is its capabilities is copied rather than
-shared.
+**Levels.** A capability variable is minted at the emission level. `type_level` counts it as it
+counts every solver variable, so a definition whose type holds a capability variable above the
+binding level generalizes (`should_generalize`), as one holding a type variable there does. A type
+becoming a bound of a variable at a shallower level gives each capability variable above that level
+a proxy there (`extrude_capabilities`). At a positive position the original flows into the proxy, at
+a negative one the proxy flows into the original, and at an invariant one both. A negative proxy of
+an open input is an open input (`CapabilityVar::open_input`): what each use supplies to the
+original, it supplies to the proxy. A monomorphic binding lowers its capability variables with its
+other variables (`lower_levels`). An edge is recorded on both of its variables
+(`CapabilityVar::flows_from`, `CapabilityVar::outgoing`). Instantiation copies a capability variable
+above the scheme's cutoff with its capabilities, its upper bounds, the edges into it, and its edges
+into variables the copy leaves in place (`copy_var`), so two uses of one polymorphic function
+collect their capabilities apart, and a proxy below the cutoff collects both. `freshen_level` counts
+a function type's capability variable, so a type whose only quantified part is its capabilities is
+copied rather than shared.
 
 **A clone takes its use's capabilities.** A clone's capability variables are its use's copies, and
 uses whose functions resolve to different capabilities get separate clones ([Capabilities on every
