@@ -295,9 +295,6 @@ impl Breaker for AggregateProducer {
         self.input.release(self.input.tiling().universal_guard());
         self.mark_terminal();
     }
-    fn consumes_concurrently(&self) -> bool {
-        !matches!(self.tiling(), Tiling::Aggregation { accumulator, .. } if accumulator.holds_a_level())
-    }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
         self.input.tiling().clone()
@@ -1443,9 +1440,6 @@ impl Breaker for MapAggregateProducer {
 
     fn finish_parallel_input(&mut self) {
         self.input.release(self.input.tiling().universal_guard());
-    }
-    fn consumes_concurrently(&self) -> bool {
-        !folded_shape(self.tiling()).1.holds_a_level()
     }
 
     /// Every input pipeline is closed and every claim is integrated, so no element reaches a
