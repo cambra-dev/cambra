@@ -963,10 +963,12 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
         "the reload should be accepted: {reply}"
     );
     // `4` is the step that can only happen if the swap resumed from `2`; a
-    // restart would report `2` again. Pull mode prints a step per line and a
-    // dispatched run a delivery's steps together, so the values are read in
-    // order across the printed tiles.
-    assert_eq!(printed_ints(&out), [1, 2, 4, 6], "{out}");
+    // restart would report `2` again. A `main` output hands each delivery's steps as
+    // its package finishes, in no order, and the steps rise with their positions, so
+    // the values are compared sorted.
+    let mut printed = printed_ints(&out);
+    printed.sort_unstable();
+    assert_eq!(printed, [1, 2, 4, 6], "{out}");
 }
 
 /// The integers of every value column `out` prints, `codomain: Scalar(Ints(…))`, in the order
