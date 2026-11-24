@@ -355,6 +355,11 @@ pub(super) struct InferCtx {
     /// name, innermost last, pushed where the binder is entered and popped where its scope
     /// closes, a `let`'s at `close_let_type`.
     scope_exits: HashMap<Name, Vec<ScopeExit>>,
+    /// The first parameter of each source signature, retained across currying.
+    parameter_groups: HashMap<Name, Name>,
+    /// The signature of the innermost lambda being emitted, with the level it was entered at.
+    /// A `Temporary` parameter at that level joins it; any other parameter starts its own.
+    active_parameter_group: Option<(Level, Name)>,
     /// The joined binders each `let` a contribution crossed varies with, for each such `let`
     /// whose definition reads one ([`Self::name_varying_binders`]).
     varies_with: HashMap<Name, Vec<Name>>,
@@ -900,6 +905,8 @@ impl InferCtx {
             bound_at_annotation: HashSet::new(),
             definition_telescopes: HashMap::new(),
             scope_exits: HashMap::new(),
+            parameter_groups: HashMap::new(),
+            active_parameter_group: None,
             varies_with: HashMap::new(),
             loop_sources: HashMap::new(),
             open_transactions: Vec::new(),
@@ -2999,6 +3006,69 @@ impl InferCtx {
         r
     }
 
+    /// The binding a handle reaches through transparent aliases and product projections.
+    fn target_origin<'a>(&'a self, target: &'a Name) -> &'a Name {
+        use crate::ccl::ccl_utils::{ValueReference, resolve_product_reference};
+        match resolve_product_reference(ValueReference::Name(target), |name| {
+            match self.exit_of(name) {
+                ScopeExit::Discharge(definition) => Some(definition),
+                _ => None,
+            }
+        }) {
+            ValueReference::Name(origin) => origin,
+            ValueReference::Expr(_) => target,
+        }
+    }
+
+    /// The inferred contract at a handle's storage binding, when that binding is known.
+    pub(super) fn feed_contract(&self, target: &Name) -> Option<Type> {
+        let binding = self.scopes.lookup(self.target_origin(target))?;
+        binding.scheme.body.as_feed()?;
+        Some(binding.scheme.instantiate(self.level))
+    }
+
+    /// A handle received through a joined binder contributes to its incoming contract,
+    /// outside that binder. Its aliases do not introduce a new storage scope.
+    fn contribution_crossing(
+        &self,
+        target: &Name,
+        history: &Type,
+    ) -> Option<(Telescope, Vec<Name>)> {
+        let origin = self.target_origin(target);
+        if matches!(self.exit_of(origin), ScopeExit::Join) {
+            let (scope, mut crossed) = self.telescope.split_at(origin)?;
+            let group = self.parameter_groups.get(origin).unwrap_or(origin);
+            let named = crate::ccl::subst::type_free_vars(history);
+            let mut parameters = Vec::new();
+            let mut reached_group = false;
+            for name in scope.iter() {
+                debug_assert!(
+                    !self.parameter_groups.contains_key(origin)
+                        || self.parameter_groups.get(name) == Some(group),
+                    "a source signature contains only parameters in its group",
+                );
+                if name == origin || !named.contains(name) {
+                    parameters.push(name.clone());
+                }
+                if name == group {
+                    reached_group = true;
+                    break;
+                }
+            }
+            debug_assert!(
+                reached_group,
+                "the first parameter of a source signature is in its telescope"
+            );
+            crossed.extend(parameters.iter().cloned());
+            Some((
+                scope.rescoped(|name| parameters.contains(name), []),
+                crossed,
+            ))
+        } else {
+            self.telescope.split_at(origin)
+        }
+    }
+
     /// Record `contribution <: history`: a feed, define or write into the history `target`
     /// binds, made at the current position.
     ///
@@ -3017,7 +3087,7 @@ impl InferCtx {
         history: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+        let Some((target_scope, crossed)) = self.contribution_crossing(target, history) else {
             return self.require_sub(contribution, history, at);
         };
         self.note_varying_binders(&crossed);
@@ -3053,7 +3123,7 @@ impl InferCtx {
     /// contract the call's argument edge carries to the caller
     /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its target").
     pub(super) fn feed_row(&mut self, target: &Name, value: &Type, channel: &Type) -> Type {
-        if matches!(self.exit_of(target), ScopeExit::Join) {
+        if matches!(self.exit_of(self.target_origin(target)), ScopeExit::Join) {
             let Type::Fun { codomain, .. } = channel.peel_refinements() else {
                 unreachable!(
                     "a feed's channel is the data function `domain ⤇ value`, got {channel}"
@@ -3061,7 +3131,7 @@ impl InferCtx {
             };
             return (**codomain).clone();
         }
-        let Some((_, crossed)) = self.telescope.split_at(target) else {
+        let Some((_, crossed)) = self.telescope.split_at(self.target_origin(target)) else {
             return value.clone();
         };
         let loops = &self.loop_sources;
@@ -3108,7 +3178,7 @@ impl InferCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
         let row = |ctx: &mut Self| Type::data_fun(ctx.fresh(), value.clone());
-        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+        let Some((target_scope, crossed)) = self.contribution_crossing(target, channel) else {
             let contribution = row(self);
             return self.require_sub(&contribution, channel, at);
         };
@@ -3145,7 +3215,10 @@ impl InferCtx {
         });
         let keyable =
             keyed.is_some() && !loops.is_empty() && !in_transaction && only_lets_and_loops;
-        let places = self.feed_places.get(target).map_or(&[][..], Vec::as_slice);
+        let places = self
+            .feed_places
+            .get(self.target_origin(target))
+            .map_or(&[][..], Vec::as_slice);
         if keyable && let Some(&other) = places.iter().find(|&&p| p != self.current_node_id) {
             for x in &loops {
                 self.fed_elsewhere.insert(x.clone(), other);
@@ -4445,6 +4518,30 @@ impl Typing for InferCtx {
             self.capability_transactions.push((node, var));
         }
         r
+    }
+
+    fn scoped_parameter<R>(
+        &mut self,
+        parameter: &TypedBinding,
+        ty: &Type,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.active_parameter_group.clone();
+        let group = if parameter.role == crate::ccl::BindingRole::Temporary {
+            previous
+                .as_ref()
+                .filter(|(level, _)| *level == self.level)
+                .map(|(_, group)| group.clone())
+                .unwrap_or_else(|| parameter.name.clone())
+        } else {
+            parameter.name.clone()
+        };
+        self.parameter_groups
+            .insert(parameter.name.clone(), group.clone());
+        self.active_parameter_group = Some((self.level, group));
+        let result = self.scoped(&parameter.name, ty, f);
+        self.active_parameter_group = previous;
+        result
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {

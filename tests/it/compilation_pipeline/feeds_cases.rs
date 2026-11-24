@@ -1182,21 +1182,176 @@ fn feeding_what_is_not_a_feed_is_a_type_error(#[case] code: &str, #[case] needle
     check_compile_error(code, "type inference error");
 }
 
-/// A feed taken out of a tuple that holds a computed value does not reach its declaration, so
-/// feeding it is refused rather than dropped (`docs/chl-spec.md`, "A deferred collection inside
-/// a data structure \[Open\]").
+/// A static product preserves a computed sibling's binding while its handle reaches the feed.
+#[rstest]
+#[case::tuple(indoc! {r#"
+    t = (sum(xs), out)
+    a, o = t
+"#})]
+#[case::record(indoc! {r#"
+    t = (amount=sum(xs), channel=out)
+    a = t.amount
+    o = t.channel
+"#})]
+fn a_feed_out_of_a_static_product_preserves_its_computed_sibling(#[case] unpack: &str) {
+    let program = indoc! {r#"
+        xs = [1, 2]
+        out: Feed(_)
+        out << 1
+        {unpack}
+        o << a
+        o << a
+        sum(out)
+    "#}
+    .replace("{unpack}", unpack);
+    check_scalar(&program, Value::Int(7));
+    let expr = cambra::ccl::context::compile_to(
+        &LoadedProgram::test(&program),
+        cambra::ccl::context::Phase::Inline,
+    )
+    .unwrap();
+    fn sums(expr: &cambra::ccl::Expr) -> usize {
+        let mut count = usize::from(matches!(
+            expr.node,
+            cambra::ccl::TypedExprNode::Aggregate {
+                kind: cambra::ccl::AggregateKind::Sum,
+                ..
+            }
+        ));
+        expr.walk_children(|child| count += sums(child));
+        count
+    }
+    assert_eq!(sums(&expr), 2, "the sibling sum is computed once");
+}
+
+#[rstest]
+#[case::tuple("packed = (x, out)", "value, handle = packed")]
+#[case::record("packed = (value=x, channel=out)", indoc! {r#"
+    value = packed.value
+    handle = packed.channel
+"#})]
+fn a_static_product_keeps_the_mutable_value_it_captured(#[case] pack: &str, #[case] unpack: &str) {
+    let program = indoc! {r#"
+        x := 1
+        out: Feed(_)
+        {pack}
+        x += 1
+        {unpack}
+        handle << value
+        sum(out)
+    "#}
+    .replace("{pack}", pack)
+    .replace("{unpack}", unpack);
+    check_scalar(&program, Value::Int(1));
+}
+
+#[rstest]
+#[case::alias("alias = out")]
+#[case::tuple(indoc! {r#"
+    packed = (sum(source), out)
+    alias = packed.1
+"#})]
+#[case::record(indoc! {r#"
+    packed = (amount=sum(source), channel=out)
+    alias = packed.channel
+"#})]
+#[case::computed_sibling_passed_to_a_call(indoc! {r#"
+    packed = (amount=sum(source), channel=out)
+    ignored = identity(packed.amount)
+    alias = packed.channel
+"#})]
+fn a_static_product_handle_retains_a_payload_domain_keyed_by_its_loop(#[case] select: &str) {
+    let program = indoc! {r#"
+        def identity(value):
+            value
+        source = [1, 2, 3]
+        out: Feed(_)
+        for i in source:
+            {select}
+            alias << [k for k in source if k > i]
+        sum([sum(row) for row in out])
+    "#}
+    .replace("{select}", &select.trim_end().replace('\n', "\n    "));
+    check_scalar(&program, Value::Int(8));
+}
+
+/// Each alias is a place that feeds `out`, so the loop's position does not key the channel's
+/// rows, and the payloads' domains, which vary with `i`, have no join.
 #[test]
-fn feeding_a_feed_out_of_a_data_structure_is_refused() {
+fn two_aliases_out_of_a_product_feed_a_channel_from_two_places() {
     check_compile_error(
-        indoc::indoc! {r#"
-            xs = [1, 2]
+        indoc! {r#"
+            source = [1, 2, 3]
+            out: Feed(_)
+            for i in source:
+                packed = (first=out, second=out)
+                first = packed.first
+                second = packed.second
+                first << [k for k in source if k > i]
+                second << [k for k in source if k > i]
+            sum([sum(row) for row in out])
+        "#},
+        "The keys of a collection written to a feed or mutable variable depend on `i`",
+    );
+}
+
+#[test]
+fn a_product_projection_selects_one_of_two_channels() {
+    check_scalar(
+        indoc! {r#"
+            source = [1, 2, 3]
+            first: Feed(_)
+            second: Feed(_)
+            second << 99
+            for i in source:
+                packed = (first, second)
+                selected = packed.0
+                selected << [k for k in source if k > i]
+            sum([sum(row) for row in first]) + sum(second)
+        "#},
+        Value::Int(107),
+    );
+}
+
+/// A handle chosen at run time has no declaration to gather its contributions at
+/// (`docs/chl-spec.md`, "A deferred collection inside a data structure \[Open\]").
+#[rstest]
+#[case::static_target("first", true)]
+#[case::runtime_target("first if condition else second", false)]
+fn a_feed_chosen_at_run_time_is_refused(#[case] choice: &str, #[case] accepts: bool) {
+    let program = indoc! {r#"
+        def emit(condition, first, second):
+            chosen = CHOICE
+            chosen << 3
+        first: Feed(_)
+        second: Feed(_)
+        first << 1
+        second << 2
+        emit(sum([1, 2]) > 0, first, second)
+        sum(first) + sum(second)
+    "#}
+    .replace("CHOICE", choice);
+    if accepts {
+        check_scalar(&program, Value::Int(6));
+    } else {
+        check_compile_error(&program, "No type meets every requirement on this value");
+    }
+}
+
+/// A handle projected out of a tuple that is also used whole, here as a list element, does not
+/// reach its declaration, so feeding it is refused rather than dropped.
+#[test]
+fn a_feed_out_of_a_product_used_whole_is_refused() {
+    check_compile_error(
+        indoc! {r#"
             out: Feed(_)
             out << 1
-            t = (sum(xs), out)
-            a, o = t
-            o << a
-            sum(out)
-            "#},
+            packed = (out, 1)
+            all = [packed]
+            handle = packed.0
+            handle << 2
+            sum(out) + sum([p.1 for p in all])
+        "#},
         "this feeds a feed taken out of a data structure",
     );
 }
@@ -2560,18 +2715,87 @@ fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] ex
 /// accumulator the caller's loop writes. The tap carries the row at the parameter's value type,
 /// which reads no argument of the call.
 ///
-/// The unannotated variant is pinned on its failure as a known gap: the contribution's bound
-/// leaves the scope of the tuple parameter the parameters lower to. Under a loop of the `def`,
-/// the tap collection is typed from the feed's row lifted through that loop's level.
+/// An unannotated handle projected from the argument tuple contributes outside that tuple's
+/// binder. Under a loop of the `def`, the tap collection lifts the stored row through that level.
 #[rstest]
 #[case::annotated(indoc! {r#"
     def emit(v: Int, out: Feed(Int)):
         out << v ^+ 1
 "#})]
-#[should_panic(expected = "the bound left its binder's scope without a mediating discharge")]
 #[case::unannotated(indoc! {r#"
     def emit(v, out):
         out << v ^+ 1
+"#})]
+#[case::unannotated_value(indoc! {r#"
+    def emit(v, out: Feed(Int)):
+        out << v ^+ 1
+"#})]
+#[case::unannotated_handle(indoc! {r#"
+    def emit(v: Int, out):
+        out << v ^+ 1
+"#})]
+#[case::inferred_row(indoc! {r#"
+    def emit(v: Int, out: Feed(_)):
+        out << v ^+ 1
+"#})]
+#[case::unannotated_feed_first(indoc! {r#"
+    def emit(out, v):
+        out << v ^+ 1
+"#})]
+#[case::aliased_unannotated_handle(indoc! {r#"
+    def emit(v, out):
+        alias = out
+        alias << v ^+ 1
+"#})]
+#[case::tuple_wrapped_handle(indoc! {r#"
+    def emit(v, out):
+        packed = (out, 0)
+        alias = packed.0
+        alias << v ^+ 1
+"#})]
+#[case::nested_tuple_aliases(indoc! {r#"
+    def emit(v, out):
+        packed = ((0, out), 1)
+        copied = packed
+        inner = copied.0
+        alias = inner.1
+        alias << v ^+ 1
+"#})]
+#[case::record_wrapped_handle(indoc! {r#"
+    def emit(v, out):
+        packed = (channel=out, other=0)
+        alias = packed.channel
+        alias << v ^+ 1
+"#})]
+#[case::nested_product_aliases(indoc! {r#"
+    def emit(v, out):
+        packed = ((other=0, channel=out), 0)
+        copied = packed
+        record = copied.0
+        alias = record.channel
+        alias << v ^+ 1
+"#})]
+#[case::whole_tuple_passed_through_a_function(indoc! {r#"
+    def append(packed):
+        handle, value = packed
+        handle << value ^+ 1
+    def emit(v, out):
+        packed = (out, v)
+        append(packed)
+"#})]
+#[case::whole_record_passed_through_a_function(indoc! {r#"
+    def append(packed):
+        handle = packed.channel
+        handle << packed.value ^+ 1
+    def emit(v, out):
+        packed = (channel=out, value=v)
+        append(packed)
+"#})]
+#[case::forwarded_unannotated_handle(indoc! {r#"
+    def append(v, out):
+        out << v ^+ 1
+    def emit(v, out):
+        append(v, out)
 "#})]
 #[case::feed_first(indoc! {r#"
     def emit(out: Feed(Int), v: Int):
@@ -2601,6 +2825,69 @@ fn refined_read_fed_through_a_feed_parameter(#[case] def: &str) {
         .replace("CALL", call),
     );
     check_tile(&program, Tile::Scalar(ColumnValue::Ints(vec![6])))
+}
+
+/// A contribution through a curried function's handle crosses the signature's earlier
+/// parameters: `value`'s refinement reads `limit`, and an inner function's signature is its own
+/// (`src/ccl/design/type-inference.md`, "A handle received through a parameter").
+#[rstest]
+#[case::written_dependency(indoc! {r#"
+    def emit(limit: Int, value: {Int where _ >= limit}, out: Feed(Int)):
+        out << value
+    out: Feed(Int)
+    emit(0, 1, out)
+    emit(0, 2, out)
+    sum(out)
+"#}, 3)]
+#[case::nested_signatures(indoc! {r#"
+    def emit(value: Int, out: Feed(_)):
+        def inner(extra: Int, target: Feed(_)):
+            target << value ^+ extra
+        inner(1, out)
+    out: Feed(Int)
+    emit(1, out)
+    emit(2, out)
+    sum(out)
+"#}, 5)]
+fn feed_signature_scopes(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+#[test]
+fn a_collection_fed_through_an_inferred_parameter_keeps_its_domain() {
+    check_scalar(
+        indoc! {r#"
+            def emit(v, out):
+                out << [k for k in [1, 2, 3] if k > 1]
+            out: Feed(_)
+            for i in [1, 2, 3]:
+                emit(i, out)
+            sum([sum(row) for row in out])
+        "#},
+        Value::Int(15),
+    );
+}
+
+#[rstest]
+#[case::direct("out")]
+#[case::alias("alias")]
+#[case::tuple("tuple_alias")]
+fn an_inferred_feed_parameter_does_not_join_varying_collection_domains(#[case] target: &str) {
+    let program = indoc! {r#"
+        def emit(v, out):
+            alias = out
+            packed = (out, 0)
+            tuple_alias = packed.0
+            TARGET << [k for k in [1, 2, 3] if k > v]
+        out: Feed(_)
+        emit(1, out)
+        out
+    "#}
+    .replace("TARGET", target);
+    check_compile_error(
+        &program,
+        "The keys of a collection written to a feed or mutable variable depend on `v`",
+    );
 }
 
 /// A row computed by a refined operation over the read of an accumulator, fed from a loop

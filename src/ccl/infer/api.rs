@@ -2255,8 +2255,13 @@ impl std::fmt::Debug for InferError {
                 site,
                 fed_elsewhere,
             } => {
-                let spelled =
-                    |names: &[Name]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>();
+                let spelled = |names: &[Name]| {
+                    names
+                        .iter()
+                        .flat_map(|n| binder_spellings(n, predicate))
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                };
                 let between = match site {
                     JoinSite::Contribution => "between the target's declaration and the write",
                     JoinSite::Arm => "in the arm",
@@ -3831,6 +3836,38 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// How a diagnostic names `binder`, which `predicate` reads. A `def`'s parameters are bound as
+/// one tuple, which is named by the parameters the predicate projects out of it, or by all of
+/// them where it reads the tuple whole.
+fn binder_spellings(binder: &Name, predicate: &Expr) -> Vec<String> {
+    fn projected(binder: &Name, e: &Expr, out: &mut Vec<usize>) {
+        if let TypedExprNode::Apply { argument, function } = &e.node
+            && let TypedExprNode::Var(n) = &argument.node
+            && n == binder
+            && let TypedExprNode::Proj(crate::ccl::ProjKey::Index(i)) = &function.node
+        {
+            out.push(*i);
+        }
+        e.walk_children(|c| projected(binder, c, out));
+    }
+    let Some(positions) = binder.positions() else {
+        return vec![binder.to_string()];
+    };
+    let mut read = Vec::new();
+    projected(binder, predicate, &mut read);
+    read.sort_unstable();
+    read.dedup();
+    let read: Vec<String> = read
+        .into_iter()
+        .filter_map(|i| positions.get(i).map(ToString::to_string))
+        .collect();
+    if read.is_empty() {
+        positions.iter().map(ToString::to_string).collect()
+    } else {
+        read
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4249,6 +4286,7 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(body),
         });
@@ -4456,6 +4494,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
@@ -4489,6 +4528,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
@@ -4513,6 +4553,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
@@ -4549,6 +4590,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::var("xs")),
         });
@@ -4589,6 +4631,7 @@ mod tests {
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 body: Box::new(Expr::var("m")),
             });
@@ -4653,6 +4696,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::var("xs")),
         });
@@ -4678,6 +4722,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
         });
@@ -4742,6 +4787,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
             body: Box::new(Expr::var("x")),
@@ -5421,6 +5467,7 @@ mod tests {
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 body: Box::new(Expr::apply(Expr::var("x"), inner)),
             });
@@ -5470,6 +5517,7 @@ mod tests {
                     )),
                     transparency: BindingTransparency::Transparent,
                     site: None,
+                    role: Default::default(),
                 },
                 body: Box::new(Expr::var("x")),
             })),
@@ -5506,6 +5554,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::lit(Lit::Unit)),
         });
@@ -5971,6 +6020,7 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -6059,6 +6109,7 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -6116,6 +6167,7 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
         })
@@ -6417,6 +6469,7 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
+                role: Default::default(),
             },
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
         })

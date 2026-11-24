@@ -1384,6 +1384,7 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                         user_annotation: None,
                         transparency: BindingTransparency::Transparent,
                         site: None,
+                        role: Default::default(),
                     },
                     body: Box::new(body),
                 })
