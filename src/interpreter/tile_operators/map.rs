@@ -1482,7 +1482,7 @@ impl TileProducer for MapResultWithSourceProducer {
 mod nested_projection_tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{
-        ProjectionSpyOp, assert_conforms_beneath, paths_guard, two_levels_of_ints,
+        ProjectionSpyOp, assert_conforms_beneath, two_levels_of_ints,
     };
     use crate::interpreter::{BaseType, Extent, FunctionDef, Predicate, UnaryOpKind, Value};
 
@@ -1553,10 +1553,9 @@ mod nested_projection_tests {
     }
 
     /// A collection constant that replaces each row's collection holds the keys beneath the row,
-    /// so a projection of them names nothing of the input.
+    /// so a pull of some of them pulls the rows holding them and answers the cut of those rows.
     #[test]
-    #[should_panic(expected = "restates the outermost keys and the keys above level 1")]
-    fn a_constant_refuses_a_projection_of_the_keys_it_replaces() {
+    fn a_constant_answers_a_projection_of_the_keys_it_replaces_from_their_rows() {
         use crate::interpreter::tile_operators::test_helpers::ints_by_position;
         let constant_tiling = Tiling::data_function(Extent::uint_range(2), Tiling::Scalar(int()));
         let mut map = MapResultToConst::new_at(
@@ -1568,12 +1567,18 @@ mod nested_projection_tests {
             MapResultToConstMode::Replace,
             CurryLevel::new(1),
         );
-        let guard = map.tiling().universal_guard();
-        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
-        producer.get(paths_guard(Predicate::qualified(
-            Predicate::point(Value::UInt(0)),
-            Predicate::point(Value::UInt(1)),
-        )));
+        let tiling = map.tiling().clone();
+        let mut producer = map.subscribe(
+            tiling.universal_guard(),
+            Box::new(|| {}),
+            &mut Scheduler::new(),
+        );
+        let path = [Value::UInt(0), Value::UInt(1)];
+        let projection = Projection::keys_at(CurryLevel::new(1), Predicate::exactly(&path));
+        let actual = producer.get(projection.guard(&tiling));
+        let mut expected = producer.get(tiling.universal_guard());
+        expected.restrict_to(&projection, &tiling);
+        assert_eq!(actual, expected);
     }
 }
 
