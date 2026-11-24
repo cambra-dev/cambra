@@ -796,6 +796,10 @@ fn exchange_method(
     }
     stream.write_all(b"\r\n").unwrap();
     stream.write_all(body).unwrap();
+    read_http_reply(stream)
+}
+
+fn read_http_reply(mut stream: TcpStream) -> HttpReply {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     let (head, body) = response.split_once("\r\n\r\n").expect("an HTTP response");
@@ -895,6 +899,94 @@ fn typed_http_rejects_non_utf8_without_poisoning_the_route() {
     assert!(
         !admitted.contains_path(&[Value::UInt(1)]),
         "only the valid request gets a key"
+    );
+}
+
+#[rstest]
+#[case::below_limit(1024 * 1024 - 1, 200)]
+#[case::at_limit(1024 * 1024, 200)]
+#[case::above_limit(1024 * 1024 + 1, 413)]
+fn http_request_body_size_is_bounded(#[case] length: usize, #[case] status: u16) {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/limited") as server
+        server::respond([http::ok_text("accepted") for req in server::requests])
+    "#};
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        tx.send(exchange(port, "/limited", &vec![b'x'; length], &[]))
+            .unwrap();
+    });
+    let reply = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(reply.status, status);
+    if status == 200 {
+        assert_eq!(reply.body, "accepted");
+    }
+}
+
+#[rstest]
+#[case::content_length(false)]
+#[case::chunked(true)]
+fn an_oversized_http_body_is_rejected_before_the_upload_finishes(#[case] chunked: bool) {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        import std::http
+        run std::http::serve(port="{port}", method="POST", path="/limited") as server
+        server::respond([http::ok_text(req.body()) for req in server::requests])
+    "#};
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let length = 1024 * 1024 + 1;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /limited HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+        )
+        .unwrap();
+        if chunked {
+            write!(stream, "Transfer-Encoding: chunked\r\n\r\n{length:X}\r\n").unwrap();
+            stream.write_all(&vec![b'x'; length]).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            // The zero chunk is withheld: rejection must not wait for the body to finish.
+        } else {
+            write!(
+                stream,
+                "Content-Length: {length}\r\nExpect: 100-continue\r\n\r\n"
+            )
+            .unwrap();
+        }
+        let rejected = read_http_reply(stream);
+        let accepted = exchange(port, "/limited", b"next", &[]);
+        tx.send((rejected, accepted)).unwrap();
+    });
+    let (rejected, accepted) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(rejected.status, 413);
+    assert_eq!(accepted.status, 200);
+    assert_eq!(accepted.body, "next");
+    let source = ctx
+        .conversion_ctx()
+        .get_source(&cambra::ccl::lower::http_requests_source_name(
+            port, "POST", "/limited",
+        ))
+        .unwrap();
+    let admitted = source.borrow().get_yield_predicate();
+    assert!(admitted.contains_path(&[Value::UInt(0)]));
+    assert!(
+        !admitted.contains_path(&[Value::UInt(1)]),
+        "the rejected upload consumes no request-domain key"
     );
 }
 

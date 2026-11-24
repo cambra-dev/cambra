@@ -13,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    io::Read,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -32,6 +33,28 @@ use crate::interpreter::{
     tiling::{FunctionGuard, Predicate, Tile, TileGuard},
     tuple_field,
 };
+
+// TODO: Make request limits configurable once the record API makes configuration ergonomic.
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+fn request_body(request: &mut tiny_http::Request) -> Result<String, (u16, &'static str)> {
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_REQUEST_BODY_BYTES)
+    {
+        return Err((413, "request body exceeds 1 MiB"));
+    }
+    let mut bytes = Vec::new();
+    request
+        .as_reader()
+        .take(MAX_REQUEST_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| (400, "invalid request body"))?;
+    if bytes.len() > MAX_REQUEST_BODY_BYTES {
+        return Err((413, "request body exceeds 1 MiB"));
+    }
+    String::from_utf8(bytes).map_err(|_| (400, "request body must be UTF-8"))
+}
 
 fn http_tuple<const N: usize>(values: [Value; N]) -> Value {
     Value::Record(
@@ -304,20 +327,14 @@ impl SharedHttpServer {
 
                         match sender {
                             Some(tx) => {
-                                let mut body_bytes = Vec::new();
-                                if request.as_reader().read_to_end(&mut body_bytes).is_err() {
-                                    let _ = request.respond(
-                                        Response::from_string("invalid request body")
-                                            .with_status_code(400),
-                                    );
-                                    continue;
-                                }
-                                let Ok(body) = String::from_utf8(body_bytes) else {
-                                    let _ = request.respond(
-                                        Response::from_string("request body must be UTF-8")
-                                            .with_status_code(400),
-                                    );
-                                    continue;
+                                let body = match request_body(&mut request) {
+                                    Ok(body) => body,
+                                    Err((status, message)) => {
+                                        let _ = request.respond(
+                                            Response::from_string(message).with_status_code(status),
+                                        );
+                                        continue;
+                                    }
                                 };
                                 let headers = Value::Function(
                                     request

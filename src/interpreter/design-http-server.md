@@ -17,7 +17,9 @@ A filtered domain, contribution-site-tagged domain, or another route's domain is
 The module defines its private response Feed once with `<<=`. No writable place is exported.
 
 Request and response bodies are UTF-8 Strings. Invalid UTF-8 request bodies receive 400 before
-source admission. Header lists preserve order and repeated names. Response status codes range
+source admission. Request bodies are limited to 1 MiB; larger bodies receive 413 before admission
+and consume no request-domain key. This fixed limit applies to Content-Length and chunked bodies.
+Header lists preserve order and repeated names. Response status codes range
 from 200 through 599. Binary bodies, streaming, informational responses, protocol upgrades, and
 TLS are not implemented.
 
@@ -91,6 +93,9 @@ refuses any other. The route is keyed by its normalized path, so two runs that s
 differently serve one route, which is refused as a duplicate.
 
 For a matched request, the dispatcher reads and validates the UTF-8 body before enqueueing it.
+It rejects an oversized Content-Length before reading and otherwise reads at most 1 MiB plus one
+byte to detect overflow. Body reads have no deadline, and tiny_http retains responsibility for
+unread-body cleanup. A stalled upload can still block the port's dispatcher.
 Its raw value is `(method, target, headers, body)`, where headers are a materialized list of
 String pairs. The embedded module uses ordinary CHL constructors to build nominal Header and
 Request values. Sources continue to return `ColumnValue`; collection-valued fields open through
