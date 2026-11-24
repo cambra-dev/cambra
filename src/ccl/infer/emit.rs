@@ -259,6 +259,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Cast: rebuild `value`'s function type with `target`'s domain refinements.
         // See [`emit_cast`] (shared with `check_node`).
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        TypedExprNode::Member { key, .. } => emit_member(key, ctx)?,
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
         // Scheme-based rules: the registry lookup (which scheme for this op)
@@ -1097,6 +1098,19 @@ pub(super) fn emit_lambda<C: Typing>(
     Ok(ty)
 }
 
+/// Type the judgment `key : domain` ([`TypedExprNode::Member`]): a `Bool`, with `key` typed
+/// as the term it is. The judgment states nothing about `key`'s type; the edge a demand on it
+/// emits does (`src/ccl/design/collections.md`, "The checked lookup's refinement").
+///
+/// Shared by `emit_node` (Emit) and `check_node` (Check) via [`Typing`].
+pub(super) fn emit_member<C: Typing>(
+    key: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    ctx.subexpr(key)?;
+    Ok(Type::Base(BaseType::Bool))
+}
+
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
 /// `target`, attaching `target`'s domain refinement `r` to `value`'s type.
 ///
@@ -1456,7 +1470,10 @@ fn keyed_access_value<C: Typing>(
 /// `Option`.
 ///
 /// The key is related to the collection's keys and nothing is applied at it
-/// ([`keyed_access_value`]); presence is what the operator decides at runtime.
+/// ([`keyed_access_value`]); presence is what the operator decides at runtime. The answer is
+/// refined by the judgment `𝑘 : 𝐷` on the collection's domain `𝐷`
+/// ([`crate::ccl::nominal::lookup_checked_refinement`]), which reads nothing of the collection's
+/// type here: `𝐷` and the collection's kind may still be inference variables.
 fn emit_lookup_checked<C: Typing>(
     function: &mut Expr,
     collection: &Type,
@@ -1484,7 +1501,32 @@ fn emit_lookup_checked<C: Typing>(
         None,
         &|| "the value a checked lookup answers".to_string(),
     )?;
-    let result = Type::option_of(at_key);
+    // The judgment reads the collection's own domain and kind, unread: a sum's domain names
+    // its witness, which the instantiated `keys` does not.
+    let Type::Fun {
+        domain, fun_kind, ..
+    } = collection.peel_refinements()
+    else {
+        unreachable!(
+            "keyed_access_types answered for a collection that is not a function: {collection}"
+        )
+    };
+    let site = function.node_id();
+    let derive = || {
+        let _g = crate::ccl::provenance::enter(
+            site,
+            "infer.lookup_checked",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        let refinement = crate::ccl::nominal::lookup_checked_refinement(
+            key,
+            (**domain).clone(),
+            fun_kind.clone(),
+            &at_key,
+        );
+        Type::refined_one(Type::option_of(at_key.clone()), refinement)
+    };
+    let result = ctx.checked_lookup_answer(&derive, &function.ty);
     // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
     // passes read a consistent type off the node. The domain is the pair the operator is
     // applied to, which is what op-conversion reads to size its output.

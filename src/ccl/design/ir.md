@@ -360,6 +360,15 @@ after the restriction is planned. See
 [dependent refinements](type-inference.md#45-dependent-refinements-via-pi-types) and
 [optimization](optimization.md).
 
+### `Member` — the judgment that a key is a collection's key
+
+`Member { key, domain, kind }` is the `Bool` judgment `key : domain`. It stands only in a
+refinement predicate: the checked lookup's answer states its presence with it
+([The checked lookup's refinement](collections.md#the-checked-lookups-refinement)). `domain` is a
+type slot, as a `Cast`'s `target` is, so type and predicate walks reach it. `kind` is the
+collection's function kind, which decides whether the judgment is exactly membership in `domain`.
+Every pass that walks the term tree outside predicates has an unreachable arm for a `Member`.
+
 ### `Case` only — no `IfThenElse`
 
 `Case { scrutinee, branches }` represents `if`/`elif`/`else`, conditional expressions, and

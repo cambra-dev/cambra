@@ -3172,14 +3172,10 @@ impl Interp {
                 Ok(Value::Record(fields))
             }
 
-            // `c[k]!` is the entry at `k`; the checked `c[k]` answers `Option::some(v)` for an
-            // entry and `Option::none` where there is none (`docs/chl-spec.md`, "3.9 Subscript
-            // and attribute access").
-            Expr::Subscript {
-                target,
-                index,
-                checked,
-            } => {
+            // `c[k]` answers `Option::some(v)` for an entry and `Option::none` where there is
+            // none; `c[k]!` unwraps that (`docs/chl-spec.md`, "3.9 Subscript and attribute
+            // access").
+            Expr::Subscript { target, index } => {
                 let t = self.eval(target)?;
                 let k = self.eval(index)?;
                 if any_pending([&t, &k]) {
@@ -3188,34 +3184,20 @@ impl Interp {
                 match t {
                     Value::Collection(c) => {
                         let found = c.entries().iter().find(|(key, _)| *key == k);
-                        match (found, *checked) {
-                            (Some((_, v)), false) => Ok(v.clone()),
-                            (None, false) => err(format!("no entry at key {k}")),
-                            (Some((_, v)), true) => Ok(Value::Nominal {
+                        Ok(match found {
+                            Some((_, v)) => Value::Nominal {
                                 ty: OPTION.to_string(),
                                 ctor: "some".to_string(),
                                 payload: Box::new(v.clone()),
-                            }),
-                            (None, true) => Ok(Value::Nominal {
+                            },
+                            None => Value::Nominal {
                                 ty: OPTION.to_string(),
                                 ctor: "none".to_string(),
                                 payload: Box::new(Value::Unit),
-                            }),
-                        }
+                            },
+                        })
                     }
-                    Value::Record(_) if *checked => {
-                        err("a checked subscript of a product is not defined")
-                    }
-                    Value::Record(fields) => {
-                        let Value::Int(i) = k else {
-                            return err("a product is subscripted by position");
-                        };
-                        fields
-                            .into_iter()
-                            .find(|(n, _)| *n == format!("_{i}"))
-                            .map(|(_, v)| v)
-                            .ok_or_else(|| Error::Message(format!("no component _{i}")))
-                    }
+                    Value::Record(_) => err("a subscript of a product is not defined"),
                     other => err(format!("cannot subscript {other}")),
                 }
             }

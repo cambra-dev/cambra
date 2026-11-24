@@ -1179,24 +1179,18 @@ pub enum Expr {
         causes: Box<Clause<TraitType>>,
     },
 
-    /// Subscript: the **checked** form `target[index]`, or the proven form
-    /// `target[index]!` — **collection lookup only**. Projecting a product is a
-    /// different operation and has its own spelling, [`Expr::Attribute`].
-    ///
-    /// The two subscript forms are one syntactic form because they are one operation —
-    /// evaluate a finite function at a point — differing only in what happens when the
-    /// point may be absent. `checked` yields `Option(V)` and always type-checks; the
-    /// proven form yields `V` and requires the index's presence to be *provable*
-    /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
+    /// Subscript: the checked lookup `target[index]`, which yields `Option(V)` —
+    /// **collection lookup only**. Projecting a product is a different operation and has its
+    /// own spelling, [`Expr::Attribute`]. The proven lookup `target[index]!` is an
+    /// [`Expr::Unwrap`] of this node (`docs/chl-spec.md`, "3.9 Subscript and attribute
+    /// access").
     Subscript {
         target: Box<Spanned<Expr>>,
         index: Box<Spanned<Expr>>,
-        checked: bool,
     },
 
     /// Unwrap: `target!` — the payload of an `Option` proven to be `Option::some`
-    /// (`docs/chl-spec.md`, "Subscript and unwrap syntax \[Decided\]"). `c[k]!` directly
-    /// after a subscript is the proven lookup [`Expr::Subscript`] instead.
+    /// (`docs/chl-spec.md`, "Subscript and unwrap syntax \[Decided\]").
     Unwrap(Box<Spanned<Expr>>),
 
     /// Attribute access: `target.attr` — a record field by **name** (`r.age`) or a

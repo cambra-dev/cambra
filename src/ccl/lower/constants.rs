@@ -622,11 +622,12 @@ impl LoweringContext {
                     .normalized()
                     .map_err(no_value)
             }
-            ChlExpr::Subscript {
-                target,
-                index,
-                checked: false,
-            } => {
+            // The proven lookup `c[k]!`, the unwrap of a checked lookup. A constant holds no
+            // `Option`, so the pair folds as one element read, and an absent key has no value.
+            ChlExpr::Unwrap(lookup) if matches!(lookup.node, ChlExpr::Subscript { .. }) => {
+                let ChlExpr::Subscript { target, index } = &lookup.node else {
+                    unreachable!("matched a subscript above")
+                };
                 let target = self.const_term(target, at)?;
                 let index = self.const_term(index, at)?;
                 ConstTerm::Element(Box::new(target), Box::new(index))

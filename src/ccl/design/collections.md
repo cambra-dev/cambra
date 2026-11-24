@@ -357,16 +357,22 @@ runtime-free conversion API. No surface view constructor should be inferred from
 
 ## Lookup: membership discharge
 
-The proven lookup `c[k]!` lowers as function application. It requires the key type to be below
-the collection's domain. `c[k]` is checked lookup: it requires a compatible key type but decides
-presence at runtime and returns `Option`. The
-[CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access) owns the spellings.
+`c[k]` is checked lookup: it requires a compatible key type but decides presence at runtime and
+returns `Option`. The proven lookup `c[k]!` is `!` applied to it, and lowers to
+`(c, k) ▷ lookup? ▷ Option::value`. `Option::value`'s parameter excludes `none`, so `c[k]!` is
+accepted where [The checked lookup's refinement](#the-checked-lookups-refinement) entails that the
+key is present. The [CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access)
+owns the spellings.
 
-A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
-That typing rule does not construct a value at such a domain. A concrete keyed domain requires
-its own membership evidence; a known source element does not currently acquire it automatically.
-A list's proven lookup accepts a `UInt` key whose refinement entails the range bound, such as
-`xs[int_to_uint(1)]!` over `0..3` (see
+The call `c(k)` lowers as function application, which requires the key type to be below the
+collection's domain. `c[k]!` makes the same requirement through the edge its demand emits, so in
+both `\i -> xs(i)` and `\i -> xs[i]!`, `i` is bounded by `xs`'s domain.
+
+A `FullMap(K, V)` parameter's domain is `K` with no refinement, so a key of type `K` meets it and
+`m[k]!` is accepted. That typing rule does not construct a value at such a domain. A concrete keyed
+domain requires its own membership evidence; a known source element does not currently acquire it
+automatically. A list's proven lookup accepts a `UInt` key whose refinement entails the range
+bound, such as `xs[int_to_uint(1)]!` over `0..3` (see
 [Semantic entailment as a fallback](type-inference.md#semantic-entailment-as-a-fallback)).
 
 ### The checked lookup `𝑐[𝑘]`
@@ -381,8 +387,9 @@ Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin applic
 3. `keyed_access_value` constrains the key below the domain's base, peeling refinements. The
    base of a range `0..𝑛` is `UInt`, so a list's checked lookup at a key outside the range types
    and answers `none`.
-4. The rule returns `Option` of the value type and stamps the builtin with the concrete
-   pair-to-Option function type.
+4. The rule returns `Option` of the value type, refined as
+   [The checked lookup's refinement](#the-checked-lookups-refinement) gives, and stamps the
+   builtin with the concrete pair-to-Option function type.
 
 The key constraint is directional. Joining the lookup key and collection keys at a common
 supertype would admit a wrong-base key by widening instead of rejecting it.
@@ -395,6 +402,39 @@ covers tuple targets and range domains. A tuple is a product, not a collection l
 Emission computes the dependent result once. Later type checks recover the payload from the
 stamped operator type rather than substituting again into predicates that planning may have
 converted to point-free form. A second discharge could produce a different embedded term.
+
+#### The checked lookup's refinement
+
+For `𝑐` typed `𝐷 ⤇ 𝑉`, the answer of `𝑐[𝑘]` is
+`{Option(𝑉) | ((𝑘 : 𝐷) and not (__elem ▷ ctor_is(Option::none))) or (not (𝑘 : 𝐷) and __elem ▷ ctor_is(Option::none))}`
+(`nominal::lookup_checked_refinement`). The judgment `𝑘 : 𝐷` is a `Member` node that carries `𝑘`,
+`𝐷`, and `𝑐`'s function kind. Emission reads nothing of `𝑐`'s type to build it, so `𝐷` and the kind
+may still be inference variables. Coalescing resolves `𝐷` with the rest of the predicate.
+
+The judgment states that `𝑘` is a key of `𝑐`. For a plain collection, that holds exactly when `𝑘` is
+a member of `𝐷`. A sum's domain is not exactly its keys, so for a sum a member of `𝐷` is a key and
+nothing more follows. The judgment carries the kind instead of choosing between the two statements
+at emission, because the kind may not be pinned yet.
+
+`!` demands `not (__elem ▷ ctor_is(Option::none))` of its operand. Against this refinement that
+demand is the judgment `𝑘 : 𝐷`, so `constrain_refined` emits it as the edge `type(𝑘) <: 𝐷` rather
+than as an SMT query. The edge waits on `𝐷` like any other edge. It bounds an unannotated key, so
+`\i -> xs[i]!` types `i` at `xs`'s domain. The refinement travels with the answer's type, so
+`r = c[k]; r!` meets the same edge at `r!`.
+
+Every other query reads the judgment through its SMT encoding (`Encode::member`). For a plain
+collection the encoding is `𝐷`'s membership at `𝑘`: the bound of a range `0..𝑛`, and each of `𝐷`'s
+predicates stated of `𝑘`. For a sum, and for a kind not yet pinned, it is a fresh constant that the
+membership implies. A domain whose membership has no encoding fails the plain collection's
+judgment, and the antecedent drops that refinement.
+
+Refinement erasure rewrites the `match` that `!` inlines to over a lookup into the application
+`𝑘 ▷ 𝑐`, since it erases the refinement the `match` relies on
+([Refinement Erasure](optimization.md#refinement-erasure-cclerase_refinementsrs)).
+
+A check reads the refinement back from the stamp (`Typing::checked_lookup_answer`) for the same
+reason that it reads the payload back. A transparent `let`'s scope exit substitutes the key
+binder's definition into the tree, and the substituted refinement would hold a different key term.
 
 #### Runtime readiness and answer shape
 
@@ -432,7 +472,10 @@ A key produced by a collection's key morphism should support membership in that 
 The current compiler does not implement that introduction rule. The regression
 `a_key_from_the_source_does_not_yet_carry_its_key_domain` rejects direct source elements,
 applications of the key function and projected source fields. This is missing functionality,
-not a decision that such keys must remain unusable.
+not a decision that such keys must remain unusable. Those programs look up a group-by, whose
+values are collections. The checked lookup requires `Equatable(V, V)` of the values
+([Constructors state what they build](../../../docs/chl-spec.md#constructors-state-what-they-build)),
+so `g[k]!` on a group-by is rejected at every key before membership is considered.
 
 A key whose type names a sum's witness through the sum's value is a member by its type; see
 [Projecting a sum's witness](#projecting-a-sums-witness).

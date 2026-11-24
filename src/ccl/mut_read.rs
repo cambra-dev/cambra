@@ -107,9 +107,8 @@
 //! three positions (`src/ccl/design/mutability.md`, "A mutable variable read is
 //! an explicit operation"), and two of them — a pass-by-reference argument and
 //! `await_final`'s operand — are an application's argument, which `emit_apply`
-//! relates to the parameter by reading a bare reference there. A proven keyed read of a
-//! mutable collection, `m[k]!`, puts the handle in the function position of the
-//! same node.
+//! relates to the parameter by reading a bare reference there. Applying a mutable
+//! collection, `m(k)`, puts the handle in the function position of the same node.
 //!
 //! **A refined cast's value.** A cast target that refines its domain holds a
 //! copy of the term being cast, and inference dedups the two by structural

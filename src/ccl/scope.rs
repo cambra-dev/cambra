@@ -339,6 +339,8 @@ where
         // `target` is a type; its refinement predicate is reached by the
         // caller's type walk, not here (see the module docs).
         N::Cast { value, .. } => open(f, value),
+        // `domain` is a type, reached by the caller's type walk as a cast's `target` is.
+        N::Member { key, .. } => open(f, key),
         N::BinOp { left, right, .. } => {
             open(f, left);
             open(f, right);
@@ -677,6 +679,7 @@ where
         | N::Error
         | N::Apply { .. }
         | N::Cast { .. }
+        | N::Member { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
         | N::Aggregate { .. }
@@ -742,6 +745,11 @@ mod tests {
             node(N::Cast {
                 value: Box::new(var("v")),
                 target: Type::Hole,
+            }),
+            node(N::Member {
+                key: Box::new(var("k")),
+                domain: Type::Hole,
+                kind: crate::ccl::FunKind::Data(None),
             }),
             comprehension_two_guarded_generators(),
             TypedExpr::binop(
@@ -964,6 +972,7 @@ mod tests {
         N::Builtin(_) => "Builtin",
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
+        N::Member { .. } => "Member",
         N::Comprehension { .. } => "Comprehension",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",

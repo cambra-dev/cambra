@@ -348,8 +348,8 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   write to one key of a mutable collection — and `None` for a write of the whole variable. Its rule
   is application on the left of the assignment: the key is checked against the collection's key type
   and the value against the codomain that key names, a dependent codomain being discharged to the
-  key term.  So when writing, `m[k]` denotes the same type as proven lookup `m[k]!`, but without
-  requiring the presence proof.  Peeling takes the domain's whole refinement set, membership
+  key term.  So on the left of a write, `m[k]` is typed as the application `m(k)` without the
+  presence requirement.  Peeling takes the domain's whole refinement set, membership
   predicate and any other alike, so a domain refinement that is not about presence is not enforced
   at a write either.  `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it
   denotes, `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them

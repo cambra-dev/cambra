@@ -1593,9 +1593,9 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
 /// the edge — and the raw mismatch reads as an internal confusion rather than as what it
 /// is, a lookup whose proof obligation cannot be discharged. An `Array(3, 𝑇)`'s range
 /// domain `0..3` is left to its own message, which already says it wanted an index in the
-/// range. Named here rather than at the subscript form because `c[k]!` lowers to
-/// exactly the application `c(k)`, so the diagnosis has to be type-directed to cover both
-/// spellings.
+/// range. The diagnosis is type-directed because two spellings meet this edge: the application
+/// `c(k)`, and the proven lookup `c[k]!`, whose demand on `c[k]`'s answer is the edge from the
+/// key's type to the domain.
 ///
 /// The proven/checked operator pair this points at is specified in `docs/chl-spec.md`,
 /// "3.9 Subscript and attribute access"; the discharge it rests on is

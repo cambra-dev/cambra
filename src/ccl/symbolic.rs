@@ -475,6 +475,16 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, text)
         }
 
+        // The judgment renders `(key : domain)`, in parentheses so the colon reads as the
+        // judgment's own in any operand position.
+        TypedExprNode::Member { key, domain, .. } => {
+            let key = fmt(key, Precedence::Lowest, opts);
+            (
+                Precedence::Atom,
+                format!("({key} : {})", ty_at(domain, opts)),
+            )
+        }
+
         TypedExprNode::Lambda { param, body } => {
             // Domain refinements ride the type lattice, so they render as part
             // of `param.ty` (a `Type::Refinement`) via `Display for Type`.
