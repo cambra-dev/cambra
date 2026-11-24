@@ -2439,15 +2439,24 @@ mod tests {
         assert_eq!(closed.within(&Projection::Everything), Ok(()));
     }
 
-    /// A producer that restates no projection beneath its outermost keys is caught by the `get`
-    /// wrapper in a debug build when it is pulled at one (`TileProducer::restates`).
+    /// A pull beneath the outermost keys of a producer that restates none is answered by pulling
+    /// the outermost keys its paths run through and cutting the answer to the keys asked for
+    /// (`TileProducer::get`).
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "restates the outermost keys only")]
-    fn get_rejects_a_pull_beneath_the_outermost_keys_of_a_producer_that_restates_none() {
-        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
-        let producer = TestTileProducer::new(three_rows(), nested_tiling());
-        producer.get(codomain(domain(under(key(0), key(1)))));
+    fn get_widens_a_pull_beneath_the_outermost_keys_of_a_producer_that_restates_none() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+        let (mut producer, pulled, _) = ProjectionSpy::new(three_rows(), nested_tiling());
+        producer.restates = Restates::Outermost;
+        let asked = codomain(domain(under(key(0), key(1))));
+        let projection = Projection::of(&asked).expect("a projection of inner keys");
+        let mut expected = three_rows();
+        expected.restrict_to(&projection, &nested_tiling());
+        assert_eq!(producer.get(asked), expected);
+        assert_eq!(
+            *pulled.read().unwrap_or_else(PoisonError::into_inner),
+            vec![domain(key(0))],
+            "the producer is pulled at the outermost key the asked path runs through"
+        );
     }
 
     /// A producer that ignores the guard is caught by the `get` wrapper in a debug build, where
