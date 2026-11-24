@@ -324,9 +324,10 @@ fn hash_type<'a>(
             domain,
             codomain,
             fun_kind,
-            binder: _,
+            binder,
             capabilities,
         } => {
+            binder.parameter_count().hash(state);
             std::mem::discriminant(fun_kind).hash(state);
             hash_capabilities(capabilities, env, free, state);
             if let FunKind::Var(v) = fun_kind {
@@ -1003,6 +1004,22 @@ mod tests {
     /// the term structure held fixed.
     fn typed(ty: Type) -> TypedExpr {
         TypedExpr::new(TypedExprNode::Var("x".into())).with_ty(ty)
+    }
+
+    #[test]
+    fn function_parameter_count_participates_in_the_hash() {
+        let int = Type::Base(BaseType::Int);
+        let parameters = Type::fun_of_params(
+            vec![("a".into(), int.clone()), ("b".into(), int.clone())],
+            int.clone(),
+            FunKind::Compute,
+        );
+        let tuple = Type::fun(Type::tuple(vec![int.clone(), int.clone()]), int);
+        assert_ne!(h(&typed(parameters.clone())), h(&typed(tuple.clone())));
+        assert_ne!(
+            resolved_hash(&typed(parameters), &[]),
+            resolved_hash(&typed(tuple), &[])
+        );
     }
 
     #[test]

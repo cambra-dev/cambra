@@ -146,18 +146,22 @@ fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::FunBinder) ->
 pub(crate) fn opened_deep(ty: &Type) -> Type {
     match ty {
         Type::Fun {
-            binder: crate::ccl::FunBinder::Whole(b),
+            binder,
             fun_kind,
             domain,
             codomain,
             capabilities,
-        } => Type::Fun {
-            binder: crate::ccl::FunBinder::Whole(b.clone()),
-            fun_kind: fun_kind.clone(),
-            domain: Box::new(opened_deep(domain)),
-            codomain: Box::new(opened_deep(&crate::ccl::subst::open_codomain(ty, codomain))),
-            capabilities: capabilities.clone(),
-        },
+        } if !binder.is_none() => {
+            let binder = crate::ccl::subst::named_binder(binder);
+            let codomain = crate::ccl::subst::open_at_binder(&binder, domain, codomain);
+            Type::Fun {
+                binder,
+                fun_kind: fun_kind.clone(),
+                domain: Box::new(opened_deep(domain)),
+                codomain: Box::new(opened_deep(&codomain)),
+                capabilities: capabilities.clone(),
+            }
+        }
         // A family's body reads its binders by their names.
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
             let opened = crate::ccl::subst::opened_family_body(binders, body);
@@ -199,17 +203,21 @@ pub(crate) fn opened_deep(ty: &Type) -> Type {
 pub(crate) fn closed_deep(ty: &Type) -> Type {
     match ty {
         Type::Fun {
-            binder: crate::ccl::FunBinder::Whole(b),
+            binder,
             fun_kind,
             domain,
             codomain,
-            ..
-        } => Type::pi_kinded(
-            b.clone(),
-            closed_deep(domain),
-            closed_deep(codomain),
-            fun_kind.clone(),
-        ),
+            capabilities,
+        } if !binder.is_none() => Type::Fun {
+            binder: binder.clone(),
+            fun_kind: fun_kind.clone(),
+            domain: Box::new(closed_deep(domain)),
+            codomain: Box::new(crate::ccl::subst::close_at_binder(
+                binder,
+                &closed_deep(codomain),
+            )),
+            capabilities: capabilities.clone(),
+        },
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => Type::family(
             binders
                 .iter()
@@ -700,10 +708,7 @@ type GeneralizedCache = HashMap<(Type, Vec<crate::ccl::Name>), Type>;
 /// family binders.
 fn type_binders(ty: &Type, out: &mut Vec<crate::ccl::Name>) {
     match ty {
-        Type::Fun {
-            binder: crate::ccl::FunBinder::Whole(n),
-            ..
-        } => out.push(n.clone()),
+        Type::Fun { binder, .. } => out.extend(binder.names().cloned()),
         Type::DepTuple(cs) => out.extend(cs.iter().filter_map(|(n, _)| n.clone())),
         Type::Family { binders, .. } => out.extend(binders.iter().filter_map(|(n, _)| n.clone())),
         _ => {}
@@ -1015,28 +1020,32 @@ fn renamed_apart(
 ) -> Type {
     match ty {
         Type::Fun {
-            binder: crate::ccl::FunBinder::Whole(b),
+            binder,
             fun_kind,
             domain,
             codomain,
-            ..
-        } if free.contains(b) => {
-            let fresh = match renames.iter().find(|(_, original)| original == b) {
-                Some((fresh, _)) => fresh.clone(),
-                None => {
-                    let fresh = b.refreshed();
-                    renames.push((fresh.clone(), b.clone()));
-                    fresh
+            capabilities,
+        } if binder.names().any(|b| free.contains(b)) => {
+            let fresh = binder.map_names(|b| {
+                if !free.contains(b) {
+                    return b.clone();
                 }
-            };
-            let opened =
-                codomain_opened_as(ty, codomain, &crate::ccl::FunBinder::Whole(fresh.clone()));
-            Type::pi_kinded(
-                fresh,
-                renamed_apart(domain, free, renames),
-                renamed_apart(&opened, free, renames),
-                fun_kind.clone(),
-            )
+                if let Some((fresh, _)) = renames.iter().find(|(_, original)| original == b) {
+                    return fresh.clone();
+                }
+                let fresh = b.refreshed();
+                renames.push((fresh.clone(), b.clone()));
+                fresh
+            });
+            let opened = codomain_opened_as(ty, codomain, &fresh);
+            let codomain = renamed_apart(&opened, free, renames);
+            Type::Fun {
+                codomain: Box::new(crate::ccl::subst::close_at_binder(&fresh, &codomain)),
+                binder: fresh,
+                domain: Box::new(renamed_apart(domain, free, renames)),
+                fun_kind: fun_kind.clone(),
+                capabilities: capabilities.clone(),
+            }
         }
         _ => {
             let mut out = ty.clone();
@@ -1054,22 +1063,22 @@ fn restored_names(ty: &Type, renames: &[(crate::ccl::Name, crate::ccl::Name)]) -
     }
     match ty {
         Type::Fun {
-            binder: crate::ccl::FunBinder::Whole(b),
+            binder,
             fun_kind,
             domain,
             codomain,
             capabilities,
         } => {
-            let name = match renames.iter().find(|(fresh, _)| fresh == b) {
+            let names = binder.map_names(|b| match renames.iter().find(|(fresh, _)| fresh == b) {
                 Some((_, original))
                     if !crate::ccl::subst::type_free_vars(codomain).contains(original) =>
                 {
                     original.clone()
                 }
                 _ => b.clone(),
-            };
+            });
             Type::Fun {
-                binder: crate::ccl::FunBinder::Whole(name),
+                binder: names,
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(restored_names(domain, renames)),
                 codomain: Box::new(restored_names(codomain, renames)),
@@ -2002,6 +2011,36 @@ mod tests {
         assert_eq!(target.domain().unwrap().refinements().len(), 1);
         assert_eq!(body.ty.domain().unwrap().refinements().len(), filters);
         crate::ccl::infer::check(held).unwrap();
+    }
+
+    #[test]
+    fn parameter_list_binders_round_trip_through_name_form() {
+        let int = Type::Base(BaseType::Int);
+        let result = Type::refined_one(
+            int.clone(),
+            Refinement::born(Rc::new(
+                Expr::binop(
+                    Expr::var(Name::elem()).with_ty(int.clone()),
+                    BinOpKind::Compare(CompareKind::GreaterOrEq),
+                    Expr::var("a").with_ty(int.clone()),
+                )
+                .with_ty(Type::Base(BaseType::Bool)),
+            )),
+        );
+        let ty = Type::fun_of_params(
+            vec![(Name::from("a"), int.clone()), (Name::from("b"), int)],
+            result,
+            FunKind::Compute,
+        );
+        let named = opened_deep(&ty);
+        let Type::Fun { codomain, .. } = &named else {
+            unreachable!()
+        };
+        assert!(crate::ccl::subst::type_free_vars(codomain).contains(&Name::from("a")));
+        assert_eq!(closed_deep(&named), ty);
+        let mut binders = Vec::new();
+        type_binders(&ty, &mut binders);
+        assert_eq!(binders, vec![Name::from("a"), Name::from("b")]);
     }
 
     /// A comprehension joins its guards into one conjunction, so a guard reading a binder out of

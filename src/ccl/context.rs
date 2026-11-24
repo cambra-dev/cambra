@@ -3186,6 +3186,7 @@ fn run_passes(
     }
     expr = recorded(capture_provenance, Phase::Inline, || {
         let expr = inline::inline_compute_lambdas(expr);
+        inline::check_parameter_lists_eliminated(&expr).map_err(Refused::Unsupported)?;
         crate::ccl::observe_world::check_filters(&expr)
             .map_err(|m| Refused::Internal("observeWorld", m))?;
         crate::ccl::exceptions::eliminate(expr).map_err(Refused::Unsupported)

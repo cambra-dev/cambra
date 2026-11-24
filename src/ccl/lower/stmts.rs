@@ -4369,6 +4369,12 @@ pub(super) fn lower_type_expr_or_poly(
             let ChlExpr::Tuple(entries) = &domain.node else {
                 unreachable!("matched a parameter list")
             };
+            if entries.len() == 1 {
+                return Err(LoweringError::unsupported(
+                    domain.span,
+                    "a one-parameter type is A => C; write {A,} => C for one tuple parameter",
+                ));
+            }
             if *arrow == chl_parser::ast::Arrow::Data {
                 return Err(LoweringError::unsupported(
                     domain.span,

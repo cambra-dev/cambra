@@ -341,7 +341,23 @@ fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {
         memo: &crate::ccl::ccl_utils::PredMemo<()>,
     ) -> bool {
         // A projection's domain distinguishes it from the same index at another product.
-        if let Some(i) = operands.iter().position(|o| *o == e) {
+        fn projections<'a>(expr: &'a Expr, out: &mut Vec<&'a Type>) {
+            if matches!(expr.node, TypedExprNode::Proj(_)) {
+                out.push(&expr.ty);
+            }
+            expr.walk_children(|child| projections(child, out));
+        }
+        if let Some(i) = operands.iter().position(|o| {
+            if !crate::ccl::eq_term_modulo_ty_slots(o, e) {
+                return false;
+            }
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            projections(o, &mut left);
+            projections(e, &mut right);
+            left.iter()
+                .zip(&right)
+                .all(|(a, b)| a.domain() == b.domain())
+        }) {
             *e = at(i, &e.ty);
             return true;
         }
@@ -3262,6 +3278,37 @@ mod tests {
     /// `Bool` base type, for predicate bodies and other boolean-typed nodes.
     fn bool_ty() -> Type {
         Type::Base(BaseType::Bool)
+    }
+
+    #[test]
+    fn operation_abstraction_matches_an_operand_after_value_refinements_are_erased() {
+        let name = Name::fresh("limit");
+        let refined = Type::refined_one(
+            int_ty(),
+            Refinement::born(Rc::new(
+                Expr::binop(
+                    Expr::var(Name::elem()).with_ty(int_ty()),
+                    BinOpKind::Compare(CompareKind::Greater),
+                    lit(0).with_ty(int_ty()),
+                )
+                .with_ty(bool_ty()),
+            )),
+        );
+        let quoted = Expr::var(&name).with_ty(refined);
+        let operand = Expr::var(&name).with_ty(int_ty());
+        let result = Type::refined_one(
+            int_ty(),
+            Refinement::born(Rc::new(
+                Expr::binop(
+                    Expr::var(Name::elem()).with_ty(int_ty()),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    quoted,
+                )
+                .with_ty(bool_ty()),
+            )),
+        );
+        let ty = operation_type(&[&operand], &int_ty(), &result);
+        assert!(crate::ccl::subst::type_free_vars(&ty).is_empty());
     }
 
     #[test]

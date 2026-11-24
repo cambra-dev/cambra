@@ -228,7 +228,8 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Apply**: `arg ▷ func` (left-assoc; `a ▷ f ▷ g` means `(a ▷ f) ▷ g`).
 - **Apply with `Proj` as function**: postfix dot-access. `t ▷ .0` → `t.0`, `rec ▷ .name` → `rec.name`.
 - **Compose**: `f ≫ g ≫ h`.
-- **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (an unresolved refined base renders by its own type form: `{_ | predicate}` for a `Hole`, `{?N | predicate}` for an `Infer`). The refinement rides the param *type* — there is no separate lambda refinement slot — and the predicate appears bare inside the braces; do not write `{T | Refined(p)}`.
+- **Arguments**: `args(a, b)` passes an explicit parameter list; `args()` passes none.
+- **Lambda**: `λ x → body`. A list of parameters: `λ (x, y) → body`, and `λ () → body` for none. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (an unresolved refined base renders by its own type form: `{_ | predicate}` for a `Hole`, `{?N | predicate}` for an `Infer`). The refinement rides the param *type* — there is no separate lambda refinement slot — and the predicate appears bare inside the braces; do not write `{T | Refined(p)}`.
 - **Let**: `let x = e in body`.
 - **LetType** (a type alias declaration, removed by `uniquify`): `let type Name = T` then `in body` on the next line, mirroring `Let`'s layout.
 - **Run** (a `run` statement before linking, which linking replaces with the run's chain): `run name = module` then `in body` on the next line.
@@ -283,7 +284,7 @@ Use the symbolic forms below in prose and inline pseudo-code (not in fenced code
 - **Data function type** (`FunKind::Data`, rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is the data".
 - **Σ type**: **always write the binder, and kind it with `:`.** `Σ (𝐷 : [𝐷₀, 𝐷₁]). 𝐷 ⤇ 𝑉` — a sum is a data arrow carrying its binders, so the body is always the arrow, and every binder scopes over the domain. A described witness kind goes in the same position by name: `Σ (𝐷 : UIntRanges). 𝐷 ⤇ 𝑇`. A listing kind is written in **brackets** — `[𝑇₀, 𝑇₁]`, or `[𝑇₀, …]` where the length is beside the point — because braces are the record type's and a listing whose only cardinality marker is an `ᵢ` subscript (`{𝑇ᵢ}`) does not say whether it is one candidate or many. Reserve `∈` for membership of a candidate in a kind (`𝑑 ∈ 𝐾`, in a rule premise), not for the binder. Do **not** use an anonymous shorthand (`Σ[𝐷₀, 𝐷₁] ⤇ 𝑉`) or a lattice-operator spelling (`⨆[𝑇ᵢ]`) — the binder is what makes the scoping readable.
 - **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.
-- **Lambda** (term): `λ 𝑥 → body`. The `→` after the binder separates the parameter from the body.
+- **Lambda** (term): `λ 𝑥 → body`, and `λ (𝑥, 𝑦) → body` over a list of parameters. The `→` after the binder separates the parameters from the body.
 - **Forward apply** (term level): `𝑎 ▷ 𝑓` means `𝑓(𝑎)`.
 - **Forward compose** (term level): `𝑓 ≫ 𝑔` means `λ 𝑥 → 𝑔(𝑓(𝑥))`.
 

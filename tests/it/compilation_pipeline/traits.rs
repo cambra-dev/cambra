@@ -1655,18 +1655,8 @@ fn an_arithmetic_operator_calls_its_instance(#[case] code: &str, #[case] expecte
     check_scalar(&with_money(code), Value::Int(expected));
 }
 
-/// An instance over two different types: `**`'s exponent is a non-negative `Int` at every
-/// instance.
-///
-/// Refused today: `Exponentiable`'s signature takes the exponent as a plain `Int`, so the
-/// instance's `other` is one, and an exponent of unrefined `Int` is refused
-/// (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators"). The refinement is stated on each
-/// `**`'s exponent rather than in the signature (`TODO(pow-signature)` in `lower/exprs.rs`), so
-/// nothing tells the instance its exponent is non-negative.
+/// The operator's exponent refinement is also the instance's parameter contract.
 #[test]
-#[should_panic(
-    expected = "Annotation mismatch: annotated as {Int where _ >= 0}, but inferred as Int"
-)]
 fn an_arithmetic_instance_over_two_types() {
     check_scalar(
         indoc! {"
@@ -2788,10 +2778,9 @@ fn an_instance_restating_a_parameter_states_its_history() {
     );
 }
 
-/// A gap the compiler refuses as its own: a refinement in a trait function's signature.
 #[test]
-fn a_refined_trait_signature_is_an_internal_gap() {
-    check_compile_error(
+fn an_instance_meets_its_refined_trait_result() {
+    check_scalar(
         indoc! {"
             type Bag = Int
             trait Container(C):
@@ -2801,6 +2790,57 @@ fn a_refined_trait_signature_is_an_internal_gap() {
                     3
             summon(Container(_))::first(Bag::new(1))
         "},
-        "a refinement in the signature of",
+        Value::Int(3),
+    );
+}
+
+#[test]
+fn refined_trait_inputs_are_instantiated_for_each_type_and_call() {
+    check_scalar(
+        indoc! {r#"
+            trait Same(T):
+                def same(value: {T where _ == _}) => T
+            instance Same(Int):
+                def same(value):
+                    value
+            instance Same(Bool):
+                def same(value):
+                    value
+            first = summon(Same(Int))::same(3)
+            flag = summon(Same(Bool))::same(True)
+            first + summon(Same(Int))::same(4) + (1 if flag else 0)
+        "#},
+        Value::Int(8),
+    );
+}
+
+#[test]
+fn a_trait_call_must_meet_its_refined_input() {
+    check_compile_error(
+        indoc! {r#"
+            trait Positive(T):
+                def value(t: T, n: {Int where _ >= 0}) => Int
+            instance Positive(Bool):
+                def value(t, n):
+                    n
+            summon(Positive(Bool))::value(True, -1)
+        "#},
+        "Type mismatch for Positive::value: expected {Int where _ >= 0}",
+    );
+}
+
+#[test]
+fn an_instance_must_meet_its_refined_trait_result() {
+    check_compile_error(
+        indoc! {r#"
+            type Bag = Int
+            trait Container(C):
+                def first(c: C) => {Int where _ >= 0}
+            instance Container(Bag):
+                def first(c):
+                    -1
+            summon(Container(_))::first(Bag::new(1))
+        "#},
+        "Annotation mismatch: annotated as {Int where _ >= 0}",
     );
 }

@@ -2047,7 +2047,7 @@ mod tests {
                     yield x + n
             add_to"#},
         indoc::indoc! {r#"
-            let add_to : ((_, _) ⇒ _) = λ (xs, n) → let __result_0 = defer
+            let add_to : (((_, _): (_, _)) ⇒ _) = λ (xs, n) → let __result_0 = defer
             in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → feed(__result_0, x + n)); __result_0
             in add_to"#}
     )]
@@ -2073,7 +2073,7 @@ mod tests {
                         yield x + y
             cross"#},
         indoc::indoc! {r#"
-            let cross : ((_, _) ⇒ _) = λ (xs, ys) → let __result_0 = defer
+            let cross : (((_, _): (_, _)) ⇒ _) = λ (xs, ys) → let __result_0 = defer
             in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → ys ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, x + y))); __result_0
             in cross"#}
     )]
@@ -2087,7 +2087,7 @@ mod tests {
                             yield x + y + z
             triple"#},
         indoc::indoc! {r#"
-            let triple : ((_, _, _) ⇒ _) = λ (xs, ys, zs) → let __result_0 = defer
+            let triple : (((_, _, _): (_, _, _)) ⇒ _) = λ (xs, ys, zs) → let __result_0 = defer
             in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → ys ▷ Iterable::elements ▷ unbox ≫ (λ y → zs ▷ Iterable::elements ▷ unbox ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
             in triple"#}
     )]
@@ -2101,7 +2101,7 @@ mod tests {
                             yield y
             cross_filtered"#},
         indoc::indoc! {r#"
-            let cross_filtered : ((_, _) ⇒ _) = λ (xs, ys) → let __result_0 = defer
+            let cross_filtered : (((_, _): (_, _)) ⇒ _) = λ (xs, ys) → let __result_0 = defer
             in xs ▷ Iterable::elements ▷ unbox ≫ (λ x → { x > 0 → ys ▷ Iterable::elements ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
             in cross_filtered"#}
     )]

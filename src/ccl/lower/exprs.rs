@@ -886,14 +886,6 @@ pub(super) fn lower_binop(
 /// give `a ** -n` one, the exponent has to carry `{Int | __elem >= 0}` and a program that
 /// cannot show it is rejected where it is written.
 ///
-/// TODO(pow-signature): stated on the exponent rather than in the operator's own signature,
-/// which needs two things this head has neither of. `Check` decides refinements structurally
-/// (`constrain_subtype`'s `SkipSmtScope`), so it cannot discharge `{Int | __elem == 3} <:
-/// {Int | __elem >= 0}` the way inference does through the semantic fallback; an annotation
-/// is narrowed by inference, so `Check` compares the refinement against itself and matches.
-/// And an instance states each operand's type and no predicate over its values, so an
-/// `Exponentiable` row carries a base and no predicate. Fold this back into the signature once
-/// `Check` raises its own queries and a trait row can carry a predicate.
 fn pow_with_checked_exponent(
     base: Expr,
     mut exponent: Expr,

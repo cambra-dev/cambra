@@ -1481,7 +1481,7 @@ pub(super) fn emit_apply<C: Typing>(
 /// argument. Functions are never partially applied, and a tuple passed as one argument does not
 /// spread over a parameter list (`docs/chl-spec.md`, "Parameter lists"). A function known only
 /// once inference solves it fails its application's function edge instead
-/// ([`InferError::CallArity`]'s hint).
+/// as a type mismatch if its parameter count differs.
 fn call_arity(function: &Expr, fn_ty: &Type, list: Option<usize>) -> Result<(), LocatedInferError> {
     if matches!(
         function.node,
@@ -3569,7 +3569,13 @@ pub(super) fn emit_proj<C: Typing>(
                 binder: FunBinder::Whole(b),
                 ..
             } => b.clone(),
-            _ => Name::fresh("__proj"),
+            _ => {
+                debug_assert!(
+                    !crate::ccl::subst::references_enclosing_function(&codomain),
+                    "a projection without a whole-input binder has an independent codomain"
+                );
+                Name::fresh("__proj")
+            }
         };
         if let Some(component) =
             domain.component_type(*k, |j, _| Expr::projection(&binder, &domain, j))

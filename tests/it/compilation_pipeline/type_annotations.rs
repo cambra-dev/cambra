@@ -69,17 +69,27 @@ fn dependent_parameters_take_their_arguments(#[case] call: &str) {
         f(n, n + 4)
     g(1)
 "#}, "expected {Int where _ >= n}, found Int")]
-#[case::a_higher_order_call(indoc! {r#"
-    def apply(h, x, y):
-        h(x, y)
-    apply(f, 1, 5)
-"#}, "expected {Int where _ >= x}, found {Int where _ == 5}")]
+
 fn dependent_parameters_refuse_an_unbounded_argument(#[case] call: &str, #[case] needle: &str) {
     let definition = indoc! {r#"
         def f(a: Int, b: {Int where _ >= a}):
             b
     "#};
     check_compile_error(&format!("{definition}{call}"), needle);
+}
+
+#[test]
+fn an_unsolved_higher_order_callee_takes_its_arguments_whole() {
+    check_compile_error(
+        indoc! {r#"
+        def f(a: Int, b: {Int where _ >= a}):
+            b
+        def apply(h, x, y):
+            h(x, y)
+        apply(f, 1, 5)
+    "#},
+        "expected {Int where _ >= x}, found {Int where _ == 5}",
+    );
 }
 
 /// A tuple passed to a function of a parameter list is one argument, which a list of two does not
@@ -94,6 +104,43 @@ fn dependent_parameters_take_no_tuple() {
             f(pair)
         "#},
         "`f` takes 2 arguments, got 1",
+    );
+}
+
+#[test]
+fn a_late_callee_still_checks_parameter_count() {
+    check_compile_error(
+        indoc! {r#"
+        def inc(x: Int) => Int:
+            x + 1
+        def apply2(h, x):
+            h(x, 1)
+        apply2(inc, 5)
+    "#},
+        "Type mismatch",
+    );
+}
+
+#[test]
+fn a_single_parameter_list_uses_no_comma() {
+    check_compile_error(
+        indoc! {r#"
+            f: (Int,) => Int = \x -> x
+            f(1)
+        "#},
+        "a one-parameter type is A => C",
+    );
+}
+
+#[test]
+fn parameters_in_one_signature_have_distinct_names() {
+    check_compile_error(
+        indoc! {r#"
+        def f(a: Int, a: Int):
+            a
+        f(1, 2)
+    "#},
+        "parameter `a` is declared twice",
     );
 }
 

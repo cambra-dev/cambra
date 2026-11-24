@@ -2698,7 +2698,7 @@ impl Subst {
     /// A type binder's scope can nest inside a type binding the same name: a chain's type
     /// holds its earlier morphisms, whose types bind the name lambda elimination gave every
     /// morphism it built from one lambda. The assertion is made for the entries that act inside
-    /// the binder's scope ([`Self::under_binder_ty`], and the dependent-tuple arms), where a
+    /// the binder's scope ([`Self::under_binders_ty`], and the dependent-tuple arms), where a
     /// collision would capture.
     fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
@@ -3057,7 +3057,7 @@ impl Subst {
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
             Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(|t| self.apply_type(t)).collect()),
             // Each component under the names of the components before it, as a codomain is under
-            // its function's binder ([`Self::under_binder_ty`]): restricted to the entries that
+            // its function's binder ([`Self::under_binders_ty`]): restricted to the entries that
             // act on it, so a range naming an earlier component captures only where the
             // substitution reaches inside.
             Type::DepTuple(cs) => {
@@ -3078,7 +3078,7 @@ impl Subst {
                 Type::DepTuple(out)
             }
             // The body under every binder's name, as a codomain is under its function's
-            // ([`Self::under_binder_ty`]).
+            // ([`Self::under_binders_ty`]).
             Type::Family { binders, body } => {
                 let names: Vec<Name> = binders.iter().filter_map(|(n, _)| n.clone()).collect();
                 let restricted = names

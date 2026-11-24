@@ -151,6 +151,15 @@ pub(super) fn lower_params(
     body_expr: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    let mut names = HashSet::new();
+    for param in params {
+        if !names.insert(&param.name) {
+            return Err(LoweringError::unsupported(
+                param.name_span,
+                format!("parameter `{}` is declared twice", param.name),
+            ));
+        }
+    }
     let mut bindings = Vec::with_capacity(params.len());
     for param in params {
         let mut binding = crate::ccl::TypedBinding::new_unannotated(
@@ -836,7 +845,7 @@ mod tests {
                 x + y
             add"#},
         indoc::indoc! {r#"
-            let add : ((_, _) ⇒ _) = λ (x, y) → x + y
+            let add : (((_, _): (_, _)) ⇒ _) = λ (x, y) → x + y
             in add"#}
     )]
     fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {

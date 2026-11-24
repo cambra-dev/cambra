@@ -424,6 +424,10 @@ whose component `𝑘` reads the components before it. The body sees each parame
 and so does the function type: one parameter is its whole input (`FunBinder::Whole`), and any
 other number is a list binding each component by one name (`FunBinder::Parameters`).
 
+At a call whose callee is unresolved, dependent parameters are not yet known, so inference takes
+its arguments whole. Such a higher-order call can reject valid dependent arguments. A written
+function type on the higher-order parameter supplies the dependence before that call is emitted.
+
 A function type's binder names the input in one of three ways: not at all, its one parameter by
 one name (`(x: A) => B`), or a parameter list, each parameter by one name (`(a: A, b: B) => C`). A
 closed codomain reads a whole input as `PiRef { component: None }`; a projection of it and a

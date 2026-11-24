@@ -1413,7 +1413,6 @@ impl FunBinder {
     pub fn spelled(&self) -> Option<String> {
         match self {
             FunBinder::None => None,
-            FunBinder::Parameters(names) if names.iter().all(Option::is_none) => None,
             FunBinder::Whole(n) => Some(n.to_string()),
             FunBinder::Parameters(names) => {
                 let spelled: Vec<_> = names
@@ -3972,7 +3971,10 @@ impl Type {
     /// references closed into indices, where the codomain reads it, and unnamed otherwise
     /// ([`Type::fun_over`] for any [`FunBinder`]; [`FunBinder::unread`]).
     pub fn fun_binding(binder: FunBinder, domain: Self, codomain: Self, fun_kind: FunKind) -> Self {
-        let binder = if crate::ccl::subst::binder_reads(&binder, &codomain) {
+        let binder = if crate::ccl::subst::binder_reads(&binder, &codomain)
+            || (binder.parameter_count().is_some()
+                && matches!(domain.peel_refinements(), Type::DepTuple(_)))
+        {
             binder
         } else {
             binder.unread()

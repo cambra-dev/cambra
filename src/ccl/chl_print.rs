@@ -1506,7 +1506,6 @@ mod tests {
             ty.without_pi_names().to_string(),
             "{printed} lowers to the type it was printed from",
         );
-        // The debug rendering writes a parameter list naming nothing as a tuple domain.
         let parameters = |t: &Type| {
             let t = match t {
                 Type::Poly(p) => &p.body,
@@ -1618,6 +1617,18 @@ mod tests {
             elem(),
             BinOpKind::Compare(CompareKind::GreaterOrEq),
             TypedExpr::var(lo.clone()).with_ty(int()),
+        );
+        let independent = Type::fun_of_params(
+            vec![
+                (lo.clone(), int()),
+                (x.clone(), refined(at_least_lo.clone())),
+            ],
+            int(),
+            FunKind::Compute,
+        );
+        assert_eq!(
+            chl_type(&independent),
+            "(lo: Int, x: {Int where _ >= lo}) => Int"
         );
         let ty = Type::fun_of_params(
             vec![(lo, int()), (x, refined(at_least_lo.clone()))],

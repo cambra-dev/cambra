@@ -790,3 +790,10 @@ to the `try` around it.
   `` `__ok ``: the code after it matches the outcome, and the transaction commits the block's
   writes and sends its outputs only where the outcome is `` `__ok ``
   ([mutability.md](mutability.md#a-block-an-exception-escapes)).
+
+
+### Symbolic parameter lists
+
+A lambda binds a list as `λ (𝑥, 𝑦) → body`, or `λ () → body` for none. `args(𝑎, 𝑏)` passes
+its arguments, and `args()` passes none. A tuple remains one argument. Inlining eliminates
+parameter lists before later phases require single-parameter lambdas.

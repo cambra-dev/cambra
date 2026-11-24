@@ -793,7 +793,7 @@ fn signature_types(
                 ),
             ));
         }
-        inputs.push(signature_input(&annotation.ty, qualified, ctx)?);
+        inputs.push(signature_input(&annotation.ty, ctx)?);
     }
     let Some(output) = output else {
         return Err(LoweringError::unsupported(
@@ -801,7 +801,7 @@ fn signature_types(
             format!("`{qualified}` declares no result type; write `=> T` after its parameters"),
         ));
     };
-    let output = signature_type(output, qualified, ctx)?;
+    let output = lower_type_expr(output, ctx)?;
     Ok((inputs, output))
 }
 
@@ -810,12 +810,9 @@ fn signature_types(
 /// argument, and the function writes it (`docs/chl-spec.md`, "Declaring a trait").
 fn signature_input(
     annotation: &Spanned<ChlExpr>,
-    qualified: &str,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
-    parameter_type(annotation, ctx, |ty, ctx| {
-        signature_type(ty, qualified, ctx)
-    })
+    parameter_type(annotation, ctx, lower_type_expr)
 }
 
 /// The type `annotation` gives a parameter, a `Mut` or `Feed` parameter's history among them,
@@ -845,25 +842,6 @@ fn parameter_type(
         return Ok(Type::feed(Type::Hole, lower(value, ctx)?));
     }
     lower(annotation, ctx)
-}
-
-/// A type a trait's signature states, lowered.
-///
-/// A refinement is refused: every call would share its predicate's term, which inference
-/// types once per use.
-fn signature_type(
-    annotation: &Spanned<ChlExpr>,
-    qualified: &str,
-    ctx: &mut LoweringContext,
-) -> Result<Type, LoweringError> {
-    let ty = lower_type_expr(annotation, ctx)?;
-    if ty.carries_refinement() {
-        return Err(LoweringError::internal(
-            annotation.span,
-            format!("a refinement in the signature of `{qualified}` is not supported yet"),
-        ));
-    }
-    Ok(ty)
 }
 
 /// Declare the instance each `instance` block among the module's top-level `stmts`
@@ -1982,6 +1960,11 @@ fn lower_instance_def(
         .iter()
         .map(|t| replace_params(t, &at_instance))
         .collect();
+    for (parameter, ty) in params.iter().zip(&inputs) {
+        ty.walk_held_terms(&mut |predicate| {
+            ctx.tag_predicate(predicate, parameter.name_span, "lower.instance_signature");
+        });
+    }
     let output_ty = replace_params(&sig.output, &at_instance);
     if params.len() != inputs.len() {
         return Err(LoweringError::unsupported(

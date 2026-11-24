@@ -22,6 +22,8 @@ use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
 use super::compact::{AtomKey, ConsultedNames};
 use crate::ccl::ty::KindPin;
 
+type FunctionHead = (KindPin, Option<usize>);
+
 /// The identity of a use's instantiation, for deciding which uses may share one
 /// monomorphization specialization: its two directed reads, kept apart (see the
 /// module docs for why merging them is wrong).
@@ -69,7 +71,7 @@ struct KeyView {
     /// capabilities at each node, so uses whose functions do different things share none
     /// (`src/ccl/design/type-inference.md`, "Capabilities on every expression"). Compared as a set.
     capabilities: Vec<crate::ccl::capabilities::CapabilitySet>,
-    /// Function contributions, **keyed by kind** so a compute function and a data
+    /// Function contributions, keyed by kind and parameter count so a compute function and a data
     /// collection at one position stay distinguishable rather than one shadowing
     /// the other — exactly as [`history`](Self::history) is keyed by
     /// [`HistoryKind`]. Each maps to `(domain, codomain)`.
@@ -92,7 +94,7 @@ struct KeyView {
     /// `refinements`, compared structurally. Keeping the name would also make the
     /// key sensitive to the solver's per-site fresh dependent-application binders
     /// (`Name::solver_arg`), which would split every use into its own key.
-    fun: BTreeMap<KindPin, (Box<KeyView>, Box<KeyView>)>,
+    fun: BTreeMap<FunctionHead, (Box<KeyView>, Box<KeyView>)>,
     /// Record/tuple fields, unioned. Tuples and records share this representation
     /// keyed by `Index` / `Name`, exactly as `compact_type` normalizes them.
     rec: BTreeMap<FieldKey, KeyView>,
@@ -346,7 +348,7 @@ fn union_map(into: &mut BTreeMap<FieldKey, KeyView>, from: BTreeMap<FieldKey, Ke
 impl fmt::Display for KeyView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts: Vec<String> = self.atoms.iter().map(|a| a.to_type().to_string()).collect();
-        for (kind, (d, c)) in &self.fun {
+        for ((kind, count), (d, c)) in &self.fun {
             let arrow = match kind {
                 KindPin::Data => "⤇",
                 KindPin::Compute => "⇒",
@@ -356,7 +358,8 @@ impl fmt::Display for KeyView {
                 KindPin::Unpinned => "⇒?",
                 KindPin::Plain | KindPin::Sum(_) => "⤇",
             };
-            parts.push(format!("({d} {arrow} {c})"));
+            let count = count.map(|n| format!("/{n}")).unwrap_or_default();
+            parts.push(format!("({d} {arrow}{count} {c})"));
         }
         if !self.rec.is_empty() {
             let mut fields: Vec<String> =
@@ -730,7 +733,10 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // What the function does, resolved, as compaction resolves it.
             let does = capabilities.set();
             let mut acc = KeyView {
-                fun: BTreeMap::from([(key_kind, (Box::new(dom), Box::new(cod)))]),
+                fun: BTreeMap::from([(
+                    (key_kind, binder.parameter_count()),
+                    (Box::new(dom), Box::new(cod)),
+                )]),
                 capabilities: if does.is_empty() {
                     Vec::new()
                 } else {
@@ -977,6 +983,17 @@ mod tests {
 
     fn refined(marker: i64) -> Refinement {
         Refinement::born(Rc::new(TypedExpr::lit(Lit::Int(marker))))
+    }
+
+    #[test]
+    fn a_parameter_list_and_one_tuple_parameter_have_distinct_keys() {
+        let parameters = Type::fun_of_params(
+            vec![("a".into(), int()), ("b".into(), int())],
+            int(),
+            crate::ccl::FunKind::Compute,
+        );
+        let tuple = Type::fun(Type::tuple(vec![int(), int()]), int());
+        assert_ne!(spec_key(&parameters), spec_key(&tuple));
     }
 
     #[test]

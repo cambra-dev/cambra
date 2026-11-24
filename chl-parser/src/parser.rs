@@ -317,65 +317,54 @@ where
             })
             .boxed();
 
-        // Parenthesised expression / tuple / record / generator expression.
+        // Parse each entry once; a named entry distinguishes a parameter list from a tuple.
+        let paren_entry = type_binder.or(bracketed_expr.clone()).boxed();
         let paren_group = just(Token::LParen)
             .ignore_then(choice((
-                // Empty tuple `()`.
                 just(Token::RParen).map_with(|_, e| Spanned::new(e.span(), Expr::Tuple(vec![]))),
-                // Record value `(name=value, …)`.
                 paren_record,
-                // The domain of a dependent function type, `(k: K)`.
-                type_binder
-                    .clone()
-                    .then_ignore(just(Token::RParen))
-                    .map_with(|binder, e| Spanned::new(e.span(), binder.node)),
-                // A function type's parameter list naming some of its parameters,
-                // `(a: A, B, c: C(a))`: entries of a parenthesised list, which lowering reads
-                // only as a function type's domain. A list naming none is a tuple below.
-                type_binder
-                    .clone()
-                    .or(bracketed_expr.clone())
-                    .separated_by(just(Token::Comma))
-                    .at_least(2)
-                    .collect::<Vec<_>>()
-                    .then_ignore(just(Token::RParen))
-                    .try_map(|entries, span| {
-                        if entries
-                            .iter()
-                            .any(|p| matches!(p.node, Expr::TypeBinder { .. }))
-                        {
-                            Ok(Spanned::new(span, Expr::Tuple(entries)))
-                        } else {
-                            Err(Rich::custom(span, "a list naming no parameter"))
-                        }
-                    }),
-                bracketed_expr
+                paren_entry
                     .clone()
                     .then(choice((
-                        // Generator expression `(expr for ...)`.
                         comp_clauses.clone().map(GroupTail::Gen),
-                        // Tuple with trailing comma or more: `(a,)` or `(a, b, ...)`.
                         just(Token::Comma)
-                            .ignore_then(list_elements.clone().or_not())
-                            .map(|rest| GroupTail::Tuple(rest.unwrap_or_default())),
-                        // Plain parenthesised expr.
+                            .ignore_then(
+                                paren_entry
+                                    .separated_by(just(Token::Comma))
+                                    .collect::<Vec<_>>()
+                                    .then(just(Token::Comma).or_not()),
+                            )
+                            .map(|(rest, trailing)| {
+                                let trailing = rest.is_empty() || trailing.is_some();
+                                GroupTail::Tuple(rest, trailing)
+                            }),
                         empty().to(GroupTail::Group),
                     )))
                     .then_ignore(just(Token::RParen))
-                    .map_with(|(first, tail), e| match tail {
-                        GroupTail::Group => first, // re-use sub-expression's span via .node
-                        GroupTail::Tuple(rest) => {
+                    .try_map(|(first, tail), span| match tail {
+                        GroupTail::Group => Ok(first),
+                        GroupTail::Tuple(rest, trailing) => {
                             let mut elts = vec![first];
                             elts.extend(rest);
-                            Spanned::new(e.span(), Expr::Tuple(elts))
+                            if trailing
+                                && elts
+                                    .iter()
+                                    .any(|e| matches!(e.node, Expr::TypeBinder { .. }))
+                            {
+                                return Err(Rich::custom(
+                                    span,
+                                    "a parameter list has no trailing comma",
+                                ));
+                            }
+                            Ok(Spanned::new(span, Expr::Tuple(elts)))
                         }
-                        GroupTail::Gen(clauses) => Spanned::new(
-                            e.span(),
+                        GroupTail::Gen(clauses) => Ok(Spanned::new(
+                            span,
                             Expr::GenExp(Comprehension {
                                 element: Box::new(first),
                                 clauses,
                             }),
-                        ),
+                        )),
                     }),
             )))
             .boxed();
@@ -1363,7 +1352,7 @@ where
 #[derive(Clone)]
 enum GroupTail {
     Group,
-    Tuple(Vec<Spanned<Expr>>),
+    Tuple(Vec<Spanned<Expr>>, bool),
     Gen(Vec<CompClause>),
 }
 
@@ -4515,6 +4504,20 @@ mod tests {
             })
             .collect();
         assert_eq!(named, [Some("a"), None, Some("c")]);
+    }
+
+    #[test]
+    fn deeply_nested_parentheses_parse_each_group_once() {
+        let source = format!("{}1{}", "(".repeat(32), ")".repeat(32));
+        assert!(parse_expr(&source).errors.is_empty());
+    }
+
+    #[test]
+    fn a_named_parameter_list_has_no_trailing_comma() {
+        assert!(!parse_expr("(a: Int,) => Int").errors.is_empty());
+        assert!(!parse_expr("(a: Int, b: Int,) => Int").errors.is_empty());
+        assert!(parse_expr("(1,)").errors.is_empty());
+        assert!(parse_expr("(1, 2,)").errors.is_empty());
     }
 
     /// A function type's parameter list may name its parameters, `(a: A, B, c: C(a))`: a

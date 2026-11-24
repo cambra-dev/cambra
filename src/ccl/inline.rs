@@ -139,6 +139,49 @@ fn reduce_parameter_list_calls_in_types(expr: &mut Expr, memo: &PredMemo) {
     expr.walk_children_mut(|child| reduce_parameter_list_calls_in_types(child, memo));
 }
 
+/// Refuse a parameter-list lambda that has no resolved call to eliminate it.
+pub(crate) fn check_parameter_lists_eliminated(
+    expr: &Expr,
+) -> Result<(), provenance::Located<String>> {
+    fn in_type(ty: &Type, seen: &mut HashSet<usize>) -> Option<provenance::NodeId> {
+        let mut found = None;
+        ty.walk_held_terms(&mut |term| {
+            if found.is_none() && seen.insert(std::rc::Rc::as_ptr(term) as usize) {
+                found = find(term, seen);
+            }
+        });
+        found
+    }
+
+    fn find(expr: &Expr, seen: &mut HashSet<usize>) -> Option<provenance::NodeId> {
+        if let TypedExprNode::Lambda { params, .. } = &expr.node
+            && params.len() != 1
+        {
+            return Some(expr.node_id());
+        }
+        let mut found = None;
+        expr.walk_children(|child| {
+            if found.is_none() {
+                found = find(child, seen);
+            }
+        });
+        expr.walk_type_slots(|ty| {
+            if found.is_none() {
+                found = in_type(ty, seen);
+            }
+        });
+        found
+    }
+    match find(expr, &mut HashSet::new()) {
+        Some(id) => Err(provenance::Located::new(
+            "a function with a parameter list must be called so its parameters can be resolved"
+                .to_string(),
+            id,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Refuse a call whose function the inliner could not resolve, pointing at the call.
 ///
 /// After [`inline_compute_lambdas`], a call to a compute function has a lambda, a projection
@@ -188,7 +231,7 @@ pub(crate) fn check_calls_resolved(expr: &Expr) -> Result<(), provenance::Locate
 /// each use. This pass has no cost model to choose between those tradeoffs; see
 /// `src/ccl/design/optimization.md`, "Collection sharing".
 fn should_inline(bound_ty: &Type) -> bool {
-    match bound_ty {
+    match bound_ty.peel_refinements() {
         Type::Fun { fun_kind, .. } => !matches!(fun_kind, FunKind::Data(..)),
         _ => false,
     }
@@ -1980,6 +2023,28 @@ mod tests {
     use crate::ccl::Occurrence;
     use crate::ccl::ty::FunKind;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
+
+    #[test]
+    fn unresolved_parameter_lists_are_refused_in_values_and_quoted_terms() {
+        let lambda = || {
+            Expr::lambda_of(
+                vec![
+                    TypedBinding::new_unannotated("a", Occurrence::mint()),
+                    TypedBinding::new_unannotated("b", Occurrence::mint()),
+                ],
+                Expr::var("a"),
+            )
+        };
+        let value = Expr::tuple(vec![lambda(), Expr::lit(Lit::Unit)]);
+        assert!(check_parameter_lists_eliminated(&value).is_err());
+        let quoted = Expr::lit(Lit::Unit).with_ty(Type::refined_one(
+            Type::Base(BaseType::Unit),
+            Refinement::born(std::rc::Rc::new(lambda())),
+        ));
+        assert!(check_parameter_lists_eliminated(&quoted).is_err());
+        let single = Expr::lambda("a", Occurrence::mint(), Type::Hole, Expr::var("a"));
+        assert!(check_parameter_lists_eliminated(&single).is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // should_inline predicate
