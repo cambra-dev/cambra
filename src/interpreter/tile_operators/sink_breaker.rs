@@ -163,8 +163,18 @@ impl Breaker for SinkBreaker {
     }
 
     /// Each package's answer is handed, or merged into a `main` output's answer, under the
-    /// hands' lock, so packages of disjoint keys are consumed at once.
+    /// hands' lock, so packages of disjoint keys are consumed at once. A `main` output that hands
+    /// each package's answer runs over a live source, and hands them in queue order.
     fn consumes_concurrently(&self) -> bool {
+        if matches!(
+            *self.hands.lock().unwrap_or_else(PoisonError::into_inner),
+            Hands::Main {
+                each_package: true,
+                ..
+            }
+        ) {
+            return false;
+        }
         let slot = Self::reading(&self.producer);
         slot.as_ref().is_some_and(|producer| has_keys(&**producer))
     }
