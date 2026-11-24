@@ -2222,6 +2222,20 @@ mod tests {
         );
     }
 
+    /// A qualified arm admits its keys under some enclosing paths only, so it drops out, and
+    /// an unqualified arm stays as it is.
+    #[test]
+    fn unqualified_arms_keep_only_the_keys_admitted_under_every_enclosing_path() {
+        let qualified = Predicate::qualified(only(1), Predicate::at_or_below(u(5)));
+        assert_eq!(qualified.unqualified_arms(), Predicate::False);
+        assert_eq!(only(3).unqualified_arms(), only(3));
+        let mixed = only(7).union(&qualified);
+        assert!(mixed.qualifies());
+        let unqualified = mixed.unqualified_arms();
+        assert!(unqualified.contains(&u(7)));
+        assert!(!unqualified.contains(&u(2)));
+    }
+
     #[test]
     fn an_unqualified_predicate_answers_for_the_key_under_every_enclosing_path() {
         let rect = Predicate::at_or_below(u(1));
