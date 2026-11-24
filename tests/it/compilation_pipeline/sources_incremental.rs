@@ -2283,3 +2283,49 @@ fn a_map_of_collections_read_from_a_source_holds_each_collection_under_its_key()
         vec![(Value::Int(0), list.clone()), (Value::Int(7), list)]
     );
 }
+
+/// A map whose values read a second source through the key holds each key's whole collection
+/// at any number of workers and morsel size: the source correlated two levels in is released
+/// beneath particular keys, an element that grows is merged into the one its key holds, and
+/// the map aggregate's finish settles every group.
+#[test]
+fn a_map_of_collections_correlated_two_levels_in_agrees_at_any_concurrency() {
+    let code = indoc! {r#"
+        out = test_sink()
+        out << map([(k, [y + k for y in source2()]) for k in source1()])
+    "#};
+    let run = |dop: usize, morsel: usize| {
+        let mut ctx = GlobalContext::default();
+        let out = ctx.register_test_sink("out");
+        for (name, rows) in [("source1", 6), ("source2", 5)] {
+            let source =
+                TestDataSource::new(name, Type::Base(BaseType::Int), Extent::Base(BaseType::Int));
+            ctx.register_source(source.clone());
+            let data: Vec<(Value, Value)> = (0..rows)
+                .map(|i| (Value::UInt(i as u64), Value::Int((i as i64 * 7) % 13)))
+                .collect();
+            let mut source = source.write().unwrap_or_else(PoisonError::into_inner);
+            source.add_data(&data);
+            source.set_yield_predicate(Predicate::True);
+        }
+        let loaded = LoadedProgram::test(code);
+        let mut program =
+            compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+        cambra::interpreter::dispatcher::run_program_with_workers(&mut program, morsel, dop)
+            .expect("the program runs");
+        out.value().expect("the map is complete")
+    };
+    let whole = run(1, usize::MAX);
+    let Value::Function(rows) = &whole else {
+        panic!("sink rows")
+    };
+    let Value::Function(entries) = rows[0].output.clone() else {
+        panic!("a map")
+    };
+    assert_eq!(entries.len(), 6, "one entry per distinct key: {whole:?}");
+    for dop in [1, 2, 4] {
+        for _ in 0..10 {
+            assert_eq!(run(dop, 1), whole, "{dop} workers, one-row morsels");
+        }
+    }
+}
