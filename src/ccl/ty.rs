@@ -704,14 +704,6 @@ struct FunKindBounds {
     /// Kinds recorded **above** it — what it must satisfy — each with the substitution its
     /// edge was recorded under.
     upper: Vec<(FunKind, crate::ccl::subst::Subst)>,
-    /// The kind this one is a **copy of**, where it was made by instantiating a scheme.
-    ///
-    /// Not a bound, and not a pair of them. Mutual bounds would say the two kinds are equal,
-    /// which recouples the pins that freshening exists to separate — "a pin the definition
-    /// site acquires later must not reach this instantiation" (`copy_var`). What a
-    /// copy shares is *which binder each position is*, not what the kind resolves to, and a
-    /// bound cannot say the first without saying the second.
-    instantiated_from: Option<Rc<FunKindVar>>,
     /// This kind's binder names, one per position, picked where the arity became known.
     ///
     /// Not an `Option` per slot: a name is picked for every position at once, because the
@@ -725,13 +717,20 @@ struct FunKindBounds {
 /// One position per position of each source, so the widths add. An empty list is not width
 /// zero: a kind nothing was built over says nothing about its width, and folding it to `0`
 /// would call every ordinary collection plain.
-fn built_width(solver: &Solver, sources: &[FunKind]) -> Option<usize> {
+fn built_width_seen(
+    solver: &Solver,
+    sources: &[FunKind],
+    seen: &mut std::collections::HashSet<FunKindVarId>,
+) -> Option<usize> {
     if sources.is_empty() {
         return None;
     }
     sources
         .iter()
-        .map(|k| k.arity(solver))
+        .map(|k| match k {
+            FunKind::Var(v) => v.class_pin(solver, seen).arity(),
+            other => other.arity(solver),
+        })
         .try_fold(0, |acc, n| Some(acc + n?))
 }
 
@@ -780,8 +779,10 @@ pub struct FunKindVarFixed {
     /// any run. A run can stamp it data later ([`FunKindVar::stamp_data`]).
     minted: KindPin,
     /// The kind whose binders this one binds, where it binds another's: an extrusion's proxy
-    /// binds its original's ([`FunKindVar::proxy`]), so the function type it stands in, whose
-    /// parts name those binders, stays closed. `None` for a kind naming its own.
+    /// binds its original's ([`FunKindVar::proxy`]), as a type variable's proxy keeps its
+    /// original's telescope. Binder names belong to the function, and a proxy changes only the
+    /// level it is read at, so the function type it stands in, whose parts name those binders,
+    /// stays closed, and nothing crossing the link is renamed. `None` for a kind naming its own.
     binders_of: Option<Rc<FunKindVar>>,
 }
 
@@ -807,24 +808,121 @@ pub(crate) struct FunKindState {
     /// [`FunKindVar::resolved`]'s answer, at the funkind revision it was computed at
     /// ([`Solver::funkind_revision`](crate::ccl::infer::solver::Solver::funkind_revision)).
     resolved_at: crate::ccl::infer::solver::state::Stamped<u64, KindPin>,
-    /// [`FunKindVar::component`]'s answer, at the funkind revision it was computed at. Weak
-    /// references, so a kind does not keep its relations alive through the cache.
-    component_at: crate::ccl::infer::solver::state::Stamped<u64, Rc<KindComponent>>,
-    /// Witness positions in this kind's graph ([`FunKindVar::binder_position`]), at the
-    /// revision of the facts and binder names they read
-    /// ([`Solver::funkind_names_revision`](crate::ccl::infer::solver::Solver::funkind_names_revision)).
-    binder_positions_at: crate::ccl::infer::solver::state::Stamped<
-        (u64, u64),
-        Rc<std::collections::HashMap<WitnessId, usize>>,
-    >,
 }
 
-/// A kind's [`component`](FunKindVar::component): the kinds reached, and their binder names
-/// at the revision they were read at.
-struct KindComponent {
-    ids: std::collections::HashSet<FunKindVarId>,
-    kinds: Vec<std::rc::Weak<FunKindVar>>,
-    binders_at: crate::ccl::infer::solver::state::Stamped<(u64, u64), Vec<WitnessId>>,
+/// The facts a component of related funkind variables shares, held by the solver as classes of
+/// variables rather than on any variable, so a kind names no other kind to share them.
+///
+/// Two equivalences, since a copy shares less than an edge does. A kind edge relates two
+/// spellings of one collection, so the two share what the kind resolves to: the **pin** class
+/// joins its members' points. A copy shares *which binder each position is* and nothing about
+/// what the kind resolves to: a pin the definition site acquires later must not reach the
+/// instantiation (`copy_var`). So the **name** class, over edges and copies, holds the binder
+/// positions and the members whose binders a reference may name.
+#[derive(Default)]
+pub(crate) struct KindClasses {
+    /// Each variable's node in both union-finds.
+    index: std::collections::HashMap<FunKindVarId, usize>,
+    pin_parent: Vec<usize>,
+    pin: Vec<PinFacts>,
+    name_parent: Vec<usize>,
+    names: Vec<NameFacts>,
+}
+
+/// What a pin class's members say the kind is.
+#[derive(Default, Clone)]
+struct PinFacts {
+    /// The join of every point recorded on a member: its construction stamp, a stamp since,
+    /// and each concrete kind an edge relates it to.
+    pin: KindPin,
+    /// The members built over sources, whose widths are read where the class is resolved.
+    built: Vec<Rc<FunKindVar>>,
+}
+
+/// Which binder each name a name class's members have minted is, and the members.
+#[derive(Default, Clone)]
+struct NameFacts {
+    positions: std::collections::HashMap<WitnessId, usize>,
+    members: std::collections::HashSet<FunKindVarId>,
+}
+
+impl KindClasses {
+    /// `var`'s node, made with its construction stamp and its names where it has none yet.
+    fn node(&mut self, var: &FunKindVar, names: &[WitnessId]) -> usize {
+        if let Some(&n) = self.index.get(&var.uid) {
+            return n;
+        }
+        let n = self.pin_parent.len();
+        self.index.insert(var.uid, n);
+        self.pin_parent.push(n);
+        self.pin.push(PinFacts {
+            pin: var.fixed.minted.clone(),
+            built: Vec::new(),
+        });
+        self.name_parent.push(n);
+        self.names.push(NameFacts {
+            positions: names.iter().enumerate().map(|(i, w)| (*w, i)).collect(),
+            members: std::collections::HashSet::from([var.uid]),
+        });
+        n
+    }
+
+    fn find(parent: &[usize], mut n: usize) -> usize {
+        while parent[n] != n {
+            n = parent[n];
+        }
+        n
+    }
+
+    fn pin_root(&self, var: &FunKindVar) -> Option<usize> {
+        self.index
+            .get(&var.uid)
+            .map(|&n| Self::find(&self.pin_parent, n))
+    }
+
+    fn name_root(&self, var: &FunKindVar) -> Option<usize> {
+        self.index
+            .get(&var.uid)
+            .map(|&n| Self::find(&self.name_parent, n))
+    }
+
+    /// Join the pin classes of `a` and `b`, and their name classes.
+    fn relate(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (
+            Self::find(&self.pin_parent, a),
+            Self::find(&self.pin_parent, b),
+        );
+        if ra != rb {
+            self.pin_parent[rb] = ra;
+            let moved = std::mem::take(&mut self.pin[rb]);
+            let into = &mut self.pin[ra];
+            into.pin = into.pin.clone().join(moved.pin);
+            into.built.extend(moved.built);
+        }
+        self.copied(a, b);
+    }
+
+    /// Join the name classes of `a` and `b`.
+    fn copied(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (
+            Self::find(&self.name_parent, a),
+            Self::find(&self.name_parent, b),
+        );
+        if ra != rb {
+            self.name_parent[rb] = ra;
+            let mut moved = std::mem::take(&mut self.names[rb]);
+            let into = &mut self.names[ra];
+            for (w, i) in moved.positions {
+                into.positions.entry(w).or_insert(i);
+            }
+            // The smaller set is the one copied, so a chain of joins copies each member
+            // O(log n) times.
+            if into.members.len() < moved.members.len() {
+                std::mem::swap(&mut into.members, &mut moved.members);
+            }
+            into.members.extend(moved.members);
+        }
+    }
 }
 
 impl FunKindState {
@@ -846,8 +944,6 @@ pub(crate) struct FunKindVarFields {
     pub(crate) level: (),
     pub(crate) bounds: (),
     pub(crate) resolved_at: (),
-    pub(crate) component_at: (),
-    pub(crate) binder_positions_at: (),
 }
 
 impl FunKindVar {
@@ -873,8 +969,6 @@ impl FunKindVar {
         let FunKindState {
             bounds: _,
             resolved_at: _,
-            component_at: _,
-            binder_positions_at: _,
         } = solver.funkind_state(self);
         FunKindVarFields {
             uid: (),
@@ -885,8 +979,6 @@ impl FunKindVar {
             level: (),
             bounds: (),
             resolved_at: (),
-            component_at: (),
-            binder_positions_at: (),
         }
     }
 }
@@ -987,7 +1079,7 @@ impl FunKindVar {
     }
 
     /// Record `k` below (or above) this variable, with no substitution between the two.
-    pub fn record(&self, solver: &mut Solver, k: FunKind, lower: bool) {
+    pub fn record(self: &Rc<Self>, solver: &mut Solver, k: FunKind, lower: bool) {
         self.record_under(solver, k, lower, crate::ccl::subst::Subst::id());
     }
 
@@ -998,7 +1090,7 @@ impl FunKindVar {
     /// the bound's content is ([`Self::lower_edges`]). Deduplicated by the point it denotes
     /// and the substitution, so one edge drawn twice records once.
     pub fn record_under(
-        &self,
+        self: &Rc<Self>,
         solver: &mut Solver,
         k: FunKind,
         lower: bool,
@@ -1007,6 +1099,32 @@ impl FunKindVar {
         // A variable against itself says nothing, and recording it makes every reader walk
         // a cycle to find that out.
         if matches!(&k, FunKind::Var(v) if v.uid == self.uid) {
+            return;
+        }
+        // A kind names nothing deeper than itself, so an edge to a deeper kind is stored on that
+        // kind alone, as a type variable's bound to a shallower variable is.
+        if let FunKind::Var(other) = &k
+            && other.home().is_some()
+            && other.level(solver) > self.level(solver)
+        {
+            // A proxy's own link is that edge. Any other edge to a deeper kind is drawn to that
+            // kind's proxy at this level, which reads what the deeper kind knows on this edge's
+            // side and binds its binders.
+            let proxy_of_other = self
+                .fixed
+                .binders_of
+                .as_ref()
+                .is_some_and(|o| o.uid == other.binders_owner().uid);
+            if !proxy_of_other {
+                let level = self.level(solver);
+                let proxy =
+                    crate::ccl::infer::solver::constrain::proxy_of(solver, other, &[lower], level);
+                self.record_under(solver, FunKind::Var(proxy), lower, subst);
+                return;
+            }
+            // A proxy's link to its original is stored on the original, the deeper end, as an edge
+            // to a shallower variable is: on the side opposite this one's.
+            other.record_under(solver, FunKind::Var(Rc::clone(self)), !lower, subst);
             return;
         }
         let subst = acting_on_kind(solver, &k, &subst);
@@ -1020,7 +1138,38 @@ impl FunKindVar {
         }
         let b = &mut solver.funkind_state_mut(self).bounds;
         let side = if lower { &mut b.lower } else { &mut b.upper };
-        side.push((k, subst));
+        side.push((k.clone(), subst.clone()));
+        crate::ccl::infer::solver::constrain::push_to_kind_proxies(
+            solver,
+            self,
+            crate::ccl::infer::solver::constrain::KindFact::Edge(&k, lower, &subst),
+        );
+        // The two kinds an edge relates are one kind: one pin class and one name class.
+        let mine = self.class_node(solver);
+        match &k {
+            FunKind::Var(other) if other.home().is_some() => {
+                let theirs = other.class_node(solver);
+                solver.kind_classes_mut().relate(mine, theirs);
+            }
+            // A kind no run owns, lowering's mark, is the point it was minted as.
+            concrete => {
+                let point = concrete.resolved_in(solver);
+                let names: Vec<WitnessId> = concrete.witnesses().iter().map(|w| *w.id()).collect();
+                let classes = solver.kind_classes_mut();
+                let root = KindClasses::find(&classes.pin_parent, mine);
+                classes.pin[root].pin = classes.pin[root].pin.clone().join(point);
+                let root = KindClasses::find(&classes.name_parent, mine);
+                for (i, w) in names.into_iter().enumerate() {
+                    classes.names[root].positions.entry(w).or_insert(i);
+                }
+            }
+        }
+    }
+
+    /// This kind's node in the solver's [`KindClasses`], made where it has none yet.
+    fn class_node(&self, solver: &mut Solver) -> usize {
+        let names = self.named_binder_ids(solver);
+        solver.kind_classes_mut().node(self, &names)
     }
 
     /// **What this kind is**, as far as everything recorded says: the join of every point
@@ -1039,52 +1188,47 @@ impl FunKindVar {
     /// funkind variable is written ([`Solver::funkind_revision`](crate::ccl::infer::solver::Solver::funkind_revision)).
     pub fn resolved_in(&self, solver: &Solver) -> KindPin {
         let now = solver.funkind_revision();
-        fn cached(solver: &Solver, v: &FunKindVar, now: u64) -> Option<KindPin> {
-            solver.funkind_state(v).resolved_at.at(&now)
-        }
-        fn go(
-            solver: &Solver,
-            v: &FunKindVar,
-            now: u64,
-            seen: &mut std::collections::HashSet<FunKindVarId>,
-        ) -> KindPin {
-            if !seen.insert(v.uid) {
-                return KindPin::Unpinned;
-            }
-            if let Some(pin) = cached(solver, v, now) {
-                return pin;
-            }
-            let b = v.bounds(solver);
-            // **What a collection is built over says what it is.** It binds one position
-            // per position of each source, so its width is their sum — a sum of that
-            // width, or a plain collection where the sources bind nothing. Answered here
-            // rather than beside this, so "what is this kind" and "how wide is it" cannot
-            // give different answers about one kind.
-            let over = match built_width(solver, &b.built_over) {
-                Some(0) => KindPin::Plain,
-                Some(n) => KindPin::Sum(n),
-                None => KindPin::Unpinned,
-            };
-            b.lower.iter().chain(b.upper.iter()).map(|(k, _)| k).fold(
-                v.fixed.minted.clone().join(b.stamped.clone()).join(over),
-                |acc, k| {
-                    let point = match k {
-                        FunKind::Var(x) => go(solver, x, now, seen),
-                        other => other.resolved_in(solver),
-                    };
-                    acc.join(point)
-                },
-            )
-        }
-        if let Some(pin) = cached(solver, self, now) {
+        if let Some(pin) = solver.funkind_state(self).resolved_at.at(&now) {
             return pin;
         }
-        let pin = go(solver, self, now, &mut std::collections::HashSet::new());
+        let pin = self.class_pin(solver, &mut std::collections::HashSet::new());
         solver
             .funkind_state(self)
             .resolved_at
             .store(now, pin.clone());
         pin
+    }
+
+    /// What this kind's pin class says it is ([`KindClasses`]): the join of the points its
+    /// members recorded, and the width of each member built over sources. `seen` ends a
+    /// collection built over itself through a recurrence.
+    fn class_pin(
+        &self,
+        solver: &Solver,
+        seen: &mut std::collections::HashSet<FunKindVarId>,
+    ) -> KindPin {
+        if !seen.insert(self.uid) {
+            return KindPin::Unpinned;
+        }
+        let over = |solver: &Solver,
+                    k: &FunKindVar,
+                    seen: &mut std::collections::HashSet<FunKindVarId>| {
+            match built_width_seen(solver, &k.bounds(solver).built_over, seen) {
+                Some(0) => KindPin::Plain,
+                Some(n) => KindPin::Sum(n),
+                None => KindPin::Unpinned,
+            }
+        };
+        let classes = solver.kind_classes();
+        let Some(root) = classes.pin_root(self) else {
+            let own = self.stamped(solver);
+            return own.join(over(solver, self, seen));
+        };
+        let facts = classes.pin[root].clone();
+        facts
+            .built
+            .iter()
+            .fold(facts.pin, |acc, k| acc.join(over(solver, k, seen)))
     }
 
     /// [`Self::resolved_in`] outside every typing run, through
@@ -1095,17 +1239,28 @@ impl FunKindVar {
 
     /// Record that this collection is **built over** `src`, ahead of what is already there.
     ///
-    /// See [`built_width`] for how the sources' widths add up to this one's.
+    /// Its width is the sum of the sources' ([`FunKindVar::resolved_in`]).
     ///
     /// Front-first because a sum's positions are ordered — the outermost binds the first
     /// generator — and the caller that has sources to register walks them backwards to nest
     /// its applications. The order is the generator order, not the visit order.
-    pub fn contributes_first(&self, solver: &mut Solver, src: FunKind) {
+    pub fn contributes_first(self: &Rc<Self>, solver: &mut Solver, src: FunKind) {
         solver
             .funkind_state_mut(self)
             .bounds
             .built_over
-            .insert(0, src);
+            .insert(0, src.clone());
+        crate::ccl::infer::solver::constrain::push_to_kind_proxies(
+            solver,
+            self,
+            crate::ccl::infer::solver::constrain::KindFact::BuiltOver(&src),
+        );
+        let node = self.class_node(solver);
+        let classes = solver.kind_classes_mut();
+        let root = KindClasses::find(&classes.pin_parent, node);
+        if !classes.pin[root].built.iter().any(|k| k.uid == self.uid) {
+            classes.pin[root].built.push(Rc::clone(self));
+        }
     }
 
     /// The kinds this one is built over, in generator order.
@@ -1134,6 +1289,7 @@ impl FunKindVar {
             solver
                 .funkind_names_mut(owner)
                 .resize_with(arity, crate::ccl::infer_var::fresh_witness_binder_id);
+            owner.note_names(solver);
         }
         owner.bounds(solver).settled[..arity]
             .iter()
@@ -1155,6 +1311,7 @@ impl FunKindVar {
             solver
                 .funkind_names_mut(owner)
                 .resize_with(position + 1, crate::ccl::infer_var::fresh_witness_binder_id);
+            owner.note_names(solver);
         }
         WitnessId(owner.bounds(solver).settled[position])
     }
@@ -1174,6 +1331,10 @@ impl FunKindVar {
     /// fact that is not an edge, because no `FunKind` spells it.
     pub fn stamp_data(&self, solver: &mut Solver) {
         solver.funkind_state_mut(self).bounds.stamped = KindPin::Data;
+        let node = self.class_node(solver);
+        let classes = solver.kind_classes_mut();
+        let root = KindClasses::find(&classes.pin_parent, node);
+        classes.pin[root].pin = classes.pin[root].pin.clone().join(KindPin::Data);
     }
 
     /// A one-line rendering of everything recorded, for tracing.
@@ -1207,10 +1368,7 @@ impl FunKindVar {
             .map(|b| format!("\u{03c3}@{}", b.0))
             .collect::<Vec<_>>()
             .join(",");
-        let from = match self.instantiated_from(solver) {
-            Some(o) => format!(" from=k{}", o.uid.0),
-            None => String::new(),
-        };
+        let from = String::new();
         format!(
             "k{} stamp={stamped:?} lower=[{}] upper=[{}] over=[{}] arity={:?} binds=[{names}]{from}",
             self.uid.0,
@@ -1275,23 +1433,23 @@ impl FunKindVar {
         b.upper = upper;
     }
 
-    /// Record that this kind is a copy of `original` — see
-    /// [`instantiated_from`](FunKindBounds::instantiated_from).
+    /// Record that this kind is a copy of `original`: the two share which binder each position
+    /// is, and so one name class ([`KindClasses`]), but not what the kind resolves to.
     pub fn copied_from(&self, solver: &mut Solver, original: &Rc<FunKindVar>) {
-        if self
-            .bounds(solver)
-            .instantiated_from
-            .as_ref()
-            .map(|k| k.uid)
-            != Some(original.uid)
-        {
-            solver.funkind_state_mut(self).bounds.instantiated_from = Some(Rc::clone(original));
-        }
+        let mine = self.class_node(solver);
+        let theirs = original.class_node(solver);
+        solver.kind_classes_mut().copied(mine, theirs);
     }
 
-    /// What this kind is a copy of, where it is one.
-    pub fn instantiated_from(&self, solver: &Solver) -> Option<Rc<FunKindVar>> {
-        self.bounds(solver).instantiated_from.clone()
+    /// Record this kind's minted names in its name class, each at its position.
+    fn note_names(&self, solver: &mut Solver) {
+        let names = self.named_binder_ids(solver);
+        let node = self.class_node(solver);
+        let classes = solver.kind_classes_mut();
+        let root = KindClasses::find(&classes.name_parent, node);
+        for (i, w) in names.into_iter().enumerate() {
+            classes.names[root].positions.entry(w).or_insert(i);
+        }
     }
 
     /// Whether a part of a function of this kind can name `w`: one of the kind's own binders,
@@ -1305,114 +1463,37 @@ impl FunKindVar {
     /// it ([`Self::may_bind`]): its position in the sum binding it, since binders correspond
     /// by position across a kind edge.
     pub fn binder_position(&self, solver: &Solver, w: &WitnessId) -> Option<usize> {
-        let now = solver.funkind_names_revision();
-        if let Some(positions) = solver.funkind_state(self).binder_positions_at.at(&now) {
-            return positions.get(w).copied();
-        }
-        fn collect(
-            solver: &Solver,
-            k: &FunKindVar,
-            seen: &mut std::collections::HashSet<FunKindVarId>,
-            positions: &mut std::collections::HashMap<WitnessId, usize>,
-        ) {
-            if !seen.insert(k.uid) {
-                return;
-            }
-            for (index, w) in k.named_binder_ids(solver).into_iter().enumerate() {
-                positions.entry(w).or_insert(index);
-            }
-            let b = k.bounds(solver);
-            for (kind, _) in b.lower.iter().chain(&b.upper) {
-                match kind {
-                    FunKind::Data(Some(ws)) => {
-                        for (index, w) in ws.iter().enumerate() {
-                            positions.entry(*w.id()).or_insert(index);
-                        }
-                    }
-                    FunKind::Var(other) => collect(solver, other, seen, positions),
-                    _ => {}
-                }
-            }
-            if let Some(original) = &b.instantiated_from {
-                collect(solver, original, seen, positions);
-            }
-        }
-        let mut positions = std::collections::HashMap::new();
-        collect(
-            solver,
-            self,
-            &mut std::collections::HashSet::new(),
-            &mut positions,
-        );
-        let result = positions.get(w).copied();
-        solver
-            .funkind_state(self)
-            .binder_positions_at
-            .store(now, Rc::new(positions));
-        result
-    }
-
-    /// **The kinds whose binders [`Self::binder_position`] can place**, this one included: every
-    /// kind reached through kind edges in either direction or through being copied.
-    fn component(self: &Rc<Self>, solver: &Solver) -> Rc<KindComponent> {
-        let now = solver.funkind_revision();
-        if let Some(component) = solver.funkind_state(self).component_at.at(&now) {
-            return component;
-        }
-        let mut reached: Vec<Rc<FunKindVar>> = vec![Rc::clone(self)];
-        let mut seen = std::collections::HashSet::from([self.uid]);
-        let mut next = 0;
-        while let Some(k) = reached.get(next).cloned() {
-            next += 1;
-            let b = k.bounds(solver);
-            let mut related: Vec<Rc<FunKindVar>> = b
-                .lower
+        let classes = solver.kind_classes();
+        match classes.name_root(self) {
+            Some(root) => classes.names[root].positions.get(w).copied(),
+            None => self
+                .named_binder_ids(solver)
                 .iter()
-                .chain(b.upper.iter())
-                .filter_map(|(k, _)| match k {
-                    FunKind::Var(v) => Some(Rc::clone(v)),
-                    _ => None,
-                })
-                .collect();
-            related.extend(k.instantiated_from(solver));
-            for r in related {
-                if seen.insert(r.uid) {
-                    reached.push(r);
-                }
-            }
+                .position(|own| own == w),
         }
-        let component = Rc::new(KindComponent {
-            ids: seen,
-            kinds: reached.iter().map(Rc::downgrade).collect(),
-            binders_at: Default::default(),
-        });
-        solver
-            .funkind_state(self)
-            .component_at
-            .store(now, Rc::clone(&component));
-        component
     }
-
-    /// Whether `other` is in this kind's [`component`](Self::component).
+    /// Whether `other` shares this kind's name class: a kind an edge or a copy relates it to,
+    /// whose binders a reference here may name ([`KindClasses`]).
     pub fn same_component(self: &Rc<Self>, solver: &Solver, other: &Rc<FunKindVar>) -> bool {
-        self.uid == other.uid || self.component(solver).ids.contains(&other.uid)
+        if self.uid == other.uid {
+            return true;
+        }
+        let classes = solver.kind_classes();
+        matches!((classes.name_root(self), classes.name_root(other)), (Some(a), Some(b)) if a == b)
     }
 
-    /// Every binder name minted so far by a kind in this one's [`component`](Self::component).
+    /// Every binder name minted so far by a kind in this one's name class.
     pub fn component_binder_ids(self: &Rc<Self>, solver: &Solver) -> Vec<WitnessId> {
-        let component = self.component(solver);
-        let now = solver.funkind_names_revision();
-        if let Some(ids) = component.binders_at.at(&now) {
-            return ids;
+        let classes = solver.kind_classes();
+        match classes.name_root(self) {
+            Some(root) => {
+                let mut ids: Vec<WitnessId> =
+                    classes.names[root].positions.keys().copied().collect();
+                ids.sort();
+                ids
+            }
+            None => self.named_binder_ids(solver),
         }
-        let ids: Vec<_> = component
-            .kinds
-            .iter()
-            .filter_map(std::rc::Weak::upgrade)
-            .flat_map(|k| k.named_binder_ids(solver))
-            .collect();
-        component.binders_at.store(now, ids.clone());
-        ids
     }
 
     /// What this kind was stamped at construction or since — the one fact no edge spells

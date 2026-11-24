@@ -1792,6 +1792,7 @@ fn attempt_run(
     // obligation, which would leave the sweep's verdict stale.
     #[cfg(debug_assertions)]
     solver::traits::seal_emission(&mut sub_ctx.solver);
+    sub_ctx.solver.proxies.finish_emission();
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding

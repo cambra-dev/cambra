@@ -238,6 +238,12 @@ pub struct Solver {
     pub(crate) read_suspensions: HashMap<InferVarId, Vec<(crate::ccl::subst::Subst, Rc<InferVar>)>>,
     /// What the run records about capabilities beyond each variable's state.
     capability_run: CapabilityRun,
+    /// The classes of funkind variables sharing what they resolve to and which binder each
+    /// position is ([`crate::ccl::ty::KindClasses`]).
+    kind_classes: crate::ccl::ty::KindClasses,
+    /// Each deeper variable's proxies at shallower levels, and the scopes they stand in
+    /// ([`super::proxies::Proxies`]).
+    pub(crate) proxies: super::proxies::Proxies,
     /// How many facts the run has recorded, by what holds them ([`Revisions`]).
     revisions: Revisions,
     /// The memberships recorded on suspensions ([`crate::ccl::infer_var::SuspendedMembership`]).
@@ -322,6 +328,8 @@ impl Solver {
             reading: 0,
             read_suspensions: HashMap::new(),
             capability_run: CapabilityRun::default(),
+            kind_classes: Default::default(),
+            proxies: Default::default(),
             revisions: Revisions::default(),
             suspended_memberships: SuspendedMemberships::default(),
             derivations: Default::default(),
@@ -391,12 +399,6 @@ impl Solver {
         self.revisions.funkind
     }
 
-    /// The revision a funkind variable's binder positions read at: the facts recorded on funkind
-    /// variables, and the binder names they have settled on.
-    pub(crate) fn funkind_names_revision(&self) -> (u64, u64) {
-        (self.revisions.funkind, self.revisions.funkind_names)
-    }
-
     /// The revision a capability variable's resolution reads at: the facts recorded on
     /// capability variables; on funkind variables, since an edge's filter can hold only while
     /// a kind is data ([`crate::ccl::capabilities::Filter`]); on inference variables, since a
@@ -417,6 +419,19 @@ impl Solver {
     /// What the run has recorded about capabilities beyond each variable's state.
     pub(crate) fn capability_run(&self) -> &CapabilityRun {
         &self.capability_run
+    }
+
+    /// The classes of funkind variables ([`crate::ccl::ty::KindClasses`]).
+    pub(crate) fn kind_classes(&self) -> &crate::ccl::ty::KindClasses {
+        &self.kind_classes
+    }
+
+    /// The classes of funkind variables, for recording more: a funkind fact, so the funkind
+    /// revision moves ([`Revisions`]).
+    pub(crate) fn kind_classes_mut(&mut self) -> &mut crate::ccl::ty::KindClasses {
+        self.revisions.funkind += 1;
+        self.revisions.funkind_names += 1;
+        &mut self.kind_classes
     }
 
     /// What the run has recorded about capabilities, for recording more ([`Revisions`]).

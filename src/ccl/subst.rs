@@ -1178,6 +1178,29 @@ impl Subst {
     /// copies — see `solver::scheme::freshen_subst_payloads`, called from `freshen_above`'s
     /// bound-copying arm. Each payload visited gets a new `Rc` ([`Mapping::Discharge`] says
     /// why).
+    /// Replace each term this substitution carries, a discharge's or an elimination's, by what
+    /// `f` makes of it where it makes something. A term `f` leaves keeps its `Rc`, so a mapping
+    /// that changes nothing leaves the substitution's identities as they were.
+    pub(crate) fn replace_discharge_terms(
+        &mut self,
+        f: &mut impl FnMut(&TypedExpr) -> Option<TypedExpr>,
+    ) {
+        for m in self.binders.values_mut() {
+            if let Mapping::Discharge(t) | Mapping::Join(Some(t), _) = m
+                && let Some(term) = f(t)
+            {
+                *t = Rc::new(term);
+            }
+        }
+        for e in &mut self.elims {
+            if let Elim::Top(t) | Elim::Kind(_, t) | Elim::ReadBack(_, t) = e
+                && let Some(term) = f(t)
+            {
+                *t = Rc::new(term);
+            }
+        }
+    }
+
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.binders.values_mut() {
             match m {
@@ -1300,16 +1323,6 @@ impl Subst {
                 t
             },
         )
-    }
-
-    /// Each kind an elimination names, as [`Self::map_witness_half`] passes it to `kind`.
-    pub(crate) fn eliminated_kinds(
-        &self,
-    ) -> impl Iterator<Item = &Rc<crate::ccl::ty::FunKindVar>> + '_ {
-        self.elims.iter().filter_map(|e| match e {
-            Elim::Top(_) | Elim::Map(_) => None,
-            Elim::Kind(k, _) | Elim::ReadBack(k, _) | Elim::Onto(k) => Some(k),
-        })
     }
 
     /// This substitution with its witness half rewritten: every binder, a key or a

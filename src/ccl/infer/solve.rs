@@ -4186,7 +4186,7 @@ pub(super) fn specialize_use(
     // This clone re-mints the `walk_children` domain only: a predicate rides its
     // type slot behind an `Rc` that `Type`'s `Clone` shares.
     // `freshen_expr_type_slots` below re-mints those interiors separately,
-    // through `freshen_refinement_predicate`, and its copies are captured by this
+    // through `transport_refinement`, and its copies are captured by this
     // same recording.
     let mut clone = frame.def.duplicate();
     let mut origins = HashMap::new();

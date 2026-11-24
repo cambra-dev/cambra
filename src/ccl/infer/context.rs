@@ -986,12 +986,7 @@ impl InferCtx {
         // reaching one may catch at any use, so none of its clauses is dead at the definition.
         let mut errors = Vec::new();
         for t in &self.capability_tries {
-            if t.var.reaches(&self.solver, &|solver, v| {
-                v.open_input(solver)
-                    && v.incoming(solver).is_empty()
-                    && v.own(solver).is_empty()
-                    && !v.closed(solver).1
-            }) {
+            if t.var.reaches_open_input(&mut self.solver, true) {
                 continue;
             }
             // A clause catches a type the compiler carries as an exception.
@@ -1665,12 +1660,9 @@ impl InferCtx {
     /// ([`CapabilityVar::open_input`]), with nothing flowing into it at the definition, so a
     /// statement or a block reaching one may do something and is not reported.
     pub(super) fn does_nothing(&mut self) -> Vec<(NodeId, InferError)> {
-        let undetermined = |solver: &Solver, v: &CapabilityVar| {
-            v.open_input(solver) && v.incoming(solver).is_empty() && v.own(solver).is_empty()
-        };
         let mut idle = |var: &CapabilityVar| {
             var.resolved_set(&mut self.solver).causes_nothing()
-                && !var.reaches(&self.solver, &undetermined)
+                && !var.reaches_open_input(&mut self.solver, false)
         };
         let empty: Vec<&(NodeId, Rc<CapabilityVar>)> = self
             .capability_transactions
@@ -2094,6 +2086,9 @@ impl InferCtx {
         let written = self.normalize_written(written);
         let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         var.set_open_input(&mut self.solver, written.open_causes);
+        // The written bound comes before any edge out of the variable, which decides what leaves
+        // against it ([`CapabilityVar::bound_above`]).
+        self.bound_written(&var, &written, Blame::Written(written.at));
         // A parameter a clause names relates both ways with the position: what flows in is
         // what the parameter stands for, and the position holds what it stands for. The items
         // the clause lists beside it are the position's own, so they stay out of it.
@@ -2128,7 +2123,6 @@ impl InferCtx {
                 },
             );
         }
-        self.bound_written(&var, &written, Blame::Written(written.at));
         if written.open_requires || written.open_causes {
             var.mark_hole(&mut self.solver, written.at);
         }
@@ -4849,6 +4843,9 @@ impl Typing for InferCtx {
         // exactly those variables. Restore the level on the way out.
         self.level += 1;
         let r = f(self);
+        // The right-hand side's scope closes, and its variables are generalized at the binding
+        // ([`crate::ccl::infer::solver::proxies`]).
+        self.solver.proxies.close_from(self.level);
         self.level -= 1;
         r
     }

@@ -2396,11 +2396,19 @@ impl Solved for Capabilities {
 #[derive(Default)]
 pub(crate) struct CapabilityState {
     own: BTreeSet<LocatedCapability>,
-    incoming: Vec<(Rc<CapabilityVar>, Filter)>,
-    /// The variables this one flows into, each with the edge's filter: the other end of an
-    /// entry in each one's `incoming`. A copy reads it to keep the edges into variables the
-    /// freshening leaves in place, as a copied inference variable keeps its bounds on them.
-    outgoing: Vec<(Rc<CapabilityVar>, Filter)>,
+    /// The shallower variables flowing into this one, each with the steps between: read where
+    /// this one is resolved ([`relate`]).
+    incoming: Vec<(Rc<CapabilityVar>, Chain)>,
+    /// The variables this one flows into that stand at its level or shallower, each with the
+    /// steps between: what this one holds is pushed there as it arrives ([`relate`]).
+    out: Vec<(Rc<CapabilityVar>, Chain)>,
+    /// What the variables flowing into this one pushed ([`Pushed`]). Only grows.
+    pushed: Vec<Pushed>,
+    /// The positions in `pushed` of the entries under each [`Pushed::bucket`].
+    pushed_buckets: HashMap<u64, Vec<usize>>,
+    /// Each variable with an edge stored on it into this one, which pushes along it ([`relate`]).
+    /// This variable stores no edge from it, so [`CapabilityVar::reaching`] walks back over these.
+    pushed_from: BTreeMap<CapabilityVarId, Rc<CapabilityVar>>,
     /// [`CapabilityVar::resolved`]'s answer, at the revision it was computed at
     /// ([`Solver::capability_revision`]).
     resolved_at: crate::ccl::infer::solver::state::Stamped<
@@ -2416,6 +2424,407 @@ pub(crate) struct CapabilityState {
     hole: Option<chl_parser::ast::Span>,
     /// An effect input supplied at a use. Empty lower bounds do not establish purity.
     open_input: bool,
+}
+
+impl CapabilityState {
+    /// Record `entry` unless an entry that is the same one ([`Pushed::same`]) is recorded;
+    /// whether it was recorded.
+    fn record_pushed(&mut self, entry: Pushed) -> bool {
+        let positions = self.pushed_buckets.entry(entry.bucket()).or_default();
+        if positions.iter().any(|&i| self.pushed[i].same(&entry)) {
+            return false;
+        }
+        positions.push(self.pushed.len());
+        self.pushed.push(entry);
+        true
+    }
+}
+
+/// One edge a pushed capability crossed: the variable it left, whose written bounds stop what
+/// exceeds them, and the edge's filter. Decided where the capability is read, with what is known
+/// then, so pushing decides nothing and what a variable holds only grows.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Step {
+    source: Rc<CapabilityVar>,
+    filter: Filter,
+}
+
+/// The steps between two variables, the first leaving the variable a capability starts at.
+pub(crate) type Chain = Rc<[Step]>;
+
+/// What a variable holds, pushed from a variable flowing into it, or its own: its capabilities,
+/// and what the checks reading the variables upstream ask of them.
+///
+/// Each decision a step makes is made as the step is crossed, so what is pushed forgets the path it
+/// took. Only the decisions that wait on a fact still open ride along, as the steps making them
+/// ([`Guard`]), and are made where the capability is read: whether an edge waiting on a kind holds,
+/// and whether a step admits an exception whose type, or a requirement whose answer, is still open.
+/// Each of those keeps or drops what it decides and rewrites nothing, so a set of them answers as
+/// the steps in order would, and two paths through the same open steps push one entry.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Pushed {
+    Item(LocatedCapability, Guard),
+    /// An open input ([`CapabilityVar::open_input`]), read for whether anything flows into it yet,
+    /// with the steps an ordering input still waits on; `None` once a step carries no effects.
+    Open(Rc<CapabilityVar>, Option<Guard>),
+    /// A variable written as a clause ending in `_` ([`CapabilityVar::mark_hole`]), with what the
+    /// edges crossed discharge.
+    Hole(Rc<CapabilityVar>, BTreeSet<Requirement>),
+}
+
+/// The steps whose decisions a pushed capability still waits on, each once.
+pub(crate) type Guard = Rc<[Step]>;
+
+/// `guard` with `step` added, unless a step equal to it is there.
+fn guarded(guard: &Guard, step: &Step) -> Guard {
+    if guard
+        .iter()
+        .any(|g| g.source.uid == step.source.uid && g.filter == step.filter)
+    {
+        Rc::clone(guard)
+    } else {
+        guard.iter().chain([step]).cloned().collect()
+    }
+}
+
+/// Whether two guards hold the same steps.
+fn same_guard(a: &Guard, b: &Guard) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|x| {
+            b.iter()
+                .any(|y| x.source.uid == y.source.uid && x.filter == y.filter)
+        })
+}
+
+impl Pushed {
+    /// Whether this is the entry `other` is, its guard a set.
+    fn same(&self, other: &Pushed) -> bool {
+        match (self, other) {
+            (Pushed::Item(a, g), Pushed::Item(b, h)) => a == b && a.at == b.at && same_guard(g, h),
+            (Pushed::Open(a, g), Pushed::Open(b, h)) => {
+                a.uid == b.uid
+                    && match (g, h) {
+                        (Some(g), Some(h)) => same_guard(g, h),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (Pushed::Hole(a, d), Pushed::Hole(b, e)) => a.uid == b.uid && d == e,
+            _ => false,
+        }
+    }
+
+    /// A hash of the parts of this entry that [`Self::same`] requires to be equal: equal for two
+    /// entries that are the same one. A guard contributes only its length, since
+    /// [`same_guard`] compares its steps as a set.
+    fn bucket(&self) -> u64 {
+        let mut state = std::hash::DefaultHasher::new();
+        std::mem::discriminant(self).hash(&mut state);
+        match self {
+            Pushed::Item(c, g) => (c, c.at, g.len()).hash(&mut state),
+            Pushed::Open(v, g) => (v.uid, g.as_ref().map(|g| g.len())).hash(&mut state),
+            Pushed::Hole(v, d) => (v.uid, d.len()).hash(&mut state),
+        }
+        state.finish()
+    }
+
+    /// This entry as it arrives at `into` across `chain`, or `None` where a step drops it. A
+    /// capability enters each variable along the way only where it is in that variable's scope
+    /// ([`CapabilityVar::in_scope`]), and one entering a variable shallower than the variable it
+    /// leaves is extruded at the shallower level ([`Self::extruded`]).
+    fn across(&self, solver: &mut Solver, chain: &Chain, into: &CapabilityVar) -> Option<Pushed> {
+        let mut entry = self.clone();
+        for (i, step) in chain.iter().enumerate() {
+            entry = entry.cross(solver, step)?;
+            let receiver = chain.get(i + 1).map_or(into, |next| &*next.source);
+            if let Pushed::Item(capability, _) = &entry
+                && !receiver.in_scope(&capability.item)
+            {
+                return None;
+            }
+            let level = receiver.level(solver);
+            if level < step.source.level(solver) {
+                entry = entry.extruded(solver, level);
+            }
+        }
+        Some(entry)
+    }
+
+    /// This entry as a variable at `level` holds it: a capability with each type it names
+    /// extruded to `level`, as a type flowing into a variable there is
+    /// (`crate::ccl::infer::solver::constrain::extrude`). A guard and a marker are kept as they
+    /// are: each names the step or the variable whose state a check reads, as a guarded bound's
+    /// guard is kept (`src/ccl/design/type-inference.md`, "Capabilities cross levels by push").
+    fn extruded(self, solver: &mut Solver, level: Level) -> Pushed {
+        match self {
+            Pushed::Item(capability, guard) => {
+                let item = crate::ccl::infer::solver::transport::transport_capability(
+                    solver,
+                    &capability.item,
+                    crate::ccl::infer::solver::transport::Side::Pos,
+                    &mut crate::ccl::infer::solver::constrain::Extruding { level },
+                );
+                Pushed::Item(LocatedCapability { item, ..capability }, guard)
+            }
+            entry => entry,
+        }
+    }
+
+    /// This entry past `step`: each decision the step makes now is made, and one waiting on an
+    /// open fact is added to the guard.
+    fn cross(self, solver: &mut Solver, step: &Step) -> Option<Pushed> {
+        match self {
+            Pushed::Item(capability, guard) => {
+                if step.waits(solver, &capability) {
+                    return Some(Pushed::Item(capability, guarded(&guard, step)));
+                }
+                let passed = step.passes(solver, &capability)?;
+                Some(Pushed::Item(passed, guard))
+            }
+            Pushed::Open(var, guard) => {
+                let guard = match guard {
+                    Some(_) if step.filter.of_causes == Some(false) => None,
+                    Some(g) if step.ordering_settled(solver) => Some(g),
+                    Some(g) => Some(guarded(&g, step)),
+                    None => None,
+                };
+                Some(Pushed::Open(var, guard))
+            }
+            Pushed::Hole(var, mut discharged) => {
+                discharged.extend(step.filter.discharges.iter().cloned());
+                Some(Pushed::Hole(var, discharged))
+            }
+        }
+    }
+}
+
+impl Step {
+    /// Whether this step's decision on `capability` waits on a fact still open: an edge waiting on
+    /// a kind not yet settled, or an exception whose type, or an ordering requirement whose answer,
+    /// is still open where a bound, a catch or a stated clause decides it.
+    fn waits(&self, solver: &mut Solver, capability: &LocatedCapability) -> bool {
+        if let Some(kind) = &self.filter.when_data
+            && matches!(kind.resolved_in(solver), crate::ccl::ty::KindPin::Unpinned)
+        {
+            return true;
+        }
+        // A hole takes its bounds where its definition's body closes, after what it holds has
+        // left it, so what leaves it waits on them.
+        if self.source.state(solver).hole.is_some() {
+            return true;
+        }
+        let decides = !self.source.written_uppers(solver).is_empty()
+            || self.filter.catches.is_some()
+            || !self.filter.stated.is_empty()
+            || !self.filter.except.is_empty();
+        match &capability.item {
+            Capability::Causes(Effect::Raise(raised)) => {
+                decides && raised.decided_type(solver).is_none()
+            }
+            Capability::Requires(r) => {
+                (r.ordering().is_some() && decides) || !self.filter.stated.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// `capability` past this step, decided with what is known now, or `None` where it stops:
+    /// the variable it leaves admits it within its written bounds, and the edge's filter, holding,
+    /// passes it, entering where the edge stands.
+    fn passes(
+        &self,
+        solver: &mut Solver,
+        capability: &LocatedCapability,
+    ) -> Option<LocatedCapability> {
+        if !self.filter.holds(solver) {
+            return None;
+        }
+        let written = self.source.written_uppers(solver);
+        if !admitted(solver, &written, capability) {
+            return None;
+        }
+        let passed = self.filter.pass(solver, capability)?;
+        Some(LocatedCapability {
+            at: self.filter.at.or(passed.at),
+            ..passed
+        })
+    }
+
+    /// Whether this step's answer for an ordering input is settled to pass: the edge holds for good
+    /// and the variable it leaves has no bound that could exclude ordering.
+    fn ordering_settled(&self, solver: &mut Solver) -> bool {
+        let holds = match &self.filter.when_data {
+            None => true,
+            Some(kind) => kind.resolved_in(solver).is_data(),
+        };
+        holds && self.source.uppers(solver).is_empty() && self.source.state(solver).hole.is_none()
+    }
+}
+
+/// Whether every step of `guard` passes `capability` now.
+fn guard_passes(solver: &mut Solver, guard: &Guard, capability: &LocatedCapability) -> bool {
+    guard
+        .iter()
+        .all(|step| step.passes(solver, capability).is_some())
+}
+
+/// Record that what `source` holds flows into `target` across `chain`, stored as a type variable's
+/// bound is: on `source` and pushed there now and as it arrives, where `target` stands at its level
+/// or shallower; otherwise on `target`, which reads `source` where it is resolved. A variable
+/// names nothing deeper than itself. A variable a stored edge reads composes with the edges out of
+/// it, as a type variable's lower bound closes against its upper bounds, so what arrives at the
+/// shallower one later reaches each of them.
+pub(crate) fn relate(
+    solver: &mut Solver,
+    source: &Rc<CapabilityVar>,
+    target: &Rc<CapabilityVar>,
+    chain: Chain,
+) {
+    // A worklist: the edges a composition draws are related in turn, as far as they reach.
+    let mut work = vec![(Rc::clone(source), Rc::clone(target), chain)];
+    while let Some((source, target, chain)) = work.pop() {
+        // A chain already passing through `target` past its first step is a cycle, which
+        // relates nothing new.
+        if chain
+            .iter()
+            .skip(1)
+            .any(|step| step.source.uid == target.uid)
+        {
+            continue;
+        }
+        note_try_steps(solver, &chain);
+        if source.level(solver) >= target.level(solver) {
+            if source
+                .state(solver)
+                .out
+                .iter()
+                .any(|(t, c)| t.uid == target.uid && *c == chain)
+            {
+                continue;
+            }
+            source
+                .state_mut(solver)
+                .out
+                .push((Rc::clone(&target), Rc::clone(&chain)));
+            target
+                .state_mut(solver)
+                .pushed_from
+                .entry(source.uid)
+                .or_insert_with(|| Rc::clone(&source));
+            for entry in source.contents(solver) {
+                if let Some(arrived) = entry.across(solver, &chain, &target) {
+                    push_into(solver, &target, arrived);
+                }
+            }
+            for (shallower, before) in source.incoming_chains(solver) {
+                work.push((shallower, Rc::clone(&target), then(&before, &chain)));
+            }
+        } else {
+            if target
+                .state(solver)
+                .incoming
+                .iter()
+                .any(|(s, c)| s.uid == source.uid && *c == chain)
+            {
+                continue;
+            }
+            target
+                .state_mut(solver)
+                .incoming
+                .push((Rc::clone(&source), Rc::clone(&chain)));
+            for (after, next) in target.out_edges(solver) {
+                work.push((Rc::clone(&source), after, then(&chain, &next)));
+            }
+        }
+    }
+}
+
+/// Each step of `chain` leaving a `try` body, an edge out of it, which `partly_caught` reads.
+fn note_try_steps(solver: &mut Solver, chain: &Chain) {
+    for step in chain.iter() {
+        if let Some(catch) = &step.filter.catches
+            && !solver
+                .capability_run()
+                .try_edges
+                .iter()
+                .any(|(c, s)| Rc::ptr_eq(c, catch) && s.uid == step.source.uid)
+        {
+            solver
+                .capability_run_mut()
+                .try_edges
+                .push((Rc::clone(catch), Rc::clone(&step.source)));
+        }
+    }
+}
+
+/// `entry`, arrived at `target`, held there and pushed on along the edges out of it. An entry
+/// already held carries nothing new, which also ends a cycle.
+fn push_into(solver: &mut Solver, target: &Rc<CapabilityVar>, entry: Pushed) {
+    let mut work = vec![(Rc::clone(target), entry)];
+    while let Some((target, entry)) = work.pop() {
+        if !target.state_mut(solver).record_pushed(entry.clone()) {
+            continue;
+        }
+        for (after, chain) in target.out_edges(solver) {
+            if let Some(arrived) = entry.across(solver, &chain, &after) {
+                work.push((after, arrived));
+            }
+        }
+    }
+}
+
+/// The steps of `chain`: each variable it leaves, with the edge's filter.
+pub(crate) fn chain_steps(chain: &Chain) -> Vec<(Rc<CapabilityVar>, Filter)> {
+    chain
+        .iter()
+        .map(|s| (Rc::clone(&s.source), s.filter.clone()))
+        .collect()
+}
+
+/// The chain of `steps`, each a variable left and the edge's filter.
+pub(crate) fn chain_of(steps: Vec<(Rc<CapabilityVar>, Filter)>) -> Chain {
+    steps
+        .into_iter()
+        .map(|(source, filter)| Step { source, filter })
+        .collect()
+}
+
+/// `first`'s steps, then `second`'s.
+fn then(first: &Chain, second: &Chain) -> Chain {
+    first.iter().chain(second.iter()).cloned().collect()
+}
+
+/// `capability` as it arrives across `chain`, or `None` where a step stops it: each variable it
+/// leaves admits it within its written bounds, and each edge's filter, holding, passes it, as
+/// [`CapabilityVar::resolved`] reads a single edge.
+fn across(
+    solver: &mut Solver,
+    chain: &Chain,
+    capability: &LocatedCapability,
+    allows: &dyn Fn(&Filter) -> bool,
+    into: &CapabilityVar,
+) -> Option<LocatedCapability> {
+    let mut capability = capability.clone();
+    for (i, step) in chain.iter().enumerate() {
+        if !allows(&step.filter) || !step.filter.holds(solver) {
+            return None;
+        }
+        let written = step.source.written_uppers(solver);
+        if !admitted(solver, &written, &capability) {
+            return None;
+        }
+        let passed = step.filter.pass(solver, &capability)?;
+        capability = LocatedCapability {
+            at: step.filter.at.or(passed.at),
+            ..passed
+        };
+        // A capability enters a variable only where it is in its scope.
+        let receiver = chain.get(i + 1).map_or(into, |next| &*next.source);
+        if !receiver.in_scope(&capability.item) {
+            return None;
+        }
+    }
+    Some(capability)
 }
 
 /// A set a [`CapabilityVar`] may not exceed, and what a failure reports.
@@ -2576,39 +2985,57 @@ impl CapabilityVar {
         self.state(solver).open_input
     }
 
-    pub(crate) fn set_open_input(&self, solver: &mut Solver, open: bool) {
+    pub(crate) fn set_open_input(self: &Rc<Self>, solver: &mut Solver, open: bool) {
         if self.state(solver).open_input != open {
             self.state_mut(solver).open_input = open;
+            if open {
+                self.push_own(
+                    solver,
+                    Pushed::Open(Rc::clone(self), Some(Rc::from(Vec::new()))),
+                );
+            }
         }
     }
 
     fn has_open_ordering_input(&self, solver: &mut Solver) -> bool {
-        let mut seen = HashSet::new();
-        let mut stack = self.incoming(solver);
-        if self.open_input(solver)
-            && stack.is_empty()
-            && self.state(solver).own.is_empty()
-            && !self.excludes_ordering(solver)
-        {
-            return true;
-        }
-        while let Some((var, filter)) = stack.pop() {
-            if filter.of_causes == Some(false)
-                || !filter.holds(solver)
-                || !seen.insert(var.uid)
-                || var.excludes_ordering(solver)
+        self.open_input(solver) && self.empty(solver) && !self.excludes_ordering(solver)
+            || self.ordering_input_reaching(solver)
+    }
+
+    /// Whether an open input with nothing flowing into it reaches this variable through edges that
+    /// carry effects and hold, leaving no variable that excludes ordering.
+    fn ordering_input_reaching(&self, solver: &mut Solver) -> bool {
+        let passes = |solver: &mut Solver, chain: &Chain| {
+            chain.iter().all(|step| {
+                step.filter.of_causes != Some(false)
+                    && step.filter.holds(solver)
+                    && !step.source.excludes_ordering(solver)
+            })
+        };
+        let guard_holds = |solver: &mut Solver, guard: &Guard| {
+            guard
+                .iter()
+                .all(|step| step.filter.holds(solver) && !step.source.excludes_ordering(solver))
+        };
+        for entry in self.pushed(solver) {
+            if let Pushed::Open(v, Some(guard)) = entry
+                && v.open_input(solver)
+                && v.empty(solver)
+                && guard_holds(solver, &guard)
             {
-                continue;
-            }
-            let incoming = var.incoming(solver);
-            if var.open_input(solver) && incoming.is_empty() && var.state(solver).own.is_empty() {
                 return true;
             }
-            stack.extend(incoming);
+        }
+        for (source, chain) in self.incoming_chains(solver) {
+            if passes(solver, &chain)
+                && (source.open_input(solver) && source.empty(solver)
+                    || source.ordering_input_reaching(solver))
+            {
+                return true;
+            }
         }
         false
     }
-
     pub(crate) fn excludes_ordering(&self, solver: &mut Solver) -> bool {
         self.uppers(solver).iter().any(|upper| {
             upper.of_causes
@@ -2624,51 +3051,67 @@ impl CapabilityVar {
 
     /// Mark this variable as a written function type's whose clause ends in `_`, written at
     /// `at`.
-    pub fn mark_hole(&self, solver: &mut Solver, at: chl_parser::ast::Span) {
-        self.state_mut(solver).hole = Some(at);
+    pub fn mark_hole(self: &Rc<Self>, solver: &mut Solver, at: chl_parser::ast::Span) {
+        if self.state(solver).hole.is_none() {
+            self.state_mut(solver).hole = Some(at);
+            self.push_own(solver, Pushed::Hole(Rc::clone(self), BTreeSet::new()));
+        }
     }
 
-    /// Bound each hole flowing into this variable by this variable's bounds, through the
-    /// edges between: a `_` whose capabilities reach a bounded clause admits only what that
-    /// clause does, besides what an edge on the way discharges, so each use's argument meets
-    /// the bound where it is passed (`docs/chl-spec.md`, "Writing requirements and effects").
+    /// Each variable written as a clause ending in `_` that flows into this one, with the
+    /// requirements every path from it discharges: what each edge on a path discharges, met
+    /// across the paths.
     #[expect(
         clippy::mutable_key_type,
         reason = "a `Requirement` reaches a `Type` only through its trait declaration, and a \
                   trait hashes and orders by its module path and name"
     )]
+    fn holes_reaching(
+        self: &Rc<Self>,
+        solver: &mut Solver,
+    ) -> HashMap<CapabilityVarId, (Rc<CapabilityVar>, BTreeSet<Requirement>)> {
+        let discharged = |chain: &Chain| -> BTreeSet<Requirement> {
+            chain
+                .iter()
+                .flat_map(|step| step.filter.discharges.iter().cloned())
+                .collect()
+        };
+        let mut reached: HashMap<CapabilityVarId, (Rc<CapabilityVar>, BTreeSet<Requirement>)> =
+            HashMap::new();
+        let mut meet = |hole: &Rc<CapabilityVar>, on_path: BTreeSet<Requirement>| match reached
+            .get_mut(&hole.uid)
+        {
+            Some((_, seen)) => *seen = seen.intersection(&on_path).cloned().collect(),
+            None => {
+                reached.insert(hole.uid, (Rc::clone(hole), on_path));
+            }
+        };
+        for entry in self.pushed(solver) {
+            if let Pushed::Hole(hole, below) = entry {
+                meet(&hole, below);
+            }
+        }
+        for (source, chain) in self.incoming_chains(solver) {
+            let on_edge = discharged(&chain);
+            if source.state(solver).hole.is_some() {
+                meet(&source, on_edge.clone());
+            }
+            for (hole, below) in source.holes_reaching(solver).into_values() {
+                meet(&hole, below.union(&on_edge).cloned().collect());
+            }
+        }
+        reached
+    }
+    /// Bound each hole flowing into this variable by this variable's bounds, through the
+    /// edges between: a `_` whose capabilities reach a bounded clause admits only what that
+    /// clause does, besides what an edge on the way discharges, so each use's argument meets
+    /// the bound where it is passed (`docs/chl-spec.md`, "Writing requirements and effects").
     pub fn bound_holes_reaching(self: &Rc<Self>, solver: &mut Solver) {
         let uppers = self.uppers(solver);
         if uppers.is_empty() {
             return;
         }
-        // Each variable reaching this one, with the requirements every path from it discharges.
-        let mut reached: HashMap<CapabilityVarId, (Rc<CapabilityVar>, BTreeSet<Requirement>)> =
-            HashMap::new();
-        let mut stack = vec![(Rc::clone(self), BTreeSet::new())];
-        while let Some((w, discharged)) = stack.pop() {
-            for (source, filter) in w.incoming(solver) {
-                let mut on_path = discharged.clone();
-                on_path.extend(filter.discharges.iter().cloned());
-                let updated = match reached.get_mut(&source.uid) {
-                    Some((_, seen)) => {
-                        let met: BTreeSet<Requirement> =
-                            seen.intersection(&on_path).cloned().collect();
-                        let changed = met.len() < seen.len();
-                        *seen = met.clone();
-                        changed.then_some(met)
-                    }
-                    None => {
-                        reached.insert(source.uid, (Rc::clone(&source), on_path.clone()));
-                        Some(on_path)
-                    }
-                };
-                if let Some(discharged) = updated {
-                    stack.push((source, discharged));
-                }
-            }
-        }
-        for (hole, discharged) in reached.into_values() {
+        for (hole, discharged) in self.holes_reaching(solver).into_values() {
             let Some(at) = hole.state(solver).hole else {
                 continue;
             };
@@ -2711,6 +3154,15 @@ impl CapabilityVar {
     /// Bound this variable by `upper`. A set already bounding it is not recorded again, so
     /// a `def`'s `only` clause and the annotation stamping it report once.
     pub fn bound_above(self: &Rc<Self>, solver: &mut Solver, upper: Upper) {
+        // What leaves a variable is decided against its written bounds as it leaves, so a written
+        // bound comes before any edge out, except on a hole, whose bounds a definition sets when
+        // its body closes and whose edges out wait on them ([`Step::waits`]).
+        debug_assert!(
+            !matches!(upper.blame, Blame::Written(_))
+                || self.state(solver).out.is_empty()
+                || self.state(solver).hole.is_some(),
+            "a written bound recorded on {self:?} after it pushed what it holds"
+        );
         let uppers = &self.state(solver).uppers;
         if uppers.iter().any(|u| {
             u.set == upper.set
@@ -2762,15 +3214,17 @@ impl CapabilityVar {
     }
 
     /// Record `capability` on this variable.
-    pub fn record(&self, solver: &mut Solver, capability: LocatedCapability) {
+    pub fn record(self: &Rc<Self>, solver: &mut Solver, capability: LocatedCapability) {
         debug_assert!(
             self.in_scope(&capability.item),
             "a capability enters only a variable whose telescope binds its named place"
         );
-        self.state_mut(solver).own.insert(capability);
+        if self.state_mut(solver).own.insert(capability.clone()) {
+            self.push_own(solver, Pushed::Item(capability, Rc::from(Vec::new())));
+        }
     }
 
-    /// Record that what `source` holds, through `filter`, is held here too.
+    /// Record that what `source` holds, through `filter`, is held here too ([`relate`]).
     pub fn flows_from(
         self: &Rc<Self>,
         solver: &mut Solver,
@@ -2780,28 +3234,12 @@ impl CapabilityVar {
         if source.uid == self.uid && filter.discharges.is_empty() {
             return;
         }
-        if !self
-            .state(solver)
-            .incoming
-            .iter()
-            .any(|(v, f)| v.uid == source.uid && *f == filter)
-        {
-            if let Some(catch) = &filter.catches {
-                solver
-                    .capability_run_mut()
-                    .try_edges
-                    .push((Rc::clone(catch), Rc::clone(source)));
-            }
-            source
-                .state_mut(solver)
-                .outgoing
-                .push((Rc::clone(self), filter.clone()));
-            self.state_mut(solver)
-                .incoming
-                .push((Rc::clone(source), filter));
-        }
+        let chain: Chain = Rc::from(vec![Step {
+            source: Rc::clone(source),
+            filter,
+        }]);
+        relate(solver, source, self, chain);
     }
-
     /// The capabilities recorded on this variable and on every variable flowing into it, each
     /// through the filters of the path it takes.
     #[expect(
@@ -2866,14 +3304,6 @@ impl CapabilityVar {
         let allows = |filter: &Filter| {
             direction.is_none() || filter.of_causes.is_none() || direction == filter.of_causes
         };
-        let own = |solver: &Solver, v: &CapabilityVar| {
-            v.state(solver)
-                .own
-                .iter()
-                .filter(|c| direction.is_none_or(|d| c.item.of_causes() == d))
-                .cloned()
-                .collect::<BTreeSet<_>>()
-        };
         let now = solver.capability_revision();
         if direction.is_none()
             && stop
@@ -2881,125 +3311,26 @@ impl CapabilityVar {
         {
             return capabilities;
         }
-        // The variables reaching this one, each with the edges into it. A worklist
-        // fixpoint, since edges can form cycles and two paths can filter differently.
-        //
-        // A variable whose resolution is cached at the current count is settled: its stopped
-        // value is what it passes on, so the walk takes it from the cache and does not descend
-        // into what flows into it. Resolving each node of a long spine would otherwise walk
-        // the whole spine below it.
-        let mut nodes: HashMap<CapabilityVarId, Rc<CapabilityVar>> = HashMap::new();
-        let mut settled: HashSet<CapabilityVarId> = HashSet::new();
-        let mut stack: Vec<Rc<CapabilityVar>> = Vec::new();
-        let mut sets: HashMap<CapabilityVarId, BTreeSet<LocatedCapability>> = HashMap::new();
-        sets.insert(self.uid, own(solver, self));
-        for (v, filter) in self.state(solver).incoming.iter() {
-            if allows(filter) {
-                stack.push(Rc::clone(v));
-            }
-        }
-        while let Some(v) = stack.pop() {
-            if v.uid == self.uid || nodes.contains_key(&v.uid) {
-                continue;
-            }
-            if direction.is_none()
-                && let Some(capabilities) = v.state(solver).resolved_at.at(&now)
+        // What is recorded here; what was pushed here, across the steps it crossed; and what
+        // each shallower variable flowing in holds, its stopped value across the steps between.
+        // Every step is decided now, with what is known now.
+        let mut out: BTreeSet<LocatedCapability> = self.state(solver).own.clone();
+        for entry in self.pushed(solver) {
+            if let Pushed::Item(capability, guard) = entry
+                && direction.is_none_or(|d| capability.item.of_causes() == d)
+                && guard_passes(solver, &guard, &capability)
             {
-                sets.insert(v.uid, capabilities);
-                settled.insert(v.uid);
-                nodes.insert(v.uid, v);
-                continue;
+                out.insert(capability);
             }
-            sets.insert(v.uid, own(solver, &v));
-            for (w, filter) in v.state(solver).incoming.iter() {
-                if allows(filter) {
-                    stack.push(Rc::clone(w));
-                }
-            }
-            nodes.insert(v.uid, v);
         }
-        let receiver = |uid: CapabilityVarId| -> &CapabilityVar {
-            if uid == self.uid { self } else { &nodes[&uid] }
-        };
-        // The edges out of each variable reached, into each one not settled: a settled
-        // variable's set is whole.
-        let mut out_edges: HashMap<CapabilityVarId, Vec<(CapabilityVarId, Filter)>> =
-            HashMap::new();
-        for &id in sets.keys() {
-            if settled.contains(&id) {
-                continue;
-            }
-            for (src, filter) in receiver(id).state(solver).incoming.iter() {
-                if allows(filter) {
-                    out_edges
-                        .entry(src.uid)
-                        .or_default()
-                        .push((id, filter.clone()));
+        for (source, chain) in self.incoming_chains(solver) {
+            for capability in source.resolve(solver, direction, true) {
+                if let Some(arrived) = across(solver, &chain, &capability, &allows, self) {
+                    out.insert(arrived);
                 }
             }
         }
-        // A capability crosses an edge by itself, whatever else the source holds, so a
-        // variable passes on only what reached it since it last passed: each capability
-        // crosses each edge once. Every set starts as what its variable has yet to pass.
-        let mut arrived: HashMap<CapabilityVarId, Vec<LocatedCapability>> = sets
-            .iter()
-            .map(|(id, set)| (*id, set.iter().cloned().collect()))
-            .collect();
-        let mut work: Vec<CapabilityVarId> = arrived.keys().copied().collect();
-        let mut queued: HashSet<CapabilityVarId> = work.iter().copied().collect();
-        while let Some(src) = work.pop() {
-            queued.remove(&src);
-            let passing = arrived.remove(&src).unwrap_or_default();
-            let Some(edges) = out_edges.get(&src) else {
-                continue;
-            };
-            // What `src` passes on is its stopped value.
-            let written = receiver(src).written_uppers(solver);
-            for (id, filter) in edges {
-                if !filter.holds(solver) {
-                    continue;
-                }
-                let into_var = receiver(*id);
-                let flowing: Vec<LocatedCapability> = passing
-                    .iter()
-                    .filter_map(|l| {
-                        if admitted(solver, &written, l) {
-                            filter.pass(solver, l)
-                        } else {
-                            None
-                        }
-                    })
-                    .filter(|l| into_var.in_scope(&l.item))
-                    .map(|l| LocatedCapability {
-                        at: filter.at.or(l.at),
-                        ..l
-                    })
-                    .collect();
-                let into = sets.get_mut(id).expect("every reached variable has a set");
-                for l in flowing {
-                    if into.insert(l.clone()) {
-                        arrived.entry(*id).or_default().push(l);
-                        if queued.insert(*id) {
-                            work.push(*id);
-                        }
-                    }
-                }
-            }
-        }
-        let mut out = sets.remove(&self.uid).expect("the variable's own set");
-        // Every variable reached and not settled has its whole set now: every edge into it was
-        // followed. Its stopped value is its resolution, so it is cached as resolving it would.
-        if direction.is_none() {
-            for (id, v) in &nodes {
-                if settled.contains(id) {
-                    continue;
-                }
-                let mut resolved = sets.remove(id).expect("every reached variable has a set");
-                let written = v.written_uppers(solver);
-                resolved.retain(|l| admitted(solver, &written, l));
-                v.state(solver).resolved_at.store(now, resolved);
-            }
-        }
+        out.retain(|c| direction.is_none_or(|d| c.item.of_causes() == d));
         if stop {
             let written = self.written_uppers(solver);
             out.retain(|l| admitted(solver, &written, l));
@@ -3009,7 +3340,6 @@ impl CapabilityVar {
         }
         out
     }
-
     /// The bounds a written function type puts on this variable, the only bounds that stop
     /// what exceeds them.
     ///
@@ -3048,24 +3378,37 @@ impl CapabilityVar {
             .collect()
     }
 
-    /// This variable and every variable flowing into it, through edges whose filters hold
-    /// or do not.
+    /// This variable and every variable at its level or shallower flowing into it, through edges
+    /// whose filters hold or do not: a walk back over each variable's push sources
+    /// (`pushed_from`) and the shallower variables it reads (`incoming`). A type at this
+    /// variable's level names no deeper variable, so no reader of the set can meet one, but the
+    /// walk passes through deeper variables to the shallower ones beyond them.
     pub fn reaching(
         self: &Rc<Self>,
         solver: &Solver,
     ) -> BTreeMap<CapabilityVarId, Rc<CapabilityVar>> {
+        let level = self.level(solver);
+        let mut seen = HashSet::new();
         let mut out = BTreeMap::new();
-        let mut stack = vec![Rc::clone(self)];
-        while let Some(v) = stack.pop() {
-            if out.contains_key(&v.uid) {
+        let mut work = vec![Rc::clone(self)];
+        while let Some(v) = work.pop() {
+            if !seen.insert(v.uid) {
                 continue;
             }
-            stack.extend(v.incoming(solver).into_iter().map(|(w, _)| w));
-            out.insert(v.uid, v);
+            let state = v.state(solver);
+            work.extend(state.pushed_from.values().cloned());
+            work.extend(state.incoming.iter().map(|(source, _)| Rc::clone(source)));
+            if v.level(solver) <= level {
+                out.insert(v.uid, v);
+            }
         }
         out
     }
 
+    /// The variables with an edge stored on them into this one ([`relate`]).
+    pub(crate) fn pushed_from(&self, solver: &Solver) -> Vec<Rc<CapabilityVar>> {
+        self.state(solver).pushed_from.values().cloned().collect()
+    }
     /// Whether an upper bound closes the requirements, and the effects, this variable
     /// holds: a written clause without `_` states them exactly.
     pub fn closed(&self, solver: &Solver) -> (bool, bool) {
@@ -3076,27 +3419,29 @@ impl CapabilityVar {
         )
     }
 
-    /// Whether `pred` holds of this variable or of any variable flowing into it.
-    pub fn reaches(&self, solver: &Solver, pred: &dyn Fn(&Solver, &CapabilityVar) -> bool) -> bool {
-        let mut seen = HashSet::new();
-        let mut stack: Vec<Rc<CapabilityVar>> =
-            self.incoming(solver).into_iter().map(|(v, _)| v).collect();
-        if pred(solver, self) {
+    /// Whether an open input with nothing flowing into it reaches this variable, by any edge
+    /// whatever it filters: a call of a function only each use of the definition determines
+    /// (`CapabilityVar::open_input`). With `unclosed`, only one whose effects no written clause
+    /// closes counts. Each open input reaching this one was pushed here as a marker, or reaches a
+    /// shallower variable flowing in.
+    pub(crate) fn reaches_open_input(&self, solver: &mut Solver, unclosed: bool) -> bool {
+        let open = |solver: &Solver, v: &CapabilityVar| {
+            v.open_input(solver) && v.empty(solver) && (!unclosed || !v.closed(solver).1)
+        };
+        if open(solver, self) {
             return true;
         }
-        seen.insert(self.uid);
-        while let Some(v) = stack.pop() {
-            if !seen.insert(v.uid) {
-                continue;
-            }
-            if pred(solver, &v) {
-                return true;
-            }
-            stack.extend(v.incoming(solver).into_iter().map(|(w, _)| w));
+        if self
+            .pushed(solver)
+            .iter()
+            .any(|e| matches!(e, Pushed::Open(v, _) if open(solver, v)))
+        {
+            return true;
         }
-        false
+        self.incoming_chains(solver)
+            .iter()
+            .any(|(source, _)| source.reaches_open_input(solver, unclosed))
     }
-
     /// The capabilities recorded on this variable itself, without what flows in.
     #[expect(
         clippy::mutable_key_type,
@@ -3107,15 +3452,99 @@ impl CapabilityVar {
         self.state(solver).own.clone()
     }
 
-    /// The edges into this variable.
-    pub fn incoming(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Filter)> {
+    /// The shallower variables flowing into this one, each with the steps between ([`relate`]).
+    pub(crate) fn incoming_chains(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Chain)> {
         self.state(solver).incoming.clone()
     }
 
-    /// The variables this one flows into, each with the edge's filter
-    /// ([`CapabilityState`]'s `outgoing`).
-    pub fn outgoing(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Filter)> {
-        self.state(solver).outgoing.clone()
+    /// The variables this one pushes to, each with the steps between ([`relate`]).
+    pub(crate) fn out_edges(&self, solver: &Solver) -> Vec<(Rc<CapabilityVar>, Chain)> {
+        self.state(solver).out.clone()
+    }
+
+    /// What the variables flowing into this one pushed.
+    pub(crate) fn pushed(&self, solver: &Solver) -> Vec<Pushed> {
+        self.state(solver).pushed.clone()
+    }
+
+    /// Carry to this copy the edges its original stores, the variables pushing into the original
+    /// and what they pushed, each already freshened: a copy carries its original's stored state,
+    /// as a type variable's copy carries its bounds, so nothing is pushed again and nothing is
+    /// recorded on the variable at an edge's other end (`crate::ccl::infer::solver::scheme`).
+    pub(crate) fn carry_copied(
+        &self,
+        solver: &mut Solver,
+        incoming: Vec<(Rc<CapabilityVar>, Chain)>,
+        out: Vec<(Rc<CapabilityVar>, Chain)>,
+        pushed_from: Vec<Rc<CapabilityVar>>,
+        pushed: Vec<Pushed>,
+    ) {
+        for (_, chain) in incoming.iter().chain(out.iter()) {
+            note_try_steps(solver, chain);
+        }
+        let state = self.state_mut(solver);
+        for (source, chain) in incoming {
+            if !state
+                .incoming
+                .iter()
+                .any(|(s, c)| s.uid == source.uid && *c == chain)
+            {
+                state.incoming.push((source, chain));
+            }
+        }
+        for (sink, chain) in out {
+            if !state
+                .out
+                .iter()
+                .any(|(t, c)| t.uid == sink.uid && *c == chain)
+            {
+                state.out.push((sink, chain));
+            }
+        }
+        for source in pushed_from {
+            state.pushed_from.entry(source.uid).or_insert(source);
+        }
+        for entry in pushed {
+            state.record_pushed(entry);
+        }
+    }
+
+    /// What this variable pushes along an edge out of it: its own capabilities and markers, and
+    /// what was pushed into it.
+    fn contents(self: &Rc<Self>, solver: &Solver) -> Vec<Pushed> {
+        let state = self.state(solver);
+        let none: Guard = Rc::from(Vec::new());
+        let mut out: Vec<Pushed> = state
+            .own
+            .iter()
+            .map(|c| Pushed::Item(c.clone(), Rc::clone(&none)))
+            .collect();
+        if state.open_input {
+            out.push(Pushed::Open(Rc::clone(self), Some(Rc::clone(&none))));
+        }
+        if state.hole.is_some() {
+            out.push(Pushed::Hole(Rc::clone(self), BTreeSet::new()));
+        }
+        out.extend(state.pushed.iter().cloned());
+        out
+    }
+
+    /// Push `entry`, starting here, along every edge out of this variable.
+    fn push_own(self: &Rc<Self>, solver: &mut Solver, entry: Pushed) {
+        for (target, chain) in self.out_edges(solver) {
+            if let Some(arrived) = entry.across(solver, &chain, &target) {
+                push_into(solver, &target, arrived);
+            }
+        }
+    }
+
+    /// Whether nothing flows into this variable or is recorded on it.
+    fn empty(&self, solver: &Solver) -> bool {
+        let state = self.state(solver);
+        state.incoming.is_empty()
+            && state.pushed_from.is_empty()
+            && state.own.is_empty()
+            && state.pushed.is_empty()
     }
 }
 
@@ -3987,14 +4416,11 @@ mod tests {
         let scope = Telescope::empty().extended(Name::from("x"));
         let bounded = CapabilityVar::fresh(solver, 0, &scope);
         let downstream = CapabilityVar::fresh(solver, 0, &scope);
-        downstream.flows_from(solver, &bounded, Filter::default());
         let appended = LocatedCapability {
             item: write("x"),
             at: None,
         };
-        bounded.record(solver, appended.clone());
-        assert!(downstream.resolved(solver).contains(&appended));
-
+        // A written bound is recorded where its variable is made, before any edge out of it.
         bounded.bound_above(
             solver,
             Upper {
@@ -4005,6 +4431,8 @@ mod tests {
                 blame: Blame::Written(chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0)),
             },
         );
+        downstream.flows_from(solver, &bounded, Filter::default());
+        bounded.record(solver, appended.clone());
         assert!(bounded.resolved(solver).is_empty());
         assert!(downstream.resolved(solver).is_empty());
         let exceeded = exceeded_uppers(solver);
@@ -4041,6 +4469,35 @@ mod tests {
 
         input.set_open_input(solver, true);
         assert!(union.set_in(solver).requires.contains(&order));
+    }
+
+    /// `reaching` names no variable deeper than the variable read: a deeper variable stands at no
+    /// position of a type at its level.
+    #[test]
+    fn reaching_names_no_deeper_variable() {
+        let solver = &mut Solver::new();
+        let read = CapabilityVar::fresh(solver, 0, &Telescope::empty());
+        let deeper = CapabilityVar::fresh(solver, 1, &Telescope::empty());
+        let beside = CapabilityVar::fresh(solver, 0, &Telescope::empty());
+        read.flows_from(solver, &deeper, Filter::default());
+        read.flows_from(solver, &beside, Filter::default());
+        let reaching = read.reaching(solver);
+        assert!(reaching.contains_key(&beside.uid));
+        assert!(!reaching.contains_key(&deeper.uid));
+    }
+
+    /// `reaching` walks through a shallower variable to a variable at the reader's level beyond it.
+    #[test]
+    fn reaching_passes_through_a_shallower_variable() {
+        let solver = &mut Solver::new();
+        let read = CapabilityVar::fresh(solver, 1, &Telescope::empty());
+        let shallower = CapabilityVar::fresh(solver, 0, &Telescope::empty());
+        let beyond = CapabilityVar::fresh(solver, 1, &Telescope::empty());
+        shallower.flows_from(solver, &beyond, Filter::default());
+        read.flows_from(solver, &shallower, Filter::default());
+        let reaching = read.reaching(solver);
+        assert!(reaching.contains_key(&shallower.uid));
+        assert!(reaching.contains_key(&beyond.uid));
     }
 
     /// A capability variable's resolution reads the funkind variable an edge's filter waits on,
