@@ -5,8 +5,8 @@ A projection names the part of a producer's tile a pull asks for
 name keys at any collection level, each under the path of keys above it, and the guard differences
 they need. A producer declares the levels whose keys it restates (`TileProducer::restates`, a
 `Restates`), the outermost keys only by default, and one that declares more reads its projection
-with `TileGuard::projection_for`. The `get` wrapper of a debug build panics on a pull at a level a
-producer does not restate.
+with `TileGuard::projection_for`. The `get` wrapper answers a pull at a level a producer does not
+restate by pulling the nearest level above that it restates and cutting the answer.
 
 ## Representation
 
