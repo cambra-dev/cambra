@@ -709,6 +709,23 @@ fn a_message_names_the_parameters_a_type_reads() {
     g: (p: {(a: Int), (b: {Int where _ >= a})}) => {Int where _ >= p.0} = h
     g((1, 5))
 "#}, 5)]
+#[case::named_refined_values(indoc! {r#"
+    lo = 1
+    hi = lo ^+ 4
+    p: {(a: Int), (b: {Int where _ >= a})} = (lo, hi)
+    p.1
+"#}, 5)]
+#[case::a_mutable_snapshot(indoc! {r#"
+    x := 1
+    p: {(a: Int), (b: {Int where _ >= a})} = (x, x ^+ 1)
+    p.1
+"#}, 2)]
+#[case::an_unannotated_projection_function(indoc! {r#"
+    def second(p):
+        p.1
+    t: {(a: Int), (b: {Int where _ >= a})} = (1, 5)
+    second(t)
+"#}, 5)]
 fn a_written_dependent_tuple(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
@@ -729,6 +746,20 @@ fn a_value_outside_a_written_dependent_tuple_is_refused(#[case] code: &str) {
     check_compile_error(code, "annotated as {(a: Int), {Int where _ >= a}}");
 }
 
+#[test]
+fn an_annotated_higher_order_callee_accepts_the_dependent_arguments() {
+    check_scalar(
+        indoc! {r#"
+        def f(a: Int, b: {Int where _ >= a}):
+            b
+        def apply(fn: (a: Int, b: {Int where _ >= a}) => Int, x: Int, y: {Int where _ >= x}):
+            fn(x, y)
+        apply(f, 1, 5)
+    "#},
+        Value::Int(5),
+    );
+}
+
 /// An argument outside a type that reads an earlier parameter is refused at the call, the
 /// earlier argument in the parameter's place.
 #[rstest]
@@ -738,8 +769,8 @@ fn a_value_outside_a_written_dependent_tuple_is_refused(#[case] code: &str) {
     f(pair.0, pair.1)
 "#})]
 #[case::higher_order(indoc! {r#"
-    def apply(fn, a, b):
-        fn(a, b)
+    def apply(fn: (a: Int, b: {Int where _ >= a}) => Int, x: Int, y: {Int where _ >= x}):
+        fn(x, y)
     apply(f, 5, 1)
 "#})]
 fn an_argument_outside_a_type_reading_an_earlier_parameter_is_refused(#[case] call: &str) {
