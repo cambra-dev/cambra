@@ -1286,8 +1286,30 @@ impl Tile {
                     return TileGuard::Function(FunctionGuard::Domain(Predicate::True));
                 }
                 if !codomain.holds_a_level() {
+                    // The guard is the held keys' points joined with the statement. A held key
+                    // the statement already covers adds nothing, and for record keys the union
+                    // compares the points pairwise, so naming every covered key is quadratic.
+                    // A point names its key under every enclosing path, and `contains` reads a
+                    // key alone, so only the statement's unqualified arms are read here. A key
+                    // only qualified arms cover keeps its point, which the union subsumes.
+                    let unqualified = domain_predicate.unqualified_arms();
+                    let held = match unqualified.is_false() {
+                        true => Predicate::from_column_value(domain),
+                        false => {
+                            let uncovered: Vec<usize> = (0..domain.len())
+                                .filter(|&key| !unqualified.contains(&domain.index_at(key)))
+                                .collect();
+                            match uncovered.len() {
+                                0 => Predicate::False,
+                                all if all == domain.len() => Predicate::from_column_value(domain),
+                                some => Predicate::from_column_value(
+                                    &domain.select_indices(uncovered.into_iter(), some),
+                                ),
+                            }
+                        }
+                    };
                     return TileGuard::Function(FunctionGuard::Domain(
-                        Predicate::from_column_value(domain).union(domain_predicate),
+                        held.union(domain_predicate),
                     ));
                 }
                 // The region the statement makes releasable, where the held keys form a prefix
@@ -6352,6 +6374,24 @@ mod tests {
             tile.to_guard(),
             TileGuard::Function(FunctionGuard::Domain(pred))
         );
+    }
+
+    /// A one-level guard names every held key, whether or not the statement covers it, and
+    /// nothing else held.
+    #[test]
+    fn to_guard_one_level_names_the_held_keys_the_statement_leaves_out() {
+        let ints = |keys: Vec<i64>| Predicate::from_column_value(&ColumnValue::Ints(keys));
+        for statement in [Predicate::False, ints(vec![2]), ints(vec![2, 7])] {
+            let tile = fn_int(vec![1, 2, 3], vec![10, 20, 30], statement.clone());
+            let TileGuard::Function(FunctionGuard::Domain(named)) = tile.to_guard() else {
+                panic!("a one-level guard is a domain guard")
+            };
+            let expected = ints(vec![1, 2, 3]).union(&statement);
+            assert!(
+                named.subsumes(&expected) && expected.subsumes(&named),
+                "the guard of {statement:?} names {named:?}, not {expected:?}"
+            );
+        }
     }
 
     /// A single open group holds a prefix of itself, and the guard names it as the path to
