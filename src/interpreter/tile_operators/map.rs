@@ -394,6 +394,7 @@ impl TileOperator for MapResult {
             function: function_producer,
             values_are_keys,
             level: self.level,
+            whole_reads: Some(aligned.whole_reads()),
         })
     }
 
@@ -420,6 +421,10 @@ struct MapResultProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
+    /// The flags of its inputs read whole, which a read clears as it starts
+    /// ([`WholeReads`](crate::interpreter::notifications::WholeReads)); `None` where it reads none.
+    whole_reads: Option<crate::interpreter::notifications::WholeReads>,
+
     /// Whether each of the input's values is its own key: a one-level stream such as an
     /// iteration's positions, which the function is then looked up at.
     values_are_keys: bool,
@@ -872,6 +877,10 @@ impl TileProducer for MapResultProducer {
     }
 
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+        // A read of the inputs read whole starts here, so a delivery after it notifies again.
+        if let Some(reads) = &self.whole_reads {
+            reads.reading();
+        }
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1020,7 +1029,8 @@ impl TileOperator for MapResultToConst {
         // keys, so each input's delta is restated as the pairs it creates with what the other
         // input has delivered (`notifications::Delivered`). At the outermost level the constant
         // replaces the input, and a scalar constant has no keys: its notification widens.
-        let (constant_producer, input_consumer) = match self.level != CurryLevel::OUTERMOST
+        let (constant_producer, input_consumer, whole_reads) = match self.level
+            != CurryLevel::OUTERMOST
             && self.constant.tiling().is_data_function()
         {
             true => {
@@ -1048,7 +1058,7 @@ impl TileOperator for MapResultToConst {
                     delivered,
                     forwarding_consumer_keeping_keys(&shared),
                 );
-                (constant, input)
+                (constant, input, None)
             }
             // Both sides' regions name the result's rows, the constant's widened to every row, and
             // a row exists once both have delivered, so each side's delivery is passed on under
@@ -1074,7 +1084,7 @@ impl TileOperator for MapResultToConst {
                         forwarding_consumer_keeping_keys(&shared),
                     ),
                 );
-                (constant, input)
+                (constant, input, Some(aligned.whole_reads()))
             }
         };
         let input_producer =
@@ -1093,6 +1103,7 @@ impl TileOperator for MapResultToConst {
             constant: constant_producer,
             mode: self.mode,
             level: self.level,
+            whole_reads,
         })
     }
 }
@@ -1104,6 +1115,9 @@ struct MapResultToConstProducer {
     constant: Box<dyn TileProducer>,
     mode: MapResultToConstMode,
     level: CurryLevel,
+    /// The flags of its inputs read whole, which a read clears as it starts
+    /// ([`WholeReads`](crate::interpreter::notifications::WholeReads)); `None` where it reads none.
+    whole_reads: Option<crate::interpreter::notifications::WholeReads>,
 }
 
 impl MapResultToConstProducer {
@@ -1196,6 +1210,10 @@ impl TileProducer for MapResultToConstProducer {
     /// (`an_outermost_constant_answers_only_the_requested_keys`). The constant is read whole:
     /// every row reads all of it.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+        // A read of the inputs read whole starts here, so a delivery after it notifies again.
+        if let Some(reads) = &self.whole_reads {
+            reads.reading();
+        }
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1944,6 +1962,7 @@ mod tests {
             function: Box::new(fn_spy),
             values_are_keys: false,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         (producer, released, in_tiling)
     }
@@ -2045,6 +2064,7 @@ mod tests {
             function: Box::new(function_producer),
             values_are_keys: false,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
 
         // Get the result from MapResultProducer
@@ -2170,6 +2190,7 @@ mod tests {
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
             values_are_keys: false,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
 
         let result = map_result.read_in_pipeline(map_result.tiling().universal_guard());
@@ -2244,6 +2265,7 @@ mod tests {
             function: Box::new(ProjectionSpy::new(two_level_fn_tile, function_tiling).0),
             values_are_keys: false,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         let result = map_result.read_in_pipeline(map_result.tiling().universal_guard());
         let Tile::DataFunction {
@@ -2315,6 +2337,7 @@ mod tests {
             function: Box::new(ProjectionSpy::new(f, fn_tiling).0),
             values_are_keys: false,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
@@ -2400,6 +2423,7 @@ mod tests {
             function: Box::new(function),
             values_are_keys: false,
             level: CurryLevel::new(2),
+            whole_reads: None,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
@@ -2464,6 +2488,7 @@ mod tests {
             values_are_keys: false,
             level: CurryLevel::new(2),
             dropped_rows: Default::default(),
+            whole_reads: None,
         };
         let out = producer.get(producer.tiling().universal_guard());
         let paths = out.row_paths_at(3);
@@ -2554,6 +2579,7 @@ mod tests {
             values_are_keys: false,
             level: CurryLevel::new(2),
             dropped_rows: Default::default(),
+            whole_reads: None,
         };
         let out = producer.get(producer.tiling().universal_guard());
         assert!(
@@ -2603,6 +2629,7 @@ mod tests {
             )),
             mode: MapResultToConstMode::Replace,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(
@@ -2663,6 +2690,7 @@ mod tests {
             function: Box::new(TestTileProducer::new(fn_tile, fn_tiling)),
             values_are_keys: false,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert!(out.is_empty(), "no argument, no result: {out:?}");
@@ -2707,6 +2735,7 @@ mod tests {
             )),
             mode: MapResultToConstMode::Replace,
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         let first = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
@@ -3119,6 +3148,7 @@ mod projection_tests {
                 function: Box::new(function),
                 values_are_keys,
                 level,
+                whole_reads: None,
             },
             Logs {
                 input_pulled,
@@ -3531,6 +3561,7 @@ mod const_projection_tests {
                 constant: Box::new(constant),
                 mode,
                 level: CurryLevel::new(1),
+                whole_reads: None,
             },
             input_pulled,
             constant_pulled,

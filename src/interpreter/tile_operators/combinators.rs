@@ -1197,6 +1197,7 @@ impl TileOperator for Filter {
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
+            whole_reads: Some(aligned.whole_reads()),
         })
     }
 
@@ -1210,6 +1211,9 @@ struct FilterProducer {
     input: Box<dyn TileProducer>,
     predicate: Box<dyn TileProducer>,
     level: CurryLevel,
+    /// The flags of its inputs read whole, which a read clears as it starts
+    /// ([`WholeReads`](crate::interpreter::notifications::WholeReads)); `None` where it reads none.
+    whole_reads: Option<crate::interpreter::notifications::WholeReads>,
 }
 
 impl TileProducer for FilterProducer {
@@ -1256,6 +1260,10 @@ impl TileProducer for FilterProducer {
     /// The input, and a predicate that is a collection, share the keys of the level the mask
     /// names, so both are pulled at the projection; a function predicate is read whole.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+        // A read of the inputs read whole starts here, so a delivery after it notifies again.
+        if let Some(reads) = &self.whole_reads {
+            reads.reading();
+        }
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -2521,6 +2529,7 @@ mod tests {
             input: Box::new(TestTileProducer::new(input, tiling.clone())),
             predicate: Box::new(predicate),
             level: CurryLevel::new(1),
+            whole_reads: None,
         };
         filter.read_in_pipeline(filter.tiling().universal_guard())
     }
@@ -4084,6 +4093,7 @@ mod filter_projection_tests {
                 input: Box::new(input),
                 predicate: Box::new(predicate),
                 level: CurryLevel::OUTERMOST,
+                whole_reads: None,
             },
             input_pulled,
             predicate_pulled,
@@ -4231,6 +4241,7 @@ mod filter_projection_tests {
             input: Box::new(input),
             predicate: Box::new(predicate),
             level: CurryLevel::OUTERMOST,
+            whole_reads: None,
         };
 
         let first = filter.read_in_pipeline(keys_between(0, ROWS - 1));
@@ -4326,6 +4337,7 @@ mod filter_projection_tests {
             input: Box::new(input),
             predicate: Box::new(predicate),
             level: CurryLevel::new(1),
+            whole_reads: None,
         }
     }
 
@@ -4376,6 +4388,7 @@ mod filter_projection_tests {
                 input: Box::new(input),
                 predicate: Box::new(predicate),
                 level: CurryLevel::new(2),
+                whole_reads: None,
             }) as Box<dyn TileProducer>
         };
         let point = |k: u64| Predicate::point(Value::UInt(k));
@@ -4407,6 +4420,7 @@ mod filter_projection_tests {
             input: Box::new(input),
             predicate: Box::new(predicate),
             level: CurryLevel::OUTERMOST,
+            whole_reads: None,
         };
         assert!(matches!(by_function.restates(), Restates::Every));
         assert_eq!(

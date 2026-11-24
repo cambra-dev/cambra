@@ -1053,6 +1053,10 @@ impl Breaker for InductionStoreProducer {
     ///
     /// As [`consume_store`].
     fn consume_impl(&self, input: InputId, guard: TileGuard) {
+        // The seeds are read as of here, so a seed's push after it queues the input again.
+        for reads in &self.seed_reads {
+            reads.reading();
+        }
         let mut state_guard = self
             .state
             .lock()
@@ -1202,14 +1206,17 @@ fn subscribe_seed(
 ) -> (
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
+    crate::interpreter::notifications::WholeReads,
 ) {
     let (entry, placement) = crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling());
-    let seed = op.clone().subscribe(
-        op.tiling().universal_guard(),
-        crate::interpreter::notifications::widening(Box::new(entry)),
-        cx,
-    );
-    (seed, placement)
+    // The store reads its seeds whole as it consumes, so a push of the seed queues the input
+    // once until the store's next consume reads it.
+    let (consumer, reads) =
+        crate::interpreter::notifications::widening_once_per_read(Box::new(entry));
+    let seed = op
+        .clone()
+        .subscribe(op.tiling().universal_guard(), consumer, cx);
+    (seed, placement, reads)
 }
 
 impl CommitProducer {
@@ -1450,6 +1457,10 @@ impl Breaker for CommitProducer {
     ///
     /// Where `input` is a writer's, and as [`consume_store`].
     fn consume_impl(&self, input: InputId, guard: TileGuard) {
+        // The seeds are read as of here, so a seed's push after it queues the input again.
+        for reads in &self.seed_reads {
+            reads.reading();
+        }
         let mut state_guard = self
             .state
             .lock()
@@ -2522,12 +2533,14 @@ impl TileOperator for CommitOperator {
         // subscribed behind an entry a planner places in that input's pipeline, and a push of a
         // seed queues the input whole, since the store reads every seed whole when it opens.
         let mut seed_placements = Vec::new();
+        let mut seed_reads = Vec::new();
         let seed_producers = self
             .seed_ops
             .iter()
             .map(|(key, op)| {
-                let (seed, placement) = subscribe_seed(op, cx);
+                let (seed, placement, reads) = subscribe_seed(op, cx);
                 seed_placements.push(placement);
+                seed_reads.push(reads);
                 (key.clone(), seed)
             })
             .collect();
@@ -2563,6 +2576,7 @@ impl TileOperator for CommitOperator {
         Box::new(CommitProducer {
             base,
             seed_placements,
+            seed_reads,
             writer_placements: placements.clone(),
             writer_write_keys: self.writer_write_keys.clone(),
             state: std::sync::Mutex::new(CommitState {
@@ -2590,6 +2604,9 @@ impl TileOperator for CommitOperator {
 #[doc(hidden)]
 pub struct CommitProducer {
     base: ProducerBase,
+    /// Per seed stream, the flag its notification sets and a consume clears as it starts, so a
+    /// seed's pushes queue its input once per read ([`subscribe_seed`]).
+    seed_reads: Vec<crate::interpreter::notifications::WholeReads>,
     /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
     /// to the pipeline of the store's input 0 ([`Self::writer_of`]). Empty where the store has no
     /// seed stream, and then it has no seed input.
@@ -3465,12 +3482,14 @@ impl TileOperator for InductionStore {
         // subscribed behind an entry a planner places in the pipeline of the loop's scope, which
         // takes no push of it and records what it has decided.
         let mut seed_placements = Vec::new();
+        let mut seed_reads = Vec::new();
         let seed_producers = self
             .seed_ops
             .iter()
             .map(|(key, op)| {
-                let (seed, placement) = subscribe_seed(op, cx);
+                let (seed, placement, reads) = subscribe_seed(op, cx);
                 seed_placements.push(placement);
+                seed_reads.push(reads);
                 (key.clone(), seed)
             })
             .collect();
@@ -3483,6 +3502,7 @@ impl TileOperator for InductionStore {
             )
             .breaking(consumer.clone(), placement),
             seed_placements,
+            seed_reads,
             resumed_after: self.resumed_after.clone(),
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
@@ -3510,6 +3530,9 @@ impl TileOperator for InductionStore {
 /// An induction store with accumulator state and dispatcher-run control.
 pub struct InductionStoreProducer {
     base: ProducerBase,
+    /// Per seed stream, the flag its notification sets and a consume clears as it starts, so a
+    /// seed's pushes queue its input once per read ([`subscribe_seed`]).
+    seed_reads: Vec<crate::interpreter::notifications::WholeReads>,
     /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
     /// to the pipeline of the loop's scope.
     seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
@@ -4493,8 +4516,13 @@ impl TileOperator for StoreFinalRead {
         let consumer = shared_consumer(consumer);
 
         let forward = forwarding_consumer_keeping_keys(&consumer);
+        // The final value at the outermost level is one value, so a push of the store queues its
+        // reader once per read of it.
+        let mut final_reads = None;
         let forward: Box<dyn Consumer> = if self.levels_above == 0 {
-            crate::interpreter::widening(forward)
+            let (once, reads) = crate::interpreter::notifications::widening_once_per_read(forward);
+            final_reads = Some(reads);
+            once
         } else {
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(self.levels_above),
@@ -4517,6 +4545,7 @@ impl TileOperator for StoreFinalRead {
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
             levels_above: self.levels_above,
+            final_reads,
         })
     }
 }
@@ -4528,6 +4557,9 @@ struct StoreFinalReadProducer {
     key: Value,
     value_extent: Extent,
     levels_above: usize,
+    /// The flag a push sets and a read clears as it starts, where the final value is one value
+    /// (`levels_above` is 0).
+    final_reads: Option<crate::interpreter::notifications::WholeReads>,
 }
 
 impl TileProducer for StoreFinalReadProducer {
@@ -4553,6 +4585,9 @@ impl TileProducer for StoreFinalReadProducer {
         None
     }
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+        if let Some(reads) = &self.final_reads {
+            reads.reading();
+        }
         if self.obsolete_guard().is_universal() {
             return self.tiling().empty_tile();
         }

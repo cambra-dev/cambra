@@ -184,7 +184,7 @@ impl TileOperator for CheckedLookup {
         consumer: Box<dyn Consumer>,
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let source = match &self.source {
+        let (source, whole_reads) = match &self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
             // absence, so when it settles after the keys it is the input that completes the
             // answer — subscribed with a consumer of its own it would settle with nobody
@@ -215,16 +215,22 @@ impl TileOperator for CheckedLookup {
                     ),
                     cx,
                 );
-                ProducerSource::Split { collection, keys }
+                (
+                    ProducerSource::Split { collection, keys },
+                    Some(aligned.whole_reads()),
+                )
             }
             // One input, carrying both operands, so there is nothing to share.
-            LookupSource::Paired(pairs) => ProducerSource::Paired(pairs.clone().subscribe(
-                pairs.tiling().universal_guard(),
-                // The pairs are pulled at the projection, and each answer sits at its
-                // row's position.
-                consumer,
-                cx,
-            )),
+            LookupSource::Paired(pairs) => (
+                ProducerSource::Paired(pairs.clone().subscribe(
+                    pairs.tiling().universal_guard(),
+                    // The pairs are pulled at the projection, and each answer sits at its
+                    // row's position.
+                    consumer,
+                    cx,
+                )),
+                None,
+            ),
         };
         Box::new(CheckedLookupProducer {
             dropped_rows: Default::default(),
@@ -235,6 +241,7 @@ impl TileOperator for CheckedLookup {
                 cx,
             ),
             source,
+            whole_reads,
         })
     }
 }
@@ -243,6 +250,9 @@ struct CheckedLookupProducer {
     dropped_rows: [DroppedRows; 2],
     base: ProducerBase,
     source: ProducerSource,
+    /// The flags of its inputs read whole, which a read clears as it starts
+    /// ([`WholeReads`](crate::interpreter::notifications::WholeReads)); `None` where it reads none.
+    whole_reads: Option<crate::interpreter::notifications::WholeReads>,
 }
 
 /// [`LookupSource`] after subscription.
@@ -481,6 +491,10 @@ impl TileProducer for CheckedLookupProducer {
     /// every key is answered against all of it. One answer for one key is a scalar and has no
     /// keys to project.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
+        // A read of the inputs read whole starts here, so a delivery after it notifies again.
+        if let Some(reads) = &self.whole_reads {
+            reads.reading();
+        }
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1007,6 +1021,7 @@ mod tests {
                 collection: Box::new(TestTileProducer::new(coll.0, coll.1)),
                 keys: Box::new(TestTileProducer::new(keys.0, keys.1)),
             },
+            whole_reads: None,
         }
     }
 
@@ -1098,6 +1113,7 @@ mod tests {
                 collection: Box::new(TestTileProducer::new(coll, coll_tiling)),
                 keys: Box::new(spy),
             },
+            whole_reads: None,
         };
         let out = lookup.read_in_pipeline(lookup.tiling().universal_guard());
         let taken = out.to_guard();
@@ -1307,6 +1323,7 @@ mod projection_tests {
                 collection: Box::new(collection),
                 keys: Box::new(key_stream),
             },
+            whole_reads: None,
         };
         (lookup, key_pulls, collection_pulls)
     }
@@ -1426,6 +1443,7 @@ mod projection_tests {
                     Tiling::Scalar(int()),
                 )),
             },
+            whole_reads: None,
         };
         lookup.read_in_pipeline(keys_between(0, 1));
     }

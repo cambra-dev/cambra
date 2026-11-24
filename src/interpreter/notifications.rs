@@ -467,6 +467,63 @@ pub(crate) enum InputRows {
 pub(crate) struct AlignedInputs {
     at: CurryLevel,
     delivered: SharedAligned,
+    whole_reads: WholeReads,
+}
+
+/// For each input of a row-aligned operator that it reads whole, whether a delivery has notified
+/// every row since the operator last read: a further delivery is then dropped, since the package
+/// that notification queued reads the input as it is when it runs. The operator clears the flags as
+/// it starts a read ([`WholeReads::reading`]), so a delivery that lands after the clear notifies
+/// again.
+#[derive(Clone)]
+pub(crate) struct WholeReads(
+    // shared-state-ok: one flag per input, set by a delivery on any thread and cleared by the
+    // operator's read; what crosses it is a flag, never a tile.
+    Arc<Vec<std::sync::atomic::AtomicBool>>,
+);
+
+impl WholeReads {
+    /// Clear every input's flag: the operator is about to read its inputs, so what was delivered
+    /// so far is read, and the next delivery notifies again.
+    pub(crate) fn reading(&self) {
+        for flag in self.0.iter() {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// `consumer` behind a consumer that widens a delivery to every key once per read: a further
+/// delivery is dropped until the reader clears the returned flag as it starts a read
+/// ([`WholeReads::reading`]). For an input its reader reads whole, so any change names all of it.
+pub(crate) fn widening_once_per_read(
+    consumer: Box<dyn Consumer>,
+) -> (Box<dyn Consumer>, WholeReads) {
+    let flag = WholeReads(Arc::new(vec![std::sync::atomic::AtomicBool::new(false)]));
+    let once = Box::new(OncePerRead {
+        flag: flag.clone(),
+        arm: 0,
+        consumer: widening(consumer),
+    });
+    (once, flag)
+}
+
+/// `consumer` behind a consumer that passes on a delivery of an input read whole only where no
+/// delivery has notified since the operator last read ([`WholeReads`]).
+struct OncePerRead {
+    flag: WholeReads,
+    arm: usize,
+    consumer: Box<dyn Consumer>,
+}
+
+impl Consumer for OncePerRead {
+    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
+        if landing.is_delivery()
+            && self.flag.0[self.arm].swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.consumer.notify(region, landing);
+    }
 }
 
 impl AlignedInputs {
@@ -477,17 +534,28 @@ impl AlignedInputs {
         at: CurryLevel,
         inputs: impl IntoIterator<Item = &'a Arc<dyn crate::interpreter::tile_operators::TileOperator>>,
     ) -> Self {
-        let arms = inputs
+        let arms: Vec<crate::interpreter::Predicate> = inputs
             .into_iter()
             .map(|input| match input.keys_arrive_by_push() {
                 true => crate::interpreter::Predicate::False,
                 false => crate::interpreter::Predicate::True,
             })
             .collect();
+        let whole_reads = WholeReads(Arc::new(
+            (0..arms.len())
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+        ));
         Self {
             at,
             delivered: Arc::new(Mutex::new(AlignedDelivered { arms })),
+            whole_reads,
         }
+    }
+
+    /// The flags of the inputs read whole, which the operator clears as it starts each read.
+    pub(crate) fn whole_reads(&self) -> WholeReads {
+        self.whole_reads.clone()
     }
 
     /// `consumer` behind the consumer of input `arm`, which passes on a delivery only under the
@@ -507,7 +575,11 @@ impl AlignedInputs {
         });
         match rows {
             InputRows::Keys => aligned,
-            InputRows::Whole => widening(aligned),
+            InputRows::Whole => Box::new(OncePerRead {
+                flag: self.whole_reads.clone(),
+                arm,
+                consumer: widening(aligned),
+            }),
         }
     }
 }
