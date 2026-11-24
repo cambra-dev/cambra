@@ -886,14 +886,6 @@ fn run_targets(
             _ => None,
         })
         .collect();
-    let consuming: Vec<BreakerHandle> = worker_targets
-        .iter()
-        .flatten()
-        .filter_map(|target| match target {
-            WorkerBreaker::Chain(handle) => Some(handle.clone()),
-            WorkerBreaker::Sink(_) => None,
-        })
-        .collect();
     // A push into a scope's pipeline offers the scope requests, which the coordinator queues after
     // the consume or the finish that pushed them (`Execution::consume`, `Execution::finish`), so
     // a pipeline a scope's pipeline reads stays the coordinator's. A loop's drive source offers
@@ -913,12 +905,18 @@ fn run_targets(
         .map(|(target, read_by_scope)| {
             target.and_then(|handle| {
                 let restated = match &handle {
-                    WorkerBreaker::Chain(chain) => chain_restated_level(chain, &consuming),
+                    WorkerBreaker::Chain(chain) => {
+                        let chain = chain.read().unwrap_or_else(PoisonError::into_inner);
+                        chain.as_producer()?;
+                        concurrent_level(&*chain)
+                    }
                     WorkerBreaker::Sink(sink) => {
                         // A sink is the workers' only where its packages run at once: one handed
                         // a package at a time stays on the coordinator, which hands a `main`
                         // output its answers.
-                        Some(sink_restated_level(sink, &consuming)?)
+                        Some(concurrent_level(
+                            &*sink.read().unwrap_or_else(PoisonError::into_inner),
+                        )?)
                     }
                 };
                 Some(WorkerTarget {
@@ -3325,7 +3323,7 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
 /// disjoint regions of its input, at whatever level they land. A range beneath the pipeline's
 /// outermost keys, as a nest's inner range is, lands each piece beneath the rows it reaches: the
 /// pieces are disjoint where they name different inner keys, and they run alone or beside each
-/// other as the chain restates that level ([`chain_restated_level`]). Pieces that land on the same
+/// other as their pipeline admits ([`concurrent_level`]). Pieces that land on the same
 /// region, as a range re-keyed onto values its pieces share would, are pushed whole.
 ///
 /// The first two pieces decide for all of them: every piece is a region of the same range pushed
@@ -3361,42 +3359,13 @@ fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[P
     }
 }
 
-/// The deepest level whose keys every operator the chain under `breaker` pulls restates, for a
-/// breaker whose consume runs concurrently
-/// ([`Breaker::consumes_concurrently`](crate::interpreter::tile_operators::Breaker::consumes_concurrently)).
-/// A package naming keys at or above it is answered exactly, so it runs beside the pipeline's
-/// other packages; one naming keys beneath it would widen, and runs alone
-/// ([`Dispatcher::restate`]). `None` where the breaker consumes one package at a time or the chain
-/// restates not even the outermost keys.
-fn chain_restated_level(
-    breaker: &BreakerHandle,
-    consuming: &[BreakerHandle],
-) -> Option<CurryLevel> {
-    let breaker = breaker.read().unwrap_or_else(PoisonError::into_inner);
-    let producer = breaker.as_producer()?;
-    restated_level(&*breaker, consuming, &mut |visit| {
-        producer.visit_input_producers(&mut |_, input| visit(input));
-    })
-}
-
-/// [`chain_restated_level`] for a sink at the root of the run, whose input is the producer it
-/// pulls.
-fn sink_restated_level(
-    sink: &RwLock<crate::interpreter::tile_operators::SinkBreaker>,
-    consuming: &[BreakerHandle],
-) -> Option<CurryLevel> {
-    let sink = sink.read().unwrap_or_else(PoisonError::into_inner);
-    restated_level(&*sink, consuming, &mut |visit| sink.visit_input(visit))
-}
-
-/// The deepest level whose keys every input of `breaker`, visited by `inputs`, and the chain
-/// beneath each restate; `None` where `breaker` consumes one package at a time or not even the
-/// outermost keys are restated.
-fn restated_level(
-    breaker: &dyn Breaker,
-    consuming: &[BreakerHandle],
-    inputs: &mut dyn FnMut(&mut dyn FnMut(&dyn crate::interpreter::tile_operators::TileProducer)),
-) -> Option<CurryLevel> {
+/// The deepest level whose keys a package of `breaker`'s pipeline may name and still run beside
+/// the pipeline's other packages: the innermost level of its input, where the breaker consumes
+/// concurrently ([`Breaker::consumes_concurrently`]) and its input is keyed by ordered keys. Every
+/// producer answers a projection at every level, widening a pull at keys it does not restate and
+/// cutting the answer after (`TileProducer::get`). `None` where the breaker consumes one package
+/// at a time, or its input has no ordered keys to cut.
+fn concurrent_level(breaker: &dyn Breaker) -> Option<CurryLevel> {
     let input = breaker.input_tiling(InputId::ONLY);
     // A push is cut into morsels in key order, which a function value has none of.
     let ordered = input
@@ -3405,21 +3374,7 @@ fn restated_level(
     if !breaker.consumes_concurrently() || !ordered {
         return None;
     }
-    let levels = input.levels();
-    let mut restates = |level: CurryLevel| {
-        let mut refused = false;
-        inputs(&mut |input| {
-            // The breaker's own input answers the package as it is: the walk below stops at a
-            // recurrence slot or a store read, which the input itself may be.
-            refused |= input.restates().refuses(level)
-                || unrestated(input, Some(level), consuming, false).is_some();
-        });
-        !refused
-    };
-    (0..levels)
-        .map(CurryLevel::new)
-        .take_while(|&level| restates(level))
-        .last()
+    input.levels().checked_sub(1).map(CurryLevel::new)
 }
 
 /// Why a round of a loop's scope cannot pull the chain at `producer`, or `None` where every

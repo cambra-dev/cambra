@@ -1974,6 +1974,17 @@ pub trait TileProducer: Send + Sync {
         {
             return self.get(asked.rows().guard(self.tiling()));
         }
+        // A pull at keys of a level the producer does not restate pulls the keys above them at
+        // the nearest level it restates, and the answer is cut to the keys asked for: pulling
+        // more is sound for a `get`, so every producer answers a projection at every level.
+        if let Ok(asked) = Projection::of(&projection_guard)
+            && let Some(level) = asked.level()
+            && self.restates().refuses(level)
+        {
+            let mut answer = self.get(asked.restated_by(&self.restates()).guard(self.tiling()));
+            answer.restrict_to(&asked, self.tiling());
+            return answer;
+        }
         #[cfg(test)]
         {
             self.base()
@@ -1991,19 +2002,6 @@ pub trait TileProducer: Send + Sync {
             pull_levels::PullFrame::enter(self, &projection_guard)
         };
         let asked = cfg!(debug_assertions).then(|| projection_guard.clone());
-        // A producer has no exact answer to a pull at keys it does not restate, so the pull is
-        // its consumer's bug.
-        if let Some(asked) = &asked
-            && let Ok(projection) = Projection::of(asked)
-            && let Some(level) = projection.level()
-            && self.restates().refuses(level)
-        {
-            panic!(
-                "{} was pulled at {asked:?}, at the keys of {level}, and restates {}",
-                self.name(),
-                self.restates()
-            );
-        }
         // What the producer released before the pull began, which the answer must not hold. A
         // release that lands while the pull runs comes from another package's thread; the answer
         // can predate it.

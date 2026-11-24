@@ -521,16 +521,18 @@ A pipeline is **admitted** when all of these hold:
 
 - It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
   loop's or transaction writer's body. A sink is admitted only where its packages run at once.
-- Its chain restates a level, or no scope's pipeline reads it.
+- Its packages run at once at some level, or no scope's pipeline reads it.
 
-A chain **restates** level `L` where its breaker consumes concurrently, and the breaker's input and
-every operator its chain pulls restate the keys of every level from the outermost through `L`
-(`chain_restated_level`, `sink_restated_level`). The planner records the deepest such level per
-pipeline and registers a rule with the dispatcher (`Dispatcher::classify`) that flags each package
-as it is queued. A package runs **alone** where its guard is no projection or names keys beneath the
-restated level: it waits until no package of the pipeline is in flight, and no package is claimed
-beside it (`Queue::claim`). Every other package runs beside the pipeline's others, except one whose
-guard overlaps a package in flight.
+A pipeline's packages run beside each other at any level of its input where its breaker consumes
+concurrently and its input is keyed by ordered keys (`concurrent_level`). Every producer answers a
+projection at every level: a pull at keys of a level the producer does not restate
+(`TileProducer::restates`) pulls the keys above them at the nearest level it restates, and the
+answer is cut to the keys asked for (`TileProducer::get`). The planner registers a rule with the
+dispatcher (`Dispatcher::classify`) that flags each package as it is queued: a package naming keys
+beneath that level runs **alone**, waiting until no package of the pipeline is in flight, and no
+package is claimed beside it (`Queue::claim`). A package is always a projection, which a debug build
+asserts. Every other package runs beside the pipeline's others, except one whose guard overlaps a
+package in flight.
 
 A pipeline admitted for the second reason alone is **serial**: the planner orders it, so one package
 of it is in flight at a time, on any thread. A worker runs the finish of every admitted pipeline no
