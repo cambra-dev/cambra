@@ -420,12 +420,6 @@ impl Breaker for ExtractFinalProducer {
         self.source.release(self.source.tiling().universal_guard());
         self.extract_once_released(&mut state);
     }
-
-    /// The source is keyed by position, and the row at the greatest key wins whatever order the
-    /// packages merge in.
-    fn consumes_concurrently(&self) -> bool {
-        has_keys(&*self.source)
-    }
 }
 
 impl ExtractFinalProducer {

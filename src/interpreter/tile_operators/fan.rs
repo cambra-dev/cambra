@@ -1269,30 +1269,19 @@ impl SelectFieldProducer {
     fn at_field(&self, guard: TileGuard) -> TileGuard {
         guard_at_field(&self.input_tiling, &self.name, guard)
     }
-
-    /// The level of a stream's records, whose keys are the deepest the input is pulled at;
-    /// `None` for a product of collections, which has no keys of its own.
-    fn rows(&self) -> Option<CurryLevel> {
-        CurryLevel::values_of(self.input.tiling()).enclosing()
-    }
 }
 
 impl TileProducer for SelectFieldProducer {
     impl_producer_base!();
 
-    /// Every level: the keys above the record are the input's, and a field that is itself a
-    /// collection carries its keys out of the record. A product of collections is pulled at the
-    /// selected field's part, at any level of the field.
+    /// A stream of records keeps its keys at every level above the record, so its input is pulled
+    /// at a projection there; the levels of a field that is itself a collection are inside the
+    /// record's values. A product of collections is pulled at the selected field's part, at any
+    /// level of the field.
     fn restates(&self) -> Restates {
-        Restates::Every
-    }
-
-    /// A stream of records is pulled no deeper than its rows: the levels of a field that is
-    /// itself a collection are inside the record's values.
-    fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        match self.rows() {
-            Some(rows) => Some(level.min(rows)),
-            None => Some(level),
+        match self.input.tiling().is_data_function() {
+            true => Restates::Above(CurryLevel::values_of(self.input.tiling())),
+            false => Restates::Every,
         }
     }
 
@@ -1304,21 +1293,16 @@ impl TileProducer for SelectFieldProducer {
         visit("input", &mut *self.input);
     }
 
-    /// A stream of records keeps its keys above the record, so the input is pulled at the
-    /// projection there. A projection of a collection field's keys names keys inside the
-    /// record's values, so the input is pulled at the rows its paths run through
-    /// ([`Projection::restated_by`]) and the answer cut to the projection after. A product of
-    /// collections has no keys of its own: it is pulled at the selected field's part of the
-    /// projection ([`Projection::of_field`]), and the field cut after.
+    /// A stream of records keeps its keys under the field, so the input is pulled at the
+    /// projection. A product of collections has no keys of its own: it is pulled at the selected
+    /// field's part of the projection ([`Projection::of_field`]), and the field cut after.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
         let input_guard = match self.input.tiling().is_data_function() {
-            true => projection
-                .restated_by(&Restates::Above(CurryLevel::values_of(self.input.tiling())))
-                .guard(self.input.tiling()),
+            true => projection.guard(self.input.tiling()),
             false => {
                 Projection::of_field(&self.name, projection.clone()).guard(self.input.tiling())
             }

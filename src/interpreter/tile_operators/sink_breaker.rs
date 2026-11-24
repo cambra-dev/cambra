@@ -155,13 +155,6 @@ impl Breaker for SinkBreaker {
         self.deliver(tile);
     }
 
-    /// Each package's answer is handed, or merged into a `main` output's answer, under the
-    /// hands' lock, so packages of disjoint keys are consumed at once.
-    fn consumes_concurrently(&self) -> bool {
-        let slot = Self::reading(&self.producer);
-        slot.as_ref().is_some_and(|producer| has_keys(&**producer))
-    }
-
     fn finish(&mut self, _input: InputId, _: &mut Pushes<'_>) {
         let Hands::Main {
             each_package,
