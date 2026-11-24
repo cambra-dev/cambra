@@ -1611,7 +1611,7 @@ fn refinements_in_scope(
 
 /// `ty` with `group` replaced by `d`, and a refinement of `group`'s base that holds all of
 /// `group`'s refinements by `d` refined by the rest, in quoted annotations as well.
-/// Quoted `Cast` computations transport their producers and retain their filters.
+/// Quoted `Cast` computations transport their values and retain their filters.
 ///
 /// The generalized type is a new type beside the ones that keep the quoted terms as they were,
 /// so the terms it rewrites are derived ones, minted under the caller's recording.
@@ -1641,7 +1641,7 @@ fn abstract_quoted_term(term: &mut crate::ccl::Expr, group: &Type, d: &Type) -> 
     if let crate::ccl::TypedExprNode::Cast { value, target } = &mut term.node {
         let mut changed = abstract_quoted_term(value, group, d);
         // A target's predicates define its filter. Rewrite their annotations, then derive
-        // both stored types from the transported producer instead of abstracting the filter.
+        // both stored types from the transported value instead of abstracting the filter.
         changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
             target,
             &crate::ccl::ccl_utils::PredMemo::default(),
@@ -1923,7 +1923,7 @@ mod tests {
     #[rstest::rstest]
     #[case(1)]
     #[case(2)]
-    fn a_quoted_cast_transports_its_producer_and_preserves_its_filter(#[case] filters: usize) {
+    fn a_quoted_cast_is_rebuilt_from_its_value_and_keeps_its_filter(#[case] filters: usize) {
         let int = Type::Base(BaseType::Int);
         let above_outer = Expr::binop(
             Expr::var(Name::elem()).with_ty(int.clone()),

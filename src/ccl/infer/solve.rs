@@ -2892,9 +2892,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     refresh_lambda_param_slot(expr);
 
     // A cast's target and result share the coalesced view's shape and bases. The target
-    // keeps its born refinements; the result also includes the producer's restrictions.
+    // keeps its born refinements; the result also includes the value's restrictions.
     // Keeping the two distinct lets Check reconstruct the result without applying the
-    // producer's filters twice.
+    // value's filters twice.
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
         let view = expr.ty.clone();
         if let TypedExprNode::Cast { value, target } = &mut expr.node {

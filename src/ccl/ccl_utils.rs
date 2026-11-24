@@ -2847,7 +2847,7 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 }
 
 /// A cast's target and result at `view`'s shape, with the target's own filter and the
-/// producer's preceding restrictions retained in their respective slots.
+/// value's preceding restrictions retained in their respective slots.
 pub(crate) fn canonical_cast_types(born: &Type, value: &Type, view: Type) -> (Type, Type) {
     (
         canonical_cast_ty(born, None, view.clone()),
