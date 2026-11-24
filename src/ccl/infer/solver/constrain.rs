@@ -1059,6 +1059,24 @@ fn joined_keys(domain: &Type, subst: &Subst) -> Option<ConstrainError> {
     None
 }
 
+/// One closing step of a variable's bounds, where a definite failure outranks
+/// [`ConstrainError::NotCompiledYet`]: an edge the solver cannot compile yet is held in
+/// `not_compiled` while the remaining bounds are closed, so a mismatch among them is what the
+/// edge reports. A program that fails a judgment is wrong whatever the solver can compile, and
+/// reporting that it is not compiled yet would say it is a program the compiler should accept.
+fn defer_not_compiled(
+    closed: Result<(), ConstrainError>,
+    not_compiled: &mut Option<ConstrainError>,
+) -> Result<(), ConstrainError> {
+    match closed {
+        Err(e @ ConstrainError::NotCompiledYet(_)) => {
+            not_compiled.get_or_insert(e);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// The substitution taking the lower side of the edge `lhs‹sl› <: rhs‹sr›` into the frame `rhs`
 /// stands in: `sl`, then `sr` undone where it can be.
 fn edge_into_holder(sl: &Subst, sr: &Subst) -> Subst {
@@ -2365,11 +2383,12 @@ fn constrain_go_impl(
             if let Type::Infer(rv) = rhs {
                 link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?;
             }
+            let mut not_compiled = None;
             for low in lows.iter() {
                 let Some((tau_l, tau_u)) = bridge_holder_gap(&low.self_subst, sl, Some(lv)) else {
                     continue;
                 };
-                cache.with_origins((low.origin, None), |cache| {
+                let closed = cache.with_origins((low.origin, None), |cache| {
                     constrain_go(
                         &low.ty,
                         rhs,
@@ -2378,9 +2397,10 @@ fn constrain_go_impl(
                         cache,
                         scope,
                     )
-                })?;
+                });
+                defer_not_compiled(closed, &mut not_compiled)?;
             }
-            Ok(())
+            not_compiled.map_or(Ok(()), Err)
         }
 
         // Variable on rhs, lhs has compatible level: record the lower edge in
@@ -2485,11 +2505,12 @@ fn constrain_go_impl(
                 Type::BarrierVar(barrier) => link_barrier_watches(barrier, rv, cache)?,
                 _ => {}
             }
+            let mut not_compiled = None;
             for up in ups.iter() {
                 let Some((tau_l, tau_u)) = bridge_holder_gap(sr, &up.self_subst, Some(rv)) else {
                     continue;
                 };
-                cache.with_origins((None, up.origin), |cache| {
+                let closed = cache.with_origins((None, up.origin), |cache| {
                     constrain_go(
                         lhs,
                         &up.ty,
@@ -2498,7 +2519,11 @@ fn constrain_go_impl(
                         cache,
                         scope,
                     )
-                })?;
+                });
+                defer_not_compiled(closed, &mut not_compiled)?;
+            }
+            if let Some(e) = not_compiled {
+                return Err(e);
             }
             let guarded = rv.bounds.borrow().guarded_upper.clone();
             if !guarded.is_empty() && cache.checks_guarded {

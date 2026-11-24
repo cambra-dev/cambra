@@ -1100,6 +1100,36 @@ impl Subst {
         }
     }
 
+    /// The funkind variables this substitution's eliminations name.
+    pub(crate) fn elim_kinds(&self) -> impl Iterator<Item = &Rc<crate::ccl::ty::FunKindVar>> {
+        self.elims.iter().filter_map(|e| match e {
+            Elim::Kind(k, _) | Elim::ReadBack(k, _) | Elim::Onto(k) => Some(k),
+            Elim::Top(_) | Elim::Map(_) => None,
+        })
+    }
+
+    /// The binders this substitution's witness half names: each key and each rename's target,
+    /// its own and its eliminations' maps' alike.
+    #[cfg(debug_assertions)]
+    pub(crate) fn witness_ids(&self) -> Vec<crate::ccl::ty::WitnessId> {
+        let mut out = Vec::new();
+        let mut add = |m: &WitnessMap| {
+            for (from, to) in m {
+                out.push(*from);
+                if let WitnessMapping::Rename(to) = to {
+                    out.push(*to);
+                }
+            }
+        };
+        add(&self.witnesses);
+        for e in &self.elims {
+            if let Elim::Map(m) = e {
+                add(m);
+            }
+        }
+        out
+    }
+
     /// This substitution with its witness half rewritten: every binder, a key or a
     /// rename's target, through `binder`, every kind an elimination names through `kind`, and
     /// every discharge's type through `candidate`.

@@ -3820,7 +3820,9 @@ gains the copy beside the original, through the edge it already had to the origi
 (`freshen_kind_var`). So a closure's scheme instantiated inside a definition relates its copies
 to the funkind variables the definition owns, the bound `_ |=> 𝑉` on an associated type among
 them, and a specialization of the definition copies both sides with the correspondence between
-them.
+them. A copied bound's substitution names the copies too: `freshen_subst_payloads` freshens each
+kind the substitution's eliminations name before mapping it, so an `Onto(κ)` reads the copy's
+binders through `κ`'s copy whether or not the walk had reached `κ` yet.
 
 Each instantiation, and each specialization's clone, is checked in debug builds against what it
 copied (`PolyScheme::instantiate*`, `specialize_use`, `assert_copied_apart`): no variable or
@@ -3829,9 +3831,10 @@ clone's type slots, through their structure or the copies' bounds and funkind ed
 would be shared between the scheme and every use, and would carry whatever one use records into the
 others.
 The audit enters quoted predicate, family-argument and projection terms, and follows copied
-variables' bounds and funkind edges. A function's own funkind is checked even when its domain
-and codomain contain no inference variables. Reaching an enclosing variable or funkind at or
-below the cutoff stops that path: its graph is shared by design.
+variables' bounds and funkind edges, with the funkind variables their substitutions' eliminations
+name. Those substitutions name no binder the freshening renamed. A function's own funkind is checked
+even when its domain and codomain contain no inference variables. Reaching an enclosing variable or
+funkind at or below the cutoff stops that path: its graph is shared by design.
 
 A copied function places only variables minted by that freshening under its witness scope.
 Captured variables retain their existing placement. Adding a new scope to a captured variable

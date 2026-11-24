@@ -293,8 +293,23 @@ pub(crate) fn assert_copied_apart_from(
         /// The copies the cache holds, which a specialization may have taken from its use's
         /// instantiation before `before` (`UseCapabilities::copies`).
         capability_copies: std::collections::HashSet<CapabilityVarId>,
+        /// The binders the freshening renamed: a copy names their renames, never them.
+        renamed: std::collections::HashSet<crate::ccl::ty::WitnessId>,
     }
     impl Audit {
+        /// A substitution a copy's bound or funkind edge carries: the kinds its eliminations name
+        /// are audited as the copy's own, and it names no binder the freshening renamed.
+        fn subst(&mut self, subst: &Subst) {
+            for k in subst.elim_kinds() {
+                self.kind(&FunKind::Var(Rc::clone(k)));
+            }
+            for w in subst.witness_ids() {
+                assert!(
+                    !self.renamed.contains(&w),
+                    "an instantiation's bound names the binder {w:?}, which it renamed"
+                );
+            }
+        }
         fn kind(&mut self, kind: &FunKind) {
             if let FunKind::Var(k) = kind {
                 assert!(
@@ -305,8 +320,9 @@ pub(crate) fn assert_copied_apart_from(
                 if k.level().is_some_and(|l| l <= self.lim) || !self.kinds.insert(k.uid) {
                     return;
                 }
-                for (edge, _) in k.lower_edges().into_iter().chain(k.upper_edges()) {
+                for (edge, subst) in k.lower_edges().into_iter().chain(k.upper_edges()) {
                     self.kind(&edge);
+                    self.subst(&subst);
                 }
             }
             for witness in kind.witnesses() {
@@ -344,6 +360,8 @@ pub(crate) fn assert_copied_apart_from(
                     .chain(v.bounds.borrow().upper().iter())
                 {
                     self.ty(&bound.ty);
+                    self.subst(&bound.ty_subst);
+                    self.subst(&bound.self_subst);
                 }
             }
             if let Type::Fun {
@@ -377,6 +395,7 @@ pub(crate) fn assert_copied_apart_from(
         kinds: Default::default(),
         terms: Default::default(),
         capability_copies: cache.capability_vars.values().map(|c| c.uid).collect(),
+        renamed: cache.witnesses.keys().copied().collect(),
     };
     roots(&mut |root| audit.ty(root));
     for copy in cache.vars.values() {
@@ -1975,6 +1994,14 @@ fn freshen_subst_payloads(
     subst.for_each_discharge_term_mut(&mut |t| freshen_expr_type_slots(t, lim, target, cache));
     // The witness half comes across too: its binders and the kinds it eliminates are this
     // instantiation's, and a discharge's type is freshened as any other type the bound carries.
+    // Each kind an elimination names is freshened first, which also puts its binders' renames
+    // in the cache: one the walk has not reached yet would otherwise stay the original's, so a
+    // bound reading the copy's binders through `Onto(κ)` would read them in a scope that never
+    // binds them.
+    let kinds: Vec<_> = subst.elim_kinds().cloned().collect();
+    for kind in &kinds {
+        freshen_kind_var(kind, lim, target, cache);
+    }
     let renames = cache.witnesses.clone();
     let kinds = cache.fun_kind_vars.clone();
     subst.map_witness_half(
