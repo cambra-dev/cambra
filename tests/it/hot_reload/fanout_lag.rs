@@ -75,7 +75,7 @@ fn a_stdin_feed_resumes_after_the_cut_when_its_other_writer_is_edited() {
     // The driver prints each tile's `Debug` form, one string value per line of a `Strings`
     // column. A channel's arm tags print quoted too, outside any `Strings` column.
     let mut in_strings = false;
-    let printed: Vec<&str> = out
+    let mut printed: Vec<&str> = out
         .lines()
         .map(str::trim)
         .filter_map(|l| {
@@ -89,6 +89,9 @@ fn a_stdin_feed_resumes_after_the_cut_when_its_other_writer_is_edited() {
                 .flatten()
         })
         .collect();
+    // A `main` output hands each package's answer as the package finishes, in no order, and
+    // each value extends the one before it, so the values are compared sorted.
+    printed.sort_unstable();
     assert_eq!(
         printed,
         vec!["a", "ab", "abc"],
