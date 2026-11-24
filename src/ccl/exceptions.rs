@@ -370,6 +370,16 @@ fn holds_raise(e: &Expr) -> bool {
     }
 }
 
+/// Whether an exception may escape a refinement predicate in `ty` ([`Cx::escapes`]). A filter
+/// whose every `try` catches what it raises holds a `raise` without one escaping it.
+fn filter_escapes(ty: &Type) -> bool {
+    let mut raised = Vec::new();
+    crate::ccl::ccl_utils::walk_refined_predicates(ty, &mut HashSet::new(), &mut |predicate, _| {
+        Cx::escapes(predicate, &mut raised)
+    });
+    !raised.is_empty()
+}
+
 /// Whether a refinement predicate in `ty` holds a `raise` or a `try`.
 fn filter_raises(ty: &Type) -> bool {
     let mut raises = false;
@@ -1119,7 +1129,9 @@ impl Cx {
                 let lambda_ty = ty.clone();
                 self.elim_collection(kept, param, *body, &lambda_ty, None, &ty, arms)
             }
-            TypedExprNode::Cast { value, target } if filter_raises(&target) => {
+            // A filter that holds a `try` and lets nothing escape takes the filtered
+            // comprehension's path below, and [`Self::purify`] eliminates it in its type.
+            TypedExprNode::Cast { value, target } if filter_escapes(&target) => {
                 self.elim_raising_filter(kept, *value, target, &ty, arms)
             }
             // A filtered comprehension: the filter is the cast's, on the collection's domain.
@@ -1670,6 +1682,11 @@ impl Cx {
     /// value, read where nothing raised, is every element's value. A filtered comprehension's
     /// lambda stands in a `cast` to its filtered domain, which the outcomes keep, so a
     /// position the filter drops raises nothing.
+    ///
+    /// A collection whose elements hold a `try` that no exception escapes is eliminated in
+    /// place, with no outcomes and no scan. [`Self::purify`] eliminates a copy of it in a
+    /// refinement predicate the same way, and a predicate cannot hold a scan, which is a
+    /// statement.
     #[expect(
         clippy::too_many_arguments,
         reason = "the lambda's parts, the cast around it, and the collection's own type"
@@ -1686,6 +1703,26 @@ impl Cx {
     ) -> Elim {
         let mut raised = Vec::new();
         Self::escapes(&body, &mut raised);
+        if raised.is_empty() {
+            let Elim::Pure(body) = self.elim(body, &[]) else {
+                unreachable!("an element that no exception escapes eliminates to its value")
+            };
+            let lambda = kept
+                .rebuild(TypedExprNode::Lambda {
+                    param,
+                    body: Box::new(body),
+                })
+                .with_ty(lambda_ty.clone());
+            return Elim::Pure(match cast {
+                None => lambda,
+                Some((cast_kept, target)) => cast_kept
+                    .rebuild(TypedExprNode::Cast {
+                        value: Box::new(lambda),
+                        target,
+                    })
+                    .with_ty(ty.clone()),
+            });
+        }
         let inner = self.arms(&raised);
         let value_ty = body.ty.clone();
         let element = self.elim(body, &inner);
@@ -2046,11 +2083,16 @@ impl Cx {
         pure
     }
 
-    /// `ty` with each filter in it that may raise in its pure form ([`Self::pure_filter`]).
+    /// `ty` with each filter in it that may raise in its pure form ([`Self::pure_filter`]),
+    /// the types in a predicate's terms included.
     fn purify(&mut self, ty: &mut Type) {
         let filters = self.filters.clone();
         walk_refined_predicates_mut(ty, &filters, &(), &mut |predicate, _| {
             if !holds_raise(predicate) {
+                // A predicate whose term raises nothing can still hold a filter that does, in
+                // the type of a lambda's parameter. A rewrite there moves the memo's revision,
+                // which `PredMemo::rebuild` reads as a change.
+                self.purify_tree(predicate);
                 return false;
             }
             *predicate = self.pure_filter(std::mem::take(predicate));
