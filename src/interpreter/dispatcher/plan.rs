@@ -9,7 +9,7 @@ use std::sync::{PoisonError, RwLock};
 use smol_str::SmolStr;
 
 use super::loop_scope::{self, Body, Member, induction};
-use super::workers::{WorkerPool, WorkerTarget};
+use super::workers::{WorkerBreaker, WorkerPool, WorkerTarget};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
@@ -423,7 +423,7 @@ fn run_targets(
         };
         let pipeline = planner.add(Located::Sink(at), format!("SinkBreaker#{at}"), None, under);
         sink_pipelines.push(pipeline);
-        sink_breakers.push(RwLock::new(breaker));
+        sink_breakers.push(Arc::new(RwLock::new(breaker)));
     }
     planner.check_direct();
     if let Some(refused) = planner.refused.take() {
@@ -872,20 +872,28 @@ fn run_targets(
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
     };
-    let worker_targets: Vec<Option<BreakerHandle>> = execution
+    let worker_targets: Vec<Option<WorkerBreaker>> = execution
         .handlers
         .iter()
         .enumerate()
         .map(|(pipeline, handler)| match handler {
-            Handler::Root => match members.located[pipeline] {
-                Located::Chain(handle) => Some(handle.clone()),
+            Handler::Root => match &members.located[pipeline] {
+                Located::Chain(handle) => Some(WorkerBreaker::Chain(handle.clone())),
+                Located::Sink(sink) => Some(WorkerBreaker::Sink(sink_breakers[*sink].clone())),
                 _ => None,
             },
-            Handler::Body(handle) => Some(handle.clone()),
+            Handler::Body(handle) => Some(WorkerBreaker::Chain(handle.clone())),
             _ => None,
         })
         .collect();
-    let consuming: Vec<BreakerHandle> = worker_targets.iter().flatten().cloned().collect();
+    let consuming: Vec<BreakerHandle> = worker_targets
+        .iter()
+        .flatten()
+        .filter_map(|target| match target {
+            WorkerBreaker::Chain(handle) => Some(handle.clone()),
+            WorkerBreaker::Sink(_) => None,
+        })
+        .collect();
     // A push into a scope's pipeline offers the scope requests, which the coordinator queues after
     // the consume or the finish that pushed them (`Execution::consume`, `Execution::finish`), so
     // a pipeline a scope's pipeline reads stays the coordinator's. A loop's drive source offers
@@ -903,10 +911,21 @@ fn run_targets(
         .into_iter()
         .zip(read_by_scope)
         .map(|(target, read_by_scope)| {
-            target.map(|handle| WorkerTarget {
-                restated: chain_restated_level(&handle, &consuming),
-                serial: !read_by_scope,
-                handle,
+            target.and_then(|handle| {
+                let restated = match &handle {
+                    WorkerBreaker::Chain(chain) => chain_restated_level(chain, &consuming),
+                    WorkerBreaker::Sink(sink) => {
+                        // A sink is the workers' only where its packages run at once: one handed
+                        // a package at a time stays on the coordinator, which hands a `main`
+                        // output its answers.
+                        Some(sink_restated_level(sink, &consuming)?)
+                    }
+                };
+                Some(WorkerTarget {
+                    restated,
+                    serial: !read_by_scope,
+                    handle,
+                })
             })
         })
         .collect();
@@ -3308,13 +3327,36 @@ fn chain_restated_level(
 ) -> Option<CurryLevel> {
     let breaker = breaker.read().unwrap_or_else(PoisonError::into_inner);
     let producer = breaker.as_producer()?;
+    restated_level(&*breaker, consuming, &mut |visit| {
+        producer.visit_input_producers(&mut |_, input| visit(input));
+    })
+}
+
+/// [`chain_restated_level`] for a sink at the root of the run, whose input is the producer it
+/// pulls.
+fn sink_restated_level(
+    sink: &RwLock<crate::interpreter::tile_operators::SinkBreaker>,
+    consuming: &[BreakerHandle],
+) -> Option<CurryLevel> {
+    let sink = sink.read().unwrap_or_else(PoisonError::into_inner);
+    restated_level(&*sink, consuming, &mut |visit| sink.visit_input(visit))
+}
+
+/// The deepest level whose keys every input of `breaker`, visited by `inputs`, and the chain
+/// beneath each restate; `None` where `breaker` consumes one package at a time or not even the
+/// outermost keys are restated.
+fn restated_level(
+    breaker: &dyn Breaker,
+    consuming: &[BreakerHandle],
+    inputs: &mut dyn FnMut(&mut dyn FnMut(&dyn crate::interpreter::tile_operators::TileProducer)),
+) -> Option<CurryLevel> {
     if !breaker.consumes_concurrently() {
         return None;
     }
     let levels = breaker.input_tiling(InputId::ONLY).levels();
-    let restates = |level: CurryLevel| {
+    let mut restates = |level: CurryLevel| {
         let mut refused = false;
-        producer.visit_input_producers(&mut |_, input| {
+        inputs(&mut |input| {
             // The breaker's own input answers the package as it is: the walk below stops at a
             // recurrence slot or a store read, which the input itself may be.
             refused |= input.restates().refuses(level)
