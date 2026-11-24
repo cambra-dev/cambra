@@ -3726,10 +3726,11 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 /// Each crash point is tried over a store that makes its writes durable after every step, and,
 /// where `lag` is above 1, over one that makes them durable after every `lag`-th step, so a crash
 /// loses the writes of up to `lag - 1` steps and the release gates keep every source position those
-/// writes cover. A case with a transaction or a nested loop has a `lag` of 1, since it does not
-/// recover from a lagging store: a transaction's acknowledging releases pass no gate
-/// (`BreakingProducer::releases_acknowledge`), and an inner loop's store releases to its driver
-/// inside one step (`docs/durability.md`, "Checkpoints").
+/// writes cover. Where `lag` is above 1, each crash point is also tried with only each proper
+/// prefix of that step's writes durable, as a store that stops partway through making them durable
+/// leaves. A case with a transaction has a `lag` of 1, since it does not recover from a lagging
+/// store: a transaction's acknowledging releases pass no gate
+/// (`BreakingProducer::releases_acknowledge`).
 #[rstest_log::rstest]
 #[case::a_map(
     "[x * 10 for x in source1()]",
@@ -3840,21 +3841,21 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         for y in [1, 2]:
             total += x * y
     total
-"}, "45", 1)]
+"}, "45", 3)]
 #[case::a_nested_loop_of_three_positions(indoc! {"
     total := 0
     for x in source1():
         for y in [1, 2, 3]:
             total += x * y
     total
-"}, "90", 1)]
+"}, "90", 3)]
 #[case::a_nested_loop_over_the_source(indoc! {"
     total := 0
     for x in source1():
         for y in source1():
             total += x * y
     total
-"}, "225", 1)]
+"}, "225", 3)]
 fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     #[case] source: &str,
     #[case] expected: &str,
@@ -3863,16 +3864,51 @@ fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     #[values(false, true)] retains: bool,
 ) {
     assert!(
-        recovers(source, expected, rows, retains, lag, None),
+        recovers(source, expected, rows, retains, lag, None).is_some(),
         "a run checkpointed at its first pause recovers: {source}"
     );
+    let cuts = lag > 1;
     let lags = if lag == 1 { vec![1] } else { vec![1, lag] };
     for lag in lags {
         let mut step = 1;
-        while recovers(source, expected, rows, retains, lag, Some(step)) {
+        while let Some(pending) = recovers(
+            source,
+            expected,
+            rows,
+            retains,
+            lag,
+            Some(Crash::after(step)),
+        ) {
+            // At a lag of 1 the writes pending at a crash are that step's alone.
+            if cuts && lag == 1 {
+                for kept in 1..pending {
+                    let crash = Crash {
+                        after: step,
+                        kept: Some(kept),
+                    };
+                    recovers(source, expected, rows, retains, lag, Some(crash))
+                        .expect("a run that reached a crash point reaches it again");
+                }
+            }
             step += 1;
         }
         assert!(step > 1, "a run takes a step: {source}");
+    }
+}
+
+/// Where a process crashes: after the crash point `after`, with the writes made durable at earlier
+/// crash points kept. Where `kept` is set, the store keeps only the first `kept` writes that are
+/// not durable yet at the crash; otherwise it makes them durable at the crash as `lag` says
+/// ([`Persisting`]).
+#[derive(Clone, Copy, Debug)]
+struct Crash {
+    after: usize,
+    kept: Option<usize>,
+}
+
+impl Crash {
+    fn after(after: usize) -> Self {
+        Self { after, kept: None }
     }
 }
 
@@ -3881,7 +3917,7 @@ struct Crashed;
 
 /// A durable run's observer: it steps the durability after each step and at each drained
 /// boundary (`Durability::step`), makes the store's writes durable after every `lag`-th step,
-/// pauses at every drained boundary, and crashes after the crash point `crash_after` names.
+/// pauses at every drained boundary, and crashes as `crash` says.
 ///
 /// Every top-level step is a crash point, those inside a loop's or a transaction's open request
 /// included: the recovered run rebuilds the request from the breakers (`durability`).
@@ -3892,7 +3928,9 @@ struct Persisting {
     lag: usize,
     /// The crash points passed so far.
     steps: usize,
-    crash_after: Option<usize>,
+    crash: Option<Crash>,
+    /// How many writes were not durable yet at the crash, before the crash made any durable.
+    pending_at_crash: Option<usize>,
 }
 
 impl Persisting {
@@ -3904,7 +3942,7 @@ impl Persisting {
         store: std::sync::Arc<crate::interpreter::durability::MemoryStore>,
         handed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         lag: usize,
-        crash_after: Option<usize>,
+        crash: Option<Crash>,
     ) -> Self {
         use std::hash::{Hash, Hasher};
         let mut program = std::hash::DefaultHasher::new();
@@ -3922,7 +3960,8 @@ impl Persisting {
             durability,
             lag,
             steps: 0,
-            crash_after,
+            crash,
+            pending_at_crash: None,
         }
     }
 }
@@ -3936,10 +3975,16 @@ impl crate::interpreter::dispatcher::RunObserver for Persisting {
     fn stepped(&mut self) {
         self.durability.step(&self.roots);
         self.steps += 1;
-        if self.steps.is_multiple_of(self.lag) {
-            self.store.flush();
+        let crash = self.crash.filter(|crash| crash.after == self.steps);
+        if crash.is_some() {
+            self.pending_at_crash = Some(self.store.pending());
         }
-        if self.crash_after == Some(self.steps) {
+        match crash.and_then(|crash| crash.kept) {
+            Some(kept) => self.store.flush_first(kept),
+            None if self.steps.is_multiple_of(self.lag) => self.store.flush(),
+            None => {}
+        }
+        if crash.is_some() {
             std::panic::resume_unwind(Box::new(Crashed));
         }
     }
@@ -4059,11 +4104,12 @@ fn compiled_over_source1(
 }
 
 /// Run `source` over `two_batches` in a process that stops, recover in another from the store it
-/// leaves, run what is left, and check the answer. Answers `false`, checking nothing, where the
-/// run ends before the crash point `crash_after` names.
+/// leaves, run what is left, and check the answer. Answers how many writes were not durable yet
+/// at the crash, before the crash made any durable (0 without a crash), and `None`, checking
+/// nothing, where the run ends before the crash point `crash` names.
 ///
-/// With `crash_after` `None`, the process stops at the first delivery's pause and every write is
-/// durable there. Otherwise it crashes at that crash point ([`Persisting`]), and the writes not yet
+/// With `crash` `None`, the process stops at the first delivery's pause and every write is
+/// durable there. Otherwise it crashes as `crash` says ([`Persisting`]), and the writes not yet
 /// durable are lost. Both runs use one worker, so no worker steps while the durability does. The
 /// crash points are every top-level step, so the test is quadratic in a program's steps.
 fn recovers(
@@ -4072,8 +4118,8 @@ fn recovers(
     rows: usize,
     retains: bool,
     lag: usize,
-    crash_after: Option<usize>,
-) -> bool {
+    crash: Option<Crash>,
+) -> Option<usize> {
     use crate::interpreter::dispatcher::Ended;
     use crate::interpreter::durability::MemoryStore;
     let main = std::sync::Arc::new(MainAnswers::default());
@@ -4084,7 +4130,7 @@ fn recovers(
         });
     let batches = two_batches();
     let delivered = std::cell::Cell::new(1);
-    let (store, released, old_source) = {
+    let (store, released, old_source, pending) = {
         let (_ctx, feed, slot, targets) =
             compiled_over_source1(source, &batches[0].0, batches[0].1.clone(), &recipient);
         let store = std::sync::Arc::new(MemoryStore::default());
@@ -4094,7 +4140,7 @@ fn recovers(
             store.clone(),
             targets.main_handed_terminal(),
             lag,
-            crash_after,
+            crash,
         );
         let run = |observer: &mut Persisting| match targets
             .run_with_workers(rows, 1, observer)
@@ -4108,7 +4154,7 @@ fn recovers(
                 run(&mut observer),
                 "the first delivery's run pauses: {source}"
             );
-            if crash_after.is_none() {
+            if crash.is_none() {
                 return;
             }
             let mut written = feed.write().unwrap_or_else(PoisonError::into_inner);
@@ -4121,18 +4167,19 @@ fn recovers(
                 "the last delivery's run ends: {source}"
             );
         }));
-        match (crashed, crash_after) {
+        match (crashed, crash) {
             (Ok(()), None) => store.flush(),
-            (Ok(()), Some(_)) => return false,
+            (Ok(()), Some(_)) => return None,
             (Err(payload), Some(_)) if payload.is::<Crashed>() => {}
             (Err(payload), _) => std::panic::resume_unwind(payload),
         }
+        let pending = observer.pending_at_crash;
         drop(observer);
         let released = feed
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get_released_predicate();
-        (store.crashed(), released, feed.downgrade())
+        (store.crashed(), released, feed.downgrade(), pending)
     };
     assert!(
         old_source.upgrade().is_none(),
@@ -4171,13 +4218,13 @@ fn recovers(
     }
     assert!(
         matches!(run(), Ended::Done(_)),
-        "the recovered run ends after the last delivery: {source}, crash after {crash_after:?}"
+        "the recovered run ends after the last delivery: {source}, crash after {crash:?}"
     );
     let value = main.kept.value().expect("the `main` output's value");
     assert_eq!(
         rendered_in_key_order(&value),
         expected,
-        "{source}, crash after {crash_after:?}"
+        "{source}, crash after {crash:?}"
     );
     assert!(
         main.printed
@@ -4186,17 +4233,17 @@ fn recovers(
             .iter()
             .any(crate::interpreter::Tile::is_terminal),
         "the recipient is handed an answer that states the output complete: {source}, crash after \
-         {crash_after:?}"
+         {crash:?}"
     );
     if let Value::Function(_) = &value {
         assert_eq!(
             main.keys.load(std::sync::atomic::Ordering::SeqCst),
             value.as_function().iter().count(),
             "the recipient is handed each key once, across the crash: {source}, crash after \
-             {crash_after:?}"
+             {crash:?}"
         );
     }
-    true
+    Some(pending.unwrap_or_default())
 }
 
 /// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.

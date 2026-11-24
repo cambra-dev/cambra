@@ -44,7 +44,13 @@
 //! reload"), and a loop's round first runs the position its drive emitted past the store's decided
 //! path ([`TileProducer::emitted_undecided`](crate::interpreter::tile_operators::TileProducer::emitted_undecided)).
 //!
-//! Seven gaps remain:
+//! A loop's store is gated like any breaker whose releases do not acknowledge. Its release of its
+//! body stops at the body's gate, so the drive reclaims an emitted row, and releases its source,
+//! only once a durable checkpoint of the store holds the decision that row fed. The recovery test
+//! crashes nested loops over a lagging store, and with each prefix of a step's writes durable
+//! (`program_run_tests::a_run_recovered_from_a_checkpoint_answers_as_one_run`).
+//!
+//! Six gaps remain:
 //!
 //! - A breaker's key is its position in [`walk`], checked by its kind, tiling and input roles. That
 //!   holds only between two compilations of one text in one version.
@@ -58,9 +64,6 @@
 //!   the two reads, and the copy then holds rows past `taken`, which recovery delivers again.
 //! - A transaction's commits are as durable as the store's checkpoint at the end of the step, since
 //!   the releases that acknowledge them pass no gate.
-//! - An induction loop's store releases to its driver inside one step, so a crash between
-//!   checkpoints of a nested loop's store and driver can leave them at different positions
-//!   (`docs/durability.md`, "Checkpoints").
 //! - A source's credit does not count the releases its readers' gates hold, so a store that makes
 //!   writes durable slowly grows what each input keeps instead of slowing the source.
 

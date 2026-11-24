@@ -80,14 +80,26 @@ impl MemoryStore {
 
     /// Make every write so far durable.
     pub(crate) fn flush(&self) {
+        self.flush_first(usize::MAX);
+    }
+
+    /// Make durable the first `count` writes that are not durable yet, in ticket order, as a store
+    /// that stops partway through making them durable does.
+    pub(crate) fn flush_first(&self, count: usize) {
         let mut state = self.state();
-        let pending = std::mem::take(&mut state.pending);
+        let count = count.min(state.pending.len());
+        let pending: Vec<_> = state.pending.drain(..count).collect();
         if let Some((last, _, _)) = pending.last() {
             state.durable_through = Some(*last);
         }
         for (_, key, record) in pending {
             state.durable.insert(key, record);
         }
+    }
+
+    /// How many writes are not durable yet.
+    pub(crate) fn pending(&self) -> usize {
+        self.state().pending.len()
     }
 
     /// The store a crash leaves: the durable writes, the program and the fence, without the

@@ -976,13 +976,16 @@ step the run writes a checkpoint of each breaker whose issued releases changed, 
 each input what a durable checkpoint covers, which is when the input reclaims. The inputs of the
 commit operator and of a transaction's writer pass no gate, because their releases acknowledge a
 commit and finish a position within one step. A test over an in-memory store whose writes become
-durable every third step recovers after a crash at any step, for programs with no transaction and no
-nested loop. A transaction drive recovered from an older checkpoint emits its next attempt past
-every attempt its readers released (`TileProducer::reader_released`), since a row it emitted again
-would carry another frontier. A loop's or a transaction's open request is not written: the recovered
-run rebuilds it from the stores and drives. A constructor's tag encodes its declaration as the
-process's id, so a checkpoint decodes in the process that wrote it, and a breaker's only identity
-across compilations is its position in a walk of the graph.
+durable every third step recovers after a crash at any step, for programs with no transaction. A
+loop's store releases its body through the body's gate, so the drive reclaims an emitted row only
+once a durable checkpoint of the store holds the decision the row fed. The test also crashes with
+each prefix of a step's writes durable (`a_run_recovered_from_a_checkpoint_answers_as_one_run`). A
+transaction drive recovered from an older checkpoint emits its next attempt past every attempt its
+readers released (`TileProducer::reader_released`), since a row it emitted again would carry another
+frontier. A loop's or a transaction's open request is not written: the recovered run rebuilds it
+from the stores and drives. A constructor's tag encodes its declaration as the process's id, so a
+checkpoint decodes in the process that wrote it, and a breaker's only identity across compilations
+is its position in a walk of the graph.
 
 A producer chooses when to checkpoint. Checkpointing once the input it has taken since its last
 checkpoint passes a bound keeps what recovery recomputes for that producer below the bound, which
