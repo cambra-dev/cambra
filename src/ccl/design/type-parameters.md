@@ -569,6 +569,14 @@ the positions two types share for every shape of type, a function's Σ candidate
 the binders each side puts around a position. A shape the walk does not pair is a leaf, a
 refinement or a generic type, which the walk handles itself.
 
+Constructor generalization uses the same handling of type binders, including data functions
+nested in variant payloads. Abstraction updates ordinary quoted type slots as their binders'
+types change. A quoted `Cast` transports its value and the annotations in its filter predicates.
+Its target retains the filter, and both stored types are reconstructed from the transported
+value by the same rule as cast canonicalization. Replacing the computed domain with a parameter
+would remove the filter. A domain that still names an escaping binder through that computation
+becomes a parameter or family whole.
+
 Check instantiates a generalized type where it is used: at a chain edge from the codomain before it,
 at a chain's head from the chain's input, and at an application from the argument
 (`generalize::instantiate`). It matches the type's domain against what it receives, with every
