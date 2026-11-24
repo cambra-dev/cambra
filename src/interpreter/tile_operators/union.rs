@@ -782,18 +782,6 @@ impl TileProducer for UnionProducer {
         Restates::Every
     }
 
-    /// An arm is pulled at the level a projection names, or at the nearest level above that the
-    /// arm restates ([`Projection::restated_by`]), and the declaration is that level. A tagged
-    /// union's projection reaches an arm under the arm's tag at the same level.
-    fn input_level(&self, role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        let arm = role
-            .strip_prefix('_')
-            .and_then(|arm| arm.parse::<usize>().ok())
-            .and_then(|arm| self.inputs.get(arm))
-            .unwrap_or_else(|| panic!("{} has no arm {role}", self.name()));
-        Some(arm.restates().nearest(level))
-    }
-
     /// A flat union's arms are disjoint slices of one collection, so each is pulled at the
     /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
     /// projection reaches each arm as what it names under that arm's tag, as a release does, and
@@ -817,11 +805,7 @@ impl TileProducer for UnionProducer {
                 .zip(&self.tags)
                 .map(|(p, tag)| match under_arm(keys, level.index(), tag) {
                     under if under.is_false() => p.tiling().empty_tile(),
-                    under => p.get(
-                        Projection::keys_at(*level, under)
-                            .restated_by(&p.restates())
-                            .guard(p.tiling()),
-                    ),
+                    under => p.get(Projection::keys_at(*level, under).guard(p.tiling())),
                 })
                 .collect();
             let mut merged = self.combine(tiles);
@@ -869,10 +853,8 @@ impl TileProducer for UnionProducer {
                     }
                     return released;
                 }
-                // An arm may compute values beneath a shallower level. Read at the nearest
-                // level it restates, then cut the combined answer to the requested projection.
                 match &tags {
-                    None => p.get(projection.restated_by(&p.restates()).guard(p.tiling())),
+                    None => p.get(projection.guard(p.tiling())),
                     Some(pred) => {
                         let under = pred
                             .under_tag(&self.tags[arm])
@@ -1177,11 +1159,11 @@ mod tests {
                         .guard(&arm_tiling)
                 ),
             );
-            // The arm restates its outermost keys only, so the level it is declared at is the
-            // level it was pulled at.
+            // The arm is declared at the level the union is pulled at, and widens its own pull to
+            // its outermost keys, the only ones it restates (`TileProducer::get`).
             assert_eq!(
                 union.input_level("_0", CurryLevel::new(1)),
-                Some(CurryLevel::OUTERMOST)
+                Some(CurryLevel::new(1))
             );
             union.release(guard);
         }

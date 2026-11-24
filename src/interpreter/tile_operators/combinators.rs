@@ -673,19 +673,13 @@ impl TileProducer for MapDomainProducer {
         Restates::Every
     }
 
-    /// Every level's keys stand, so the input is pulled at the projection, or at the nearest level
-    /// above that the input restates ([`Projection::restated_by`]).
+    /// Every level's keys stand, so the input is pulled at the projection.
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let restated = projection.restated_by(&self.input.restates());
-        let mut tile = self.input.get(restated.guard(self.input.tiling()));
-        // A pull widened to a level above is cut back to what was asked.
-        if restated != projection {
-            tile.restrict_to(&projection, self.input.tiling());
-        }
+        let mut tile = self.input.get(projection.guard(self.input.tiling()));
         // The keys stand, so only the values at the level are replaced, in place. They are no
         // collection afterwards, so the level's keys follow none.
         tile.unfollow_values_at(CurryLevel::new(self.level.index() + 1));
@@ -902,15 +896,12 @@ impl TileProducer for UncurryProducer {
     }
 
     /// At and beneath the pairs, a pair is its outer key with its inner key on the next input
-    /// level, so the input is pulled at most one level deeper; above them it keeps its keys. An
-    /// input that does not restate that level is pulled at the nearest level above that it
-    /// restates ([`Projection::restated_by`]), and the declaration is that level.
+    /// level, so the input is pulled at most one level deeper; above them it keeps its keys.
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        let unpaired = match level.index() < self.level.index() {
+        Some(match level.index() < self.level.index() {
             true => level,
             false => CurryLevel::new(level.index() + 1),
-        };
-        Some(self.input.restates().nearest(unpaired))
+        })
     }
 
     /// Projections above the paired level keep their keys. At and beneath that level,
@@ -936,12 +927,7 @@ impl TileProducer for UncurryProducer {
             }
             above_the_pairs => above_the_pairs.clone(),
         };
-        // An input that does not restate the level `pulled` names is pulled at the nearest
-        // level above that it does, and the pairs are cut after.
-        let input_guard = pulled
-            .restated_by(&self.input.restates())
-            .guard(self.input.tiling());
-        let input_tile = self.input.get(input_guard);
+        let input_tile = self.input.get(pulled.guard(self.input.tiling()));
         // Pair beneath the standing levels, which stand unchanged: a row's group is a
         // curried collection in its own right, so the pairing below is the same one a
         // depth-zero `Uncurry` does to the whole tile.
@@ -4950,11 +4936,12 @@ mod uncurry_projection_tests {
         assert_eq!(pair_count(&morsel), 1, "only the pair (1, 2): {morsel:?}");
     }
 
-    /// The level `input_level` declares for a pull of pairs is the level the grouping is pulled
-    /// at: the pair's path one level in for a grouping that restates every level, and its group
-    /// for one that restates its outermost keys only.
+    /// `input_level` declares a pull of pairs at the pair's path one level in, whatever the
+    /// grouping restates. A grouping that restates every level is pulled there; one that restates
+    /// its outermost keys only is pulled at its group, the nearest level it restates, by the `get`
+    /// wrapper.
     #[test]
-    fn the_declared_input_level_is_the_level_the_grouping_is_pulled_at() {
+    fn the_declared_input_level_is_the_pairs_path_and_the_grouping_widens_its_own_pull() {
         let pair = pairs(
             Predicate::point(Value::Int(1)),
             Predicate::point(Value::UInt(2)),
@@ -4967,7 +4954,7 @@ mod uncurry_projection_tests {
             let restates = uncurry.input.restates();
             assert_eq!(
                 uncurry.input_level("input", CurryLevel::OUTERMOST),
-                Some(level),
+                Some(CurryLevel::new(1)),
                 "{restates}"
             );
             let [guard] = pulled

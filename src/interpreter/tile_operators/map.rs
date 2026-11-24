@@ -1241,14 +1241,8 @@ impl MapResultToConstProducer {
         // A scalar input has no keys to project, so it is read whole and the answer cut. Applied
         // at the outermost level the constant replaces the whole input, so the output's keys are
         // the constant's and the projection names none of the input's.
-        // The input is read at the nearest level above it restates, as a union reads an arm: a
-        // region with part of a row released names keys beneath the outermost, which an input
-        // restating only its outermost keys has no exact answer to.
         let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
-            true => projection
-                .above(self.level)
-                .restated_by(&self.input.restates())
-                .guard(&i_tiling),
+            true => projection.above(self.level).guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);

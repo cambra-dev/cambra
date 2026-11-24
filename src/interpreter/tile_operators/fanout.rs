@@ -1326,14 +1326,13 @@ impl TileProducer for FanOutProducer {
     }
 
     /// A cyclic fan-out reads its input whole ([`get_impl`](Self::get_impl)); any other pulls
-    /// it at the nearest level at or above the one it is pulled at that the input restates.
+    /// it at the level it is pulled at.
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
         let shared = self.shared();
         let shared = shared.read().unwrap_or_else(PoisonError::into_inner);
-        match (&shared.reentrancy, &shared.producer) {
-            (Some(_), _) => None,
-            (None, Some(Inner::Owned(producer))) => Some(producer.restates().nearest(level)),
-            (None, _) => Some(level),
+        match &shared.reentrancy {
+            Some(_) => None,
+            None => Some(level),
         }
     }
 
@@ -1405,13 +1404,7 @@ impl TileProducer for FanOutProducer {
                 .as_ref()
                 .expect("a pulled slot is subscribed")
             {
-                // The input is pulled at the nearest keys at or above the projection that it
-                // restates, and the answer is cut to the projection below.
-                Inner::Owned(producer) => producer.get(
-                    projection
-                        .restated_by(&producer.restates())
-                        .guard(producer.tiling()),
-                ),
+                Inner::Owned(producer) => producer.get(projection.guard(producer.tiling())),
                 Inner::Store(_) => unreachable!("matched above"),
             },
         };
@@ -1638,13 +1631,6 @@ impl MemoProducer {
     /// of the input: what the answer states complete, and the keys of `projection` the cache now
     /// states complete.
     fn read_input(&self, guard: TileGuard, projection: &Projection) -> TileGuard {
-        // An input that does not restate the level the read names is read at the nearest level
-        // above that it does: reading more is sound, and the merge keeps what the cache held.
-        let restated = projection.restated_by(&self.input.restates());
-        let guard = match restated == *projection {
-            true => guard,
-            false => restated.guard(self.input.tiling()),
-        };
         let mut input = self.input.get(guard);
         let mut released = input.to_guard();
         input.compact();
