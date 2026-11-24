@@ -3320,38 +3320,41 @@ fn rows_above_positions(tiling: &Tiling) -> usize {
 }
 
 /// Whether `pieces`, keys a range in `pipeline`'s chain yielded, reach `pipeline`'s own entry as
-/// disjoint regions of the outermost keys of its input. A range beneath those keys, as the inner
-/// range of a nest is, reaches each row whole or in part, and its pieces then name the same rows.
+/// disjoint regions of its input, at whatever level they land. A range beneath the pipeline's
+/// outermost keys, as a nest's inner range is, lands each piece beneath the rows it reaches: the
+/// pieces are disjoint where they name different inner keys, and they run alone or beside each
+/// other as the chain restates that level ([`chain_restated_level`]). Pieces that land on the same
+/// region, as a range re-keyed onto values its pieces share would, are pushed whole.
 ///
 /// The first two pieces decide for all of them: every piece is a region of the same range pushed
 /// through the same consumers, so the chain maps each piece's keys to the pipeline's keys the same
 /// way. They are pushed through a probe landing, which records where they arrive and queues and
 /// records nothing else ([`Landing::probe`]).
 fn lands_as_morsels(consumer: &SharedConsumer, pipeline: PipelineId, pieces: &[Predicate]) -> bool {
-    let landed = |piece: &Predicate| -> Option<Predicate> {
+    let landed = |piece: &Predicate| -> Option<TileGuard> {
         let mut landing = Landing::probe(pipeline);
         crate::interpreter::notifications::notify_shared(
             consumer,
             &Projection::admitting(piece.clone()),
             &mut landing,
         );
-        landing
+        let guards: Vec<TileGuard> = landing
             .arrivals()
             .into_iter()
             .filter(|arrival| arrival.pipeline.0 == pipeline.0)
-            .try_fold(Predicate::False, |keys, arrival| match arrival.guard {
-                TileGuard::Function(FunctionGuard::Domain(landed)) if !landed.qualifies() => {
-                    Some(keys.union(&landed))
-                }
-                _ => None,
-            })
-            .filter(|keys| !keys.is_false())
+            .map(|arrival| arrival.guard)
+            .collect();
+        if guards.is_empty() {
+            return None;
+        }
+        let guard = TileGuard::flatten_or(guards);
+        (!guard.is_empty()).then_some(guard)
     };
     let [first, second, ..] = pieces else {
         return true;
     };
     match (landed(first), landed(second)) {
-        (Some(first), Some(second)) => first.intersect(&second).is_false(),
+        (Some(first), Some(second)) => first.intersect(&second).is_empty(),
         _ => false,
     }
 }
@@ -3740,9 +3743,8 @@ impl LivePipeline {
                 true => leaf.extent.morsels(&fresh, dispatcher.morsel_rows),
                 false => vec![fresh.clone()],
             };
-            // Pieces that land on overlapping keys of the pipeline, as a range beneath its outermost
-            // keys or a range re-keyed on its way does, would run one at a time, each releasing
-            // what the others still read, so the range's keys are pushed whole.
+            // Pieces that land on one region of the pipeline's input would run one at a time, each
+            // releasing what the others still read, so such a range's keys are pushed whole.
             let pieces = match !lands_as_morsels(&leaf.consumer, self.pipeline, &pieces) {
                 true => vec![fresh.clone()],
                 false => pieces,
