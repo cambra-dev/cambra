@@ -130,6 +130,13 @@ impl SinkBreaker {
         producer.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// `visit` on the producer this sink pulls.
+    pub(crate) fn visit_input(&self, visit: &mut dyn FnMut(&dyn TileProducer)) {
+        if let Some(producer) = Self::reading(&self.producer).as_ref() {
+            visit(&**producer);
+        }
+    }
+
     fn reading(
         producer: &ProducerSlot,
     ) -> std::sync::RwLockReadGuard<'_, Option<Box<dyn TileProducer>>> {
