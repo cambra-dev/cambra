@@ -3208,7 +3208,7 @@ fn close_over(mut e: Expr, kept: &[Kept]) -> Expr {
     e
 }
 
-/// What [`close_in_place`] closes: a term, or a feed's producer and row, which close together.
+/// What [`close_in_place`] closes: a term, or a feed's fed value and row, which close together.
 trait Closable {
     /// Whether the value or its types read `name`.
     fn reads(&self, name: &Name) -> bool;
@@ -3967,7 +3967,7 @@ impl<'a> WriterWalk<'a> {
             for f in &self.feeds[arm.feeds.clone()] {
                 if self.leaves_in_a_slot(f, arm) {
                     // The row names no binding of this arm (leaves_in_a_slot), so only
-                    // the producer and fire path add captured bindings here.
+                    // the fed value and fire path add captured bindings here.
                     leaving.extend([&f.value.value, &f.fire]);
                 }
             }
@@ -4723,9 +4723,9 @@ mod tests {
     fn closing_a_feed_transports_a_binding_read_only_by_its_row() {
         let name = Name::fresh("bound");
         let int = Type::Base(BaseType::Int);
-        let producer = typed_literal(9);
-        let producer_type = producer.ty.clone();
-        let mut value = FeedValue::new(producer, row_above(&name));
+        let fed_value = typed_literal(9);
+        let fed_value_type = fed_value.ty.clone();
+        let mut value = FeedValue::new(fed_value, row_above(&name));
         close_in_place(
             &mut value,
             &[Kept::Let(
@@ -4736,24 +4736,24 @@ mod tests {
         );
         assert!(!crate::ccl::subst::type_free_vars(&value.row).contains(&name));
         assert!(!value.row.refinements().is_empty());
-        assert_eq!(value.value.ty, producer_type);
+        assert_eq!(value.value.ty, fed_value_type);
         assert_ne!(value.value.ty, value.row);
     }
 
-    /// A producer reading the binding twice keeps it as a `let` under a fresh name, and the row
+    /// A fed value reading the binding twice keeps it as a `let` under a fresh name, and the row
     /// is lifted past that `let`.
     #[test]
-    fn closing_a_feed_keeps_a_binding_its_producer_reads_twice() {
+    fn closing_a_feed_keeps_a_binding_its_fed_value_reads_twice() {
         let name = Name::fresh("bound");
         let int = Type::Base(BaseType::Int);
         let read = tvar(&name, int.clone());
-        let producer = Expr::binop(
+        let fed_value = Expr::binop(
             read.clone(),
             crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
             read,
         )
         .with_ty(int.clone());
-        let mut value = FeedValue::new(producer, row_above(&name));
+        let mut value = FeedValue::new(fed_value, row_above(&name));
         close_in_place(
             &mut value,
             &[Kept::Let(
@@ -4769,7 +4769,7 @@ mod tests {
         } = &value.value.node
         else {
             panic!(
-                "the producer stays under its `let`: {}",
+                "the fed value stays under its `let`: {}",
                 symbolic(&value.value)
             )
         };

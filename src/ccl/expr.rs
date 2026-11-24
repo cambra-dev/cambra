@@ -2784,6 +2784,17 @@ impl TypedExpr {
     /// that rewrite type slots in place. Kept in lockstep with it — any new
     /// type-slot-bearing variant must appear in both.
     pub fn walk_type_slots_mut(&mut self, mut f: impl FnMut(&mut Type)) {
+        self.walk_ambient_type_slots_mut(&mut f);
+        if let TypedExprNode::For { target, .. } = &mut self.node {
+            f(&mut target.ty);
+            if let Some(annotation) = &mut target.user_annotation {
+                f(&mut annotation.ty);
+            }
+        }
+    }
+
+    /// Mutable analog of [`Self::walk_ambient_type_slots`].
+    pub fn walk_ambient_type_slots_mut(&mut self, mut f: impl FnMut(&mut Type)) {
         f(&mut self.ty);
         if let Some(annotation) = &mut self.user_annotation {
             f(annotation);
@@ -2817,12 +2828,14 @@ impl TypedExpr {
                 f(parameter);
             }
         }
-        self.walk_binders_mut(|b| {
-            f(&mut b.ty);
-            if let Some(annotation) = &mut b.user_annotation {
-                f(&mut annotation.ty);
-            }
-        });
+        if !matches!(self.node, TypedExprNode::For { .. }) {
+            self.walk_binders_mut(|b| {
+                f(&mut b.ty);
+                if let Some(annotation) = &mut b.user_annotation {
+                    f(&mut annotation.ty);
+                }
+            });
+        }
     }
 
     /// The name of every binder this node declares, outermost first: a `For`'s position, which

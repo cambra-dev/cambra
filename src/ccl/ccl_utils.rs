@@ -2096,7 +2096,7 @@ pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
 }
 
 /// The chain's type with its last morphism stated at `last_type`. A contribution's
-/// producer and storage row share the prefix but can state different codomains.
+/// fed value and row share the prefix but can state different codomains.
 pub(crate) fn chain_type_with_last(elts: &[Expr], last_type: &Type, stated: Type) -> Type {
     let mut types: Vec<Type> = elts
         .iter()

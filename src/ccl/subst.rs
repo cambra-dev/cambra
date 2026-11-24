@@ -2154,7 +2154,16 @@ impl Subst {
         if self.is_id() {
             return;
         }
-        e.walk_type_slots_mut(|ty| *ty = self.apply_type(ty));
+        e.walk_ambient_type_slots_mut(|ty| *ty = self.apply_type(ty));
+        if let TypedExprNode::For {
+            position, target, ..
+        } = &mut e.node
+        {
+            target.ty = self.under_binder_ty(position, &target.ty);
+            if let Some(annotation) = &mut target.user_annotation {
+                annotation.ty = self.under_binder_ty(position, &annotation.ty);
+            }
+        }
     }
 
     /// Rewrite a `Feed`/`Define` handle use (see the `Feed` arm above for
@@ -2334,7 +2343,15 @@ impl Subst {
         // *enclosing* scope (a binder does not bind in its own type), so the
         // unrestricted substitution is the right one for it, and the binder
         // crossings below still only guard the children.
-        e.walk_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
+        e.walk_ambient_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
+        if let TypedExprNode::For { position, target, .. } = &mut e.node {
+            let scoped = self.shadow(position);
+            scoped.assert_no_capture(position);
+            scoped.rewrite_type_go(&mut target.ty, memo);
+            if let Some(annotation) = &mut target.user_annotation {
+                scoped.rewrite_type_go(&mut annotation.ty, memo);
+            }
+        }
         e.own_capabilities = self.apply_capabilities(&e.own_capabilities);
 
         // Capture-avoiding descent, plus the node's own name occurrences. Which
@@ -4942,6 +4959,40 @@ mod tests {
             panic!("expected a refined row");
         };
         assert_eq!(*r.predicate, gt(var("i"), var("j")));
+    }
+
+    #[test]
+    fn transport_respects_the_position_scope_of_a_for_target_type() {
+        let row = Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
+            Refinement::born(Rc::new(gt(var("position"), var("outer")))),
+        );
+        let mut target = TypedBinding::new_unannotated("item", Occurrence::mint());
+        target.ty = row.clone();
+        let expr = TypedExpr::new(TypedExprNode::For {
+            position: Box::new(Name::from("position")),
+            target,
+            iter: Box::new(var("position").with_ty(row.clone())),
+            body: Box::new(var("item")),
+        });
+        let subst = Subst::of_binders(BTreeMap::from([
+            (
+                Name::from("position"),
+                Mapping::Rename(Name::from("elsewhere")),
+            ),
+            (Name::from("outer"), Mapping::Rename(Name::from("renamed"))),
+        ]));
+        let transported = subst.apply_expr(&expr);
+        let mut rewritten = expr;
+        subst.rewrite_expr(&mut rewritten);
+        let expected = Subst::rename("outer", "renamed").apply_type(&row);
+        for result in [&transported, &rewritten] {
+            let TypedExprNode::For { target, iter, .. } = &result.node else {
+                unreachable!()
+            };
+            assert_eq!(target.ty, expected);
+            assert_eq!(iter.ty, subst.apply_type(&row));
+        }
     }
 
     #[test]

@@ -941,7 +941,7 @@ struct Contribution {
 /// `feed_loop` is a loop, `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`, with no mutable variable written in
 /// `body`.
 ///
-/// Extraction lifts the producer and its recorded storage row through the same loop scopes.
+/// Extraction lifts the fed value and its row through the same loop scopes.
 pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
     let mut contributions = Vec::new();
     let mut rest = feed_loop;
@@ -1744,7 +1744,7 @@ struct Extract<'a> {
 /// reads one or holds a `letrec` of its own. The channel's type stands where the declaration
 /// does, outside every such group, and no type there can state the value. A `let` whose value
 /// reads none is not among them: a contribution reading its binder takes a copy of the `let`
-/// along, its type lifted past the binder ([`lifted_past`]). Nor are a loop's variable and a
+/// along, its type lifted past the binder ([`crate::ccl::ccl_utils::closed_let_type`]). Nor are a loop's variable and a
 /// `match` arm's payload: a feed's keys bind the first ([`crate::ccl::feed_nest`]), and the
 /// guard form a `match` converts to reads the second off its scrutinee.
 fn recursive_values(expr: &Expr) -> HashSet<Name> {
@@ -2895,7 +2895,7 @@ fn copair_type(feeds: &[Expr], sites: &[FieldKey], element: Option<&Type>) -> Ty
 /// or [`TypedExprNode::Case`] branch boundary — `Define` is disallowed in those
 /// contexts since the channelized binding would need to escape the inner scope.
 ///
-/// Each contribution retains its producer and storage row through extraction. Loop and
+/// Each contribution retains its fed value and row through extraction. Loop and
 /// scope constructors lift both types; consumers select a view after extraction.
 fn extract_for_defer(
     expr: Expr,
@@ -3895,7 +3895,7 @@ fn extract_for_defer_impl(
                 assert!(
                     !bindings.iter().any(|(b, _)| ty_fvs.contains(&b.name)),
                     "a contribution's type reads a `letrec` binding it is extracted from under: \
-                     producer {}, row {}",
+                     fed value {}, row {}",
                     feed.value.ty,
                     feed.row
                 );
@@ -3966,10 +3966,10 @@ mod tests {
     }
 
     #[test]
-    fn extraction_preserves_distinct_producer_and_storage_types() {
+    fn extraction_keeps_the_fed_value_type_apart_from_the_row() {
         let int = Type::Base(BaseType::Int);
         for depth in 0..=3 {
-            let producer = if depth == 0 {
+            let fed_value = if depth == 0 {
                 lit(9)
             } else {
                 Expr::binop(
@@ -3978,7 +3978,7 @@ mod tests {
                     lit(1),
                 )
             };
-            let mut body = Expr::feed("out", Occurrence::mint(), producer);
+            let mut body = Expr::feed("out", Occurrence::mint(), fed_value);
             for _ in 0..depth {
                 body = Expr::compose(vec![
                     Expr::list(vec![lit(1), lit(2)]),
@@ -4016,17 +4016,14 @@ mod tests {
                 contribution.value.indexed(contribution.levels)
             }
             .flatten(contribution.levels);
-            let producer = value.value.ty.codomain().expect("one flattened producer");
-            let stored = value
-                .row
-                .codomain()
-                .expect("one flattened storage contract");
-            assert_eq!(stored, int);
+            let fed_value = value.value.ty.codomain().expect("one flattened fed value");
+            let row = value.row.codomain().expect("one flattened row");
+            assert_eq!(row, int);
             assert!(
-                !producer.refinements().is_empty(),
-                "the producer retains its singleton type"
+                !fed_value.refinements().is_empty(),
+                "the fed value retains its singleton type"
             );
-            assert_ne!(producer, stored);
+            assert_ne!(fed_value, row);
             assert!(crate::ccl::subst::type_free_vars(&value.value.ty).is_empty());
             assert!(crate::ccl::subst::type_free_vars(&value.row).is_empty());
         }

@@ -2334,7 +2334,8 @@ allocation or `NodeId` no-op: expression-copy identity follows the provenance ru
 Both modes enumerate carried types through `TypedExpr::walk_type_slots_mut`, including feed
 rows, cast targets, binder declarations, annotations and transaction parameters. Transport
 rebuilds child terms under their binder crossings before applying the substitution to the
-rebuilt node's slots. A slot is transported once; simultaneous renames are not composed by
+rebuilt node's slots. A `For` target's types are transported under its position binder; other
+slots use the node's ambient scope. A slot is transported once; simultaneous renames are not composed by
 visiting it again.
 
 `Mapping::as_expr` gives a renamed variable the replaced occurrence's type and copies a discharge's
