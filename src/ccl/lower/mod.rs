@@ -1155,7 +1155,8 @@ impl LoweringContext {
                 Ok(()) => registered.push(SinkOutput {
                     subject: match sink {
                         DeclaredSink::Http { route, .. } => Some(format!(
-                            "the response collection for HTTP route `{route}` (call `respond`)"
+                            "the response collection for HTTP route `{}` (call `respond`)",
+                            route.describe()
                         )),
                         #[cfg(test)]
                         DeclaredSink::Test { .. } => None,

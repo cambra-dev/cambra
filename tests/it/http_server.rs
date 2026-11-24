@@ -18,7 +18,7 @@ use std::{
 use cambra::{
     ccl::{
         context::{CompileResultExt, GlobalContext, compile_program},
-        lower::{LoweringContext, LoweringError, lower_stmts},
+        lower::{LoweringContext, lower_stmts},
     },
     chl_parser,
     interpreter::{
@@ -495,57 +495,26 @@ fn test_http_serve_inside_an_expression_is_error() {
 
 /// `http_serve` inside an if/else branch is rejected at lowering time.
 #[test]
-fn the_http_intrinsic_is_private_in_a_branch() {
-    let port = reserve_test_port();
-    let code = indoc::formatdoc!(
-        r#"
-            if True:
-                requests, responses = http_serve("{port}", "POST", "/echo")
-                for req in requests:
-                    responses << req
-            "#
-    );
-    let mut ctx = LoweringContext::default();
-    let module = chl_parser::parse_module(FileId::ROOT, &code)
-        .into_result()
-        .expect("parse failed");
-    let result = lower_stmts(&module, &mut ctx);
-    assert!(
-        result
-            .errors
-            .iter()
-            .any(|e| format!("{e:?}").contains("HTTP routes are declared by running `std::http")),
-        "expected the private-intrinsic refusal, got: {:?}",
-        result.errors,
-    );
+fn test_http_serve_in_branch_body_is_error() {
+    assert_http_serve_refused_as_nested(indoc! {r#"
+        if true:
+            requests, responses = http_serve("PORT", "POST", "/echo")
+            for req in requests:
+                responses << req
+        0
+    "#});
 }
 
 /// `http_serve` inside a function body is rejected at lowering time.
 #[test]
-fn the_http_intrinsic_is_private_in_a_function() {
-    let port = reserve_test_port();
-    let code = indoc::formatdoc!(
-        r#"
-            def handler():
-                requests, responses = http_serve("{port}", "POST", "/echo")
-                for req in requests:
-                    responses << req
-            handler()
-            "#
-    );
-    let mut ctx = LoweringContext::default();
-    let module = chl_parser::parse_module(FileId::ROOT, &code)
-        .into_result()
-        .expect("parse failed");
-    let result = lower_stmts(&module, &mut ctx);
-    assert!(
-        result
-            .errors
-            .iter()
-            .any(|e| format!("{e:?}").contains("HTTP routes are declared by running `std::http")),
-        "expected the private-intrinsic refusal, got: {:?}",
-        result.errors,
-    );
+fn test_http_serve_in_function_body_is_error() {
+    assert_http_serve_refused_as_nested(indoc! {r#"
+        def handler():
+            requests, responses = http_serve("PORT", "POST", "/echo")
+            for req in requests:
+                responses << req
+        handler()
+    "#});
 }
 
 /// Lower `template` with a free port in place of `PORT`, and assert that `http_serve` is refused

@@ -206,6 +206,17 @@ pub(super) enum RouteAddress {
 }
 
 impl HttpRoute {
+    pub(super) fn describe(&self) -> String {
+        match &self.address {
+            RouteAddress::Fixed { port, method, path } => {
+                format!("`{method} {path}` on port {port}")
+            }
+            RouteAddress::Constant { port, method, path } => {
+                format!("`{method} {path}` on port {port}")
+            }
+        }
+    }
+
     /// The route at the address `port`, `method` and `path`, or why it has none: a port is a
     /// number below 65536.
     fn fixed(port: &str, method: &str, path: &str) -> Result<HttpRoute, String> {
