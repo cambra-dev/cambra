@@ -713,9 +713,17 @@ impl TileProducer for MapExtractAggregateProducer {
             .unwrap_or_else(|| panic!("Expected bools"));
         *slot = self.kind.extract(*accumulator);
         // One bool per accumulator, so the mask is over the innermost collection's keys.
-        output
-            .values_at_mut(CurryLevel::new(self.input.tiling().levels() - 1))
-            .retain_keys(mask);
+        let keys = CurryLevel::new(self.input.tiling().levels() - 1);
+        let undecided = Predicate::union_all(
+            output
+                .paths_at(keys)
+                .iter()
+                .zip(mask.iter())
+                .filter(|(_, terminal)| !**terminal)
+                .map(|(path, _)| Predicate::exactly(path))
+                .collect(),
+        );
+        output.values_at_mut(keys).retain_keys(mask);
         // Extracted collections are a column over the groups kept, so their statements name
         // only those paths. The input's enclosing completion statements remain unchanged.
         let values = CurryLevel::new(self.input.tiling().levels());
@@ -730,6 +738,15 @@ impl TileProducer for MapExtractAggregateProducer {
             output
                 .values_at_mut(values)
                 .map_level_predicates(&mut |depth, stated| stated.qualified_by(&rows, depth));
+        }
+        // A key whose aggregation is not terminal is held back, not absent: no statement may
+        // call it decided, so the answer is restricted to the other keys, which also cuts a
+        // statement above that would state it ([`Tile::restrict_to`]).
+        if !undecided.is_false() {
+            output.restrict_to(
+                &Projection::keys_at(keys, Predicate::True.minus(&undecided)),
+                self.tiling(),
+            );
         }
         output
     }
@@ -961,7 +978,7 @@ struct MapAggregateProducer {
 /// Group accumulators and completeness protected by the canonical breaker lock.
 pub(crate) struct MapAggregateState {
     kind: AggregateKind,
-    accumulators: HashMap<Vec<Value>, Tile>,
+    accumulators: HashMap<Vec<Value>, GroupAccumulator>,
     keys_with_nothing_beneath: HashSet<Vec<Value>>,
     stated: Option<Stated>,
 }
@@ -1060,6 +1077,11 @@ impl MapAggregateState {
         // element the folded level calls complete.
         let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let values = (**codomain).clone();
+        // A `Sole` group keeps its one element, and an accumulator states a collection it holds
+        // over the paths within it, so the element's statements are restated within the
+        // element's own path (`Predicate::within`).
+        let element_paths = (matches!(self.kind, AggregateKind::Sole) && values.holds_a_level())
+            .then(|| input_tile.paths_at(CurryLevel::new(depth)));
 
         // Fold each group into its row's accumulator. A group is a contiguous run of the
         // folded collection's values, so the fold stays vectorized.
@@ -1070,10 +1092,23 @@ impl MapAggregateState {
                 continue;
             }
             let (start, end) = folded.row_run(row);
-            let acc = accumulators
-                .entry(path.clone())
-                .or_insert_with(|| kind.initial_accumulator(&output_tiling));
-            kind.accumulate(acc, &values, start, end);
+            let acc = accumulators.entry(path.clone()).or_insert_with(|| {
+                GroupAccumulator::new(*kind, &output_tiling, element_paths.is_some())
+            });
+            match &element_paths {
+                // Each member of the group is an element of its own: the run can hold the held
+                // member's grown element beside another member's.
+                Some(paths) => {
+                    for (member, element_path) in paths.iter().enumerate().take(end).skip(start) {
+                        let mut element = values.select_rows(&[member]);
+                        element.map_level_predicates(&mut |level, stated| {
+                            stated.within(element_path, level)
+                        });
+                        acc.add_element(*kind, element, element_path);
+                    }
+                }
+                None => acc.fold(*kind, &values, start, end),
+            }
         }
         // A key above the groups' level with nothing beneath it stands over no group, so no
         // accumulator's path reaches it. Its value is the empty collection, which the output
@@ -1133,7 +1168,7 @@ impl MapAggregateState {
         let mut entries: Vec<(Vec<Value>, Tile)> = self
             .accumulators
             .iter()
-            .map(|(path, acc)| (path.clone(), acc.clone()))
+            .map(|(path, acc)| (path.clone(), acc.tile().clone()))
             .collect();
         // Sorted so the outermost column stays ordered and a parent's children sit
         // contiguously, which is what rebuilding the offsets assumes.
@@ -1323,7 +1358,7 @@ impl TileProducer for MapAggregateProducer {
         let accumulators: usize = state
             .accumulators
             .iter()
-            .map(|(path, acc)| path.len() + acc.cell_count())
+            .map(|(path, acc)| path.len() + acc.tile().cell_count())
             .sum();
         ProducerStateInfo::holding(accumulators + state.keys_with_nothing_beneath.len())
     }
@@ -1411,6 +1446,31 @@ impl Breaker for MapAggregateProducer {
     }
     fn consumes_concurrently(&self) -> bool {
         !folded_shape(self.tiling()).1.holds_a_level()
+    }
+
+    /// Every input pipeline is closed and every claim is integrated, so no element reaches a
+    /// group any more: every group is complete, whatever the answers stated of it. An answer
+    /// beneath the groups' keys states only the members it reached, so without this a group
+    /// whose last statement was partial would stay open, held back as undecided above.
+    fn finish(&mut self, _: InputId, pushes: &mut Pushes<'_>) {
+        debug_assert!(
+            self.obsolete_guard().is_universal() || self.input.obsolete_guard().is_universal(),
+            "{} states every group complete only after its input was released whole",
+            self.name()
+        );
+        if let Some(stated) = &mut self
+            .state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stated
+        {
+            for level in &mut stated.level_predicates {
+                *level = Predicate::True;
+            }
+            stated.elements = Predicate::True;
+            stated.complete = Predicate::True;
+        }
+        pushes.push_final(self);
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -2760,6 +2820,65 @@ mod map_aggregate_projection_tests {
             .collect()
     }
 
+    /// `Sole` over key 0's members, each a collection of `Int`s: member 0 holding `[5]` and still
+    /// growing, then member 0 grown to `[5, 6]` beside member 1 holding `[7]`. The second member
+    /// is a second element under the key though it arrives in one pull with the held member's
+    /// grown element.
+    #[test]
+    #[should_panic(expected = "sole: 2 elements under one key")]
+    fn a_second_member_beside_the_held_members_growth_is_rejected() {
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let uint = || Extent::uint_range(2);
+        let element = Tiling::data_function(uint(), int());
+        let input_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), element.clone()));
+        let output_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sole,
+                accumulator: Box::new(element),
+            },
+        );
+        // Key 0's members, the `values` of each under its member key, none stated complete.
+        let members = |members: &[(u64, &[i64])]| {
+            let mut starts = Vec::new();
+            let (mut keys, mut ints) = (Vec::new(), Vec::new());
+            for (_, values) in members {
+                starts.push(keys.len());
+                keys.extend(0..values.len() as u64);
+                ints.extend(values.iter());
+            }
+            Tile::data_function(
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::UInts(members.iter().map(|(member, _)| *member).collect()),
+                    Box::new(Tile::grouped(
+                        starts,
+                        ColumnValue::UInts(keys),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(ints))),
+                        Predicate::False,
+                        BitSet::new(),
+                    )),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let (input, script) = ProjectionSpy::scripted(members(&[(0, &[5])]), input_tiling);
+        let mut aggregate = MapAggregateProducer::new(
+            ProducerBase::unowned(MapAggregateProducer::alloc_id(), &output_tiling),
+            Box::new(input),
+            AggregateKind::Sole,
+        );
+        aggregate.begin_run();
+        aggregate.consume_in_pipeline(InputId::ONLY, keys_between(0, 0));
+        *script.write().unwrap() = members(&[(0, &[5, 6]), (1, &[7])]);
+        aggregate.consume_in_pipeline(InputId::ONLY, keys_between(0, 0));
+    }
+
     #[test]
     fn small_morsels_preserve_an_empty_enclosing_group() {
         let int = Tiling::Scalar(Extent::Base(BaseType::Int));
@@ -3966,8 +4085,8 @@ mod map_aggregate_consuming_tests {
                 let Value::UInt(key) = path[0] else {
                     panic!("a group key, got {path:?}")
                 };
-                let Tile::Scalar(ColumnValue::Ints(sum)) = accumulator else {
-                    panic!("a sum per group, got {accumulator:?}")
+                let Tile::Scalar(ColumnValue::Ints(sum)) = accumulator.tile() else {
+                    panic!("a sum per group, got {:?}", accumulator.tile())
                 };
                 (key, sum[0])
             })
@@ -4461,5 +4580,85 @@ mod map_aggregate_consuming_tests {
             run.apply(Consume(All));
             run.check();
         }
+    }
+}
+
+/// One group's accumulator in a map aggregate.
+enum GroupAccumulator {
+    /// The group's elements folded by the aggregate's law ([`AggregateKind::accumulate`]).
+    Fold(Tile),
+    /// A `Sole` group whose element holds a collection: the element, and the path of the member
+    /// it came from, `None` before the first. A collection the element holds arrives in parts,
+    /// so a later delivery of the same member is the element grown and merges into it; a
+    /// delivery of another member is a second element under the key, which the law rejects.
+    Element {
+        member: Option<Vec<Value>>,
+        element: Tile,
+    },
+}
+
+impl GroupAccumulator {
+    /// An empty accumulator for `kind` folding into `tiling`, one that tracks its element's
+    /// member where `holds_element` says the fold is `Sole` over elements holding a collection.
+    fn new(kind: AggregateKind, tiling: &Tiling, holds_element: bool) -> Self {
+        let empty = kind.initial_accumulator(tiling);
+        match holds_element {
+            true => GroupAccumulator::Element {
+                member: None,
+                element: empty,
+            },
+            false => GroupAccumulator::Fold(empty),
+        }
+    }
+
+    /// What the accumulator holds, as the output's aggregation carries it.
+    fn tile(&self) -> &Tile {
+        match self {
+            GroupAccumulator::Fold(tile) | GroupAccumulator::Element { element: tile, .. } => tile,
+        }
+    }
+
+    /// Fold `values`' rows `start..end` into the accumulator.
+    fn fold(&mut self, kind: AggregateKind, values: &Tile, start: usize, end: usize) {
+        debug_assert!(
+            matches!(self, GroupAccumulator::Fold(_)),
+            "a group tracking its element takes it whole (`add_element`)"
+        );
+        if let GroupAccumulator::Fold(tile) = self {
+            kind.accumulate(tile, values, start, end);
+        }
+    }
+
+    /// Take `element`, a delivery of member `member`'s element, stated within its own path: the
+    /// element grown where it is the member held, merging its collections by key and keeping its
+    /// plain values as held, and otherwise a new element, which the law accepts only as the
+    /// group's first.
+    fn add_element(&mut self, kind: AggregateKind, element: Tile, member: &[Value]) {
+        let GroupAccumulator::Element {
+            member: held,
+            element: tile,
+        } = self
+        else {
+            unreachable!("only a `Sole` group over elements holding a collection takes an element")
+        };
+        if held.as_deref() == Some(member) {
+            match (tile, element) {
+                (Tile::Record { fields, .. }, Tile::Record { fields: grown, .. }) => {
+                    for (name, field) in grown {
+                        if field.holds_a_level()
+                            && let Some(held) = fields.get_mut(&name)
+                        {
+                            held.merge(field);
+                        }
+                    }
+                }
+                (tile, grown) if grown.holds_a_level() => tile.merge(grown),
+                _ => {}
+            }
+            return;
+        }
+        let rows = element.rows();
+        kind.accumulate(tile, &element, 0, rows);
+        *held = Some(member.to_vec());
     }
 }
