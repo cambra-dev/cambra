@@ -423,6 +423,11 @@ impl RekeySortedProducer {
 }
 
 impl Breaker for RekeySortedProducer {
+    /// The keys complete with the consumed prefix of its input, which packages extend in order.
+    fn consumes_concurrently(&self) -> bool {
+        false
+    }
+
     fn input_tiling(&self, _: InputId) -> Tiling {
         self.input.tiling().clone()
     }
