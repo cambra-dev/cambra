@@ -263,10 +263,10 @@ A live pipeline's poll cuts the keys each of its own ranges newly yielded at the
 source holds (`DataSourceDomainExtentImpl::morsels`, `LivePipeline::poll`), pushes each piece
 through the range's consumer, and queues each landing as one package. Only the test source
 (`TestDataSource`) cuts; the HTTP and stdin sources queue each arrival as one package. A range
-beneath the pipeline's outermost keys, as a nest's inner range is, reaches each row whole or in
-part, so its pieces would name the same rows: the poll pushes such a range's keys whole
-(`lands_as_morsels`). Two ranges of one pipeline, as a join's two sides are, can deliver the same
-rows, so each morsel is queued less what the poll queued before it.
+beneath the pipeline's outermost keys, as a nest's inner range is, is cut too: its pieces land as
+packages beneath the outermost keys, which run alone unless the chain restates their level
+([Who claims what](#who-claims-what)). Two ranges of one pipeline, as a join's two sides are, can
+deliver the same rows, so each morsel is queued less what the poll queued before it.
 
 ## Completeness in pushes
 
@@ -485,20 +485,22 @@ canonical breaker handles. Workers retain those handles and call the existing br
 `consume_impl`; they construct no operator chains, input readers, or secondary topology.
 `get` and `get_impl` read the existing operands directly.
 
-A breaker splits its input at its outermost keys (`parallel_input_level`): a memo, an aggregate, a
-map-aggregate, and a sink that hands each package's answer. The keys must have an order, since a
-push is cut into morsels in key order, and a function value has none. A memo whose rows hold a
-nested collection does not split: a merge of its packages' answers loses the completion each states
-of its rows' inner collections. A sum folds its packages in any order by wrapping addition, which a
-release build's `+` already does, so a sum is the same in every build and every order. A breaker
-that requires ordered input (`requires_ordered_input`), as a store does, and its producing
-dependencies preserve input order: the planner orders every pipeline such a breaker reads
-(`order_inputs_of_ordered_breakers`). So do a loop's store pipeline
-and every pipeline it reads, transitively: a loop runs its positions in order and takes a request
-none of whose positions is next as one that only closes absent positions, so its input is published
-in position order, one package in flight per pipeline. The store's step reads the body and seeds no
-ordering, so the body is not ordered by this. Control scopes, sinks, and shapes without independent
-position projections keep their coordinator handlers.
+A breaker consumes packages at once where it answers `Breaker::consumes_concurrently`: a memo, an
+aggregate and a map-aggregate whose accumulator holds no collection level, a final-value extraction,
+and a sink that hands each package's answer. Each requires keyed input whose keys have an order
+(`has_keys`), since a push is cut into morsels in key order, and a function value has none. A memo
+merges its packages' answers, nested rows included: a merge unions each level's statement and states
+a path once, at the outermost level that settles it (`Tile::merge`). A final-value extraction keeps
+the row at the greatest key whatever order its packages merge in. A sum folds its packages in any
+order by wrapping addition, which a release build's `+` already does, so a sum is the same in every
+build and every order. A breaker that requires ordered input (`requires_ordered_input`), as a store
+does, and its producing dependencies preserve input order: the planner orders every pipeline such a
+breaker reads (`order_inputs_of_ordered_breakers`). So do a loop's store pipeline and every pipeline
+it reads, transitively: a loop runs its positions in order and takes a request none of whose
+positions is next as one that only closes absent positions, so its input is published in position
+order, one package in flight per pipeline. The store's step reads the body and seeds no ordering, so
+the body is not ordered by this. Control scopes, a sink handed one package at a time, and shapes
+without independent position projections keep their coordinator handlers.
 
 A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
 `TestSink` merges them in arrival order and reads the merged value in key order
@@ -517,10 +519,18 @@ consumed input through the existing producer chain.
 
 A pipeline is **admitted** when all of these hold:
 
-- It is a pipeline of the program over a chain or a pipeline of a loop's or transaction writer's
-  body.
-- Its breaker answers `Breaker::parallel_level`, and every operator its chain pulls restates the
-  keys of that level (`chain_restates_parallel_level`), or no scope's pipeline reads it.
+- It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
+  loop's or transaction writer's body. A sink is admitted only where its packages run at once.
+- Its chain restates a level, or no scope's pipeline reads it.
+
+A chain **restates** level `L` where its breaker consumes concurrently, and the breaker's input and
+every operator its chain pulls restate the keys of every level from the outermost through `L`
+(`chain_restated_level`, `sink_restated_level`). The planner records the deepest such level per
+pipeline and registers a rule with the dispatcher (`Dispatcher::classify`) that flags each package
+as it is queued. A package runs **alone** where its guard is no projection or names keys beneath the
+restated level: it waits until no package of the pipeline is in flight, and no package is claimed
+beside it (`Queue::claim`). Every other package runs beside the pipeline's others, except one whose
+guard overlaps a package in flight.
 
 A pipeline admitted for the second reason alone is **serial**: the planner orders it, so one package
 of it is in flight at a time, on any thread. A worker runs the finish of every admitted pipeline no
