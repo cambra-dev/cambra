@@ -243,9 +243,10 @@ pub(super) fn declare_nominal_types(
             name.span,
             matches!(decl.body, TypeDeclBody::Single(_)),
         );
-        Rc::get_mut(&mut declared)
-            .expect("a declaration just made has no other holder")
-            .prelude_shadowed = prelude_shadowed;
+        let fresh =
+            Rc::get_mut(&mut declared).expect("a declaration just made has no other holder");
+        fresh.prelude_shadowed = prelude_shadowed;
+        fresh.is_abstract = decl.abstract_kw.is_some();
         ctx.nominal_types.push(declared);
     }
     errors
@@ -1951,9 +1952,12 @@ impl Named {
                 Some(function) => Some(Member::Associated {
                     arity: function.arity,
                 }),
-                None => member(decl, name, ctx)
-                    .map(|(m, _)| m)
-                    .filter(|m| !matches!(m, Member::Associated { .. })),
+                None => {
+                    self.check_member_visible(name, span)?;
+                    member(decl, name, ctx)
+                        .map(|(m, _)| m)
+                        .filter(|m| !matches!(m, Member::Associated { .. }))
+                }
             },
         };
         found.ok_or_else(|| {
@@ -1967,6 +1971,18 @@ impl Named {
         })
     }
 
+    /// Refuse naming the constructor or `extract` called `name`, written at `at`, from another
+    /// module than the type's when the type is `abstract`: another module neither builds nor
+    /// matches its values (`docs/chl-spec.md`, "9.5 Visibility").
+    fn check_member_visible(&self, name: &str, at: Span) -> Result<(), LoweringError> {
+        let constructs =
+            self.decl.ctor(name).is_some() || (name == "extract" && self.decl.declares_extract);
+        if self.foreign.is_none() || !self.decl.is_abstract || !constructs {
+            return Ok(());
+        }
+        Err(abstract_member_refusal(&self.decl, name, at))
+    }
+
     /// The name a reference to the member `name` reads: the binding its module's chain
     /// binds, spelled through the qualifier for another module's type.
     fn reference(&self, name: &str) -> String {
@@ -1977,6 +1993,41 @@ impl Named {
             }
         }
     }
+}
+
+/// A public abstract type of single-constructor form that a qualifier of this module reaches:
+/// one whose `extract` another module does not reach.
+fn abstract_extract_owner(ctx: &LoweringContext) -> Option<Rc<NominalDecl>> {
+    let mut qualifiers: Vec<&super::modules::Qualifier> = ctx
+        .module
+        .qualifiers
+        .values()
+        .filter(|q| q.view.is_none())
+        .collect();
+    qualifiers.sort_by_key(|q| (q.kind.sequential(), q.name.to_string()));
+    qualifiers.into_iter().find_map(|qualifier| {
+        let ty = qualifier
+            .reachable()?
+            .nominal
+            .values()
+            .find(|ty| ty.public && ty.decl.declares_extract && ty.decl.is_abstract)?;
+        Some(Rc::clone(&ty.decl))
+    })
+}
+
+/// The refusal of another module naming the constructor or `extract` called `name` of the
+/// abstract type `decl`, written at `at`.
+fn abstract_member_refusal(decl: &NominalDecl, name: &str, at: Span) -> LoweringError {
+    let module = decl.module.join("::");
+    LoweringError::unsupported(
+        at,
+        format!(
+            "`{module}` exports `{}` as `pub abstract type`, so `{}::{name}` is private to \
+             `{module}`",
+            decl.name, decl.name,
+        ),
+    )
+    .with_related(decl.span, "declared `abstract` here")
 }
 
 /// The nominal type `path` names, `Shape` or `shop::Shape`: one the module declares or a `use`
@@ -2264,17 +2315,17 @@ fn resolve_pattern_type(
     let Some(named) = resolve_type(&pattern.type_path, ctx)? else {
         return Err(LoweringError::unavailable_member(ty.span));
     };
-    let decl = named.decl;
-    if decl.ctor(&pattern.ctor.node).is_none() {
+    if named.decl.ctor(&pattern.ctor.node).is_none() {
         return Err(LoweringError::unsupported(
             ty.span.join(pattern.ctor.span),
             format!(
                 "`{}` declares no constructor `{}`",
-                decl.name, pattern.ctor.node
+                named.decl.name, pattern.ctor.node
             ),
         ));
     }
-    Ok(decl)
+    named.check_member_visible(&pattern.ctor.node, ty.span.join(pattern.ctor.span))?;
+    Ok(named.decl)
 }
 
 /// A constructor pattern binds one name or `_` per declared parameter, and takes no
@@ -2838,7 +2889,7 @@ fn foreign_methods(
             let params = match ty.functions.get(method) {
                 Some(function) if function.public && function.is_method => function.arity - 1,
                 Some(_) => continue,
-                None if method == "extract" && ty.decl.declares_extract => 0,
+                None if method == "extract" && ty.decl.exports_extract() => 0,
                 None => continue,
             };
             let decl = qualifier.instance(&ty.decl);
@@ -2903,6 +2954,12 @@ pub(super) fn lower_method_call(
     // A type another module declares that no qualifier reaches has its method found by
     // inference, from the copies linking adds (`modules::add_method_copies`).
     if owners.is_empty() && !ctx.reached_methods.contains(&method.node) {
+        // `extract` of an abstract type a qualifier reaches is its module's alone.
+        if method.node == "extract"
+            && let Some(decl) = abstract_extract_owner(ctx)
+        {
+            return Err(abstract_member_refusal(&decl, "extract", method.span));
+        }
         return Err(LoweringError::unsupported(
             method.span,
             format!(

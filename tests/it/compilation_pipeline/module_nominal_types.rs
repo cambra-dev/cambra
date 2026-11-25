@@ -31,6 +31,22 @@ const SHOP: &str = indoc! {"
     type Secret = Int
     pub type Box(T) = T
     pub type Amount = {amount: Int}
+    pub abstract type Token:
+        revoked
+        issued(Int)
+    pub def Token::issue(n: Int) => Token:
+        Token::issued(n)
+    pub def Token::code(self) => Int:
+        match self:
+            case Token::revoked:
+                0
+            case Token::issued(n):
+                n
+    pub abstract type Cents = Int
+    pub def Cents::of(n: Int) => Cents:
+        Cents::new(n)
+    pub def Cents::value(self) => Int:
+        self.extract()
 "};
 
 /// [`SHOP`] with a transactional variable, so it is run and not imported.
@@ -341,9 +357,84 @@ fn a_method_call_through_another_module_reaches_only_public_methods(#[case] meth
     );
 }
 
+/// An abstract type's values pass through another module, which reaches them through the
+/// type's public functions alone (`docs/chl-spec.md`, "9.5 Visibility").
+#[test]
+fn an_abstract_type_s_values_are_reached_through_its_functions() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import shop
+                def code(t: shop::Token) => Int:
+                    t.code()
+                code(shop::Token::issue(5)) + shop::Cents::of(3).value()
+            "},
+            &[("shop", SHOP)],
+        ),
+        Value::Int(8),
+    );
+}
+
+/// `.extract()` on an abstract type is refused as private where no type the module reaches
+/// exports an `extract` at all.
+#[test]
+fn an_abstract_type_s_extract_is_private_where_no_type_exports_one() {
+    let coins = indoc! {"
+        pub abstract type Cents = Int
+        pub def Cents::of(n: Int) => Cents:
+            Cents::new(n)
+    "};
+    assert_refused(
+        &program(
+            "import coins\ncoins::Cents::of(1).extract()\n",
+            &[("coins", coins)],
+        ),
+        "`coins` exports `Cents` as `pub abstract type`, so `Cents::extract` is private to `coins`",
+    );
+}
+
 /// A private type, and a private associated function of a public one, are their module's
-/// alone.
+/// alone, as are an abstract type's constructors, its `new` and its `extract`.
 #[rstest]
+#[case::constructor_built(
+    indoc! {"
+        import shop
+        shop::Token::issued(1)
+    "},
+    "`shop` exports `Token` as `pub abstract type`, so `Token::issued` is private to `shop`"
+)]
+#[case::constructor_matched(
+    indoc! {"
+        import shop
+        match shop::Token::issue(1):
+            case shop::Token::issued(n):
+                n
+            case _:
+                0
+    "},
+    "`shop` exports `Token` as `pub abstract type`, so `Token::issued` is private to `shop`"
+)]
+#[case::new(
+    indoc! {"
+        import shop
+        shop::Cents::new(1)
+    "},
+    "`shop` exports `Cents` as `pub abstract type`, so `Cents::new` is private to `shop`"
+)]
+#[case::extract_named(
+    indoc! {"
+        import shop
+        shop::Cents::extract(shop::Cents::of(1))
+    "},
+    "`shop` exports `Cents` as `pub abstract type`, so `Cents::extract` is private to `shop`"
+)]
+#[case::extract_called(
+    indoc! {"
+        import shop
+        shop::Cents::of(1).extract()
+    "},
+    "`shop` exports `Cents` as `pub abstract type`, so `Cents::extract` is private to `shop`"
+)]
 #[case::type_(
     indoc! {"
         import shop

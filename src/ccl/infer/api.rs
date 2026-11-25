@@ -1982,6 +1982,20 @@ impl std::fmt::Debug for InferError {
                  of a definition polymorphic over that type determines it; annotate the \
                  receiver with a nominal type, or call a trait's function to work across types"
             ),
+            // An abstract type's `extract` is its module's alone, and the module's own calls find
+            // it, so a call that misses it stands in another module.
+            InferError::UnresolvedMethod {
+                method,
+                receiver: Some(Type::Nominal(decl, _)),
+            } if method == "extract" && decl.declares_extract && decl.is_abstract => {
+                let module = decl.module.join("::");
+                write!(
+                    f,
+                    "`{module}` exports `{}` as `pub abstract type`, so `{}::extract` is private \
+                     to `{module}`",
+                    decl.name, decl.name
+                )
+            }
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty @ Type::Nominal(..)),

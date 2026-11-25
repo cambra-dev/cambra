@@ -614,6 +614,10 @@ pub enum PayloadPattern {
 /// A nominal type declaration ([`Stmt::TypeDecl`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeDecl {
+    /// `abstract` after `pub`: another module holds the type's values but neither builds nor
+    /// matches them, and reaches neither `new` nor `extract` (`docs/chl-spec.md`, "9.5
+    /// Visibility").
+    pub abstract_kw: Option<Span>,
     /// The capitalized type name.
     pub name: Spanned<SmolStr>,
     /// The type parameters, `T` in `type Option(T):`, each with its kind where it states one:

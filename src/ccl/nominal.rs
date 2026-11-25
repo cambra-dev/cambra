@@ -446,6 +446,10 @@ pub struct NominalDecl {
     /// declares itself, so that a diagnostic writes this one by its path, `std::Option`
     /// ([`Self::spelled`]).
     pub prelude_shadowed: bool,
+    /// Whether the declaration is `pub abstract type`: another module neither builds nor matches
+    /// its values, and reaches neither `new` nor `extract` (`docs/chl-spec.md`, "9.5
+    /// Visibility").
+    pub is_abstract: bool,
 }
 
 /// A declaration's `requires` clause (`docs/chl-spec.md`, "Declaring a nominal type"): its type
@@ -714,6 +718,7 @@ impl NominalDecl {
             const_args: None,
             requirements: Rc::new(OnceCell::new()),
             prelude_shadowed: false,
+            is_abstract: false,
         })
     }
 
@@ -840,6 +845,7 @@ impl NominalDecl {
             const_args: self.const_args.clone(),
             requirements: Rc::clone(&self.requirements),
             prelude_shadowed: self.prelude_shadowed,
+            is_abstract: self.is_abstract,
         }
     }
 
@@ -1122,6 +1128,12 @@ impl NominalDecl {
         table.orders.push(orders);
         table.ids.insert(key, id);
         id
+    }
+
+    /// Whether another module reaches `extract`: the single-constructor form's, exported with
+    /// `new` unless the type is `abstract` (`docs/chl-spec.md`, "9.5 Visibility").
+    pub fn exports_extract(&self) -> bool {
+        self.declares_extract && !self.is_abstract
     }
 
     /// The constructor named `name`.
