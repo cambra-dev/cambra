@@ -4287,6 +4287,60 @@ fn a_writer_reading_a_sum_of_its_live_source_waits_for_the_source(
     );
 }
 
+/// A writer parks on an unfinished sum. Closing its only source must publish its final value
+/// at the next drained boundary, while a disconnected source is still open and idle.
+#[rstest_log::rstest]
+fn a_parked_writer_finishes_while_an_unrelated_live_source_stays_open(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    use crate::interpreter::dispatcher::transaction_scope::STALLS;
+    use crate::interpreter::{Predicate, SinkReadError};
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1", "source2"]);
+    let settled = ctx.register_test_sink("settled");
+    let _other = ctx.register_test_sink("other");
+    let source = indoc! {"
+        settled = test_sink()
+        other = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for x in source1():
+            with begin():
+                pool := pool - sum(source1())
+        settled << await_final(pool)
+        other << sum(source2())
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .expect("two independent sinks compile");
+    let _operators = ctx.take_operator_map();
+    deliver_one(&feeds[0], 0, 7);
+    STALLS.with(|stalls| stalls.set(0));
+    let mut boundaries = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        match boundaries {
+            0 => {
+                assert!(STALLS.with(std::cell::Cell::get) > 0, "the writer parked");
+                assert_eq!(settled.written_so_far(), Err(SinkReadError::NothingWritten));
+            }
+            1 => assert_eq!(
+                single_value(
+                    &settled
+                        .value()
+                        .expect("writer finished before source2 closed")
+                ),
+                Value::Int(93)
+            ),
+            _ => panic!("both sources have closed"),
+        }
+        feeds[boundaries]
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_yield_predicate(Predicate::True);
+        boundaries += 1;
+    })
+    .unwrap();
+    assert_eq!(boundaries, 2);
+}
+
 /// A writer's attempt that waits for its input keeps the snapshot it read while another writer
 /// commits past it. The waiting writer's store-slot release stops below that snapshot
 /// (`TransactWriterProducer::consume_impl`), so its proposal still reads the store there, which a
