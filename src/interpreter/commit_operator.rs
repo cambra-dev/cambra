@@ -7422,11 +7422,13 @@ impl TransactDriverProducer {
             state.latest_emit = Some((pos, frontier));
         }
         self.debug_assert_window_invariants(state);
-        // Every item has been acknowledged and no more can arrive. An item is acknowledged only
-        // once its decision commits, and its rows stay until every reader releases them, so an
-        // exhausted drive also holds no row.
-        let exhausted =
-            source_complete && next_item.is_none() && state.window.inner_row_count() == 0;
+        // Every item the source delivers has been acknowledged, and no more can arrive. An
+        // acknowledgement drops the item from the decoded source as it releases it there, so no
+        // item is left. A finished item's rows can stay until every reader releases them, and a
+        // reader's release can reach the drive steps after the pull that sees the last
+        // acknowledgement, through a gate in the body, with no pull to follow it. So the rows of
+        // finished items do not hold the drive open.
+        let exhausted = source_complete && state.source.items.is_empty();
         // Terminal once every item has finished. This is the writer's completeness signal
         // too: it owns no source of its own, so "all transactions attempted" is exactly this
         // tile closing. A live window that is momentarily empty over an incomplete source
@@ -11478,7 +11480,8 @@ mod tests {
 
     /// An item whose decision goes stale at every frontier is emitted again at each, and the
     /// release of each superseded row keeps the window within [`MAX_LIVE_ATTEMPTS`]. The commit's
-    /// acknowledgement of the newest row finishes the item, and with the row's release the drive.
+    /// acknowledgement of the newest row finishes the item and the drive, which holds the row
+    /// until its readers release it.
     #[test]
     fn a_repeatedly_retried_item_keeps_the_drive_window_flat() {
         use crate::interpreter::tile_operators::test_helpers::NotifyingOp;
@@ -11533,15 +11536,16 @@ mod tests {
         driver.acknowledge(&committed);
         let rows = advance_drive(&mut driver);
         assert!(
-            !rows.is_terminal(),
-            "the drive holds the finished item's row until its readers release it: {rows:?}"
-        );
-        driver.release(committed);
-        let rows = advance_drive(&mut driver);
-        assert!(
             rows.is_terminal(),
             "the committed item finishes the drive: {rows:?}"
         );
+        assert_eq!(
+            newest_body_position(&rows),
+            Some(pos(8)),
+            "the drive holds the finished item's row until its readers release it"
+        );
+        driver.release(committed);
+        let rows = advance_drive(&mut driver);
         assert_eq!(newest_body_position(&rows), None);
     }
 

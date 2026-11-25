@@ -65,6 +65,13 @@
 //! batches not yet durable kept
 //! (`program_run_tests::a_run_recovered_from_a_checkpoint_answers_as_one_run`).
 //!
+//! A gate passes a release on in a step, outside the consume that issued it, so the release
+//! reaches its producer with no consume to follow it. A scope whose request waits for its input
+//! to grow is woken only by a push. When nothing is claimable, the run asks its observer to pass
+//! on held releases (`RunObserver::pass_held_releases`). A durable run's observer passes on what
+//! its durable checkpoints cover. Where any release has been passed on since the run last asked,
+//! the run offers each scope its waiting positions again.
+//!
 //! With several workers a step copies the breakers one after another while workers consume, so
 //! the copies in a batch are taken at different times. The walk copies a breaker's gates and
 //! state under the breaker's lock, so no consume of that breaker runs between them. It copies the
@@ -298,7 +305,7 @@ impl Durability {
     /// # Panics
     ///
     /// Where the store refuses the batch: a later open has fenced this run out.
-    pub(crate) fn step(&mut self, roots: &[ProducerSlot]) {
+    pub(crate) fn step(&mut self, roots: &[ProducerSlot]) -> bool {
         let mut copies = Vec::new();
         let mut at = 0;
         let complete = walk_roots(roots, &mut |breaker| {
@@ -380,20 +387,23 @@ impl Durability {
                 }
             }
         }
-        self.forward(roots);
+        self.forward(roots)
     }
 
     /// Pass on to each gated input, and each root, what the store's durable checkpoints cover.
-    fn forward(&self, roots: &[ProducerSlot]) {
+    /// Answers whether a gate passed a release on.
+    fn forward(&self, roots: &[ProducerSlot]) -> bool {
         let Some(durable) = self.store.durable_through() else {
-            return;
+            return false;
         };
+        let mut passed = false;
         walk_roots(roots, &mut |breaker| {
-            breaker.visit_input_producers(&mut |_, input| forward(input, durable));
+            breaker.visit_input_producers(&mut |_, input| passed |= forward(input, durable));
         });
         for root in roots {
-            root_producer(root, &mut |producer| forward(producer, durable));
+            root_producer(root, &mut |producer| passed |= forward(producer, durable));
         }
+        passed
     }
 }
 
@@ -446,16 +456,19 @@ fn inputs_of(breaker: &dyn BreakingProducer) -> Vec<TileGuard> {
     released
 }
 
-/// Pass on to `producer` what its gate's durable checkpoints cover through `durable`.
-fn forward(producer: &dyn TileProducer, durable: Ticket) {
+/// Pass on to `producer` what its gate's durable checkpoints cover through `durable`. Answers
+/// whether the gate passed a release on.
+fn forward(producer: &dyn TileProducer, durable: Ticket) -> bool {
     let released = producer
         .base()
         .release_gate
         .as_ref()
         .and_then(|gate| gate.durable(durable));
+    let passed = released.is_some();
     if let Some(released) = released {
         producer.release_past_gate(released);
     }
+    passed
 }
 
 /// Call `visit` with the producer `root` holds.

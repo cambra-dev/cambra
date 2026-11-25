@@ -253,6 +253,14 @@ position waits (`Offered::woken`). Positions that begin to wait after such a pus
 (`Body::set_waiting`), since the push may have grown an input after the request that left them
 undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
+A release can also end a wait. In a durable run a gate holds a breaker's release until a checkpoint
+covering it is durable, then passes it on in a later step, outside any consume
+(`src/interpreter/durability/mod.rs`). Such a release can let a producer emit what a scope waits
+for, as a transaction drive emits its next item once its last row is reclaimed, but it reaches no
+entry, so it wakes no scope. When the run is quiescent, the driver asks its observer to pass on held
+releases (`RunObserver::pass_held_releases`). Where the observer answers that it passed one on, the
+driver offers each scope its waiting positions again (`Execution::offer_waiting`) and claims again.
+
 A nested loop holds each row the round around it gives it until its drive's source delivers the row
 (`Body::ready_rows`). A held row the source has not delivered does not hold back the round around
 it, which steps and leaves its own position waiting.
@@ -655,8 +663,11 @@ pipeline has finished, the run has failed, or the run is quiescent. A coordinato
 2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
    the routine answers that the run is quiescent. A run with no live source panics. A live run
-   pushes what its breakers hold and claims again where that changed anything; otherwise it has
-   reached a drained boundary, where its driver polls the sources and tells its observer.
+   pushes what its breakers hold and claims again where that changed anything. Otherwise it asks
+   its observer to pass on held releases, and where the observer passed one on, it offers each
+   scope its waiting positions and claims again ([Waiting for input
+   completion](#waiting-for-input-completion)). Otherwise it has reached a drained boundary, where
+   its driver polls the sources and tells its observer.
 
 A worker's publication can advance the generation during the resume pass, which then counts as
 progress. The coordinator claims again and reaches the same fixed point.

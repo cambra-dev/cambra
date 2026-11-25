@@ -89,7 +89,9 @@ impl ReleaseGate {
         {
             covered = state.written.pop_front().map(|(_, taken)| taken);
         }
-        let covered = covered.filter(|taken| *taken != state.forwarded)?;
+        // Only a guard that releases more than the gate has passed on is passed on, so each gate
+        // answers `Some` finitely often for a finite set of issued releases.
+        let covered = covered.filter(|taken| !state.forwarded.subsumes(taken))?;
         debug_assert!(
             state.issued.subsumes(&covered),
             "a gate passes on only what its breaker issued: {covered:?} past {:?}",

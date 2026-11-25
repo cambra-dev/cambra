@@ -4065,8 +4065,9 @@ impl Crash {
 struct Crashed;
 
 /// A durable run's observer: it steps the durability after each step and at each drained
-/// boundary (`Durability::step`), makes the store's batches durable after every `lag`-th step,
-/// pauses at every drained boundary, and crashes as `crash` says.
+/// boundary (`Durability::step`), makes the store's batches durable after every `lag`-th step and
+/// when the run can wait only on releases the gates hold, pauses at every drained boundary, and
+/// crashes as `crash` says.
 ///
 /// Every top-level step is a crash point, those inside a loop's or a transaction's open request
 /// included: the recovered run rebuilds the request from the breakers (`durability`).
@@ -4080,6 +4081,9 @@ struct Persisting {
     crash: Option<Crash>,
     /// How many batches were not durable yet at the crash, before the crash made any durable.
     pending_at_crash: Option<usize>,
+    /// Whether a gate passed a release on since the run was last quiescent
+    /// (`RunObserver::quiescent`).
+    passed: bool,
 }
 
 impl Persisting {
@@ -4111,18 +4115,31 @@ impl Persisting {
             steps: 0,
             crash,
             pending_at_crash: None,
+            passed: false,
         }
     }
 }
 
 impl crate::interpreter::dispatcher::RunObserver for Persisting {
+    /// Where the steps since the run last asked passed nothing on, the run can wait only on
+    /// releases the gates hold, so the store makes every batch durable, as a store that lags does
+    /// once the run gives it time, and the gates pass on what that covers.
+    fn pass_held_releases(&mut self) -> bool {
+        self.passed |= self.durability.step(&self.roots);
+        if !self.passed {
+            self.store.flush();
+            self.passed |= self.durability.step(&self.roots);
+        }
+        std::mem::take(&mut self.passed)
+    }
+
     fn drained(&mut self, _changed: bool) -> std::ops::ControlFlow<()> {
-        self.durability.step(&self.roots);
+        self.passed |= self.durability.step(&self.roots);
         std::ops::ControlFlow::Break(())
     }
 
     fn stepped(&mut self) {
-        self.durability.step(&self.roots);
+        self.passed |= self.durability.step(&self.roots);
         self.steps += 1;
         let crash = self.crash.filter(|crash| crash.after == self.steps);
         if crash.is_some() {

@@ -278,6 +278,15 @@ pub trait RunObserver {
     /// or a transaction's open request may be. A durable run checkpoints here
     /// (`Durability::step`), and a test that simulates a crash panics here.
     fn stepped(&mut self) {}
+    /// Pass on releases the observer holds. The run calls it when nothing is claimable, no claim
+    /// is in flight, and nothing has changed since the last claim. Answers whether a release has
+    /// been passed on since the run last called it. A durable run passes on what its durable
+    /// checkpoints cover (`Durability::step`). Such a release reaches its producer outside a
+    /// consume, where it can let the producer emit what a scope waits for. So where the answer is
+    /// `true`, the run offers each scope its waiting positions again and goes on claiming.
+    fn pass_held_releases(&mut self) -> bool {
+        false
+    }
 }
 
 /// [`run_program_into`]'s observer: it calls `on_idle` after a pass that changed nothing and
@@ -1487,6 +1496,23 @@ impl Execution {
             }
         }
         self.hold_followers(dispatcher);
+    }
+
+    /// Offer each scope the positions it keeps waiting for inputs ([`Body::waiting`]), then queue
+    /// what is offered. A wait ends on a push that reaches the scope. A release passed on outside
+    /// a consume (`RunObserver::pass_held_releases`) is no push, and can still let the scope
+    /// progress.
+    fn offer_waiting(&self, dispatcher: &Dispatcher) {
+        for handler in &self.handlers {
+            if let Handler::Request(scope) = handler {
+                scope.with_body(|body| {
+                    if let Some(waiting) = body.waiting() {
+                        body.offer(&waiting);
+                    }
+                });
+            }
+        }
+        self.queue_scope_requests(dispatcher);
     }
 
     /// Have each scope queue the requests offered to it where they can run. A push that offers
@@ -3799,9 +3825,9 @@ fn drive_live(
             changed |= at.poll(dispatcher, execution, reach);
         }
         loop {
-            match execution
-                .claim_until_quiescent(dispatcher, reach, workers, &mut || observer.stepped())
-            {
+            let claimed = execution
+                .claim_until_quiescent(dispatcher, reach, workers, &mut || observer.stepped());
+            match claimed {
                 Claimed::Done => return true,
                 // A worker's panic failed the run; the pool resumes it once it joins.
                 Claimed::Failed => return false,
@@ -3812,6 +3838,10 @@ fn drive_live(
                     let before = dispatcher.changes();
                     execution.push_held(dispatcher, reach);
                     if dispatcher.changes() != before {
+                        continue;
+                    }
+                    if observer.pass_held_releases() {
+                        execution.offer_waiting(dispatcher);
                         continue;
                     }
                     assert!(
