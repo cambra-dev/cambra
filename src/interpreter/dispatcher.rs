@@ -2098,15 +2098,46 @@ pub struct Offered {
     /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
     /// reads what grew.
     pub grown: Vec<(PipelineId, TileGuard)>,
-    /// The positions of the scope's input a request left undecided, waiting for inputs: a push
-    /// that reaches one of the scope's entries and no pipeline there takes offers them again
-    /// ([`Entry::wake`]).
+    /// The positions of the scope's input a request left undecided, waiting for inputs: the first
+    /// push that reaches one of the scope's entries and no pipeline there takes them and offers
+    /// them again ([`Entry::wake`]).
     pub waiting: Option<TileGuard>,
+    /// The waiting positions a push took and offered ([`Entry::wake`]) that no request has begun
+    /// on yet. The request that begins next runs them as positions that waited
+    /// (`Body::take_waited`).
+    pub offered_waiting: Option<TileGuard>,
     /// Whether a push woke the scope while no position waited, since positions last began to wait
-    /// ([`Entry::wake`]). Positions that begin to wait after such a push are offered once
-    /// (`Body::set_waiting`), since the push may have grown an input after the request that left
-    /// them undecided read it.
+    /// ([`Entry::wake`]): before any did, or after an earlier push took them. Positions that begin
+    /// to wait after such a push are offered once (`Body::set_waiting`), since the push may have
+    /// grown an input after the request that left them undecided read it.
     pub woken: bool,
+}
+
+impl Offered {
+    /// Transfer the parked positions to the next request once, including when a wake preceded
+    /// the decision to park.
+    fn offer_waiting(&mut self) {
+        if let Some(waiting) = self.waiting.take() {
+            self.offered_waiting = Some(match self.offered_waiting.take() {
+                Some(before) => before.union(&waiting),
+                None => waiting.clone(),
+            });
+            self.region = Some(match self.region.take() {
+                Some(before) => before.union(&waiting),
+                None => waiting,
+            });
+        }
+    }
+
+    /// The positions that waited for inputs when a request begins: those still waiting, and those
+    /// a push took and offered since ([`offered_waiting`](Self::offered_waiting)), which this
+    /// takes.
+    pub(crate) fn take_waited(&mut self) -> Option<TileGuard> {
+        match (self.offered_waiting.take(), self.waiting.clone()) {
+            (Some(taken), Some(waiting)) => Some(taken.union(&waiting)),
+            (taken, waiting) => taken.or(waiting),
+        }
+    }
 }
 
 /// A scope's [`Offered`], shared with the entry in front of its drive's source.
@@ -2205,7 +2236,9 @@ impl Entry {
     /// Offer the scope the entry sits in its positions waiting for inputs, for a push no pipeline
     /// here takes: something the scope's body reads has grown, so a request may now decide them.
     /// The region pushed names what grew, not which waiting positions it decides, so all of them
-    /// are offered.
+    /// are offered. The offer takes them into `Offered::offered_waiting`, so a push that arrives
+    /// before the next request ends finds none waiting and sets `Offered::woken`. That request's end
+    /// then offers what it leaves undecided once (`Body::set_waiting`).
     ///
     /// A placed entry records what reached it (`Offered::grown`), whether or not positions wait, so
     /// its pipeline reads it with the next round or attempt: a push that arrives while a round or
@@ -2216,12 +2249,7 @@ impl Entry {
         };
         let mut offered = scope.lock().unwrap_or_else(PoisonError::into_inner);
         offered.woken |= offered.waiting.is_none();
-        if let Some(waiting) = offered.waiting.clone() {
-            offered.region = Some(match offered.region.take() {
-                Some(before) => before.union(&waiting),
-                None => waiting,
-            });
-        }
+        offered.offer_waiting();
         if let (Some(pipeline), Some(guard)) =
             (self.pipeline.get(), pushed_guard(region, &self.input))
         {
@@ -2784,6 +2812,80 @@ fn finish_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, pipeline: Pipelin
 
 #[cfg(test)]
 mod tests {
+    use crate::interpreter::tile_operators::test_helpers::keys_between;
+
+    /// An unplaced entry of the scope `offers`. An unplaced entry queues nothing, so its input
+    /// tiling is beside the point.
+    fn waking_entry(offers: &Offers) -> Entry {
+        let unit = Tiling::Scalar(Extent::Base(BaseType::Unit));
+        let (entry, placement) = Entry::unplaced(unit);
+        placement.set_scope(Some(offers.clone()));
+        entry
+    }
+
+    /// The first push after positions begin to wait offers them and takes them. A later push
+    /// offers nothing and leaves the offer to the end of the request (`Offered::woken`).
+    #[test]
+    fn a_push_offers_waiting_positions_once() {
+        let offers = Offers::default();
+        let waiting = keys_between(1, 2);
+        offers.lock().unwrap().waiting = Some(waiting.clone());
+        let entry = waking_entry(&offers);
+        entry.wake(&Projection::Everything);
+        {
+            let offered = offers.lock().unwrap();
+            assert_eq!(
+                offered.region.as_ref(),
+                Some(&waiting),
+                "the push offers them"
+            );
+            assert!(offered.waiting.is_none(), "the offer takes them");
+            assert!(!offered.woken, "the push was answered by its offer");
+        }
+        offers.lock().unwrap().region = None;
+        entry.wake(&Projection::Everything);
+        let offered = offers.lock().unwrap();
+        assert!(offered.region.is_none(), "a second push offers nothing");
+        assert!(offered.woken, "the request's end answers the second push");
+    }
+
+    /// The request a wake brings begins with the positions that waited, though the wake took
+    /// them out of `Offered::waiting`. `begin_package` steps a loop's store over what this
+    /// answers, and records for `keep_undecided` that positions waited.
+    #[test]
+    fn a_request_a_push_brings_begins_with_the_positions_that_waited() {
+        let offers = Offers::default();
+        let waiting = keys_between(1, 2);
+        offers.lock().unwrap().waiting = Some(waiting.clone());
+        waking_entry(&offers).wake(&Projection::Everything);
+        let mut offered = offers.lock().unwrap();
+        assert_eq!(offered.take_waited(), Some(waiting));
+        assert_eq!(offered.take_waited(), None, "one request takes them");
+    }
+
+    /// A request begins with both the positions a push took and those still waiting, and leaves
+    /// the waiting ones in place: only a request's end changes what waits.
+    #[test]
+    fn a_request_begins_with_taken_and_waiting_positions() {
+        let mut offered = Offered {
+            offered_waiting: Some(keys_between(0, 0)),
+            waiting: Some(keys_between(2, 2)),
+            ..Offered::default()
+        };
+        assert_eq!(
+            offered.take_waited(),
+            Some(keys_between(0, 0).union(&keys_between(2, 2)))
+        );
+        assert!(
+            offered.offered_waiting.is_none(),
+            "the taken ones are taken"
+        );
+        assert_eq!(
+            offered.waiting,
+            Some(keys_between(2, 2)),
+            "the waiting ones stay"
+        );
+    }
 
     /// A chain of diamonds: each layer's two pipelines read the one below, and the pipeline
     /// above reads both. A path of reads to the bottom doubles at each layer, and a quiescence
