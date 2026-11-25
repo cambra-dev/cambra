@@ -439,7 +439,9 @@ impl Body {
     /// Close the scope's pipeline once everything offered to it is queued.
     pub(super) fn close_offers(&self) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.closing |= !offered.closed;
+        if offered.intake == Intake::Open {
+            offered.intake = Intake::Closing;
+        }
     }
 
     /// Queue what was offered on the scope's pipeline, and close the pipeline once asked, where
@@ -474,16 +476,17 @@ impl Body {
         // The pipeline stays open while a request is queued or running, which may leave positions
         // waiting for inputs, and while any wait: what an input brings queues the request that
         // runs them.
-        let closing = offered.closing
+        let closing = offered.intake == Intake::Closing
             && offered.region.is_none()
             && dispatcher.outstanding(pipeline) == 0
-            && offered.waiting.is_none();
+            && !matches!(offered.retry, Retry::Parked(_));
         if !ready || (offered.region.is_none() && !closing) {
             return false;
         }
         let region = offered.region.take();
-        offered.closing &= !closing;
-        offered.closed |= closing;
+        if closing {
+            offered.intake = Intake::Closed;
+        }
         drop(offered);
         if let Some(region) = region {
             dispatcher.queue_for(pipeline, &region);
@@ -497,7 +500,7 @@ impl Body {
     /// Whether anything offered is not queued yet.
     pub(super) fn has_offers(&self) -> bool {
         let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.region.is_some() || offered.closing
+        offered.region.is_some() || offered.intake == Intake::Closing
     }
 
     /// Clear every inner pipeline's entries.
@@ -533,7 +536,7 @@ impl Body {
             .take_waited()
     }
 
-    /// Set the positions waiting for inputs (`Offered::waiting`): the first push that reaches one
+    /// Set the positions waiting for inputs (`Retry::Parked`): the first push that reaches one
     /// of the scope's entries and no pipeline there takes them and offers them again
     /// (`Entry::wake`), so `entry`, the placement of an entry the body does not place, is marked
     /// the scope's too. A push that woke the scope while nothing waited ([`Offered::woken`]) may
@@ -545,9 +548,8 @@ impl Body {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
         // A push that took positions while a request ran took ones that request covered: what it
         // left undecided is `waiting` now.
-        offered.offered_waiting = None;
-        offered.waiting = waiting;
-        if offered.waiting.is_some() && std::mem::take(&mut offered.woken) {
+        offered.retry = waiting.map_or(Retry::None, Retry::Parked);
+        if matches!(offered.retry, Retry::Parked(_)) && std::mem::take(&mut offered.woken) {
             offered.offer_waiting();
         }
     }
@@ -1164,7 +1166,7 @@ impl InductionStoreProducer {
 
     /// Step the store after the round's body and held pushes have settled. The store steps the
     /// positions of the round its input has decided; positions not decided yet stay unreleased,
-    /// and the scope keeps them waiting for inputs (`Offered::waiting`).
+    /// and the scope keeps them waiting for inputs (`Retry::Parked`).
     fn step_round(&mut self, guard: &TileGuard) {
         self.consume_impl(InputId::ONLY, guard.clone());
     }

@@ -235,7 +235,7 @@ paused run unplaces them ([Pause and reload](#pause-and-reload)).
 ## Waiting for input completion
 
 A scope holds the positions a round or attempt could not decide as waiting for inputs
-(`Offered::waiting`). A loop's round decides nothing at a position whose body read an input that is
+(`Retry::Parked`). A loop's round decides nothing at a position whose body read an input that is
 not final yet, as a sum over a live source. A writer's attempt is held the same way once every
 writer has attempted without changing the store, an input's release or the decisions to retry. The
 request then ends with those positions unreleased, so a drained boundary holds no claim of it.
@@ -250,7 +250,7 @@ source's first poll of the run does, reaches them.
 
 A push that reaches one of the scope's entries and that no pipeline there takes wakes the scope
 (`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake
-offers the scope its waiting positions and takes them (`Offered::offered_waiting`), so a later push
+offers the scope its waiting positions and takes them (`Retry::Offered`), so a later push
 offers them only after the next request leaves them waiting again. A placed entry records what
 reached it (`Offered::grown`). The next request runs the positions that waited
 (`Offered::take_waited`), and its first round or attempt queues what grew on the pipelines it

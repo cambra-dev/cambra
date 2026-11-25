@@ -1805,7 +1805,7 @@ pub(super) fn plan_edges(
                     planned[reader].held = true;
                 }
                 // A store or a loop's scope over a live source takes each delivery as positions;
-                // the positions a request leaves undecided wait for inputs (`Offered::waiting`),
+                // the positions a request leaves undecided wait for inputs (`Retry::Parked`),
                 // so it reads no row again.
                 Consumes::Rounds => dispatcher.take_arrivals(PipelineId(reader)),
             }
