@@ -52,7 +52,7 @@ use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
 use crate::ccl::feed_nest::FeedValue;
 use crate::ccl::infer::solver::Solver;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::Duplicate;
@@ -1500,7 +1500,7 @@ fn holds_a_sum(ty: &Type) -> bool {
 /// Restate `e` at `target`: through [`view_at`] where `target` is a sum, and component by
 /// component where it is a product holding one.
 fn view_at_value_type(e: &mut Expr, target: &Type) {
-    if target.peel_refinements().sum().is_some() {
+    if target.former().sum().is_some() {
         if e.ty != *target {
             view_at(e, target.clone());
         }
@@ -1565,7 +1565,7 @@ pub(crate) fn spell_out_product(e: &mut Expr, target: &Type) {
         )
         .with_ty(component.clone())
     };
-    let spelled = match ty.peel_refinements() {
+    let spelled = match ty.lets_distributed().peel_refinements() {
         Type::Record(fields) => Expr::new(TypedExprNode::Record(RecordEntry::minted(
             fields
                 .iter()
@@ -1832,6 +1832,15 @@ fn source_fun(ty: &Type) -> Type {
                 history_kind: HistoryKind::Overwrite,
                 ..
             } => return source_fun(t.history_parts().expect("matched a history").1),
+            // A function under type `let`s: each part holds the ones it reads.
+            Type::Let(_) => {
+                let distributed = t.lets_distributed().into_owned();
+                return if matches!(distributed, Type::Let(_)) {
+                    distributed
+                } else {
+                    source_fun(&distributed)
+                };
+            }
             _ => return t.clone(),
         }
     }
@@ -1852,7 +1861,7 @@ fn unboxed_source(iter: &Expr) -> Expr {
     let Some(stamp) = crate::ccl::ty::unbox_type(&value_ty) else {
         return iter.duplicate();
     };
-    let source = Rc::new(source_value(iter));
+    let source = crate::ccl::ty::IntoHeldTerm::into_held(source_value(iter));
     let unboxed_ty = crate::ccl::ty::unboxed_type(&value_ty, &source)
         .expect("`unbox_type` stamped a type, so the source is a sum");
     let mut unboxed = Expr::apply(
@@ -1991,7 +2000,7 @@ pub(crate) fn loop_domain(iter: &Expr) -> Type {
     let Some(witnesses) = fun.sum() else {
         return domain;
     };
-    let source = Rc::new(source_value(iter));
+    let source = crate::ccl::ty::IntoHeldTerm::into_held(source_value(iter));
     witnesses
         .iter()
         .enumerate()
@@ -3219,7 +3228,7 @@ fn close_in_place<T: Closable>(e: &mut T, kept: &[Kept]) {
     let needed = needed_by_reads(kept, |name| e.reads(name));
     for (entry, _) in kept.iter().zip(&needed).rev().filter(|(_, n)| **n) {
         match entry {
-            Kept::Let(_, b, value) if e.value_reads(&b.name) <= 1 => e.discharge(&b.name, value),
+            Kept::Let(_, b, value) if e.value_reads(&b.name) <= 1 => e.discharge(b, value),
             Kept::Let(_, b, value) => e.under_fresh_let(b.duplicate(), value.duplicate()),
             Kept::Group(bs) => e.under_group(bs.duplicate()),
         }
@@ -3239,7 +3248,9 @@ trait Closable {
     /// How many times the value itself reads `name`, which decides whether a `let` is
     /// substituted or kept.
     fn value_reads(&self, name: &Name) -> usize;
-    fn discharge(&mut self, name: &Name, definition: &Expr);
+    /// `binding`'s value read in place of its binder. A transparent binder's type readers hold
+    /// the value as a type `let` ([`crate::ccl::lambda_elim::inline_let`]).
+    fn discharge(&mut self, binding: &TypedBinding, definition: &Expr);
     /// Under `binding` renamed to a fresh name.
     fn under_fresh_let(&mut self, binding: TypedBinding, definition: Expr);
     fn under_group(&mut self, bindings: Vec<(TypedBinding, Expr)>);
@@ -3254,12 +3265,16 @@ impl Closable for Expr {
         crate::ccl::ccl_utils::count_free_in_value(name, self)
     }
 
-    fn discharge(&mut self, name: &Name, definition: &Expr) {
-        *self = Subst::discharge_env_in_place(
-            std::mem::take(self),
-            &HashMap::from([(name.clone(), definition.duplicate())]),
-            crate::ccl::Ids::Fresh,
-        );
+    fn discharge(&mut self, binding: &TypedBinding, definition: &Expr) {
+        *self = if binding.transparency == BindingTransparency::Transparent {
+            crate::ccl::lambda_elim::inline_let(std::mem::take(self), &binding.name, definition)
+        } else {
+            Subst::discharge_env_in_place(
+                std::mem::take(self),
+                &HashMap::from([(binding.name.clone(), definition.duplicate())]),
+                crate::ccl::Ids::Fresh,
+            )
+        };
     }
 
     fn under_fresh_let(&mut self, mut binding: TypedBinding, definition: Expr) {
@@ -3281,8 +3296,24 @@ impl Closable for FeedValue {
         self.value.value_reads(name)
     }
 
-    fn discharge(&mut self, name: &Name, definition: &Expr) {
-        self.substitute(&Subst::discharge(name.clone(), definition.duplicate()));
+    fn discharge(&mut self, binding: &TypedBinding, definition: &Expr) {
+        if binding.transparency == BindingTransparency::Transparent {
+            self.value = crate::ccl::lambda_elim::inline_let(
+                std::mem::take(&mut self.value),
+                &binding.name,
+                definition,
+            );
+            self.row = Subst::let_exit(
+                binding.name.clone(),
+                crate::ccl::ccl_utils::predicate_term(&mut Solver::none(), definition),
+            )
+            .apply_type(&self.row);
+        } else {
+            self.substitute(&Subst::discharge(
+                binding.name.clone(),
+                definition.duplicate(),
+            ));
+        }
     }
 
     fn under_fresh_let(&mut self, mut binding: TypedBinding, definition: Expr) {
@@ -3377,7 +3408,7 @@ fn keeps(value: &Expr) -> bool {
             | TypedExprNode::List(_)
     ) && crate::ccl::subst::type_free_vars(&value.ty).is_empty()
         && !matches!(
-            value.ty.peel_refinements(),
+            value.ty.former(),
             Type::Fun { fun_kind, .. } if !fun_kind.witnesses().is_empty()
         )
 }
@@ -4254,6 +4285,7 @@ impl<'a> WriterWalk<'a> {
             })
             .collect();
         let tuple_ty = joined_ty(branches.iter().map(|b| &b.body.ty));
+        let tuple_ty = tuple_ty.lets_distributed().into_owned();
         let Type::Tuple(slot_tys) = tuple_ty.peel_refinements() else {
             panic!("the join of the tuples a merge's arms hold is a tuple, not `{tuple_ty}`")
         };
@@ -4426,31 +4458,60 @@ impl<'a> WriterWalk<'a> {
 
 /// `ty` without each refinement of a value that reads a name other than the value's own: the
 /// type of the value at every value the names take. A refinement of a collection's domain is
-/// kept, since a fed row's keys may depend on the loop variable.
+/// kept, since a fed row's keys may depend on the loop variable. A type `let`'s binder reads
+/// the names its definition reads, and the `let` goes where nothing reads it any more.
 fn without_value_refinements_reading_names(ty: &Type) -> Type {
-    match ty {
-        Type::Refinement(base, refinements) => {
-            let kept: Vec<crate::ccl::Refinement> = refinements
-                .iter()
-                .filter(|r| {
-                    crate::ccl::ccl_utils::free_names(&r.predicate)
+    // Each type `let` around the position, with the names outside every `let` its definition
+    // reads.
+    fn go(ty: &Type, lets: &mut Vec<(Name, BTreeSet<Name>)>) -> Type {
+        let outside = |reads: BTreeSet<Name>, lets: &[(Name, BTreeSet<Name>)]| -> BTreeSet<Name> {
+            reads
+                .into_iter()
+                .flat_map(|n| match lets.iter().rev().find(|(b, _)| *b == n) {
+                    Some((_, through)) => through.clone(),
+                    None => BTreeSet::from([n]),
+                })
+                .collect()
+        };
+        match ty {
+            Type::Refinement(base, refinements) => {
+                let kept: Vec<crate::ccl::Refinement> = refinements
+                    .iter()
+                    .filter(|r| {
+                        outside(
+                            crate::ccl::ccl_utils::free_names(&r.predicate)
+                                .into_iter()
+                                .collect(),
+                            lets,
+                        )
                         .iter()
                         .all(Name::is_elem)
-                })
-                .cloned()
-                .collect();
-            Type::refined(
-                without_value_refinements_reading_names(base),
-                kept.into_iter().collect(),
-            )
-        }
-        Type::Fun { .. } => ty.clone(),
-        _ => {
-            let mut ty = ty.clone();
-            ty.walk_children_mut(|child| *child = without_value_refinements_reading_names(child));
-            ty
+                    })
+                    .cloned()
+                    .collect();
+                Type::refined(go(base, lets), kept.into_iter().collect())
+            }
+            Type::Fun { .. } => ty.clone(),
+            Type::Let(l) => {
+                let through = outside(
+                    crate::ccl::ccl_utils::free_names(&l.definition)
+                        .into_iter()
+                        .collect(),
+                    lets,
+                );
+                lets.push((l.name.clone(), through));
+                let body = go(&l.body, lets);
+                lets.pop();
+                l.over(body)
+            }
+            _ => {
+                let mut ty = ty.clone();
+                ty.walk_children_mut(|child| *child = go(child, lets));
+                ty
+            }
         }
     }
+    go(ty, &mut Vec::new())
 }
 
 /// The value of a feed a writer's block declares, `let 𝑐₀ = Defer in feed(𝑐₀, 𝑣₁); …; 𝑐₀`:

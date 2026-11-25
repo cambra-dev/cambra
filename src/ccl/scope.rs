@@ -730,7 +730,7 @@ pub(crate) fn assert_binders_unique(e: &TypedExpr) {
         }
         e.walk_type_slots(|t| {
             t.walk_held_terms(&mut |q| {
-                if held.insert(Rc::as_ptr(q)) {
+                if held.insert(std::ptr::from_ref::<TypedExpr>(q)) {
                     walk(q, bound, held);
                 }
             });
@@ -895,7 +895,7 @@ struct Renamer<'m> {
     memo: &'m PredMemo,
     ids: crate::ccl::Ids,
     /// The names each held term reads, by allocation, so a term riding many slots is read once.
-    held_names: HashMap<*const TypedExpr, Rc<std::collections::BTreeSet<Name>>>,
+    held_names: HashMap<*const crate::ccl::ty::HeldTerm, Rc<std::collections::BTreeSet<Name>>>,
 }
 
 /// Where a type slot's names resolve: the binders a type binds within itself, then the node's
@@ -1090,6 +1090,24 @@ impl Renamer<'_> {
                 slots.within.truncate(depth);
                 return changed;
             }
+            // A type `let`'s binder is bound over its body alone; its definition, renamed with
+            // the held terms above, reads the scope around the `let`.
+            Type::Let(l) => {
+                let l = Rc::make_mut(l);
+                let depth = slots.within.len();
+                let to = slots
+                    .get(&l.name)
+                    .cloned()
+                    .unwrap_or_else(|| l.name.clone());
+                slots.within.push((l.name.clone(), to.clone()));
+                if to != l.name {
+                    l.name = to;
+                    changed = true;
+                }
+                changed |= self.ty(&mut l.body, slots);
+                slots.within.truncate(depth);
+                return changed;
+            }
             _ => {}
         }
         ty.walk_children_mut(|t| changed |= self.ty(t, slots));
@@ -1097,7 +1115,11 @@ impl Renamer<'_> {
     }
 
     /// Whether the held term `q` reads a name `slots` renames.
-    fn held_reads_renamed(&mut self, q: &Rc<TypedExpr>, slots: &SlotScope<'_>) -> bool {
+    fn held_reads_renamed(
+        &mut self,
+        q: &Rc<crate::ccl::ty::HeldTerm>,
+        slots: &SlotScope<'_>,
+    ) -> bool {
         let names = self
             .held_names
             .entry(Rc::as_ptr(q))

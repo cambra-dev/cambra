@@ -355,16 +355,12 @@ fn a_set_nested_as_a_comprehension_source_is_driven(#[case] code: &str, #[case] 
     check_scalar(code, Value::Int(count));
 }
 
-// Pinned: a set of a set fed to a sink does not compile. The outer set's key domain reads the
-// inner set through a binder, the name `t` or the temporary a literal is bound to, and the
-// discharge of that binder as the fed value leaves its scope does not reach the unresolved
-// variables in the domain's lambda bodies (`Subst::under_binder` sees no binder behind a
-// variable). They later resolve to types naming the binder, so the feed's type names it outside
-// its scope. Expected: `[() -> [() -> ()]]` for both.
+/// A set of a set fed to a sink. The outer set's key domain reads the inner set through a
+/// binder, the temporary a literal is bound to, which the feed's type holds as a `let` where the
+/// fed value leaves the binder's scope.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[should_panic(expected = "Scope violation")]
-fn a_set_of_a_literal_s_set_fed_to_a_sink_does_not_compile_yet() {
+fn a_set_of_a_literal_s_set_fed_to_a_sink() {
     check_sink(
         indoc! {r#"
             out = test_sink()
@@ -374,11 +370,10 @@ fn a_set_of_a_literal_s_set_fed_to_a_sink_does_not_compile_yet() {
     );
 }
 
-/// [`a_set_of_a_literal_s_set_fed_to_a_sink_does_not_compile_yet`] over a named collection.
+/// [`a_set_of_a_literal_s_set_fed_to_a_sink`] over a named collection.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[should_panic(expected = "Scope violation")]
-fn a_set_of_a_named_set_fed_to_a_sink_does_not_compile_yet() {
+fn a_set_of_a_named_set_fed_to_a_sink() {
     check_sink(
         indoc! {r#"
             out = test_sink()
@@ -531,7 +526,7 @@ fn a_bare_groupby_tail_is_driven() {
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
     indoc::indoc! {r#"
         let __anf : ({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} ⤇ Int) = iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast([1, 2, 3])
-        in iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(__anf):({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)"#},
+        in iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(__anf):(let __anf = cast([1, 2, 3]) in {0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)"#},
     make_int_list(&[1])
 )]
 #[case(
@@ -577,7 +572,7 @@ fn a_bare_groupby_tail_is_driven() {
     // is realized as `converse`), and the compiled tile below is unchanged. The
     // morphism inside it stays **pointful** — planning point-frees the predicates it
     // reifies into a `Restrict`, and this one it never reaches.
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ ((λ __iter_record : 0..4 → __iter_record ▷ [1, 2, 3, 4] ▷ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(let __anf = [1, 2, 3, 4] in {Int | __elem ▷ ((λ __iter_record : 0..4 → __iter_record ▷ __anf ▷ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
     Tile::data_function(ColumnValue::Ints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))), Predicate::True, BitSet::new()))]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
@@ -644,7 +639,7 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
     indoc::indoc! {r#"
         let __anf : ({(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int) = (iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)
-        in (iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ __anf) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ add):({(0..1, {(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)"#},
+        in (iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ __anf) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ add):(let __anf = cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) in {(0..1, {(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ eq)} ⤇ Int)"#},
     Tile::data_function(ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
             ("_1".into(), ColumnValue::Records(HashMap::from([

@@ -14,7 +14,9 @@
 //! exception, and passes the rest on to the `try` around it.
 
 use crate::ccl::infer::solver::Solver;
-use std::collections::HashSet;
+use crate::ccl::ty::{HeldTerm, IntoHeldTerm};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
@@ -76,11 +78,33 @@ fn first_raise(e: &Expr) -> Option<provenance::NodeId> {
     found
 }
 
-/// `ty` with each refinement predicate structurally equal to `from` replaced by `to`, one
-/// rewrite per predicate term however many slots share it ([`PredMemo`]).
-fn replace_filter(ty: &mut Type, memo: &PredMemo<()>, from: &Expr, to: &Expr) {
+/// `ty` with each refinement predicate equal to `from` replaced by `to`, one rewrite per
+/// predicate term however many slots share it ([`PredMemo`]). A predicate reading a binder that
+/// `definitions` defines, or that a root `let` of either side binds, equals one with the
+/// definition discharged: a type holds a predicate's root `let` as its own
+/// ([`crate::ccl::Type::refined`]).
+fn replace_filter(
+    ty: &mut Type,
+    memo: &PredMemo<()>,
+    from: &Expr,
+    to: &Expr,
+    definitions: &HashMap<Name, Rc<HeldTerm>>,
+) {
+    let (from_lets, from_body) = root_lets(from);
     walk_refined_predicates_mut(ty, memo, &(), &mut |predicate, _| {
-        if !crate::ccl::ty::eq_term_modulo_ty_slots(predicate, from) {
+        let equal = crate::ccl::ty::eq_term_modulo_ty_slots(predicate, from) || {
+            let (own_lets, body) = root_lets(predicate);
+            crate::ccl::ty::eq_term_under_definitions(body, from_body, &|n| {
+                definitions.get(n).map(|d| d.term()).or_else(|| {
+                    from_lets
+                        .iter()
+                        .chain(&own_lets)
+                        .find(|(m, _)| m == n)
+                        .map(|(_, d)| *d)
+                })
+            })
+        };
+        if !equal {
             return false;
         }
         *predicate = to.duplicate();
@@ -88,10 +112,115 @@ fn replace_filter(ty: &mut Type, memo: &PredMemo<()>, from: &Expr, to: &Expr) {
     });
 }
 
-/// [`replace_filter`] at every type slot in `e`.
+/// The transparent `let`s at `e`'s root, outermost first, by binder and definition, and the
+/// term under them.
+fn root_lets(e: &Expr) -> (Vec<(Name, &Expr)>, &Expr) {
+    let mut lets = Vec::new();
+    let mut at = e;
+    while let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &at.node
+        && binding.transparency == BindingTransparency::Transparent
+    {
+        lets.push((binding.name.clone(), &**bound_expr));
+        at = body;
+    }
+    (lets, at)
+}
+
+/// [`replace_filter`] at every type slot in `e`, with the definitions of the transparent `let`s
+/// in `e` that `from` reads and of every `let` a type in `e` holds.
 fn replace_filter_in(e: &mut Expr, memo: &PredMemo<()>, from: &Expr, to: &Expr) {
-    e.walk_type_slots_mut(|t| replace_filter(t, memo, from, to));
-    e.walk_children_mut(|c| replace_filter_in(c, memo, from, to));
+    let definitions = filter_definitions(e, from);
+    replace_filter_in_go(e, memo, from, to, &definitions);
+}
+
+fn replace_filter_in_go(
+    e: &mut Expr,
+    memo: &PredMemo<()>,
+    from: &Expr,
+    to: &Expr,
+    definitions: &HashMap<Name, Rc<HeldTerm>>,
+) {
+    e.walk_type_slots_mut(|t| replace_filter(t, memo, from, to, definitions));
+    e.walk_children_mut(|c| replace_filter_in_go(c, memo, from, to, definitions));
+}
+
+/// The definitions of the `let`s `ty` holds, in its structure and in the terms it holds.
+fn type_definitions(ty: &Type) -> HashMap<Name, Rc<HeldTerm>> {
+    let mut out = HashMap::new();
+    filter_definitions_in_type(ty, &mut out, &mut HashSet::new());
+    out
+}
+
+/// The `let`s `ty` holds, into `out`: in its structure, and in the types of the terms it holds.
+fn filter_definitions_in_type(
+    ty: &Type,
+    out: &mut HashMap<Name, Rc<HeldTerm>>,
+    seen: &mut HashSet<*const HeldTerm>,
+) {
+    if let Type::Let(l) = ty {
+        out.entry(l.name.clone())
+            .or_insert_with(|| Rc::clone(&l.definition));
+    }
+    for term in ty
+        .own_refinements()
+        .iter()
+        .map(|r| &r.predicate)
+        .chain(ty.held_terms())
+    {
+        if seen.insert(Rc::as_ptr(term)) {
+            filter_definitions_in_term(term, out, seen);
+        }
+    }
+    ty.walk_children(|c| filter_definitions_in_type(c, out, seen));
+}
+
+/// [`filter_definitions_in_type`] at every type slot of `e` and of the terms below it.
+fn filter_definitions_in_term(
+    e: &Expr,
+    out: &mut HashMap<Name, Rc<HeldTerm>>,
+    seen: &mut HashSet<*const HeldTerm>,
+) {
+    e.walk_type_slots(|t| filter_definitions_in_type(t, out, seen));
+    e.walk_children(|c| filter_definitions_in_term(c, out, seen));
+}
+
+/// The definitions [`replace_filter_in`] compares under: every `let` a type in `e` holds, and
+/// each transparent `let` of `e` whose binder `from` reads, directly or through another's
+/// definition.
+fn filter_definitions(e: &Expr, from: &Expr) -> HashMap<Name, Rc<HeldTerm>> {
+    fn tree_lets<'e>(e: &'e Expr, out: &mut HashMap<Name, &'e Expr>) {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+            && binding.transparency == BindingTransparency::Transparent
+        {
+            out.insert(binding.name.clone(), bound_expr);
+        }
+        e.walk_children(|c| tree_lets(c, out));
+    }
+    let mut out = HashMap::new();
+    filter_definitions_in_term(e, &mut out, &mut HashSet::new());
+    let mut tree = HashMap::new();
+    tree_lets(e, &mut tree);
+    let mut pending: Vec<Name> = crate::ccl::ccl_utils::free_names(from)
+        .into_iter()
+        .collect();
+    while let Some(n) = pending.pop() {
+        if out.contains_key(&n) {
+            continue;
+        }
+        if let Some(definition) = tree.get(&n) {
+            pending.extend(crate::ccl::ccl_utils::free_names(definition));
+            out.insert(n, definition.clone_preserving_ids().into_held());
+        }
+    }
+    out
 }
 
 /// A node elimination rebuilds: its id, and what it does of its own, which the rebuild keeps.
@@ -559,7 +688,7 @@ fn uncurried_arity(e: &Expr) -> Option<usize> {
 /// type gives its position where it gives one.
 fn positions_of(c: Expr) -> Expr {
     let ty = c.ty.clone();
-    let (position, domain, codomain) = match ty.peel_refinements() {
+    let (position, domain, codomain) = match ty.lets_distributed().peel_refinements() {
         Type::Fun {
             binder,
             domain,
@@ -582,7 +711,8 @@ fn positions_of(c: Expr) -> Expr {
 
 /// The function type `ty` with `codomain` for its codomain.
 fn with_codomain(ty: &Type, codomain: &Type) -> Type {
-    match ty.peel_refinements() {
+    // The domain holds the type `let`s it reads, standing alone in the result.
+    match ty.lets_distributed().peel_refinements() {
         Type::Fun {
             binder,
             fun_kind,
@@ -1758,7 +1888,7 @@ impl Cx {
             .with_ty(Type::fun(outcome_ty.clone(), value_ty.clone()));
         // A collection whose element type reads its position names it in its type, and the
         // value's binder takes that name, so its body's type is the one the type states.
-        let position = match ty.peel_refinements() {
+        let position = match ty.lets_distributed().peel_refinements() {
             Type::Fun {
                 binder: crate::ccl::FunBinder::Whole(b),
                 ..
@@ -1819,14 +1949,21 @@ impl Cx {
         };
         let param = crate::ccl::into_one_param(params);
         let domain = target.domain().expect("a cast target is a collection");
-        let filter = {
-            let mut raising = domain
-                .refinements()
+        // The filter as the target holds it, which the rewrite below replaces, and standing
+        // alone with the definitions it reads, which the scan evaluates.
+        let (written, filter) = {
+            let (lets, under) = crate::ccl::ty::TypeLet::peel(&domain);
+            let mut raising = under
+                .own_refinements()
                 .iter()
                 .filter(|r| holds_raise(&r.predicate));
-            let filter = raising.next().expect("the filter raises");
+            let written = raising.next().expect("the filter raises");
             assert!(raising.next().is_none(), "a comprehension has one filter");
-            Expr::duplicate(&filter.predicate)
+            let standalone = crate::ccl::ty::TypeLet::refinement_under(&lets, written);
+            (
+                Expr::duplicate(&written.predicate),
+                Expr::duplicate(&standalone.predicate),
+            )
         };
         let value_ty = body.ty.clone();
         let bool_ty = Type::Base(BaseType::Bool);
@@ -1967,10 +2104,13 @@ impl Cx {
             &bool_ty,
         );
         let memo = PredMemo::default();
-        replace_filter(&mut target, &memo, &filter, &held_here);
-        replace_filter(&mut lambda_ty, &memo, &filter, &held_here);
+        let defined = type_definitions(&target);
+        replace_filter(&mut target, &memo, &written, &held_here, &defined);
+        let defined = type_definitions(&lambda_ty);
+        replace_filter(&mut lambda_ty, &memo, &filter, &held_here, &defined);
         let mut ty = ty.clone();
-        replace_filter(&mut ty, &memo, &filter, &held_here);
+        let defined = type_definitions(&ty);
+        replace_filter(&mut ty, &memo, &filter, &held_here, &defined);
         self.lifted.push(LiftedFilter {
             at: cast_kept.id,
             name: filter_b.name.clone(),

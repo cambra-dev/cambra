@@ -48,7 +48,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
     // level `𝑖`, `λ 𝑟ᵢ → 𝑟ᵢ ▷ 𝑙ᵢ ▷ (λ 𝑣ᵢ → …)`, binds `𝑣ᵢ` to `rec.𝑖 ▷ 𝑙ᵢ`. A dependent tuple's
     // components are not independent arms, so its filter is one residual.
     if let Some((levels, inner)) = filter_nest_levels(refinement)
-        && let Type::Tuple(components) = rec_ty.peel_refinements()
+        && let Type::Tuple(components) = rec_ty.lets_distributed().peel_refinements()
     {
         for (i, (element, source)) in levels.into_iter().enumerate() {
             let component = components[i].clone();
@@ -793,6 +793,7 @@ fn join_plan_to_expr(
     plan: &JoinPlan,
     types: &[Type],
     checker: &FragmentChecker,
+    held: &held::TypeLetRoles,
     lifted: &mut Vec<NodeId>,
 ) -> Result<Expr, String> {
     match plan {
@@ -808,7 +809,7 @@ fn join_plan_to_expr(
         // and op-conversion recognises it as a filter-free iteration.
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = if arms.len() == 1 {
-                match convert_refinement_to_join(&types[arms[0]], checker, lifted)? {
+                match convert_refinement_to_join(&types[arms[0]], checker, held, lifted)? {
                     Some(transformed) => {
                         trace!(
                             "Converted iteration to {} : {}",
@@ -874,7 +875,7 @@ fn join_plan_to_expr(
             // Build side: group by the build key using converse.
             // Use the full build output tuple type so that converse groups entire
             // build tuples (not just the key arm), preserving all arms through the join.
-            let build_input = join_plan_to_expr(build, types, checker, lifted)?;
+            let build_input = join_plan_to_expr(build, types, checker, held, lifted)?;
             let build_output_ty = build_input.ty.codomain().unwrap().clone();
             let build_key = if let Some(build_key_idx) = build_key_idx {
                 typed_compose(vec![
@@ -906,7 +907,7 @@ fn join_plan_to_expr(
 
             // Probe side: compose the probe key with the build side lookup.
             // Use the full probe output tuple type for the same reason.
-            let probe_input = join_plan_to_expr(probe, types, checker, lifted)?;
+            let probe_input = join_plan_to_expr(probe, types, checker, held, lifted)?;
             let probe_output_ty = probe_input.ty.codomain().unwrap().clone();
             let probe_key = if let Some(probe_key_idx) = probe_key_idx {
                 typed_compose(vec![
@@ -1081,6 +1082,7 @@ fn convert_loop_join(
     base_ty: &Type,
     refinement: &Expr,
     checker: &FragmentChecker,
+    held: &held::TypeLetRoles,
     lifted: &mut Vec<NodeId>,
 ) -> Result<Option<Expr>, String> {
     trace!(
@@ -1099,7 +1101,7 @@ fn convert_loop_join(
         return Ok(None);
     };
     trace!("convert_loop_join: planning succeeded. Plan:\n{plan:#?}");
-    let expr = join_plan_to_expr(&plan, arm_types, checker, lifted)?;
+    let expr = join_plan_to_expr(&plan, arm_types, checker, held, lifted)?;
 
     // The morphism produces the join-satisfying extent; surface that on its
     // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
@@ -1189,9 +1191,10 @@ fn convert_loop_join(
 fn convert_refinement_to_join(
     domain_ty: &Type,
     checker: &FragmentChecker,
+    held: &held::TypeLetRoles,
     lifted: &mut Vec<NodeId>,
 ) -> Result<Option<Expr>, String> {
-    let Type::Refinement(base, refinements) = domain_ty else {
+    let Some((base, refinements)) = predicates::refined_under_lets(domain_ty, held) else {
         return Ok(None);
     };
     let [refinement] = refinements.as_slice() else {
@@ -1200,7 +1203,7 @@ fn convert_refinement_to_join(
     trace!("Attempting loop join conversion inside iteration");
     // `convert_loop_join` only reads the predicate (it builds a new expr),
     // so borrow the immutable term rather than clone it.
-    convert_loop_join(base, &refinement.predicate, checker, lifted)
+    convert_loop_join(&base, &refinement.predicate, checker, held, lifted)
 }
 
 /// Try the hash-join rewrite at an iteration site whose domain is `domain_ty`.
@@ -1275,7 +1278,8 @@ pub(super) fn try_hash_join_rewrite(
         provenance::Nature::Machinery,
     );
     let mut lifted = Vec::new();
-    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &ctx.checker, &mut lifted)?
+    let Some(mut transformed) =
+        convert_refinement_to_join(domain_ty, &ctx.checker, &ctx.held, &mut lifted)?
     else {
         trace!("Hash-join pattern did not match");
         return Ok(false);
@@ -1333,7 +1337,7 @@ mod tests {
         checker: &FragmentChecker,
         lifted: &mut Vec<NodeId>,
     ) -> Option<Expr> {
-        convert_loop_join(base_ty, refinement, checker, lifted)
+        convert_loop_join(base_ty, refinement, checker, &Default::default(), lifted)
             .expect("these joins' arms enumerate their own keys")
     }
 

@@ -80,7 +80,8 @@ pub fn visit_places<'a>(ty: &'a Type, at_top: bool, visit: &mut impl FnMut(&'a T
             codomain,
             ..
         } => {
-            match domain.peel_refinements() {
+            // Which parts are places does not depend on the type `let`s around them.
+            match domain.former() {
                 Type::Tuple(ts) if binder.parameter_count().is_some() => {
                     ts.iter().for_each(|t| visit_places(t, true, visit))
                 }

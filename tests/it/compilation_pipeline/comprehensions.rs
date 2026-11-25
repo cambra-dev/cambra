@@ -962,6 +962,16 @@ fn comprehensions_over_boxed_rows_beside_a_list_generator(
     check_sink(source, expected);
 }
 
+/// A dependent comprehension four levels deep, each level reading the boxed row its key picks.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_dependent_comprehension_four_levels_deep() {
+    check_scalar(
+        "sum([x for xsss in [box([box([box([1, 2]), box([3])]), box([box([4])])]), box([box([box([5])])])] for xss in xsss for xs in xss for x in xs])",
+        Value::Int(1 + 2 + 3 + 4 + 5),
+    );
+}
+
 /// Dependent comprehensions that do not compile yet: each reads a row of boxed collections at
 /// its key, and the operator for that reading takes rows whose values are one column. Each case
 /// names the value it must answer.
@@ -974,10 +984,6 @@ fn comprehensions_over_boxed_rows_beside_a_list_generator(
 // (1 + 2 + 3 + 4) * 2 + 4.
 #[case::three_levels_after_an_independent_generator(
     "sum([x + i for i in [0, 1] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs])"
-)]
-// 1 + 2 + 3 + 4 + 5.
-#[case::four_levels(
-    "sum([x for xsss in [box([box([box([1, 2]), box([3])]), box([box([4])])]), box([box([box([5])])])] for xss in xsss for xs in xss for x in xs])"
 )]
 fn a_dependent_comprehension_reading_a_row_of_collections_is_refused(#[case] program: &str) {
     check_compile_error(

@@ -1787,7 +1787,7 @@ the compilation declined outlives it here"
         kinds: &HashMap<crate::ccl::WitnessId, crate::ccl::TypeKind>,
         ty: &Type,
     ) -> Result<Extent, ConversionError> {
-        match domain.peel_refinements() {
+        match domain.former() {
             Type::WitnessRef(w) => match kinds.get(w) {
                 Some(kind) => self.witness_domain_extent(kind, ty),
                 None => Err(ConversionError::TypeError(format!(
@@ -1883,13 +1883,13 @@ the compilation declined outlives it here"
     fn candidate_key_extent(&self, candidate: &Type) -> Result<Extent, ConversionError> {
         // A generalized parameter's keys are its bound's ([`Self::extent_in`]), refined or not.
         if let Some(bound) = candidate
-            .peel_refinements()
+            .former()
             .generalized_param()
             .and_then(|p| p.bound.as_ref())
         {
             return self.candidate_key_extent(bound);
         }
-        match candidate.peel_refinements() {
+        match candidate.former() {
             Type::UIntRange(_) => Ok(Extent::Base(BaseType::UInt)),
             other => self.extent_of(other),
         }
@@ -1934,6 +1934,10 @@ the compilation declined outlives it here"
         match ty {
             // Strip refinements at every level — Filter handles them instead.
             Type::Refinement(inner, _) => self.extent_in(inner, tuples),
+            // A type `let`'s binder is read by refinements, which are stripped, and by quoted
+            // terms, which carry their own types: the extent is the body's
+            // ([`crate::ccl::ty::TypeLet`]).
+            Type::Let(l) => self.extent_in(&l.body, tuples),
             // A nominal value is held as its representation (`Type::structure`).
             Type::Nominal(..) => self.extent_in(&ty.structure(), tuples),
             // Look up the runtime impl and wrap it in DataSourceDomain.
@@ -3193,7 +3197,7 @@ fn convert_impl_inner(
                             expr.ty
                         ))
                     })?;
-                    let union_ty = codomain.peel_refinements().structure();
+                    let union_ty = codomain.former().structure();
                     let Type::Variant(variants, _) = &*union_ty else {
                         return Err(ConversionError::TypeError(format!(
                             "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
@@ -3357,7 +3361,26 @@ fn convert_impl_inner(
                 _ => unreachable!("matched as a constructor"),
             };
             expect_no_input(input, "variant constructor")?;
-            let ty = expr.ty.peel_refinements().structure();
+            // The representation under the type `let`s the type holds, each arm holding the ones
+            // it reads.
+            let (lets, under) = crate::ccl::TypeLet::peel(&expr.ty);
+            let ty = under.peel_refinements().structure();
+            let ty = match &*ty {
+                Type::Variant(arms, openness) if !lets.is_empty() => {
+                    std::borrow::Cow::Owned(Type::Variant(
+                        arms.iter()
+                            .map(|(k, t)| {
+                                (
+                                    k.clone(),
+                                    crate::ccl::TypeLet::innermost_each(&lets, t.clone()),
+                                )
+                            })
+                            .collect(),
+                        *openness,
+                    ))
+                }
+                _ => ty,
+            };
             let Type::Variant(variants, _) = &*ty else {
                 return Err(ConversionError::TypeError(format!(
                     "VariantCtor `{tag}` has non-variant type {}; inference should have \
@@ -3898,7 +3921,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
-    let Type::Record(fields) = codom.peel_refinements() else {
+    let Type::Record(fields) = codom.former() else {
         return Vec::new();
     };
     fields
@@ -3937,7 +3960,7 @@ fn stored_tap_extent(
 /// every write, so it is what a key's extent is read off. The seed is one value of that type,
 /// and its own type may lack a tag a later write carries.
 fn key_value_types(transact: &Expr) -> HashMap<Label, Type> {
-    let stated = transact.ty.peel_refinements();
+    let stated = transact.ty.former();
     let record = match stated {
         Type::Record(_) => stated.clone(),
         _ => stated

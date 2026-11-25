@@ -1269,7 +1269,7 @@ fn erase_chan_domains_in_type(
         else {
             unreachable!("a history's function is an unrefined function")
         };
-        let fun_kind = match domain.peel_refinements() {
+        let fun_kind = match domain.lets_distributed().peel_refinements() {
             Type::ChanDom(n, _) => kinds.get(n).cloned(),
             _ => None,
         };
@@ -1560,7 +1560,7 @@ fn erase_chan_domains(
         // mutable variable's read, is not discharged: a type lifted past it keeps the
         // binder (`crate::ccl::BindingTransparency`).
         if binding.transparency == BindingTransparency::Transparent {
-            let discharge = Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
+            let discharge = Subst::let_exit(&binding.name, bound_expr.clone_preserving_ids());
             // Only a domain naming the binder is rewritten. A `let` under a loop's position
             // lambda can read the position, and a domain built from that loop names a binder
             // after it, which a discharge passing under it would report as a capture.
@@ -2947,7 +2947,7 @@ fn combine_feed_values(
 fn copair_type(feeds: &[Expr], sites: &[FieldKey], element: Option<&Type>) -> Type {
     let mut tags: Vec<(FieldKey, Type)> = Vec::with_capacity(feeds.len());
     for (site, f) in sites.iter().zip(feeds) {
-        match f.ty.peel_refinements() {
+        match f.ty.lets_distributed().peel_refinements() {
             Type::Fun { domain, .. } => {
                 tags.push((site.clone(), (**domain).clone()));
             }
@@ -3518,7 +3518,11 @@ fn extract_for_defer_impl(
                                     let pred = under_lets(&lets, condition.duplicate());
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
                                     // The item at the element: a family's item reads its key.
-                                    let item_at_elem = match source_prefix.ty.peel_refinements() {
+                                    let item_at_elem = match source_prefix
+                                        .ty
+                                        .lets_distributed()
+                                        .peel_refinements()
+                                    {
                                         Type::Fun {
                                             binder: crate::ccl::FunBinder::Whole(key),
                                             codomain,

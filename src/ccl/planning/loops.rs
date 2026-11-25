@@ -175,7 +175,7 @@ fn flatten_channel_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Exp
 
 /// The `𝑉` of a write's or a tap's `` {`fired{𝑉} | `idle} ``.
 fn fired_value_ty(ty: &Type) -> Type {
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         Type::Variant(tags, _) => tags
             .iter()
             .find(|(k, _)| matches!(k, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_FIRED))
@@ -543,7 +543,7 @@ fn split_decision_compose(
                 .domain()
                 .expect("letrec recognition: a snapshot slot is a function"),
         );
-        let p = match p.peel_refinements() {
+        let p = match p.lets_distributed().peel_refinements() {
             Type::Tuple(parts) if parts.len() == 2 => {
                 crate::ccl::generalize::renamed_by_match(&p, &parts[0], ctx_ty)
             }
@@ -555,7 +555,7 @@ fn split_decision_compose(
         // A dependent pair where the inner positions depend on the enclosing value, an inner
         // source filtered by the outer loop's variable.
         assert!(
-            match p.peel_refinements() {
+            match p.lets_distributed().peel_refinements() {
                 Type::Tuple(parts) => parts.len() == 2 && parts[0] == *ctx_ty,
                 Type::DepTuple(parts) => parts.len() == 2 && parts[0].1 == *ctx_ty,
                 _ => false,
@@ -827,7 +827,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 // `TransactKey`'s value type and the extents built off it, which is a
                 // mis-stamped history to fix at the stamp.
                 assert!(
-                    value_ty.refinements().is_empty(),
+                    value_ty.standalone_refinements().is_empty(),
                     "letrec recognition: a mutable variable's joined value type carries no \
                      refinement, got {value_ty} for `{}`",
                     b.name

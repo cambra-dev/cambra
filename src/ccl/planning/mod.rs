@@ -20,8 +20,8 @@
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    self, PredMemo, apply_function, make_iterate, make_restrict, make_restrict_stating,
-    refine_extent, set_codomain, trivially_true_predicate, typed_compose,
+    self, PredMemo, apply_function, make_iterate, make_restrict, refine_extent, set_codomain,
+    trivially_true_predicate, typed_compose,
 };
 // Re-exported so the `planning` submodules (`groupby`, `join`) can keep calling
 // `is_builtin` unqualified through their `use super::*`.
@@ -41,6 +41,7 @@ mod conditionals;
 mod const_fold;
 mod correlated;
 mod groupby;
+mod held;
 mod iterate;
 mod join;
 mod loops;
@@ -59,6 +60,9 @@ pub(crate) struct PlanningCtx {
     pub(super) witnesses: Witnesses,
     /// The check of each term planning builds.
     pub(super) checker: FragmentChecker,
+    /// What planning does with each type `let`'s definition a compiled refinement reads
+    /// ([`held::bind_type_let_definitions`]).
+    pub(super) held: Rc<held::TypeLetRoles>,
 }
 
 /// The context of a program that declares no instance, before realization.
@@ -73,6 +77,7 @@ impl PlanningCtx {
         PlanningCtx {
             witnesses: Witnesses::default(),
             checker,
+            held: Rc::default(),
         }
     }
 }
@@ -85,6 +90,10 @@ pub(super) struct FragmentChecker {
     /// program declares answers, as `converse` states `Equatable` of its keys.
     instances: Rc<InstanceTable>,
     mode: CheckMode,
+    /// The type `let` definitions the program's root binds ([`held::bind_type_let_definitions`]). A
+    /// fragment built out of a type's predicates reads their type `let` binders, which the tree
+    /// binds once planning ends ([`held::bind_reads`]), so the fragment is checked so bound.
+    held: Rc<std::collections::BTreeMap<Name, held::RootBinding>>,
 }
 
 /// The check of a program that declares no instance, with every refinement kept.
@@ -93,13 +102,28 @@ impl Default for FragmentChecker {
         FragmentChecker {
             instances: InstanceTable::std(),
             mode: CheckMode::Full,
+            held: Rc::default(),
         }
     }
 }
 
 impl FragmentChecker {
+    /// The definition the root binds under the tree name `tree` ([`held::bind_type_let_definitions`]).
+    pub(super) fn root_definition(&self, tree: &Name) -> Option<&Expr> {
+        self.held
+            .values()
+            .find(|b| b.tree == *tree)
+            .map(|b| b.definition.term())
+    }
+
     pub(super) fn check(&self, fragment: &Expr) -> Result<(), Vec<InferError>> {
-        typecheck_in(fragment, &self.instances, self.mode)
+        if self.held.is_empty() {
+            return typecheck_in(fragment, &self.instances, self.mode);
+        }
+        // A copy the check reads and drops, so it keeps its ids.
+        let mut bound = fragment.clone_preserving_ids();
+        held::bind_reads(&mut bound, &self.held);
+        typecheck_in(&bound, &self.instances, self.mode)
     }
 }
 
@@ -154,15 +178,24 @@ pub fn run(expr: Expr, instances: &Rc<InstanceTable>, mode: CheckMode) -> Result
     // Planning compiles the predicates it reaches by eliminating their lambdas, so one memo
     // serves every binder conversion of a predicate shared across sites.
     let mut expr = crate::ccl::subst::with_conversion_memo(|| {
-        run_phases(
+        // A compiled refinement reads the definitions its type holds, so the tree binds them
+        // before any phase plans what reads them.
+        let held::TypeLetBindings {
             expr,
-            Root::Program,
-            &PlanningPhase::ALL,
-            &mut PlanningCtx::of(FragmentChecker {
-                instances: Rc::clone(instances),
-                mode,
-            }),
-        )
+            roles,
+            renamed,
+            in_checks,
+        } = held::bind_type_let_definitions(expr)?;
+        let mut ctx = PlanningCtx::of(FragmentChecker {
+            instances: Rc::clone(instances),
+            mode,
+            held: Rc::new(in_checks),
+        });
+        ctx.held = Rc::new(roles);
+        let mut planned = run_phases(expr, Root::Program, &PlanningPhase::ALL, &mut ctx)?;
+        // The terms planning built out of predicates read the type `let` binders.
+        held::bind_reads(&mut planned, &renamed);
+        Ok::<_, String>(planned)
     })?;
     // Projection pruning runs on the planned program, after the final `simplify`
     // ([`PlanningPhase::Cleanup`]). Every phase matches a source in the shape it has when the
@@ -338,10 +371,12 @@ fn run_phases(
                 Root::Program => insert_iterate_markers(&mut term, ctx, &memo)?,
                 Root::Lifted => iterate::insert_iterate_recurse(&mut term, ctx, &memo)?,
             },
-            PlanningPhase::CompilePredicates => compile_refinement_predicates(&mut term, &memo),
+            PlanningPhase::CompilePredicates => {
+                compile_refinement_predicates(&mut term, &memo, &ctx.held)
+            }
             PlanningPhase::InsertPerGroupFilters => {
                 per_group_filter::insert_per_group_filters(&mut term, ctx)?;
-                per_group_filter::reject_unmaterialized_narrowings(&term)?;
+                per_group_filter::reject_unmaterialized_narrowings(&term, &ctx.held)?;
             }
         }
     }

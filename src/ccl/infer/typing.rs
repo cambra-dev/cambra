@@ -334,6 +334,20 @@ pub(super) trait Typing: crate::ccl::infer_var::TelescopeWalk + Sized {
     where
         Self: Sized;
 
+    /// Run `f` with the binder of the type `let` `held` in scope, at its definition's type: a term
+    /// the `let` is around reads it as it reads a term's binder. Check also compares under the
+    /// definition, as it does in the `let`'s body.
+    fn scoped_type_let<R>(
+        &mut self,
+        held: &crate::ccl::ty::TypeLet,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized,
+    {
+        self.scoped(&held.name, &held.definition.ty, f)
+    }
+
     /// Run `f` over a function body, or a run's top level, with the opaque binders it binds
     /// entered ([`crate::ccl::infer_var::body_opaque_binders`]). A type crossing one of them keeps
     /// its name, as it crosses the opaque binder's own `let`.

@@ -320,7 +320,8 @@ fn opened_levels(ty: &Type, levels: usize) -> (Vec<(Option<Name>, Type)>, Type) 
     let mut components = Vec::with_capacity(levels);
     let mut current = ty.clone();
     for _ in 0..levels {
-        let level = current.peel_refinements().clone();
+        // Each part holds the type `let`s it reads, so it stands alone as a component.
+        let level = current.lets_distributed().peel_refinements().clone();
         let Type::Fun {
             fun_kind: FunKind::Data(_),
             binder,
@@ -409,7 +410,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
         // The keys this loop ranges over: its source's own refinements and, where it filters,
         // the ones its `cast` states, which the keys satisfy together. A present-key
         // refinement is not a filter and is not lifted.
-        let mut refinements: Vec<Refinement> = domains[index].refinements().to_vec();
+        let mut refinements: Vec<Refinement> = domains[index].standalone_refinements();
         if let TypedExprNode::Cast { target, .. } = &generator.iterated.node {
             for r in cast_target_refinement(target)
                 .expect("a loop filter's cast states the filter (`make_cast` asserts it)")
@@ -431,12 +432,12 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
             lifted.push(Refinement::born(Rc::new(predicate)));
         }
     }
-    let keys = if lifted.is_empty() {
-        bare
-    } else {
+    // Built by [`Type::refined`], which lifts the type `let`s standing refinements carry back
+    // around the type.
+    let keys = {
         let mut set = crate::ccl::ty::RefinementSet::new();
         set.extend(lifted);
-        Type::Refinement(Box::new(bare), set)
+        Type::refined(bare, set)
     };
     let record = Name::fresh("__iter_record");
     let nest_params: Vec<Name> = generators.iter().map(|g| g.param.name.clone()).collect();
@@ -766,7 +767,7 @@ fn read_level(
     }
     // A source whose values depend on their position holds, at this one, its codomain read
     // there.
-    let item = match source.ty.read_view().peel_refinements() {
+    let item = match source.ty.read_view().lets_distributed().peel_refinements() {
         Type::Fun {
             binder: crate::ccl::FunBinder::Whole(k),
             codomain,

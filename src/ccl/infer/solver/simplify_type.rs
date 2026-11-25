@@ -216,6 +216,7 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
         term: simplify_reconstruct(cty.term, &var_subst),
         rec_vars: new_rec_vars,
         join_violations: cty.join_violations,
+        lets: cty.lets,
     }
 }
 
@@ -537,6 +538,7 @@ fn simplify_reconstruct(
         family: new_family,
         nominal: new_nominal,
         origins: ct.origins,
+        lets: ct.lets,
         nominal_conflict: ct.nominal_conflict.map(|(decl, a, b)| {
             (
                 decl,
@@ -659,6 +661,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
 
         let simplified = simplify_type(graph);
@@ -693,6 +696,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
 
         let simplified = simplify_type(graph);
@@ -730,6 +734,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
 
         let simplified = simplify_type(graph);
@@ -764,6 +769,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
 
         let simplified = simplify_type(graph);

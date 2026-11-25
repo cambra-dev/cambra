@@ -162,7 +162,7 @@ fn prune(source: &mut Expr, head: &mut Expr) -> Option<Plan> {
 fn reads_a_product(proj: &Expr) -> bool {
     proj.ty
         .domain()
-        .is_some_and(|d| matches!(d.peel_refinements(), Type::Tuple(_) | Type::Record(_)))
+        .is_some_and(|d| matches!(d.former(), Type::Tuple(_) | Type::Record(_)))
 }
 
 /// The projection steps at the front of `elts`, while each reads a tuple or a record.

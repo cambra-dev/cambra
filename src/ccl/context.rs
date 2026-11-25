@@ -784,7 +784,7 @@ fn derived_from(
 fn enclosing(tree: &Expr, node: NodeId) -> Option<Vec<NodeId>> {
     fn predicates<'a>(ty: &'a Type, out: &mut Vec<&'a Expr>) {
         if let Type::Refinement(_, refinements) = ty {
-            out.extend(refinements.iter().map(|r| &*r.predicate));
+            out.extend(refinements.iter().map(|r| r.predicate.term()));
         }
         ty.walk_children(|c| predicates(c, out));
     }
@@ -1539,7 +1539,6 @@ pub enum Phase {
 /// See `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     use std::collections::{HashMap, HashSet};
-    use std::rc::Rc;
 
     // One entry per *distinct* predicate term, keyed by `Rc` pointer: a term
     // riding many type slots is one term and shares its ids with itself.
@@ -1549,8 +1548,8 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         });
         e.walk_children(|c| ids_of(c, out));
     }
-    fn from_term(term: &Rc<Expr>, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        let key = Rc::as_ptr(term) as usize;
+    fn from_term(term: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
+        let key = std::ptr::from_ref(term) as usize;
         if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
             let mut s = HashSet::new();
             ids_of(term, &mut s);
@@ -1628,7 +1627,7 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
         // walked once: walked again from every slot, the walk is exponential in how deeply
         // shared predicates nest.
         e.walk_held_terms(&mut |term| {
-            if held.insert(Rc::as_ptr(term)) {
+            if held.insert(std::ptr::from_ref(term)) {
                 from_expr(term, acc, held);
             }
         });
@@ -3851,7 +3850,7 @@ fn drop_plain_unboxes_in(expr: &mut Expr, memo: &crate::ccl::ccl_utils::PredMemo
             function.node,
             TypedExprNode::Builtin(crate::ccl::Builtin::Unbox)
         )
-        && argument.ty.peel_refinements().sum().is_none()
+        && argument.ty.former().sum().is_none()
     {
         *expr = std::mem::take(&mut **argument);
         dropped = true;

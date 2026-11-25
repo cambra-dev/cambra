@@ -65,9 +65,9 @@ struct KeyView {
     /// ordinary domain.
     witness: bool,
     /// Refinements at this position, deduplicated by [`Refinement`]'s
-    /// type-blind structural equality. Order is insertion order, so equality
-    /// compares these as a set.
-    refinements: Vec<Refinement>,
+    /// type-blind structural equality under the type `let`s each reads ([`KeyRefinement`]).
+    /// Order is insertion order, so equality compares these as a set.
+    refinements: Vec<KeyRefinement>,
     /// What a function at this position requires and causes, resolved: a clone has one set of
     /// capabilities at each node, so uses whose functions do different things share none
     /// (`src/ccl/design/type-inference.md`, "Capabilities on every expression"). Compared as a set.
@@ -124,6 +124,26 @@ struct KeyView {
     nominal: crate::ccl::nominal::DeclMap<Vec<KeyView>>,
 }
 
+/// A refinement a key states, and the type `let`s it reads, outermost first
+/// ([`Subst::force_refinement_holding`]). Two are one where they are equal with each read of a
+/// binder taken as its definition ([`crate::ccl::ty::refinement_eq_under_lets`]).
+#[derive(Debug, Clone)]
+struct KeyRefinement {
+    refinement: Refinement,
+    lets: Vec<crate::ccl::ty::TypeLetExit>,
+}
+
+impl PartialEq for KeyRefinement {
+    fn eq(&self, other: &Self) -> bool {
+        crate::ccl::ty::refinement_eq_under_lets(
+            &self.refinement,
+            &self.lets,
+            &other.refinement,
+            &other.lets,
+        )
+    }
+}
+
 /// Structural equality, with `refinements` compared as a set.
 ///
 /// Refinements accumulate in first-insertion order, which depends on the order the
@@ -133,7 +153,7 @@ struct KeyView {
 /// insertion, so equal lengths plus containment is set equality.
 impl PartialEq for KeyView {
     fn eq(&self, other: &Self) -> bool {
-        fn same_refinements(a: &[Refinement], b: &[Refinement]) -> bool {
+        fn same_refinements(a: &[KeyRefinement], b: &[KeyRefinement]) -> bool {
             a.len() == b.len() && a.iter().all(|w| b.contains(w))
         }
         fn same_kinds(a: &[crate::ccl::ty::TypeKind], b: &[crate::ccl::ty::TypeKind]) -> bool {
@@ -404,7 +424,7 @@ impl fmt::Display for KeyView {
             let preds: Vec<String> = self
                 .refinements
                 .iter()
-                .map(|w| crate::ccl::symbolic::symbolic(&w.predicate))
+                .map(|w| crate::ccl::symbolic::symbolic(&w.refinement.predicate))
                 .collect();
             write!(f, "{{{base} | {}}}", preds.join(", "))
         }
@@ -648,6 +668,13 @@ fn key_go(
             AtomKey::from_type(solver, ty).expect("every atomic type classifies as an AtomKey"),
         ),
         Type::Poly(_) => unreachable!("a polymorphic type reached `spec_key`"),
+        // A type `let` stands for its body with the definition discharged, read as compaction
+        // reads it.
+        Type::Let(l) => {
+            let discharge = Subst::let_exit(l.name.clone(), Rc::clone(&l.definition));
+            let acc = Subst::then(solver, &discharge, subst_acc);
+            key_go(solver, &l.body, pol, &acc, ctx)
+        }
         // A `Hole` contributes nothing — the same "no information here" the
         // default key denotes, so a `Hole` keys identically to an
         // under-determined `Infer`. That collision cannot merge two uses that
@@ -717,11 +744,23 @@ fn key_go(
         Type::Refinement(inner, refinements) => {
             let mut k = key_go(solver, inner, pol, subst_acc, ctx);
             for r in refinements {
-                let r = subst_acc.force_refinement(solver, r);
+                // The type `let`s the substitution holds stay held: the key reads each one's
+                // binder, beside its definition ([`KeyRefinement`]).
+                let (r, lets) = subst_acc.force_refinement_holding(solver, r);
                 // Closed against the walk's enclosing binders, as in `compact_go`:
                 // the key stores the index-spelled refinement, so α-variant
-                // instantiations key together.
-                let r = ctx.scope.close(solver, &r);
+                // instantiations key together. A definition stands where the refinement does,
+                // so it closes alike.
+                let r = KeyRefinement {
+                    refinement: ctx.scope.close(solver, &r),
+                    lets: lets
+                        .into_iter()
+                        .map(|(n, d)| {
+                            let closed = ctx.scope.close(solver, &Refinement::born(d));
+                            (n, closed.predicate)
+                        })
+                        .collect(),
+                };
                 if !k.refinements.contains(&r) {
                     k.refinements.push(r);
                 }
@@ -1314,7 +1353,7 @@ mod tests {
             0,
             &crate::ccl::infer_var::Telescope::empty(),
         );
-        let collection = Rc::new(TypedExpr::var("xs"));
+        let collection = crate::ccl::ty::IntoHeldTerm::into_held(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
         let (root, nodes) =
             super::super::test_helpers::diamond_bound_graph(solver, 16, int(), &edge);

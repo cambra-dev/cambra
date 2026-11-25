@@ -342,6 +342,12 @@ impl<'m> Walk<'m> {
             Type::Record(fields) => fields.iter().for_each(|(_, t)| self.ty(t)),
             Type::Variant(tags, _) => tags.iter().for_each(|(_, t)| self.ty(t)),
             Type::History { function, .. } => self.ty(function),
+            // `FN(let 𝑥 = 𝑒 in 𝑇) = FN(𝑒) ∪ (FN(𝑇) − {𝑥})`: the definition, a term binding no
+            // element, stands where the `let` does, and the body is under the binder.
+            Type::Let(l) => {
+                self.held(&l.definition, false);
+                self.under(std::iter::once(&l.name), |w| w.ty(&l.body));
+            }
         }
     }
 
@@ -356,7 +362,7 @@ impl<'m> Walk<'m> {
 
     /// A term a type holds: a refinement's predicate, which binds its element when
     /// `binds_elem`, or a projected sum, which binds none.
-    fn held(&mut self, term: &Rc<Expr>, binds_elem: bool) {
+    fn held(&mut self, term: &Rc<crate::ccl::ty::HeldTerm>, binds_elem: bool) {
         let id = Rc::as_ptr(term);
         let entered = u32::from(binds_elem);
         match &mut self.ask {
@@ -426,7 +432,7 @@ mod tests {
 
     /// `{Int | __elem == 𝑟}`, each copy over one shared predicate term.
     fn equal_to(read: TypedExpr) -> impl Fn() -> Type {
-        let predicate = Rc::new(TypedExpr::binop(
+        let predicate = crate::ccl::ty::IntoHeldTerm::into_held(TypedExpr::binop(
             TypedExpr::var(Name::elem()),
             BinOpKind::Compare(CompareKind::Equals),
             read,

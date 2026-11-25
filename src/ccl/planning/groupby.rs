@@ -225,7 +225,10 @@ struct PointfulSite {
 /// This is the syntactic half, coupled to how a site is currently spelled, as against
 /// [`partition_key_of`]'s question of whether a refinement partitions at all. It stays
 /// narrow: a new site pattern is a sibling of this function rather than an edit to it.
-fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
+fn match_pointful_site<'d>(
+    head: &Expr,
+    root_definition: &dyn Fn(&Name) -> Option<&'d Expr>,
+) -> Option<PointfulSite> {
     // The family lambda elimination builds for a group-by: `(.1 ≫ 𝑐) ▷ curry`, the
     // collection `𝑐` read at the element half of each `(key, element)` pair of the
     // partition's domain, curried back into one collection per key.
@@ -263,7 +266,10 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
     // key domain on the *result* stays on downstream consumer types — it faithfully
     // names the present-key domain — and is never executed as a filter; see
     // `src/ccl/design/collections.md`.)
-    let head_ty = crate::ccl::generalize::opened(&head.ty);
+    // The family's function stands at the root, each part holding the type `let`s it reads.
+    let head_ty = &crate::ccl::generalize::opened(&head.ty)
+        .lets_distributed()
+        .into_owned();
     let Type::Fun {
         binder: key_binder,
         domain: key_ty,
@@ -277,12 +283,15 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
     // run"): the family is stored closed, so `pred`'s reference to the key is an
     // index until the codomain is read under the binder. The match below is
     // structural on that reference being a free `Var`.
-    let inner = crate::ccl::subst::open_codomain(head_ty, inner);
+    // The group's function stands at the root, its domain holding the type `let`s it reads.
+    let inner = crate::ccl::subst::open_codomain(head_ty, inner)
+        .lets_distributed()
+        .into_owned();
     let Type::Fun {
         domain: refined_dom,
         codomain: value_ty,
         ..
-    } = &inner
+    } = inner.peel_refinements()
     else {
         return None;
     };
@@ -290,7 +299,9 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
     // it: an ordinary filter on the grouped collection rides alongside, and is not this
     // rewrite's to consume. Nothing distinguishes the grouping refinement positionally —
     // the set is unordered — which is why the recognizer asks what a refinement *says*.
-    let Type::Refinement(idx_ty, refinements) = refined_dom.as_ref() else {
+    // Under the type `let`s around the domain, which the value domain keeps.
+    let (lets, under) = crate::ccl::ty::TypeLet::peel(refined_dom);
+    let Type::Refinement(idx_ty, refinements) = under else {
         return None;
     };
     let (key_eq, partition) = refinements
@@ -320,7 +331,22 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
         return None;
     }
     let path_pf = predicates::eliminate_lifted((**path_of).duplicate()).ok()?;
-    if !crate::ccl::eq_term_modulo_ty_slots(&path_pf, collection) {
+    // The path reads the type `let`s of the site's type where the site's collection can have
+    // their definitions discharged, or read the root's binding of them.
+    let mut held = std::collections::HashMap::new();
+    crate::ccl::generalize::type_let_definitions(&head.ty, &mut |name, definition, _| {
+        held.entry(name.clone()).or_insert_with(definition);
+    });
+    let definitions = |n: &Name| {
+        lets.iter()
+            .find(|l| l.name == *n)
+            .map(|l| l.definition.term())
+            .or_else(|| held.get(n).map(|d: &Rc<crate::ccl::ty::HeldTerm>| d.term()))
+            .or_else(|| root_definition(n))
+    };
+    if !crate::ccl::eq_term_modulo_ty_slots(&path_pf, collection)
+        && !crate::ccl::ty::eq_term_under_definitions(&path_pf, collection, &definitions)
+    {
         return None;
     }
 
@@ -330,14 +356,17 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
         key_fn: partition.key_fn.duplicate(),
         key_ty: ccl_utils::strip_refinements(key_ty),
         key_dom: (**key_ty).clone(),
-        value_idx_ty: Type::refined(
-            (**idx_ty).clone(),
-            refinements
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != key_eq)
-                .map(|(_, r)| r.clone())
-                .collect(),
+        value_idx_ty: crate::ccl::ty::TypeLet::rewrap(
+            &lets,
+            Type::refined(
+                (**idx_ty).clone(),
+                refinements
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != key_eq)
+                    .map(|(_, r)| r.clone())
+                    .collect(),
+            ),
         ),
         group_idx_ty: (**refined_dom).clone(),
         value_ty: (**value_ty).clone(),
@@ -374,7 +403,11 @@ fn convert_groupby_pointful(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option
 /// The group-by source rewrite: recognize the pointful site and return the equivalent
 /// bucketize chain. See [`convert_groupby_pointful`].
 fn rewrite_groupby_source(head: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, String> {
-    let Some(site) = match_pointful_site(head) else {
+    let Some(site) = match_pointful_site(head, &|n| {
+        ctx.checker
+            .root_definition(n)
+            .or_else(|| ctx.held.definitions.get(n).map(|d| d.term()))
+    }) else {
         return Ok(None);
     };
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
@@ -584,7 +617,7 @@ mod tests {
         let refined = Type::refined_one(int_ty(), Refinement::born(Rc::new(pred)));
         let head = var("src").with_ty(fun_ty(int_ty(), fun_ty(refined, int_ty())));
         assert!(
-            match_pointful_site(&head).is_none(),
+            match_pointful_site(&head, &|_| None).is_none(),
             "an unrecognized site must decline, not guess"
         );
 

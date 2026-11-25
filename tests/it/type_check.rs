@@ -54,16 +54,19 @@ fn projected_kinds(ty: &Type) -> Vec<TypeKind> {
         ty.sum().is_none(),
         "a comprehension over a sum is plain, got {ty}"
     );
-    let Type::Fun { domain, .. } = ty.peel_refinements() else {
+    // A part read under the type `let`s the type holds.
+    let shape = ty.lets_distributed();
+    let Type::Fun { domain, .. } = shape.peel_refinements() else {
         panic!("a comprehension is a collection, got {ty}")
     };
+    let domain = domain.lets_distributed();
     let positions = match domain.peel_refinements() {
         Type::Tuple(ts) => ts.clone(),
         d => vec![d.clone()],
     };
     positions
         .iter()
-        .map(|d| match d.peel_refinements() {
+        .map(|d| match d.former() {
             Type::WitnessProjection(p) => p
                 .witness()
                 .unwrap_or_else(|| panic!("the projected term is a sum, got {ty}"))
@@ -2087,7 +2090,9 @@ fn a_groupby_is_a_full_map_at_either_strength() {
     ))
     .to_string();
     assert!(
-        bounded.starts_with("((__gb_k: {Int | ") && bounded.contains("collection_contains"),
+        bounded.contains("((__gb_k: ")
+            && bounded.contains("{Int | ")
+            && bounded.contains("collection_contains"),
         "a group-by satisfies FullMap and keeps its present-key domain, got {bounded}"
     );
     // Exact: `g` binds at the annotation, whose binder the filled codomain names.
@@ -2098,7 +2103,7 @@ fn a_groupby_is_a_full_map_at_either_strength() {
     ))
     .to_string();
     assert!(
-        exact.starts_with("((__map_k: {Int | ") && exact.contains("== __map_k"),
+        exact.contains("((__map_k: ") && exact.contains("{Int | ") && exact.contains("== __map_k"),
         "the exact form binds at the annotation's binder, got {exact}"
     );
     // And it is usable, not merely inhabited: consuming the groups sums them.
@@ -2858,37 +2863,25 @@ fn test_copair_heterogeneous_rejected() {
 #[case("groupby([(a=1, b=\"w\"), (a=2, b=\"e\")], \\r -> r.b)", string())]
 fn test_groupby_key_type_comes_from_the_key_function(#[case] code: &str, #[case] key_ty: Type) {
     let ty = infer_program(code);
-    let Type::Fun { domain, .. } = &ty else {
+    let shape = ty.lets_distributed();
+    let Type::Fun { domain, .. } = shape.peel_refinements() else {
         panic!("a group-by is a function from key to partition, got {ty}");
     };
-    assert_eq!(
-        strip_refinements(domain),
-        key_ty,
-        "wrong key type for {code}"
-    );
-}
-
-/// The bare type under any refinement layers — the local stand-in for
-/// `ccl_utils::strip_refinements`, which is crate-private.
-fn strip_refinements(ty: &Type) -> Type {
-    let mut cur = ty;
-    while let Type::Refinement(inner, _) = cur {
-        cur = inner;
-    }
-    cur.clone()
+    assert_eq!(domain.former().clone(), key_ty, "wrong key type for {code}");
 }
 
 /// The key type of the group-by in `code`'s result, which is expected to be a
 /// tuple of two group-bys — one per instantiation / occurrence under test.
 fn groupby_key_types(code: &str) -> (Type, Type) {
     let ty = infer_program(code);
-    let Type::Tuple(parts) = &ty else {
+    let shape = ty.lets_distributed();
+    let Type::Tuple(parts) = shape.peel_refinements() else {
         panic!("expected a pair of group-bys, got {ty}");
     };
-    let key_of = |t: &Type| match t {
+    let key_of = |t: &Type| match t.lets_distributed().peel_refinements() {
         // The **base** of the present-key domain; see
         // `test_groupby_key_type_comes_from_the_key_function`.
-        Type::Fun { domain, .. } => strip_refinements(domain),
+        Type::Fun { domain, .. } => domain.former().clone(),
         other => panic!("a group-by is a function from key to partition, got {other}"),
     };
     (key_of(&parts[0]), key_of(&parts[1]))
@@ -3013,10 +3006,11 @@ fn higher_order_dependent_application_discharges_the_binder() {
 /// Shared assertion for the two discharge tests: `ty` is a data function whose domain
 /// refinement mentions the discharged argument `0` and no longer references `binder`.
 fn assert_predicate_discharged(ty: &Type, binder: &str) {
-    let Type::Fun { domain: dom, .. } = ty else {
+    let shape = ty.lets_distributed();
+    let Type::Fun { domain: dom, .. } = shape.peel_refinements() else {
         panic!("expected a refined data function, got {ty}");
     };
-    let [r] = dom.refinements() else {
+    let [r] = &dom.standalone_refinements()[..] else {
         panic!("expected a singly-refined domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
@@ -3040,7 +3034,7 @@ fn assert_predicate_discharged(ty: &Type, binder: &str) {
 fn set_infers_deduped_keyed_unit_collection() {
     assert_eq!(
         infer_program("set([1,2,3])").to_string(),
-        "({Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ [1, 2, 3] ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)"
+        "(let __anf = [1, 2, 3] in {Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ __anf ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)"
     );
 }
 
@@ -3063,7 +3057,7 @@ fn set_injects_into_nominal_set_annotation() {
             x <: Set(Int) = box(set([1,2,3]))
             x"#})
         .to_string(),
-        "Σ (σ : [{Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ [1, 2, 3] ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)}]). (σ ⤇ Unit)"
+        "Σ (σ : [let __anf = [1, 2, 3] in {Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ __anf ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)}]). (σ ⤇ Unit)"
     );
     // The **key type** flows too: it is a kind *parameter*, so the edge relates it
     // rather than ignoring it — and it survives the `box`, which reaches the annotation
@@ -3093,7 +3087,7 @@ fn set_injects_into_nominal_set_annotation() {
 fn map_infers_a_key_domain_over_the_value() {
     assert_eq!(
         infer_program("map([(1, 10), (2, 20)])").to_string(),
-        "({Int | __elem ▷ ((λ __iter_record : 0..2 → __iter_record ▷ [(1, 10), (2, 20)] ▷ (λ __map_kv : (Int, Int) → __map_kv.0)) ▷ collection_contains)} ⤇ Int)"
+        "(let __anf = (2, 20) in let __anf = (1, 10) in let __anf = [__anf, __anf] in {Int | __elem ▷ ((λ __iter_record : 0..2 → __iter_record ▷ __anf ▷ (λ __map_kv : (Int, Int) → __map_kv.0)) ▷ collection_contains)} ⤇ Int)"
     );
 }
 
@@ -3135,18 +3129,21 @@ fn map_injects_into_nominal_map_annotation() {
 #[test]
 fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
     let ty = infer_program("groupby([1, 2, 3], \\x -> x)");
+    let shape = ty.lets_distributed();
     let Type::Fun {
         binder: cambra::ccl::FunBinder::Whole(key_binder),
         codomain,
         ..
-    } = &ty
+    } = &*shape
     else {
         panic!("a group-by is a dependent function from key to partition, got {ty}");
     };
-    let Type::Fun { domain: dom, .. } = &**codomain else {
+    let codomain = codomain.lets_distributed();
+    let Type::Fun { domain: dom, .. } = &*codomain else {
         panic!("expected the partition function inside the key function, got {ty}");
     };
-    let [r] = dom.refinements() else {
+    // The refinement under the type `let`s the domain holds.
+    let [r] = cambra::ccl::TypeLet::peel(dom).1.own_refinements() else {
         panic!("expected a singly-refined partition domain, got {ty}");
     };
     // Stored: the reference is a bound index, not a free name. Read off the
@@ -3412,10 +3409,10 @@ fn test_filtered_comprehension_has_refinement_on_domain() {
         domain: dom,
         codomain: cod,
         ..
-    } = &ty
+    } = ty.lets_distributed().peel_refinements()
     {
         assert!(
-            matches!(&**dom, Type::Refinement(_, _)),
+            !dom.standalone_refinements().is_empty(),
             "expected Refinement-wrapped domain, got {ty}"
         );
         assert_eq!(**cod, int(), "expected codomain Int, got {ty}");
@@ -3465,14 +3462,15 @@ fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
             else:
                 [x for x in xs if x > 1]
             "#});
+    let shape = ty.lets_distributed();
     let Type::Fun {
         domain, codomain, ..
-    } = &ty
+    } = shape.peel_refinements()
     else {
         panic!("expected a collection type, got {ty}");
     };
     assert!(
-        matches!(&**domain, Type::Refinement(..)),
+        !domain.standalone_refinements().is_empty(),
         "the filter both arms establish must survive the join, got {ty}"
     );
     assert_eq!(**codomain, int(), "expected an Int codomain, got {ty}");
@@ -3491,9 +3489,10 @@ fn test_list_of_filtered_comprehensions_passes_consistency_wall() {
             xs = [1, 2, 3]
             [[x for x in xs if x > 1]]
             "#});
+    let shape = ty.lets_distributed();
     let Type::Fun {
         domain, codomain, ..
-    } = &ty
+    } = shape.peel_refinements()
     else {
         panic!("expected a collection type, got {ty}");
     };
@@ -3503,7 +3502,7 @@ fn test_list_of_filtered_comprehensions_passes_consistency_wall() {
         "expected a 1-element list, got {ty}"
     );
     assert!(
-        matches!(&**codomain, Type::Fun { domain: d, .. } if matches!(&**d, Type::Refinement(..))),
+        matches!(codomain.lets_distributed().peel_refinements(), Type::Fun { domain: d, .. } if !d.standalone_refinements().is_empty()),
         "the element's filtered domain must survive, got {ty}"
     );
 }
@@ -3549,7 +3548,8 @@ fn test_case_arms_with_different_filters_become_sigma_candidates() {
             else:
                 box([x for x in xs if x < 3])
             "#});
-    let Some([w]) = ty.sum() else {
+    let shape = ty.lets_distributed();
+    let Some([w]) = shape.peel_refinements().sum() else {
         panic!("expected a conditional collection (a sum), got {ty}");
     };
     let TypeKind::Enumerated(candidates) = w.type_kind() else {
@@ -3559,11 +3559,12 @@ fn test_case_arms_with_different_filters_become_sigma_candidates() {
     // Each candidate is the source domain under exactly one filter: its own arm's, and
     // only that one.
     for c in &candidates {
-        let Type::Refinement(base, _) = c else {
-            panic!("expected a filtered candidate domain, got {ty}");
-        };
+        assert!(
+            !c.standalone_refinements().is_empty(),
+            "expected a filtered candidate domain, got {ty}"
+        );
         assert_eq!(
-            **base,
+            *c.former(),
             Type::UIntRange(3),
             "expected the source domain under the filter, got {ty}"
         );
@@ -5175,14 +5176,18 @@ fn two_alpha_variant_dependent_refinements_share_a_position() {
     else {
         panic!("expected the dependent function as the element, got {ty}");
     };
-    let Type::Fun { domain, .. } = &**inner else {
+    let inner = inner.lets_distributed();
+    let Type::Fun { domain, .. } = inner.peel_refinements() else {
         panic!("expected the filtered collection, got {ty}");
     };
-    let Type::Refinement(base, _) = &**domain else {
-        panic!("the filter both arms establish must survive the join, got {ty}");
-    };
+    let refinements = domain.standalone_refinements();
     assert!(
-        !matches!(&**base, Type::Refinement(..)),
+        !refinements.is_empty(),
+        "the filter both arms establish must survive the join, got {ty}"
+    );
+    assert_eq!(
+        refinements.len(),
+        1,
         "the two α-variant refinements must dedup to one layer, got {ty}"
     );
 }
@@ -5242,7 +5247,11 @@ fn let_binder_does_not_escape_into_result_refinement() {
 
         g
     "#});
-    assert_eq!(ty.to_string(), "((n: Int) ⇒ {Int | __elem == n ^+ 1 + 1})");
+    // The codomain holds `m`'s definition once, as a type `let`, so `m` is bound in it.
+    assert_eq!(
+        ty.to_string(),
+        "((n: Int) ⇒ let m = n ^+ 1 in {Int | __elem == m + 1})"
+    );
 }
 
 /// The contrast: a result refinement over the **parameter** needs no
@@ -5319,7 +5328,7 @@ fn an_arm_whose_domain_is_inferred_joins_like_a_written_one() {
     assert!(
         candidates
             .iter()
-            .any(|d| matches!(d, Type::Refinement(b, _) if **b == Type::UIntRange(3))),
+            .any(|d| !d.standalone_refinements().is_empty() && *d.former() == Type::UIntRange(3)),
         "the filtered arm keeps its restriction over its own domain, got {ty}"
     );
     assert!(
@@ -5471,7 +5480,8 @@ fn a_conditional_collection_survives_every_shape_of_consumer() {
         panic!("a filtered collection has a domain, got {filtered}");
     };
     assert!(
-        matches!(&domain, Type::Refinement(b, _) if matches!(**b, Type::WitnessProjection(_))),
+        !domain.standalone_refinements().is_empty()
+            && matches!(domain.former(), Type::WitnessProjection(_)),
         "the restriction rides the witness, got {filtered}"
     );
     // And a collapsing consumer wrapping a domain-preserving one collapses the sum.
@@ -5619,7 +5629,8 @@ fn one_collection_consumed_twice_is_one_collection() {
             c = 3 > 2
             x = box([1, 2]) if c else box([1, 2, 3])
             ([y for y in x], [z for z in x])"#});
-    let Type::Tuple(parts) = &ty else {
+    let shape = ty.lets_distributed();
+    let Type::Tuple(parts) = shape.peel_refinements() else {
         panic!("expected a pair of collections, got {ty}")
     };
     let [a, b] = &parts[..] else {
@@ -5736,7 +5747,8 @@ fn a_refinement_belongs_to_one_candidate_not_the_sum() {
         (&refined_wider, Type::UIntRange(3), Type::UIntRange(2)),
         (&refined_narrower, Type::UIntRange(2), Type::UIntRange(3)),
     ] {
-        let Some([w]) = ty.sum() else {
+        let shape = ty.lets_distributed();
+        let Some([w]) = shape.peel_refinements().sum() else {
             panic!("expected a conditional collection, got {ty}");
         };
         let kind = w.type_kind();
@@ -5745,11 +5757,13 @@ fn a_refinement_belongs_to_one_candidate_not_the_sum() {
         assert!(
             candidates
                 .iter()
-                .any(|d| matches!(d, Type::Refinement(base, _) if **base == refined)),
+                .any(|d| !d.standalone_refinements().is_empty() && *d.former() == refined),
             "the filtered arm's domain must carry the refinement, got {ty}"
         );
         assert!(
-            candidates.contains(&bare),
+            candidates
+                .iter()
+                .any(|d| *d.former() == bare && d.standalone_refinements().is_empty()),
             "the unfiltered arm's domain must stay bare, got {ty}"
         );
     }
@@ -5942,6 +5956,7 @@ fn a_boxed_dependent_collection_declares_its_binder_on_the_witness() {
         g = {gb}
         g"#
     ))
+    .lets_distributed()
     .to_string();
     // The candidate is the argument's domain *exactly* — the group-by's present-key
     // domain, refined — because `box`'s candidate position is invariant. What this pins is

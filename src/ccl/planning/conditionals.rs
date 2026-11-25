@@ -126,7 +126,7 @@ fn instantiate_erased_witnesses(
     // candidate the projection now names.
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && matches!(function.node, TypedExprNode::Builtin(Builtin::Unbox))
-        && argument.ty.peel_refinements().sum().is_none()
+        && argument.ty.former().sum().is_none()
     {
         *expr = std::mem::take(&mut **argument);
     }
@@ -297,7 +297,7 @@ fn read_the_arm_instead(predicate: &Expr, witness: &crate::ccl::ty::Witness, arm
 /// whose binder nothing relates to the site's is a naming gap this reads around rather than a
 /// rule it follows.
 fn indexed_by_this_sum(expr: &Expr, type_kind: &crate::ccl::ty::TypeKind) -> bool {
-    match expr.ty.peel_refinements().sum() {
+    match expr.ty.lets_distributed().peel_refinements().sum() {
         Some([first, ..]) => first.type_kind() == *type_kind,
         // A domain that *names* an index rather than being a sum has its binder elsewhere,
         // so this type does not say what it ranges over.
@@ -514,7 +514,10 @@ fn realize(
         // refinement is a mismatch; and `insert_iterate_markers` reifies a domain
         // refinement into a `restrict` only at a term that carries one. A refinement no
         // term carries is one nothing downstream is obliged to honour.
-        let gated = matches!(refined, Type::Refinement(_, _));
+        let gated = matches!(
+            crate::ccl::ty::TypeLet::peel(&refined).1,
+            Type::Refinement(_, _)
+        );
         let leg_ty = Type::fun_like(&leg.ty, refined, value_ty.clone());
         // A **vacuously true** gate refines nothing (`refine_with` drops it), so there is
         // no refinement for a cast to carry and the leg is its arm at its own type. One
@@ -535,7 +538,7 @@ fn realize(
     // Every witness of the site is instantiated in its legs, so each leg is a plain data
     // function and no binder is left for it to carry.
     debug_assert!(
-        legs[0].ty.peel_refinements().sum().is_none(),
+        legs[0].ty.former().sum().is_none(),
         "a realized leg quantifies a witness the site did not name: site {:?} named {:?}, leg {:?}",
         original.peel_refinements().to_string(),
         witnesses.iter().map(|w| w.id()).collect::<Vec<_>>(),
@@ -619,7 +622,10 @@ fn unboxed_arm(arm: Expr) -> Option<(Expr, Type)> {
         provenance::Nature::Machinery,
     );
     let stamp = crate::ccl::ty::unbox_type(&arm.ty)?;
-    let ty = crate::ccl::ty::unboxed_type(&arm.ty, &Rc::new(arm.duplicate()))?;
+    let ty = crate::ccl::ty::unboxed_type(
+        &arm.ty,
+        &crate::ccl::ty::IntoHeldTerm::into_held(arm.duplicate()),
+    )?;
     let dom = ty.domain()?;
     let unboxed = Expr::apply(arm, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(ty);
     Some((unboxed, dom))
@@ -745,7 +751,7 @@ fn combinations(choices: &[Vec<ArmChoice>]) -> Vec<Vec<&ArmChoice>> {
 /// domain is the product they index — so "which witness" is a list, and the depth-one reading
 /// ([`witness_named_by`]) is its head.
 fn witnesses_named_by(ty: &Type) -> Vec<crate::ccl::ty::Witness> {
-    ty.peel_refinements().sum().unwrap_or_default().to_vec()
+    ty.sum_binders()
 }
 
 /// Whether `expr` **is** the conditional collection this witness names.
@@ -763,7 +769,9 @@ fn witnesses_named_by(ty: &Type) -> Vec<crate::ccl::ty::Witness> {
 /// position: a realized `Case` stops matching, so the walk pairs sites and `Case`s in
 /// order (`two_conditional_sources_compile`).
 fn is_the_conditional(expr: &Expr, wanted: &crate::ccl::ty::Witness) -> bool {
-    let named = match expr.ty.peel_refinements().sum() {
+    // Read with its candidates under the type `let`s the type holds, as `wanted`'s are.
+    let ty = expr.ty.lets_distributed();
+    let named = match ty.peel_refinements().sum() {
         Some([first, ..]) => first.type_kind() == wanted.type_kind(),
         _ => witness_named_by(&expr.ty) == Some(*wanted.id()),
     };
@@ -855,7 +863,7 @@ fn replace_the_conditional(
 /// The shared element type of a collection-valued `Case`, or `None` when the `Case` is
 /// not collection-valued (a scalar one, which `lambda_elim`'s C-form already handled).
 fn collection_value_ty(ty: &Type) -> Option<Type> {
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         // A sum's codomain is the element type shared across its fibers, at any number
         // of binders — one slot read serves both spellings.
         Type::Fun { codomain, .. } => Some(codomain.as_ref().clone()),
@@ -931,13 +939,13 @@ fn erase_determined_boxes(
                 | crate::ccl::ty::TypeKind::Type
         )
     );
-    if argument.ty.peel_refinements().sum().is_some() && !preserves_result_kind {
+    if argument.ty.former().sum().is_some() && !preserves_result_kind {
         return ((**argument).duplicate(), true);
     }
     // Only a determined witness — one candidate — is erasable.
     match stated.witness_kind() {
         Some(crate::ccl::ty::TypeKind::Enumerated(ds)) if ds.len() == 1 => {
-            if let Some([first, ..]) = stated.peel_refinements().sum()
+            if let Some(first) = stated.sum_binders().first()
                 && let Some(sole) = first.sole_candidate()
             {
                 erased.insert(*first.id(), sole);

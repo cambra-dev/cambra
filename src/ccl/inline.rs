@@ -82,7 +82,7 @@ use crate::ccl::{
         PredMemo, count_free, discharge_transparent_lets, free_names, free_names_in_value, is_free,
         refresh_let_binder, spelled_in_a_type, walk_held_terms_mut,
     },
-    lambda_elim::substitute,
+    lambda_elim::{inline_let, substitute},
     provenance,
     site::Site,
 };
@@ -235,7 +235,7 @@ pub(crate) fn check_calls_resolved(expr: &Expr) -> Result<(), provenance::Locate
 /// each use. This pass has no cost model to choose between those tradeoffs; see
 /// `src/ccl/design/optimization.md`, "Collection sharing".
 fn should_inline(bound_ty: &Type) -> bool {
-    match bound_ty.peel_refinements() {
+    match bound_ty.lets_distributed().peel_refinements() {
         Type::Fun { fun_kind, .. } => !matches!(fun_kind, FunKind::Data(..)),
         _ => false,
     }
@@ -942,7 +942,7 @@ fn flatten_anf_bindings(mut elt: Expr) -> Expr {
     else {
         unreachable!("matched above");
     };
-    substitute(*body, &binding.name, &bound_expr)
+    inline_let(*body, &binding.name, &bound_expr)
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,7 +1287,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
                 // the substitution and land between the projection and the
                 // former again, one level in.
                 let former = flatten_anf_bindings(bound_expr);
-                return inline_impl(substitute(body, &binding.name, &former), scope);
+                return inline_impl(inline_let(body, &binding.name, &former), scope);
             }
 
             if !binder_spelled_in_a_type && should_inline(&bound_expr.ty) {
@@ -2050,11 +2050,11 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// `restrict` lift.
 fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeEnv) -> bool {
     let arg_ty = &argument.ty;
-    if param_ty.refinements().is_empty() {
+    if param_ty.standalone_refinements().is_empty() {
         return true;
     }
     let demanded: Vec<Refinement> = param_ty
-        .refinements()
+        .standalone_refinements()
         .iter()
         .map(discharge_transparent_lets)
         .collect();
@@ -2067,12 +2067,17 @@ fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeE
     // against the parameter would ask a place type to entail a fact about a value. See
     // `src/ccl/design/mutability.md`, "`Mut` is a CCL type".
     let mut supplied: Vec<Refinement> = arg_ty
-        .refinements()
+        .standalone_refinements()
         .iter()
         .map(discharge_transparent_lets)
         .collect();
     if let Some(value) = arg_ty.mut_value_type() {
-        supplied.extend(value.refinements().iter().map(discharge_transparent_lets));
+        supplied.extend(
+            value
+                .standalone_refinements()
+                .iter()
+                .map(discharge_transparent_lets),
+        );
     }
 
     if demanded.iter().all(|d| supplied.contains(d)) {

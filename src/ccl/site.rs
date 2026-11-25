@@ -126,7 +126,7 @@ pub(crate) fn root_site(kind: PlaceKind, spelling: &str, index: u32) -> Rc<Site>
 /// say which site fed which.
 pub fn channel_tags(ty: &Type, n: usize) -> Option<Vec<FieldKey>> {
     let domain = ty.domain()?;
-    let Type::Variant(arms, _) = domain.peel_refinements() else {
+    let Type::Variant(arms, _) = domain.former() else {
         return None;
     };
     if arms

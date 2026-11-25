@@ -10,6 +10,7 @@
 //! `∀ (D, D1(_)). ((k : D) ⤇ (D1(k) ⤇ Int)) ⇒ …`.
 
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::ty::IntoHeldTerm;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -138,6 +139,7 @@ fn generalized_bodies(ty: &Type) -> Type {
 /// `codomain`, the codomain of the function `fun`, with `fun`'s references to its binder read
 /// as the name `b`.
 fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::FunBinder) -> Type {
+    let fun = fun.lets_distributed();
     let Type::Fun { domain, .. } = fun.peel_refinements() else {
         unreachable!("only a function has a codomain")
     };
@@ -267,7 +269,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
         let avoid: Vec<TypeParamId> = free_params(sup).iter().map(|q| q.id).collect();
         let renamed = params_renamed_apart(p, &avoid);
         let (sub, p) = (&Type::Poly(Rc::clone(&renamed)), &renamed);
-        let opened = match sup.peel_refinements().domain() {
+        let opened = match sup.lets_distributed().peel_refinements().domain() {
             Some(input) => instantiate(sub, &input),
             // A generic value meets the type it is expected at whole.
             None => {
@@ -391,7 +393,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
 /// The structure a generalized parameter has: its bound's, read the same way, since it ranges over
 /// subtypes of the bound. Any other type is its own.
 pub(crate) fn shape(ty: &Type) -> Type {
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         Type::Param(p) if p.generalized => p.bound.as_ref().map_or_else(|| ty.clone(), shape),
         Type::FamilyApp(app) => app.param.bound.as_ref().map_or_else(|| ty.clone(), shape),
         _ => ty.clone(),
@@ -486,10 +488,10 @@ fn match_params(
     // is only an upper bound and fixes nothing.
     while let Some((p, actual)) = met.pop() {
         let Some(bound) = &p.bound else { continue };
-        if matches!(bound.peel_refinements(), Type::Param(_)) {
+        if matches!(bound.former(), Type::Param(_)) {
             continue;
         }
-        let structure = match actual.peel_refinements() {
+        let structure = match actual.lets_distributed().peel_refinements() {
             Type::Param(q) if q.generalized => match &q.bound {
                 Some(b) => b.clone(),
                 None => continue,
@@ -530,6 +532,17 @@ fn match_direct(
     out: &mut HashMap<TypeParamId, Instance>,
     met: &mut Vec<(Rc<crate::ccl::ty::TypeParam>, Type)>,
 ) {
+    // The actual's type `let`s go into its parts, so a part a parameter is bound to holds the
+    // ones it reads.
+    if !matches!(pattern, Type::Let(_))
+        && param_at(pattern).is_none()
+        && let Type::Let(_) = actual
+    {
+        let distributed = actual.lets_distributed().into_owned();
+        if !matches!(distributed, Type::Let(_)) {
+            return match_direct(pattern, &distributed, params, pairs, out, met);
+        }
+    }
     if let Some((p, args, stated)) = param_at(pattern)
         && params.contains(&p.id)
     {
@@ -723,12 +736,229 @@ fn substitute_go(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
 pub(crate) fn generalize_out_of_scope(root: &mut crate::ccl::Expr) -> Result<(), Ungeneralizable> {
     let mut cache = HashMap::new();
     let memo = crate::ccl::ccl_utils::PredMemo::new();
-    walk(root, &mut Vec::new(), &mut cache, &memo).map(|_| ())
+    let mut lets = TreeLets {
+        read: names_types_read(root),
+        lets: Vec::new(),
+    };
+    walk(root, &mut Vec::new(), &mut cache, &memo, &mut lets).map(|_| ())
+}
+
+/// The tree's transparent `let`s around the position a walk has reached whose binders a type
+/// reads, outermost first. A type under one spells a part with the binder or with its
+/// definition alike ([`Definitions`]).
+struct TreeLets {
+    /// The names some type slot in the tree reads.
+    read: std::collections::HashSet<crate::ccl::Name>,
+    lets: Vec<crate::ccl::ty::TypeLet>,
+}
+
+/// The definitions a type is generalized under, by binder: the `let`s it holds and the tree's
+/// `let`s around it. A part spelled with a binder and the same part spelled with the binder's
+/// definition are one part, so the parts a parameter abstracts are grouped as equal under these
+/// ([`crate::ccl::ty::type_eq_under_definitions`]), and no definition is discharged.
+#[derive(Clone, Default)]
+struct Definitions {
+    /// Every definition, by binder. Binders are unique, so one map serves every position.
+    all: HashMap<crate::ccl::Name, Rc<crate::ccl::ty::HeldTerm>>,
+    /// The type's own type `let`s, outermost first: a bound taken out of the type holds the
+    /// ones it reads ([`Self::holding`]).
+    held: Vec<(crate::ccl::Name, Rc<crate::ccl::ty::HeldTerm>)>,
+}
+
+impl Definitions {
+    /// The tree's `let`s around a position.
+    fn around(tree: &TreeLets) -> Self {
+        Definitions {
+            all: tree
+                .lets
+                .iter()
+                .map(|l| (l.name.clone(), Rc::clone(&l.definition)))
+                .collect(),
+            held: Vec::new(),
+        }
+    }
+
+    /// These, and the `let`s `ty` holds, in its structure and in the terms it holds
+    /// ([`type_let_definitions`]).
+    fn with(&self, ty: &Type) -> Self {
+        let mut out = self.clone();
+        type_let_definitions(ty, &mut |name, definition, of_the_type| {
+            if out.all.contains_key(name) {
+                return;
+            }
+            let definition = definition();
+            out.all.insert(name.clone(), Rc::clone(&definition));
+            if of_the_type {
+                out.held.push((name.clone(), definition));
+            }
+        });
+        out
+    }
+
+    /// The binders whose definitions read a binder `out_of_scope` reports, directly or through
+    /// another's definition. A part reading one reads out of scope, and the `let` binding it
+    /// cannot stay where the type goes.
+    fn reading_out_of_scope(
+        &self,
+        out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    ) -> std::collections::HashSet<crate::ccl::Name> {
+        let mut found = std::collections::HashSet::new();
+        let reads: Vec<(
+            &crate::ccl::Name,
+            std::collections::BTreeSet<crate::ccl::Name>,
+        )> = self
+            .all
+            .iter()
+            .map(|(n, d)| (n, crate::ccl::ccl_utils::free_names(d)))
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (n, read) in &reads {
+                if !found.contains(*n) && read.iter().any(|r| out_of_scope(r) || found.contains(r))
+                {
+                    found.insert((*n).clone());
+                    changed = true;
+                }
+            }
+        }
+        found
+    }
+
+    /// `names`, and the names each type `let`'s binder among them reads through its definition, in
+    /// turn: what a part reading `names` reads.
+    fn reads_through(
+        &self,
+        names: impl IntoIterator<Item = crate::ccl::Name>,
+    ) -> std::collections::BTreeSet<crate::ccl::Name> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut pending: Vec<crate::ccl::Name> = names.into_iter().collect();
+        while let Some(n) = pending.pop() {
+            if out.insert(n.clone())
+                && let Some(d) = self.all.get(&n)
+            {
+                pending.extend(crate::ccl::ccl_utils::free_names(d));
+            }
+        }
+        out
+    }
+
+    /// Whether `a` and `b` are one part: equal under these definitions.
+    fn same(&self, a: &Type, b: &Type) -> bool {
+        crate::ccl::ty::type_eq_under_definitions(a, b, &|n| self.definition(n))
+    }
+
+    /// Whether `a` and `b` are one refinement: equal under these definitions.
+    fn same_refinement(&self, a: &crate::ccl::Refinement, b: &crate::ccl::Refinement) -> bool {
+        crate::ccl::ty::refinement_eq_under_definitions(a, b, &|n| self.definition(n))
+    }
+
+    fn definition(&self, n: &crate::ccl::Name) -> Option<&crate::ccl::TypedExpr> {
+        self.all.get(n).map(|d| d.term())
+    }
+
+    /// `part`, taken out of the type, holding each of the type's `let`s it reads, directly or
+    /// through another's definition ([`crate::ccl::ty::TypeLet::innermost`]).
+    fn holding(&self, part: Type) -> Type {
+        if self.held.is_empty() {
+            return part;
+        }
+        let lets: Vec<crate::ccl::ty::TypeLet> = self
+            .held
+            .iter()
+            .map(|(n, d)| crate::ccl::ty::TypeLet::new(n.clone(), Rc::clone(d), Type::Hole))
+            .collect();
+        let lets: Vec<&crate::ccl::ty::TypeLet> = lets.iter().collect();
+        let read =
+            crate::ccl::ty::TypeLet::read_by(&lets, crate::ccl::subst::type_free_vars(&part));
+        let read: Vec<&crate::ccl::ty::TypeLet> = lets
+            .iter()
+            .zip(read)
+            .filter_map(|(l, r)| r.then_some(*l))
+            .collect();
+        crate::ccl::ty::TypeLet::innermost_each(&read, part)
+    }
+}
+
+/// Each definition `ty` holds, in its structure and in the terms it holds, outermost first:
+/// `found(name, definition, of_the_type)`, `definition` giving it on demand, `of_the_type` false
+/// for a transparent `let` inside a held term. Such a `let` binds its name as a type `let` does, for the types below it: a
+/// predicate standing alone holds the definitions it reads so
+/// ([`crate::ccl::ty::TypeLet::refinement_under`]). It is no `let` of the type, so a part taken
+/// out of the type does not hold it. Binders are unique, so the names identify the definitions.
+pub(crate) fn type_let_definitions(ty: &Type, found: &mut Found<'_>) {
+    fn in_type(
+        ty: &Type,
+        found: &mut Found<'_>,
+        seen: &mut std::collections::HashSet<*const crate::ccl::ty::HeldTerm>,
+    ) {
+        if let Type::Let(l) = ty {
+            found(&l.name, &|| Rc::clone(&l.definition), true);
+        }
+        for term in ty
+            .own_refinements()
+            .iter()
+            .map(|r| &r.predicate)
+            .chain(ty.held_terms())
+        {
+            if seen.insert(Rc::as_ptr(term)) {
+                in_term(term, found, seen);
+            }
+        }
+        ty.walk_children(|c| in_type(c, found, seen));
+    }
+    fn in_term(
+        e: &crate::ccl::TypedExpr,
+        found: &mut Found<'_>,
+        seen: &mut std::collections::HashSet<*const crate::ccl::ty::HeldTerm>,
+    ) {
+        if let crate::ccl::TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+            && binding.transparency == crate::ccl::BindingTransparency::Transparent
+        {
+            found(
+                &binding.name,
+                &|| (**bound_expr).clone_preserving_ids().into_held(),
+                false,
+            );
+        }
+        e.walk_type_slots(|t| in_type(t, found, seen));
+        e.walk_children(|c| in_term(c, found, seen));
+    }
+    in_type(ty, found, &mut std::collections::HashSet::new());
+}
+
+/// What [`type_let_definitions`] reports each definition to.
+pub(crate) type Found<'f> =
+    dyn FnMut(&crate::ccl::Name, &dyn Fn() -> Rc<crate::ccl::ty::HeldTerm>, bool) + 'f;
+
+/// The names the type slots of `e` and of the terms below it read free.
+fn names_types_read(e: &crate::ccl::Expr) -> std::collections::HashSet<crate::ccl::Name> {
+    fn go(e: &crate::ccl::Expr, out: &mut std::collections::HashSet<crate::ccl::Name>) {
+        e.walk_type_slots(|t| out.extend(crate::ccl::subst::type_free_vars(t)));
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = std::collections::HashSet::new();
+    go(e, &mut out);
+    out
 }
 
 /// What [`generalized`] memoizes: a type with the names it reads that are out of scope where it
 /// is generalized, which decide the result.
 type GeneralizedCache = HashMap<(Type, Vec<crate::ccl::Name>), Type>;
+
+/// The binders of the type `let`s in `ty`, which bind their names over their bodies as
+/// [`type_binders`]'s do over parts of the type. A held name has one definition, so it is no
+/// index a family ranges over, and [`quantified`] leaves it out of those.
+fn type_let_binders(ty: &Type, out: &mut Vec<crate::ccl::Name>) {
+    if let Type::Let(l) = ty {
+        out.push(l.name.clone());
+    }
+    ty.walk_children(|c| type_let_binders(c, out));
+}
 
 /// The names `ty` binds over parts of itself: Pi binders, dependent-tuple components and
 /// family binders.
@@ -748,32 +978,47 @@ fn walk(
     scope: &mut Vec<crate::ccl::Name>,
     cache: &mut GeneralizedCache,
     memo: &crate::ccl::ccl_utils::PredMemo<Vec<crate::ccl::Name>>,
+    tree_lets: &mut TreeLets,
 ) -> Result<bool, Ungeneralizable> {
     let mut changed = false;
     // The traversals below take closures, so a failure inside one is held here, the rest of the
     // traversal skipped, and returned after it.
     let mut failed = None;
     // The terms a type slot holds hold types of their own, under the node's scope, the
-    // refinement's `__elem`, and the binders of the type around them. Every binder of the
-    // type is taken as in scope, which can leave a type ungeneralized but never generalizes
-    // one over a name the type binds.
+    // refinement's `__elem`, and the binders of the type around them, its type `let`s' among
+    // them. Every binder of the type is taken as in scope, which can leave a type
+    // ungeneralized but never generalizes one over a name the type binds.
     e.walk_type_slots_mut(|ty| {
-        if failed.is_some()
-            || !crate::ccl::subst::type_free_vars(ty)
-                .iter()
-                .any(|n| n.elem_index().is_none() && !scope.contains(n))
+        if failed.is_some() {
+            return;
+        }
+        let free = crate::ccl::subst::type_free_vars(ty);
+        if !free
+            .iter()
+            .any(|n| n.elem_index().is_none() && !scope.contains(n))
         {
             return;
         }
+        let mut own = vec![crate::ccl::Name::elem()];
+        type_binders(ty, &mut own);
+        type_let_binders(ty, &mut own);
         let mut inner = scope.clone();
-        inner.push(crate::ccl::Name::elem());
-        type_binders(ty, &mut inner);
+        inner.extend(own.iter().cloned());
+        // A term the type holds reads only names free in the type and the type's own binders,
+        // so those of the scope are what its walk depends on: the memo answers a term reached
+        // again under a scope differing elsewhere.
+        let relevant: Vec<crate::ccl::Name> = scope
+            .iter()
+            .filter(|n| free.contains(*n))
+            .cloned()
+            .chain(own)
+            .collect();
         changed |=
-            crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &inner, &mut |term, memo| {
+            crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &relevant, &mut |term, memo| {
                 if failed.is_some() {
                     return false;
                 }
-                walk(term, &mut inner.clone(), cache, memo).unwrap_or_else(|u| {
+                walk(term, &mut inner.clone(), cache, memo, tree_lets).unwrap_or_else(|u| {
                     failed = Some(u);
                     false
                 })
@@ -783,8 +1028,13 @@ fn walk(
         return Err(u);
     }
     let out_of_scope = |n: &crate::ccl::Name| !scope.contains(n);
-    let is_morphism = |c: &Type| matches!(c.peel_refinements(), Type::Fun { fun_kind, .. } if !fun_kind.resolved().is_data());
-    let morphisms = match opened(&e.ty) {
+    // Whether a type is a morphism is its shape's, under the type `let`s at its root.
+    fn shape(t: &Type) -> &Type {
+        opened(crate::ccl::ty::TypeLet::peel(t).1)
+    }
+    let is_morphism =
+        |c: &Type| matches!(shape(c), Type::Fun { fun_kind, .. } if !fun_kind.resolved().is_data());
+    let morphisms = match shape(&e.ty) {
         Type::Fun { fun_kind, .. } => !fun_kind.resolved().is_data(),
         Type::Tuple(components) => components.iter().any(is_morphism),
         Type::Record(fields) => fields.iter().any(|(_, c)| is_morphism(c)),
@@ -803,12 +1053,14 @@ fn walk(
             crate::ccl::provenance::Nature::Machinery,
         );
         changed = true;
+        let around = Definitions::around(tree_lets);
         e.ty = if constructs_variant(e) {
-            constructor_generalized(&e.ty, &out_of_scope)?
+            constructor_generalized(&e.ty, &out_of_scope, &around)?
         } else {
-            generalized(
+            generalized_under(
                 &e.ty,
                 &out_of_scope,
+                &around,
                 &crate::ccl::symbolic::symbolic(e),
                 cache,
             )?
@@ -832,7 +1084,7 @@ fn walk(
             .iter()
             .any(out_of_scope)
     {
-        walk(argument, scope, cache, memo)?;
+        walk(argument, scope, cache, memo, tree_lets)?;
         let Type::Fun { fun_kind, .. } = opened(&function.ty) else {
             panic!(
                 "an applied builtin's type is a function, got {}",
@@ -867,23 +1119,47 @@ fn walk(
         _ => Vec::new(),
     };
     for binding in binders {
-        if is_morphism(opened(&binding.ty))
+        if is_morphism(&binding.ty)
             && crate::ccl::subst::type_free_vars(&binding.ty)
                 .iter()
                 .any(out_of_scope)
         {
             changed = true;
-            binding.ty = generalized(&binding.ty, &out_of_scope, &binding.name.to_string(), cache)?;
+            binding.ty = generalized_under(
+                &binding.ty,
+                &out_of_scope,
+                &Definitions::around(tree_lets),
+                &binding.name.to_string(),
+                cache,
+            )?;
         }
     }
     let depth = scope.len();
+    // A transparent `let`'s binder a type reads stands for its definition below it.
+    let held = match &e.node {
+        crate::ccl::TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if binding.transparency == crate::ccl::BindingTransparency::Transparent
+            && tree_lets.read.contains(&binding.name) =>
+        {
+            tree_lets.lets.push(crate::ccl::ty::TypeLet::new(
+                binding.name.clone(),
+                (**bound_expr).clone_preserving_ids().into_held(),
+                Type::Hole,
+            ));
+            true
+        }
+        _ => false,
+    };
     crate::ccl::scope::for_each_scoped_item_mut(e, &mut |item| match item {
         crate::ccl::scope::ScopedItemMut::Scope(names) => {
             scope.truncate(depth);
             scope.extend(names.iter().cloned());
         }
         crate::ccl::scope::ScopedItemMut::Child(expr) if failed.is_none() => {
-            match walk(expr, scope, cache, memo) {
+            match walk(expr, scope, cache, memo, tree_lets) {
                 Ok(c) => changed |= c,
                 Err(u) => failed = Some(u),
             }
@@ -891,6 +1167,9 @@ fn walk(
         _ => {}
     });
     scope.truncate(depth);
+    if held {
+        tree_lets.lets.pop();
+    }
     match failed {
         Some(u) => Err(u),
         None => Ok(changed),
@@ -920,12 +1199,13 @@ fn constructs_variant(e: &crate::ccl::Expr) -> bool {
 fn constructor_generalized(
     ty: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    around: &Definitions,
 ) -> Result<Type, Ungeneralizable> {
     // A type generic already is generalized at its body, its parameters kept.
     if let Type::Poly(p) = ty
         && p.is_generalized()
     {
-        let inner = constructor_generalized(&p.body, out_of_scope)?;
+        let inner = constructor_generalized(&p.body, out_of_scope, around)?;
         return Ok(match inner {
             Type::Poly(q) => {
                 let mut merged = (*q).clone();
@@ -937,12 +1217,17 @@ fn constructor_generalized(
     }
     let free = crate::ccl::subst::type_free_vars(ty);
     with_open_binders(ty, &free, out_of_scope, |opened, out_of_scope| {
+        // A part reading a type `let`'s binder whose definition reads out of scope reads out of scope.
+        let definitions = around.with(opened);
+        let reading = definitions.reading_out_of_scope(out_of_scope);
+        let out_of_scope = |n: &crate::ccl::Name| out_of_scope(n) || reading.contains(n);
         let mut groups = Vec::new();
-        refined_parts_naming(opened, out_of_scope, &mut groups);
+        refined_parts_naming(opened, &out_of_scope, &definitions, &mut groups);
         quantified(
             opened,
             groups,
-            out_of_scope,
+            &out_of_scope,
+            &definitions,
             "a builtin whose output its use states",
         )
     })
@@ -988,6 +1273,24 @@ pub(crate) fn generalized(
     at: &str,
     cache: &mut GeneralizedCache,
 ) -> Result<Type, Ungeneralizable> {
+    generalized_under(ty, out_of_scope, &Definitions::default(), at, cache)
+}
+
+/// [`generalized`] under `around`, the definitions of the tree's `let`s and of the types' around
+/// `ty`.
+///
+/// A type `let` stays where the type goes, read where it was read. One whose definition reads a
+/// binder out of scope cannot, and its binder is out of scope as that binder is: a part reading
+/// it is abstracted, and the `let` goes where nothing reads it
+/// ([`Definitions::reading_out_of_scope`]).
+#[allow(clippy::mutable_key_type)]
+fn generalized_under(
+    ty: &Type,
+    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    around: &Definitions,
+    at: &str,
+    cache: &mut GeneralizedCache,
+) -> Result<Type, Ungeneralizable> {
     let free = crate::ccl::subst::type_free_vars(ty);
     let key = (
         ty.clone(),
@@ -1000,7 +1303,7 @@ pub(crate) fn generalized(
     if let Type::Poly(p) = ty
         && p.is_generalized()
     {
-        let done = match generalized(&p.body, out_of_scope, at, cache)? {
+        let done = match generalized_under(&p.body, out_of_scope, around, at, cache)? {
             Type::Poly(q) => {
                 let mut merged = (*q).clone();
                 merged.params.splice(0..0, p.params.iter().cloned());
@@ -1012,7 +1315,10 @@ pub(crate) fn generalized(
         return Ok(done);
     }
     let done = with_open_binders(ty, &free, out_of_scope, |opened, out_of_scope| {
-        generalized_go(opened, out_of_scope, at, cache)
+        let definitions = around.with(opened);
+        let reading = definitions.reading_out_of_scope(out_of_scope);
+        let out_of_scope = |n: &crate::ccl::Name| out_of_scope(n) || reading.contains(n);
+        generalized_go(opened, &out_of_scope, &definitions, at, cache)
     })?;
     cache.insert(key, done.clone());
     Ok(done)
@@ -1028,8 +1334,11 @@ fn with_open_binders(
 ) -> Result<Type, Ungeneralizable> {
     let mut renames = Vec::new();
     let apart = renamed_apart(ty, free, &mut renames);
+    // A type `let`'s binder is in scope over its body; one whose definition reads out of scope
+    // is out of scope through it ([`Definitions::reading_out_of_scope`]).
     let mut own = Vec::new();
     type_binders(&apart, &mut own);
+    type_let_binders(&apart, &mut own);
     let out_of_scope_here = |n: &crate::ccl::Name| out_of_scope(n) && !own.contains(n);
     let generalized = closed_deep(
         &derive(
@@ -1133,9 +1442,33 @@ fn restored_names(ty: &Type, renames: &[(crate::ccl::Name, crate::ccl::Name)]) -
 fn generalized_go(
     ty: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    definitions: &Definitions,
     at: &str,
     cache: &mut GeneralizedCache,
 ) -> Result<Type, Ungeneralizable> {
+    // A type `let` stays over what it holds, generalized: its binder is in scope there, and a
+    // part abstracted to a parameter stops reading it, so the `let` goes where nothing reads
+    // it ([`crate::ccl::ty::TypeLet::over`]). It goes inside a generic result whose bounds do
+    // not read it, where the parameters are quantified outside the function.
+    if let Type::Let(l) = ty {
+        return Ok(
+            match generalized_go(&l.body, out_of_scope, definitions, at, cache)? {
+                Type::Poly(p)
+                    if p.is_generalized()
+                        && p.params.iter().all(|q| {
+                            q.param.bound.as_ref().is_none_or(|t| {
+                                !crate::ccl::subst::type_free_vars(t).contains(&l.name)
+                            })
+                        }) =>
+                {
+                    let mut held = (*p).clone();
+                    held.body = l.over(p.body.clone());
+                    Type::Poly(Rc::new(held))
+                }
+                body => l.over(body),
+            },
+        );
+    }
     let names = |t: &Type| {
         crate::ccl::subst::type_free_vars(t)
             .into_iter()
@@ -1151,9 +1484,9 @@ fn generalized_go(
     else {
         // A component that is a compute function is generalized on its own; a collection is its
         // data, and stays as it is.
-        let mut component = |c: &Type| match c.peel_refinements() {
+        let mut component = |c: &Type| match c.former() {
             Type::Fun { fun_kind, .. } if !fun_kind.resolved().is_data() => {
-                generalized(c, out_of_scope, at, cache)
+                generalized_under(c, out_of_scope, definitions, at, cache)
             }
             _ => Ok(c.clone()),
         };
@@ -1187,7 +1520,13 @@ fn generalized_go(
         // A curried function receives what names the binder further in: generalize there.
         // The parameters are quantified outside the function where their bounds do not read
         // its binder, the one place Check's derivation of an application puts them.
-        let inner = product_hoisted(generalized(codomain, out_of_scope, at, cache)?);
+        let inner = product_hoisted(generalized_under(
+            codomain,
+            out_of_scope,
+            definitions,
+            at,
+            cache,
+        )?);
         let fun = |codomain: Type| Type::Fun {
             binder: binder.clone(),
             fun_kind: fun_kind.clone(),
@@ -1215,8 +1554,8 @@ fn generalized_go(
         });
     }
     let mut groups: Vec<Type> = Vec::new();
-    refined_parts_naming(domain, out_of_scope, &mut groups);
-    quantified(ty.peel_refinements(), groups, out_of_scope, at)
+    refined_parts_naming(domain, out_of_scope, definitions, &mut groups);
+    quantified(ty.peel_refinements(), groups, out_of_scope, definitions, at)
 }
 
 /// A product whose components are generalized types, quantified once outside it: the form Check
@@ -1254,19 +1593,22 @@ fn quantified(
     ty: &Type,
     groups: Vec<Type>,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    definitions: &Definitions,
     at: &str,
 ) -> Result<Type, Ungeneralizable> {
     let mut params = Vec::new();
     let mut body = ty.clone();
-    let mut groups = contained_first(groups);
+    let mut groups = contained_first(groups, definitions);
     // The parameters are quantified outside every binder of the type, so a refinement reading
     // one of those binders stays where the binder is in scope, around its parameter.
     let mut own = Vec::new();
     type_binders(ty, &mut own);
     // The type is opened, so a predicate reads its binders by name, a dependent tuple's
     // components included.
+    // A refinement reads what the type `let` binders it reads read.
     let reads_own = |r: &crate::ccl::Refinement| {
-        crate::ccl::subst::refinement_free_vars(r)
+        definitions
+            .reads_through(crate::ccl::subst::refinement_free_vars(r))
             .iter()
             .any(|n| own.contains(n))
     };
@@ -1280,31 +1622,35 @@ fn quantified(
         {
             continue;
         }
-        let (kind, bound) = part_range(&group, out_of_scope, &reads_own, at)?;
-        let staying: crate::ccl::RefinementSet = match &group {
+        let (kind, bound) = part_range(&group, out_of_scope, &reads_own, definitions, at)?;
+        // A part's refinements are read under the type `let`s at its root, and a refinement
+        // staying around the parameter takes the ones it reads with it.
+        let (group_lets, group_refined) = crate::ccl::ty::TypeLet::peel(&group);
+        let staying_here: Vec<&crate::ccl::Refinement> = match group_refined {
             Type::Refinement(_, refinements) => refinements
                 .iter()
                 .filter(|r| reads_own(r) && !reads(r, out_of_scope))
-                .cloned()
                 .collect(),
-            _ => crate::ccl::RefinementSet::default(),
+            _ => Vec::new(),
         };
+        let staying: crate::ccl::RefinementSet = staying_here
+            .iter()
+            .map(|r| crate::ccl::ty::TypeLet::refinement_under(&group_lets, r))
+            .collect();
         // The type's own binders the parameter's part reads, outermost first: the part is a
         // type per value of them, so the parameter is a family over them, applied to them
         // where the part stands.
-        let part_reads = match &group {
+        let part_reads = match group_refined {
             Type::Refinement(base, refinements) => {
                 let mut names = crate::ccl::subst::type_free_vars(base);
-                for r in refinements
-                    .iter()
-                    .filter(|r| !staying.iter().any(|s| s == *r))
-                {
+                for r in refinements.iter().filter(|r| !staying_here.contains(r)) {
                     names.extend(crate::ccl::subst::refinement_free_vars(r));
                 }
                 names
             }
             other => crate::ccl::subst::type_free_vars(other),
         };
+        let part_reads = definitions.reads_through(part_reads);
         let mut indices: Vec<crate::ccl::Name> = Vec::new();
         for b in &own {
             if part_reads.contains(b) && !indices.contains(b) {
@@ -1322,29 +1668,37 @@ fn quantified(
                     let mut read = crate::ccl::Expr::var(b.clone());
                     read.ty = binder_domain(&body, b)
                         .unwrap_or_else(|| unreachable!("`{b}` is a binder of the type `{body}`"));
-                    Rc::new(read)
+                    read.into_held()
                 })
                 .collect();
             Type::FamilyApp(crate::ccl::ty::FamilyApp::new(Rc::clone(&param), args))
         };
         let d = Type::refined(d, staying);
-        body = abstract_deep(&body, &group, &d);
+        body = abstract_deep(&body, &group, &d, definitions);
         // A later part can hold this one inside the terms it holds; it is matched as the
         // abstraction leaves it.
         for later in groups.iter_mut().skip(i + 1) {
-            *later = abstract_deep(later, &group, &d);
+            *later = abstract_deep(later, &group, &d, definitions);
         }
         // The part read at other values of its indices is the family applied there: an
         // application's result reads the part at the argument, `__args.0`, where the function
         // it applies reads it at its own binder.
+        // The part holds the `let`s it reads while it is read at other values of its indices,
+        // whose definitions can read the indices.
+        let group_with_lets = definitions.holding(group.clone());
         for args in index_instances(&body, &indices, &own) {
-            let instance =
-                crate::ccl::subst::discharge_binders(&mut Solver::none(), &indices, &group, &args);
-            if instance == group {
+            let args: Vec<_> = args.into_iter().map(IntoHeldTerm::into_held).collect();
+            let instance = crate::ccl::subst::discharge_binders(
+                &mut Solver::none(),
+                &indices,
+                &group_with_lets,
+                &args,
+            );
+            if definitions.same(&instance, &group_with_lets) {
                 continue;
             }
             let at = crate::ccl::subst::discharge_binders(&mut Solver::none(), &indices, &d, &args);
-            body = abstract_deep(&body, &instance, &at);
+            body = abstract_deep(&body, &instance, &at, definitions);
         }
         params.push(crate::ccl::ty::PolyParam {
             param,
@@ -1476,11 +1830,11 @@ fn binder_domain(ty: &Type, b: &crate::ccl::Name) -> Option<Type> {
 /// `groups` ordered so that each comes after every other it contains, as a nested type or as
 /// its base with a subset of its refinements ([`abstract_go`]): a part is quantified once,
 /// and a part holding it reads its parameter.
-fn contained_first(mut groups: Vec<Type>) -> Vec<Type> {
+fn contained_first(mut groups: Vec<Type>, definitions: &Definitions) -> Vec<Type> {
     let contains = |outer: &Type, inner: &Type| {
         let mut replaced = false;
-        abstract_go(outer, inner, &Type::Hole, &mut replaced);
-        outer != inner && replaced
+        abstract_go(outer, inner, &Type::Hole, definitions, &mut replaced);
+        !definitions.same(outer, inner) && replaced
     };
     let mut ordered = Vec::with_capacity(groups.len());
     while !groups.is_empty() {
@@ -1506,13 +1860,20 @@ fn part_range(
     group: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
     reads_own: &dyn Fn(&crate::ccl::Refinement) -> bool,
+    definitions: &Definitions,
     at: &str,
 ) -> Result<(crate::ccl::ty::TypeKind, Option<Type>), Ungeneralizable> {
-    let base = match group {
-        Type::Refinement(..) => refinements_in_scope(group, out_of_scope, reads_own),
-        other => other.clone(),
+    // A part's refinements are read under the type `let`s at its root, and its base holds the
+    // ones it reads.
+    let (lets, refined) = crate::ccl::ty::TypeLet::peel(group);
+    let base = match refined {
+        Type::Refinement(..) => crate::ccl::ty::TypeLet::innermost_each(
+            &lets,
+            refinements_in_scope(refined, out_of_scope, reads_own),
+        ),
+        _ => group.clone(),
     };
-    if let Type::WitnessProjection(p) = base.peel_refinements() {
+    if let Type::WitnessProjection(p) = base.former() {
         let kind = p
             .witness()
             .map(|w| w.type_kind())
@@ -1536,7 +1897,10 @@ fn part_range(
                      out of scope once its refinements naming it are dropped"
                 )));
             }
-            Ok(closed_deep(&base, crate::ccl::Ids::Fresh))
+            Ok(closed_deep(
+                &definitions.holding(base),
+                crate::ccl::Ids::Fresh,
+            ))
         };
         let kind = match kind {
             crate::ccl::ty::TypeKind::Enumerated(candidates) => {
@@ -1571,7 +1935,7 @@ fn part_range(
     }
     // Stated closed: closing the quantified type ([`generalized`]) rebuilds the kind's copy of
     // the bound but not the parameter's, which would keep terms no tree holds.
-    let bound = closed_deep(&base, crate::ccl::Ids::Fresh);
+    let bound = closed_deep(&definitions.holding(base), crate::ccl::Ids::Fresh);
     Ok((
         crate::ccl::ty::TypeKind::SubtypesOf(Box::new(bound.clone())),
         Some(bound),
@@ -1591,6 +1955,7 @@ fn spelling(i: usize) -> String {
 fn refined_parts_naming(
     ty: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    definitions: &Definitions,
     out: &mut Vec<Type>,
 ) {
     let names = match ty {
@@ -1601,9 +1966,9 @@ fn refined_parts_naming(
         _ => false,
     };
     if !matches!(ty, Type::WitnessProjection(_)) {
-        ty.walk_children(|c| refined_parts_naming(c, out_of_scope, out));
+        ty.walk_children(|c| refined_parts_naming(c, out_of_scope, definitions, out));
     }
-    if names && !out.contains(ty) {
+    if names && !out.iter().any(|g| definitions.same(g, ty)) {
         out.push(ty.clone());
     }
 }
@@ -1646,6 +2011,8 @@ fn refinements_in_scope(
             out.push(conjunct);
         }
     }
+    // The type `let`s around the part stay around what is kept of it.
+    let (lets, ty) = crate::ccl::ty::TypeLet::peel(ty);
     let Type::Refinement(base, refinements) = ty else {
         unreachable!("a part found by refined_parts_naming is refined")
     };
@@ -1657,7 +2024,10 @@ fn refinements_in_scope(
             kept.push(r.clone());
         }
     }
-    Type::refined((**base).clone(), kept.into_iter().collect())
+    crate::ccl::ty::TypeLet::innermost_each(
+        &lets,
+        Type::refined((**base).clone(), kept.into_iter().collect()),
+    )
 }
 
 /// `ty` with `group` replaced by `d`, and a refinement of `group`'s base that holds all of
@@ -1666,13 +2036,14 @@ fn refinements_in_scope(
 ///
 /// The generalized type is a new type beside the ones that keep the held terms as they were,
 /// so the terms it rewrites are derived ones, minted under the caller's recording.
-fn abstract_deep(ty: &Type, group: &Type, d: &Type) -> Type {
+fn abstract_deep(ty: &Type, group: &Type, d: &Type, definitions: &Definitions) -> Type {
     let mut out = ty.clone();
     abstract_type(
         &mut out,
         group,
         d,
         &crate::ccl::ccl_utils::PredMemo::default(),
+        definitions,
     );
     out
 }
@@ -1689,11 +2060,12 @@ fn abstract_type(
     group: &Type,
     d: &Type,
     memo: &crate::ccl::ccl_utils::PredMemo,
+    definitions: &Definitions,
 ) -> bool {
     let mut changed = false;
-    *ty = abstract_go(ty, group, d, &mut changed);
+    *ty = abstract_go(ty, group, d, definitions, &mut changed);
     changed |= crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |term, memo| {
-        abstract_held_term(term, group, d, memo)
+        abstract_held_term(term, group, d, memo, definitions)
     });
     changed
 }
@@ -1703,14 +2075,15 @@ fn abstract_held_term(
     group: &Type,
     d: &Type,
     memo: &crate::ccl::ccl_utils::PredMemo,
+    definitions: &Definitions,
 ) -> bool {
     if let crate::ccl::TypedExprNode::Cast { value, target } = &mut term.node {
-        let mut changed = abstract_held_term(value, group, d, memo);
+        let mut changed = abstract_held_term(value, group, d, memo, definitions);
         // A target's predicates define its filter. Rewrite their annotations, then derive
         // both stored types from the transported value instead of abstracting the filter.
         changed |=
             crate::ccl::ccl_utils::walk_held_terms_mut(target, memo, &(), &mut |held, memo| {
-                abstract_held_term(held, group, d, memo)
+                abstract_held_term(held, group, d, memo, definitions)
             });
         let (born, result) = crate::ccl::ccl_utils::canonical_cast_types(
             &mut Solver::none(),
@@ -1722,42 +2095,58 @@ fn abstract_held_term(
         term.ty = result;
         *target = born;
         if let Some(annotation) = &mut term.user_annotation {
-            changed |= abstract_type(annotation, group, d, memo);
+            changed |= abstract_type(annotation, group, d, memo, definitions);
         }
         return changed;
     }
     let mut changed = false;
-    term.walk_type_slots_mut(|ty| changed |= abstract_type(ty, group, d, memo));
-    term.walk_children_mut(|child| changed |= abstract_held_term(child, group, d, memo));
+    term.walk_type_slots_mut(|ty| changed |= abstract_type(ty, group, d, memo, definitions));
+    term.walk_children_mut(|child| {
+        changed |= abstract_held_term(child, group, d, memo, definitions);
+    });
     changed
 }
 
 /// `ty` with `group` replaced by `d` ([`abstract_deep`] outside the terms `ty` holds), setting
 /// `replaced` where it replaced anything.
-fn abstract_go(ty: &Type, group: &Type, d: &Type, replaced: &mut bool) -> Type {
-    if ty == group {
+fn abstract_go(
+    ty: &Type,
+    group: &Type,
+    d: &Type,
+    definitions: &Definitions,
+    replaced: &mut bool,
+) -> Type {
+    if definitions.same(ty, group) {
         *replaced = true;
         return d.clone();
     }
+    // A type `let` around a refined part is read through: the part's refinements are its body's.
+    let (lets, under) = crate::ccl::ty::TypeLet::peel(ty);
     if let (Type::Refinement(base, refinements), Type::Refinement(gbase, grefinements)) =
-        (ty, group)
-        && base == gbase
-        && grefinements
-            .iter()
-            .all(|g| refinements.iter().any(|r| r == g))
+        (under, group)
+        && definitions.same(base, gbase)
+        && grefinements.iter().all(|g| {
+            refinements
+                .iter()
+                .any(|r| definitions.same_refinement(r, g))
+        })
     {
         let rest: crate::ccl::RefinementSet = refinements
             .iter()
-            .filter(|r| !grefinements.iter().any(|g| g == *r))
+            .filter(|r| {
+                !grefinements
+                    .iter()
+                    .any(|g| definitions.same_refinement(g, r))
+            })
             .cloned()
             .collect();
         *replaced = true;
-        return Type::refined(d.clone(), rest);
+        return crate::ccl::ty::TypeLet::rewrap(&lets, Type::refined(d.clone(), rest));
     }
     // The type is abstracted opened, its dependent tuples reading their components by name;
     // closing it again ([`closed_deep`]) makes a tuple whose components read none plain.
     let mut out = ty.clone();
-    out.walk_children_mut(|c| *c = abstract_go(c, group, d, replaced));
+    out.walk_children_mut(|c| *c = abstract_go(c, group, d, definitions, replaced));
     out
 }
 
@@ -1804,6 +2193,13 @@ fn drop_facts_naming(
                     go(base, false, out_of_scope, at, whole)?,
                     kept.into_iter().collect(),
                 )
+            }
+            // A type `let` stands where its body does: around a collection's domain, its body
+            // is that domain.
+            Type::Let(l) => {
+                let mut held = (**l).clone();
+                held.body = go(&l.body, on_domain, out_of_scope, at, whole)?;
+                Type::Let(Rc::new(held))
             }
             Type::Fun {
                 binder,
@@ -2036,7 +2432,8 @@ mod tests {
             &mut ty,
             &group,
             &d,
-            &crate::ccl::ccl_utils::PredMemo::default()
+            &crate::ccl::ccl_utils::PredMemo::default(),
+            &Definitions::default(),
         ));
         assert!(!crate::ccl::subst::type_free_vars(&ty).contains(&Name::from("outer")));
         let Type::FamilyApp(app) = &ty else {
@@ -2184,7 +2581,9 @@ mod tests {
             rows.clone(),
             crate::ccl::ccl_utils::tap_variant_ty(rows.clone()),
         );
-        let generic = constructor_generalized(&ty, &|n| *n == Name::from("rows")).unwrap();
+        let generic =
+            constructor_generalized(&ty, &|n| *n == Name::from("rows"), &Definitions::default())
+                .unwrap();
         let Type::Poly(poly) = &generic else {
             panic!("the constructor's payload reads `rows`: {generic}")
         };

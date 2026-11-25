@@ -5,6 +5,7 @@
 use crate::ccl::Label;
 use crate::ccl::infer::api::RelatedPositions;
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::ty::IntoHeldTerm;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -93,7 +94,8 @@ pub(super) struct CoalesceCtx {
     replay: HashMap<NodeId, Vec<LocatedInferError>>,
     /// The predicates the write pass has walked, by allocation: a predicate shared by several
     /// types is one term, whose uses are specialized once.
-    walked_predicates: HashMap<*const Expr, Rc<Expr>>,
+    walked_predicates:
+        HashMap<(*const crate::ccl::ty::HeldTerm, Vec<Name>), Rc<crate::ccl::ty::HeldTerm>>,
     /// The program's trait instances: the module a run's instances come from, an instance
     /// function's specialization arguments, and the associated types an instance states.
     instances: Rc<InstanceTable>,
@@ -126,12 +128,27 @@ pub(super) struct CoalesceCtx {
     /// that entered the coalesce walk sharing one predicate `Rc` sharing a
     /// single coalesced `Rc` on the way out, instead of splitting into one
     /// independently-coalesced copy per node. See [`PredMemo`].
-    pred_memo: PredMemo,
+    pred_memo: PredMemo<Vec<Name>>,
+    /// The binders of the type `let`s the walk is inside of, innermost last: a read of one in a
+    /// predicate is of the definition the type holds, not a use of a generalized `let` of the
+    /// tree spelled the same. They key [`Self::pred_memo`], since a predicate coalesces apart
+    /// under them.
+    let_shadows: Vec<Name>,
+    /// Each generalized `let` the walk met, its binder to its node
+    /// ([`specialize_generic_type_lets`]).
+    generalized_lets: HashMap<Name, NodeId>,
+    /// Each specialization spliced into the tree, by its plan index, with its binder and a copy
+    /// of its definition, for the types holding the generalized definition
+    /// ([`specialize_generic_type_lets`]).
+    spliced: HashMap<usize, (Name, Rc<crate::ccl::ty::HeldTerm>)>,
     /// The coalesced predicates made from each origin ([`crate::ccl::ccl_utils::derivation_origin`]), the
     /// origin kept alive beside them: copies of one predicate a transport made apart coalesce
     /// apart, and one equal to a predicate already here takes its allocation instead
     /// (`src/ccl/design/type-inference.md`, "Copies of one predicate share after coalesce").
     coalesced_by_origin: HashMap<crate::ccl::PredicateId, CoalescedFromOrigin>,
+    /// The coalesced held terms other than predicates, by what identifies the term a copy is
+    /// of ([`share_held_term`]).
+    coalesced_definitions: HashMap<HeldKey, crate::ccl::ccl_utils::SharedTerms>,
     /// The node whose coalesce rule is running, maintained by
     /// [`coalesce_node`] on both exit paths. The same discipline `emit_node` and
     /// `check_node` use; seeded with the tree's root at construction.
@@ -576,16 +593,13 @@ struct Specialization {
     raised: Vec<(Option<NodeId>, LocatedInferError)>,
 }
 
-/// The names and the witnesses a predicate reads free ([`share_with_its_origin`]).
-type PredicateReads = (BTreeSet<Name>, BTreeSet<crate::ccl::ty::WitnessId>);
-
 /// The coalesced predicates made from one origin ([`CoalesceCtx::coalesced_by_origin`]).
 struct CoalescedFromOrigin {
     /// Kept so the key's address stays allocated for the walk; never read.
     #[allow(dead_code)]
-    origin: Rc<Expr>,
-    /// Each coalesced predicate with what it reads.
-    made: Vec<(Rc<Expr>, PredicateReads)>,
+    origin: Rc<crate::ccl::ty::HeldTerm>,
+    /// The coalesced predicates.
+    made: crate::ccl::ccl_utils::SharedTerms,
 }
 
 /// A specialization placed under a binder between its definition and its use
@@ -780,6 +794,7 @@ fn pin_valueless_call(solver: &mut Solver, call: &Expr, ctx: &mut CoalesceCtx) {
 /// its position. With no answer the variable stays, for the post-inference check to
 /// report. See `src/ccl/design/type-inference.md`, "Pin sites".
 fn pin_unobservable_param(solver: &mut Solver, lambda_ty: &Type, ctx: &mut CoalesceCtx) {
+    let lambda_ty = lambda_ty.lets_distributed();
     let Type::Fun { domain, .. } = lambda_ty.peel_refinements() else {
         return;
     };
@@ -819,6 +834,7 @@ fn pin_unobservable_type(solver: &mut Solver, domain: &Type, ctx: &mut CoalesceC
 /// (`docs/chl-spec.md`, "Type parameters"). See
 /// `src/ccl/design/type-inference.md`, "Pin sites".
 fn pin_unobservable_ctor_args(solver: &mut Solver, value_ty: &Type, ctx: &mut CoalesceCtx) {
+    let value_ty = value_ty.lets_distributed();
     let Type::Nominal(decl, args) = value_ty.peel_refinements() else {
         return;
     };
@@ -876,7 +892,7 @@ fn accepted_position_type(
 ) -> Option<Type> {
     let position = position_type(solver, v, &mut ctx.occurrences)?;
     if let Some(choices) = obligation_choices(solver, v)
-        && !matches!(position.peel_refinements(), Type::Base(b) if choices.contains(b))
+        && !matches!(position.former(), Type::Base(b) if choices.contains(b))
     {
         return None;
     }
@@ -987,6 +1003,9 @@ fn for_each_positioned_var(
         Type::Refinement(base, _) | Type::BoundedHole(base) => {
             for_each_positioned_var(base, path, f);
         }
+        // A type `let`'s body is at the `let`'s position; its definition is a held term, no
+        // position.
+        Type::Let(l) => for_each_positioned_var(&l.body, path, f),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -1005,12 +1024,17 @@ fn for_each_positioned_var(
 }
 
 /// The type at `path` inside `ty`, looking through refinements; `None` where `ty` has no
-/// such position.
-fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
+/// such position. A type `let` stands over each position of its body, so what is read under
+/// one keeps it.
+fn read_at(ty: &Type, path: &[PositionStep]) -> Option<Type> {
     let Some((first, rest)) = path.split_first() else {
-        return Some(ty);
+        return Some(ty.clone());
     };
-    let inner = match (ty.peel_refinements(), first) {
+    if let Type::Let(l) = ty.peel_refinements() {
+        return read_at(&l.body, path).map(|at| l.over(at));
+    }
+    let shape = ty.lets_distributed();
+    let inner = match (shape.peel_refinements(), first) {
         (Type::Fun { domain, .. }, PositionStep::Domain) => domain.as_ref(),
         (Type::Fun { codomain, .. }, PositionStep::Codomain) => codomain.as_ref(),
         (Type::Tuple(ts) | Type::OpenTuple(ts), PositionStep::Component(i)) => ts.get(*i)?,
@@ -1264,7 +1288,7 @@ fn position_answer(
         let holder_ty = Type::Infer(Rc::clone(&holder));
         if let Ok(reading) = coalesce_positive(solver, &holder_ty)
             && let Some(at) = read_at(&reading, &position)
-            && let Some(answer) = offer(at, partial)
+            && let Some(answer) = offer(&at, partial)
         {
             return Some(answer);
         }
@@ -1272,7 +1296,7 @@ fn position_answer(
         let outer = position_type_go(solver, &holder, index, question, &mut outer_partial);
         for outer in outer.iter().chain(outer_partial.iter()) {
             if let Some(at) = read_at(outer, &position)
-                && let Some(answer) = offer(at, partial)
+                && let Some(answer) = offer(&at, partial)
             {
                 return Some(answer);
             }
@@ -1426,7 +1450,11 @@ pub(super) fn coalesce_pass(
         lambda_params: Vec::new(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
+        let_shadows: Vec::new(),
+        generalized_lets: HashMap::new(),
+        spliced: HashMap::new(),
         coalesced_by_origin: HashMap::new(),
+        coalesced_definitions: HashMap::new(),
         discarding: false,
         specializing: Vec::new(),
         placed: Vec::new(),
@@ -1459,7 +1487,8 @@ pub(super) fn coalesce_pass(
     ctx.current_node = expr.node_id();
     // The stamp pass reads the graph the write pass left, and records nothing on it.
     crate::ccl::infer::solver::compact::reading_fixed_graph(solver, |solver| {
-        coalesce_node(solver, expr, 0, &mut ctx)
+        coalesce_node(solver, expr, 0, &mut ctx);
+        specialize_generic_type_lets(solver, expr, &ctx);
     });
     // A node the stamp pass did not reach keeps its errors.
     let mut unreached: Vec<_> = std::mem::take(&mut ctx.replay)
@@ -1478,6 +1507,166 @@ pub(super) fn coalesce_pass(
     // resolves no type at included.
     settle_capabilities(solver, expr);
     ctx.errors
+}
+
+/// Hold, in every type of `expr`, the specializations its reads of a generalized definition need
+/// in place of the definition: a held `let f = 𝑑 in 𝑇` reading `f` at an instantiation the tree
+/// specialized `f` at as `f₁` becomes `let f₁ = 𝑑₁ in 𝑇[f ↦ f₁]`, as the tree's `let` did. A
+/// read matches the specialization whose instantiation resolves to the type the read has.
+///
+/// Runs once the stamp pass has spliced every specialization ([`CoalesceCtx::spliced`]): a type
+/// holding the definition stands outside its scope, before or after it in the walk.
+fn specialize_generic_type_lets(solver: &mut Solver, expr: &mut Expr, ctx: &CoalesceCtx) {
+    if ctx.generalized_lets.is_empty() {
+        return;
+    }
+    let mut held = GenericTypeLets {
+        ctx,
+        solver,
+        specs: HashMap::new(),
+    };
+    let _g = crate::ccl::provenance::enter(
+        expr.node_id(),
+        "mono.type_let_specialize",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    held.in_expr(expr);
+}
+
+/// What [`specialize_generic_type_lets`] rewrites a held generalized definition with.
+struct GenericTypeLets<'a> {
+    ctx: &'a CoalesceCtx,
+    solver: &'a mut Solver,
+    /// Each generalized `let`'s spliced specializations by its node, each with the type it was
+    /// instantiated at, its binder and its definition: resolved when a type first holds the
+    /// `let` ([`Self::specs_of`]).
+    specs: HashMap<NodeId, Vec<(Type, Name, Rc<crate::ccl::ty::HeldTerm>)>>,
+}
+
+impl GenericTypeLets<'_> {
+    /// The spliced specializations of the generalized `let` at `node`
+    /// ([`CoalesceCtx::spliced`]), each with the type it was instantiated at.
+    fn specs_of(&mut self, node: NodeId) -> Vec<(Type, Name, Rc<crate::ccl::ty::HeldTerm>)> {
+        if let Some(specs) = self.specs.get(&node) {
+            return specs.clone();
+        }
+        let mut specs = Vec::new();
+        for (i, planned) in self.ctx.plan.specs.iter().enumerate() {
+            if planned.let_node != node {
+                continue;
+            }
+            let Some((name, definition)) = self.ctx.spliced.get(&i) else {
+                continue;
+            };
+            if let Ok(at) = resolve_var_type(self.solver, &planned.instantiation) {
+                specs.push((at, name.clone(), Rc::clone(definition)));
+            }
+        }
+        self.specs.insert(node, specs.clone());
+        specs
+    }
+
+    fn in_expr(&mut self, e: &mut Expr) -> bool {
+        let mut changed = false;
+        e.walk_type_slots_mut(|t| changed |= self.in_type(t));
+        e.walk_children_mut(|c| changed |= self.in_expr(c));
+        changed
+    }
+
+    /// Rewrite each held term of `ty` that holds a generalized definition, as a fresh copy.
+    fn in_held_terms(&mut self, ty: &mut Type) -> bool {
+        let mut changed = false;
+        for quoted in ty.held_terms_mut() {
+            let mut term = quoted.held().clone_preserving_ids();
+            if self.in_expr(&mut term) {
+                quoted.replace_held(Duplicate::duplicate(&term).into_held());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn in_type(&mut self, ty: &mut Type) -> bool {
+        let mut changed = false;
+        if let Type::Refinement(_, refinements) = ty {
+            refinements.rewrite_each(|_, r| {
+                let mut term = r.predicate.clone_preserving_ids();
+                if self.in_expr(&mut term) {
+                    *r = crate::ccl::Refinement::born(Rc::new(Duplicate::duplicate(&term)));
+                    changed = true;
+                }
+            });
+        } else {
+            changed |= self.in_held_terms(ty);
+        }
+        ty.walk_children_mut(|c| changed |= self.in_type(c));
+        if let Type::Let(l) = ty
+            && let Some(&node) = self.ctx.generalized_lets.get(&l.name)
+        {
+            let specs = self.specs_of(node);
+            let name = l.name.clone();
+            let mut body = l.body.clone();
+            let mut used: Vec<usize> = Vec::new();
+            rename_reads_in_type(&mut body, &name, &mut |read_ty: &Type| {
+                let at = specs
+                    .iter()
+                    .position(|(at, _, _)| at == read_ty)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "internal error: a type holds the generalized definition of `{name}` \
+                             and reads it at {read_ty}, which no specialization of it has"
+                        )
+                    });
+                if !used.contains(&at) {
+                    used.push(at);
+                }
+                specs[at].1.clone()
+            });
+            *ty = used.iter().fold(body, |body, &at| {
+                let (_, spec, definition) = &specs[at];
+                crate::ccl::ty::TypeLet::innermost(spec.clone(), Rc::clone(definition), body)
+            });
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// Rename each read of `name` in the terms `ty` holds to the binder `to` picks for the read's
+/// type, each renamed term a fresh copy.
+fn rename_reads_in_type(ty: &mut Type, name: &Name, to: &mut dyn FnMut(&Type) -> Name) -> bool {
+    fn in_expr(e: &mut Expr, name: &Name, to: &mut dyn FnMut(&Type) -> Name) -> bool {
+        let mut changed = false;
+        if let TypedExprNode::Var(n) = &e.node
+            && n == name
+        {
+            e.node = TypedExprNode::Var(to(&e.ty));
+            changed = true;
+        }
+        e.walk_type_slots_mut(|t| changed |= rename_reads_in_type(t, name, to));
+        e.walk_children_mut(|c| changed |= in_expr(c, name, to));
+        changed
+    }
+    let mut changed = false;
+    if let Type::Refinement(_, refinements) = ty {
+        refinements.rewrite_each(|_, r| {
+            let mut term = r.predicate.clone_preserving_ids();
+            if in_expr(&mut term, name, to) {
+                *r = crate::ccl::Refinement::born(Rc::new(Duplicate::duplicate(&term)));
+                changed = true;
+            }
+        });
+    } else {
+        for quoted in ty.held_terms_mut() {
+            let mut term = quoted.held().clone_preserving_ids();
+            if in_expr(&mut term, name, to) {
+                quoted.replace_held(Duplicate::duplicate(&term).into_held());
+                changed = true;
+            }
+        }
+    }
+    ty.walk_children_mut(|c| changed |= rename_reads_in_type(c, name, to));
+    changed
 }
 
 /// Settle `expr` as its run ends ([`Settler`]): every capability value and ordering requirement
@@ -1530,8 +1719,8 @@ pub(super) fn assert_settled(
             }
         }
 
-        fn enter_term(&mut self, term: &Rc<Expr>) -> bool {
-            self.0.insert(Rc::as_ptr(term))
+        fn enter_term(&mut self, term: &Rc<crate::ccl::ty::HeldTerm>) -> bool {
+            self.0.insert(std::ptr::from_ref::<Expr>(term))
         }
     }
     value.walk_held(&mut Settled(seen));
@@ -1712,7 +1901,7 @@ impl crate::ccl::infer::solver::held::HeldRewriter for Settler<'_> {
         Some(done)
     }
 
-    fn held_term(&mut self, held: &mut dyn crate::ccl::ty::HeldTerm) -> bool {
+    fn held_term(&mut self, held: &mut dyn crate::ccl::ty::TermHolder) -> bool {
         use crate::ccl::infer::solver::held::HoldsSolverState;
         let memo = self.memo;
         memo.rebuild(held, &(), |term| term.rewrite_held(self))
@@ -1800,7 +1989,7 @@ impl crate::ccl::infer::solver::held::HeldRewriter for Closer<'_> {
         k.home().is_some().then(|| self.kind(k))
     }
 
-    fn held_term(&mut self, held: &mut dyn crate::ccl::ty::HeldTerm) -> bool {
+    fn held_term(&mut self, held: &mut dyn crate::ccl::ty::TermHolder) -> bool {
         use crate::ccl::infer::solver::held::HoldsSolverState;
         let memo = self.memo;
         memo.rebuild(held, &(), |term| term.rewrite_held(self))
@@ -2731,7 +2920,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             // The preceding codomain is opened at its own binder, the name the morphisms
             // after it read its position by (`src/ccl/design/type-inference.md`, "A chain
             // names each position").
-            let position = match (expr.ty.peel_refinements(), elts.first()) {
+            let position = match (expr.ty.lets_distributed().peel_refinements(), elts.first()) {
                 (
                     Type::Fun {
                         binder: crate::ccl::FunBinder::Whole(k),
@@ -2739,7 +2928,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
                     },
                     _,
                 ) => Some(k.clone()),
-                (_, Some(head)) => match head.ty.peel_refinements() {
+                (_, Some(head)) => match head.ty.lets_distributed().peel_refinements() {
                     Type::Fun { binder, .. } => binder.whole().cloned(),
                     _ => None,
                 },
@@ -3166,7 +3355,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
                 && !matches!(bound_expr.node, TypedExprNode::Error)
                 && crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name)
             {
-                let sigma = crate::ccl::subst::Subst::discharge(
+                let sigma = crate::ccl::subst::Subst::let_exit(
                     &binding.name,
                     crate::ccl::ccl_utils::predicate_term(solver, bound_expr),
                 );
@@ -3303,22 +3492,39 @@ fn walk_annotation_predicates(
 
 /// [`walk_annotation_predicates`] for one type: each predicate it carries, once per allocation.
 fn walk_type_predicates(solver: &mut Solver, ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
-    fn collect(ty: &Type, out: &mut Vec<Rc<Expr>>) {
-        use crate::ccl::ty::HeldTerm;
+    /// Each term `ty` holds, with the binders of the type `let`s around it, which it reads as
+    /// the definitions the type holds ([`CoalesceCtx::let_shadows`]).
+    fn collect(
+        ty: &Type,
+        held: &mut Vec<Name>,
+        out: &mut Vec<(Rc<crate::ccl::ty::HeldTerm>, Vec<Name>)>,
+    ) {
+        use crate::ccl::ty::TermHolder;
         match ty {
-            Type::Refinement(_, refinements) => {
-                out.extend(refinements.iter().map(|r| Rc::clone(r.held())))
+            Type::Refinement(_, refinements) => out.extend(
+                refinements
+                    .iter()
+                    .map(|r| (Rc::clone(r.held()), held.clone())),
+            ),
+            Type::WitnessProjection(p) => out.push((Rc::clone(p.held()), held.clone())),
+            Type::FamilyApp(app) => {
+                out.extend(app.args.iter().map(|a| (Rc::clone(a.held()), held.clone())))
             }
-            Type::WitnessProjection(p) => out.push(Rc::clone(p.held())),
-            Type::FamilyApp(app) => out.extend(app.args.iter().map(|a| Rc::clone(a.held()))),
+            Type::Let(l) => {
+                out.push((Rc::clone(&l.definition), held.clone()));
+                held.push(l.name.clone());
+                collect(&l.body, held, out);
+                held.pop();
+                return;
+            }
             _ => {}
         }
-        ty.walk_children(|child| collect(child, out));
+        ty.walk_children(|child| collect(child, held, out));
     }
     let mut predicates = Vec::new();
-    collect(ty, &mut predicates);
-    for predicate in predicates {
-        let at = Rc::as_ptr(&predicate);
+    collect(ty, &mut Vec::new(), &mut predicates);
+    for (predicate, held) in predicates {
+        let at = (Rc::as_ptr(&predicate), held.clone());
         if ctx.walked_predicates.contains_key(&at) {
             continue;
         }
@@ -3327,7 +3533,9 @@ fn walk_type_predicates(solver: &mut Solver, ty: &Type, level: Level, ctx: &mut 
         // the stamp pass finds by that use's node.
         let mut walked = predicate.clone_preserving_ids();
         ctx.in_held += 1;
-        coalesce_node(solver, &mut walked, level, ctx);
+        with_shadows(ctx, held, |ctx| {
+            coalesce_node(solver, &mut walked, level, ctx)
+        });
         ctx.in_held -= 1;
     }
 }
@@ -3748,11 +3956,12 @@ fn coalesce_type_predicates_go(
             // which re-enters this same memo through `coalesce_node` →
             // `coalesce_type_predicates`.
             let memo = ctx.pred_memo.clone();
+            let held = ctx.let_shadows.clone();
             let base = inner.clone();
             refinements.rewrite_each(|_, r| {
                 let entered = Rc::clone(&r.predicate);
                 let this = r.clone();
-                memo.rebuild(r, &(), |pred| {
+                memo.rebuild(r, &held, |pred| {
                     let input = std::cell::OnceCell::new();
                     let repeats = ctx.predicates_in_progress.iter().any(|prior| {
                         *prior == this
@@ -3835,8 +4044,9 @@ fn coalesce_type_predicates_go(
         // A declared family's arguments are held terms, resolved as a projection's is.
         Type::FamilyApp(app) => {
             let memo = ctx.pred_memo.clone();
+            let held = ctx.let_shadows.clone();
             for arg in &mut app.args {
-                memo.rebuild(arg, &(), |term| {
+                memo.rebuild(arg, &held, |term| {
                     ctx.in_held += 1;
                     coalesce_node(solver, term, level, ctx);
                     ctx.in_held -= 1;
@@ -3856,11 +4066,49 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(solver, body, level, ctx, scope);
             binders.iter().for_each(|_| scope.exit());
         }
+        // The definition is a held term, resolved as a family's argument is; the body stands
+        // where the `let` does, under a binder that crosses no function.
+        Type::Let(l) => {
+            let l = Rc::make_mut(l);
+            let memo = ctx.pred_memo.clone();
+            let held = ctx.let_shadows.clone();
+            memo.rebuild(l, &held, |term| {
+                ctx.in_held += 1;
+                coalesce_node(solver, term, level, ctx);
+                ctx.in_held -= 1;
+                true
+            });
+            scope.close_held(solver, l);
+            share_held_term(
+                &mut ctx.coalesced_definitions,
+                HeldKey::Definition(l.name.clone()),
+                l,
+            );
+            // The body reads the binder as the definition the type holds.
+            ctx.let_shadows.push(l.name.clone());
+            with_shadows(ctx, [l.name.clone()], |ctx| {
+                coalesce_type_predicates_go(solver, &mut l.body, level, ctx, scope)
+            });
+            ctx.let_shadows.pop();
+            // Resolving can leave the body reading the binder no more, as a projection
+            // resolved to its one candidate does: the `let` then holds nothing.
+            if !crate::ccl::subst::type_free_vars(&l.body).contains(&l.name) {
+                let body = std::mem::replace(&mut l.body, Type::Hole);
+                *ty = body;
+                return;
+            }
+            // Resolving can leave the definition a variable, which is discharged
+            // ([`crate::ccl::ty::TypeLet::inline_atomic`]).
+            if let Some(inlined) = l.inline_atomic() {
+                *ty = inlined;
+            }
+        }
         // A projection holds a term as a predicate does, so its slots resolve the same way
         // and it leaves closed against the functions entered.
         Type::WitnessProjection(p) => {
             let memo = ctx.pred_memo.clone();
-            memo.rebuild(p, &(), |term| {
+            let held = ctx.let_shadows.clone();
+            memo.rebuild(p, &held, |term| {
                 ctx.in_held += 1;
                 coalesce_node(solver, term, level, ctx);
                 ctx.in_held -= 1;
@@ -3870,14 +4118,16 @@ fn coalesce_type_predicates_go(
             // The candidate is read off the term's own type, written where the binders around
             // this position are term variables, so it reads them by name and is closed here as
             // a rebuilt predicate is.
-            if let Some(sole) = p
-                .witness()
-                .and_then(crate::ccl::ty::Witness::sole_candidate)
-            {
+            if let Some(sole) = p.witness().and_then(|w| w.sole_candidate()) {
                 *ty = scope.closed_type(solver, &sole);
                 return;
             }
             scope.close_held(solver, p);
+            share_held_term(
+                &mut ctx.coalesced_definitions,
+                HeldKey::Projection(p.position),
+                p,
+            );
         }
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and
@@ -3900,6 +4150,29 @@ fn coalesce_type_predicates_go(
     }
 }
 
+/// What identifies the term a coalesced held term other than a predicate is a copy of: a held
+/// `let`'s binder, which the run holds one definition under, or a projection's position.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum HeldKey {
+    Definition(Name),
+    Projection(usize),
+}
+
+/// Point `held` at a coalesced term of the same `key` that equals it, or record it as one: copies
+/// of one held term made apart by the substitutions that carried them coalesce to equal terms
+/// ([`crate::ccl::ccl_utils::SharedTerms`]).
+fn share_held_term(
+    made: &mut HashMap<HeldKey, crate::ccl::ccl_utils::SharedTerms>,
+    key: HeldKey,
+    held: &mut dyn crate::ccl::ty::TermHolder,
+) {
+    if let Some(kept) = made.entry(key).or_default().share(held.held(), || {
+        crate::ccl::ccl_utils::term_reads(held.held())
+    }) {
+        held.replace_held(kept);
+    }
+}
+
 /// Point `r` at a coalesced predicate made from its origin that equals it and reads the same
 /// names and witnesses, or record it as one ([`CoalesceCtx::coalesced_by_origin`]). Equality
 /// compares refinements nested in type slots type-blind, and two copies made under different
@@ -3912,22 +4185,16 @@ fn share_with_its_origin(solver: &Solver, ctx: &mut CoalesceCtx, r: &mut crate::
         .entry(Rc::as_ptr(&origin))
         .or_insert_with(|| CoalescedFromOrigin {
             origin: Rc::clone(&origin),
-            made: Vec::new(),
+            made: Default::default(),
         })
         .made;
-    if made.iter().any(|(p, _)| Rc::ptr_eq(p, &r.predicate)) {
-        return;
-    }
-    let reads = (
-        crate::ccl::free_names::names_in_refinement(r),
-        crate::ccl::ccl_utils::free_witnesses(&r.predicate),
-    );
-    match made
-        .iter()
-        .find(|(p, p_reads)| **p == *r.predicate && *p_reads == reads)
-    {
-        Some((p, _)) => *r = crate::ccl::Refinement::sharing(p),
-        None => made.push((Rc::clone(&r.predicate), reads)),
+    if let Some(p) = made.share(&r.predicate, || {
+        (
+            crate::ccl::free_names::names_in_refinement(r),
+            crate::ccl::ccl_utils::free_witnesses(&r.predicate),
+        )
+    }) {
+        *r = crate::ccl::Refinement::sharing(&p);
     }
 }
 
@@ -5106,6 +5373,8 @@ pub(super) fn coalesce_generalized_let(
             )
         })
         .clone();
+    ctx.generalized_lets
+        .insert(binding.name.clone(), expr.node_id());
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             occurrence: binding.occurrence.id(),
@@ -5251,6 +5520,7 @@ pub(super) fn coalesce_generalized_let(
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
         result = specialization_let(
             solver,
+            &mut ctx.spliced,
             spec,
             frame.occurrence,
             transparency,
@@ -5265,6 +5535,7 @@ pub(super) fn coalesce_generalized_let(
 /// `body` under the `let` binding `spec`'s clone, its type closed over the binder.
 fn specialization_let(
     solver: &mut Solver,
+    spliced: &mut HashMap<usize, (Name, Rc<crate::ccl::ty::HeldTerm>)>,
     spec: Specialization,
     occurrence: NodeId,
     transparency: BindingTransparency,
@@ -5277,11 +5548,21 @@ fn specialization_let(
     let body_ty = if transparency == BindingTransparency::Transparent
         && crate::ccl::subst::type_free_vars(&body.ty).contains(&spec.name)
     {
-        crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone_preserving_ids())
+        crate::ccl::subst::Subst::let_exit(&spec.name, spec.def.clone_preserving_ids())
             .apply_type_in(solver, &body.ty)
     } else {
         body.ty.clone()
     };
+    {
+        let _copy = crate::ccl::provenance::copy_frame("mono.type_let_specialization");
+        spliced.insert(
+            spec.plan,
+            (
+                spec.name.clone(),
+                Duplicate::duplicate(&spec.def).into_held(),
+            ),
+        );
+    }
     Expr::new(TypedExprNode::Let {
         binding: TypedBinding {
             parameter_mode,
@@ -5321,6 +5602,7 @@ fn splice_placed(solver: &mut Solver, ctx: &mut CoalesceCtx, binders: &[Name], b
     for placed in here.into_iter().rev().filter(|p| p.spec.referenced) {
         result = specialization_let(
             solver,
+            &mut ctx.spliced,
             placed.spec,
             placed.occurrence,
             placed.transparency,
@@ -5574,7 +5856,7 @@ fn refresh_lambda_param_slot(solver: &mut Solver, expr: &mut Expr) {
         [] => {}
         [param] => param.ty = dom,
         params => {
-            let components: Vec<Type> = match dom.peel_refinements() {
+            let components: Vec<Type> = match dom.lets_distributed().peel_refinements() {
                 Type::Tuple(ts) if ts.len() == params.len() => ts.clone(),
                 Type::DepTuple(cs) if cs.len() == params.len() => {
                     crate::ccl::subst::open_tuple_components(

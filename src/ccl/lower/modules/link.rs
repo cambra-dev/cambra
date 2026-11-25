@@ -408,17 +408,26 @@ pub(super) fn compound_const_reads(
 /// predicate's nodes are copies of the module's, as the chain's are.
 /// `copies` holds each predicate copied, with the original, which keeps its address from
 /// being reused while it keys the map.
-fn copy_predicates(expr: &mut Expr, copies: &mut HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>) {
-    fn in_type(ty: &mut Type, copies: &mut HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>) {
+fn copy_predicates(
+    expr: &mut Expr,
+    copies: &mut HashMap<PredicateId, (Rc<crate::ccl::ty::HeldTerm>, Rc<crate::ccl::ty::HeldTerm>)>,
+) {
+    fn in_type(
+        ty: &mut Type,
+        copies: &mut HashMap<
+            PredicateId,
+            (Rc<crate::ccl::ty::HeldTerm>, Rc<crate::ccl::ty::HeldTerm>),
+        >,
+    ) {
         if let Type::Refinement(_, refinements) = ty {
             refinements.rewrite_each(|_, refinement| {
                 let id = refinement.predicate_id();
                 let copy = match copies.get(&id) {
                     Some((_, copy)) => Rc::clone(copy),
                     None => {
-                        let mut copy = (*refinement.predicate).duplicate();
+                        let mut copy = refinement.predicate.term().duplicate();
                         copy_predicates(&mut copy, copies);
-                        let copy = Rc::new(copy);
+                        let copy = crate::ccl::ty::IntoHeldTerm::into_held(copy);
                         let original = Rc::clone(&refinement.predicate);
                         copies.insert(id, (original, Rc::clone(&copy)));
                         copy

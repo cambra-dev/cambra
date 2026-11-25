@@ -18,7 +18,7 @@ use crate::ccl::capabilities::{Capabilities, CapabilityVar, CapabilityVarId, Req
 use crate::ccl::expr::TypedExpr;
 use crate::ccl::infer::solver::traits::{TraitObligation, TraitObligationId};
 use crate::ccl::infer_var::{InferVar, InferVarId};
-use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId, HeldTerm, TraitRequirement};
+use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId, TermHolder, TraitRequirement};
 
 /// One handle to a typing run's state.
 #[derive(Clone)]
@@ -102,7 +102,7 @@ pub trait HeldVisitor {
     /// Whether to walk `term`, a term a type holds (a refinement's predicate, a projection's
     /// sum, a family's argument). A term can be shared by many types, so a walk that has seen
     /// one may skip it.
-    fn enter_term(&mut self, _term: &Rc<TypedExpr>) -> bool {
+    fn enter_term(&mut self, _term: &Rc<crate::ccl::ty::HeldTerm>) -> bool {
         true
     }
 }
@@ -143,7 +143,7 @@ pub trait HeldRewriter {
     /// Rewrite the term `held` holds, a term a type holds; whether it changed. A term can be
     /// shared by many types, so a rewriter re-points each occurrence at one rewritten copy
     /// ([`crate::ccl::ccl_utils::PredMemo::rebuild`]).
-    fn held_term(&mut self, held: &mut dyn HeldTerm) -> bool;
+    fn held_term(&mut self, held: &mut dyn TermHolder) -> bool;
 }
 
 /// A value that can hold handles to a typing run's state.
@@ -284,7 +284,7 @@ impl HoldsSolverState for TypedExpr {
 
 /// The terms `ty` holds at its own node: a refinement's predicates, a projection's sum, a
 /// family's arguments.
-fn held_terms_here(ty: &Type) -> impl Iterator<Item = &Rc<TypedExpr>> {
+fn held_terms_here(ty: &Type) -> impl Iterator<Item = &Rc<crate::ccl::ty::HeldTerm>> {
     let predicates = match ty {
         Type::Refinement(_, refinements) => Some(refinements.iter().map(|r| &r.predicate)),
         _ => None,

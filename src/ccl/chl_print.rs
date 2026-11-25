@@ -26,7 +26,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::names::SyntheticKind;
-use crate::ccl::ty::{FunKind, PolyType, TypeKind, TypeParamId};
+use crate::ccl::ty::{FunKind, PolyType, RenderCtx, TypeKind, TypeParamId};
 use crate::ccl::{BaseType, BinOpKind, Builtin, Expr, HistoryKind, Lit, Name, Type, TypedExprNode};
 use crate::ccl::{FieldKey, FunBinder, ProjKey, UnaryOpKind};
 
@@ -72,7 +72,7 @@ impl Writer {
 
     /// `ty` written in CHL, reading its variables through `ctx`: a type a run renders while
     /// it holds the run's variables.
-    pub fn ty_with(&self, ctx: &crate::ccl::ty::RenderCtx<'_>, ty: &Type) -> String {
+    pub fn ty_with(&self, ctx: &RenderCtx<'_>, ty: &Type) -> String {
         Printer {
             ctx: Some(ctx),
             variables: Rc::clone(&self.variables),
@@ -150,8 +150,8 @@ pub fn chl_inferred_poly_in(inferred: &InferredPoly, home: Option<&[SmolStr]>) -
 #[derive(Default)]
 struct Printer<'c, 'r> {
     /// What the text reads a variable through: a run's solver, or a scratch one outside every
-    /// run ([`crate::ccl::ty::RenderCtx`]).
-    ctx: Option<&'c crate::ccl::ty::RenderCtx<'r>>,
+    /// run ([`RenderCtx`]).
+    ctx: Option<&'c RenderCtx<'r>>,
     /// The functions the walk has descended into the codomain of, innermost last: the
     /// spelling of each one's binder, or `None` for one that names none. A reference
     /// `index` crossings out reads entry `len - 1 - index`, as
@@ -174,6 +174,10 @@ struct Printer<'c, 'r> {
     home: Option<Vec<SmolStr>>,
     /// The variables of the message the text is part of ([`Writer`]).
     variables: Rc<RefCell<Vec<String>>>,
+    /// The definitions of the type `let`s the walk is inside of, innermost last, each with how
+    /// many of [`Self::binders`] stood around its `let`: a read of a binder the compiler minted
+    /// is written as its definition, which reads those binders.
+    lets: Vec<(Name, Rc<crate::ccl::ty::HeldTerm>, usize)>,
 }
 
 /// What one crossing of [`Printer::binders`] binds, as the text spells it.
@@ -206,7 +210,7 @@ impl Crossing {
 
 /// The number of components of `ty`, a product.
 fn product_width(ty: &Type) -> Option<usize> {
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         Type::Tuple(ts) => Some(ts.len()),
         Type::DepTuple(cs) => Some(cs.len()),
         _ => None,
@@ -252,13 +256,22 @@ enum Prec {
 /// depth of the environment that expression is written in.
 type Env<'a> = Vec<(&'a Name, &'a Expr, usize)>;
 
+/// The type `let`s a printed term stands under ([`Printer::lets`]) as the environment it starts
+/// in: a literal a definition holds is read through, as a lambda's argument is.
+fn let_env(held: &[(Name, Rc<crate::ccl::ty::HeldTerm>, usize)]) -> Env<'_> {
+    held.iter()
+        .enumerate()
+        .map(|(i, (name, definition, _))| (name, definition.term(), i))
+        .collect()
+}
+
 impl Printer<'_, '_> {
     /// Ask the context's rendering questions, or a detached context's where there is none
-    /// ([`RenderCtx::detached`](crate::ccl::ty::RenderCtx::detached)).
-    fn with_ctx<R>(&self, f: impl FnOnce(&crate::ccl::ty::RenderCtx<'_>) -> R) -> R {
+    /// ([`RenderCtx::detached`](RenderCtx::detached)).
+    fn with_ctx<R>(&self, f: impl FnOnce(&RenderCtx<'_>) -> R) -> R {
         match self.ctx {
             Some(ctx) => f(ctx),
-            None => f(&crate::ccl::ty::RenderCtx::detached()),
+            None => f(&RenderCtx::detached()),
         }
     }
 
@@ -448,6 +461,15 @@ impl Printer<'_, '_> {
                 format!("{}({})", app.param.spelling, args.join(", "))
             }
             Type::Family { binders, body } => self.family(binders, body),
+            // CHL has no `let` in a type: the type it stands for is written, each read of its
+            // binder as the program's name for it or as its definition ([`Printer::lets`]).
+            Type::Let(l) => {
+                self.lets
+                    .push((l.name.clone(), Rc::clone(&l.definition), self.binders.len()));
+                let text = self.ty(&l.body);
+                self.lets.pop();
+                text
+            }
             Type::Tuple(ts) => match ts.as_slice() {
                 [] => "{}".to_string(),
                 [only] => format!("{{{},}}", self.component(only)),
@@ -489,9 +511,11 @@ impl Printer<'_, '_> {
                 }
             }
             Type::Refinement(base, refinements) => {
+                let held = self.lets.clone();
+                let env = let_env(&held);
                 let mut preds: Vec<String> = refinements
                     .iter()
-                    .map(|r| self.expr(&r.predicate, Prec::And, &Vec::new()))
+                    .map(|r| self.expr(&r.predicate, Prec::And, &env))
                     .collect();
                 preds.sort();
                 match base.as_ref() {
@@ -564,7 +588,8 @@ impl Printer<'_, '_> {
             // around the written part, and the witness is its key type.
             Type::WitnessRef(_) => OUTER_KEYS.to_string(),
             Type::WitnessProjection(p) => {
-                let collection = self.expr(&p.term, Prec::Lowest, &Vec::new());
+                let held = self.lets.clone();
+                let collection = self.expr(&p.term, Prec::Lowest, &let_env(&held));
                 format!("‹the keys of {collection}›")
             }
             Type::DepTuple(components) => self.dep_tuple(components),
@@ -589,7 +614,8 @@ impl Printer<'_, '_> {
             self.free_spelled.push((n.clone(), s.clone()));
             return s;
         }
-        self.expr(term, Prec::Lowest, &Vec::new())
+        let held = self.lets.clone();
+        self.expr(term, Prec::Lowest, &let_env(&held))
     }
 
     /// A family, `\k: K -> T`, or its body alone where the body reads no binder: a type
@@ -862,6 +888,21 @@ impl Printer<'_, '_> {
             // refinement's, `__elem^𝑛`, which `spelling` declines and the fallback marks.
             TypedExprNode::Var(name) if name.is_elem() => (Prec::Atom, "_".to_string()),
             TypedExprNode::Var(name) => {
+                // A type `let`'s binder the program named is written by that name. One the
+                // compiler minted has no name a reader knows, so its definition, a term the
+                // program wrote once, is written where its `let` stands, under the binders
+                // around it, which its indices count.
+                if let Some(at) = self.lets.iter().rposition(|(n, _, _)| n == name) {
+                    if let Some(spelled) = spelling(name) {
+                        return (Prec::Atom, spelled);
+                    }
+                    let held = self.lets[..at].to_vec();
+                    let (_, definition, around) = self.lets[at].clone();
+                    let inner = self.binders.split_off(around);
+                    let text = self.expr_inner(&definition, &let_env(&held));
+                    self.binders.extend(inner);
+                    return text;
+                }
                 if let Some((_, bound, depth)) = env.iter().rev().find(|(n, _, _)| *n == name) {
                     let outer: Env<'a> = env[..*depth].to_vec();
                     return self.expr_inner(bound, &outer);
@@ -1190,7 +1231,7 @@ impl Printer<'_, '_> {
     /// `f` applied to `argument`: a proven lookup `f[a]!` for a collection, a call `f(a)`
     /// for a function, and `None` for a function whose type names no kind.
     fn call<'a>(&mut self, f: &'a Expr, argument: Val, env: &Env<'a>) -> Option<Val> {
-        let Type::Fun { fun_kind, .. } = f.ty.peel_refinements() else {
+        let Type::Fun { fun_kind, .. } = f.ty.former() else {
             return None;
         };
         let target = self.expr(f, Prec::Postfix, env);
@@ -1446,7 +1487,7 @@ impl fmt::Display for VariantArms {
 
 /// The `width` components of the product `domain`, each with the name a dependent tuple gives it.
 fn product_components(domain: &Type, width: usize) -> Vec<(Option<Name>, Type)> {
-    match domain.peel_refinements() {
+    match domain.lets_distributed().peel_refinements() {
         Type::Tuple(ts) => ts.iter().map(|t| (None, t.clone())).collect(),
         Type::DepTuple(cs) => cs.clone(),
         other => unreachable!("a product of {width} components, got {other}"),
@@ -1551,7 +1592,7 @@ mod tests {
                 Type::Poly(p) => &p.body,
                 t => t,
             };
-            match t.peel_refinements() {
+            match t.lets_distributed().peel_refinements() {
                 Type::Fun { binder, .. } => binder.parameter_count(),
                 _ => None,
             }

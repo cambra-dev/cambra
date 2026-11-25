@@ -236,6 +236,12 @@ pub struct Solver {
     /// The suspensions the reads in progress have minted, by the variable each suspends on
     /// ([`Self::read`]).
     pub(crate) read_suspensions: HashMap<InferVarId, Vec<(crate::ccl::subst::Subst, Rc<InferVar>)>>,
+    /// What the reads in progress have computed under substitutions
+    /// ([`crate::ccl::subst::ReadMemo`]).
+    pub(crate) read_memo: crate::ccl::subst::ReadMemo,
+    /// The name each definition the run's compactions hold is held under
+    /// ([`super::compact::TypeLetNames`]).
+    pub(crate) type_let_names: super::compact::TypeLetNames,
     /// What the run records about capabilities beyond each variable's state.
     capability_run: CapabilityRun,
     /// The classes of funkind variables sharing what they resolve to and which binder each
@@ -258,9 +264,11 @@ pub struct Solver {
     /// The variables whose sums are being read, so a cycle through them answers no
     /// (`compact`'s `projects_a_uint_range`).
     pub(crate) reading_sums: std::collections::HashSet<InferVarId>,
-    /// The distinct closed atoms met with each hash, in the order met, which tells apart two
-    /// unequal atoms whose hashes collide ([`crate::ccl::infer::solver::compact::ClosedAtom`]).
-    pub(crate) closed_atoms: HashMap<u64, Vec<Type>>,
+    /// The distinct closed atoms met with each hash, in the order met, each with the definitions
+    /// it reads, which tells apart two unequal atoms whose hashes collide
+    /// ([`crate::ccl::infer::solver::compact::ClosedAtom`]).
+    pub(crate) closed_atoms:
+        HashMap<u64, Vec<(Type, crate::ccl::infer::solver::compact::AtomReads)>>,
     /// The predicates the transport application in progress has rewritten
     /// ([`crate::ccl::subst::with_transport_memo`]).
     pub(crate) transport_memo: Option<crate::ccl::subst::TransportMemo>,
@@ -327,6 +335,8 @@ impl Solver {
             orderings: Table::default(),
             reading: 0,
             read_suspensions: HashMap::new(),
+            read_memo: Default::default(),
+            type_let_names: Default::default(),
             capability_run: CapabilityRun::default(),
             kind_classes: Default::default(),
             proxies: Default::default(),
@@ -452,6 +462,7 @@ impl Solver {
         self.reading -= 1;
         if self.reading == 0 {
             self.read_suspensions.clear();
+            self.read_memo.clear();
         }
         out
     }

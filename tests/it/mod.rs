@@ -35,6 +35,7 @@ mod hot_reload;
 mod http_server;
 mod inference_variants;
 mod inspector_wire;
+mod let_definition_cost;
 mod live_keys_readers;
 mod loop_body_binding_cost;
 mod nested_extract_allocations;

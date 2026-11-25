@@ -38,7 +38,9 @@ fn plan_and_run(code: &str) -> (String, cambra::interpreter::Tile) {
     (symbolic(&expr), result)
 }
 
-/// The key collection is the iteration, whatever stands behind it.
+/// The key collection is the iteration, whatever stands behind it, except a collection a `let`
+/// binds ([`a_bound_collection_keeps_its_map_domain`]). A filtered list's source is one: the
+/// filter's type holds the list, which the program's root binds once.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::a_mapped_list(
@@ -48,7 +50,7 @@ fn plan_and_run(code: &str) -> (String, cambra::interpreter::Tile) {
 )]
 #[case::a_filtered_list(
     "[sum([x + i for x in [y for y in [1, 2, 3] if y > 1]]) for i in [1, 2]]",
-    "iterate ≫ [1, 2] ≫ iterate ▷ const ▷ strength_over ≫ ((.1 ≫ [1, 2, 3] ≫ (id, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (.1 ≫ cast([1, 2, 3]), .0) ▷ zip ≫ add) ▷ map ≫ sum",
+    "let __anf : (0..3 ⤇ Int) = iterate ≫ [1, 2, 3]\nin iterate ≫ [1, 2] ≫ __anf ▷ map_domain ▷ const ▷ strength_over ≫ ((.1 ≫ __anf ≫ (id, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (.1 ≫ cast([1, 2, 3]), .0) ▷ zip ≫ add) ▷ map ≫ sum",
     &[7, 9]
 )]
 #[case::a_data_source(
