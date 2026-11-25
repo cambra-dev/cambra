@@ -1317,6 +1317,9 @@ impl Scope {
 
 pub(super) struct Execution {
     handlers: Vec<Handler>,
+    /// Handler at which the coordinator resumes its search for the next settled scope.
+    // shared-state-ok: only the coordinator rotates its search through eligible scopes.
+    step_cursor: Cell<usize>,
     roots: usize,
     /// Each scope's inner pipelines, its step, its own pipeline and its body's follower hold, as
     /// attached.
@@ -1332,6 +1335,7 @@ impl Execution {
         let mut execution = Self {
             handlers: (0..scopes.len()).map(|_| Handler::Root).collect(),
             roots: scopes.len(),
+            step_cursor: Cell::new(0),
             bodies: Vec::new(),
             closes_on_reads: Vec::new(),
         };
@@ -1655,7 +1659,24 @@ impl Execution {
         // A step runs on what its round settled, and one scope's step can bring another scope's
         // body work, as a writer's commit does for a writer that reads the store: so a pass with
         // nothing else to do queues one step, and the next pass reads the bodies again.
-        progressed || self.scopes().any(|scope| scope.queue_step(dispatcher))
+        progressed
+            || self.queue_one_step(|index| match &self.handlers[index] {
+                Handler::Request(scope) => scope.queue_step(dispatcher),
+                _ => false,
+            })
+    }
+
+    /// Queue at most one step per settlement pass. Start after the previous winner so a writer
+    /// retrying at the beginning of the handler table gives an already eligible peer a turn.
+    fn queue_one_step(&self, mut queue: impl FnMut(usize) -> bool) -> bool {
+        let start = self.step_cursor.get();
+        for index in (start..self.handlers.len()).chain(0..start) {
+            if queue(index) {
+                self.step_cursor.set(index + 1);
+                return true;
+            }
+        }
+        false
     }
 
     fn push_held(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
@@ -3878,6 +3899,23 @@ fn drive_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_continuously_ready_scope_yields_to_another_ready_step() {
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![]], usize::MAX);
+        let execution = Execution::new(&[None, None, None], &mut dispatcher);
+        let mut steps = Vec::new();
+        for _ in 0..4 {
+            assert!(execution.queue_one_step(|index| {
+                if index == 1 {
+                    return false;
+                }
+                steps.push(index);
+                true
+            }));
+        }
+        assert_eq!(steps, [0, 2, 0, 2]);
+    }
 
     /// A record range over a source field yields a prefix where that field's yield is every
     /// position at or below one, whatever its other fields hold.
