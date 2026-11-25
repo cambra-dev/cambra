@@ -823,6 +823,23 @@ impl BreakerState {
         self.cycle = Some(cycle);
     }
 
+    /// Publish `tile` to the store's cycle where it has one, and keep it as the store's snapshot.
+    ///
+    /// Every tile a store publishes is its snapshot. A re-entrant pull of the fan-out is answered
+    /// from the published tile (`Cycle::publish`), and a direct pull of the store from the
+    /// snapshot ([`Self::offer`]). Both answer the same tile, except that a nested induction
+    /// store's direct pull leaves out the rows it has released
+    /// (`InductionStoreProducer::get_impl`).
+    ///
+    /// A caller that requires a cycle asserts it, and `publish_commits` then has the operators
+    /// inside the cycle read again.
+    fn publish(&mut self, tile: Tile) {
+        if let Some(cycle) = &self.cycle {
+            cycle.publish(&tile);
+        }
+        self.snapshot = Some(tile);
+    }
+
     fn terminal(&self) -> bool {
         self.snapshot.as_ref().is_some_and(Tile::is_terminal)
     }
@@ -896,13 +913,11 @@ fn consume_store<S: SteppedStore>(
     }
     let step = |state: &mut S::State| {
         store.read_cycle_inputs(state, &cycle);
-        let tile = store.step_store(state, input);
-        cycle.publish(&tile);
-        tile
+        store.step_store(state, input)
     };
     if S::breaker(state).snapshot.is_none() {
         let tile = step(state);
-        S::breaker_mut(state).snapshot = Some(tile);
+        S::breaker_mut(state).publish(tile);
     }
     loop {
         let released = store.input_released_in_state(state, input);
@@ -910,9 +925,10 @@ fn consume_store<S: SteppedStore>(
             return;
         }
         let tile = step(state);
-        let progressed = S::breaker(state).snapshot.as_ref() != Some(&tile)
-            || store.input_released_in_state(state, input) != released;
-        S::breaker_mut(state).snapshot = Some(tile);
+        // The step's tile is compared with the snapshot before `publish` replaces it.
+        let changed = S::breaker(state).snapshot.as_ref() != Some(&tile);
+        S::breaker_mut(state).publish(tile);
+        let progressed = changed || store.input_released_in_state(state, input) != released;
         // A position its input has not decided yet stops the steps: the package's rest stays
         // unreleased, and the scope keeps it waiting for inputs until a push brings what decides
         // it (`Offered::retry`).
@@ -1311,10 +1327,7 @@ impl Breaker for CommitProducer {
         if state.breaker.snapshot.is_none() && state.seed_producers.is_empty() {
             assert!(self.open_store(state), "constant seeds open without input");
             let tile = self.render_store(state);
-            if let Some(cycle) = &state.breaker.cycle {
-                cycle.publish(&tile);
-            }
-            state.breaker.snapshot = Some(tile);
+            state.breaker.publish(tile);
         }
     }
 
@@ -1407,14 +1420,12 @@ impl Breaker for CommitProducer {
                  since: writer {writer}'s drive still holds one, which a terminal store would drop"
             );
             state.writer_terminal[writer] = true;
+            assert!(
+                state.breaker.cycle.is_some(),
+                "a writer's finish publishes the store to its cyclic fan-out"
+            );
             let tile = self.render_store(state);
-            state
-                .breaker
-                .cycle
-                .as_ref()
-                .expect("a store's cyclic fan-out")
-                .publish(&tile);
-            state.breaker.snapshot = Some(tile);
+            state.breaker.publish(tile);
         }
         finish_store(self, state);
         drop(state_guard);
@@ -3125,14 +3136,13 @@ impl CommitProducer {
     /// published tile. A snapshot older than that tile would hold the changelog a release has
     /// since reclaimed, and the direct pull would answer it again.
     fn publish_commits(&self, state: &mut CommitState) {
-        let tile = self.render_store(state);
         let cycle = state
             .breaker
             .cycle
             .clone()
             .expect("a transaction store steps itself only as its cyclic fan-out's input");
-        cycle.publish(&tile);
-        state.breaker.snapshot = Some(tile);
+        let tile = self.render_store(state);
+        state.breaker.publish(tile);
         self.read_cycle_inputs(state, &cycle);
     }
 
@@ -3141,10 +3151,7 @@ impl CommitProducer {
     fn settle_ready(&self, state: &mut CommitState) {
         if self.open_store(state) {
             let tile = self.render_store(state);
-            if let Some(cycle) = &state.breaker.cycle {
-                cycle.publish(&tile);
-            }
-            state.breaker.snapshot = Some(tile);
+            state.breaker.publish(tile);
         }
     }
 }
@@ -3584,10 +3591,7 @@ impl InductionStoreProducer {
         };
         self.open_at(state, &row, &seed);
         let tile = self.render_store(state);
-        if let Some(cycle) = &state.breaker.cycle {
-            cycle.publish(&tile);
-        }
-        state.breaker.snapshot = Some(tile);
+        state.breaker.publish(tile);
         true
     }
 

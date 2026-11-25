@@ -8,7 +8,7 @@ use std::sync::PoisonError;
 
 use super::*;
 use crate::interpreter::DataSink;
-use crate::interpreter::sinks::ProducerSlot;
+use crate::interpreter::sinks::{ProducerSlot, live_rows};
 
 /// The pipeline breaker of a sink or a `main` output: it consumes a package by pulling the
 /// producer at the package's guard, releasing what the answer states, and handing the answer
@@ -53,7 +53,10 @@ enum Hands {
 }
 
 impl SinkBreaker {
+    /// Hand `tile` to the sink, or merge it into the `main` output's answer, without the rows it
+    /// marks deleted ([`live_rows`]).
     fn deliver(&self, tile: Tile) {
+        let tile = live_rows(tile);
         match &mut *self.hands.lock().unwrap_or_else(PoisonError::into_inner) {
             Hands::EachPackage => self.sink.process(&tile),
             Hands::Main {
@@ -169,6 +172,7 @@ impl Breaker for SinkBreaker {
         let producer = slot.as_mut().expect("a sink has subscribed its producer");
         let rest = crate::interpreter::sinks::pull_at_finish(&mut **producer);
         producer.release(rest.to_guard());
+        let rest = live_rows(rest);
         // The packages consumed all the producer holds, so the pull adds no key, except the rows
         // of a loop's rounds where the output reads a loop's scope (`reads_a_loop`).
         debug_assert!(
@@ -232,7 +236,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+    use crate::interpreter::tile_operators::test_helpers::{ProjectionSpy, TestTileProducer};
     use crate::interpreter::{BaseType, ColumnValue, Extent};
 
     /// A sink that counts the tiles it is handed.
@@ -310,6 +314,48 @@ mod tests {
         );
         assert_eq!(sink.0.load(Ordering::SeqCst), 1);
         assert!(!breaker.input_released(InputId::ONLY).is_universal());
+    }
+
+    /// A sink is handed only the rows its producer's answer holds live, and the producer is
+    /// released at the answer's marked keys too.
+    #[test]
+    fn a_sink_is_handed_no_marked_row_and_its_producer_is_released_at_it() {
+        let tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let mut deleted = bit_set::BitSet::new();
+        deleted.insert(1);
+        let answer = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+            Predicate::False,
+            deleted,
+        );
+        let producer: ProducerSlot = Arc::new(RwLock::new(Some(Box::new(TestTileProducer::new(
+            answer,
+            tiling.clone(),
+        )))));
+        let sink = Arc::new(Recording::default());
+        let mut breaker = SinkBreaker::new(producer, sink.clone());
+        breaker.consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
+        let handed = sink.0.lock().expect("no hand-off panics");
+        let [
+            Tile::DataFunction {
+                domain, deleted, ..
+            },
+        ] = handed.as_slice()
+        else {
+            panic!("one collection handed: {handed:?}")
+        };
+        assert_eq!(*domain, ColumnValue::Ints(vec![1, 3]), "{handed:?}");
+        assert!(deleted.is_empty(), "{handed:?}");
+        let TileGuard::Function(FunctionGuard::Domain(released)) =
+            breaker.input_released(InputId::ONLY)
+        else {
+            panic!("a collection's release names its keys")
+        };
+        assert!(released.contains(&Value::Int(2)), "{released:?}");
     }
 
     /// A sink that keeps each tile it is handed.
