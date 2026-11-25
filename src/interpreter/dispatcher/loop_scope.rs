@@ -26,7 +26,7 @@ pub(crate) struct InductionRun {
     /// which take it once the pipelines they read have finished the round.
     starts: Vec<PipelineId>,
     opened: bool,
-    request: Option<Request>,
+    round: Option<ActiveRound>,
     /// The position round a request ended with undecided: the next request runs it again first,
     /// since the drive has emitted its position already ([`complete_round`](InductionStoreProducer::complete_round)).
     rerun: Option<TileGuard>,
@@ -601,7 +601,7 @@ impl Drop for Body {
     }
 }
 
-struct Request {
+pub(super) struct Request {
     /// Whether the request has read the drive's source for newly delivered positions.
     read: bool,
     /// Whether the request has run a position round.
@@ -611,32 +611,25 @@ struct Request {
     covers: TileGuard,
     /// Whether positions waited for inputs when the request began ([`Body::take_waited`]).
     waited: bool,
-    round: Round,
     package: WorkPackage,
 }
 
-/// Where a request stands between its rounds, which decides what
-/// [`queue_package_round`](InductionStoreProducer::queue_package_round) does next.
+/// A round whose body is running or whose step is queued.
+struct ActiveRound {
+    request: Request,
+    kind: Round,
+}
+
 enum Round {
-    /// No round is queued: the next call runs the next position the request covers, or the
-    /// closing round, or ends the request.
-    Selecting,
-    /// The round at this position is queued, and [`complete_round`] steps the store over it.
-    ///
-    /// [`complete_round`]: InductionStoreProducer::complete_round
     Position(TileGuard),
-    /// The closing round over the request's positions is queued.
     Closing,
-    /// The closing round has run: the next call ends the request, keeping the positions the
-    /// store has not decided waiting for inputs ([`keep_undecided`]).
-    ///
-    /// [`keep_undecided`]: InductionStoreProducer::keep_undecided
-    Closed,
-    /// The last position round did not decide its position: what the body read there is not final
-    /// yet. The next call ends the request with the positions it covers and the store has not
-    /// decided waiting for inputs, and a push from a pipeline the scope reads brings the next
-    /// request, which runs that position again.
-    Undecided,
+}
+
+/// What to do with a request after acknowledging its step package.
+pub(super) enum RoundOutcome {
+    Select,
+    Park,
+    End,
 }
 
 impl InductionRun {
@@ -645,7 +638,7 @@ impl InductionRun {
             body,
             starts,
             opened: false,
-            request: None,
+            round: None,
             rerun: None,
         }
     }
@@ -704,7 +697,7 @@ impl InductionStoreProducer {
     pub(super) fn settlement_pipelines(&self) -> Vec<PipelineId> {
         let body = &self.run().body;
         // As `release_followers` releases them: while a request is open or the body finishes.
-        if !body.is_active() || (self.run().request.is_none() && !body.is_finishing()) {
+        if !body.is_active() || (self.run().round.is_none() && !body.is_finishing()) {
             return Vec::new();
         }
         (0..body.members.len())
@@ -724,7 +717,7 @@ impl InductionStoreProducer {
         // must run before the scope finishes, so a finishing body releases them as a request
         // does, after the pass publishes what its inner pipelines hold (`settlement_pipelines`).
         let run = self.run();
-        (run.request.is_some() || run.body.is_finishing())
+        (run.round.is_some() || run.body.is_finishing())
             && run.body.release_followers(dispatcher, read)
     }
 
@@ -741,8 +734,8 @@ impl InductionStoreProducer {
         package: WorkPackage,
     ) -> (Option<WorkPackage>, RoundWork) {
         self.activate(dispatcher);
-        self.begin_package(package);
-        self.queue_package_round(dispatcher)
+        let request = self.begin_package(package);
+        self.queue_package_round(dispatcher, request, RoundOutcome::Select)
     }
 
     pub(super) fn begin_shared_finish(&mut self, dispatcher: &Dispatcher) {
@@ -953,9 +946,9 @@ impl InductionStoreProducer {
             .collect()
     }
 
-    fn begin_package(&mut self, package: WorkPackage) {
+    fn begin_package(&mut self, package: WorkPackage) -> Request {
         assert!(
-            self.run().request.is_none(),
+            self.run().round.is_none(),
             "a loop completes one request before starting another"
         );
         let waited = self.run().body.take_waited();
@@ -980,14 +973,13 @@ impl InductionStoreProducer {
         if let Some(waited) = &waited {
             self.placed(|scope| scope.step_round(waited));
         }
-        self.run_mut().request = Some(Request {
+        Request {
             read: rows,
             emitted: false,
             covers,
             waited: waited.is_some(),
-            round: Round::Selecting,
             package,
-        });
+        }
     }
 
     /// Keep `waiting`, the positions a request leaves undecided, waiting for inputs: a push that
@@ -1020,7 +1012,7 @@ impl InductionStoreProducer {
     }
 
     pub(super) fn has_package(&self) -> bool {
-        self.run().request.is_some()
+        self.run().round.is_some()
     }
 
     /// The next round of the open request: the request, where it has no round left, and the
@@ -1028,28 +1020,22 @@ impl InductionStoreProducer {
     pub(super) fn queue_package_round(
         &mut self,
         dispatcher: &Dispatcher,
+        mut request: Request,
+        outcome: RoundOutcome,
     ) -> (Option<WorkPackage>, RoundWork) {
-        let rows = !matches!(self.tiling(), Tiling::Store { .. });
-        let mut request = self
-            .run_mut()
-            .request
-            .take()
-            .expect("a loop has a pending request");
-        match request.round {
-            Round::Selecting => {}
-            Round::Undecided => {
+        match outcome {
+            RoundOutcome::Select => {}
+            RoundOutcome::Park => {
                 let waiting = guard_minus(&request.covers, &self.input_released(InputId::ONLY));
                 self.wait_for_inputs(waiting);
                 return (Some(request.package), RoundWork::default());
             }
-            Round::Closed => {
+            RoundOutcome::End => {
                 self.keep_undecided(&request.covers, request.waited);
                 return (Some(request.package), RoundWork::default());
             }
-            Round::Position(_) | Round::Closing => {
-                unreachable!("the body and store step complete before the next round")
-            }
         }
+        let rows = !matches!(self.tiling(), Tiling::Store { .. });
         // A round an earlier request left undecided runs again first: what it read has grown.
         if let Some(guard) = self.run_mut().rerun.take()
             && !guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty()
@@ -1058,8 +1044,10 @@ impl InductionStoreProducer {
             let mut work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
             self.run().body.queue_grown(&mut work);
             request.emitted = true;
-            request.round = Round::Position(guard);
-            self.run_mut().request = Some(request);
+            self.run_mut().round = Some(ActiveRound {
+                request,
+                kind: Round::Position(guard),
+            });
             return (None, work);
         }
         loop {
@@ -1072,8 +1060,10 @@ impl InductionStoreProducer {
                 let mut work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
                 self.run().body.queue_grown(&mut work);
                 request.emitted = true;
-                request.round = Round::Position(guard);
-                self.run_mut().request = Some(request);
+                self.run_mut().round = Some(ActiveRound {
+                    request,
+                    kind: Round::Position(guard),
+                });
                 return (None, work);
             }
             // A flat scope reads newly delivered source positions at most once per request,
@@ -1109,52 +1099,37 @@ impl InductionStoreProducer {
         // readers, a nested loop's among them, and a reader that has not read what grew would
         // offer the nested loop none of the positions it brings.
         self.run().body.queue_grown(&mut work);
-        request.round = Round::Closing;
-        self.run_mut().request = Some(request);
+        self.run_mut().round = Some(ActiveRound {
+            request,
+            kind: Round::Closing,
+        });
         (None, work)
     }
 
     /// Step the queued round after its body and held pushes settle.
-    pub(super) fn complete_round(&mut self) {
-        let request = self
+    pub(super) fn complete_round(&mut self) -> (Request, RoundOutcome) {
+        let ActiveRound { request, kind } = self
             .run_mut()
-            .request
-            .as_mut()
+            .round
+            .take()
             .expect("a loop steps one queued round");
-        let round = std::mem::replace(&mut request.round, Round::Selecting);
-        match round {
+        let outcome = match kind {
             Round::Position(guard) => {
                 self.placed(|scope| scope.step_round(&guard));
-                // A position round the store did not decide stays unreleased: running it again
-                // before what the body read changes would decide nothing again.
-                if !guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty() {
-                    self.run_mut()
-                        .request
-                        .as_mut()
-                        .expect("a loop steps one queued round")
-                        .round = Round::Undecided;
+                if guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty() {
+                    RoundOutcome::Select
+                } else {
+                    // Retry the exact position when a later request wakes its wider coverage.
                     self.run_mut().rerun = Some(guard);
+                    RoundOutcome::Park
                 }
             }
             Round::Closing => {
-                let covers = self
-                    .run_mut()
-                    .request
-                    .as_ref()
-                    .expect("a loop steps one queued round")
-                    .covers
-                    .clone();
-                self.placed(|scope| scope.step_round(&covers));
-                self.run_mut()
-                    .request
-                    .as_mut()
-                    .expect("a loop steps one queued round")
-                    .round = Round::Closed;
+                self.placed(|scope| scope.step_round(&request.covers));
+                RoundOutcome::End
             }
-            Round::Selecting | Round::Closed | Round::Undecided => {
-                unreachable!("a loop steps one queued round")
-            }
-        }
+        };
+        (request, outcome)
     }
 
     /// The body's work for one position or closing row, before the store steps it.
@@ -1365,8 +1340,7 @@ mod tests {
             .claim_of(PipelineId(0))
             .expect("ordinary request");
         assert_eq!(request.guard, fresh);
-        scope.begin_package(request);
-        let active = scope.run().request.as_ref().unwrap();
+        let active = scope.begin_package(request);
         assert!(active.waited);
         assert_eq!(active.covers, fresh.union(&waiting));
         assert_eq!(compiled.dispatcher.outstanding(PipelineId(0)), 1);
@@ -1628,15 +1602,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the body and store step complete before the next round")]
-    fn a_request_cannot_queue_the_next_round_before_stepping() {
+    #[should_panic(expected = "a loop completes one request before starting another")]
+    fn a_loop_cannot_begin_another_request_before_stepping() {
         let compiled = Compiled::of(SUM);
         let whole = induction(&compiled.scope)
             .input_tiling(InputId::ONLY)
             .universal_guard();
         compiled.dispatcher.notify(PipelineId(0), &whole);
         assert_eq!(compiled.tick(), Some(PipelineId(0)));
-        let _ = induction(&compiled.scope).queue_package_round(&compiled.dispatcher);
+        let _ = induction(&compiled.scope).begin_package(WorkPackage {
+            pipeline: PipelineId(0),
+            guard: whole,
+            index: 1,
+        });
     }
 
     /// A guarded loop's `Memo`s are inner pipelines, which each round queues the position for and
