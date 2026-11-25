@@ -67,6 +67,23 @@ fn a_captured_callback_separates_transactional_reads() {
     );
 }
 
+#[test]
+fn an_inner_transactional_writer_does_not_change_its_shadowed_value_parameter() {
+    check_scalar(
+        indoc! {r#"
+            def outer(value, counter: Mut(Int, Txn)):
+                def write(value):
+                    with begin():
+                        value := value + 1
+                write(&counter)
+                value
+            counter: Mut(Int, Txn) := 7
+            outer(10, &counter) + await_final(counter)
+        "#},
+        Value::Int(18),
+    );
+}
+
 #[rstest]
 #[case::effect_top("() => Int causes Effect")]
 #[case::write_top("() => Int causes Write(*)")]
@@ -276,7 +293,7 @@ fn places_and_values(#[case] code: &str, #[case] expected: i64) {
 }
 
 #[rstest]
-#[case::a_value_parameter_does_not_borrow(indoc! {r#"
+#[case::a_used_value_parameter_reports_a_borrow_type_mismatch(indoc! {r#"
     def inc(value):
         value + 1
     counter := 7

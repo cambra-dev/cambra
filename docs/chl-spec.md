@@ -1979,7 +1979,8 @@ forms.
 as its own statement form.
 
 `<<=` is a contribution, as `<<` is: it stands in the feed's declaring scope, or in a function that
-scope lends the feed to with `&` ([8.4 Deferred collections](#84-deferred-collections)).
+scope lends the feed to with `&`, at a call or a `run` statement
+([8.4 Deferred collections](#84-deferred-collections)).
 
 ### 4.5 `if` / `elif` / `else`
 
@@ -5402,7 +5403,8 @@ Its name denotes its final collection, and no read observes it partly defined, w
 stands. The collection's elements reach its consumers as they are contributed.
 
 The contributions that define a feed are those in its declaring scope, those in a function that
-scope lends it to with `&`, for the duration of that call, and those in a `def` of the declaring
+scope lends it to with `&`, for the duration of that call, those in a module that receives it
+through a run’s `&` argument, for the duration of that run, and those in a `def` of the declaring
 module that captures it. Nothing else contributes to a feed.
 
 #### Places and values
@@ -5419,11 +5421,11 @@ product fields and arguments to plain parameters are such uses. `saved = out` th
 collection data, and a function ending in bare `out` returns collection data. Neither exposes the
 feed.
 
-A **borrow**, `&x` at a call, lends a place for the duration of that call. An unmarked argument is
-always a copy. A parameter's borrow mode is part of its type, and the body supplies it: a parameter
-the body writes, feeds or lends on with `&` borrows, and one the body only reads is a plain
-parameter. An explicit `Mut(V)` or `Feed(T)` annotation asserts the mode. Passing `&x` to a plain
-parameter, or an unmarked place to a borrowing one, is a compile-time error.
+A **borrow**, `&x` at a call or a `run` statement, lends a place for the duration of that call or
+run. An unmarked argument is always a copy. A parameter's borrow mode is part of its type, and the
+body supplies it: a parameter the body writes, feeds or lends on with `&` borrows, and one the body
+only reads is a plain parameter. An explicit `Mut(V)` or `Feed(T)` annotation asserts the mode.
+Passing `&x` to a plain parameter, or an unmarked place to a borrowing one, is a compile-time error.
 
 ```python
 def emit(out, value):

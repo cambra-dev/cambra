@@ -298,6 +298,9 @@ a user's `` `some `` builds that module's own tag.
   when it has none ([ir.md, "`Abstract` — a value known only by its
   type"](../src/ccl/design/ir.md#abstract--a-value-known-only-by-its-type)). The interface records
   each parameter's annotation and whether it has a default.
+  A place parameter takes an explicit `&place` argument and borrows that place for the run
+  ([Places and values](chl-spec.md#places-and-values)). Its compiler binding retains the place;
+  an ordinary use in the module reads its value.
   A `run` statement binds each argument above its `Run` node under `argument_name`'s
   double-underscore name, `__run::eu::port`, at the parameter's annotated type spelled through the
   run name, so a mismatch is reported at the argument. Creating the run points each parameter with

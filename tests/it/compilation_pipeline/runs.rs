@@ -962,6 +962,23 @@ fn module_place_arguments_require_the_borrow_mode(
 }
 
 #[test]
+fn an_unknown_module_argument_reports_no_borrow_mode() {
+    let errors = compile_errors(&program(
+        indoc! {r#"
+            out: Feed(Int)
+            run sinker(sink=&out, nope=&out)
+            0
+        "#},
+        &[("sinker", "param sink: Feed(Int)")],
+    ));
+    assert!(
+        errors.contains("module `sinker` has no parameter `nope`"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
+#[test]
 fn a_module_borrow_cannot_escape_in_an_exported_mutable_writer() {
     assert_refused(
         &program(

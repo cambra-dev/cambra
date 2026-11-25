@@ -206,7 +206,7 @@ impl LoweringContext {
                         .and_then(Parameter::annotation)
                         .is_some_and(Type::is_place);
                     let borrowed = super::super::exprs::borrowed_place(&arg.value).is_some();
-                    if borrows != borrowed {
+                    if parameter.is_some() && borrows != borrowed {
                         let message = if borrows {
                             format!(
                                 "module parameter `{}` borrows a place; pass it with `&`",

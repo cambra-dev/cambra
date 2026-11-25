@@ -704,13 +704,7 @@ const COMPILE_FAILS: &[&str] = &[
 
 /// Programs that compile but reach the inspector's one-file restriction.
 /// The sweep checks their compiler result separately from the degraded payload.
-const MULTI_MODULE_DUMPS: &[&str] = &[
-    "hot_reload",
-    "http_accumulator",
-    "http_counter",
-    "http_greeter",
-    "source_two_runs",
-];
+const MULTI_MODULE_DUMPS: &[&str] = &["source_two_runs"];
 
 /// Every `*.cambra` source under `tests/programs/`, as (program-directory name,
 /// absolute path). Walks the directory rather than reading a list:

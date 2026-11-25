@@ -825,7 +825,7 @@ fn parameter_type(
         if matches!(&func.node, ChlExpr::Name(head) if head == "Feed"))
     {
         let ChlExpr::Call { args, .. } = &annotation.node else {
-            unreachable!("`is_feed_type` matched a call")
+            unreachable!("a `Feed` annotation is a call")
         };
         let [value] = args.as_slice() else {
             return Err(LoweringError::unsupported(
