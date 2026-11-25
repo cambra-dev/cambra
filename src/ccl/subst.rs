@@ -5000,7 +5000,7 @@ mod tests {
 
     #[test]
     fn transport_and_rewrite_visit_the_same_type_slots_once() {
-        use crate::ccl::infer::solver::traits::{Assoc, Trait};
+        use crate::ccl::infer::solver::traits::{Assoc, InstanceTable, StdTrait};
 
         let row = Type::refined_one(
             Type::Base(crate::ccl::BaseType::Int),
@@ -5023,10 +5023,10 @@ mod tests {
                 parameter: Some(row.clone()),
             }),
             TypedExpr::new(TypedExprNode::TraitFn {
-                trait_: Trait::addable(),
+                trait_: InstanceTable::std().std_trait(StdTrait::Addable),
                 function: "add".into(),
                 operands: vec![row.clone()],
-                assoc: vec![(Assoc::Output, row.clone())],
+                assoc: vec![(Assoc::output(), row.clone())],
             }),
         ];
         // Simultaneous renames expose a slot visited twice: k must become j, not m.

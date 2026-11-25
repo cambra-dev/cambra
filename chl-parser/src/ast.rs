@@ -650,6 +650,9 @@ pub struct ImplBlock {
     /// The block's `def`s, each a [`Stmt::FunctionDef`], or one under [`Stmt::Pub`]. Empty
     /// for a head written with no block, an instance of a trait that declares no function.
     pub defs: Vec<Spanned<Stmt>>,
+    /// The `@Builtin` decorator on the line above an instance: the compiler supplies the
+    /// instance's functions (`docs/chl-spec.md`, "9.16 The std root").
+    pub builtin: Option<Span>,
 }
 
 /// A trait declaration ([`Stmt::TraitDecl`]).
@@ -662,8 +665,12 @@ pub struct TraitDecl {
     /// What every instance of the trait requires of its operands, `Equatable(A, B)` in
     /// `trait Ordered(A, B) requires Equatable(A, B):`.
     pub requires: Vec<Spanned<Requirement>>,
-    /// The body's lines, in source order.
+    /// The body's lines, in source order. Empty for a trait written with no body, which
+    /// associates no type and declares no function.
     pub items: Vec<TraitItem>,
+    /// The `@Builtin` decorator on the line above: the compiler answers the trait for types
+    /// beyond its instances (`docs/chl-spec.md`, "9.16 The std root").
+    pub builtin: Option<Span>,
 }
 
 /// One line of a [`TraitDecl`].

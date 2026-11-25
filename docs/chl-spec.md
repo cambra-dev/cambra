@@ -4250,7 +4250,8 @@ one for each list of operand types. A **trait requirement** in a definition's `r
 parameter of such a type that no call writes: each call passes the instance its types pick
 ([Summoning an instance](#summoning-an-instance)). Each operator places a requirement on its
 operand types. A module declares traits of its own ([Declaring a trait](#declaring-a-trait)), and a
-trait requirement names one as it names these, which are built in:
+trait requirement names one as it names these, which `std` declares and the prelude imports
+([9.16 The std root](#916-the-std-root)):
 
 | Trait | Required by | Operands | Associated type | Function | Satisfied by |
 | --- | --- | --- | --- | --- | --- |
@@ -4258,7 +4259,7 @@ trait requirement names one as it names these, which are built in:
 | `Subtractable` | `-` | 2 | `Output` | `sub` | `Int`, `UInt` |
 | `Multipliable` | `*` | 2 | `Output` | `mul` | `Int`, `UInt` |
 | `Divisible` | `//` | 2 | `Output` | `div` | `Int`, `UInt` |
-| `Exponentiable` | `**` | 2 | `Output` | `pow` | `Int`, `UInt` |
+| `Exponentiable` | `**` | 2 | `Output` | `pow` | `Int` |
 | `Negatable` | unary `-` | 1 | `Output` | `neg` | `Int` |
 | `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
 | `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
@@ -4272,8 +4273,11 @@ of two `Int`s is an `Int`. A nominal type satisfies these traits where its modul
 instance ([Equality and order](#equality-and-order)).
 
 - **An operator calls its trait's function.** `a + b` is `summon(Addable(_, _))::add(a, b)`, and
-  `-a` is `summon(Negatable(_))::neg(a)`. The compiler's instances run the built-in operation:
-  `add` of two strings joins them.
+  `-a` is `summon(Negatable(_))::neg(a)`. `std`'s instances for base types are `@Builtin`, and run
+  the compiler's operation: `add` of two strings joins them.
+- **An operator names `std`'s trait.** A module that declares a trait of the same name, or binds
+  the name otherwise, shadows the prelude's name and leaves its operators alone: `+` requires
+  `std`'s `Addable` in every module.
 - **A comparison calls no function.** `Equatable` and `Orderable` compare values by value
   ([Equality and order](#equality-and-order)), so an instance of either defines nothing.
 - **A loop calls `Iterable`'s `elements`.** `for x in c` walks `summon(Iterable(_))::elements(c)`
@@ -4428,8 +4432,8 @@ def total(S, s: S) => Int requires a: Area(S):
 #### Declaring a trait
 
 ```ebnf
-trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ] ":"
-                NEWLINE INDENT trait_item+ DEDENT
+trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ]
+                ( ":" NEWLINE INDENT trait_item+ DEDENT | NEWLINE )
 trait_item  ::= Ident [ "<:" expression ] NEWLINE
              |  "def" ident "(" params ")" "=>" expression [ requires_clause ]
                 [ causes_clause ] NEWLINE
@@ -4459,6 +4463,8 @@ trait Scales(V, F):
     def scale_vec(f: F, v: V) => V
 ```
 
+- **A trait with no block declares nothing.** `trait Same(A, B)` associates no type and declares no
+  function, as `Equatable` does: an instance of it states only that its types satisfy it.
 - **A signature states every type.** Each parameter is annotated and the result is written. The
   operands and associated types are types in every signature. A function may declare type parameters
   of its own, as `tag` declares `R`, and a `requires` clause; each call opens the parameters at its
@@ -4495,9 +4501,9 @@ trait Scales(V, F):
   out would take, is not part of the language: every instance defines each of its trait's
   functions.
 - **A trait's names are types.** The trait's name, its operands and its associated types are
-  capitalized, and none is a type the module declares or a built-in name. A trait is declared at a
-  module's top level, and its signatures name the traits declared above it.
-- **A requirement names a declared trait as it names a built-in one.** `requires Area(S)` states
+  capitalized, and none is a type the module declares or a built-in type's name. A trait is
+  declared at a module's top level, and its signatures name the traits declared above it.
+- **A requirement names a module's trait as it names `std`'s.** `requires Area(S)` states
   that `S` has an instance of `Area`, and under `requires c: Container(C)`, `c::Elem` is the `Elem`
   of `C`'s ([Trait requirements](#trait-requirements)).
 - **[Open] — an associated type the trait defines.** `Elem = Int` in a trait, which every instance
@@ -4554,11 +4560,13 @@ instance forall (T) Area(Two(T)) requires a: Area(T):
         Two::new((a::scaled(s.extract().0, k), a::scaled(s.extract().1, k)))
 ```
 
-- **An instance is for a nominal type.** Each operand of the head is a **pattern**: a type
+- **An instance is for patterns of types.** Each operand of the head is a **pattern**: a type
   variable, a base type, or a nominal type applied to patterns in turn, as in `Two(T)`, `Two(Int)`
-  and `Duo(Two(Int), B)`. At least one operand is a nominal type, and the instance is declared in
-  its trait's module or in the module of a nominal type its head names
-  ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)).
+  and `Duo(Two(Int), B)`. The instance is declared in its trait's module or in the module of a
+  nominal type its head names
+  ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)),
+  so outside its trait's module at least one operand is a nominal type. In its trait's module the
+  operands may be any patterns, as in `instance Show(Int)`.
 - **`forall` declares the head's type variables.** `instance forall (T) Area(Two(T))` declares `T`;
   a capitalized name in the head that names no type and is not declared is an error. A type variable
   stands for any type, one type wherever the head names it, appears in an operand, and is a type
@@ -4576,7 +4584,7 @@ instance forall (T) Area(Two(T)) requires a: Area(T):
   trait not declared before it, is shallower: both comparisons are strict.
   `instance forall (T) Area(Two(T)) requires Area(T)` is accepted, and `requires Area(Two(T))` is an
   error. A variable may stand in a condition more often than in the head, as `T` does in
-  `instance forall (T) Same(Two(T)) requires Equatable(T, T)`. The compiler's traits are declared
+  `instance forall (T) Same(Two(T)) requires Equatable(T, T)`. `std`'s traits are declared
   before a module's, a module's traits in the order it writes them, and an imported module's
   before the importing module's; traits of two modules neither of which imports the other are not
   ordered. A chain of conditions therefore either names an earlier trait or a shallower type at
@@ -4706,9 +4714,9 @@ belongs to the whole program.
 - **An instance is declared in its trait's module or in the module of a nominal type its head
   names.** A module that can name the trait and the type imports the module declaring the
   instance, directly, through other imports, or through the prelude
-  ([9.16 The std root](#916-the-std-root)). The compiler's traits belong to no module, so a module
-  declares an instance of a compiler trait only for a type it declares. `Option` belongs to
-  `std`, so a module declares an instance for `Option` only of a trait it declares.
+  ([9.16 The std root](#916-the-std-root)). The traits operators require and `Option` belong to
+  `std`, so another module declares an instance of one of those traits only for a type it
+  declares, and an instance for `Option` only of a trait it declares.
 - **Outside its trait's module, no operand of an instance's head is a type variable.**
   `instance forall (T) shapes::Area(Two(T))` may stand in `Two`'s module, and
   `instance forall (F) Scales(Vec2, F)` only in `Scales`'s. Two modules that do not import each
@@ -6442,7 +6450,7 @@ modules are CHL source the compiler embeds (`stdlib/src/`). A diagnostic in one 
 
 | Module | Holds |
 | -- | -- |
-| `std` | `Option`, its methods `is_none`, `value` and `unwrap_or`, and its instance of `Equatable` |
+| `std` | `Option`, its methods `is_none`, `value` and `unwrap_or`, and the traits operators, loops and aggregates require ([Trait requirements](#trait-requirements)), with their instances for base types |
 
 **The prelude** is a list of `import` statements of std modules (`stdlib/prelude.cambra`). Every
 module outside the std root reaches each of their `use` items by its name, without an import, and
@@ -6452,9 +6460,35 @@ names nothing until a module imports it.
 - **A module's own name shadows a prelude name.** A member, a parameter, an import name, a run name
   or a `use` name spelled like a prelude name is the module's, in place of the prelude's, so adding
   a prelude name changes no module that already binds it. Where some module of a program declares
-  a type a prelude name names, a diagnostic writes `std`'s type by its path, `std::Option`.
+  a type or a trait a prelude name names, a diagnostic writes `std`'s declaration by its path:
+  `std::Option`, `std::Addable`.
 - **A std module reaches no prelude.** It imports each std module whose members it names.
-- **The prelude holds `Option`.**
+- **The prelude holds `Option`** and every trait of [Trait requirements](#trait-requirements).
+
+**`@Builtin` marks a declaration whose behaviour the compiler supplies.** Only a std module
+declares one, and its declaration states its type. A `@Builtin def` stands in any std module,
+and every other `@Builtin` declaration only in `std`:
+
+- **A `@Builtin` trait** holds of types beyond its instances: `Equatable` of a product whose
+  components are `Equatable`, `Orderable` of a tuple whose components are `Orderable`, and
+  `Iterable` of every structural collection, as its own `Elements`.
+- **A `@Builtin` instance** is for base types, and runs a primitive for each function its trait
+  declares: `@Builtin instance Addable(String, String)` concatenates. Its block defines the
+  trait's associated types and no function. An instance of a trait that declares no function
+  supplies nothing, so it is never `@Builtin`: `std` writes `instance Equatable(Int, Int)`.
+
+```python
+@Builtin
+pub trait Equatable(A, B)
+
+pub trait Addable(A, B):
+    Output
+    def add(a: A, b: B) => Output
+
+@Builtin
+instance Addable(Int, Int):
+    Output = Int
+```
 
 `Option` is a `type` that `std` declares
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). The operations
@@ -6476,9 +6510,8 @@ the bare name `http_serve` is gone. Its address arguments are constants
 **[Planned]** — the builtins in the prelude: `sum`, `max`, `groupby`, `stdin`, `box`, `begin`, and
 the rest stay unqualified in every module as prelude names of std modules.
 
-**`@Builtin` marks a declaration whose behaviour the compiler supplies.** Only a std module
-declares one, and its declaration states its type. A `@Builtin def` is a signature with no `:` and
-no block, and its clauses are exact, as a written function type's are
+**A `@Builtin def`** is a signature with no `:` and no block, and its clauses are exact, as a
+written function type's are
 ([Writing requirements and effects](#writing-requirements-and-effects)). The compiler supplies the
 value of each call, and finds the function by its path. `std::time` declares its clock this way,
 and its `now` wraps the reading in an `Instant`:
