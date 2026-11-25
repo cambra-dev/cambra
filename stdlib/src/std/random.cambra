@@ -12,8 +12,8 @@
 #         t = random::next()
 #         tokens << (request=r, token=t)
 #
-# Status: [Decided] (docs/chl-spec.md, "Inputs from outside the program"). The std root it belongs
-# to is [Planned] (docs/chl-spec.md, "9.16 The std root").
+# Status: [Decided] (docs/chl-spec.md, "Inputs from outside the program"). Embedding it in the
+# std root is [Planned] (docs/chl-spec.md, "9.16 The std root").
 
 # Returns a random `Int`: a reading, whose value the compiler supplies (docs/chl-spec.md, "9.16 The
 # std root").

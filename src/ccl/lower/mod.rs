@@ -83,7 +83,7 @@ use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::Arc,
 };
@@ -479,6 +479,10 @@ pub(super) struct TypeParamScope {
 /// register each entry with the appropriate downstream contexts.
 #[derive(Default)]
 pub struct LoweringContext {
+    /// The names the prelude binds that some module of the program declares itself
+    /// ([`crate::ccl::load::LoadedProgram::prelude_names_declared`]): `std`'s declaration of
+    /// one is written by its path in diagnostics ([`NominalDecl::prelude_shadowed`]).
+    pub(crate) prelude_names_declared: std::collections::BTreeSet<SmolStr>,
     /// Names each feed's and each call's place ([`crate::ccl::site`]).
     pub(crate) places: crate::ccl::site::Naming,
     /// All sources for this compilation: pre-registered (e.g. stdin, test sources)
@@ -688,12 +692,10 @@ pub struct LoweringContext {
     /// (`docs/chl-spec.md`, "Effects in traits").
     pub(super) in_signature: Option<String>,
 
-    /// The members of compiler-provided declarations the module names, by binding name: the
-    /// ones a qualified reference names, and the candidates of a method call of their name
-    /// (`src/ccl/design/nominal-types.md`, "The compiler-provided `Option`").
-    /// `nominal::bind_constructors` binds only these, so a module that names no member of
-    /// `Option` lowers as it would without it.
-    pub(super) builtin_members_used: BTreeMap<String, (Rc<NominalDecl>, SmolStr)>,
+    /// `std`'s `Option`, once that module has lowered: the type a checked lookup
+    /// `c[k]` answers, which [`exprs::lower_subscript`] stamps on the lookup it builds
+    /// (`docs/chl-spec.md`, "9.16 The std root").
+    pub(super) std_option: Option<Rc<NominalDecl>>,
 
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
@@ -1372,7 +1374,7 @@ impl LoweringContext {
             .map(|alias| &alias.ty)
     }
 
-    /// The nominal type `name` names: one the module declares, or a compiler-provided one.
+    /// The nominal type `name` names: one the module declares, or one a `use` name reaches.
     pub(super) fn nominal_type(&self, name: &str) -> Option<Rc<NominalDecl>> {
         self.nominal_types
             .iter()
@@ -1383,7 +1385,6 @@ impl LoweringContext {
                     .get(name)
                     .map(|(found, _)| Rc::clone(&found.decl))
             })
-            .or_else(|| crate::ccl::nominal::builtin(name))
     }
 
     /// The type parameters and family parameters in scope now, for [`Self::end_type_params`].
@@ -2232,9 +2233,15 @@ pub(crate) mod test_helpers {
         )))
     }
 
-    /// Lower the CHL type expression `code`, a polymorphic type included.
+    /// Lower the CHL type expression `code`, a polymorphic type included, where a module the
+    /// prelude reaches names it, so `Option(Int)` lowers.
     pub(crate) fn lower_type(code: &str) -> Type {
-        super::stmts::lower_type_expr_or_poly(&parse_expr(code), &mut LoweringContext::default())
+        let mut ctx = LoweringContext::default();
+        let program = crate::ccl::load::LoadedProgram::test("1");
+        super::modules::lower_program(&program, &mut ctx)
+            .into_result()
+            .expect("a program of one literal lowers");
+        super::stmts::lower_type_expr_or_poly(&parse_expr(code), &mut ctx)
             .unwrap_or_else(|e| panic!("`{code}` lowers as a type: {e:?}"))
     }
 
@@ -2350,18 +2357,26 @@ mod tests {
         }
     }
 
-    /// A module binds only the members of the compiler-provided `Option` it names
-    /// (`src/ccl/design/nominal-types.md`, "The compiler-provided `Option`"), so one that names
-    /// none lowers as it would without the declaration.
+    /// A program holds only the members of `std` it reads
+    /// (`src/ccl/design/nominal-types.md`, "`Option` in `std`"), so one that names
+    /// none lowers as it would without the prelude. The functions of one `impl` block bind
+    /// together, so reading `is_none` holds `value` too.
     #[test]
-    fn a_module_binds_only_the_option_members_it_names() {
-        fn option_bindings(e: &crate::ccl::Expr, out: &mut Vec<String>) {
-            if let super::TypedExprNode::Let { binding, .. } = &e.node
-                && binding.name.base().starts_with("Option::")
-            {
-                out.push(binding.name.base().to_string());
+    fn a_program_links_only_the_option_members_it_reads() {
+        fn imported_bindings(e: &crate::ccl::Expr, out: &mut Vec<String>) {
+            let binders: Vec<&crate::ccl::Name> = match &e.node {
+                super::TypedExprNode::Let { binding, .. } => vec![&binding.name],
+                super::TypedExprNode::DefGroup { bindings, .. } => {
+                    bindings.iter().map(|(binding, _)| &binding.name).collect()
+                }
+                _ => Vec::new(),
+            };
+            for name in binders {
+                if matches!(name.home(), Some(crate::ccl::Home::Import(_))) {
+                    out.push(name.base().to_string());
+                }
             }
-            e.fold_children((), |(), c| option_bindings(c, out));
+            e.fold_children((), |(), c| imported_bindings(c, out));
         }
         for (code, bound) in [
             (
@@ -2375,16 +2390,17 @@ mod tests {
                 indoc::indoc! {r#"
                     m = map([(1, 10)])
                     m[1].is_none()"#},
-                &["Option::is_none"][..],
+                &["Option::is_none", "Option::value"][..],
             ),
         ] {
-            let module = super::test_helpers::parse_module(code);
-            let lowered = super::lower_stmts(&module, &mut super::LoweringContext::default())
-                .into_result()
-                .unwrap_or_else(|e| panic!("`{code}` lowers: {e:?}"));
+            let program = crate::ccl::load::LoadedProgram::test(code);
+            let lowered =
+                super::modules::lower_program(&program, &mut super::LoweringContext::default())
+                    .into_result()
+                    .unwrap_or_else(|e| panic!("`{code}` lowers: {e:?}"));
             let mut found = Vec::new();
-            option_bindings(&lowered, &mut found);
-            assert_eq!(found, bound, "the `Option` members `{code}` binds");
+            imported_bindings(&lowered, &mut found);
+            assert_eq!(found, bound, "the `std` members `{code}` links");
         }
     }
 }

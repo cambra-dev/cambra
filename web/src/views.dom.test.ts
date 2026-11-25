@@ -159,10 +159,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
     // must draw `1` strongly and the rest of the wider span lightly, not the
     // whole of `1, 2` strongly.
     const snap = structuredClone(listMin) as Snapshot;
-    const widened = snap.panes.find((p) => p.id === "post-channelize")!;
-    const twin = (widened as { nodes: { nodeId: number; spans: unknown[] }[] }).nodes.find(
-      (n) => n.nodeId === 1,
-    )!;
+    const twin = theNode(irPaneById(snap, "post-channelize"), "Lit(Int(1))");
     twin.spans = [{ file: 0, start: 1, end: 5 }];
 
     const root = document.createElement("div");

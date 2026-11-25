@@ -154,7 +154,6 @@ impl LoweringContext {
         self.used_nominal.clear();
         self.nominal_types.clear();
         self.associated_functions.clear();
-        self.builtin_members_used.clear();
         self.history_param_fns.clear();
         self.declared_sinks.clear();
         self.parameters.clear();
@@ -1050,13 +1049,25 @@ pub(super) fn member_path(
 }
 
 /// The import name `stmt` binds, if it is an `import` whose path the parser
-/// accepted.
-pub(super) fn import_name(stmt: &Spanned<ChlStmt>) -> Option<SmolStr> {
+/// accepted. A prelude import binds a name no module can spell ([`prelude_qualifier`]).
+pub(super) fn import_name(program: &LoadedProgram, stmt: &Spanned<ChlStmt>) -> Option<SmolStr> {
     let ChlStmt::Import { path, alias, .. } = &stmt.node else {
         return None;
     };
     let module = path.to_path()?;
-    Some(bound_name(&module, alias.as_ref()))
+    Some(if program.in_prelude(stmt.span) {
+        prelude_qualifier(&module)
+    } else {
+        bound_name(&module, alias.as_ref())
+    })
+}
+
+/// The name a prelude import binds its module under, `<prelude>::std` for `std`. A module
+/// spells a qualifier with one identifier, so no module names it, and the module's own names,
+/// an `import std` included, are free to take the module's (`docs/chl-spec.md`, "9.16 The std
+/// root").
+pub(super) fn prelude_qualifier(module: &ModulePath) -> SmolStr {
+    SmolStr::from(format!("<prelude>::{module}"))
 }
 
 /// One error per argument in `args`, of a `run` or an `import` of `module`,
@@ -1112,7 +1123,7 @@ pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) 
 /// is an import name, a run name, another `use` name, a builtin's, or a
 /// built-in type's.
 pub(super) fn module_scope(
-    module: &ChlModule,
+    file: FileId,
     labels: Option<ModulePath>,
     program: &LoadedProgram,
     interfaces: &HashMap<Span, Option<Rc<Interface>>>,
@@ -1120,18 +1131,23 @@ pub(super) fn module_scope(
     ctx: &LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> ModuleScope {
+    let module = program
+        .ast(file)
+        .expect("a module whose scope is built has a tree");
+    let prelude = program.prelude_for(file);
     let mut qualifiers: HashMap<SmolStr, Qualifier> = HashMap::new();
     let mut use_items = Vec::new();
-    for stmt in &module.body {
+    let mut prelude_items = Vec::new();
+    for stmt in prelude.iter().chain(&module.body) {
         let (name, qualifier, uses) = match &stmt.node {
-            ChlStmt::Import {
-                path, alias, uses, ..
-            } => {
+            ChlStmt::Import { path, uses, .. } => {
                 // A segment the parser refused names no module.
                 let Some(module) = path.to_path() else {
                     continue;
                 };
-                let name = bound_name(&module, alias.as_ref());
+                let Some(name) = import_name(program, stmt) else {
+                    continue;
+                };
                 let file = program.file_of(&module);
                 let interface = interfaces.get(&stmt.span).cloned().flatten();
                 let qualifier = Qualifier {
@@ -1200,13 +1216,41 @@ pub(super) fn module_scope(
             continue;
         }
         let run = (qualifier.kind == QualifierKind::Run).then(|| name.clone());
-        use_items.extend(uses.iter().map(|item| (name.clone(), run.clone(), item)));
+        let items = uses.iter().map(|item| (name.clone(), run.clone(), item));
+        if program.in_prelude(stmt.span) {
+            prelude_items.extend(items);
+        } else {
+            use_items.extend(items);
+        }
         qualifiers.insert(name, qualifier);
     }
 
+    // A prelude name the module binds itself, by a member, a parameter, an import, a run or a
+    // `use` item, is the module's: the prelude's `use` item binds nothing there.
+    let declared: HashSet<SmolStr> = top_level_bindings(&module.body)
+        .into_iter()
+        .chain(top_level_aliases(&module.body))
+        .chain(top_level_nominal_types(&module.body))
+        .chain(top_level_traits(&module.body))
+        .map(|binding| binding.name)
+        .chain(module.body.iter().filter_map(|stmt| match &stmt.node {
+            ChlStmt::Param { name, .. } => Some(name.node.clone()),
+            _ => None,
+        }))
+        .collect();
+    let own_names: HashSet<SmolStr> = use_items
+        .iter()
+        .map(|(_, _, item)| item.alias.as_ref().unwrap_or(&item.name).node.clone())
+        .chain(qualifiers.keys().cloned())
+        .collect();
+    prelude_items.retain(|(_, _, item)| {
+        let bound = &item.alias.as_ref().unwrap_or(&item.name).node;
+        !declared.contains(bound) && !own_names.contains(bound)
+    });
+
     let mut uses: HashMap<SmolStr, Use> = HashMap::new();
     let mut module_uses: HashMap<SmolStr, Qualifier> = HashMap::new();
-    for (qualifier_name, run, item) in use_items {
+    for (qualifier_name, run, item) in use_items.into_iter().chain(prelude_items) {
         let bound = item.alias.as_ref().unwrap_or(&item.name);
         let qualifier = &qualifiers[&qualifier_name];
         // A member bound to a module makes its `use` name a name of that module.

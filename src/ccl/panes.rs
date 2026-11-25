@@ -1046,9 +1046,12 @@ mod tests {
     fn every_resolved_name_spans_its_spelling() {
         let mut wrong = Vec::new();
         for (program_name, code) in corpus() {
-            let program = compile_ok(&code);
+            let loaded = LoadedProgram::test(spelled(&code));
+            let mut ctx = GlobalContext::default();
+            let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+                .unwrap_or_else(|errors| panic!("expected a successful compile, got {errors:?}"));
             for row in &program.resolved_names {
-                let at = |s: Span| &code[s.start..s.end];
+                let at = |s: Span| &loaded.sources().text(s.file)[s.start..s.end];
                 if at(row.use_span) != row.name {
                     wrong.push(format!(
                         "{program_name}: use of `{}` at {:?}",
@@ -1185,7 +1188,11 @@ mod tests {
         let root_file = sources.root();
         let shop_file = sources
             .files()
-            .find(|&file| file != root_file)
+            .find(|&file| {
+                sources
+                    .module(file)
+                    .is_some_and(|module| module.segments() == ["shop"])
+            })
             .expect("the program loads `shop`");
         let rows: Vec<(usize, &str, Span)> = program
             .resolved_names
