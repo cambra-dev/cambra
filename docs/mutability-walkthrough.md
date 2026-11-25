@@ -829,10 +829,11 @@ An induction position is decided by the frontier. A transaction's is not — a c
 *moves* the frontier — so the driver cannot tell from the store alone whether its item
 finished. The item cursor advances on the **commit-ack**, delivered as a release.
 
-A release from the body alone would be wrong, and measurably so: a body releases a row the
-moment it has *consumed* it, long before the attempt commits, which would advance the driver
-past an item still in flight. So `TransactDriver` sits behind a `FanOut` with two slots —
-the body and the writer — and advances on their **intersection**: consumed *and* finished.
+A release from the body alone would be wrong: a body that fans its input through a `Memo`
+releases a row as soon as it has consumed it, before the attempt commits, which would advance
+the driver past an item still in flight. So `TransactDriver` sits behind a `FanOut` with two
+slots — the body and the writer — and advances on their **intersection**: consumed *and*
+finished.
 
 The same cycle as before, with one extra edge — again with arrows as tiles flowing:
 
