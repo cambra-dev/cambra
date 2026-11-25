@@ -851,6 +851,7 @@ fn run_targets(
             if !dispatcher.takes_arrivals(pipeline) {
                 dispatcher.take_arrivals(PipelineId(pipeline));
             }
+            // Registered in pipeline order for lookup from a finished dependency's readers.
             execution.closes_on_reads.push(PipelineId(pipeline));
         }
     }
@@ -1540,7 +1541,15 @@ impl Execution {
             Handler::Root | Handler::Body(_) => {
                 self.queue_scope_requests(dispatcher);
                 finish_with(dispatcher, reach, pipeline);
-                self.close_scopes_reading(dispatcher);
+                for &reader in &dispatcher.infos[pipeline.0].readers {
+                    if self
+                        .closes_on_reads
+                        .binary_search_by_key(&reader, |id| id.0)
+                        .is_ok()
+                    {
+                        self.close_after_reads(dispatcher, PipelineId(reader));
+                    }
+                }
             }
         }
         self.hold_followers(dispatcher);
@@ -1594,21 +1603,23 @@ impl Execution {
     /// anything.
     fn close_scopes_reading(&self, dispatcher: &Dispatcher) -> bool {
         let mut progressed = false;
-        for &PipelineId(pipeline) in &self.closes_on_reads {
-            let Handler::Request(scope) = &self.handlers[pipeline] else {
-                unreachable!("a pipeline that closes on its reads is a scope's");
-            };
-            if !dispatcher.infos[pipeline]
-                .reads
-                .iter()
-                .all(|&read| dispatcher.states[read].phase.load() == Phase::Finished)
-            {
-                continue;
-            }
-            scope.with_body(|body| body.close_offers());
-            progressed |= scope.queue_requests(dispatcher);
+        for &scope in &self.closes_on_reads {
+            progressed |= self.close_after_reads(dispatcher, scope);
         }
         progressed
+    }
+
+    fn close_after_reads(&self, dispatcher: &Dispatcher, id: PipelineId) -> bool {
+        if !dispatcher.infos[id.0]
+            .reads
+            .iter()
+            .all(|&read| dispatcher.states[read].phase.load() == Phase::Finished)
+        {
+            return false;
+        }
+        let scope = self.request_scope(id);
+        scope.with_body(|body| body.close_offers());
+        scope.queue_requests(dispatcher)
     }
 
     /// Close the scope's pipeline `pipeline` once its scope has queued every request offered to
