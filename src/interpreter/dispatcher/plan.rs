@@ -1058,6 +1058,9 @@ pub(super) enum Scope {
     Writer {
         store: StoreCell,
         writer: usize,
+        // shared-state-ok: the writer's attempt lifecycle. Only the coordinator reads or advances
+        // it, through `Execution::consume` and `Execution::finish`. It holds a work package and a
+        // guard of the writer's input, never a tile.
         phase: RefCell<WriterPhase>,
     },
 }

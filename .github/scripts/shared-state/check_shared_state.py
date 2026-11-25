@@ -156,6 +156,9 @@ EXPECTED_EXCEPTIONS = [
     # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
     # what it is handed; nothing reads it back into the graph. See `Collected`.
     ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),
+    # A transaction writer scope's attempt lifecycle. Only the coordinator reads or advances it,
+    # and it holds a work package and a guard of the writer's input, never a tile.
+    ("src/interpreter/dispatcher/plan.rs", "cell of `WriterPhase`"),
     # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
     # not see.
