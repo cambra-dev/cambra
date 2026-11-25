@@ -65,6 +65,7 @@ use std::{
     cell::RefCell,
     io::Write,
     panic::{self, AssertUnwindSafe},
+    path::Path,
     process::Stdio,
     rc::Rc,
 };
@@ -98,7 +99,18 @@ use super::panic_message::panic_message;
 /// - Joins (Record-domain functions): `Function [ r0, r1, … ]`, sorted by
 ///   the codomain record's natural order (alphabetical fields).
 pub fn expect_scalar(source: &str, expected: &str) {
-    let tile = run_to_tile(source);
+    expect_loaded_scalar(&LoadedProgram::test(source), expected);
+}
+
+/// As [`expect_scalar`], for the program whose root file is `root`, with the modules it names
+/// loaded from beside it.
+pub fn expect_scalar_file(root: &Path, expected: &str) {
+    let loaded = LoadedProgram::read(root).unwrap_or_else(|e| panic!("{e}"));
+    expect_loaded_scalar(&loaded, expected);
+}
+
+fn expect_loaded_scalar(loaded: &LoadedProgram, expected: &str) {
+    let tile = run_loaded_to_tile(loaded);
     let actual = tile_to_canonical(tile);
     assert_eq!(
         actual.trim(),
@@ -203,9 +215,13 @@ pub fn expect_scalar_currently_buggy(source: &str, current_buggy_output: &str) {
 pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_substrings: &[&str]) {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let program_path = format!("{manifest}/tests/programs/{program_name}/program.cambra");
+    expect_stdin_file(Path::new(&program_path), stdin_input, expected_substrings);
+}
 
+/// As [`expect_stdin_program`], for the program at `program_path`.
+pub fn expect_stdin_file(program_path: &Path, stdin_input: &str, expected_substrings: &[&str]) {
     let mut child = crate::it::cli::command()
-        .arg(&program_path)
+        .arg(program_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -252,14 +268,17 @@ pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_subs
 /// `main`-output [`Tile`].  Panics if the program has no `main` output
 /// (e.g. a sink-only program — those use [`compile_sink`] instead).
 pub(crate) fn run_to_tile(source: &str) -> Tile {
+    run_loaded_to_tile(&LoadedProgram::test(source))
+}
+
+fn run_loaded_to_tile(loaded: &LoadedProgram) -> Tile {
     let mut ctx = GlobalContext::default();
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let loaded = LoadedProgram::test(source);
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut compiled = compile_program(&mut ctx, loaded, consumer).unwrap_or_render(loaded);
     ctx.scheduler().check_for_notifications();
     assert!(
         *notified.borrow(),

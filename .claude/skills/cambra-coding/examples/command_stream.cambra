@@ -1,0 +1,30 @@
+# A counter driven by commands on standard input: a live source and an ordered loop.
+#
+# printf 'inc\ninc\n\nreset\ninc\ndec\ninc\ninc\n' | cambra command_stream.cambra
+# Result: 2
+
+# `stdin()` is a live source: one element per line, without its newline. A comprehension over a
+# live source streams, producing each element as its line arrives.
+commands = [c for c in stdin() if c != ""]
+
+# Writing `total`, declared outside the loop, makes this an ordered loop: its iterations run one at
+# a time in the source's position order, which for a source is arrival order. That order is why
+# `reset` lands between the second and third `inc`. A loop that writes no outer mutable variable is
+# unordered: its iterations may run in any order, including in parallel.
+#
+# Strings support `==` and `+` and nothing else. There is no formatting, indexing, splitting, or
+# conversion between `String` and `Int`.
+total := 0
+for c in commands:
+    if c == "inc":
+        total += 1
+    elif c == "dec":
+        total -= 1
+    elif c == "reset":
+        total := 0
+
+# After the loop, a bare `total` is its final value. Over a live source that value exists once the
+# source ends, so this program answers when standard input closes. Every aggregate over a live
+# source (`sum`, `max`, a lookup that must decide absence) waits the same way. A program that must
+# answer per input replies inside the loop instead, as an HTTP handler does.
+total
