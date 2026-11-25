@@ -8,7 +8,7 @@ use bit_set::BitSet;
 
 use super::curry_level::CurryLevel;
 use crate::{
-    ccl::AggregateKind,
+    ccl::{AggregateKind, TagMap},
     interpreter::{
         ColumnValue, Extent, FunctionGuard, Predicate, Tile, TileGuard, transform_hashmap_values,
         tuple_field,
@@ -24,6 +24,9 @@ pub enum Tiling {
     Scalar(Extent),
     /// A record of tilings.
     Record(HashMap<SmolStr, Tiling>),
+    /// A variant whose payload holds a collection: one tiling per tag, each over the rows
+    /// carrying it — the static shape of a [`Tile::Union`].
+    Union(TagMap<Tiling>),
     /// A collection level: the static shape of a
     /// [`Tile::DataFunction`](crate::interpreter::tiling::Tile).
     DataFunction {
@@ -58,7 +61,8 @@ pub enum Tiling {
 
 impl Tiling {
     /// The tiling a value of `extent` takes: a collection as a `DataFunction`, a record
-    /// holding one as a record of its fields' tilings, and anything else as a `Scalar` column,
+    /// holding one as a record of its fields' tilings, a variant holding one as a union of its
+    /// arms' tilings, and anything else as a `Scalar` column,
     /// which is what a consumer reading one row at a time reads. The inverse of
     /// [`Self::extent`] for these shapes.
     ///
@@ -74,6 +78,9 @@ impl Tiling {
                     .map(|(name, e)| (name.clone(), Tiling::from_extent(e)))
                     .collect(),
             ),
+            Extent::Union(arms) if extent.holds_a_collection() => {
+                Tiling::Union(arms.map(|_, e| Tiling::from_extent(e)))
+            }
             _ => Tiling::Scalar(extent.clone()),
         }
     }
@@ -82,6 +89,7 @@ impl Tiling {
         match self {
             Tiling::Scalar(e) => e.clone(),
             Tiling::Record(m) => Extent::Record(transform_hashmap_values(m, Tiling::extent)),
+            Tiling::Union(arms) => Extent::Union(arms.map(|_, t| t.extent())),
             Tiling::Store { domain, codomain } => Extent::Function {
                 domain: Box::new(domain.clone()),
                 codomain: Box::new(codomain.extent()),
@@ -109,6 +117,7 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.universal_guard()))
             }
+            Tiling::Union(arms) => TileGuard::Union(arms.map(|_, t| t.universal_guard())),
             Tiling::DataFunction { .. } | Tiling::Store { .. } => {
                 TileGuard::Function(FunctionGuard::Domain(Predicate::True))
             }
@@ -122,6 +131,7 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
+            Tiling::Union(arms) => TileGuard::Union(arms.map(|_, t| t.empty_guard())),
             Tiling::DataFunction { .. } | Tiling::Store { .. } => {
                 TileGuard::Function(FunctionGuard::Domain(Predicate::False))
             }
@@ -213,6 +223,11 @@ impl Tiling {
             Tiling::Record(m) => {
                 Tile::record(transform_hashmap_values(m, |t| t.empty_at_rows(rows)))
             }
+            // Nothing has arrived, so no row carries a tag yet.
+            Tiling::Union(arms) => Tile::Union(arms.map(|_, t| crate::interpreter::UnionArmTile {
+                rows: Vec::new(),
+                tile: t.empty_at_rows(0),
+            })),
             Tiling::DataFunction { domain, codomain } => Tile::grouped(
                 vec![0; rows],
                 ColumnValue::from_values(Vec::new(), domain),
@@ -286,6 +301,7 @@ impl Tiling {
         match self {
             Tiling::DataFunction { .. } => true,
             Tiling::Record(fields) => fields.values().any(Tiling::holds_a_level),
+            Tiling::Union(arms) => arms.values().any(Tiling::holds_a_level),
             Tiling::Scalar(_) | Tiling::Aggregation { .. } | Tiling::Store { .. } => false,
         }
     }
@@ -383,6 +399,14 @@ impl fmt::Display for Tiling {
         match self {
             Tiling::Scalar(e) => write!(f, "{e:?}"),
             Tiling::Record(fields) => fmt_record(f, fields),
+            Tiling::Union(arms) => {
+                write!(f, "{{")?;
+                for (i, (tag, arm)) in arms.iter().enumerate() {
+                    let sep = if i == 0 { "" } else { " | " };
+                    write!(f, "{sep}`{tag}{{{arm}}}")?;
+                }
+                write!(f, "}}")
+            }
             Tiling::Store { domain, codomain } => write!(f, "Store({domain:?} → {codomain})"),
             // One `→` per level rather than a nested `Fn(…)` each, which is how a curried
             // function reads.
