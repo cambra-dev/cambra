@@ -931,7 +931,7 @@ fn consume_store<S: SteppedStore>(
         let progressed = changed || store.input_released_in_state(state, input) != released;
         // A position its input has not decided yet stops the steps: the package's rest stays
         // unreleased, and the scope keeps it waiting for inputs until a push brings what decides
-        // it (`Offered::waiting`).
+        // it (`Offered::retry`).
         if !progressed {
             return;
         }

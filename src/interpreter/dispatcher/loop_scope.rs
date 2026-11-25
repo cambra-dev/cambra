@@ -474,14 +474,25 @@ impl Body {
         // The pipeline stays open while a request is queued or running, which may leave positions
         // waiting for inputs, and while any wait: what an input brings queues the request that
         // runs them.
-        let closing = offered.closing
-            && offered.region.is_none()
-            && dispatcher.outstanding(pipeline) == 0
-            && offered.waiting.is_none();
-        if !ready || (offered.region.is_none() && !closing) {
+        if !ready {
             return false;
         }
-        let region = offered.region.take();
+        let idle = dispatcher.outstanding(pipeline) == 0;
+        let closing =
+            offered.closing && idle && offered.region.is_none() && offered.retry.is_none();
+        let mut region = offered.region.take();
+        // An ordinary request already queued on this ordered pipeline takes the retry when it
+        // begins. Enqueueing a separate package behind it would revisit the same positions twice.
+        if idle && let Some(retry) = offered.ready_retry() {
+            region = Some(match region {
+                Some(fresh) => fresh.union(&retry.guard),
+                None => retry.guard.clone(),
+            });
+            retry.phase = RetryPhase::Queued;
+        }
+        if region.is_none() && !closing {
+            return false;
+        }
         offered.closing &= !closing;
         offered.closed |= closing;
         drop(offered);
@@ -497,7 +508,12 @@ impl Body {
     /// Whether anything offered is not queued yet.
     pub(super) fn has_offers(&self) -> bool {
         let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.region.is_some() || offered.closing
+        offered.region.is_some()
+            || offered
+                .retry
+                .as_ref()
+                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
+            || offered.closing
     }
 
     /// Clear every inner pipeline's entries.
@@ -525,15 +541,17 @@ impl Body {
     }
 
     /// The positions that waited for inputs when a request begins, which it runs
-    /// ([`Offered::take_waited`]).
+    /// in addition to the fresh positions named by its package.
     pub(super) fn take_waited(&self) -> Option<TileGuard> {
         self.offers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take_waited()
+            .retry
+            .take()
+            .map(|retry| retry.guard)
     }
 
-    /// Set the positions waiting for inputs (`Offered::waiting`): the first push that reaches one
+    /// Set the positions waiting for inputs (`Offered::retry`): the first push that reaches one
     /// of the scope's entries and no pipeline there takes them and offers them again
     /// (`Entry::wake`), so `entry`, the placement of an entry the body does not place, is marked
     /// the scope's too. A push that woke the scope while nothing waited ([`Offered::woken`]) may
@@ -543,13 +561,14 @@ impl Body {
             entry.set_scope(Some(self.offers.clone()));
         }
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        // A push that took positions while a request ran took ones that request covered: what it
-        // left undecided is `waiting` now.
-        offered.offered_waiting = None;
-        offered.waiting = waiting;
-        if offered.waiting.is_some() && std::mem::take(&mut offered.woken) {
-            offered.offer_waiting();
-        }
+        offered.retry = waiting.map(|guard| Retry {
+            guard,
+            phase: if std::mem::take(&mut offered.woken) {
+                RetryPhase::Ready
+            } else {
+                RetryPhase::Parked
+            },
+        });
     }
 }
 
@@ -1164,7 +1183,7 @@ impl InductionStoreProducer {
 
     /// Step the store after the round's body and held pushes have settled. The store steps the
     /// positions of the round its input has decided; positions not decided yet stay unreleased,
-    /// and the scope keeps them waiting for inputs (`Offered::waiting`).
+    /// and the scope keeps them waiting for inputs (`Offered::retry`).
     fn step_round(&mut self, guard: &TileGuard) {
         self.consume_impl(InputId::ONLY, guard.clone());
     }
@@ -1255,9 +1274,64 @@ mod tests {
         entry.wake(&Projection::Everything);
         assert!(!body.queue_offered(&compiled.dispatcher, true));
         assert_eq!(compiled.dispatcher.outstanding(PipelineId(0)), 1);
+        let request = compiled
+            .dispatcher
+            .claim_of(PipelineId(0))
+            .expect("one retry");
+        assert_eq!(request.guard, waiting);
         assert_eq!(body.take_waited(), Some(waiting.clone()));
         body.set_waiting(Some(waiting), None);
+        compiled.dispatcher.acknowledge(request);
         assert!(body.queue_offered(&compiled.dispatcher, true));
+    }
+
+    #[test]
+    fn fresh_input_and_a_woken_retry_share_one_package() {
+        let compiled = Compiled::of(SUM);
+        let mut scope = induction(&compiled.scope);
+        let (entry, placement) = Entry::unplaced(scope.input_tiling(InputId::ONLY));
+        let body = scope.body_mut();
+        let waiting = keys_between(0, 0);
+        let fresh = keys_between(2, 2);
+        body.set_waiting(Some(waiting.clone()), Some(&placement));
+        entry.wake(&Projection::Everything);
+        body.offer(&fresh);
+        assert!(body.queue_offered(&compiled.dispatcher, true));
+        entry.wake(&Projection::Everything);
+        assert!(!body.queue_offered(&compiled.dispatcher, true));
+        let request = compiled
+            .dispatcher
+            .claim_of(PipelineId(0))
+            .expect("one request");
+        assert_eq!(request.guard, fresh.union(&waiting));
+        assert_eq!(body.take_waited(), Some(waiting));
+        assert!(body.take_waited().is_none());
+    }
+
+    #[test]
+    fn an_already_queued_ordinary_request_takes_the_woken_positions() {
+        let compiled = Compiled::of(SUM);
+        let mut scope = induction(&compiled.scope);
+        let (entry, placement) = Entry::unplaced(scope.input_tiling(InputId::ONLY));
+        let body = scope.body_mut();
+        let waiting = keys_between(0, 0);
+        let fresh = keys_between(1, 1);
+        body.set_waiting(Some(waiting.clone()), Some(&placement));
+        body.offer(&fresh);
+        assert!(body.queue_offered(&compiled.dispatcher, true));
+        entry.wake(&Projection::Everything);
+        assert!(!body.queue_offered(&compiled.dispatcher, true));
+        let request = compiled
+            .dispatcher
+            .claim_of(PipelineId(0))
+            .expect("ordinary request");
+        assert_eq!(request.guard, fresh);
+        scope.begin_package(request);
+        let active = scope.run().request.as_ref().unwrap();
+        assert!(active.waited);
+        assert_eq!(active.covers, fresh.union(&waiting));
+        assert_eq!(compiled.dispatcher.outstanding(PipelineId(0)), 1);
+        assert!(scope.body_mut().take_waited().is_none());
     }
 
     /// `total` summed over `[1, 2, 3]` and written to `out`: 6.
