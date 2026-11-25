@@ -494,7 +494,7 @@ fn respond_not_found(request: tiny_http::Request) {
 }
 
 impl DataSink for HttpServerSharedState {
-    /// Dispatch HTTP responses for all live `(UInt index, String body)` entries in `tile`.
+    /// Dispatch HTTP responses for all `(UInt index, String body)` entries in `tile`.
     ///
     /// Collects `(request, body)` pairs from the pending map while holding the
     /// lock, then releases the lock and sends each response outside of it so that
@@ -521,19 +521,19 @@ impl DataSink for HttpServerSharedState {
             return;
         };
 
+        debug_assert!(
+            deleted.is_empty(),
+            "a sink is handed only live rows (`sinks::live_rows`), so no response it is handed \
+             is marked deleted: {tile:?}"
+        );
+
         // Collect (request, body) while the lock is held.
         let to_send: Vec<_> = {
             let mut pending = self.pending.lock().unwrap();
             indices
                 .iter()
                 .zip(responses.iter())
-                .enumerate()
-                .filter_map(|(j, (idx, body))| {
-                    if deleted.contains(j) {
-                        return None;
-                    }
-                    pending.remove(idx).map(|req| (req, body.clone()))
-                })
+                .filter_map(|(idx, body)| pending.remove(idx).map(|req| (req, body.clone())))
                 .collect()
         };
 
