@@ -533,6 +533,15 @@ impl Body {
             .take_waited()
     }
 
+    /// A peer changed the transaction store. Retry any parked positions. An attempt already
+    /// in progress checks the store epoch when it settles.
+    pub(super) fn offer_waiting(&self) {
+        self.offers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .offer_waiting();
+    }
+
     /// Set the positions waiting for inputs (`Offered::waiting`): the first push that reaches one
     /// of the scope's entries and no pipeline there takes them and offers them again
     /// (`Entry::wake`), so `entry`, the placement of an entry the body does not place, is marked

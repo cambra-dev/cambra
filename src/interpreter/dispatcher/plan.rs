@@ -1011,7 +1011,7 @@ impl ScopeRuns {
             self.transactions.push(store.clone());
             producer.run = Some(transaction_scope::TransactionRun {
                 writers: Vec::new(),
-                stalls: Default::default(),
+                progress: 0,
             });
         }
         let writers = &mut producer.run.as_mut().expect("a transaction run").writers;
@@ -3828,6 +3828,62 @@ mod tests {
             }));
         }
         assert_eq!(steps, [0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn a_parked_writer_wakes_on_peer_progress_and_an_older_attempt_retries() {
+        use crate::ccl::context::{GlobalContext, compile_program};
+        use crate::ccl::load::LoadedProgram;
+        use crate::interpreter::tile_operators::{StoreRead, test_helpers::keys_between};
+
+        let source = indoc::indoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for x in [1]:
+                with begin():
+                    pool := pool - x
+            for y in [2]:
+                with begin():
+                    pool := pool - y
+            out << await_final(pool)
+        "};
+        let mut ctx = GlobalContext::default();
+        let _sink = ctx.register_test_sink("out");
+        let _program =
+            compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
+        let operators = ctx.take_operator_map();
+        let fan = operators
+            .operators()
+            .into_iter()
+            .find(|fan| fan.cached_tile().is_some())
+            .unwrap();
+        let mut planner = Planner::default();
+        planner.store_pipeline(StoreRead {
+            fan: fan.id(),
+            store: fan.store().unwrap(),
+        });
+        let mut runs = ScopeRuns::new();
+        let mut run = transaction_scope::TransactionRun {
+            writers: (0..2)
+                .map(|i| planner.build_transaction(i, 1, &mut runs))
+                .collect(),
+            progress: 0,
+        };
+        let waiting = keys_between(0, 0);
+        assert!(
+            run.settle(0, false),
+            "writer zero can park at the current epoch"
+        );
+        run.writers[0].body.set_waiting(Some(waiting.clone()), None);
+        assert!(run.settle(1, false));
+        assert!(!run.writers[0].body.has_offers());
+        assert!(!run.settle(1, true));
+        assert!(run.writers[0].body.has_offers());
+        assert_eq!(run.writers[0].body.take_waited(), Some(waiting));
+        assert!(
+            !run.settle(0, false),
+            "an attempt queued before the progress must retry"
+        );
     }
 
     /// A record range over a source field yields a prefix where that field's yield is every

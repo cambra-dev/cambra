@@ -236,8 +236,8 @@ paused run unplaces them ([Pause and reload](#pause-and-reload)).
 
 A scope holds the positions a round or attempt could not decide as waiting for inputs
 (`Offered::waiting`). A loop's round decides nothing at a position whose body read an input that is
-not final yet, as a sum over a live source. A writer's attempt is held the same way once every
-writer has attempted without changing the store, an input's release or the decisions to retry. The
+not final yet, as a sum over a live source. A writer's attempt is held the same way once it has tried the
+current store epoch without progress. The
 request then ends with those positions unreleased, so a drained boundary holds no claim of it.
 A flat loop's request that ends before its drive's source delivers the positions it covers leaves
 its undecided positions waiting until the store is terminal
@@ -416,32 +416,13 @@ and make the store terminal (`CommitProducer::render_store`). A reclaim alone is
 changes the store without changing what a later attempt reads, because
 `CommitEngine::gc_released_prefix` keeps the versions every live position reads and the frontier
 stays. A stale outcome counts although it changes neither the store nor a release, because the
-drive's retry at the moved frontier reads differently. `Stalls` (`transaction_scope.rs`) counts
-consecutive attempts without progress across the store's writers, and the request ends once the
-count exceeds the number of writers. An attempt counts only if it was queued since the last attempt
-that progressed. The writers' attempts overlap, so an attempt queued before another writer's
-progress may have read the store and its inputs before that progress. Its outcome does not show that
-an attempt queued now would change nothing.
-
-The rule admits no unbounded run of attempts without a commit. A writer's retry reads a frontier
-at or past the commit that made its previous proposal stale, so that commit cannot make the retry
-stale. Each of a writer's stale outcomes is therefore caused by a distinct commit, and a writer has
-no more stale outcomes than the store has commits. A writer's input release grows only when the
-drive releases an item whose decision committed, the positions it decides absent on reading source
-news, or the whole source once it is exhausted (`TransactDriverProducer::advance`). A request's
-guard holds finitely many items and positions, and the whole-source release happens once. A writer's
-proposal stream turns terminal at most once. Past these, each other writer has at most one attempt
-queued before the last progress, which does not count. Every later attempt increments the stall
-count, so the request ends within twice the number of writers further attempts.
-
-A writer's finish attempt follows the same rule. While the store reports the writer's last decision
-stale (`CommitProducer::holds_stale_decision`) and the attempts have not stalled, the finish queues
-another attempt. An attempt of a writer that holds a stale decision always progresses: it reads a
-frontier past the commit that made the decision stale, so the drive emits the item again and the
-attempt decides it. The stall count after that attempt is zero, so the finish closes a writer only
-once its decision has committed, which `finish_request` asserts in a debug build. A writer whose
-store finish still finds a stale decision in flight fails the run (`CommitProducer::finish`), since
-a terminal store would drop the item.
+drive's retry at the moved frontier reads differently.
+The store advances a progress epoch each time an attempt progresses. An incomplete writer retries
+if its attempt was queued before the current epoch, since it may have read an earlier snapshot. A
+writer whose attempt observed the current epoch and changed nothing parks its unresolved positions.
+Progress by a peer reoffers those positions. External input wakes them through the normal scope
+intake. Each attempt therefore either makes progress, catches up to progress that already occurred,
+or parks. A writer's final attempt retries a stale item at the new frontier before closing its body.
 
 Completing a writer includes the finish's attempt, so its body observes source completion. Source
 pipelines then close; normal finishes drain the body graph before the request pipeline finishes. A

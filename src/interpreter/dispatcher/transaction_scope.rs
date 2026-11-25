@@ -19,56 +19,31 @@ thread_local! {
 
 pub(crate) struct TransactionRun {
     pub(super) writers: Vec<WriterRun>,
-    pub(super) stalls: Stalls,
+    /// Incremented whenever an attempt can change what another writer reads.
+    pub(super) progress: u64,
 }
 
-/// The attempts without progress across a store's writers, which end a request once they
-/// outnumber the writers ([`CommitProducer::finish_request`]). An attempt progresses as
-/// [`CommitProducer::complete_attempt`] answers.
-///
-/// An attempt counts toward a stall only if it was queued since the last attempt that progressed.
-/// Each writer has one attempt at a time, and the writers' attempts overlap. An attempt queued
-/// before another writer's progress may have run its pipelines before that progress, so it does
-/// not show that an attempt queued now would change nothing.
-#[derive(Default)]
-pub(super) struct Stalls {
-    /// How many attempts of this run have progressed.
-    progressed: u64,
-    /// How many attempts in a row changed nothing, each queued since the last progress.
-    stalled: usize,
-}
-
-impl Stalls {
-    /// The mark that an attempt queued now passes to [`complete`](Self::complete).
-    fn mark(&self) -> u64 {
-        self.progressed
-    }
-
-    /// Count an attempt queued at `mark`, and answer how many attempts in a row have stalled.
-    fn complete(&mut self, mark: u64, progressed: bool) -> usize {
-        debug_assert!(
-            mark <= self.progressed,
-            "an attempt's mark is a progress count already reached"
-        );
+impl TransactionRun {
+    /// Wake parked peers on progress. An incomplete request may park once it has tried the
+    /// current epoch. Overlapping attempts that read an older epoch get another turn.
+    pub(super) fn settle(&mut self, writer: usize, progressed: bool) -> bool {
         if progressed {
-            self.progressed += 1;
-            self.stalled = 0;
-        } else if mark == self.progressed {
-            self.stalled += 1;
+            self.progress += 1;
+            for (index, peer) in self.writers.iter().enumerate() {
+                if index != writer {
+                    peer.body.offer_waiting();
+                }
+            }
         }
-        self.stalled
-    }
-
-    /// Start counting again, once a stall has ended a request.
-    fn reset(&mut self) {
-        self.stalled = 0;
+        // An overlapping attempt may have read the old snapshot. Retry it once at the new epoch.
+        self.writers[writer].queued_at == self.progress
     }
 }
 
 pub(super) struct WriterRun {
     pub(super) body: Body,
     attempt: Attempt,
-    /// The [`Stalls::mark`] taken when the open attempt was queued.
+    /// The store's progress when the active attempt was queued.
     queued_at: u64,
 }
 
@@ -122,7 +97,7 @@ impl WriterRun {
         self.body.followers_hold(dispatcher)
     }
 
-    /// Activate the body for an attempt queued at the stall count's `mark` ([`Stalls::mark`]), and
+    /// Activate the body for an attempt queued at the store's progress epoch `mark`, and
     /// answer the attempt's work, which is queued once the store is released.
     fn queue(&mut self, dispatcher: &Dispatcher, guard: &TileGuard, mark: u64) -> RoundWork {
         self.queued_at = mark;
@@ -185,12 +160,11 @@ impl CommitProducer {
             .expect("a transaction run is planned")
             .writers[writer]
     }
-    fn stall_mark(&self) -> u64 {
+    fn progress_epoch(&self) -> u64 {
         self.run
             .as_ref()
             .expect("a transaction run is planned")
-            .stalls
-            .mark()
+            .progress
     }
     /// Queue the requests offered to writer `writer` on its pipeline, and close the pipeline once
     /// asked, where the store is open: an attempt reads the store, which exists once every seed
@@ -218,7 +192,7 @@ impl CommitProducer {
         );
         self.begin_delivery(input);
         self.begin_attempt();
-        let mark = self.stall_mark();
+        let mark = self.progress_epoch();
         let run = self.writer_run_mut(writer);
         let guard = match run.body.take_waited() {
             Some(waiting) => package.guard.union(&waiting),
@@ -234,33 +208,28 @@ impl CommitProducer {
     ) -> (Option<WorkPackage>, RoundWork) {
         let progressed = self.complete_attempt(writer);
         let transaction = self.run.as_mut().expect("a transaction run is planned");
-        let queued_at = transaction.writers[writer].queued_at;
-        let stalled = transaction.stalls.complete(queued_at, progressed);
-        let writers = transaction.writers.len();
+        let caught_up = transaction.settle(writer, progressed);
         let holds_stale = self.holds_stale_decision(writer);
-        let retry_finish = stalled <= writers && holds_stale;
         let run = self.writer_run_mut(writer);
         let guard = match std::mem::replace(&mut run.attempt, Attempt::Idle) {
             // A stale decision leaves its item in flight, so the finish attempts again while one
             // does. Such an attempt always progresses, so the finish closes no writer holding one
             // (`src/interpreter/design-dispatcher.md`, "Transaction requests and attempts").
-            Attempt::Finishing if retry_finish => {
+            Attempt::Finishing if holds_stale => {
+                assert!(
+                    !caught_up,
+                    "writer {writer}'s final retry made no progress on its stale item"
+                );
                 let whole = self
                     .input_tiling(self.writer_input(writer))
                     .universal_guard();
                 self.begin_attempt();
-                let mark = self.stall_mark();
+                let mark = self.progress_epoch();
                 let run = self.writer_run_mut(writer);
                 run.attempt = Attempt::Finishing;
                 return (None, run.queue(dispatcher, &whole, mark));
             }
             Attempt::Finishing => {
-                debug_assert!(
-                    !holds_stale,
-                    "writer {writer}'s finish closes it with no stale decision in flight: an \
-                     attempt that holds one decides its item again at a later frontier, which \
-                     progresses"
-                );
                 run.close(dispatcher);
                 return (None, RoundWork::default());
             }
@@ -284,13 +253,9 @@ impl CommitProducer {
             };
             return (Some(package), RoundWork::default());
         }
-        // An attempt reads the store and its inputs, and a writer's drive emits its item again
-        // after a stale decision. Once more consecutive attempts than the store has writers do not
-        // progress (`CommitProducer::complete_attempt`), counted across the writers and each
-        // queued since the last progress ([`Stalls`]), no further attempt differs. The request
-        // then ends with what it has not decided waiting for inputs, and what the writer pushes
-        // once an input grows is offered to its scope, which queues the next request.
-        if stalled > writers {
+        // The writer tried the current store and its body settled. The next relevant push,
+        // or progress by a peer, reoffers its undecided positions.
+        if caught_up {
             #[cfg(test)]
             STALLS.with(|stalls| stalls.set(stalls.get() + 1));
             let input = self.writer_input(writer);
@@ -308,15 +273,10 @@ impl CommitProducer {
             else {
                 unreachable!("matched a request above")
             };
-            self.run
-                .as_mut()
-                .expect("a transaction run is planned")
-                .stalls
-                .reset();
             return (Some(package), RoundWork::default());
         }
         self.begin_attempt();
-        let mark = self.stall_mark();
+        let mark = self.progress_epoch();
         (
             None,
             self.writer_run_mut(writer).queue(dispatcher, &guard, mark),
@@ -335,59 +295,10 @@ impl CommitProducer {
             .input_tiling(self.writer_input(writer))
             .universal_guard();
         self.begin_attempt();
-        let mark = self.stall_mark();
+        let mark = self.progress_epoch();
         let run = self.writer_run_mut(writer);
         run.attempt = Attempt::Finishing;
         run.body.begin_finish();
         run.queue(dispatcher, &whole, mark)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Stalls;
-
-    /// Two writers, as `keyed_writes_from_two_sites_at_distinct_keys_both_land` runs them at one
-    /// worker. Writer 1's first attempt is queued with writer 0's, and its drive reads the store
-    /// before it opens, so it proposes nothing. Its step runs only after writer 0 has committed
-    /// every item and run two attempts without progress. That attempt is not evidence of a stall:
-    /// its retry reads the commits and decides.
-    #[test]
-    fn an_attempt_queued_before_another_writers_progress_does_not_stall() {
-        let writers = 2;
-        let mut stalls = Stalls::default();
-        let writer_1 = stalls.mark();
-        // Writer 0 opens the store and commits its five items.
-        for _ in 0..6 {
-            let mark = stalls.mark();
-            assert_eq!(stalls.complete(mark, true), 0);
-        }
-        // Its last request attempt and its finish's attempt change nothing.
-        for expected in 1..=2 {
-            let mark = stalls.mark();
-            assert_eq!(stalls.complete(mark, false), expected);
-        }
-        assert!(
-            stalls.complete(writer_1, false) <= writers,
-            "writer 1's first attempt ended its request as stalled"
-        );
-        // Its retry is queued since the last progress, and counts.
-        let mark = stalls.mark();
-        assert_eq!(stalls.complete(mark, false), 3);
-    }
-
-    /// Attempts queued since the last progress count across writers, and progress starts the
-    /// count again.
-    #[test]
-    fn attempts_queued_since_the_last_progress_count_until_one_progresses() {
-        let mut stalls = Stalls::default();
-        let mark = stalls.mark();
-        assert_eq!(stalls.complete(mark, false), 1);
-        assert_eq!(stalls.complete(mark, false), 2);
-        assert_eq!(stalls.complete(mark, true), 0);
-        let mark = stalls.mark();
-        assert_eq!(stalls.complete(mark, false), 1);
-        stalls.reset();
-        assert_eq!(stalls.complete(mark, false), 1);
     }
 }
