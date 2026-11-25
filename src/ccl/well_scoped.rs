@@ -4,7 +4,7 @@
 //! Names are bound by term binders alone, the ones [`for_each_scoped_item`] states, and inside
 //! a type by that type's own binders, which [`crate::ccl::subst::type_free_vars`] subtracts: a
 //! Pi binder over its codomain, a dependent tuple's binder over its later components, `__elem`
-//! over a refinement's predicate, a quoted term's binders over its body. A program reads no name
+//! over a refinement's predicate, a held term's binders over its body. A program reads no name
 //! free: a source lowers to `Source(name)` and a sink to a binding.
 //!
 //! One rule the compiler still follows binds a name outside the term that binds it, and the
@@ -125,12 +125,12 @@ pub(crate) fn assert_well_scoped(root: &Expr, boundary: &str) {
     }
 }
 
-/// The innermost node, among the terms `ty` quotes, whose own type reads `name` free, with
+/// The innermost node, among the terms `ty` holds, whose own type reads `name` free, with
 /// that type: where a leaked read was minted, which the outer slot only carries.
 fn innermost_reader(ty: &Type, name: &Name) -> Option<(String, Type)> {
     fn in_type(ty: &Type, name: &Name) -> Option<(String, Type)> {
         let mut found = None;
-        ty.walk_quoted_terms(&mut |t| {
+        ty.walk_held_terms(&mut |t| {
             if found.is_none() {
                 found = in_expr(t, name);
             }

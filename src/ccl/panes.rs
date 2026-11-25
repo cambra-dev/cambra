@@ -806,7 +806,7 @@ mod tests {
                 _ => None,
             }
         }
-        /// `tree`'s nodes, the terms its types quote included.
+        /// `tree`'s nodes, the terms its types hold included.
         fn nodes(tree: &Expr) -> Vec<&Expr> {
             let mut out = Vec::new();
             let mut stack = vec![tree];
@@ -814,7 +814,7 @@ mod tests {
                 out.push(e);
                 e.walk_children(|c| stack.push(c));
                 e.walk_type_slots(|t| {
-                    t.walk_quoted_terms(&mut |q| stack.push(q.as_ref()));
+                    t.walk_held_terms(&mut |q| stack.push(q.as_ref()));
                 });
             }
             out

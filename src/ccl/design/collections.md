@@ -486,7 +486,7 @@ sum's binders into each consumer's scope, and the term and the position stay the
 mentions `σᵢ(𝑥)` and leaves the binding of `𝑥` substitutes `𝑥`'s definition, as any type naming a
 `let` binder does ([`let` binders and scope exit](type-inference.md#let-binders-and-scope-exit)).
 Realization rewrites `σᵢ(𝑐)` in a leg to the candidate the leg chose. It reads the witness off the
-term the projection quotes, under the id that term was typed with.
+term the projection holds, under the id that term was typed with.
 
 ### Typing
 
@@ -526,9 +526,9 @@ as for a map source ([The store](../../interpreter/design-operators.md#the-store
 
 A source `𝑒` that is not a variable and reads nothing an enclosing loop binds or writes is bound
 first, as `let __src = 𝑒 in for 𝑥 in __src` (`mut_elim::bind_sum_loop_sources`). The projection
-quotes `__src`, and a pass rewriting `𝑒` rewrites the binding's definition. The binding stands
+holds `__src`, and a pass rewriting `𝑒` rewrites the binding's definition. The binding stands
 outside every enclosing loop, so the domain depends on no enclosing position. A source computed per
-position of an enclosing loop is quoted as written.
+position of an enclosing loop is held as written.
 
 A loop over an outer loop's element ranges over the projected domain of that element, so the
 nested positions are a dependent tuple whose second component is `σ₁(𝑡(𝑥))` for the row `𝑡(𝑥)`
@@ -576,7 +576,7 @@ the literal as a constant, and takes a collection-valued element only written ou
 A conditional is realized where it stands. The `Case` is replaced in place by a `Realized` node
 typed as the `Case` was, which keeps the `Case` as the term it stages. Every consumer reads the
 conditional through `unbox`, over the projected domain `σ₁(𝑐)` of the `Case` term `𝑐`, so a
-consumer's types quote the conditional rather than name its witness. The check after planning
+consumer's types hold the conditional rather than name its witness. The check after planning
 rebuilds a consumer's result from the realized tree, and normal form reads the `Realized` node as
 the `Case` it stages, so the rebuilt result equals the recorded one
 ([The check after planning reads planning's rewrites back](type-inference.md#the-check-after-planning-reads-plannings-rewrites-back)).
@@ -630,7 +630,7 @@ Each row's value has type `Σ (σ : [0..2, 0..3]). σ ⤇ Int` and carries its o
 arm keeps its `box`, as every `box` does. A consumer that iterates a leg's arm finds the list
 beneath the `box` (`mark_component_source`).
 
-A loop over a conditional chosen per row reads it through `unbox`, so a type after the loop quotes
+A loop over a conditional chosen per row reads it through `unbox`, so a type after the loop holds
 the conditional as written, `σ₁({ 𝑔(𝑥) → 𝑎; true → 𝑏 })`, while the tree holds its fan-out. Normal
 form reads the fan-out applied to the row back as the `Case`, so the two compare equal
 ([Predicates are compared by normal form](type-inference.md#predicates-are-compared-by-normal-form)).

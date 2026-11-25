@@ -1610,7 +1610,7 @@ fn has_aggregate(e: &Expr) -> bool {
 /// unrefined domain and gates its values, as a tap of a recurrence or a transaction does
 /// (`src/ccl/design/mutability.md`, "A condition the channel's type cannot state").
 /// Aggregate conditions use this path too where the fed type reads no iteration binding:
-/// their nested collection filters are compiled as code once, rather than quoted in every
+/// their nested collection filters are compiled as code once, rather than held in every
 /// occurrence of the channel's domain.
 fn gated_contribution(
     source: Expr,

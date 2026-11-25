@@ -272,7 +272,7 @@ own type, from a binder's type, and from the types of other nodes — so it is o
 table that several child edges name. A table can express that and a nested tree cannot: a tree
 carries a shared subtree once per position that reaches it.
 
-One descent reaches them. `Type::walk_quoted_terms` visits every term riding a type or its nested
+One descent reaches them. `Type::walk_held_terms` visits every term riding a type or its nested
 type children, a refinement's predicate or a witness projection's sum, and the three callers that
 need it project differently from each one: this module's predicate child edges, `collect_tree_ids`'
 id domain, and `predicate_id_collisions`' per-term `Rc` keys. Written out per caller it was the same

@@ -42,17 +42,17 @@ use std::collections::HashSet;
 /// `collect_tree_ids` enumerates.
 ///
 /// Shares `collect_tree_ids`' type descent rather than mirroring it
-/// ([`Type::walk_quoted_terms`](crate::ccl::Type::walk_quoted_terms)): a quoted term
+/// ([`Type::walk_held_terms`](crate::ccl::Type::walk_held_terms)): a held term
 /// that walk enumerates and this one does not is a node the fold explains and
 /// the table omits, so the two cannot be allowed to drift apart. They now cannot,
 /// because there is one descent.
 pub(super) fn predicate_children(expr: &Expr) -> Vec<&Expr> {
-    // Every term the slot quotes, a refinement's predicate or a projection's sum, is
-    // its own child. The descent is `Type::walk_quoted_terms`, which is also what
+    // Every term the slot holds, a refinement's predicate or a projection's sum, is
+    // its own child. The descent is `Type::walk_held_terms`, which is also what
     // `collect_tree_ids` folds over — one function, so the shipped node table and
     // the shipped links cannot drift onto different id domains.
     let mut roots: Vec<&Expr> = Vec::new();
-    expr.walk_quoted_terms(&mut |term| roots.push(term));
+    expr.walk_held_terms(&mut |term| roots.push(term));
     let mut seen: HashSet<NodeId> = HashSet::new();
     roots.retain(|p| seen.insert(p.node_id()));
     roots

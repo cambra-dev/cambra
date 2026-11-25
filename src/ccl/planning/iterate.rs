@@ -802,15 +802,15 @@ pub(super) fn membership_keys(
 fn keys_of(term: &Expr, ctx: &mut PlanningCtx) -> Result<Expr, String> {
     let stamp = crate::ccl::ty::unbox_type(&term.ty)
         .ok_or_else(|| format!("a projected value has a sum type, got {}", term.ty))?;
-    let (copy, quoted) = {
+    let (copy, held) = {
         let _frame = provenance::copy_frame("planning.projected_keys");
         (term.clone(), Rc::new(term.clone()))
     };
     // The copy is a term lifted out of a type into the tree, so it is planned as every such
     // term is (`src/ccl/design/optimization.md`, "Planning a lifted term"): a conditional it
-    // quoted is realized, and its legs iterated.
+    // held is realized, and its legs iterated.
     let copy = plan_lifted(copy, PlanningPhase::MarkIterationSites, ctx)?;
-    let unboxed_ty = crate::ccl::ty::unboxed_type(&term.ty, &quoted)
+    let unboxed_ty = crate::ccl::ty::unboxed_type(&term.ty, &held)
         .ok_or_else(|| format!("a projected value has a sum type, got {}", term.ty))?;
     let unboxed =
         Expr::apply(copy, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(unboxed_ty.clone());

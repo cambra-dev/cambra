@@ -4718,7 +4718,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 /// position"). A tap reading a slot, the value a variable held entering the position, would
 /// read the history that holds it, and is refused.
 ///
-/// The terms the history types quote are minted for the `Transact` at `node_id`, whose type
+/// The terms the history types hold are minted for the `Transact` at `node_id`, whose type
 /// carries them into the tree.
 pub(super) fn writer_tap_histories(
     domain: &Type,

@@ -1976,7 +1976,7 @@ fn a_conditional_generator_beside_another(#[case] code: &str, #[case] expected: 
 /// A filter anywhere in the product, which is the same site with a restriction on it.
 ///
 /// As in `a_conditional_generator_beside_another`, the conditional is realized in its binding,
-/// so the site's domain quotes the conditional rather than naming its witness
+/// so the site's domain holds the conditional rather than naming its witness
 /// (`src/ccl/design/collections.md`, "Compiling a conditional collection"). The filter on
 /// either generator restricts that product like a filter over any other source.
 #[rstest]

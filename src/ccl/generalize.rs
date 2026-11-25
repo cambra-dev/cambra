@@ -379,7 +379,7 @@ pub(crate) fn shape(ty: &Type) -> Type {
 /// against `actual` binds them to: a part of one type read in the parameters of another, which
 /// names the same structure by parameters of its own.
 ///
-/// The result stands beside the type it is read from, so the terms it quotes are recorded
+/// The result stands beside the type it is read from, so the terms it holds are recorded
 /// copies with identities of their own, where [`substitute`] rewrites a type in place.
 pub(crate) fn renamed_by_match(part: &Type, pattern: &Type, actual: &Type) -> Type {
     let params: Vec<TypeParamId> = free_params(pattern).iter().map(|q| q.id).collect();
@@ -391,7 +391,7 @@ pub(crate) fn renamed_by_match(part: &Type, pattern: &Type, actual: &Type) -> Ty
     }
     let mut out = substitute(part, &bound);
     let _copy = crate::ccl::provenance::copy_frame("generalize.renamed_by_match");
-    crate::ccl::ccl_utils::walk_quoted_terms_mut(
+    crate::ccl::ccl_utils::walk_held_terms_mut(
         &mut out,
         &crate::ccl::ccl_utils::PredMemo::default(),
         &(),
@@ -590,10 +590,21 @@ fn match_direct(
     }
 }
 
-/// `ty` with each parameter `bound` maps replaced, in the terms it quotes as well. A refined
+/// `ty` with each parameter `bound` maps replaced, in the terms it holds as well. A refined
 /// parameter's refinements join what replaces it ([`Type::refined`]), and a family's
 /// application is its instance with the instance's binders discharged to the arguments.
 fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
+    substitute_sharing(ty, bound, &crate::ccl::ccl_utils::PredMemo::default())
+}
+
+/// [`substitute`], rewriting each held term once however many type slots it is reached
+/// through: a predicate's type slots hold predicates of their own, and a predicate shared by
+/// every slot (a group's membership) would otherwise be rewritten again at each level.
+fn substitute_sharing(
+    ty: &Type,
+    bound: &HashMap<TypeParamId, Instance>,
+    memo: &crate::ccl::ccl_utils::PredMemo,
+) -> Type {
     // An application's arguments read the binders around it, so they are discharged into the
     // instance with those binders read by name, an index being loose there.
     let families = bound
@@ -604,22 +615,21 @@ fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
     } else {
         substitute_go(ty, bound)
     };
-    // The terms a type quotes carry type slots of their own, written over the same
+    // The terms a type holds carry type slots of their own, written over the same
     // parameters. The rewrite is the same type's, so it keeps the identities it copies.
     crate::ccl::provenance::preserving_ids(|| {
-        crate::ccl::ccl_utils::walk_quoted_terms_mut(
-            &mut out,
-            &crate::ccl::ccl_utils::PredMemo::default(),
-            &(),
-            &mut |term, _| {
-                fn in_term(e: &mut crate::ccl::Expr, bound: &HashMap<TypeParamId, Instance>) {
-                    e.walk_type_slots_mut(|t| *t = substitute(t, bound));
-                    e.walk_children_mut(|c| in_term(c, bound));
-                }
-                in_term(term, bound);
-                true
-            },
-        )
+        crate::ccl::ccl_utils::walk_held_terms_mut(&mut out, memo, &(), &mut |term, memo| {
+            fn in_term(
+                e: &mut crate::ccl::Expr,
+                bound: &HashMap<TypeParamId, Instance>,
+                memo: &crate::ccl::ccl_utils::PredMemo,
+            ) {
+                e.walk_type_slots_mut(|t| *t = substitute_sharing(t, bound, memo));
+                e.walk_children_mut(|c| in_term(c, bound, memo));
+            }
+            in_term(term, bound, memo);
+            true
+        })
     });
     out
 }
@@ -633,7 +643,7 @@ fn substitute_go(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
         },
         Type::FamilyApp(app) => match bound.get(&app.param.id) {
             // The arguments are the application's own terms, moved into the instance, so
-            // they keep their identities, as `substitute`'s rewrite of quoted terms does.
+            // they keep their identities, as `substitute`'s rewrite of held terms does.
             Some(Instance::Type { binders, ty: at }) => {
                 crate::ccl::provenance::preserving_ids(|| {
                     let is_itself = |b: &crate::ccl::Name, a: &crate::ccl::ty::FamilyArg| matches!(&a.term.node, crate::ccl::TypedExprNode::Var(n) if n == b);
@@ -719,7 +729,7 @@ fn walk(
     // The traversals below take closures, so a failure inside one is held here, the rest of the
     // traversal skipped, and returned after it.
     let mut failed = None;
-    // The terms a type slot quotes hold types of their own, under the node's scope, the
+    // The terms a type slot holds hold types of their own, under the node's scope, the
     // refinement's `__elem`, and the binders of the type around them. Every binder of the
     // type is taken as in scope, which can leave a type ungeneralized but never generalizes
     // one over a name the type binds.
@@ -735,7 +745,7 @@ fn walk(
         inner.push(crate::ccl::Name::elem());
         type_binders(ty, &mut inner);
         changed |=
-            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &inner, &mut |term, memo| {
+            crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &inner, &mut |term, memo| {
                 if failed.is_some() {
                     return false;
                 }
@@ -762,7 +772,7 @@ fn walk(
             .iter()
             .any(out_of_scope)
     {
-        // The terms the generalized type quotes are minted for the node it types.
+        // The terms the generalized type holds are minted for the node it types.
         let _g = crate::ccl::provenance::enter(
             e.node_id(),
             "generalize.generalize",
@@ -924,7 +934,7 @@ pub(crate) struct Ungeneralizable(pub(crate) String);
 /// reading none of them: whether every part reading one is determined by what the morphism
 /// receives.
 pub(crate) fn generalizes(ty: &Type, out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool) -> bool {
-    // The generalized type is discarded, so the terms it quotes are copied under their own ids.
+    // The generalized type is discarded, so the terms it holds are copied under their own ids.
     crate::ccl::provenance::preserving_ids(|| {
         generalized(ty, out_of_scope, "", &mut HashMap::new()).is_ok_and(|t| {
             !crate::ccl::subst::type_free_vars(&t)
@@ -1280,7 +1290,7 @@ fn quantified(
         };
         let d = Type::refined(d, staying);
         body = abstract_deep(&body, &group, &d);
-        // A later part can hold this one inside the terms it quotes; it is matched as the
+        // A later part can hold this one inside the terms it holds; it is matched as the
         // abstraction leaves it.
         for later in groups.iter_mut().skip(i + 1) {
             *later = abstract_deep(later, &group, &d);
@@ -1314,7 +1324,7 @@ fn quantified(
 }
 
 /// The argument lists a family over `indices` may be read at in `body`: for each index, every
-/// term `body` quotes that reads one of the type's own binders `own` through projections only,
+/// term `body` holds that reads one of the type's own binders `own` through projections only,
 /// as `__args.0` does, and has the index's type. A part read at such a term is the family applied
 /// there ([`quantified`]).
 fn index_instances(
@@ -1347,7 +1357,7 @@ fn index_instances(
     }
     // A path's root reads one of the type's own binders, so it takes the type that binder
     // states in `body`, which reads the parts already abstracted, rather than the type the
-    // quoted copy carried.
+    // held copy carried.
     fn retype_root(e: &mut crate::ccl::TypedExpr, body: &Type) {
         match &mut e.node {
             crate::ccl::TypedExprNode::Var(n) => {
@@ -1359,11 +1369,11 @@ fn index_instances(
             _ => {}
         }
     }
-    // The paths are copies of terms `body` quotes, which the instances below place in the
+    // The paths are copies of terms `body` holds, which the instances below place in the
     // generalized type beside the originals.
     let _copy = crate::ccl::provenance::copy_frame("generalize.index_instances");
     let mut paths = Vec::new();
-    body.walk_quoted_terms(&mut |q| collect(q, own, &mut paths));
+    body.walk_held_terms(&mut |q| collect(q, own, &mut paths));
     for path in &mut paths {
         retype_root(path, body);
     }
@@ -1610,61 +1620,74 @@ fn refinements_in_scope(
 }
 
 /// `ty` with `group` replaced by `d`, and a refinement of `group`'s base that holds all of
-/// `group`'s refinements by `d` refined by the rest, in quoted annotations as well.
-/// Quoted `Cast` computations transport their values and retain their filters.
+/// `group`'s refinements by `d` refined by the rest, in held annotations as well.
+/// Held `Cast` computations transport their values and retain their filters.
 ///
-/// The generalized type is a new type beside the ones that keep the quoted terms as they were,
+/// The generalized type is a new type beside the ones that keep the held terms as they were,
 /// so the terms it rewrites are derived ones, minted under the caller's recording.
 fn abstract_deep(ty: &Type, group: &Type, d: &Type) -> Type {
     let mut out = ty.clone();
-    abstract_type(&mut out, group, d);
+    abstract_type(
+        &mut out,
+        group,
+        d,
+        &crate::ccl::ccl_utils::PredMemo::default(),
+    );
     out
 }
 
 /// [`abstract_deep`] in place, answering whether it replaced anything. Reported rather than read
 /// off the result: a type compares a Σ's binder by identity, not by its candidates, so a rewrite
 /// of a candidate leaves the type equal to what it was, and equality ignores annotations inside
-/// quotes.
-fn abstract_type(ty: &mut Type, group: &Type, d: &Type) -> bool {
+/// held terms.
+///
+/// `memo` is shared by the whole walk, as [`substitute`]'s is, so a held term reached through
+/// many type slots is rewritten once.
+fn abstract_type(
+    ty: &mut Type,
+    group: &Type,
+    d: &Type,
+    memo: &crate::ccl::ccl_utils::PredMemo,
+) -> bool {
     let mut changed = false;
     *ty = abstract_go(ty, group, d, &mut changed);
-    changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
-        ty,
-        &crate::ccl::ccl_utils::PredMemo::default(),
-        &(),
-        &mut |term, _| abstract_quoted_term(term, group, d),
-    );
+    changed |= crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |term, memo| {
+        abstract_held_term(term, group, d, memo)
+    });
     changed
 }
 
-fn abstract_quoted_term(term: &mut crate::ccl::Expr, group: &Type, d: &Type) -> bool {
+fn abstract_held_term(
+    term: &mut crate::ccl::Expr,
+    group: &Type,
+    d: &Type,
+    memo: &crate::ccl::ccl_utils::PredMemo,
+) -> bool {
     if let crate::ccl::TypedExprNode::Cast { value, target } = &mut term.node {
-        let mut changed = abstract_quoted_term(value, group, d);
+        let mut changed = abstract_held_term(value, group, d, memo);
         // A target's predicates define its filter. Rewrite their annotations, then derive
         // both stored types from the transported value instead of abstracting the filter.
-        changed |= crate::ccl::ccl_utils::walk_quoted_terms_mut(
-            target,
-            &crate::ccl::ccl_utils::PredMemo::default(),
-            &(),
-            &mut |quoted, _| abstract_quoted_term(quoted, group, d),
-        );
+        changed |=
+            crate::ccl::ccl_utils::walk_held_terms_mut(target, memo, &(), &mut |held, memo| {
+                abstract_held_term(held, group, d, memo)
+            });
         let (born, result) =
             crate::ccl::ccl_utils::canonical_cast_types(target, &value.ty, value.ty.clone());
         changed |= term.ty != result || *target != born;
         term.ty = result;
         *target = born;
         if let Some(annotation) = &mut term.user_annotation {
-            changed |= abstract_type(annotation, group, d);
+            changed |= abstract_type(annotation, group, d, memo);
         }
         return changed;
     }
     let mut changed = false;
-    term.walk_type_slots_mut(|ty| changed |= abstract_type(ty, group, d));
-    term.walk_children_mut(|child| changed |= abstract_quoted_term(child, group, d));
+    term.walk_type_slots_mut(|ty| changed |= abstract_type(ty, group, d, memo));
+    term.walk_children_mut(|child| changed |= abstract_held_term(child, group, d, memo));
     changed
 }
 
-/// `ty` with `group` replaced by `d` ([`abstract_deep`] outside the terms `ty` quotes), setting
+/// `ty` with `group` replaced by `d` ([`abstract_deep`] outside the terms `ty` holds), setting
 /// `replaced` where it replaced anything.
 fn abstract_go(ty: &Type, group: &Type, d: &Type, replaced: &mut bool) -> Type {
     if ty == group {
@@ -1923,7 +1946,7 @@ mod tests {
     #[rstest::rstest]
     #[case(1)]
     #[case(2)]
-    fn a_quoted_cast_is_rebuilt_from_its_value_and_keeps_its_filter(#[case] filters: usize) {
+    fn a_held_cast_is_rebuilt_from_its_value_and_keeps_its_filter(#[case] filters: usize) {
         let int = Type::Base(BaseType::Int);
         let above_outer = Expr::binop(
             Expr::var(Name::elem()).with_ty(int.clone()),
@@ -1952,24 +1975,29 @@ mod tests {
             );
             value = Expr::cast(value, target).with_ty(result);
         }
-        let quoted = Expr::lambda("g", crate::ccl::Occurrence::mint(), source_ty, value);
-        crate::ccl::infer::check(&quoted).unwrap();
+        let held = Expr::lambda("g", crate::ccl::Occurrence::mint(), source_ty, value);
+        crate::ccl::infer::check(&held).unwrap();
         let mut ty = Type::FamilyApp(crate::ccl::ty::FamilyApp::new(
             crate::ccl::ty::TypeParam::generalized_family("F".to_owned(), None, 1),
-            vec![Rc::new(quoted)],
+            vec![Rc::new(held)],
         ));
         let d = Type::Param(crate::ccl::ty::TypeParam::generalized_family(
             "D".to_owned(),
             Some(int),
             0,
         ));
-        assert!(abstract_type(&mut ty, &group, &d));
+        assert!(abstract_type(
+            &mut ty,
+            &group,
+            &d,
+            &crate::ccl::ccl_utils::PredMemo::default()
+        ));
         assert!(!crate::ccl::subst::type_free_vars(&ty).contains(&Name::from("outer")));
         let Type::FamilyApp(app) = &ty else {
             unreachable!()
         };
-        let quoted = &app.args[0].term;
-        let crate::ccl::TypedExprNode::Lambda { param, body } = &quoted.node else {
+        let held = &app.args[0].term;
+        let crate::ccl::TypedExprNode::Lambda { param, body } = &held.node else {
             unreachable!()
         };
         let crate::ccl::TypedExprNode::Cast { target, .. } = &body.node else {
@@ -1978,7 +2006,7 @@ mod tests {
         assert_eq!(param.ty.domain().unwrap(), d);
         assert_eq!(target.domain().unwrap().refinements().len(), 1);
         assert_eq!(body.ty.domain().unwrap().refinements().len(), filters);
-        crate::ccl::infer::check(quoted).unwrap();
+        crate::ccl::infer::check(held).unwrap();
     }
 
     /// A comprehension joins its guards into one conjunction, so a guard reading a binder out of

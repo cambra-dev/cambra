@@ -1243,7 +1243,7 @@ impl NominalDecl {
         // An application of a family parameter discharges its argument's binders to the
         // application's terms by name, so a declaration with one is instantiated opened.
         let mut out = if self.has_family_params() {
-            // Opening and closing rewrite the terms the declaration's types quote, which no tree
+            // Opening and closing rewrite the terms the declaration's types hold, which no tree
             // holds, so the copies keep their identities rather than derive from them.
             crate::ccl::provenance::preserving_ids(|| {
                 let mut opened = crate::ccl::generalize::opened_deep(ty);

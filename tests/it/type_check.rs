@@ -456,7 +456,7 @@ fn refining_addition_is_int_only() {
 /// binder's place: `=` carries its definiens, `^=` withholds it.
 ///
 /// The pair is the whole content of [`cambra::ccl::BindingTransparency`], and
-/// `^+` is what makes it visible — its result type quotes the operands.
+/// `^+` is what makes it visible — its result type holds the operands.
 #[rstest]
 #[case::transparent(
     indoc! {r#"

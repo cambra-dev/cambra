@@ -4701,35 +4701,35 @@ impl Type {
         })
     }
 
-    /// Every term this type or any of its nested type children quotes, in pre-order: each
-    /// refinement's predicate and each witness projection's sum ([`QuotedTerm`]), those at a
+    /// Every term this type or any of its nested type children holds, in pre-order: each
+    /// refinement's predicate and each witness projection's sum ([`HeldTerm`]), those at a
     /// level before that level's children.
     ///
     /// The one place that shape is written. Three callers need it and each wants something
-    /// different from a quoted term — its ids, its `Rc` identity, the term itself as a child
+    /// different from a held term — its ids, its `Rc` identity, the term itself as a child
     /// edge — so what they share is the descent and not the projection. A type variant that
-    /// quotes a term is remembered here once rather than in each.
+    /// holds a term is remembered here once rather than in each.
     ///
-    /// Does **not** descend into a quoted term's own type slots: the term is a
+    /// Does **not** descend into a held term's own type slots: the term is a
     /// [`TypedExpr`], so its slots are an expression walk's business. A caller that needs
     /// them recurses itself, which `collect_tree_ids` and `predicate_id_collisions`
     /// (`crate::ccl::context`) both do.
-    pub fn walk_quoted_terms<'a>(&'a self, f: &mut impl FnMut(&'a Rc<TypedExpr>)) {
+    pub fn walk_held_terms<'a>(&'a self, f: &mut impl FnMut(&'a Rc<TypedExpr>)) {
         match self {
             Type::Refinement(_, refinements) => {
                 for r in refinements.iter() {
                     f(&r.predicate);
                 }
             }
-            _ => self.quoted_terms().for_each(&mut *f),
+            _ => self.held_terms().for_each(&mut *f),
         }
-        self.walk_children(|c| c.walk_quoted_terms(f));
+        self.walk_children(|c| c.walk_held_terms(f));
     }
 
-    /// The terms this type quotes outside a refinement, at its own node and not its children's:
+    /// The terms this type holds outside a refinement, at its own node and not its children's:
     /// a witness projection's sum and a family's arguments. A substitution, a binder walk or a
     /// hash treats each as it treats a refinement's predicate, except that it binds no element.
-    pub fn quoted_terms(&self) -> impl Iterator<Item = &Rc<TypedExpr>> {
+    pub fn held_terms(&self) -> impl Iterator<Item = &Rc<TypedExpr>> {
         let (projected, arguments) = match self {
             Type::WitnessProjection(p) => (Some(&p.term), None),
             Type::FamilyApp(app) => (None, Some(app.args.iter().map(|a| &a.term))),
@@ -4738,14 +4738,14 @@ impl Type {
         projected.into_iter().chain(arguments.into_iter().flatten())
     }
 
-    /// [`quoted_terms`](Self::quoted_terms), each as the [`QuotedTerm`] holding it, for a
+    /// [`held_terms`](Self::held_terms), each as the [`HeldTerm`] holding it, for a
     /// rewrite that re-points it.
-    pub fn quoted_terms_mut(&mut self) -> impl Iterator<Item = &mut dyn QuotedTerm> {
+    pub fn held_terms_mut(&mut self) -> impl Iterator<Item = &mut dyn HeldTerm> {
         let (projected, arguments) = match self {
-            Type::WitnessProjection(p) => (Some(p as &mut dyn QuotedTerm), None),
+            Type::WitnessProjection(p) => (Some(p as &mut dyn HeldTerm), None),
             Type::FamilyApp(app) => (
                 None,
-                Some(app.args.iter_mut().map(|a| a as &mut dyn QuotedTerm)),
+                Some(app.args.iter_mut().map(|a| a as &mut dyn HeldTerm)),
             ),
             _ => (None, None),
         };
@@ -5028,7 +5028,7 @@ impl Refinement {
 /// The payload of [`Type::WitnessProjection`]: the sum `𝑐` and the position of the binder
 /// projected.
 ///
-/// The term is quoted as a refinement quotes its predicate: shared by `Rc`, compared and hashed by
+/// The term is held as a refinement holds its predicate: shared by `Rc`, compared and hashed by
 /// its normal form with its type slots skipped. The term's own type carries the sum's binders, so
 /// the witness's kind and bound are read off it. The position, counted outermost first, survives
 /// the renaming inference applies to a sum's binder ids.
@@ -5175,24 +5175,24 @@ impl fmt::Debug for WitnessProjection {
     }
 }
 
-/// A term a type quotes: a refinement's predicate, the sum a [`WitnessProjection`] projects, or a
+/// A term a type holds: a refinement's predicate, the sum a [`WitnessProjection`] projects, or a
 /// [`FamilyApp`]'s argument.
 ///
-/// A quoted term rides every type slot its type reaches, shared by `Rc`, so a pass rewriting the
+/// A held term rides every type slot its type reaches, shared by `Rc`, so a pass rewriting the
 /// terms a type holds rebuilds it once and re-points every occurrence at the rebuild
 /// ([`crate::ccl::ccl_utils::PredMemo`]).
-pub trait QuotedTerm {
-    /// The quoted term.
-    fn quoted(&self) -> &Rc<TypedExpr>;
-    /// Install `to` as the quoted term.
-    fn requote(&mut self, to: Rc<TypedExpr>);
+pub trait HeldTerm {
+    /// The held term.
+    fn held(&self) -> &Rc<TypedExpr>;
+    /// Install `to` as the held term.
+    fn replace_held(&mut self, to: Rc<TypedExpr>);
 }
 
-impl QuotedTerm for Refinement {
-    fn quoted(&self) -> &Rc<TypedExpr> {
+impl HeldTerm for Refinement {
+    fn held(&self) -> &Rc<TypedExpr> {
         &self.predicate
     }
-    fn requote(&mut self, to: Rc<TypedExpr>) {
+    fn replace_held(&mut self, to: Rc<TypedExpr>) {
         // The rewrite half of the boundary `Refinement::born` guards: a pass that
         // substitutes into a predicate can put a whole function body there, and
         // this is where such a term would be installed. Checked only where the
@@ -5205,11 +5205,11 @@ impl QuotedTerm for Refinement {
     }
 }
 
-impl QuotedTerm for WitnessProjection {
-    fn quoted(&self) -> &Rc<TypedExpr> {
+impl HeldTerm for WitnessProjection {
+    fn held(&self) -> &Rc<TypedExpr> {
         &self.term
     }
-    fn requote(&mut self, to: Rc<TypedExpr>) {
+    fn replace_held(&mut self, to: Rc<TypedExpr>) {
         self.term = to;
     }
 }
@@ -5217,7 +5217,7 @@ impl QuotedTerm for WitnessProjection {
 /// A generalized family parameter applied to its arguments ([`Type::FamilyApp`]): as many terms as
 /// the parameter's [`arity`](TypeParam::arity), each reading binders of the type around it.
 ///
-/// Each argument is quoted as a refinement quotes its predicate, and compared and hashed with
+/// Each argument is held as a refinement holds its predicate, and compared and hashed with
 /// its type slots skipped.
 #[derive(Clone)]
 pub struct FamilyApp {
@@ -5281,11 +5281,11 @@ impl fmt::Debug for FamilyApp {
     }
 }
 
-impl QuotedTerm for FamilyArg {
-    fn quoted(&self) -> &Rc<TypedExpr> {
+impl HeldTerm for FamilyArg {
+    fn held(&self) -> &Rc<TypedExpr> {
         &self.term
     }
-    fn requote(&mut self, to: Rc<TypedExpr>) {
+    fn replace_held(&mut self, to: Rc<TypedExpr>) {
         self.term = to;
     }
 }

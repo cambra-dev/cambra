@@ -4,7 +4,7 @@
 //! A term binder binds over the children [`for_each_scoped_item`] puts under it, and a binder
 //! does not bind in its own type. Inside a type, a Pi binder binds over its codomain, a
 //! dependent tuple's component over the components after it, and a refinement its element over
-//! its predicate. A quoted term, a predicate or a projected sum, is read where its type slot
+//! its predicate. A held term, a predicate or a projected sum, is read where its type slot
 //! stands.
 //!
 //! An element reference `__elem^𝑖` counts the refinements between it and the one whose element
@@ -13,7 +13,7 @@
 //! "A refinement's element is referenced by index").
 //!
 //! One walk answers three questions: every name read free ([`names`]), which of a set of names
-//! are ([`among`]), and how many times one name is ([`count`]). A quoted term shared by `Rc` across slots is read once: [`names`] reads
+//! are ([`among`]), and how many times one name is ([`count`]). A held term shared by `Rc` across slots is read once: [`names`] reads
 //! each one's free names once, relative to the term itself, and filters them by the binders
 //! in force at each slot it stands in; [`count`] counts each one once.
 
@@ -64,7 +64,7 @@ pub(crate) fn names_in_type(ty: &Type) -> BTreeSet<Name> {
 pub(crate) fn names_in_refinement(r: &Refinement) -> BTreeSet<Name> {
     let mut memo = BTreeMap::new();
     let mut walk = Walk::all(EVERY_READ, &mut memo);
-    walk.quoted(&r.predicate, true);
+    walk.held(&r.predicate, true);
     walk.into_names()
 }
 
@@ -122,7 +122,7 @@ enum Ask {
         target: Name,
         shift: u32,
         count: usize,
-        /// The quoted terms counted, each with the target's shift there: a term shared at two
+        /// The held terms counted, each with the target's shift there: a term shared at two
         /// depths reads two different elements.
         counted: BTreeSet<(PredicateId, u32)>,
     },
@@ -131,7 +131,7 @@ enum Ask {
 struct Walk<'m> {
     ask: Ask,
     reads: Reads,
-    /// Each quoted term's free names relative to the term itself, for [`Ask::All`].
+    /// Each held term's free names relative to the term itself, for [`Ask::All`].
     memo: &'m mut BTreeMap<PredicateId, Rc<BTreeSet<Name>>>,
 }
 
@@ -298,10 +298,10 @@ impl<'m> Walk<'m> {
             | Type::BarrierVar(_)
             | Type::Infer(_) => {}
             Type::Poly(poly) => poly.types().for_each(|t| self.ty(t)),
-            // A projected sum and a family's arguments are terms the type quotes. They bind no
+            // A projected sum and a family's arguments are terms the type holds. They bind no
             // element: a projected term is the collection, not a condition on a key.
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
-                ty.quoted_terms().for_each(|t| self.quoted(t, false))
+                ty.held_terms().for_each(|t| self.held(t, false))
             }
             Type::Fun {
                 name,
@@ -321,7 +321,7 @@ impl<'m> Walk<'m> {
             }
             Type::Refinement(base, refinements) => {
                 for r in refinements {
-                    self.quoted(&r.predicate, true);
+                    self.held(&r.predicate, true);
                 }
                 self.ty(base);
             }
@@ -353,9 +353,9 @@ impl<'m> Walk<'m> {
         self.under(name, |w| w.components(later));
     }
 
-    /// A term a type quotes: a refinement's predicate, which binds its element when
+    /// A term a type holds: a refinement's predicate, which binds its element when
     /// `binds_elem`, or a projected sum, which binds none.
-    fn quoted(&mut self, term: &Rc<Expr>, binds_elem: bool) {
+    fn held(&mut self, term: &Rc<Expr>, binds_elem: bool) {
         let id = Rc::as_ptr(term);
         let entered = u32::from(binds_elem);
         match &mut self.ask {

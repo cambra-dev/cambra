@@ -564,7 +564,7 @@ fn a_loop_over_a_sum_ranges_over_its_keys(#[case] code: &str, #[case] expected: 
 /// a `def`, or chosen per row of an enclosing loop. The conditional is realized where it stands
 /// and the loop reads it through `unbox` (`src/ccl/design/collections.md`, "A `for` loop over a
 /// sum"). Chosen per row, the realized conditional is lambda-eliminated point-free, and the
-/// projection its consumers' types quote reads back to it by normal form
+/// projection its consumers' types hold reads back to it by normal form
 /// (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
 #[rstest]
 #[timeout(Duration::from_secs(10))]

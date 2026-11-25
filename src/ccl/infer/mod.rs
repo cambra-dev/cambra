@@ -376,7 +376,7 @@ pub(super) fn resolve_predicate_types(ty: &mut Type) {
                 *r = Refinement::born(Rc::new(predicate));
             });
         }
-        // A projection quotes the sum it reads, which a loop source reads through its
+        // A projection holds the sum it reads, which a loop source reads through its
         // `elements` call.
         Type::WitnessProjection(p) => {
             let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");

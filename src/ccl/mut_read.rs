@@ -1074,7 +1074,7 @@ fn reveal_go(
                 break;
             }
             for (n, d) in escaped {
-                // The terms the restated type quotes are minted for the `let` whose definiens
+                // The terms the restated type holds are minted for the `let` whose definiens
                 // they copy.
                 let _g = provenance::enter(d.at, "mut_read.reveal", Nature::Machinery);
                 *ty = Subst::discharge(n, d.value.clone_preserving_ids()).apply_type(ty);

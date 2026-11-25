@@ -330,7 +330,7 @@ fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {
         changed
     }
     let mut stated = result.clone();
-    let changed = crate::ccl::ccl_utils::walk_quoted_terms_mut(
+    let changed = crate::ccl::ccl_utils::walk_held_terms_mut(
         &mut stated,
         &crate::ccl::ccl_utils::PredMemo::default(),
         &(),
@@ -2582,13 +2582,13 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     let original_ty = ty.clone();
     // Set by the `Let` arm when it re-ran the closing discharge: that arm is the
     // one place elimination is meant to change a node's type, because the type
-    // quotes a term the pass rewrote. Read only by the invariant assert below,
+    // holds a term the pass rewrote. Read only by the invariant assert below,
     // so it exists only where that assert does.
     //
     // It **disables** the invariant for that arm rather than restating it. The
     // strong form is to compare `original_ty` against the recorded discharge
     // re-applied — `[v ↦ elim(def)]` on the type the node arrived with, which is
-    // what the arm computes — and it is not asserted because `original_ty` quotes
+    // what the arm computes — and it is not asserted because `original_ty` holds
     // the uneliminated `def` at an unknown depth inside a predicate, so recovering
     // the pre-image needs the same walk the arm performs and the assert would
     // compare the arm against itself.
@@ -2833,7 +2833,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         //
         // A binding whose body type does not name the binder keeps the recorded
         // type verbatim, so elimination changes a node's type only where the
-        // term it quotes changed.
+        // term it holds changed.
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -2841,7 +2841,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         } => {
             let def = elim_lambdas(ctx, *bound_expr)?;
             let new_body = elim_lambdas(ctx, *body)?;
-            // An opaque binder quotes no term in the node's type, so elimination
+            // An opaque binder holds no term in the node's type, so elimination
             // leaves that type alone: its binder is still spelled by name, as
             // inference left it (`Typing::close_let_type`).
             let ty = if binding.transparency == BindingTransparency::Transparent
@@ -2852,11 +2852,11 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                     reclosed_let_ty = true;
                 }
                 // `clone_preserving_ids` splices the *eliminated* definition into
-                // the node's type, so this type quotes a term that a
+                // the node's type, so this type holds a term that a
                 // structurally-equal predicate elsewhere on the tree — one riding
-                // a node the pass reached by another route — need not quote. That
+                // a node the pass reached by another route — need not hold. That
                 // is the sharing split `tests/it/predicate_sharing.rs` guards
-                // against, and the discharge has to quote the eliminated term:
+                // against, and the discharge has to hold the eliminated term:
                 // the post-pass check reconstructs this node from the tree it is
                 // handed, which holds only that one. Whether the two ever diverge
                 // in practice is open.

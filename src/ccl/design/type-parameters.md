@@ -570,8 +570,8 @@ the binders each side puts around a position. A shape the walk does not pair is 
 refinement or a generic type, which the walk handles itself.
 
 Constructor generalization uses the same handling of type binders, including data functions
-nested in variant payloads. Abstraction updates ordinary quoted type slots as their binders'
-types change. A quoted `Cast` transports its value and the annotations in its filter predicates.
+nested in variant payloads. Abstraction updates ordinary held type slots as their binders'
+types change. A held `Cast` transports its value and the annotations in its filter predicates.
 Its target retains the filter, and both stored types are reconstructed from the transported
 value by the same rule as cast canonicalization. Replacing the computed domain with a parameter
 would remove the filter. A domain that still names an escaping binder through that computation

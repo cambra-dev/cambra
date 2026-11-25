@@ -131,7 +131,7 @@ around the slot's node. A program reads no name free: a source lowers to `Source
 to a binding. The term binders are the ones [Binding structure lives in one place](#binding-structure-lives-in-one-place)
 lists. Inside a type, that type's own binders bind too: a Pi binder over its codomain, a dependent
 tuple's component over the components after it, `__elem` over a refinement's predicate, and a
-quoted term's binders over that term. A sum binds its witnesses within its own type and nowhere
+held term's binders over that term. A sum binds its witnesses within its own type and nowhere
 else, and a generalized type's `Poly` binds its type parameters within that type and nowhere else.
 
 The rule does not change from phase to phase. Lowering and elimination change which form a term
@@ -450,9 +450,9 @@ Operator conversion merges the legs under the key bound `extent_of` gives the su
 (`UnionOperator::new_flat_over`), so the value is the leg holding rows, keyed by its own keys. It
 is standing: no input feeds it.
 
-`staged` is the conditional the node replaces, quoted as a type quotes a term: term walks do not
-reach it, and id enumeration does (`TypedExpr::walk_quoted_terms`). Normal form reads the node as
-`staged`, so a consumer's type quoting the conditional equals the type rebuilt over the realized
+`staged` is the conditional the node replaces, held as a type holds a term: term walks do not
+reach it, and id enumeration does (`TypedExpr::walk_held_terms`). Normal form reads the node as
+`staged`, so a consumer's type holding the conditional equals the type rebuilt over the realized
 tree
 ([Predicates are compared by normal form](type-inference.md#predicates-are-compared-by-normal-form)).
 
