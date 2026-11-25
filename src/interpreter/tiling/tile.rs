@@ -1067,6 +1067,46 @@ impl Tile {
         }
     }
 
+    /// Mark the keys `mask` does **not** name deleted, as [`mark_deleted`](Self::mark_deleted)
+    /// does, and state them complete in `domain_predicate`: a rejected key holds no element, now
+    /// or in a later answer, so it is absent.
+    ///
+    /// The statement keeps the collection's completeness once [`compact`](Self::compact) removes
+    /// the keys. [`is_terminal`](Self::is_terminal) counts a held key with a whole value toward
+    /// closing the collection, and a marked key is held until `compact` removes it. Over a scalar
+    /// codomain the statement states complete what [`to_guard`](Self::to_guard) already releases,
+    /// since a held plain value is complete.
+    ///
+    /// The statement names bare keys, so the collection is a root one: it has one row.
+    ///
+    /// # Panics
+    ///
+    /// When the tile is no collection.
+    pub fn reject_keys(&mut self, mask: &[bool]) {
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            domain_predicate,
+            ..
+        } = self
+        else {
+            panic!("reject_keys is a collection's: {self:?}")
+        };
+        debug_assert_eq!(
+            row_starts.len(),
+            1,
+            "rejected keys are stated absent by bare key, so the collection is a root one"
+        );
+        let rejected: Vec<usize> = (0..domain.len()).filter(|&k| !mask[k]).collect();
+        if !rejected.is_empty() {
+            let keys = Predicate::from_column_value(
+                &domain.select_indices(rejected.iter().copied(), rejected.len()),
+            );
+            *domain_predicate = domain_predicate.union(&keys);
+        }
+        self.mark_deleted(mask);
+    }
+
     /// Physically remove every logically-deleted key and clear `deleted`, at **every**
     /// level.
     ///
@@ -2797,7 +2837,7 @@ impl Tile {
     }
 
     /// Whether any collection in this tile, at any level, marks a row deleted.
-    fn holds_deleted_rows(&self) -> bool {
+    pub(crate) fn holds_deleted_rows(&self) -> bool {
         match self {
             Tile::DataFunction {
                 codomain, deleted, ..
