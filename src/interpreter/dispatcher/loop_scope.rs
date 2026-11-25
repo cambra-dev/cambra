@@ -294,8 +294,7 @@ pub type Offers = Arc<Mutex<Offered>>;
 /// own, which execution appends to the run's shared dispatcher between the scope's own pipeline
 /// and its step (`Execution::attach_body` in `plan.rs`).
 pub(super) struct Body {
-    /// The planned graph, until execution appends it.
-    graph: Option<Dispatcher>,
+    layout: BodyLayout,
     pub(super) members: Vec<Member>,
     /// Each inner pipeline's entries, by local id. While the body runs, every entry is placed at
     /// its pipeline's global id except a source's, which stays unplaced so the source's pushes
@@ -307,18 +306,22 @@ pub(super) struct Body {
     /// The one inner pipeline whose breaker answers `TileProducer::next_position`: a loop's drive,
     /// a writer's transaction driver.
     pub(super) driver: PipelineId,
-    /// Where the body sits in the run's shared dispatcher, once appended.
-    attached: Option<Attached>,
-    /// Whether the inner pipelines' entries are placed at their global ids and the pipelines
-    /// run, which they do from the first request on. Only an attached body activates.
-    active: bool,
     /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
     /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
     offers: Offers,
 }
 
+enum BodyLayout {
+    Planned(Box<Dispatcher>),
+    /// The dispatcher has taken the local graph and is attaching its nested scopes and step.
+    Attaching,
+    Attached(Attached),
+}
+
 /// Where a body sits in the run's shared dispatcher.
 pub(super) struct Attached {
+    /// The entries are placed at their global pipeline IDs.
+    active: bool,
     /// The scope's own pipeline in the dispatcher around it, whose claims are its requests.
     pub(super) pipeline: PipelineId,
     /// The global id of the first inner pipeline; the others follow it in local order.
@@ -338,20 +341,22 @@ impl Body {
         driver: PipelineId,
     ) -> Self {
         Self {
-            graph: Some(graph),
+            layout: BodyLayout::Planned(Box::new(graph)),
             members,
             placements,
             planned,
             driver,
-            attached: None,
-            active: false,
             offers: Offers::default(),
         }
     }
 
     /// The planned graph, for execution to append to the run's dispatcher.
     pub(super) fn take_graph(&mut self) -> Dispatcher {
-        self.graph.take().expect("a body's graph is appended once")
+        let BodyLayout::Planned(graph) = std::mem::replace(&mut self.layout, BodyLayout::Attaching)
+        else {
+            panic!("a body's graph is appended once")
+        };
+        *graph
     }
 
     /// Record where execution appended the graph: after the scope's pipeline `pipeline`, from
@@ -364,10 +369,11 @@ impl Body {
         hold: HoldGroup,
     ) {
         debug_assert!(
-            self.graph.is_none() && self.attached.is_none(),
+            matches!(self.layout, BodyLayout::Attaching),
             "a body's graph is taken, then attached, once"
         );
-        self.attached = Some(Attached {
+        self.layout = BodyLayout::Attached(Attached {
+            active: false,
             pipeline,
             base,
             step,
@@ -381,24 +387,28 @@ impl Body {
     ///
     /// Before [`attach`](Self::attach): a body is reached through the handlers attaching installs.
     pub(super) fn attached(&self) -> &Attached {
-        self.attached
-            .as_ref()
+        self.attachment()
             .expect("a body is reached once it is attached")
     }
 
+    fn attachment(&self) -> Option<&Attached> {
+        match &self.layout {
+            BodyLayout::Attached(attached) => Some(attached),
+            _ => None,
+        }
+    }
     pub(super) fn is_active(&self) -> bool {
-        self.active
+        self.attachment().is_some_and(|attached| attached.active)
     }
 
-    /// The global id of the inner pipeline `local`; its local id before the body is attached,
-    /// while planning probes the body graph alone.
+    /// The global id of an attached body's inner pipeline.
     pub(super) fn global(&self, local: PipelineId) -> PipelineId {
-        PipelineId(self.attached.as_ref().map_or(0, |attached| attached.base) + local.0)
+        PipelineId(self.attached().base + local.0)
     }
 
     /// The global ids of the inner pipelines, none before the body is attached.
     pub(super) fn pipelines(&self) -> Vec<PipelineId> {
-        match &self.attached {
+        match self.attachment() {
             Some(attached) => (attached.base..attached.base + self.members.len())
                 .map(PipelineId)
                 .collect(),
@@ -409,10 +419,13 @@ impl Body {
     /// Place each inner pipeline's entries at its global id, except a source's. Whether this call
     /// activated the body: it does so once.
     pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
-        if self.active {
+        let BodyLayout::Attached(attached) = &mut self.layout else {
+            panic!("only an attached body activates")
+        };
+        if attached.active {
             return false;
         }
-        self.active = true;
+        attached.active = true;
         for (local, placements) in self.placements.iter().enumerate() {
             let pipeline = self.global(PipelineId(local));
             for placement in placements {
@@ -425,7 +438,7 @@ impl Body {
 
     /// Hold back the pipelines that follow the inner pipelines and the step, once the body runs.
     pub(super) fn hold_followers(&self, dispatcher: &Dispatcher) {
-        if !self.active {
+        if !self.is_active() {
             return;
         }
         dispatcher.hold_followers(self.attached().hold);
@@ -458,7 +471,7 @@ impl Body {
     /// The scope pipeline once its step has finished. The step reads every inner pipeline and
     /// takes arrivals its scope closes at the finish, so it finishes after all of them.
     pub(super) fn finished_pipeline(&self, dispatcher: &Dispatcher) -> Option<PipelineId> {
-        let attached = self.attached.as_ref()?;
+        let attached = self.attachment()?;
         (dispatcher.states[attached.step.0].phase.load() == Phase::Finished)
             .then_some(attached.pipeline)
     }
@@ -582,7 +595,7 @@ impl Body {
     /// `ready` says a request can run: a writer's attempt reads its store, which must be open.
     /// Whether it queued or closed anything.
     pub(super) fn queue_offered(&mut self, dispatcher: &Dispatcher, ready: bool) -> bool {
-        let Some(pipeline) = self.attached.as_ref().map(|attached| attached.pipeline) else {
+        let Some(pipeline) = self.attachment().map(|attached| attached.pipeline) else {
             return false;
         };
         // An offer comes from a push that also queues packages to the pipelines the drive pulls
@@ -657,7 +670,9 @@ impl Body {
             placement.set(None);
             placement.set_scope(None);
         }
-        self.active = false;
+        if let BodyLayout::Attached(attached) = &mut self.layout {
+            attached.active = false;
+        }
     }
 
     /// Queue with `work` what pushes from outside the body brought its pipelines since the last
