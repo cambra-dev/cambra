@@ -2431,8 +2431,15 @@ fn check_modules(
                 wanted.insert(binding.name.clone());
             }
         }
+        // Each pass's mints are derived from what they stand for, so an error at a binding
+        // A-normalization moved is blamed on its definition rather than on the nearest
+        // enclosing node, which may be a std declaration's.
+        let derivation = DerivationSession::install();
         tree = anf::run(tree);
+        blame.derive(&derivation.into_log(), Phase::Anf);
+        let derivation = DerivationSession::install();
         tree = mut_read::run(tree);
+        blame.derive(&derivation.into_log(), Phase::MutRead);
         let derivation = DerivationSession::install();
         tree = comprehension::run(tree, ctx.lowering_ctx().shared_holes());
         blame.derive(&derivation.into_log(), Phase::Comprehension);
@@ -2496,12 +2503,14 @@ fn check_modules(
             );
         }
         if contracts_of == Some(check.file) {
-            contracts.extend(
-                checked
-                    .contracts
-                    .into_iter()
-                    .map(|(name, contract)| (SmolStr::from(name.base()), contract)),
-            );
+            // A contract printed for a reader names no A-normalization temp: a public member
+            // bound after one reads it in its type, and the temp is machinery no program
+            // mentions.
+            let temps = anf::temp_respelling(&tree);
+            contracts.extend(checked.contracts.into_iter().map(|(name, contract)| {
+                let contract = contract.map_type(|ty| *ty = temps.apply_type(ty));
+                (SmolStr::from(name.base()), contract)
+            }));
         }
         let own_spans: Vec<Span> = checked
             .errors
@@ -2526,8 +2535,11 @@ fn check_modules(
                 .is_none_or(|home| !rejected.contains(&home))
                 || blame.span(error.node_id, Some(before)).file == check.file
         });
-        let respelling =
-            crate::ccl::subst::Subst::then(&mut_read::read_respelling(&tree), &reads_named);
+        // As in `run_passes`: an A-normalization temp reads as the term it names.
+        let respelling = crate::ccl::subst::Subst::then(
+            &anf::temp_respelling(&tree),
+            &crate::ccl::subst::Subst::then(&mut_read::read_respelling(&tree), &reads_named),
+        );
         let errors = errors
             .map(|mut located| {
                 located.respell(&respelling);

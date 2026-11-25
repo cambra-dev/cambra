@@ -252,15 +252,14 @@ fn a_constant_family_s_holes_read_no_binder(#[case] groups: &str) {
 }
 
 /// A family parameter applied at two sites, in one declaration and through two applications of
-/// another: the two applications' domains reach its variable through two binders, and read in
-/// its own terms they are one domain.
+/// another, to one group-by: the two applications' domains reach its variable through two
+/// binders, and read in its own terms they are one domain.
 #[rstest]
 #[case::in_one_declaration(
     indoc! {r#"
         type Two(K, V: K => Type) = {(k: K) |=> V(k), (j: K) |=> V(j)}
         g = groupby([1, 2, 3], \x -> x > 1)
-        h = groupby([1, 2, 3], \x -> x > 1)
-        t = Two::new((g, h))
+        t = Two::new((g, g))
         match t:
             case Two::new(p):
                 sum([sum(grp) for grp in p.0]) + sum([sum(grp) for grp in p.1])
@@ -272,8 +271,7 @@ fn a_constant_family_s_holes_read_no_binder(#[case] groups: &str) {
         type G2(K, V: K => Type) = (k: K) |=> V(k)
         type Pair(K, V: K => Type) = {G2(K, V), G2(K, V)}
         g = groupby([1, 2, 3], \x -> x > 1)
-        h = groupby([1, 2, 3], \x -> x > 1)
-        t = Pair::new((G2::new(g), G2::new(h)))
+        t = Pair::new((G2::new(g), G2::new(g)))
         match t:
             case Pair::new(p):
                 match p.0:
@@ -286,19 +284,26 @@ fn a_family_applied_at_two_sites(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
 
-/// Two applications of one family over different domains have none in common.
-#[test]
-fn a_family_applied_at_two_sites_over_two_domains_is_refused() {
-    check_compile_error(
-        indoc! {r#"
-            type Two(K, V: K => Type) = {(k: K) |=> V(k), (j: K) |=> V(j)}
-            g = groupby([1, 2, 3], \x -> x > 1)
-            h = groupby([1, 2, 3, 4], \x -> x > 1)
-            t = Two::new((g, h))
-            1
-        "#},
-        "Collection domains have no common answer",
-    );
+/// Two applications of one family over different domains have none in common. Two group-bys
+/// have two domains even over equal collections and keys: a group-by's domain belongs to its
+/// site (`src/ccl/design/collections.md`, "A group-by's collection is bound once").
+#[rstest]
+#[case::different_collections(indoc! {r#"
+    type Two(K, V: K => Type) = {(k: K) |=> V(k), (j: K) |=> V(j)}
+    g = groupby([1, 2, 3], \x -> x > 1)
+    h = groupby([1, 2, 3, 4], \x -> x > 1)
+    t = Two::new((g, h))
+    1
+"#})]
+#[case::two_sites_over_equal_collections(indoc! {r#"
+    type Two(K, V: K => Type) = {(k: K) |=> V(k), (j: K) |=> V(j)}
+    g = groupby([1, 2, 3], \x -> x > 1)
+    h = groupby([1, 2, 3], \x -> x > 1)
+    t = Two::new((g, h))
+    1
+"#})]
+fn a_family_applied_at_two_sites_over_two_domains_is_refused(#[case] code: &str) {
+    check_compile_error(code, "Collection domains have no common answer");
 }
 
 /// A diagnostic writes the inferred family with its binder, which the group's domain reads. The

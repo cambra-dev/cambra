@@ -86,8 +86,8 @@ impl Rewrite<'_> {
         let comprehension = matches!(e.node, TypedExprNode::Comprehension { .. });
         self.depth += usize::from(comprehension);
         // A refinement predicate is a term like any other and can hold a
-        // comprehension — `lower_groupby` copies its collection into one, and
-        // that collection is whatever the program iterated.
+        // comprehension, such as one inside a group-by's key function, which
+        // `lower_groupby` copies into one.
         e.walk_type_slots_mut(|t| self.ty(t));
         e.walk_children_mut(|c| self.expr(c));
         if is_loop(e) {

@@ -747,9 +747,10 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
 }
 
 /// The checked Barendregt invariant at the minting boundary: right after
-/// uniquification every binding site is a [`Name::Unique`]. `Synthetic`
-/// binders don't exist yet (later passes mint them) and the element binder is
-/// never a binding site, so `Unique` is exact here — which is the whole point
+/// uniquification every binding site is a [`Name::Unique`], or an A-normalization
+/// temp lowering binds a group-by's collection to, which is minted fresh.
+/// Other `Synthetic` binders don't exist yet (later passes mint them) and the
+/// element binder is never a binding site, so the check is exact here — which is the whole point
 /// of keeping the variants distinct. Global binder *uniqueness* is deliberately
 /// not asserted — lowering copies pre-minted subtrees (see module docs), so a
 /// uid may occur at several binding sites; the convention is "distinct
@@ -764,7 +765,7 @@ fn assert_all_binders_minted(expr: &Expr) {
         // free — it cannot fall through a wildcard arm.
         e.walk_bound_names(|name| {
             assert!(
-                matches!(name, Name::Unique { .. }),
+                matches!(name, Name::Unique { .. }) || name.is_anf_temp(),
                 "uniquify must mint every binding site to a Unique name; `{name:?}` is not",
             );
         });

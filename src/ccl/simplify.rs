@@ -941,18 +941,24 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `expr`'s domain is one whose keys only a collection holds — a projected
-/// witness, which no extent enumerates. Collapsing `expr ≫ const(𝑔)` would keep the domain as
-/// a type and lose the keys, so planning could not rebuild which positions exist.
+/// Whether `expr`'s domain is one whose keys only a collection holds: a projected witness,
+/// which no extent enumerates, or a membership in a collection
+/// (`{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`), whose keys are the image of `𝑚`. Collapsing
+/// `expr ≫ const(𝑔)` would keep the domain as a type and lose the keys. Once planning has
+/// marked the site, `expr` is the iteration source that enumerates them (`m ▷ converse ▷
+/// map_domain`), and nothing after marking rebuilds a source from a type.
 fn keys_only_in_the_data(expr: &Expr) -> bool {
-    fn projected(ty: &Type) -> bool {
-        match ty.peel_refinements() {
-            Type::WitnessProjection(_) => true,
-            Type::Tuple(cs) => cs.iter().any(projected),
-            _ => false,
-        }
+    fn in_the_data(ty: &Type) -> bool {
+        ty.refinements()
+            .iter()
+            .any(|r| r.membership_collection().is_some())
+            || match ty.peel_refinements() {
+                Type::WitnessProjection(_) => true,
+                Type::Tuple(cs) => cs.iter().any(in_the_data),
+                _ => false,
+            }
     }
-    expr.ty.domain().is_some_and(|d| projected(&d))
+    expr.ty.domain().is_some_and(|d| in_the_data(&d))
 }
 
 /// Whether the morphism `expr`, composed after a collection, drops some of its keys: a

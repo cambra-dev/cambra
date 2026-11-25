@@ -735,6 +735,10 @@ pub struct LoweringContext {
     /// "`_` is the value being refined" a local rule of the predicate rather than
     /// a global meaning of `_`.
     pub(super) in_refinement_predicate: bool,
+    /// How many terms being lowered around this point a later pass copies into a type: a
+    /// group-by's key function and a comprehension's guard. A group-by lowered inside one, or
+    /// inside a refinement predicate, keeps its collection inline (`exprs::bind_grouped`).
+    pub(super) in_copied_term: u32,
     /// How many `Module{…}` literals the type being lowered stands in, where `Module::*` names
     /// the state of the module the innermost describes (save/restore, as above).
     pub(super) in_module_type: u32,
@@ -947,6 +951,14 @@ impl LoweringContext {
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
     ) {
         self.sources.insert(name.into(), source);
+    }
+
+    /// Lower with `f` a term a later pass copies into a type ([`Self::in_copied_term`]).
+    pub(super) fn with_copied_term<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.in_copied_term += 1;
+        let out = f(self);
+        self.in_copied_term -= 1;
+        out
     }
 
     /// Perfom some action on the context with
