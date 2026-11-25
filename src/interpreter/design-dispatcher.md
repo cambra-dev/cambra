@@ -235,7 +235,7 @@ paused run unplaces them ([Pause and reload](#pause-and-reload)).
 ## Waiting for input completion
 
 A scope holds the positions a round or attempt could not decide as waiting for inputs
-(`Offered::waiting`). A loop's round decides nothing at a position whose body read an input that is
+(`Offered::retry`). A loop's round decides nothing at a position whose body read an input that is
 not final yet, as a sum over a live source. A writer's attempt is held the same way once every
 writer has attempted without changing the store, an input's release or the decisions to retry. The
 request then ends with those positions unreleased, so a drained boundary holds no claim of it.
@@ -250,11 +250,12 @@ source's first poll of the run does, reaches them.
 
 A push that reaches one of the scope's entries and that no pipeline there takes wakes the scope
 (`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake
-offers the scope its waiting positions and takes them (`Offered::offered_waiting`), so a later push
-offers them only after the next request leaves them waiting again. A placed entry records what
-reached it (`Offered::grown`). The next request runs the positions that waited
-(`Offered::take_waited`), and its first round or attempt queues what grew on the pipelines it
-reached, so they read it. A closing round queues what grew too: it runs its rows' readers, a nested
+moves its one retry guard from parked to ready. Fresh input is recorded separately. An ordinary
+request already in the ordered queue takes the retry at its start. Otherwise, admission queues
+the ready guard together with any fresh input and marks it queued. Further wakes remember input
+growth without queuing a second retry. A placed entry also records which body input grew
+(`Offered::grown`). The next request takes the retry guard once (`Body::take_waited`). Its first
+round or attempt queues what grew on each affected pipeline. A closing round queues what grew too: it runs its rows' readers, a nested
 loop's among them, and a nested loop is offered only the positions its readers have read. A loop
 first steps its store over the waiting positions, so its drive emits past the ones now decided, and
 runs again the round it left undecided. A push can wake the scope while no position waits
