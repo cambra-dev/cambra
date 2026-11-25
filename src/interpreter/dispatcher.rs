@@ -371,6 +371,14 @@ impl PipelineState {
 #[cfg(test)]
 type TransitionHook = Box<dyn FnOnce() + Send>;
 
+#[cfg(test)]
+type StepProbe = Arc<dyn Fn(PipelineId) + Sync + Send>;
+#[cfg(test)]
+thread_local! {
+    // Test runs copy their own probe into the dispatcher before starting workers.
+    static STEP_PROBE: std::cell::RefCell<Option<StepProbe>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The graph of pipelines, the work packages queued for each pipeline, and what each has consumed.
 pub struct Dispatcher {
     /// The held rows a cut of a work package targets, where its shape supports cutting.
@@ -407,6 +415,8 @@ pub struct Dispatcher {
     /// Whether `events` records; off, no test-only lock orders the acknowledgements.
     #[cfg(test)]
     recording: bool,
+    #[cfg(test)]
+    scope_step_probe: Option<StepProbe>,
     #[cfg(test)]
     transition_hooks: [OnceLock<Mutex<Option<TransitionHook>>>; 2],
     /// How many pipelines quiescence checks have read the counts of.
@@ -501,6 +511,8 @@ impl Dispatcher {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             recording: true,
+            #[cfg(test)]
+            scope_step_probe: STEP_PROBE.with_borrow(Clone::clone),
             #[cfg(test)]
             transition_hooks: std::array::from_fn(|_| OnceLock::new()),
             #[cfg(test)]
@@ -1268,22 +1280,6 @@ impl Dispatcher {
     pub fn claim(&self, preferred: Option<PipelineId>) -> Next {
         loop {
             match self.try_claim(preferred) {
-                Next::Wait(generation) => self.wait(generation),
-                next => return next,
-            }
-        }
-    }
-
-    /// [`try_claim_where`](Self::try_claim_where), blocking while there is nothing to claim, as
-    /// [`claim`](Self::claim) does.
-    pub(crate) fn claim_where(
-        &self,
-        preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: &dyn Fn(PipelineId) -> bool,
-    ) -> Next {
-        loop {
-            match self.try_claim_where(preferred, takes, finishes) {
                 Next::Wait(generation) => self.wait(generation),
                 next => return next,
             }

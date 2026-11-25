@@ -27,7 +27,7 @@ pub(crate) struct InductionRun {
     starts: Vec<PipelineId>,
 }
 
-/// The coordinator alone chooses and settles a loop's rounds.
+/// One handler at a time chooses and settles this loop's rounds.
 #[derive(Default)]
 pub(super) struct LoopSchedule {
     phase: LoopPhase,
@@ -325,7 +325,7 @@ impl Body {
     }
 
     /// A step reads the active round's guard. Its outstanding dispatcher claim prevents
-    /// another admission until the coordinator settles the round and acknowledges the claim.
+    /// another admission until the handler settles the round and acknowledges the claim.
     pub(super) fn queue_step(&self, dispatcher: &Dispatcher, guard: &TileGuard) -> bool {
         let step = self.attached().step;
         if dispatcher.outstanding(step) != 0

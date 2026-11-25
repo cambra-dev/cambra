@@ -1,6 +1,7 @@
 //! Shared native breaker execution: worker threads that claim the packages of admitted pipelines
 //! from the run's dispatcher. See `src/interpreter/design-dispatcher.md`, "Shared native pipeline
 //! execution".
+use super::plan::ScopeClaim;
 use super::*;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -80,6 +81,12 @@ pub(super) struct WorkerPool {
     /// How many workers the run has; with one, the coordinator claims everything and no thread
     /// starts.
     count: usize,
+    parallel_scopes: bool,
+    /// Claims selected in the same settlement pass, checked for pairwise independence.
+    // shared-state-ok: workers take already claimed dispatcher packages from this queue.
+    scope_claims: Mutex<Vec<ScopeClaim>>,
+    /// Includes queued and running scope claims until all their pushes are visible.
+    scope_pending: AtomicUsize,
     /// Per pipeline, its breaker and whether its packages run beside each other, where the
     /// pipeline is admitted.
     specs: Vec<Option<Spec>>,
@@ -106,6 +113,7 @@ impl WorkerPool {
         count: usize,
         targets: Vec<Option<WorkerTarget>>,
         bodies: Vec<Option<HoldGroup>>,
+        parallel_scopes: bool,
     ) -> Self {
         assert!(count > 0, "a run has at least one worker");
         debug_assert_eq!(
@@ -132,6 +140,9 @@ impl WorkerPool {
             .collect();
         Self {
             count,
+            parallel_scopes,
+            scope_claims: Mutex::default(),
+            scope_pending: AtomicUsize::new(0),
             #[cfg(test)]
             stats: (0..specs.len()).map(|_| Stats::default()).collect(),
             #[cfg(test)]
@@ -144,7 +155,7 @@ impl WorkerPool {
 
     /// Whether the run starts worker threads: more than one worker, and a pipeline for them.
     fn threaded(&self) -> bool {
-        self.count > 1 && self.specs.iter().any(Option::is_some)
+        self.count > 1 && (self.parallel_scopes || self.specs.iter().any(Option::is_some))
     }
 
     /// Whether `pipeline`'s packages are the workers' to claim.
@@ -213,7 +224,10 @@ impl WorkerPool {
             let _worker = dispatcher.worker();
             let mut preferred = None;
             loop {
-                match dispatcher.claim_where(
+                if !dispatcher.has_failed() && self.help_scope(dispatcher) {
+                    continue;
+                }
+                match dispatcher.try_claim_where(
                     preferred,
                     &|pipeline| self.admits(pipeline),
                     &|pipeline| self.finishes(pipeline),
@@ -239,16 +253,74 @@ impl WorkerPool {
                         dispatcher.wake_claimants();
                     }
                     Next::Done | Next::Failed => break,
-                    Next::Wait(_) => unreachable!("a worker's claim blocks while it waits"),
+                    Next::Wait(generation) => {
+                        if !self.help_scope(dispatcher) {
+                            dispatcher.wait(generation);
+                        }
+                    }
                 }
             }
         });
         #[cfg(test)]
-        {
-            let mut counters = self.counters.lock().unwrap_or_else(PoisonError::into_inner);
-            counters[0] += crate::interpreter::commit_operator::RETRIES.with(|c| c.replace(0));
-            counters[1] += transaction_scope::STALLS.with(|c| c.replace(0));
+        self.collect_counters();
+    }
+
+    #[cfg(test)]
+    fn collect_counters(&self) {
+        let mut counters = self.counters.lock().unwrap_or_else(PoisonError::into_inner);
+        counters[0] += crate::interpreter::commit_operator::RETRIES.with(|c| c.replace(0));
+        counters[1] += transaction_scope::STALLS.with(|c| c.replace(0));
+    }
+
+    fn help_scope(&self, dispatcher: &Dispatcher) -> bool {
+        if self.scope_pending.load(Ordering::Acquire) == 0 {
+            return false;
         }
+        let claim = self
+            .scope_claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let Some(claim) = claim else { return false };
+        claim.run(dispatcher);
+        #[cfg(test)]
+        self.collect_counters();
+        self.scope_pending.fetch_sub(1, Ordering::AcqRel);
+        dispatcher.wake_claimants();
+        true
+    }
+
+    /// Run these independent transitions on the current pool. Join their side effects before the
+    /// next publication pass, live poll, or finish. No scope holds a worker while waiting for input.
+    pub(super) fn run_scopes(&self, dispatcher: &Dispatcher, mut claims: Vec<ScopeClaim>) {
+        let first = claims.pop().expect("at least one scope claim");
+        if claims.is_empty() {
+            first.run(dispatcher);
+            return;
+        }
+        {
+            let mut queue = self
+                .scope_claims
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A helper can already be trying to pop after observing the preceding batch.
+            // Publish the new count before releasing any of this batch's claims.
+            self.scope_pending.store(claims.len(), Ordering::Release);
+            *queue = claims;
+        }
+        dispatcher.wake_claimants();
+        first.run(dispatcher);
+        loop {
+            let generation = Generation(dispatcher.changes());
+            if self.scope_pending.load(Ordering::Acquire) == 0 || dispatcher.has_failed() {
+                break;
+            }
+            if !self.help_scope(dispatcher) {
+                dispatcher.wait(generation);
+            }
+        }
+        #[cfg(test)]
+        self.hand_over_counters();
     }
 
     /// Add the counters the worker threads counted to this thread's, once they have joined.
@@ -472,6 +544,67 @@ mod tests {
             compile_program(&mut context, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
         run_program_with_workers(&mut program, 8, dop).unwrap()
     }
+    /// The first handler holds its schedule and its store until a distinct worker enters the
+    /// second one. A serial implementation times out instead of satisfying the test by luck.
+    #[rstest_log::rstest]
+    fn independent_scope_steps_overlap(#[values(false, true)] transactions: bool) {
+        use super::super::{PipelineId, STEP_PROBE};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let source = if transactions {
+            indoc::indoc! {"
+                a: Mut(Int, Txn) := 0
+                b: Mut(Int, Txn) := 0
+                for x in [1, 2, 3]:
+                    with begin():
+                        a := a + x
+                for y in [4, 5]:
+                    with begin():
+                        b := b + y
+                await_final(a) + await_final(b)
+            "}
+        } else {
+            indoc::indoc! {"
+                a := 0
+                b := 0
+                for x in [1, 2, 3]:
+                    a += x
+                for y in [4, 5]:
+                    b += y
+                a + b
+            "}
+        };
+        let expected = evaluate(source, 1).main.expect("a serial result");
+        let entered = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let observed = entered.clone();
+        let probe = Arc::new(move |pipeline: PipelineId| {
+            let (entries, changed) = &*observed;
+            let mut entries = entries.lock().unwrap();
+            if entries.len() == 2 {
+                return;
+            }
+            entries.push((pipeline.0, std::thread::current().id()));
+            changed.notify_all();
+            let (entries, _) = changed
+                .wait_timeout_while(entries, Duration::from_secs(5), |e| e.len() < 2)
+                .unwrap();
+            assert_eq!(
+                entries.len(),
+                2,
+                "another independent step must enter before this handler exits"
+            );
+        });
+        STEP_PROBE.set(Some(probe));
+        let run = evaluate(source, 2);
+        STEP_PROBE.set(None);
+        assert_eq!(run.main, Some(expected));
+        let entries = entered.0.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].0, entries[1].0);
+        assert_ne!(entries[0].1, entries[1].1);
+    }
+
     #[test]
     fn compiled_programs_use_shared_native_breakers_at_each_dop() {
         let values = (0..512)
@@ -527,7 +660,7 @@ mod tests {
         );
     }
     /// A `:=` loop over a collection the workers build answers at more than one worker what it
-    /// answers at one: its body runs on the coordinator, and its source on the workers.
+    /// answers at one: its source can run on the workers between rounds.
     #[test]
     fn a_loop_answers_at_each_dop_what_it_answers_at_one() {
         let values = (0..512)
