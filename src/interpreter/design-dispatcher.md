@@ -447,15 +447,16 @@ step cannot pass an unfinished inner row. Other independent work remains claimab
 
 Quiescence alone does not permit a step: a body breaker can hold complete output it has not yet
 published. The controller publishes held output until no further work appears, then releases the
-step's dependencies. At a settled boundary the coordinator rotates through ready scopes. It selects
-up to the worker count, checking each candidate against the scopes already selected. Nested scopes,
-writers sharing a store and scopes connected by an upstream dependency settle separately. Two
-loops can share an ordinary input or feed the same downstream consumer and still step together.
+step's dependencies. The request and step are ordered dispatcher pipelines. Any admitted
+worker can claim them directly. The loop schedule or writer phase serializes that scope's
+transitions. A handler releases its store before queuing the new body's work.
 
-The coordinator claims independent request or step packages and hands them to the existing pool.
-It executes one transition itself and joins the others before publishing again, finishing a
-scope, or reporting a live idle boundary. Each handler releases its store before queuing body work.
-A request waiting for its next step or for new input retains its state between worker claims.
+For an independent scope, a claimant can publish the body's held output, release its follower
+hold and enqueue the next settled step. It tries the scope lock so a busy scope can be skipped.
+The planner checks reads, follows, shared stores and containment when identifying independent
+scopes. Scopes that share a store or depend on another scope use the coordinator's rotating
+settlement pass. When one of these has work pending, independent scopes yield to that pass.
+A parked request resumes through its scope's intake when input or peer progress wakes it.
 
 The first request initializes the store after its drive has read the source. A position package
 emits only the next covered position. A nested row also has a closing round, including when it has
@@ -599,12 +600,12 @@ reads stays the coordinator's. A loop's drive source offers through its entry in
 
 With more than one worker, two kinds of claimant share the dispatcher:
 
-- A worker thread claims packages and finishes of admitted pipelines and executes selected
-  scope transitions. It sleeps in `Dispatcher::wait` when neither kind of work is available.
+- A worker thread claims packages of admitted breaker and scope pipelines and the finishes of
+  admitted breakers. It sleeps in `Dispatcher::wait` when no claim or scope can advance.
 - The coordinator claims any package and any finish (`Dispatcher::try_claim_where`). A claim of an
   admitted pipeline runs as a worker's would (`WorkerPool::consume_on_coordinator`,
-  `WorkerPool::finish_on_coordinator`). It selects loop and transaction transitions for the pool and runs the resume
-  pass ([A loop in rounds](#a-loop-in-rounds)) and the polling of live sources.
+  `WorkerPool::finish_on_coordinator`). It also runs the shared settlement pass
+  ([A loop in rounds](#a-loop-in-rounds)) and polls live sources.
 
 ### A worker's claim
 
@@ -633,8 +634,9 @@ free and pulls the round's state, not the snapshot from before the round.
 
 A round's step passes only output the resume pass has published. Each scope body has one follower
 hold over its inner pipelines and its step (`Dispatcher::add_hold_group`). The coordinator re-holds
-a scope's body after a coordinator claim or a joined batch of scope transitions (`Execution::consume`). A worker re-holds the body it
-consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass reads the
+scope bodies after a coordinator-only claim. A scope transition re-holds its own body as it
+opens the next round or attempt. A breaker worker re-holds its body before it acknowledges the
+package (`WorkerPool::consume`). The resume pass reads the
 body's hold before it publishes and releases it only where the hold is unchanged
 (`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release decided
 before a worker's consume published fails, and the step waits for the next pass.
@@ -645,10 +647,9 @@ Both drivers claim through one routine (`Execution::claim_until_quiescent`), whi
 pipeline has finished, the run has failed, or the run is quiescent. A coordinator claim that answers
 `Next::Wait` goes on in this order:
 
-1. While a worker holds a claim, or a package or finish of an admitted pipeline is in flight,
-   claimable or finishing (`WorkerPool::may_progress`), the coordinator sleeps in
-   `Dispatcher::wait`. A worker counts itself busy once its claim returns; until then the package
-   in flight or the pipeline finishing shows the claim.
+1. It first gives independent scopes a chance to advance. While a worker can still publish, or an
+   admitted breaker can run, it sleeps in `Dispatcher::wait`. A worker registers a package claim
+   under its queue lock. A retained scope request may span several claims and idle intervals.
 2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
    the routine answers that the run is quiescent. A run with no live source panics. A live run
@@ -670,11 +671,11 @@ No two threads wait on each other through these rules:
   consumer takes only the lock on its own state and releases it before it notifies another, so a
   landing holds at most one consumer's lock at a time. No consumer takes a breaker handle or a store
   while it is notified.
-- A scope handler takes its store before reaching its body's breaker handles. During a batch,
-  the coordinator joins all selected transitions before resuming its own work on the scopes.
-  The planner excludes nested scopes, shared stores and dependencies from the same batch.
-  Ordinary breaker packages take stores with `try_write`. A handler releases its store before
-  queuing the round's packages.
+- A scope handler takes its schedule lock before its store and releases the store before queuing
+  body packages. A writer validates commits under the shared store lock. Publication of an
+  independent body takes the schedule lock with `try_lock` and releases the store before walking
+  breaker handles. The coordinator reserves an ordinary store input before claiming its package
+  or finish, so it can keep looking for work when a transition owns that store.
 
 A wait for a handle is therefore a wait on a thread that holds a handle further upstream and waits
 for nothing but handles further upstream still. The pipelines form a DAG, since a loop's cycle runs

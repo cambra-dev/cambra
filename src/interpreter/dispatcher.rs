@@ -36,7 +36,9 @@ use crate::interpreter::{
 };
 
 pub(crate) mod loop_scope;
+pub use loop_scope::{Offered, Offers};
 mod plan;
+mod scope;
 pub(crate) mod transaction_scope;
 mod workers;
 
@@ -1188,12 +1190,16 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one after observing its dependencies' progress. An ordered pipeline has at most one package
     /// in flight.
-    fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
+    fn claim_from(&self, pipeline: usize, claimed: &dyn Fn()) -> Option<WorkPackage> {
         let state = &self.states[pipeline];
         state
             .queue
             .claim(pipeline, self.infos[pipeline].ordered, || {
-                self.takes_from(pipeline)
+                if !self.takes_from(pipeline) {
+                    return false;
+                }
+                claimed();
+                true
             })
     }
 
@@ -1241,6 +1247,16 @@ impl Dispatcher {
         takes: &dyn Fn(PipelineId) -> bool,
         finishes: &dyn Fn(PipelineId) -> bool,
     ) -> Next {
+        self.try_claim_with(preferred, takes, finishes, &|| {})
+    }
+
+    fn try_claim_with(
+        &self,
+        preferred: Option<PipelineId>,
+        takes: &dyn Fn(PipelineId) -> bool,
+        finishes: &dyn Fn(PipelineId) -> bool,
+        claimed: &dyn Fn(),
+    ) -> Next {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
         let generation = self.generation.load(Ordering::SeqCst);
@@ -1257,7 +1273,7 @@ impl Dispatcher {
         let scan = preferred.map(|p| p.0).into_iter().chain(0..count);
         if let Some(package) = scan
             .filter(|&p| takes(PipelineId(p)))
-            .find_map(|p| self.claim_from(p))
+            .find_map(|p| self.claim_from(p, claimed))
         {
             return Next::Package(package);
         }
@@ -1581,13 +1597,13 @@ impl Dispatcher {
     /// recorded as claimed. Unlike a claim, it never begins a finish.
     #[cfg(test)]
     pub(crate) fn pop(&self) -> Option<WorkPackage> {
-        (0..self.infos.len()).find_map(|p| self.claim_from(p))
+        (0..self.infos.len()).find_map(|p| self.claim_from(p, &|| {}))
     }
 
     /// The package at the front of `pipeline`'s queue, claimed, where a claim may take one.
     #[cfg(test)]
     pub(crate) fn claim_of(&self, pipeline: PipelineId) -> Option<WorkPackage> {
-        self.claim_from(pipeline.0)
+        self.claim_from(pipeline.0, &|| {})
     }
 
     /// Finish `pipeline` as a claim does, with `push` in place of the breaker: begin the finish,
@@ -2078,107 +2094,6 @@ pub struct Entry {
 // shared-state-ok: the drive and the entry in front of its source both hold it, the planner
 // writes it before the run, and what crosses it is a scope's intake and a tiling, never a tile.
 pub type CompletionTarget = Arc<RwLock<Option<(Offers, Tiling)>>>;
-
-/// What a scope's input has offered it and the scope has not queued yet: a scope queues a request
-/// only where it can run ([`Body::queue_offered`](loop_scope::Body::queue_offered)), and holds
-/// the rest here.
-#[derive(Default)]
-pub struct Offered {
-    intake: ScopeInput,
-    close: IntakeClose,
-    /// Per inner pipeline, what pushes from outside the body brought it since the last round or
-    /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
-    /// reads what grew.
-    pub grown: Vec<(PipelineId, TileGuard)>,
-    /// Positions the next request must revisit. Fresh input stays in the intake.
-    retry: Option<Retry>,
-    /// A wake that the next decision to park must observe.
-    woken: bool,
-}
-
-/// Ordinary requests consume each offered region. A parent-fed loop retains delivery evidence
-/// because the parent can give it the same row again in a closing round.
-enum ScopeInput {
-    Ordinary(Option<TileGuard>),
-    Parent(Box<ParentRows>),
-}
-
-impl Default for ScopeInput {
-    fn default() -> Self {
-        Self::Ordinary(None)
-    }
-}
-
-struct ParentRows {
-    input: Tiling,
-    held: Option<TileGuard>,
-    delivered: Option<TileGuard>,
-}
-
-impl ParentRows {
-    fn ready(&self) -> Option<(TileGuard, TileGuard)> {
-        let held = self.held.as_ref()?;
-        let rest = guard_minus(held, self.delivered.as_ref()?).closed_over(&self.input);
-        Some((guard_minus(held, &rest), rest))
-    }
-}
-
-#[derive(Default, PartialEq, Eq)]
-enum IntakeClose {
-    #[default]
-    Open,
-    Requested,
-    Closed,
-}
-
-struct Retry {
-    guard: TileGuard,
-    phase: RetryPhase,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RetryPhase {
-    /// Await input, or an ordinary request that can revisit the positions.
-    Parked,
-    /// A wake made the positions eligible for admission.
-    Ready,
-    /// A package has been queued to cover these positions.
-    Queued,
-}
-
-impl Offered {
-    fn offer(&mut self, guard: TileGuard) {
-        let region = match &mut self.intake {
-            ScopeInput::Ordinary(pending) => pending,
-            ScopeInput::Parent(rows) => &mut rows.delivered,
-        };
-        *region = Some(match region.take() {
-            Some(before) => before.union(&guard),
-            None => guard,
-        });
-    }
-
-    fn wake(&mut self) {
-        if let Some(retry) = &mut self.retry
-            && retry.phase == RetryPhase::Parked
-        {
-            retry.phase = RetryPhase::Ready;
-        } else {
-            self.woken = true;
-        }
-    }
-
-    fn ready_retry(&mut self) -> Option<&mut Retry> {
-        self.retry
-            .as_mut()
-            .filter(|retry| retry.phase == RetryPhase::Ready)
-    }
-}
-
-/// A scope's [`Offered`], shared with the entry in front of its drive's source.
-// shared-state-ok: the scope and the entry in front of its drive's source both hold it; what
-// crosses it is a guard of the scope's input, never a tile.
-pub type Offers = Arc<Mutex<Offered>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
@@ -2764,7 +2679,8 @@ fn push_held(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
     pipelines: impl IntoIterator<Item = PipelineId>,
-) {
+) -> bool {
+    let mut published = false;
     for pipeline in pipelines {
         if dispatcher.states[pipeline.0].phase.load() == Phase::Finished {
             continue;
@@ -2778,9 +2694,11 @@ fn push_held(
             }
         });
         if let Some(pushes) = landed {
+            published |= !pushes.morsels.is_empty();
             dispatcher.land(pushes);
         }
     }
+    published
 }
 
 /// Finish `pipeline`, after checking what a finish rests on.

@@ -60,6 +60,47 @@ pub(super) enum WriterPhase {
 }
 
 impl WriterPhase {
+    pub(super) fn begin(
+        &mut self,
+        store: &StoreCell,
+        writer: usize,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+    ) {
+        let work = transaction(store).begin_request(self, dispatcher, writer, package);
+        work.queue(dispatcher);
+    }
+
+    pub(super) fn step(
+        &mut self,
+        store: &StoreCell,
+        writer: usize,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+    ) {
+        #[cfg(test)]
+        let pipeline = package.pipeline;
+        dispatcher.acknowledge(package);
+        let (done, work) = {
+            let mut store = transaction(store);
+            #[cfg(test)]
+            if let Some(probe) = &dispatcher.scope_step_probe {
+                probe(pipeline);
+            }
+            store.finish_request(self, dispatcher, writer)
+        };
+        work.queue(dispatcher);
+        if self.open() {
+            transaction(store)
+                .writer_run(writer)
+                .body
+                .hold_followers(dispatcher);
+        }
+        scope::complete_request(dispatcher, done, |pushes| {
+            pushes.push_final(&*transaction(store))
+        });
+    }
+
     pub(super) fn step_guard(&self) -> Option<&TileGuard> {
         match self {
             Self::Attempt { guard, .. } => Some(guard),

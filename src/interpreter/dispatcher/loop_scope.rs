@@ -48,6 +48,48 @@ enum LoopPhase {
 }
 
 impl LoopSchedule {
+    pub(super) fn begin(
+        &mut self,
+        store: &StoreCell,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+    ) {
+        let (done, work) = induction(store).begin_shared(self, dispatcher, package);
+        work.queue(dispatcher);
+        induction(store).hold_followers(dispatcher);
+        Self::complete(store, dispatcher, done);
+    }
+
+    pub(super) fn step(
+        &mut self,
+        store: &StoreCell,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+    ) {
+        let (request, outcome) = {
+            let mut store = induction(store);
+            #[cfg(test)]
+            if let Some(probe) = &dispatcher.scope_step_probe {
+                probe(package.pipeline);
+            }
+            store.complete_round(self)
+        };
+        dispatcher.acknowledge(package);
+        let (done, work) = induction(store).queue_package_round(self, dispatcher, request, outcome);
+        work.queue(dispatcher);
+        induction(store).hold_followers(dispatcher);
+        Self::complete(store, dispatcher, done);
+    }
+
+    fn complete(store: &StoreCell, dispatcher: &Dispatcher, done: Option<WorkPackage>) {
+        scope::complete_request(dispatcher, done, |pushes| {
+            let store = induction(store);
+            if store.pushes_while_consuming() {
+                pushes.push_final(&*store);
+            }
+        });
+    }
+
     pub(super) fn has_request(&self) -> bool {
         self.round.is_some()
     }
@@ -148,6 +190,116 @@ impl RoundWork {
     }
 }
 
+/// What a scope's input has offered it and the scope has not queued yet: a scope queues a request
+/// only where it can run ([`Body::queue_offered`](loop_scope::Body::queue_offered)), and holds
+/// the rest here.
+#[derive(Default)]
+pub struct Offered {
+    intake: ScopeInput,
+    close: IntakeClose,
+    /// Per inner pipeline, what pushes from outside the body brought it since the last round or
+    /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
+    /// reads what grew.
+    pub grown: Vec<(PipelineId, TileGuard)>,
+    /// Positions the next request must revisit. Fresh input stays in the intake.
+    retry: Option<Retry>,
+    /// A wake that the next decision to park must observe.
+    woken: bool,
+}
+
+/// Ordinary requests consume each offered region. A parent-fed loop retains delivery evidence
+/// because the parent can give it the same row again in a closing round.
+enum ScopeInput {
+    Ordinary(Option<TileGuard>),
+    Parent(Box<ParentRows>),
+}
+
+impl Default for ScopeInput {
+    fn default() -> Self {
+        Self::Ordinary(None)
+    }
+}
+
+struct ParentRows {
+    input: Tiling,
+    held: Option<TileGuard>,
+    delivered: Option<TileGuard>,
+}
+
+impl ParentRows {
+    fn ready(&self) -> Option<(TileGuard, TileGuard)> {
+        let held = self.held.as_ref()?;
+        let rest = guard_minus(held, self.delivered.as_ref()?).closed_over(&self.input);
+        Some((guard_minus(held, &rest), rest))
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum IntakeClose {
+    #[default]
+    Open,
+    Requested,
+    Closed,
+}
+
+struct Retry {
+    guard: TileGuard,
+    phase: RetryPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryPhase {
+    /// Await input, or an ordinary request that can revisit the positions.
+    Parked,
+    /// A wake made the positions eligible for admission.
+    Ready,
+    /// A package has been queued to cover these positions.
+    Queued,
+}
+
+impl Offered {
+    pub(super) fn has_work(&self) -> bool {
+        matches!(self.intake, ScopeInput::Ordinary(Some(_)))
+            || self
+                .retry
+                .as_ref()
+                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
+            || self.close == IntakeClose::Requested
+    }
+
+    pub(super) fn offer(&mut self, guard: TileGuard) {
+        let region = match &mut self.intake {
+            ScopeInput::Ordinary(pending) => pending,
+            ScopeInput::Parent(rows) => &mut rows.delivered,
+        };
+        *region = Some(match region.take() {
+            Some(before) => before.union(&guard),
+            None => guard,
+        });
+    }
+
+    pub(super) fn wake(&mut self) {
+        if let Some(retry) = &mut self.retry
+            && retry.phase == RetryPhase::Parked
+        {
+            retry.phase = RetryPhase::Ready;
+        } else {
+            self.woken = true;
+        }
+    }
+
+    fn ready_retry(&mut self) -> Option<&mut Retry> {
+        self.retry
+            .as_mut()
+            .filter(|retry| retry.phase == RetryPhase::Ready)
+    }
+}
+
+/// A scope's [`Offered`], shared with the entry in front of its drive's source.
+// shared-state-ok: the scope and the entry in front of its drive's source both hold it; what
+// crosses it is a guard of the scope's input, never a tile.
+pub type Offers = Arc<Mutex<Offered>>;
+
 /// A scope's inner pipelines: a loop's body ([`InductionRun`]), or a transaction writer's
 /// ([`WriterRun`](super::transaction_scope::WriterRun)). Planning builds them as a graph of their
 /// own, which execution appends to the run's shared dispatcher between the scope's own pipeline
@@ -167,7 +319,7 @@ pub(super) struct Body {
     pub(super) driver: PipelineId,
     /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
     /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
-    offers: Offers,
+    pub(super) offers: Offers,
 }
 
 enum BodyLayout {
@@ -502,12 +654,7 @@ impl Body {
     /// Whether anything offered is not queued yet.
     pub(super) fn has_offers(&self) -> bool {
         let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        matches!(offered.intake, ScopeInput::Ordinary(Some(_)))
-            || offered
-                .retry
-                .as_ref()
-                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
-            || offered.close == IntakeClose::Requested
+        offered.has_work()
     }
 
     /// Clear every inner pipeline's entries.
