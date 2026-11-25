@@ -259,7 +259,7 @@ runs again the round it left undecided. A push can wake the scope while no posit
 undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
 A nested loop holds each row the round around it gives it until its drive's source delivers the row
-(`Body::ready_rows`). The round around a nested loop steps once the loop has no request queued or
+(`ParentRows::ready`). The round around a nested loop steps once the loop has no request queued or
 open, no delivered row held and no ready retry (`Body::children_have_work`). A held row the source
 has not delivered does not hold back the round around it, which steps and leaves its own position
 waiting. A woken nested loop can retry an earlier row before the loop around it gives it another:
