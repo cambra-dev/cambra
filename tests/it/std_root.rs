@@ -3,10 +3,9 @@
 //!
 //! The compiler embeds only the std modules that compile, so each program loads against every
 //! source under `stdlib/src/` in place of the compiler's std root, with the compiler's prelude
-//! ([`LoadedProgram::load_with_std`]). Each program reaches a std module that uses constructs the
-//! compiler lacks, so the programs are loaded and not compiled: each program, and every std module
-//! it reaches, must parse and resolve its module paths. The `[proposed]` lines in the modules record
-//! what each one waits on.
+//! ([`LoadedProgram::load_with_std`]). The programs are loaded and not compiled
+//! (`stdlib/README.md`, "Tests"): each program, and every std module it reaches, must parse and
+//! resolve its module paths.
 
 use std::path::{Path, PathBuf};
 
@@ -40,17 +39,6 @@ fn cambra_files(dir: &Path) -> Vec<PathBuf> {
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
-}
-
-/// `root`, loaded against the std modules under `stdlib/src/`, which the compiler does not embed
-/// yet, with every other module's file read from `files`.
-pub(crate) fn load_against_std(root: RootFile, files: &mut InMemory) -> LoadedProgram {
-    let std = std_modules();
-    let std: Vec<(&str, &str)> = std
-        .iter()
-        .map(|(path, text)| (path.as_str(), text.as_str()))
-        .collect();
-    LoadedProgram::load_with_std(root, files, &std)
 }
 
 /// Every std module, by module path and source text: `stdlib/src/std/time.cambra` is

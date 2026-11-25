@@ -27,7 +27,7 @@ fn program(text: &str) -> LoadedProgram {
         module: None,
         text: text.to_owned(),
     };
-    crate::it::std_root::load_against_std(root, &mut InMemory::default())
+    LoadedProgram::load(root, &mut InMemory::default())
 }
 
 /// The values of a collection of integers, by key.
