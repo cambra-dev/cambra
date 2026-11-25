@@ -3684,6 +3684,12 @@ pub(super) fn emit_proj<C: Typing>(
                 binder: FunBinder::Whole(b),
                 ..
             } => b.clone(),
+            // An independent unary result has no input binder, even when the tuple’s
+            // components depend on earlier ones. Compare its component under a fresh input.
+            Type::Fun {
+                binder: FunBinder::None,
+                ..
+            } => Name::fresh("__proj"),
             _ => {
                 debug_assert!(
                     components.get(*k).is_none_or(|(_, component)| {
