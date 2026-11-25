@@ -464,7 +464,10 @@ step cannot pass an unfinished inner row. Other independent work remains claimab
 
 Quiescence alone does not permit a step: a body breaker can hold complete output it has not yet
 published. The controller publishes held output until no further work appears, then releases the
-step's dependencies. The production driver coordinates one claim at a time. The shared dispatcher
+step's dependencies. At a settled boundary the coordinator queues one eligible scope's step,
+then checks settlement again because a commit can bring another body work. It resumes the search
+after the last selected scope and wraps around, so continuously eligible peers each get a turn.
+The production driver coordinates one claim at a time. The shared dispatcher
 does not provide a concurrent loop-settlement protocol.
 
 The first request initializes the store after its drive has read the source. A position package
