@@ -230,22 +230,16 @@ struct Emitted(std::sync::Mutex<Vec<String>>);
 
 impl cambra::interpreter::DataSink for Emitted {
     fn process(&self, tile: &Tile) {
-        let Tile::DataFunction {
-            codomain, deleted, ..
-        } = tile
-        else {
+        let Tile::DataFunction { codomain, .. } = tile else {
             return;
         };
         let Tile::Scalar(ColumnValue::Strings(values)) = codomain.as_ref() else {
             return;
         };
-        self.0.lock().unwrap().extend(
-            values
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !deleted.contains(*i))
-                .map(|(_, v)| v.to_string()),
-        );
+        self.0
+            .lock()
+            .unwrap()
+            .extend(values.iter().map(|v| v.to_string()));
     }
 }
 

@@ -117,6 +117,16 @@ final answer at completion. A live main output emits package answers as they arr
 completion when its sources close. Main-output packages are not ordered. Returning several tiles
 does not change the collection's value or imply an order among its elements.
 
+A sink and a main output are handed only live rows (`sinks::live_rows`). The breaker releases the
+producer at the answer's `to_guard` first, which names every key the answer marks and states
+complete, and then removes the marked keys (`Tile::compact`). Removing the keys leaves whether the
+answer is terminal unchanged, because an operator that marks a key it rejects also states that key
+complete (`Tile::reject_keys`). `sinks::live_rows` checks this in a debug build.
+
+Every sink reads each row it is handed. `Collected`, which `Run.main` reads, and the binary's
+`PrintedMain` would therefore print a marked key. `TestSink` and the HTTP sink check in a debug
+build, as each tile is handed to them, that it marks no row.
+
 The binary runs every program through the dispatcher, including under `--inspect` and `--control`.
 `CAMBRA_MORSEL_ROWS` selects a positive morsel size, defaulting to 65,536. Compilation builds the
 graph without executing sinks. A planning refusal reports an error before execution.

@@ -140,6 +140,44 @@ fn test_source_filter_nonterminal() {
     );
 }
 
+/// A dispatched run hands its `main` output only the rows the filter keeps. The filter over a
+/// source marks each key it rejects deleted in its answer, and `Run::main` holds every row it is
+/// handed.
+#[test]
+fn a_main_output_holds_no_row_its_filter_rejects() {
+    let mut ctx = GlobalContext::default();
+    let test_source = TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    );
+    {
+        let mut source = test_source.write().unwrap_or_else(PoisonError::into_inner);
+        source.publish_rows(&[
+            (Value::UInt(0), Value::Int(10)),
+            (Value::UInt(1), Value::Int(20)),
+        ]);
+        source.set_yield_predicate(Predicate::True);
+    }
+    ctx.register_source(test_source.clone());
+    let loaded = LoadedProgram::test("[s for s in source1() if s < 15]");
+    let mut compiled =
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let main = cambra::interpreter::dispatcher::run_program(&mut compiled, 1)
+        .unwrap_or_else(|why| panic!("dispatcher refused the run: {why}"))
+        .main
+        .expect("a main output");
+    let Tile::DataFunction {
+        domain, deleted, ..
+    } = &main
+    else {
+        panic!("a collection: {main:?}")
+    };
+    assert!(deleted.is_empty(), "{main:?}");
+    assert_eq!(*domain, ColumnValue::UInts(vec![0]), "{main:?}");
+    assert!(main.is_terminal(), "{main:?}");
+}
+
 /// Test a join between two data sources, including incremental data addition
 /// and region release.
 // 30s: the original flake site; one of the heaviest compiles, ~9.5s wall on a slow CI VM.

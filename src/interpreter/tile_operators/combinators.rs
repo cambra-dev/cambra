@@ -1311,7 +1311,7 @@ impl FilterProducer {
                         .as_bools()
                         .unwrap_or_else(|| panic!("Expected boolean mask"));
                     let mut output = input;
-                    output.mark_deleted(mask);
+                    output.reject_keys(mask);
                     output
                 }
                 _ => panic!("Filter predicate is not a function"),
@@ -1569,7 +1569,7 @@ impl TileProducer for RestrictProducer {
                     domain_predicate,
                     deleted,
                 );
-                output.mark_deleted(mask);
+                output.reject_keys(mask);
                 output
             }
             _ => panic!("Restrict: predicate must produce a DataFunction tile"),
@@ -2539,6 +2539,89 @@ mod tests {
             level: CurryLevel::new(1),
         };
         filter.read_in_pipeline(filter.tiling().universal_guard())
+    }
+
+    /// `Restrict` marks each key its predicate rejects deleted and states it complete.
+    #[test]
+    fn restrict_states_the_keys_it_rejects_complete() {
+        let int = || Extent::Base(BaseType::Int);
+        let predicate = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Bools(vec![true, false]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let tiling = Tiling::data_function(int(), Tiling::Scalar(int()));
+        let restrict = RestrictProducer {
+            base: ProducerBase::unowned(RestrictProducer::alloc_id(), &tiling),
+            predicate: Box::new(TestTileProducer::new(
+                predicate,
+                Tiling::data_function(int(), Tiling::Scalar(Extent::Base(BaseType::Bool))),
+            )),
+        };
+        let answer =
+            crate::interpreter::dispatcher::in_a_run(|| restrict.get(tiling.universal_guard()));
+        let Tile::DataFunction {
+            domain_predicate,
+            deleted,
+            ..
+        } = &answer
+        else {
+            panic!("a collection: {answer:?}")
+        };
+        assert_eq!(deleted.iter().collect::<Vec<_>>(), [1], "{answer:?}");
+        assert!(domain_predicate.contains(&Value::Int(2)), "{answer:?}");
+        assert!(!domain_predicate.contains(&Value::Int(1)), "{answer:?}");
+    }
+
+    /// A filter states the keys it rejects complete, so a terminal answer stays terminal once
+    /// its marked keys are removed (`Tile::compact`). The input is a `Bool`-keyed collection of
+    /// whole collections that states nothing at its own level: it is terminal because it holds
+    /// both keys, and the filter rejects one of them.
+    #[test]
+    fn a_filtered_bool_keyed_collection_stays_terminal_once_compacted() {
+        let bool_to_bool = || Extent::Function {
+            domain: Box::new(Extent::Base(BaseType::Bool)),
+            codomain: Box::new(Extent::Base(BaseType::Bool)),
+        };
+        let tiling = Tiling::data_function(Extent::Base(BaseType::Bool), uint_tiling(1));
+        let input = Tile::data_function(
+            ColumnValue::Bools(vec![false, true]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                uints(&[10, 20]),
+                Box::new(Tile::Scalar(uints(&[100, 200]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert!(input.is_terminal(), "both keys held whole: {input:?}");
+        let keep_false = Arc::new(Constant::new(
+            Value::ComputableFunction(crate::interpreter::FunctionDef::UnaryOp(
+                crate::interpreter::unary_op::UnaryOpKind::Not,
+            )),
+            bool_to_bool(),
+        ));
+        let mut filter = FilterProducer {
+            base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
+            input: Box::new(TestTileProducer::new(input, tiling.clone())),
+            predicate: keep_false.subscribe(
+                Tiling::Scalar(bool_to_bool()).universal_guard(),
+                Box::new(|| {}),
+                &mut SubscribeContext::new(),
+            ),
+            level: CurryLevel::OUTERMOST,
+        };
+        let mut answer = filter.read_in_pipeline(tiling.universal_guard());
+        assert!(answer.is_terminal(), "{answer:?}");
+        answer.compact();
+        assert!(
+            answer.is_terminal(),
+            "the rejected key is stated complete, so removing it keeps the answer terminal: \
+             {answer:?}"
+        );
     }
 
     /// A two-level predicate masks each row's inner keys, so the survivors differ by row and
