@@ -3864,6 +3864,71 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_body_member_leaves_the_scope_held_and_peer_work_claimable() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let request = PipelineId(0);
+        let peer = PipelineId(1);
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], 1);
+        let mut execution = Execution::new(&[None, None], &mut dispatcher);
+        let (store, run) = two_writer_run();
+        let mut runs = ScopeRuns::new();
+        runs.install_transaction(&store, 0, run.writers.into_iter().next().unwrap());
+        execution.attach_transaction(&store, 0, request, &mut dispatcher);
+        let steps = execution.local_steps(&dispatcher, 2);
+        let scope = execution.request_scope(request);
+        let Scope::Writer { phase, .. } = scope else {
+            unreachable!()
+        };
+        let guard = keys_between(0, 0);
+        *phase.lock().unwrap() = WriterPhase::Attempt {
+            request: None,
+            guard: guard.clone(),
+            queued_at: 0,
+        };
+        let (member, hold, step) = scope.with_body(|body| {
+            let Member::Chain(member) = &body.members[0] else {
+                unreachable!()
+            };
+            (member.clone(), body.attached().hold, body.attached().step)
+        });
+        dispatcher.queue_for(peer, &guard);
+        let (locked, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|threads| {
+            threads.spawn(move || {
+                let _reader = member.read().unwrap();
+                locked.send(()).unwrap();
+                released
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("settlement waited for the busy member");
+            });
+            ready.recv().unwrap();
+            assert!(
+                !steps.poll(&dispatcher),
+                "a busy check alone makes no progress"
+            );
+            assert_ne!(dispatcher.followers_hold(hold).0 & 1, 0);
+            assert_eq!(dispatcher.outstanding(step), 0);
+            let Next::Package(package) = dispatcher.try_claim(None) else {
+                panic!("claim the peer")
+            };
+            assert_eq!(package.pipeline, peer);
+            dispatcher.acknowledge(package);
+            release.send(()).unwrap();
+        });
+        assert!(steps.poll(&dispatcher));
+        assert_eq!(
+            dispatcher.outstanding(step),
+            1,
+            "the next pass admits the deferred step"
+        );
+        assert!(!steps.poll(&dispatcher), "only one step is outstanding");
+    }
+
+    #[test]
     fn shared_writers_and_downstream_scopes_settle_separately() {
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![], vec![0, 2], vec![]], 1);
         let mut execution = Execution::new(&[None, None, None, None, None], &mut dispatcher);

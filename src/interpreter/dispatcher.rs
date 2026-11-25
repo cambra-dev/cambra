@@ -1311,15 +1311,20 @@ impl Dispatcher {
     pub(crate) fn may_claim_where(&self, takes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| takes(PipelineId(p)))
-            .any(|p| {
-                let queue = self.states[p]
-                    .queue
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                // With nothing in flight, an ordered pipeline claims as any other does.
-                !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
-            })
+            .any(|p| self.may_claim_from(p))
+    }
+
+    fn may_claim_from(&self, p: usize) -> bool {
+        if self.states[p].outstanding() == 0 {
+            return false;
+        }
+        let queue = self.states[p]
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A follower with only queued work may be waiting for its body's publication.
+        !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
     }
 
     /// Whether a pipeline `finishes` admits is finishing, or may begin to: a claimant restricted to
@@ -2679,26 +2684,55 @@ fn push_held(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
     pipelines: impl IntoIterator<Item = PipelineId>,
-) -> bool {
+) {
+    try_push_held(dispatcher, pipelines, |id, call| {
+        reach(id, call);
+        true
+    });
+}
+
+enum Publication {
+    Busy,
+    Published,
+    Settled,
+}
+
+/// Only a complete pass that published nothing can release a body's follower hold.
+fn try_push_held(
+    dispatcher: &Dispatcher,
+    pipelines: impl IntoIterator<Item = PipelineId>,
+    mut reach: impl FnMut(PipelineId, &mut Call<'_>) -> bool,
+) -> Publication {
     let mut published = false;
     for pipeline in pipelines {
         if dispatcher.states[pipeline.0].phase.load() == Phase::Finished {
             continue;
         }
         let mut landed = None;
-        reach(pipeline, &mut |breaker, _| {
+        let reached = reach(pipeline, &mut |breaker, _| {
             if let Some(producer) = breaker.as_producer() {
                 let mut pushes = dispatcher.pushes(pipeline);
                 pushes.push_final(producer);
                 landed = Some(pushes);
             }
         });
+        if !reached {
+            return if published {
+                Publication::Published
+            } else {
+                Publication::Busy
+            };
+        }
         if let Some(pushes) = landed {
             published |= !pushes.morsels.is_empty();
             dispatcher.land(pushes);
         }
     }
-    published
+    if published {
+        Publication::Published
+    } else {
+        Publication::Settled
+    }
 }
 
 /// Finish `pipeline`, after checking what a finish rests on.

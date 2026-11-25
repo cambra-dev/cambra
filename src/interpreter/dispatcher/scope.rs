@@ -1,5 +1,5 @@
 //! Scope control pipelines, publication and admission of settled steps.
-use super::loop_scope::{self, Body, LoopSchedule, Member, induction};
+use super::loop_scope::{Body, LoopSchedule, Member, induction};
 use super::transaction_scope::WriterPhase;
 use super::*;
 use crate::interpreter::tile_operators::{StoreBorrow, StoreCell};
@@ -54,11 +54,22 @@ impl Scope {
 
     /// Call `f` with the scope's inner pipelines.
     pub(super) fn with_body<R>(&self, f: impl FnOnce(&mut Body) -> R) -> R {
+        f(self.body_in(&mut self.store().write()))
+    }
+
+    fn body_in<'a>(&self, store: &'a mut StoreBorrow<'_>) -> &'a mut Body {
         match self {
-            Scope::Loop { store, .. } => f(induction(store).body_mut()),
-            Scope::Writer { store, writer, .. } => f(&mut transaction_scope::transaction(store)
-                .writer_run_mut(*writer)
-                .body),
+            Self::Loop { .. } => store
+                .as_induction_store_mut()
+                .expect("a loop store")
+                .body_mut(),
+            Self::Writer { writer, .. } => {
+                &mut store
+                    .as_transaction_store_mut()
+                    .expect("a transaction store")
+                    .writer_run_mut(*writer)
+                    .body
+            }
         }
     }
 
@@ -230,7 +241,7 @@ impl Scope {
     /// Queue the requests offered to the scope where they can run: a loop's at once, a writer's
     /// once its store is open. Whether it queued or closed anything.
     fn queue_requests(&self, dispatcher: &Dispatcher) -> bool {
-        self.admit(dispatcher, self.store().write(), false)
+        self.admit(dispatcher, &mut self.store().write(), false)
     }
 
     /// An unrelated transition can be holding its store. Its intake remains available for
@@ -238,16 +249,13 @@ impl Scope {
     pub(super) fn try_queue_requests(&self, dispatcher: &Dispatcher, close: bool) -> bool {
         self.store()
             .try_write()
-            .is_ok_and(|store| self.admit(dispatcher, store, close))
+            .is_ok_and(|mut store| self.admit(dispatcher, &mut store, close))
     }
 
-    fn admit(&self, dispatcher: &Dispatcher, mut store: StoreBorrow<'_>, close: bool) -> bool {
+    fn admit(&self, dispatcher: &Dispatcher, store: &mut StoreBorrow<'_>, close: bool) -> bool {
         match self {
             Self::Loop { .. } => {
-                let body = store
-                    .as_induction_store_mut()
-                    .expect("a loop store")
-                    .body_mut();
+                let body = self.body_in(store);
                 if close {
                     body.close_offers();
                 }
@@ -297,7 +305,7 @@ impl ScopePipeline {
 struct LocalSteps {
     scope: Arc<Scope>,
     base: usize,
-    members: Vec<Member>,
+    members: Vec<BreakerHandle>,
 }
 
 #[derive(Default)]
@@ -367,8 +375,19 @@ impl ScopeSteps {
                     .shared
                     .push((PipelineId(id), scope.with_body(|body| body.offers.clone())));
             } else {
-                let (base, members) =
-                    scope.with_body(|body| (body.global(PipelineId(0)).0, body.members.clone()));
+                let (base, members) = scope.with_body(|body| {
+                    let handles = body
+                        .members
+                        .iter()
+                        .map(|member| match member {
+                            Member::Chain(handle) => handle.clone(),
+                            Member::Scope(_) => {
+                                unreachable!("a nested scope uses shared settlement")
+                            }
+                        })
+                        .collect();
+                    (body.global(PipelineId(0)).0, handles)
+                });
                 steps.independent.push(LocalSteps {
                     scope,
                     base,
@@ -418,33 +437,47 @@ impl LocalSteps {
     }
 
     fn settle(&self, dispatcher: &Dispatcher, guard: Option<&TileGuard>) -> bool {
-        let admitted = self.scope.queue_requests(dispatcher);
+        let Ok(mut store) = self.scope.store().try_write() else {
+            return false;
+        };
+        let admitted = self.scope.admit(dispatcher, &mut store, false);
         let Some(guard) = guard else { return admitted };
-        let (step, hold) = self
-            .scope
-            .with_body(|body| (body.attached().step, body.attached().hold));
+        let body = self.scope.body_in(&mut store);
+        let step = body.attached().step;
+        let hold = body.attached().hold;
         if dispatcher.outstanding(step) != 0 {
             return admitted;
         }
         let held = dispatcher.followers_hold(hold);
-        if held.0 & 1 != 0 {
-            let end = self.base + self.members.len();
-            if push_held(
-                dispatcher,
-                &mut |id, call| loop_scope::reach_member(&self.members[id.0 - self.base], call),
-                (self.base..end).map(PipelineId),
-            ) {
-                return true;
-            }
-            let released = dispatcher.release_followers_if(hold, held);
-            return self
-                .scope
-                .with_body(|body| body.queue_step(dispatcher, guard))
-                || released
-                || admitted;
+        if held.0 & 1 == 0 {
+            return body.queue_step(dispatcher, guard) || admitted;
         }
-        self.scope
-            .with_body(|body| body.queue_step(dispatcher, guard))
-            || admitted
+        drop(store);
+        let members = self.base..self.base + self.members.len();
+        // Give already runnable body work its turn before inspecting breaker output.
+        // A claim can still start after this scan, so each breaker is also tried below.
+        if members.clone().any(|p| dispatcher.may_claim_from(p)) {
+            return admitted;
+        }
+        match try_push_held(dispatcher, members.map(PipelineId), |id, call| {
+            let handle = &self.members[id.0 - self.base];
+            let mut breaker = match handle.try_write() {
+                Ok(breaker) => breaker,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            };
+            call(&mut *breaker, InputId::ONLY);
+            true
+        }) {
+            Publication::Busy => admitted,
+            Publication::Published => true,
+            Publication::Settled => {
+                let released = dispatcher.release_followers_if(hold, held);
+                let queued = self.scope.store().try_write().is_ok_and(|mut store| {
+                    self.scope.body_in(&mut store).queue_step(dispatcher, guard)
+                });
+                queued || released || admitted
+            }
+        }
     }
 }

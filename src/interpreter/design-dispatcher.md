@@ -452,7 +452,9 @@ worker can claim them directly. The loop schedule or writer phase serializes tha
 transitions. A handler releases its store before queuing the new body's work.
 
 For an independent scope, a claimant can publish the body's held output, release its follower
-hold and enqueue the next settled step. It tries the scope lock so a busy scope can be skipped.
+hold and enqueue the next settled step. It tries the scope lock and store. If the body already has runnable or running work, the claimant
+returns to dispatch. Otherwise it tries each body breaker exclusively to publish its output. A busy
+breaker leaves the follower hold in place for a later pass.
 The planner checks reads, follows, shared stores and containment when identifying independent
 scopes. Scopes that share a store or depend on another scope use the coordinator's rotating
 settlement pass. When one of these has work pending, independent scopes yield to that pass.
