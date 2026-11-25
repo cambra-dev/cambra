@@ -979,30 +979,6 @@ pub(crate) fn suspended_memberships_of(original: &InferVar) -> Vec<SuspendedMemb
     })
 }
 
-/// The kinds recorded on the suspensions of `v`, `𝑣‹𝑠›`: each is `𝑣` read through a
-/// substitution, a bound of the suspension stands at `𝑣`, and a membership there is a demand on
-/// `𝑣`'s base type, which the substitution leaves as it is. A suspension at an outer level reads
-/// `𝑣` from outside a definition generalized over it, where each use is its own demand, so only
-/// those at `𝑣`'s level count.
-pub(crate) fn suspended_kinds_over(v: &InferVar) -> Vec<crate::ccl::ty::TypeKind> {
-    SUSPENDED_MEMBERSHIPS.with(|ms| {
-        ms.borrow()
-            .recorded
-            .iter()
-            .filter(|m| m.var.level() >= v.level())
-            .filter(|m| {
-                let bounds = m.var.bounds.borrow();
-                bounds
-                    .lower()
-                    .iter()
-                    .chain(bounds.upper().iter())
-                    .any(|b| matches!(&b.ty, Type::Infer(u) if u.uid == v.uid))
-            })
-            .map(|m| m.kind.clone())
-            .collect()
-    })
-}
-
 /// Is a membership recorded on the suspension `var`?
 pub(crate) fn has_suspended_memberships(var: &InferVar) -> bool {
     SUSPENDED_MEMBERSHIPS.with(|ms| ms.borrow().by_var.contains_key(&var.uid))

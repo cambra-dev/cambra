@@ -881,6 +881,12 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // the dual read already sees every bound either could reach, on whichever
         // root read follows that side.
         Type::Infer(state) => {
+            // Only the binder entries that can change what `state` resolves to reach its bounds
+            // ([`Subst::binders_in_scope_of`]). An entry for a binder outside its telescope, such
+            // as a temporary A-normalization peeled inside a nested function the walk has left,
+            // has nothing there to replace. Composed onto an edge that discharges that function,
+            // it would pass under the function's own parameter, which its definiens names.
+            let subst_acc = &*subst_acc.binders_in_scope_of(state);
             let visit_key = (state.uid, pol);
             let memo_key = (state.uid, pol, ctx.scope.enclosing().to_vec());
             let under = if subst_acc.is_id() {
@@ -1348,7 +1354,11 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
         constrain_subtype(&lower, &b, &mut cache).expect("the lower flows in");
-        let v = fresh_var(0);
+        // `?v` stands under `x` too, which what flows into it names.
+        let v = Type::Infer(crate::ccl::InferVar::fresh_in(
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(Name::raw("x")),
+        ));
         constrain_subtype(&b, &v, &mut cache).expect("the barrier flows into ?v");
         let above = |xs: &[i64]| {
             let top = fresh_var(0);

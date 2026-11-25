@@ -106,7 +106,7 @@ fn clauses_of(code: &str, member: &str) -> String {
                 out << x
     "},
     "report_all",
-    "requires r: Iterable(A), r::Elements <: C |=> D causes Append(out)"
+    "requires r: Iterable(A), r::Elements <: B |=> C causes Append(out)"
 )]
 #[case(
     indoc! {"

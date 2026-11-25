@@ -839,22 +839,18 @@ fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
 /// A refinement in a `Map` key type that no key satisfies, reported by the plain annotation and
 /// by the `Mut` form.
 ///
-/// Neither program is well-typed today: a literal key carries `__elem == "a"`, and a
-/// refinement is discharged by matching the predicate rather than by proving it, so
-/// `__elem != ""` is not satisfied. The plain annotation is an `Annotation mismatch`
-/// against the whole `Σ`, which names the annotation the program wrote. The mutable one
-/// boxes the map, so the key domain is a candidate of the box's binder, and the report is
-/// that candidate's membership in the annotated kind, decided where the position
-/// materializes.
+/// Neither program is well-typed today: a literal key carries `__elem == "a"`, and the solver
+/// has no encoding for a string literal, so `__elem != ""` is not proven. The plain annotation is an `Annotation mismatch` between
+/// the two `Map` types, the inferred key the map's own domain. The mutable one reports the
+/// initializer's first key against the declared key type.
 #[test]
 fn a_refined_map_key_no_key_satisfies() {
     check_compile_error(
         indoc::indoc! {r#"
-
             m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
             m
             "#},
-        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as {String where _ in ["a", "z"]} |=> Int"#,
+        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as Map({String where _ in ["a", "z"]}, Int)"#,
     )
 }
 
@@ -862,12 +858,69 @@ fn a_refined_map_key_no_key_satisfies() {
 fn a_refined_map_key_in_a_mut_annotation_is_reported() {
     check_compile_error(
         indoc::indoc! {r#"
-
-            m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
+            m: Mut(Map({String where _ != ""}, Int)) := map([("a", 1), ("z", 2)])
             m
             "#},
-        r#"Type mismatch for collection annotation: expected Map({String where _ != ""}, _), found {String where _ in ["a", "z"]}"#,
+        r#"Type mismatch for initializer of mutable `m`: expected {String where _ != ""}, found {String where _ == "a"}"#,
     )
+}
+
+/// A refinement in a key type holds of every key the initializer has: the map's keys are the pairs'
+/// key type refined by membership in the pairs, and each key's own type is checked against the
+/// refinement under that membership (`src/ccl/design/type-inference.md`, "A variable base takes a
+/// guarded bound"). Through a generic definition, each call's keys are checked.
+#[rstest]
+#[case::map_key(
+    "m: Map({Int where _ > 0}, Int) = map([(0, 1), (2, 2)])\nm\n",
+    "Annotation mismatch: annotated as Map({Int where _ > 0}, Int), but inferred as Map({Int where _ in [0, 2]}, Int)"
+)]
+#[case::map_empty_string_key(
+    "m: Map({String where _ != \"\"}, Int) = map([(\"\", 1), (\"z\", 2)])\nm\n",
+    r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as Map({String where _ in ["", "z"]}, Int)"#
+)]
+#[case::set_key(
+    "s: Set({Int where _ > 0}) = set([0, 1])\ns\n",
+    "Annotation mismatch: annotated as Set({Int where _ > 0}), but inferred as Set({Int where _ in [0, 1]})"
+)]
+#[case::mutable_map_key(
+    "m: Mut(Map({Int where _ > 0}, Int)) := map([(0, 1), (2, 2)])\nm\n",
+    "Type mismatch for initializer of mutable `m`: expected {Int where _ > 0}, found {Int where _ == 0}"
+)]
+#[case::generic_definition(
+    indoc! {"
+        def mk(xs) => Map({Int where _ > 0}, Int):
+            map([(x, 1) for x in xs])
+        a = mk([0, 2])
+        a
+    "},
+    "Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == 0}"
+)]
+#[case::generic_definition_at_a_second_call(
+    indoc! {"
+        def mk(xs) => Map({Int where _ > 0}, Int):
+            map([(x, 1) for x in xs])
+        a = mk([1, 2])
+        b = mk([0, 3])
+        b
+    "},
+    "Type mismatch for this call: expected {Int where _ > 0}, found {Int where _ == 0}"
+)]
+fn a_refined_key_type_is_checked_at_each_key(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// Keys that each satisfy the key type's refinement initialize the annotated collection.
+#[rstest]
+#[case::map(
+    "m: Map({Int where _ > 0}, Int) = map([(1, 10), (2, 20)])\nsum([v for (k, v) in m])\n",
+    Value::Int(30)
+)]
+#[case::set(
+    "s: Set({Int where _ > 0}) = set([1, 2])\nsum([k for k in s])\n",
+    Value::Int(3)
+)]
+fn a_refined_key_type_every_key_satisfies(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 /// This and the following two tests exclude a bug in which captured
@@ -2076,11 +2129,11 @@ q = id(g)
 fn a_refinement_in_an_invariant_nominal_argument_survives_the_barrier() {
     check_scalar(
         indoc! {r#"
-type Index(K):
-    index(FullMap(K, Int))
+type Index(K, V: K => Type):
+    index(FullMap(K, V))
 def f(x: Int):
     r ^= x
-    Index::index(map([(1, 10), (2, 20)]))
+    Index::index(groupby([1, 2], \v -> v))
 i = f(1)
 7
         "#},
@@ -2154,16 +2207,6 @@ i = f(1)
 #[case::a_codomain(indoc::indoc! {r#"
     f: Int => _ |=> Int = \n -> [n, n]
     sum(f(3))"#}, 6)]
-// A group-by's codomain reads its key, and a hole in the annotation's codomain is filled under
-// the annotation's binder.
-#[case::a_group_by(
-    indoc! {"
-        xs = [1, 2, 3]
-        g: _ |=> _ = groupby(xs, \\x -> x > 1)
-        sum([sum(v) for v in g])
-    "},
-    6
-)]
 fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }

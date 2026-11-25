@@ -5,6 +5,8 @@
 use crate::ccl::Occurrence;
 use std::rc::Rc;
 
+use crate::ccl::nominal::StdCollection;
+
 use super::*;
 use crate::{
     ccl::{
@@ -98,12 +100,12 @@ pub(super) fn lower_call(
             // The expansion copies the key function into the key domain and the groups'
             // refinement.
             let key_fn = ctx.with_copied_term(|ctx| lower_expr(&args[1], ctx))?;
-            Ok(bind_grouped(
-                collection,
-                func.span,
-                ctx,
-                |collection, ctx| lower_groupby(collection, key_fn, func.span, ctx).0,
-            ))
+            // The constructor stands inside the collection's binding, so a source that binds
+            // the group-by leads with that binding and A-normalization floats it ahead.
+            bind_grouped(collection, func.span, ctx, |collection, ctx| {
+                let group_by = lower_groupby(collection, key_fn, func.span, ctx).0;
+                wrap_std_collection(StdCollection::FullMap, group_by, func.span, ctx)
+            })
         }
         // set(xs) is a re-keying constructor ([`lower_rekeyed`];
         // `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
@@ -134,17 +136,17 @@ pub(super) fn lower_call(
                 func.span,
                 sc,
             );
-            Ok(lower_rekeyed(
+            lower_rekeyed(
                 elements,
                 id_key,
                 "__set_g",
                 |group, span, ctx| {
                     ctx.tag_machinery(Expr::aggregate(group, AggregateKind::Drain), span, sc)
                 },
+                StdCollection::Set,
                 func.span,
-                sc,
                 ctx,
-            ))
+            )
         }
         // map(kvs) is the other re-keying constructor: group the 2-tuples by their
         // first component — so this site's key domain is the distinct keys — and
@@ -189,7 +191,7 @@ pub(super) fn lower_call(
                 func.span,
                 sc,
             );
-            Ok(lower_rekeyed(
+            lower_rekeyed(
                 entries,
                 fst_key,
                 "__map_g",
@@ -199,10 +201,10 @@ pub(super) fn lower_call(
                     let val_proj = ctx.tag_machinery(Expr::proj_index(1), span, sc);
                     ctx.tag_machinery(Expr::apply(sole, val_proj), span, sc)
                 },
+                StdCollection::Map,
                 func.span,
-                sc,
                 ctx,
-            ))
+            )
         }
         Some(b @ (SurfaceBuiltin::Sum | SurfaceBuiltin::Max | SurfaceBuiltin::Min)) => {
             if !b.arity().accepts(args.len()) {
@@ -366,7 +368,12 @@ pub(super) fn lower_call(
                     ),
                 ));
             }
-            Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
+            let empty = ctx.tag_machinery(
+                Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)),
+                func.span,
+                "lower.empty_map",
+            );
+            wrap_std_collection(StdCollection::Map, empty, func.span, ctx)
         }
         // An instance stands only before `::`, where the parser reads `summon(T)::f`
         // (`docs/chl-spec.md`, "Summoning an instance").
@@ -636,8 +643,8 @@ fn bind_grouped(
     collection: Expr,
     span: Span,
     ctx: &mut LoweringContext,
-    build: impl FnOnce(Expr, &mut LoweringContext) -> Expr,
-) -> Expr {
+    build: impl FnOnce(Expr, &mut LoweringContext) -> Result<Expr, LoweringError>,
+) -> Result<Expr, LoweringError> {
     // A variable is one term wherever it is copied already. Any other term is copied before the
     // passes that rewrite it, a comprehension before its encoding mints binders, so each copy
     // would be rewritten apart. Inside a term a later pass copies into a type, the binding would
@@ -652,12 +659,12 @@ fn bind_grouped(
     let sc = "lower.groupby_collection";
     let name = Name::anf_temp();
     let read = ctx.tag_machinery(Expr::var(name.clone()), span, sc);
-    let body = build(read, ctx);
-    ctx.tag_machinery(
+    let body = build(read, ctx)?;
+    Ok(ctx.tag_machinery(
         Expr::let_bind(name, Occurrence::mint(), collection, body),
         span,
         sc,
-    )
+    ))
 }
 
 /// Lower group-by and return its present-key domain for re-keying callers.
@@ -738,12 +745,21 @@ fn lower_rekeyed(
     key_fn: Expr,
     group_binder: &'static str,
     collapse: impl FnOnce(Expr, Span, &mut LoweringContext) -> Expr,
+    std: StdCollection,
     span: Span,
-    sc: &'static str,
     ctx: &mut LoweringContext,
-) -> Expr {
+) -> Result<Expr, LoweringError> {
+    let sc = match std {
+        StdCollection::Set => "lower.set",
+        StdCollection::Map => "lower.map",
+        StdCollection::FullMap => "lower.groupby",
+    };
+    // `std`'s collection boxes the keyed function inside the collection's binding, as `groupby`
+    // wraps its own.
     bind_grouped(elements, span, ctx, |elements, ctx| {
-        rekeyed(elements, key_fn, group_binder, collapse, span, sc, ctx)
+        let keyed = rekeyed(elements, key_fn, group_binder, collapse, span, sc, ctx);
+        let boxed = boxed(keyed, span, ctx);
+        wrap_std_collection(std, boxed, span, ctx)
     })
 }
 
@@ -805,7 +821,9 @@ fn present_key_domain(
     Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
-/// Lower `target[index]!` as application and `target[index]` as checked lookup.
+/// Both lookup forms read the key-to-value function through `Indexable::entries`. Checked lookup
+/// builds `(𝑐 ▷ entries, 𝑘) ▷ lookup?`. Proven lookup builds `𝑘 ▷ (𝑐 ▷ entries)`; the key type
+/// must establish membership in the function's domain.
 /// Neither spelling projects a product; projection uses `.` regardless of the index's shape.
 /// See `docs/chl-spec.md`, "3.9 Subscript and attribute access".
 pub(super) fn lower_subscript(
@@ -815,7 +833,7 @@ pub(super) fn lower_subscript(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let collection = lower_expr(target, ctx)?;
+    let collection = lower_entries(target, ctx)?;
     let key = lower_expr(index, ctx)?;
     if checked {
         // Pair collection and key so point-free conversion can treat lookup as a morphism
@@ -845,6 +863,33 @@ pub(super) fn lower_subscript(
     }
     // Evaluate the finite function at the point.
     Ok(Expr::apply(key, collection))
+}
+
+/// Lower a subscript's collection, `𝑐` of `𝑐[𝑘]`, to the function the subscript reads:
+/// `𝑐 ▷ summon(Indexable(_))::entries` (`docs/chl-spec.md`, "Subscript and unwrap syntax").
+///
+/// The call places the requirement `Indexable(C)` on `𝑐`'s type, which waits for that type where
+/// it is not known yet. Coalescing removes the call again where `𝑐` is a structural collection,
+/// which is its own `Entries`.
+fn lower_entries(
+    target: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    use crate::ccl::infer::solver::traits::{INDEXABLE_ENTRIES, StdTrait};
+    let collection = lower_expr(target, ctx)?;
+    let trait_ = ctx.instances.std_trait(StdTrait::Indexable);
+    let label = "lower.indexable_entries";
+    let entries = ctx.tag_machinery(
+        Expr::new(TypedExprNode::TraitFn {
+            operands: (0..trait_.arity()).map(|_| Type::Hole).collect(),
+            assoc: Vec::new(),
+            trait_,
+            function: INDEXABLE_ENTRIES.into(),
+        }),
+        target.span,
+        label,
+    );
+    Ok(ctx.tag_machinery(Expr::apply(collection, entries), target.span, label))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only
@@ -1204,6 +1249,49 @@ pub(super) fn lower_boolop(
     Ok(acc)
 }
 
+/// `inner` as a sum, `inner ▷ box`: the one way into a dependent sum
+/// (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
+fn boxed(inner: Expr, span: Span, ctx: &mut LoweringContext) -> Expr {
+    let op = ctx.tag_machinery(Expr::builtin(Builtin::Box), span, "lower.box");
+    ctx.tag_machinery(Expr::apply(inner, op), span, "lower.box")
+}
+
+/// `payload` built into `std`'s collection type `collection`, by its one constructor: the
+/// private `rep` of a `@Builtin` `Set` or `Map`, whose payload is a sum, or `FullMap::new`
+/// (`docs/chl-spec.md`, "9.16 The std root").
+pub(super) fn wrap_std_collection(
+    collection: StdCollection,
+    payload: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let Some((_, decl)) = ctx.std_collections.iter().find(|(c, _)| *c == collection) else {
+        return Err(LoweringError::internal(
+            span,
+            format!(
+                "`{}` builds `std`'s `{}`, and this module lowers before `std`: a std module \
+                 that builds one imports `std`",
+                match collection {
+                    StdCollection::Set => "set(…)",
+                    StdCollection::Map => "map(…)",
+                    StdCollection::FullMap => "groupby(…)",
+                },
+                collection.name()
+            ),
+        ));
+    };
+    let decl = Rc::clone(decl);
+    let [ctor] = decl.body().ctors.as_slice() else {
+        unreachable!("`std`'s `{}` has one constructor", collection.name())
+    };
+    let ctor = ctor.name.clone();
+    Ok(ctx.tag_machinery(
+        Expr::nominal_ctor(decl, ctor, payload),
+        span,
+        "lower.std_collection",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
@@ -1347,22 +1435,22 @@ mod tests {
     // annotation on the lambda (not rendered here) is what makes it a collection.
     #[case(
         "groupby(xs, \\x -> x)",
-        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((xs ≫ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "let __anf = [1, 2, 3]\nin λ __gb_k : {_#0 | __elem ▷ ((__anf ≫ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ __anf ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ __anf)"
+        "let __anf = [1, 2, 3]\nin FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((__anf ≫ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ __anf ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ __anf))"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "[Sum(x) for x in (λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ Iterable::elements]"
+        "[Sum(x) for x in FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ Iterable::elements]"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

@@ -106,7 +106,7 @@
 //! parse, which the `found '->'` half of the assertion checks.  What the rollup still needs is
 //! entry iteration:
 //! `for key -> g in groupby(…)` binds a pair only once a keyed collection iterates entries
-//! (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Decided]").
+//! (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart").
 
 use super::common::expect_compile_error_past;
 

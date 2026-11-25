@@ -328,6 +328,16 @@ fn mark_component_source(
     {
         return mark_component_source(argument, ctx, memo);
     }
+    // Op-conversion feeds a `let`'s input to its bound value and its body alike, so a `let`
+    // standing as a component compiles both with none, and each is a component in its own
+    // right.
+    if let TypedExprNode::Let {
+        bound_expr, body, ..
+    } = &mut component.node
+    {
+        mark_component_source(bound_expr, ctx, memo)?;
+        return mark_component_source(body, ctx, memo);
+    }
     if component.ty.is_collection() {
         wrap_with_iterate(component, ctx, memo, "product-component-source")?;
     }
@@ -462,6 +472,10 @@ pub(super) fn wrap_with_iterate(
             Type::Fun { .. }
         ) {
             wrap_with_iterate(bound_expr, ctx, memo, site)?;
+        } else {
+            // A value is compiled with no input too, so a collection inside it, a `let`'s
+            // definition included, is a component of it ([`mark_component_source`]).
+            mark_component_source(bound_expr, ctx, memo)?;
         }
         return wrap_with_iterate(body, ctx, memo, site);
     }
