@@ -3825,6 +3825,19 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
                 pool := pool + y
     await_final(pool)
 "}, "85")]
+#[case::two_writers_replying_on_one_store(indoc! {"
+    out: Feed(_)
+    pool: Mut(Int, Txn) := 100
+    for x in source1():
+        with begin():
+            pool := pool - x
+            out << pool
+    for y in source1():
+        with begin():
+            pool := pool + 10 * y
+            out << pool
+    out
+"}, "[`out<<#1(u0) -> 104, `out<<#1(u1) -> 124, `out<<#1(u2) -> 154, `out<<#1(u3) -> 185, `out<<#1(u4) -> 235, `out<<(u0) -> 99, `out<<(u1) -> 97, `out<<(u2) -> 94, `out<<(u3) -> 150, `out<<(u4) -> 145]")]
 #[case::a_memo_read_twice(indoc! {"
     xs = source1()
     [x + sum(xs) for x in xs]
