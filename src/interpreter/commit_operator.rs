@@ -7591,6 +7591,9 @@ thread_local! {
     /// worker threads add their counts to the thread that runs it once they join
     /// (`WorkerPool::hand_over_counters`).
     pub(crate) static RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The packages the transaction writers consumed on this thread
+    /// (`TransactWriterProducer::consume_impl`), handed over as [`RETRIES`] is.
+    pub(crate) static WRITER_CONSUMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The field of a transaction driver's row holding the source position of its item, beside the
@@ -7917,9 +7920,11 @@ impl TileOperator for TransactWriter {
         let (entry, body_entry) =
             crate::interpreter::dispatcher::Entry::unplaced(body_tiling.clone());
         let body_consumer = shared_consumer(Box::new(entry));
+        // Each attempt's position queues the writer once (`AttemptDeliveries`).
+        let deliveries = AttemptDeliveries::new();
         let body_producer = self.body_op.clone().subscribe(
             body_tiling.universal_guard(),
-            forwarding_consumer_keeping_keys(&body_consumer),
+            deliveries.body(forwarding_consumer_keeping_keys(&body_consumer)),
             cx,
         );
         // Forward the driver's notification to this writer's consumer: the driver
@@ -7929,7 +7934,7 @@ impl TileOperator for TransactWriter {
             self.driver_op.tiling().universal_guard(),
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(1),
-                forwarding_consumer_keeping_keys(&body_consumer),
+                deliveries.driver(forwarding_consumer_keeping_keys(&body_consumer)),
             ),
             cx,
         );
@@ -7941,6 +7946,7 @@ impl TileOperator for TransactWriter {
                 cx,
             )
             .breaking(consumer, body_entry),
+            deliveries,
             read_keys: self.read_keys.clone(),
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
@@ -7987,8 +7993,155 @@ struct InFlightProposal {
     item: Position,
 }
 
+/// What a transaction writer's two inputs have delivered of its attempts since it last consumed,
+/// so that each attempt queues the writer once.
+///
+/// The writer reads the driver slot and the body over the driver's positions. Both deliver each
+/// attempt's position, and a body with breakers in it delivers it in a later landing. The driver
+/// slot's delivery of a first attempt is held until the body delivers that position, so the
+/// writer does not consume before its body has a decision there. These pass on alone and mark
+/// their rows pending, together with any held rows:
+///
+/// - a delivery while the writer has an attempt live ([`set_live`](Self::set_live)), which is a
+///   retry: the consume releases the attempt it supersedes;
+/// - a delivery while another row is held, which is also a retry of the held attempt;
+/// - the store's progress, which reaches the driver slot widened to every row.
+///
+/// The body releases a position without delivering it only after the writer released it as
+/// superseded, and the writer does that only in a consume a retry queued. So a held first attempt
+/// is announced by the body's delivery or passed on by its retry. A body delivery passes on at
+/// held rows and at rows neither held nor pending, which become pending. It is dropped at pending
+/// rows: their delivery queued the writer, or woke its scope, and the consume that follows reads
+/// the body there. The writer calls [`consumed`](Self::consumed) at the start of each consume,
+/// before it reads either input, so a delivery after that call passes on.
+pub(crate) struct AttemptDeliveries {
+    // shared-state-ok: what the writer's two input consumers and its consume have recorded since
+    // the last consume; what crosses it is predicates and a flag, never a tile.
+    state: std::sync::Arc<std::sync::Mutex<Delivered>>,
+}
+
+struct Delivered {
+    /// Positions whose delivery queued the writer, or woke its scope, since its last consume.
+    pending: Predicate,
+    /// Positions of first attempts the driver slot delivered that wait for the body's delivery.
+    held: Predicate,
+    /// Whether the writer has an attempt live ([`AttemptDeliveries::set_live`]).
+    live: bool,
+}
+
+impl AttemptDeliveries {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(Delivered {
+                pending: Predicate::False,
+                held: Predicate::False,
+                live: false,
+            })),
+        }
+    }
+
+    /// `consumer` behind the driver slot's consumer.
+    fn driver(&self, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+        self.input(AttemptInput::Driver, consumer)
+    }
+
+    /// `consumer` behind the body's consumer.
+    fn body(&self, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+        self.input(AttemptInput::Body, consumer)
+    }
+
+    fn input(&self, input: AttemptInput, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+        Box::new(AttemptConsumer {
+            input,
+            state: self.state.clone(),
+            consumer,
+        })
+    }
+
+    /// The writer is consuming and reads both inputs whole: no position is pending or held.
+    fn consumed(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = Predicate::False;
+        state.held = Predicate::False;
+    }
+
+    /// Record whether the writer has an attempt live: at the end of each consume, and when the
+    /// store's commit-ack finishes the attempts in flight, before the ack releases the driver.
+    fn set_live(&self, live: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live = live;
+    }
+}
+
+enum AttemptInput {
+    Driver,
+    Body,
+}
+
+struct AttemptConsumer {
+    input: AttemptInput,
+    // shared-state-ok: the [`AttemptDeliveries`] record this input's consumer shares with the
+    // other input's and with the writer; what crosses it is predicates and a flag, never a tile.
+    state: std::sync::Arc<std::sync::Mutex<Delivered>>,
+    consumer: Box<dyn Consumer>,
+}
+
+impl Consumer for AttemptConsumer {
+    fn notify(
+        &self,
+        region: &Projection,
+        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
+    ) {
+        use crate::interpreter::notifications::rows_reached;
+        // A landing that queues nothing states what is decided rather than what arrived.
+        if !landing.is_delivery() {
+            self.consumer.notify(region, landing);
+            return;
+        }
+        let Some(delta) = rows_reached(region, CurryLevel::OUTERMOST) else {
+            self.consumer.notify(region, landing);
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let passed = match self.input {
+            AttemptInput::Driver => match state.live || !state.held.is_false() || delta.is_true() {
+                true => {
+                    state.pending = state.pending.union(&delta).union(&state.held);
+                    state.held = Predicate::False;
+                    region.clone()
+                }
+                false => {
+                    state.held = state.held.union(&delta.minus(&state.pending));
+                    Projection::Nothing
+                }
+            },
+            AttemptInput::Body => {
+                let announced = delta.intersect(&state.held);
+                state.held = state.held.minus(&announced);
+                let open = Predicate::True.minus(&state.pending);
+                state.pending = state.pending.union(&delta.intersect(&open));
+                region.intersect(&Projection::keys_at(CurryLevel::OUTERMOST, open))
+            }
+        };
+        drop(state);
+        if passed != Projection::Nothing {
+            self.consumer.notify(&passed, landing);
+        }
+    }
+}
+
 struct TransactWriterProducer {
     base: ProducerBase,
+    /// What the driver slot and the body delivered since this writer last consumed.
+    deliveries: AttemptDeliveries,
     read_keys: Vec<Value>,
     write_keys: Vec<Value>,
     /// Reply-tap decision fields, appended to each write set (see
@@ -8240,6 +8393,9 @@ impl Breaker for TransactWriterProducer {
     }
 
     fn consume_impl(&self, _: InputId, _: TileGuard) {
+        #[cfg(test)]
+        WRITER_CONSUMES.with(|consumes| consumes.set(consumes.get() + 1));
+        self.deliveries.consumed();
         let mut state_guard = self
             .state
             .lock()
@@ -8276,6 +8432,9 @@ impl Breaker for TransactWriterProducer {
             .get(state.driver_producer.tiling().universal_guard());
         state.driver_terminal = driver_tile.is_terminal();
         let newest = newest_body_position(&driver_tile);
+        // The driver's newest position stays live until the store commits its proposal: the
+        // supersession release below leaves it, and only the commit-ack releases it.
+        let live = newest.is_some();
         // The body can run while another writer commits. Its proposal must retain the
         // frontier captured by this attempt, never the frontier at proposal consumption.
         let snapshot = newest.as_ref().map(|position| {
@@ -8427,6 +8586,7 @@ impl Breaker for TransactWriterProducer {
             }
         }
         self.debug_assert_position_invariant(state);
+        self.deliveries.set_live(live);
         if state.driver_terminal && state.emitted.is_empty() {
             state
                 .body_producer
@@ -8552,9 +8712,6 @@ impl TileProducer for TransactWriterProducer {
             .filter(|(i, _)| pred.contains(&Value::UInt(state.committed_base + uint_of_row(*i))))
             .map(|(_, p)| p.attempt.clone())
             .max();
-        if let Some(pos) = ack {
-            self.ack_through(state, &pos);
-        }
         // Drop the released leading prefix and advance the window base. Releases
         // are prefixes (`at_or_below(step)`, accumulated across commits), so the
         // released positions form a run from `committed_base` up. Dropping frees
@@ -8569,6 +8726,12 @@ impl TileProducer for TransactWriterProducer {
         if drop > 0 {
             state.emitted.drain(0..drop);
             state.committed_base += uint_of_row(drop);
+        }
+        // Recorded before the ack releases the driver, which may then emit the next item's first
+        // attempt on another thread.
+        self.deliveries.set_live(!state.emitted.is_empty());
+        if let Some(pos) = ack {
+            self.ack_through(state, &pos);
         }
     }
 }
@@ -8663,6 +8826,104 @@ impl CommitProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod attempt_deliveries {
+        use super::*;
+        use crate::interpreter::dispatcher::notify_for_test;
+        use crate::interpreter::tile_operators::test_helpers::{RegionLog, keys_between};
+
+        type Log = Arc<RwLock<Vec<Projection>>>;
+
+        fn rows(a: u64, b: u64) -> Projection {
+            Projection::of(&keys_between(a, b)).unwrap()
+        }
+
+        fn logged(log: &Log) -> Vec<Projection> {
+            log.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// A record and its two input consumers, each in front of a log.
+        fn inputs() -> (
+            AttemptDeliveries,
+            Box<dyn Consumer>,
+            Log,
+            Box<dyn Consumer>,
+            Log,
+        ) {
+            let deliveries = AttemptDeliveries::new();
+            let (driver_log, driven) = RegionLog::new();
+            let (body_log, bodied) = RegionLog::new();
+            let driver = deliveries.driver(Box::new(driver_log));
+            let body = deliveries.body(Box::new(body_log));
+            (deliveries, driver, driven, body, bodied)
+        }
+
+        /// With nothing live, the driver's delivery of a first attempt is held, and the body's
+        /// delivery of that position announces it once.
+        #[test]
+        fn a_first_attempt_waits_for_the_body() {
+            let (_deliveries, driver, driven, body, bodied) = inputs();
+            notify_for_test(&*driver, &rows(0, 0));
+            notify_for_test(&*body, &rows(0, 0));
+            notify_for_test(&*body, &rows(0, 0));
+            assert_eq!(logged(&driven), []);
+            assert_eq!(logged(&bodied), [rows(0, 0)]);
+        }
+
+        /// A position the body already announced is not held again when the driver delivers it.
+        #[test]
+        fn a_pending_position_is_not_held() {
+            let (deliveries, driver, _driven, body, bodied) = inputs();
+            notify_for_test(&*body, &rows(0, 0));
+            notify_for_test(&*driver, &rows(0, 0));
+            notify_for_test(&*body, &rows(0, 0));
+            assert_eq!(logged(&bodied), [rows(0, 0)]);
+            deliveries.consumed();
+            notify_for_test(&*driver, &rows(1, 1));
+            assert_eq!(logged(&bodied), [rows(0, 0)], "row 1 is held, not passed");
+        }
+
+        /// A retry passes on alone beside a held attempt or a live one, and takes the held
+        /// positions with it. The body is then cut to the positions not pending, and passes on
+        /// once the writer consumes.
+        #[test]
+        fn a_retry_passes_and_takes_the_held_attempt() {
+            let (deliveries, driver, driven, body, bodied) = inputs();
+            notify_for_test(&*driver, &rows(0, 0));
+            notify_for_test(&*driver, &rows(1, 1));
+            notify_for_test(&*body, &rows(0, 1));
+            assert_eq!(logged(&driven), [rows(1, 1)]);
+            assert_eq!(
+                logged(&bodied),
+                [],
+                "the retry's package reads both positions"
+            );
+            deliveries.consumed();
+            deliveries.set_live(true);
+            notify_for_test(&*driver, &rows(2, 2));
+            notify_for_test(&*body, &rows(2, 3));
+            deliveries.consumed();
+            notify_for_test(&*body, &rows(2, 2));
+            assert_eq!(logged(&driven), [rows(1, 1), rows(2, 2)]);
+            assert_eq!(logged(&bodied), [rows(3, 3), rows(2, 2)]);
+        }
+
+        /// The store's progress reaches the driver slot widened to every position: it passes on
+        /// and marks every position pending until the writer consumes.
+        #[test]
+        fn store_progress_passes_and_marks_every_position() {
+            let (deliveries, driver, driven, body, bodied) = inputs();
+            notify_for_test(&*driver, &Projection::Everything);
+            notify_for_test(&*body, &rows(0, 0));
+            assert_eq!(logged(&driven), [Projection::Everything]);
+            assert_eq!(logged(&bodied), []);
+            deliveries.consumed();
+            notify_for_test(&*body, &rows(0, 0));
+            assert_eq!(logged(&bodied), [rows(0, 0)]);
+        }
+    }
     use crate::ccl::provenance::NodeId;
     use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
     use crate::interpreter::tile_operators::{SlotReader, Version};

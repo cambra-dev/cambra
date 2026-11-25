@@ -114,11 +114,12 @@ pub(super) struct WorkerPool {
     #[cfg(test)]
     stats: Vec<Stats>,
     /// The test counters the worker threads counted: a transaction driver's reissued attempts
-    /// (`RETRIES`) and its stalled requests (`STALLS`). The coordinator adds them to its own
+    /// (`RETRIES`), its stalled requests (`STALLS`) and its writers' consumes
+    /// (`WRITER_CONSUMES`). The coordinator adds them to its own
     /// ([`hand_over_counters`](Self::hand_over_counters)), so a test that runs a program reads
     /// every thread's counts on its own thread.
     #[cfg(test)]
-    counters: Mutex<[usize; 2]>,
+    counters: Mutex<[usize; 3]>,
 }
 
 impl WorkerPool {
@@ -164,7 +165,7 @@ impl WorkerPool {
             #[cfg(test)]
             stats: (0..pipelines.len()).map(|_| Stats::default()).collect(),
             #[cfg(test)]
-            counters: Mutex::new([0; 2]),
+            counters: Mutex::new([0; 3]),
             pipelines,
             unstarted: AtomicBool::new(false),
             busy: AtomicUsize::new(0),
@@ -338,6 +339,7 @@ impl WorkerPool {
         let mut counters = self.counters.lock().unwrap_or_else(PoisonError::into_inner);
         counters[0] += crate::interpreter::commit_operator::RETRIES.with(|c| c.replace(0));
         counters[1] += transaction_scope::STALLS.with(|c| c.replace(0));
+        counters[2] += crate::interpreter::commit_operator::WRITER_CONSUMES.with(|c| c.replace(0));
     }
 
     /// The first claimant republishes output carried over from the previous run. Both the
@@ -438,6 +440,7 @@ impl WorkerPool {
             std::mem::take(&mut *self.counters.lock().unwrap_or_else(PoisonError::into_inner));
         crate::interpreter::commit_operator::RETRIES.with(|c| c.set(c.get() + counters[0]));
         transaction_scope::STALLS.with(|c| c.set(c.get() + counters[1]));
+        crate::interpreter::commit_operator::WRITER_CONSUMES.with(|c| c.set(c.get() + counters[2]));
     }
 
     /// [`consume`](Self::consume) on the coordinator, which claims as worker 0. It wakes the

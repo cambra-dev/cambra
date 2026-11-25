@@ -1540,6 +1540,19 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   `a_commit_ack_reaches_the_drive_through_the_writers_body` in `commit_operator.rs` check that the
   writer issues both releases on its body.
 
+  **Each attempt's position queues the writer once.** Both inputs deliver each attempt's
+  position, and a body with breakers in it, such as the `Memo`s of an `if`'s arms, delivers it in
+  a later landing than the driver slot. The writer holds a first attempt's delivery from the
+  driver slot until the body delivers that position, so it does not consume before the body has a
+  decision there. A retry's delivery from the driver slot queues the writer alone, because the
+  consume releases the attempt the retry supersedes. The body releases a position without
+  delivering it only after that release, so a held first attempt is announced by its body or
+  passed on by its retry. A delivery at a position whose delivery already queued the writer, or
+  woke its scope, is dropped until the writer consumes. `AttemptDeliveries` in
+  `commit_operator.rs` keeps this record, and the writer's consume clears it before it reads
+  either input. `a_writer_with_body_breakers_consumes_once_per_item` checks one consume per item
+  on one worker and on four, and `contending_writers_with_body_breakers_retry` checks the retries.
+
   **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the store has the item's decision": only the release of its newest live row is the ack, as a release from the body alone is not one.
 - **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it, in the tiling of `V` (`Tiling::from_extent`), so a collection-valued key arrives as a level, as every store read hands it out. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_read`, an induction accumulator's trailing read. It samples through `store_current` at the store's closure, so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. It reads the store whole and cuts the settled value and its completeness to the requested output keys. Without enclosing rows, a partial output release hides those keys while retaining the store slot. A universal release retires it and releases the store slot; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream, commit time ⇀ `V`, out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).

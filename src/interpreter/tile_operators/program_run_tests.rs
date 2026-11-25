@@ -5424,3 +5424,78 @@ fn a_fold_over_a_chain_refusing_its_inner_level_answers_at_each_dop() {
         assert_eq!(written(workers), one, "{workers} workers");
     }
 }
+
+/// A writer whose body holds breakers, here the `Memo`s of an `if`'s arms, consumes once per item
+/// and once more when its source completes, on one worker and on four. The body's breakers deliver
+/// each attempt's position after the driver slot has. The writer waits for the body's delivery of
+/// a first attempt rather than consuming on the driver's and finding no decision, and queues once
+/// for the two deliveries (`AttemptDeliveries`).
+#[rstest_log::rstest]
+fn a_writer_with_body_breakers_consumes_once_per_item(
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(1, 4)] workers: usize,
+) {
+    use crate::interpreter::commit_operator::WRITER_CONSUMES;
+    let source = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 10
+        for r in source1():
+            with begin():
+                if pool >= r:
+                    pool := pool - r
+        out << await_final(pool)
+    "};
+    for (delivery, batches) in deliveries() {
+        let items: usize = batches.iter().map(|(entries, _)| entries.len()).sum();
+        WRITER_CONSUMES.with(|consumes| consumes.set(0));
+        dispatched_live_observed_on(source, rows, workers, batches, |_, _| {});
+        assert_eq!(
+            WRITER_CONSUMES.with(std::cell::Cell::get),
+            items + 1,
+            "over {delivery}"
+        );
+    }
+}
+
+/// Two writers of one store over one live source, each with breakers in its body, contend: a
+/// writer's first attempts wait for its body, and its retries run on the driver alone, which
+/// releases the attempts they supersede. Each item is taken by the first writer whose `if` admits
+/// it, so the store ends at the same value in any order of commits.
+#[rstest_log::rstest]
+fn contending_writers_with_body_breakers_retry(
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(1, 4)] workers: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 1000
+        for r in source1():
+            with begin():
+                if pool >= r:
+                    pool := pool - r
+        for r in source1():
+            with begin():
+                if pool >= 2 * r:
+                    pool := pool - 2 * r
+        out << await_final(pool)
+    "};
+    for (delivery, batches) in deliveries() {
+        let items: i64 = batches
+            .iter()
+            .flat_map(|(entries, _)| entries)
+            .map(|(_, value)| match value {
+                Value::Int(item) => *item,
+                other => panic!("an item is an Int: {other:?}"),
+            })
+            .sum();
+        let (value, _) = dispatched_live_observed_on(source, rows, workers, batches, |_, _| {});
+        let [binding] = value.as_function().as_slice() else {
+            panic!("{source} writes one value: {value:?}")
+        };
+        assert_eq!(
+            binding.output,
+            Value::Int(1000 - 3 * items),
+            "over {delivery}"
+        );
+    }
+}

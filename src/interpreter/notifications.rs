@@ -595,7 +595,10 @@ struct Aligned {
 /// The rows of level `at` that `region` reaches, as paths of that level: its keys at `at`, the
 /// paths beneath its keys above `at`, and the paths its keys beneath `at` run through. `None` where
 /// the region names fields of a record, which name no row.
-fn rows_reached(region: &Projection, at: CurryLevel) -> Option<crate::interpreter::Predicate> {
+pub(crate) fn rows_reached(
+    region: &Projection,
+    at: CurryLevel,
+) -> Option<crate::interpreter::Predicate> {
     use crate::interpreter::Predicate;
     match region {
         Projection::Everything => Some(Predicate::True),
