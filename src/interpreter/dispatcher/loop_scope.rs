@@ -188,23 +188,56 @@ impl RoundWork {
 /// the rest here.
 #[derive(Default)]
 pub struct Offered {
-    /// The region of the scope's input offered and not queued yet.
-    pub region: Option<TileGuard>,
-    /// Whether the scope's pipeline closes once everything offered is queued.
-    pub closing: bool,
-    /// Whether the scope's pipeline has closed: a later ask to close it again asks nothing.
-    pub closed: bool,
-    /// Whether the scope's pipeline closes once every pipeline it reads has finished, which an
-    /// admission checks ([`Body::intake`](loop_scope::Body)) and turns into `closing`.
-    after_reads: bool,
+    intake: ScopeInput,
+    close: IntakeClose,
     /// Per inner pipeline, what pushes from outside the body brought it since the last round or
     /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
     /// reads what grew.
     pub grown: Vec<(PipelineId, TileGuard)>,
-    /// Positions the next request must revisit. Fresh input remains in `region`.
+    /// Positions the next request must revisit. Fresh input stays in the intake.
     retry: Option<Retry>,
     /// A wake that the next decision to park must observe.
     woken: bool,
+}
+
+/// Ordinary requests consume each offered region. A parent-fed loop retains delivery evidence
+/// because the parent can give it the same row again in a closing round.
+enum ScopeInput {
+    Ordinary(Option<TileGuard>),
+    Parent(Box<ParentRows>),
+}
+
+impl Default for ScopeInput {
+    fn default() -> Self {
+        Self::Ordinary(None)
+    }
+}
+
+struct ParentRows {
+    input: Tiling,
+    held: Option<TileGuard>,
+    delivered: Option<TileGuard>,
+}
+
+impl ParentRows {
+    /// The held rows the drive's source has delivered, and the rest: a row is ready where the
+    /// source delivered it, and where what is left of it, closed over the scope's input, names no
+    /// position, as a closing round gives a row's remainder past the positions its domain has.
+    /// `None` where no row is held or the source has delivered nothing.
+    fn ready(&self) -> Option<(TileGuard, TileGuard)> {
+        let held = self.held.as_ref()?;
+        let rest = guard_minus(held, self.delivered.as_ref()?).closed_over(&self.input);
+        Some((guard_minus(held, &rest), rest))
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum IntakeClose {
+    #[default]
+    Open,
+    AfterReads,
+    Requested,
+    Closed,
 }
 
 struct Retry {
@@ -223,6 +256,17 @@ enum RetryPhase {
 }
 
 impl Offered {
+    pub(super) fn offer(&mut self, guard: TileGuard) {
+        let region = match &mut self.intake {
+            ScopeInput::Ordinary(pending) => pending,
+            ScopeInput::Parent(rows) => &mut rows.delivered,
+        };
+        *region = Some(match region.take() {
+            Some(before) => before.union(&guard),
+            None => guard,
+        });
+    }
+
     pub(super) fn wake(&mut self) {
         if let Some(retry) = &mut self.retry
             && retry.phase == RetryPhase::Parked
@@ -271,13 +315,6 @@ pub(super) struct Body {
     /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
     /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
     offers: Offers,
-    /// Whether the scope is a nested loop's, whose rows the loop around it gives it: what its
-    /// drive's source offers then releases those rows ([`hold_row`](Self::hold_row)) rather than
-    /// being queued itself.
-    rows_from_outer: bool,
-    /// The rows the loop around a nested loop gave it, waiting for its drive's source to deliver
-    /// them.
-    held: Option<TileGuard>,
 }
 
 /// Where a body sits in the run's shared dispatcher.
@@ -309,8 +346,6 @@ impl Body {
             attached: None,
             active: false,
             offers: Offers::default(),
-            rows_from_outer: false,
-            held: None,
         }
     }
 
@@ -447,10 +482,7 @@ impl Body {
     /// Add `guard`, a region of the scope's input, to what is offered and not queued yet.
     pub(super) fn offer(&self, guard: &TileGuard) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.region = Some(match offered.region.take() {
-            Some(before) => before.union(guard),
-            None => guard.clone(),
-        });
+        offered.offer(guard.clone());
     }
 
     /// Whether a nested loop among the inner pipelines has work the round waits for: a request
@@ -480,57 +512,49 @@ impl Body {
     }
 
     fn has_ready_row_or_retry(&self) -> bool {
-        self.ready_rows()
-            .is_some_and(|(ready, _)| !ready.is_empty())
-            || self
-                .offers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+        let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ready_row = match &offered.intake {
+            ScopeInput::Parent(rows) => rows.ready().is_some_and(|(ready, _)| !ready.is_empty()),
+            ScopeInput::Ordinary(_) => false,
+        };
+        ready_row
+            || offered
                 .retry
                 .as_ref()
                 .is_some_and(|retry| retry.phase == RetryPhase::Ready)
     }
 
-    /// For a nested loop, the rows it holds that its drive's source has delivered, and the rest:
-    /// a row is ready where the source delivered it, and where what is left of it, closed over the
-    /// scope's input, names no position, as a closing round gives a row's remainder past the
-    /// positions its domain has. `None` where it holds no row or its source has offered nothing.
-    fn ready_rows(&self) -> Option<(TileGuard, TileGuard)> {
-        let input = self.driver_target().and_then(|target| {
-            let target = target.read().unwrap_or_else(PoisonError::into_inner);
-            target.as_ref().map(|(_, input)| input.clone())
-        });
-        let held = self.held.as_ref()?;
-        let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        let delivered = offered.region.as_ref()?;
-        let rest = guard_minus(held, delivered);
-        let rest = match input {
-            Some(input) => rest.closed_over(&input),
-            None => rest,
-        };
-        Some((guard_minus(held, &rest), rest))
-    }
-
-    /// Take the rows the loop around this nested loop gives it: they are queued once the drive's
-    /// source has offered each whole ([`queue_offered`](Self::queue_offered)).
+    /// Keep a parent row until the drive's source has delivered it.
     pub(super) fn hold_row(&mut self, guard: &TileGuard) {
-        self.rows_from_outer = true;
-        self.held = Some(match self.held.take() {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ScopeInput::Parent(rows) = &mut offered.intake else {
+            unreachable!("only a nested scope accepts a parent row")
+        };
+        rows.held = Some(match rows.held.take() {
             Some(before) => before.union(guard),
             None => guard.clone(),
         });
     }
 
-    /// Mark this scope a nested loop's, whose rows come from the loop around it.
-    pub(super) fn take_rows_from_outer(&mut self) {
-        self.rows_from_outer = true;
+    pub(super) fn take_rows_from_outer(&mut self, input: Tiling) {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ScopeInput::Ordinary(delivered) = &mut offered.intake else {
+            unreachable!("a nested scope is attached once")
+        };
+        offered.intake = ScopeInput::Parent(Box::new(ParentRows {
+            input,
+            held: None,
+            delivered: delivered.take(),
+        }));
     }
 
     /// Close the scope's pipeline once every pipeline it reads has finished and everything
     /// offered to it is queued.
     pub(super) fn close_after_reads(&self) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.after_reads |= !offered.closed;
+        if offered.close == IntakeClose::Open {
+            offered.close = IntakeClose::AfterReads;
+        }
     }
 
     /// The scope's intake, with a close after reads turned into a close once every read has
@@ -538,9 +562,10 @@ impl Body {
     /// admission that misses the last count finds it on any later admission.
     fn intake(&self, dispatcher: &Dispatcher) -> std::sync::MutexGuard<'_, Offered> {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        if offered.after_reads && dispatcher.only_arrivals_remain(self.attached().pipeline) {
-            offered.after_reads = false;
-            offered.closing |= !offered.closed;
+        if offered.close == IntakeClose::AfterReads
+            && dispatcher.only_arrivals_remain(self.attached().pipeline)
+        {
+            offered.close = IntakeClose::Requested;
         }
         offered
     }
@@ -548,7 +573,9 @@ impl Body {
     /// Close the scope's pipeline once everything offered to it is queued.
     pub(super) fn close_offers(&self) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.closing |= !offered.closed;
+        if matches!(offered.close, IntakeClose::Open | IntakeClose::AfterReads) {
+            offered.close = IntakeClose::Requested;
+        }
     }
 
     /// Queue what was offered on the scope's pipeline, and close the pipeline once asked, where
@@ -558,38 +585,36 @@ impl Body {
         let Some(pipeline) = self.attached.as_ref().map(|attached| attached.pipeline) else {
             return false;
         };
-        // A nested loop queues each row given to it once its drive's source has delivered it.
-        if self.rows_from_outer {
-            let Some((ready_rows, rest)) = self.ready_rows() else {
-                return false;
-            };
-            if ready_rows.is_empty() {
-                return false;
-            }
-            // What the drive's source delivered stays delivered: a closing round gives the row
-            // again, which reads it again.
-            self.held = (!rest.is_empty()).then_some(rest);
-            dispatcher.queue_for(pipeline, &ready_rows);
-            return true;
-        }
         // An offer comes from a push that also queues packages to the pipelines the drive pulls
         // its source through, which a worker may still be consuming: a request begun before
         // they have consumed them finds no position and closes over positions the drive will
         // emit. So the offer waits until every pipeline the scope's pipeline reads is quiescent.
-        if !dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied()) {
-            return false;
-        }
+        let reads_ready = dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied());
         let mut offered = self.intake(dispatcher);
+        let mut region = match &mut offered.intake {
+            ScopeInput::Parent(rows) => {
+                let Some((ready, rest)) = rows.ready() else {
+                    return false;
+                };
+                if ready.is_empty() {
+                    return false;
+                }
+                rows.held = (!rest.is_empty()).then_some(rest);
+                drop(offered);
+                dispatcher.queue_for(pipeline, &ready);
+                return true;
+            }
+            ScopeInput::Ordinary(pending) if ready && reads_ready => pending.take(),
+            ScopeInput::Ordinary(_) => return false,
+        };
         // The pipeline stays open while a request is queued or running, which may leave positions
         // waiting for inputs, and while any wait: what an input brings queues the request that
         // runs them.
-        if !ready {
-            return false;
-        }
         let idle = dispatcher.outstanding(pipeline) == 0;
-        let closing =
-            offered.closing && idle && offered.region.is_none() && offered.retry.is_none();
-        let mut region = offered.region.take();
+        let closing = offered.close == IntakeClose::Requested
+            && idle
+            && region.is_none()
+            && offered.retry.is_none();
         // An ordinary request already queued on this ordered pipeline takes the retry when it
         // begins. Enqueueing a separate package behind it would revisit the same positions twice.
         if idle && let Some(retry) = offered.ready_retry() {
@@ -602,8 +627,9 @@ impl Body {
         if region.is_none() && !closing {
             return false;
         }
-        offered.closing &= !closing;
-        offered.closed |= closing;
+        if closing {
+            offered.close = IntakeClose::Closed;
+        }
         drop(offered);
         if let Some(region) = region {
             dispatcher.queue_for(pipeline, &region);
@@ -617,12 +643,12 @@ impl Body {
     /// Whether anything offered is not queued yet.
     pub(super) fn has_offers(&self, dispatcher: &Dispatcher) -> bool {
         let offered = self.intake(dispatcher);
-        offered.region.is_some()
+        matches!(offered.intake, ScopeInput::Ordinary(Some(_)))
             || offered
                 .retry
                 .as_ref()
                 .is_some_and(|retry| retry.phase == RetryPhase::Ready)
-            || offered.closing
+            || offered.close == IntakeClose::Requested
     }
 
     /// Clear every inner pipeline's entries.
@@ -1344,6 +1370,26 @@ mod tests {
     use crate::interpreter::{Position, Tile};
 
     #[test]
+    fn a_closing_round_can_take_a_delivered_parent_row_again() {
+        let compiled = Compiled::of(SUM);
+        let mut scope = induction(&compiled.scope);
+        let input = scope.input_tiling(InputId::ONLY);
+        let body = scope.body_mut();
+        let row = keys_between(0, 0);
+        body.offer(&row);
+        body.take_rows_from_outer(input);
+        assert!(!body.queue_offered(&compiled.dispatcher, true));
+        for _ in 0..2 {
+            body.hold_row(&row);
+            assert!(body.queue_offered(&compiled.dispatcher, true));
+            assert!(!body.queue_offered(&compiled.dispatcher, true));
+            let request = compiled.dispatcher.claim_of(PipelineId(0)).unwrap();
+            assert_eq!(request.guard, row);
+            compiled.dispatcher.acknowledge(request);
+        }
+    }
+
+    #[test]
     fn a_wake_before_parking_and_one_after_admission_queue_one_retry() {
         let compiled = Compiled::of(SUM);
         let mut scope = induction(&compiled.scope);
@@ -1646,12 +1692,7 @@ mod tests {
         struct OfferRows(Offers);
         impl Consumer for OfferRows {
             fn notify(&self, _: &Projection, _: &mut Landing<'_>) {
-                let mut offered = self.0.lock().unwrap();
-                let rows = keys_between(0, 2);
-                offered.region = Some(match offered.region.take() {
-                    Some(before) => before.union(&rows),
-                    None => rows,
-                });
+                self.0.lock().unwrap().offer(keys_between(0, 2));
             }
         }
         let request = PipelineId(0);

@@ -2317,10 +2317,7 @@ impl Consumer for Entry {
             && let Some(guard) = pushed_guard(region, input)
         {
             let mut offered = offers.lock().unwrap_or_else(PoisonError::into_inner);
-            offered.region = Some(match offered.region.take() {
-                Some(before) => before.union(&guard),
-                None => guard,
-            });
+            offered.offer(guard);
         }
         if landing.is_delivery()
             && let Some(inline) = &self.inline
