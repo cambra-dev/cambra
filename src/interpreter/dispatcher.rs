@@ -2088,20 +2088,51 @@ pub type CompletionTarget = Arc<RwLock<Option<(Offers, Tiling)>>>;
 /// the rest here.
 #[derive(Default)]
 pub struct Offered {
-    /// The region of the scope's input offered and not queued yet.
-    pub region: Option<TileGuard>,
-    /// Whether the scope's pipeline closes once everything offered is queued.
-    pub closing: bool,
-    /// Whether the scope's pipeline has closed: a later ask to close it again asks nothing.
-    pub closed: bool,
+    intake: ScopeInput,
+    close: IntakeClose,
     /// Per inner pipeline, what pushes from outside the body brought it since the last round or
     /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
     /// reads what grew.
     pub grown: Vec<(PipelineId, TileGuard)>,
-    /// Positions the next request must revisit. Fresh input remains in `region`.
+    /// Positions the next request must revisit. Fresh input stays in the intake.
     retry: Option<Retry>,
     /// A wake that the next decision to park must observe.
     woken: bool,
+}
+
+/// Ordinary requests consume each offered region. A parent-fed loop retains delivery evidence
+/// because the parent can give it the same row again in a closing round.
+enum ScopeInput {
+    Ordinary(Option<TileGuard>),
+    Parent(Box<ParentRows>),
+}
+
+impl Default for ScopeInput {
+    fn default() -> Self {
+        Self::Ordinary(None)
+    }
+}
+
+struct ParentRows {
+    input: Tiling,
+    held: Option<TileGuard>,
+    delivered: Option<TileGuard>,
+}
+
+impl ParentRows {
+    fn ready(&self) -> Option<(TileGuard, TileGuard)> {
+        let held = self.held.as_ref()?;
+        let rest = guard_minus(held, self.delivered.as_ref()?).closed_over(&self.input);
+        Some((guard_minus(held, &rest), rest))
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum IntakeClose {
+    #[default]
+    Open,
+    Requested,
+    Closed,
 }
 
 struct Retry {
@@ -2120,6 +2151,17 @@ enum RetryPhase {
 }
 
 impl Offered {
+    fn offer(&mut self, guard: TileGuard) {
+        let region = match &mut self.intake {
+            ScopeInput::Ordinary(pending) => pending,
+            ScopeInput::Parent(rows) => &mut rows.delivered,
+        };
+        *region = Some(match region.take() {
+            Some(before) => before.union(&guard),
+            None => guard,
+        });
+    }
+
     fn wake(&mut self) {
         if let Some(retry) = &mut self.retry
             && retry.phase == RetryPhase::Parked
@@ -2309,10 +2351,7 @@ impl Consumer for Entry {
             && let Some(guard) = pushed_guard(region, input)
         {
             let mut offered = offers.lock().unwrap_or_else(PoisonError::into_inner);
-            offered.region = Some(match offered.region.take() {
-                Some(before) => before.union(&guard),
-                None => guard,
-            });
+            offered.offer(guard);
         }
         if landing.is_delivery()
             && let Some(inline) = &self.inline

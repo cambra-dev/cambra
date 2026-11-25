@@ -1323,7 +1323,8 @@ impl Execution {
                 // releases the rows the loop around it gives it.
                 let mut child = induction(child);
                 child.decide_through_drive();
-                child.body_mut().take_rows_from_outer();
+                let input = child.input_tiling(InputId::ONLY);
+                child.body_mut().take_rows_from_outer(input);
             }
         }
         let step = dispatcher.add_pipeline(body.clone());
