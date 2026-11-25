@@ -3556,7 +3556,7 @@ pub(super) fn emit_proj<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let (domain, codomain) = ctx.provide_function(node_ty, &|| projection(key))?;
     let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
-    if let (ProjKey::Index(k), Type::DepTuple(_)) = (key, domain.peel_refinements()) {
+    if let (ProjKey::Index(k), Type::DepTuple(components)) = (key, domain.peel_refinements()) {
         let _g = crate::ccl::provenance::enter(
             node_id,
             "check.dependent_projection",
@@ -3571,8 +3571,10 @@ pub(super) fn emit_proj<C: Typing>(
             } => b.clone(),
             _ => {
                 debug_assert!(
-                    !crate::ccl::subst::references_enclosing_function(&codomain),
-                    "a projection without a whole-input binder has an independent codomain"
+                    components.get(*k).is_none_or(|(_, component)| {
+                        !crate::ccl::subst::references_binder_within(component, *k as u32)
+                    }),
+                    "a projection without a whole-input binder has a component independent of earlier components"
                 );
                 Name::fresh("__proj")
             }
