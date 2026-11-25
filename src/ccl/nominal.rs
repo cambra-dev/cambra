@@ -771,9 +771,10 @@ impl NominalDecl {
     }
 
     /// Copy the declaration with its constructor parameter types transported. The transport
-    /// preserves type parameters and variance, as renaming a source-domain atom does.
+    /// preserves type parameters and variance, as renaming a source-domain atom does. A
+    /// declaration whose constructors are not defined yet has no types to transport.
     pub fn map_declared_types(&self, map: &mut dyn FnMut(&mut Type) -> bool) -> Option<Rc<Self>> {
-        let body = self.body();
+        let body = self.body.get()?;
         let mut changed = false;
         let ctors = body
             .ctors

@@ -652,7 +652,8 @@ impl Printer {
         // theirs by a length and a source.
         let shown_domain = !(is_data
             && dependent.is_none()
-            && matches!(domain, Type::UIntRange(_) | Type::DataSource(_)));
+            && (matches!(domain, Type::UIntRange(_))
+                || matches!(domain, Type::DataSource(source) if source.spelling().is_none())));
         let dom = if shown_domain {
             self.ty(domain)
         } else {
@@ -1539,6 +1540,13 @@ mod tests {
             chl_type(&Type::ChanDom(Name::raw("d"), ChanLevel(0))),
             NOT_PRINTABLE
         );
+    }
+
+    #[test]
+    fn a_collection_names_its_written_source_domain() {
+        let source = Type::DataSource(crate::ccl::SourceName::spelled("internal", "route::Reqs"));
+        let ty = Type::full_map_of(source, Type::Base(BaseType::String));
+        assert_eq!(chl_type(&ty), "route::Reqs |=> String");
     }
 
     fn int() -> Type {

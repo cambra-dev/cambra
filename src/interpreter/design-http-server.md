@@ -49,8 +49,10 @@ The response sink registration is stored outside the pure CCL tree. A diagnostic
 type as the run reaches it, `server::Reqs`.
 
 A module interface retains its route templates. Linking substitutes run arguments into source
-names in expressions, exported aliases, annotations, and quoted predicates. A nested run may
-retain a symbolic address over its enclosing module's constant parameters. A concrete root run
+names in expressions, exported aliases, annotations, quoted predicates, and nominal constructor
+patterns. A method’s written result type and the payload its pattern extracts name the same source.
+A nested run may retain a symbolic address over its enclosing module’s constant parameters. A
+concrete root run
 resolves it to the route's canonical source name. Checking a module uses unopened sources and
 opens no sockets.
 

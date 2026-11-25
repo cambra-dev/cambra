@@ -2994,6 +2994,34 @@ impl TypedExpr {
         }
     }
 
+    /// The nominal declarations this node holds outside its type slots: constructor heads,
+    /// constructor patterns and method candidates. Child expressions are visited separately.
+    pub fn walk_nominal_decls_mut(
+        &mut self,
+        mut f: impl FnMut(&mut std::rc::Rc<crate::ccl::nominal::NominalDecl>),
+    ) {
+        match &mut self.node {
+            TypedExprNode::NominalCtor { decl, .. } => f(decl),
+            TypedExprNode::Case { branches, .. } => {
+                for branch in branches {
+                    if let Some(Pattern {
+                        head: PatternHead::Constructor { decl, .. },
+                        ..
+                    }) = &mut branch.pattern
+                    {
+                        f(decl);
+                    }
+                }
+            }
+            TypedExprNode::Method { candidates, .. } => {
+                for candidate in candidates {
+                    f(&mut candidate.decl);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Mutable analog of [`walk_type_slots`](Self::walk_type_slots), for passes
     /// that rewrite type slots in place. Kept in lockstep with it — any new
     /// type-slot-bearing variant must appear in both.

@@ -4,7 +4,6 @@
 use super::*;
 use crate::ccl::capabilities::{Owner, replace_owners};
 use crate::ccl::nominal::NominalDecl;
-use crate::ccl::{Pattern, PatternHead};
 
 /// `ty`, a type its module lowered, as a module reaching it through the
 /// qualifier `qualifier` writes it: each raw name its predicates read free is
@@ -82,28 +81,7 @@ pub(super) fn substitute_in(expr: &mut Expr, arguments: &Arguments) {
         return;
     }
     expr.walk_type_slots_mut(|ty| substitute(ty, arguments));
-    // A node that names a nominal type outside a type slot names the instance the
-    // arguments reach.
-    match &mut expr.node {
-        TypedExprNode::NominalCtor { decl, .. } => substitute_decl(decl, arguments),
-        TypedExprNode::Case { branches, .. } => {
-            for branch in branches {
-                if let Some(Pattern {
-                    head: PatternHead::Constructor { decl, .. },
-                    ..
-                }) = &mut branch.pattern
-                {
-                    substitute_decl(decl, arguments);
-                }
-            }
-        }
-        TypedExprNode::Method { candidates, .. } => {
-            for candidate in candidates {
-                substitute_decl(&mut candidate.decl, arguments);
-            }
-        }
-        _ => {}
-    }
+    expr.walk_nominal_decls_mut(|decl| substitute_decl(decl, arguments));
     expr.walk_children_mut(|child| substitute_in(child, arguments));
 }
 

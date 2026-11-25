@@ -1063,7 +1063,11 @@ fn a_module_borrows_transactional_state_for_its_run() {
 #[test]
 fn a_nominal_payload_keeps_the_source_domain_of_its_const_addressed_run() {
     let loaded = program(
-        "run endpoint(port=\"0\") as route",
+        indoc! {r#"
+            run endpoint(port="0") as route
+            n = sum([1 for x in route::b.bodies()])
+            n
+        "#},
         &[(
             "endpoint",
             indoc! {r#"
@@ -1072,9 +1076,40 @@ fn a_nominal_payload_keeps_the_source_domain_of_its_const_addressed_run() {
         run std::http::serve(port=port, method="POST", path="/batch") as server
         pub type Batch:
             new(bodies: server::Reqs |=> String)
+        impl Batch:
+            pub def bodies(self) => server::Reqs |=> String:
+                match self:
+                    case Batch::new(bodies): bodies
         pub b = Batch::new([r.body() for r in server::requests])
         server::respond([http::ok_text(r.body()) for r in server::requests])
     "#},
+        )],
+    );
+    let _ = compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {}))
+        .unwrap_or_render(&loaded);
+}
+
+#[test]
+fn a_route_rename_preserves_a_nominal_argument_declared_before_its_body() {
+    let loaded = program(
+        indoc! {r#"
+            type Local:
+                new(x: Int)
+            run endpoint(T=Local, port="0") as route
+            type Holder:
+                new(p: route::Same)
+            0
+        "#},
+        &[(
+            "endpoint",
+            indoc! {r#"
+            import std::http
+            param T
+            const param port: String
+            run std::http::serve(port=port, method="POST", path="/p") as server
+            pub Same = T
+            server::respond([http::ok_text(r.body()) for r in server::requests])
+        "#},
         )],
     );
     let _ = compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {}))

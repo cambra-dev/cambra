@@ -334,15 +334,7 @@ pub(super) fn rename_source_expr(expr: &mut Expr, renames: &SourceRenames) -> bo
         *name = to.as_str().to_string();
         changed = true;
     }
-    match &mut expr.node {
-        TypedExprNode::NominalCtor { decl, .. } => changed |= rename_source_decl(decl, renames),
-        TypedExprNode::Method { candidates, .. } => {
-            for candidate in candidates {
-                changed |= rename_source_decl(&mut candidate.decl, renames);
-            }
-        }
-        _ => {}
-    }
+    expr.walk_nominal_decls_mut(|decl| changed |= rename_source_decl(decl, renames));
     expr.walk_type_slots_mut(|ty| changed |= rename_source_type(ty, renames));
     expr.walk_children_mut(|e| changed |= rename_source_expr(e, renames));
     changed
