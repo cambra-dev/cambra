@@ -1192,7 +1192,13 @@ impl Scope {
         {
             return true;
         }
-        if let Some(pipeline) = self.with_body(|body| body.take_finish(dispatcher)) {
+        let finished = match self {
+            Scope::Loop(store) => induction(store).body_mut().take_finish(dispatcher),
+            Scope::Writer { store, writer } => transaction_scope::transaction(store)
+                .writer_run_mut(*writer)
+                .take_finish(dispatcher),
+        };
+        if let Some(pipeline) = finished {
             finish_with(dispatcher, reach, pipeline);
             self.with_body(|body| body.unplace());
             return true;
@@ -1355,7 +1361,7 @@ impl Execution {
             writer,
         };
         let step = self.attach_body(scope, request, dispatcher);
-        // An attempt's step is closed once the finish's attempt has run (`WriterRun::close`).
+        // An attempt's step is closed once the finish's attempt has run (`WriterRun::drain`).
         dispatcher.take_arrivals(step);
     }
 
@@ -3833,11 +3839,10 @@ mod tests {
         assert!(yields_a_prefix(&path, &yielded(Predicate::True)));
     }
 
-    #[test]
-    fn a_parked_writer_wakes_on_peer_progress_and_an_older_attempt_retries() {
+    fn two_writer_run() -> transaction_scope::TransactionRun {
         use crate::ccl::context::{GlobalContext, compile_program};
         use crate::ccl::load::LoadedProgram;
-        use crate::interpreter::tile_operators::{StoreRead, test_helpers::keys_between};
+        use crate::interpreter::tile_operators::StoreRead;
 
         let source = indoc::indoc! {"
             out = test_sink()
@@ -3866,27 +3871,63 @@ mod tests {
             store: fan.store().unwrap(),
         });
         let mut runs = ScopeRuns::new();
-        let mut run = transaction_scope::TransactionRun {
+        transaction_scope::TransactionRun {
             writers: (0..2)
                 .map(|i| planner.build_transaction(i, 1, &mut runs))
                 .collect(),
             progress: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn a_parked_writer_wakes_on_peer_progress_and_an_older_attempt_retries() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+
+        let mut run = two_writer_run();
         let waiting = keys_between(0, 0);
+        let queued_at = run.progress;
         assert!(
-            run.settle(0, false),
+            run.settle(0, queued_at, false),
             "writer zero can park at the current epoch"
         );
         run.writers[0].body.set_waiting(Some(waiting.clone()), None);
-        assert!(run.settle(1, false));
+        assert!(run.settle(1, queued_at, false));
         assert!(!run.writers[0].body.has_offers());
-        assert!(!run.settle(1, true));
+        assert!(!run.settle(1, queued_at, true));
         assert!(run.writers[0].body.has_offers());
         assert_eq!(run.writers[0].body.take_waited(), Some(waiting));
         assert!(
-            !run.settle(0, false),
+            !run.settle(0, queued_at, false),
             "an attempt queued before the progress must retry"
         );
+    }
+
+    #[test]
+    fn a_draining_writer_finishes_once_after_its_step() {
+        let mut run = two_writer_run();
+        let writer = &mut run.writers[0];
+        let scope = PipelineId(0);
+        let mut dispatcher = Dispatcher::new(vec![vec![]], 1);
+        let base = dispatcher.append_graph(writer.body.take_graph());
+        let inner = (base..base + writer.body.members.len()).map(PipelineId);
+        let step = dispatcher.add_pipeline(inner.clone().collect());
+        dispatcher.take_arrivals(step);
+        let hold = dispatcher.add_hold_group(inner.chain([step]));
+        writer.body.attach(scope, base, step, hold);
+        assert_eq!(writer.take_finish(&dispatcher), None);
+        writer.drain(&dispatcher);
+        loop {
+            assert_eq!(writer.take_finish(&dispatcher), None);
+            let Next::Finish { pipeline } = dispatcher.try_claim(None) else {
+                panic!("closing the writer must let the body and step finish");
+            };
+            dispatcher.finish(dispatcher.pushes(pipeline));
+            if pipeline == step {
+                break;
+            }
+        }
+        assert_eq!(writer.take_finish(&dispatcher), Some(scope));
+        assert_eq!(writer.take_finish(&dispatcher), None);
     }
 
     /// A record with a source in a field after its first is ordered by no field.

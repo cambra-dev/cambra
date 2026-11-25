@@ -425,11 +425,11 @@ Progress by a peer reoffers those positions. External input wakes them through t
 intake. Each attempt therefore either makes progress, catches up to progress that already occurred,
 or parks. A writer's final attempt retries a stale item at the new frontier before closing its body.
 
-Completing a writer includes the finish's attempt, so its body observes source completion. Source
-pipelines then close; normal finishes drain the body graph before the request pipeline finishes. A
-writer's attempts are for no request, one request, or the finish (`Attempt` in
-`transaction_scope.rs`). The body holds the scope's finish until its pipelines and step have
-finished (`Body::take_finish`), for a loop as for a writer.
+A writer runs attempts for one request at a time. Each active attempt owns its guard and the
+epoch at which it was queued. At finish, a final attempt observes source completion. Once that
+attempt settles, the writer enters `Draining`, closes its inner sources and step, and continues
+to release their followers. When all those pipelines have finished, the coordinator finishes the
+writer's request pipeline exactly once.
 Run cleanup removes the transaction metadata and its placements, as it does for loop scopes.
 Transaction control retains no dispatcher handle and constructs no additional producer instances.
 

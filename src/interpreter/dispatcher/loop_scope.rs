@@ -107,9 +107,9 @@ pub(super) struct Body {
     /// Whether the inner pipelines' entries are placed at their global ids and the pipelines
     /// run, which they do from the first request on. Only an attached body activates.
     active: bool,
-    /// Whether the scope's pipeline is finishing: from the scope's finish until the inner pipelines
+    /// Whether a loop's pipeline is finishing: from the loop's finish until the inner pipelines
     /// and the step have finished.
-    finishing: bool,
+    loop_finishing: bool,
     /// Whether a loop's scope has closed its step's arrivals
     /// ([`close_step_when_settled`](Self::close_step_when_settled)).
     step_closed: bool,
@@ -156,7 +156,7 @@ impl Body {
             driver,
             attached: None,
             active: false,
-            finishing: false,
+            loop_finishing: false,
             step_closed: false,
             pending_step: None,
             offers: Offers::default(),
@@ -302,13 +302,13 @@ impl Body {
 
     /// Begin the scope's finish.
     pub(super) fn begin_finish(&mut self) {
-        debug_assert!(!self.finishing, "a scope finishes once");
-        self.finishing = true;
+        debug_assert!(!self.loop_finishing, "a scope finishes once");
+        self.loop_finishing = true;
     }
 
     /// Whether the scope's finish has begun and the body has not finished.
     pub(super) fn is_finishing(&self) -> bool {
-        self.finishing
+        self.loop_finishing
     }
 
     /// Close the inner sources, so the inner pipelines finish once they have read what is queued.
@@ -327,9 +327,9 @@ impl Body {
     /// before the scope queues the last round's step: a worker finishes an inner pipeline while
     /// the coordinator still holds that step, which waits for the round to publish. So the step
     /// takes arrivals, and its scope closes them. A transaction writer's step closes once the
-    /// finish's attempt has run (`WriterRun::close`).
+    /// finish's attempt has run (`WriterRun::drain`).
     pub(super) fn close_step_when_settled(&mut self, dispatcher: &Dispatcher) -> bool {
-        if !self.finishing
+        if !self.loop_finishing
             || self.step_closed
             || self.pending_step.is_some()
             || !self
@@ -347,18 +347,20 @@ impl Body {
     /// The scope's pipeline, once its finish has begun and the inner pipelines and the step have
     /// all finished.
     pub(super) fn take_finish(&mut self, dispatcher: &Dispatcher) -> Option<PipelineId> {
-        if !self.finishing {
+        if !self.loop_finishing {
             return None;
         }
-        let pipeline = self.attached.as_ref()?.pipeline;
-        let finished = self
-            .with_step()
-            .all(|pipeline| dispatcher.states[pipeline.0].phase.load() == Phase::Finished);
-        if !finished {
-            return None;
-        }
-        self.finishing = false;
+        let pipeline = self.finished_pipeline(dispatcher)?;
+        self.loop_finishing = false;
         Some(pipeline)
+    }
+
+    /// The scope pipeline once all its inner pipelines and its step have finished.
+    pub(super) fn finished_pipeline(&self, dispatcher: &Dispatcher) -> Option<PipelineId> {
+        let pipeline = self.attached.as_ref()?.pipeline;
+        self.with_step()
+            .all(|id| dispatcher.states[id.0].phase.load() == Phase::Finished)
+            .then_some(pipeline)
     }
 
     /// Call `call` with the breaker of the inner pipeline `local`.

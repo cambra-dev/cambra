@@ -26,7 +26,7 @@ pub(crate) struct TransactionRun {
 impl TransactionRun {
     /// Wake parked peers on progress. An incomplete request may park once it has tried the
     /// current epoch. Overlapping attempts that read an older epoch get another turn.
-    pub(super) fn settle(&mut self, writer: usize, progressed: bool) -> bool {
+    pub(super) fn settle(&mut self, writer: usize, queued_at: u64, progressed: bool) -> bool {
         if progressed {
             self.progress += 1;
             for (index, peer) in self.writers.iter().enumerate() {
@@ -36,45 +36,54 @@ impl TransactionRun {
             }
         }
         // An overlapping attempt may have read the old snapshot. Retry it once at the new epoch.
-        self.writers[writer].queued_at == self.progress
+        queued_at == self.progress
     }
 }
 
 pub(super) struct WriterRun {
     pub(super) body: Body,
-    attempt: Attempt,
-    /// The store's progress when the active attempt was queued.
-    queued_at: u64,
+    phase: WriterPhase,
 }
 
-/// What a writer's attempts are for.
-enum Attempt {
-    /// No request is open and no finish has begun.
+#[derive(Default)]
+enum WriterPhase {
+    #[default]
     Idle,
-    /// Attempts toward this request run until it completes, over the request's positions and
-    /// those an earlier request left waiting for inputs.
-    Request(WorkPackage, TileGuard),
-    /// The finish's attempt runs. Once it has, the sources close and the body finishes
-    /// ([`Body::take_finish`]).
-    Finishing,
+    Attempt {
+        /// The outstanding request, or `None` for the final attempt.
+        request: Option<WorkPackage>,
+        guard: TileGuard,
+        queued_at: u64,
+    },
+    /// The final attempt has settled and the inner sources and step have closed.
+    Draining,
+    Finished,
 }
 
 impl WriterRun {
     pub(super) fn new(body: Body) -> Self {
         Self {
             body,
-            attempt: Attempt::Idle,
-            queued_at: 0,
+            phase: WriterPhase::Idle,
         }
     }
 
     pub(super) fn has_request(&self) -> bool {
-        matches!(self.attempt, Attempt::Request(..))
+        matches!(
+            self.phase,
+            WriterPhase::Attempt {
+                request: Some(_),
+                ..
+            }
+        )
     }
 
     /// Whether the writer's followers wait on it: a request or a finish is open.
     fn open(&self) -> bool {
-        !matches!(self.attempt, Attempt::Idle) || self.body.is_finishing()
+        matches!(
+            self.phase,
+            WriterPhase::Attempt { .. } | WriterPhase::Draining
+        )
     }
 
     pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
@@ -97,13 +106,18 @@ impl WriterRun {
         self.body.followers_hold(dispatcher)
     }
 
-    /// Activate the body for an attempt queued at the store's progress epoch `mark`, and
+    /// Activate the body for an attempt queued at the store's progress epoch `queued_at`, and
     /// answer the attempt's work, which is queued once the store is released.
-    fn queue(&mut self, dispatcher: &Dispatcher, guard: &TileGuard, mark: u64) -> RoundWork {
-        self.queued_at = mark;
+    fn queue(
+        &mut self,
+        dispatcher: &Dispatcher,
+        request: Option<WorkPackage>,
+        guard: TileGuard,
+        queued_at: u64,
+    ) -> RoundWork {
         let mut work = RoundWork::default();
         self.body.activate(dispatcher);
-        self.hold_followers(dispatcher);
+        self.body.hold_followers(dispatcher);
         // The request establishes readiness of the external source. Materialize any
         // source pipelines inside this writer before advancing its driver; the
         // driver may read a breaker carrying another transaction's reply.
@@ -116,14 +130,29 @@ impl WriterRun {
             }
         }
         self.body.queue_grown(&mut work);
-        work.queue_round(self.body.global(self.body.driver), guard);
-        self.body.end_round_with(guard);
+        work.queue_round(self.body.global(self.body.driver), &guard);
+        self.body.end_round_with(&guard);
+        self.phase = WriterPhase::Attempt {
+            request,
+            guard,
+            queued_at,
+        };
         work
     }
 
-    fn close(&self, dispatcher: &Dispatcher) {
+    pub(super) fn drain(&mut self, dispatcher: &Dispatcher) {
+        self.phase = WriterPhase::Draining;
         self.body.close_sources(dispatcher);
         dispatcher.close(self.body.attached().step);
+    }
+
+    pub(super) fn take_finish(&mut self, dispatcher: &Dispatcher) -> Option<PipelineId> {
+        if !matches!(self.phase, WriterPhase::Draining) {
+            return None;
+        }
+        let pipeline = self.body.finished_pipeline(dispatcher)?;
+        self.phase = WriterPhase::Finished;
+        Some(pipeline)
     }
 }
 
@@ -187,7 +216,7 @@ impl CommitProducer {
     ) -> RoundWork {
         let input = self.writer_input(writer);
         assert!(
-            matches!(self.writer_run(writer).attempt, Attempt::Idle),
+            matches!(self.writer_run(writer).phase, WriterPhase::Idle),
             "a writer completes its request before another starts"
         );
         self.begin_delivery(input);
@@ -198,8 +227,7 @@ impl CommitProducer {
             Some(waiting) => package.guard.union(&waiting),
             None => package.guard.clone(),
         };
-        run.attempt = Attempt::Request(package, guard.clone());
-        run.queue(dispatcher, &guard, mark)
+        run.queue(dispatcher, Some(package), guard, mark)
     }
     pub(super) fn finish_request(
         &mut self,
@@ -208,36 +236,32 @@ impl CommitProducer {
     ) -> (Option<WorkPackage>, RoundWork) {
         let progressed = self.complete_attempt(writer);
         let transaction = self.run.as_mut().expect("a transaction run is planned");
-        let caught_up = transaction.settle(writer, progressed);
-        let holds_stale = self.holds_stale_decision(writer);
-        let run = self.writer_run_mut(writer);
-        let guard = match std::mem::replace(&mut run.attempt, Attempt::Idle) {
-            // A stale decision leaves its item in flight, so the finish attempts again while one
-            // does. Such an attempt always progresses, so the finish closes no writer holding one
-            // (`src/interpreter/design-dispatcher.md`, "Transaction requests and attempts").
-            Attempt::Finishing if holds_stale => {
+        let WriterPhase::Attempt {
+            request,
+            guard,
+            queued_at,
+        } = std::mem::take(&mut transaction.writers[writer].phase)
+        else {
+            unreachable!("a writer's step completes an attempt it queued")
+        };
+        let caught_up = transaction.settle(writer, queued_at, progressed);
+        let Some(package) = request else {
+            // A stale decision keeps its item in flight. Retry it before closing the sources.
+            if self.holds_stale_decision(writer) {
                 assert!(
                     !caught_up,
                     "writer {writer}'s final retry made no progress on its stale item"
                 );
-                let whole = self
-                    .input_tiling(self.writer_input(writer))
-                    .universal_guard();
                 self.begin_attempt();
                 let mark = self.progress_epoch();
-                let run = self.writer_run_mut(writer);
-                run.attempt = Attempt::Finishing;
-                return (None, run.queue(dispatcher, &whole, mark));
+                return (
+                    None,
+                    self.writer_run_mut(writer)
+                        .queue(dispatcher, None, guard, mark),
+                );
             }
-            Attempt::Finishing => {
-                run.close(dispatcher);
-                return (None, RoundWork::default());
-            }
-            Attempt::Request(package, guard) => {
-                run.attempt = Attempt::Request(package, guard.clone());
-                guard
-            }
-            Attempt::Idle => unreachable!("a writer's step completes an attempt it queued"),
+            self.writer_run_mut(writer).drain(dispatcher);
+            return (None, RoundWork::default());
         };
         if self.request_complete(self.writer_input(writer), &guard) {
             debug_assert!(
@@ -247,10 +271,6 @@ impl CommitProducer {
             );
             let run = self.writer_run_mut(writer);
             run.body.set_waiting(None, None);
-            let Attempt::Request(package, _) = std::mem::replace(&mut run.attempt, Attempt::Idle)
-            else {
-                unreachable!("matched a request above")
-            };
             return (Some(package), RoundWork::default());
         }
         // The writer tried the current store and its body settled. The next relevant push,
@@ -269,17 +289,14 @@ impl CommitProducer {
             let entry = self.writer_placements[writer].clone();
             let run = self.writer_run_mut(writer);
             run.body.set_waiting(Some(waiting), Some(&entry));
-            let Attempt::Request(package, _) = std::mem::replace(&mut run.attempt, Attempt::Idle)
-            else {
-                unreachable!("matched a request above")
-            };
             return (Some(package), RoundWork::default());
         }
         self.begin_attempt();
         let mark = self.progress_epoch();
         (
             None,
-            self.writer_run_mut(writer).queue(dispatcher, &guard, mark),
+            self.writer_run_mut(writer)
+                .queue(dispatcher, Some(package), guard, mark),
         )
     }
     pub(super) fn begin_transaction_finish(
@@ -288,7 +305,7 @@ impl CommitProducer {
         writer: usize,
     ) -> RoundWork {
         assert!(
-            matches!(self.writer_run(writer).attempt, Attempt::Idle),
+            matches!(self.writer_run(writer).phase, WriterPhase::Idle),
             "a writer finishes after its requests settle"
         );
         let whole = self
@@ -297,8 +314,6 @@ impl CommitProducer {
         self.begin_attempt();
         let mark = self.progress_epoch();
         let run = self.writer_run_mut(writer);
-        run.attempt = Attempt::Finishing;
-        run.body.begin_finish();
-        run.queue(dispatcher, &whole, mark)
+        run.queue(dispatcher, None, whole, mark)
     }
 }
