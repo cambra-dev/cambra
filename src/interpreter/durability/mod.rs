@@ -22,11 +22,19 @@
 //! acknowledgement of the attempt it decided and the drive's finish of the attempt's item happen
 //! within one step ([`TileProducer::acknowledge`]), so their records are in the step's one batch,
 //! and a crash keeps all of them or none. The drive's finish does not wait for the body's release
-//! of the attempt's row, which passes the body's gate and so reaches the drive at a later step.
+//! of the attempt's row.
 //! `docs/durability.md` has the commit operator acknowledge a commit once the decision's entry in
 //! the observation log is durable. No observation log exists yet. The step's batch takes the
 //! entry's place: it holds the store's record of the commit, because a commit changes the store's
 //! issued releases and every step writes a record of each breaker whose issued releases changed.
+//!
+//! A transaction drive's readers release its rows past no gate
+//! ([`TileProducer::releases_wait_for_checkpoints`]). Reclaiming a row releases nothing upstream:
+//! the drive releases its source at an item's acknowledgement, which the commit's batch records. A
+//! reader releases a row once it holds what it needs of it, which changes the reader's issued
+//! releases, so the reader's record is in that step's batch. No durable prefix therefore holds a
+//! reader's record that needs a row the drive has reclaimed. A gate there would delay the drive's
+//! next item by a step; with several workers the coordinator steps rarely, and the drive stalls.
 //!
 //! A checkpoint record holds, per breaker, the state [`BreakingProducer::checkpoint`] encodes and
 //! the guard the breaker issued to each input it visits, and, per root, the guard its sink
@@ -66,9 +74,11 @@
 //!   frontier, starts empty, so replaying its consumer's release does not reproduce the release
 //!   it had sent upstream. Its own releases upstream pass no gate.
 //! - `FanOutShared::released_position`, which a reload's handover reads, is not rebuilt.
-//! - A durable run uses one worker. The copy of a breaker reads its gates before its state, so the
-//!   state covers every release `taken` holds; with several workers a consume can also run between
-//!   the two reads, and the copy then holds rows past `taken`, which recovery delivers again.
+//! - A durable run is tested at one worker. The copy of a breaker reads its gates before its state,
+//!   so the state covers every release `taken` holds; with several workers a consume can also run
+//!   between the two reads, and the copy then holds rows past `taken`, which recovery delivers
+//!   again. The recovery test assumes one worker: a rerun reaches the crash point it cuts at, and
+//!   two writers commit in one order.
 //! - A source's credit does not count the releases its readers' gates hold, so a store that makes
 //!   batches durable slowly grows what each input keeps instead of slowing the source.
 
@@ -253,9 +263,12 @@ impl Durability {
             }
         }
         walk_roots(roots, &mut |breaker| {
-            if !breaker.releases_acknowledge() {
-                breaker.visit_input_producers_mut(&mut |_, input| gate(input));
-            }
+            let acknowledges = breaker.releases_acknowledge();
+            breaker.visit_input_producers_mut(&mut |_, input| {
+                if gated(acknowledges, input) {
+                    gate(input);
+                }
+            });
         });
         for root in roots {
             root_producer(root, &mut |producer| gate(producer));
@@ -399,22 +412,30 @@ fn gate(producer: &mut dyn TileProducer) {
     producer.base_mut().release_gate = Some(Arc::new(ReleaseGate::new(tiling, taken)));
 }
 
-/// The gate on each input `breaker` visits, in visit order, `None` for every input of a breaker
-/// whose releases acknowledge ([`BreakingProducer::releases_acknowledge`]).
+/// The gate on each input `breaker` visits, in visit order, `None` for every input a durable run
+/// does not gate ([`gated`]).
 fn gates_of(breaker: &dyn BreakingProducer) -> Vec<Option<Arc<ReleaseGate>>> {
-    let gated = !breaker.releases_acknowledge();
+    let acknowledges = breaker.releases_acknowledge();
     let mut gates = Vec::new();
     breaker.visit_input_producers(&mut |role, input| {
         let gate = input.base().release_gate.clone();
         assert_eq!(
             gate.is_some(),
-            gated,
-            "a durable run gates {}'s input `{role}` unless its releases acknowledge",
+            gated(acknowledges, input),
+            "a durable run gates {}'s input `{role}` exactly where the breaker's releases do not \
+             acknowledge and the input's releases wait for checkpoints",
             breaker.name()
         );
         gates.push(gate);
     });
     gates
+}
+
+/// Whether a durable run gates `input`, an input of a breaker. It gates `input` unless the
+/// breaker's releases acknowledge (`acknowledges`, [`BreakingProducer::releases_acknowledge`]) or
+/// `input`'s releases wait for no checkpoint ([`TileProducer::releases_wait_for_checkpoints`]).
+fn gated(acknowledges: bool, input: &dyn TileProducer) -> bool {
+    !acknowledges && input.releases_wait_for_checkpoints()
 }
 
 /// The guard each input `breaker` visits has released, in visit order.

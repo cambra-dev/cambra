@@ -2427,6 +2427,16 @@ pub trait TileProducer: Send + Sync {
     /// ignores it.
     fn acknowledge(&self, _acknowledged: &TileGuard) {}
 
+    /// Whether a consumer's release of this producer's output waits for a durable checkpoint of
+    /// the consumer before this producer reclaims it (`crate::interpreter::durability`). A
+    /// transaction drive answers `false`: reclaiming a row releases nothing upstream, and a
+    /// reader that releases a row writes its record in the same step's batch, so no durable
+    /// prefix holds a reader's record that needs a row the drive reclaimed. A fan-out slot and a
+    /// breaker reader answer for the producer they read.
+    fn releases_wait_for_checkpoints(&self) -> bool {
+        true
+    }
+
     /// Where this producer is a loop's drive, the target the entry in front of its source records
     /// a decided push at while the drive reads the source by pull, and `None` for any other
     /// producer ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).

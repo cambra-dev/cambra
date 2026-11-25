@@ -7606,11 +7606,14 @@ impl TileProducer for TransactDriverProducer {
         }
     }
 
+    fn releases_wait_for_checkpoints(&self) -> bool {
+        false
+    }
+
     /// The writer's acknowledgement of the newest row finishes the row's item: the drive drops it
     /// from its source and releases it there, within the step that committed the row's decision,
     /// so the step's batch holds the drive's finish with the commit (`Durability::step`). The row
-    /// stays until every reader releases it ([`release_impl`](TileProducer::release_impl)): the
-    /// body's release passes the body's gate, which a later step forwards.
+    /// stays until every reader releases it ([`release_impl`](TileProducer::release_impl)).
     ///
     /// Only the newest row's acknowledgement finishes the item. An older row is a superseded
     /// retry, and the window is all one item, so the newest row is the last.
@@ -7642,7 +7645,8 @@ impl TileProducer for TransactDriverProducer {
     /// releases its readers made after the drive's latest copy, before the drive's first step.
     /// The copy holds at most the rows of an item the writer had acknowledged: the drive finishes
     /// an item in the step of its commit, which writes the drive's record, and reclaims the
-    /// item's rows only once the body's gated release reaches it, which writes none. A reader
+    /// item's rows once every reader releases them, which can come in a later step and writes
+    /// no record. A reader
     /// that released an attempt past them is done with them, so the drive reclaims them here. A
     /// row of an unfinished item would need the acknowledgement recovery does not replay, and the
     /// assertion below rules that case out rather than handling it.

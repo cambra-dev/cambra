@@ -1504,6 +1504,24 @@ impl TileProducer for FanOutProducer {
         result
     }
 
+    /// A slot answers for the producer its fan-out reads. A recurrence and a slot over a store
+    /// answer `true`, for the store they read, and a recurrence answers without its fan-out,
+    /// which a step can reach after the store's run has ended.
+    fn releases_wait_for_checkpoints(&self) -> bool {
+        let FanHold::Reader { shared, .. } = &self.hold else {
+            return true;
+        };
+        match shared
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .producer
+            .as_ref()
+        {
+            Some(Inner::Owned(producer)) => producer.releases_wait_for_checkpoints(),
+            Some(Inner::Store(_)) | None => true,
+        }
+    }
+
     fn acknowledge(&self, acknowledged: &TileGuard) {
         if let Some(Inner::Owned(producer)) = self
             .shared()

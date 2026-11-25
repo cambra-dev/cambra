@@ -57,6 +57,12 @@ impl TileProducer for BreakerReader {
             .unwrap_or_else(PoisonError::into_inner)
             .reader_released(released);
     }
+    fn releases_wait_for_checkpoints(&self) -> bool {
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .releases_wait_for_checkpoints()
+    }
     fn acknowledge(&self, acknowledged: &TileGuard) {
         self.handle
             .read()
