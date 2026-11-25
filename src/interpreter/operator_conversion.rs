@@ -4304,23 +4304,16 @@ fn build_commit_store(
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver removes its source item on the release
-        // *intersection*, so a body's consume-release cannot acknowledge an
-        // attempt still in flight — and so this is the one fan whose input is **not**
-        // memoized. A `Memo` releases its input as soon as it caches, which reaches the
+        // *intersection*, so a body that fans its input, and releases a row as it
+        // consumes it, cannot acknowledge an attempt still in flight. This is the one
+        // fan whose input is **not** memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.
         let driver_fan = Arc::new(FanOut::new(Arc::new(driver)));
-        // The body releases each row as it consumes it, which is its half of that intersection.
-        // A `Memo` over the driver's slot makes that release for any body shape: a body that
-        // reads its input once has no fan of its own, and without the release a superseded
-        // attempt stays in the driver's window until its item finishes. A body that does fan
-        // its input holds a second, redundant `Memo`. The body runs over the store's own
-        // domain, whatever the `Transact` sits in.
-        let body_op = convert_at(
-            &w.body,
-            Some(Arc::new(Memo::new(driver_fan.slot()))),
-            CurryLevel::new(1),
-            ctx,
-        )?;
+        // The body's half of that intersection is the writer's: it releases the body's
+        // decisions for the attempts it supersedes and for the item it finishes
+        // (`TransactWriterProducer`), and the body passes the release down to this slot. The
+        // body runs over the store's own domain, whatever the `Transact` sits in.
+        let body_op = convert_at(&w.body, Some(driver_fan.slot()), CurryLevel::new(1), ctx)?;
         // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
