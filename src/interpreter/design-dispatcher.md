@@ -213,9 +213,9 @@ paused run unplaces them ([Pause and reload](#pause-and-reload)).
 ## Waiting for input completion
 
 A scope holds the positions a round or attempt could not decide as waiting for inputs
-(`Offered::waiting`). A loop's round decides nothing at a position whose body read an input that is
-not final yet, as a sum over a live source. A writer's attempt is held the same way once every
-writer has attempted without changing the store, an input's release or the decisions to retry. The
+(`Offered::retry`). A loop's round decides nothing at a position whose body read an input that is
+not final yet, as a sum over a live source. A writer's attempt is held the same way once it has tried the
+current store epoch without progress. The
 request then ends with those positions unreleased, so a drained boundary holds no claim of it.
 A flat loop's request that ends before its drive's source delivers the positions it covers leaves
 its undecided positions waiting until the store is terminal
@@ -227,14 +227,17 @@ A scope's body entries are placed, and marked the scope's, when the scope is att
 source's first poll of the run does, reaches them.
 
 A push that reaches one of the scope's entries and that no pipeline there takes wakes the scope
-(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake offers
-the scope its waiting positions, and a placed entry records what reached it (`Offered::grown`). The
-next request runs the waiting positions, and its first round or attempt queues what grew on the
-pipelines it reached, so they read it. A closing round queues what grew too: it runs its rows'
-readers, a nested loop's among them, and a nested loop is offered only the positions its readers
-have read. A loop first steps its store over the waiting positions, so its drive emits past the ones
-now decided, and runs again the round it left undecided. A push can wake the scope while no
-position waits (`Offered::woken`). Positions that begin to wait after such a push are offered once
+(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake
+moves its one retry guard from parked to ready. Fresh input is recorded separately. An ordinary
+request already in the ordered queue takes the retry at its start. Otherwise, admission queues
+the ready guard together with any fresh input and marks it queued. Further wakes remember input
+growth without queuing a second retry. A placed entry also records which body input grew
+(`Offered::grown`). The next request takes the retry guard once (`Body::take_waited`). Its first
+round or attempt queues what grew on each affected pipeline. A closing round queues what grew too: it runs its rows' readers, a nested
+loop's among them, and a nested loop is offered only the positions its readers have read. A loop
+first steps its store over the waiting positions, so its drive emits past the ones now decided, and
+runs again the round it left undecided. A push can wake the scope while no position waits
+(`Offered::woken`). Positions that begin to wait after such a push are offered once
 (`Body::set_waiting`), since the push may have grown an input after the request that left them
 undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
@@ -374,32 +377,13 @@ and make the store terminal (`CommitProducer::render_store`). A reclaim alone is
 changes the store without changing what a later attempt reads, because
 `CommitEngine::gc_released_prefix` keeps the versions every live position reads and the frontier
 stays. A stale outcome counts although it changes neither the store nor a release, because the
-drive's retry at the moved frontier reads differently. `Stalls` (`transaction_scope.rs`) counts
-consecutive attempts without progress across the store's writers, and the request ends once the
-count exceeds the number of writers. An attempt counts only if it was queued since the last attempt
-that progressed. The writers' attempts overlap, so an attempt queued before another writer's
-progress may have read the store and its inputs before that progress. Its outcome does not show that
-an attempt queued now would change nothing.
-
-The rule admits no unbounded run of attempts without a commit. A writer's retry reads a frontier
-at or past the commit that made its previous proposal stale, so that commit cannot make the retry
-stale. Each of a writer's stale outcomes is therefore caused by a distinct commit, and a writer has
-no more stale outcomes than the store has commits. A writer's input release grows only when the
-drive releases an item whose decision committed, the positions it decides absent on reading source
-news, or the whole source once it is exhausted (`TransactDriverProducer::advance`). A request's
-guard holds finitely many items and positions, and the whole-source release happens once. A writer's
-proposal stream turns terminal at most once. Past these, each other writer has at most one attempt
-queued before the last progress, which does not count. Every later attempt increments the stall
-count, so the request ends within twice the number of writers further attempts.
-
-A writer's finish attempt follows the same rule. While the store reports the writer's last decision
-stale (`CommitProducer::holds_stale_decision`) and the attempts have not stalled, the finish queues
-another attempt. An attempt of a writer that holds a stale decision always progresses: it reads a
-frontier past the commit that made the decision stale, so the drive emits the item again and the
-attempt decides it. The stall count after that attempt is zero, so the finish closes a writer only
-once its decision has committed, which `finish_request` asserts in a debug build. A writer whose
-store finish still finds a stale decision in flight fails the run (`CommitProducer::finish`), since
-a terminal store would drop the item.
+drive's retry at the moved frontier reads differently.
+The store advances a progress epoch each time an attempt progresses. An incomplete writer retries
+if its attempt was queued before the current epoch, since it may have read an earlier snapshot. A
+writer whose attempt observed the current epoch and changed nothing parks its unresolved positions.
+Progress by a peer reoffers those positions. External input wakes them through the normal scope
+intake. Each attempt therefore either makes progress, catches up to progress that already occurred,
+or parks. A writer's final attempt retries a stale item at the new frontier before closing its body.
 
 Completing a writer includes the finish's attempt, so its body observes source completion. Source
 pipelines then close; normal finishes drain the body graph before the request pipeline finishes. A

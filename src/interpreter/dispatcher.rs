@@ -1832,15 +1832,43 @@ pub struct Offered {
     /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
     /// reads what grew.
     pub grown: Vec<(PipelineId, TileGuard)>,
-    /// The positions of the scope's input a request left undecided, waiting for inputs: a push
-    /// that reaches one of the scope's entries and no pipeline there takes offers them again
-    /// ([`Entry::wake`]).
-    pub waiting: Option<TileGuard>,
-    /// Whether a push woke the scope while no position waited, since positions last began to wait
-    /// ([`Entry::wake`]). Positions that begin to wait after such a push are offered once
-    /// (`Body::set_waiting`), since the push may have grown an input after the request that left
-    /// them undecided read it.
-    pub woken: bool,
+    /// Positions the next request must revisit. Fresh input remains in `region`.
+    retry: Option<Retry>,
+    /// A wake that the next decision to park must observe.
+    woken: bool,
+}
+
+struct Retry {
+    guard: TileGuard,
+    phase: RetryPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryPhase {
+    /// Await input, or an ordinary request that can revisit the positions.
+    Parked,
+    /// A wake made the positions eligible for admission.
+    Ready,
+    /// A package has been queued to cover these positions.
+    Queued,
+}
+
+impl Offered {
+    fn wake(&mut self) {
+        if let Some(retry) = &mut self.retry
+            && retry.phase == RetryPhase::Parked
+        {
+            retry.phase = RetryPhase::Ready;
+        } else {
+            self.woken = true;
+        }
+    }
+
+    fn ready_retry(&mut self) -> Option<&mut Retry> {
+        self.retry
+            .as_mut()
+            .filter(|retry| retry.phase == RetryPhase::Ready)
+    }
 }
 
 /// A scope's [`Offered`], shared with the entry in front of its drive's source.
@@ -1945,7 +1973,7 @@ impl Entry {
     /// Offer the scope the entry sits in its positions waiting for inputs, for a push no pipeline
     /// here takes: something the scope's body reads has grown, so a request may now decide them.
     /// The region pushed names what grew, not which waiting positions it decides, so all of them
-    /// are offered.
+    /// become eligible together. A further wake is remembered for the next decision to park.
     ///
     /// A placed entry records what reached it (`Offered::grown`), whether or not positions wait, so
     /// its pipeline reads it with the next round or attempt: a push that arrives while a round or
@@ -1955,13 +1983,7 @@ impl Entry {
             return;
         };
         let mut offered = scope.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.woken |= offered.waiting.is_none();
-        if let Some(waiting) = offered.waiting.clone() {
-            offered.region = Some(match offered.region.take() {
-                Some(before) => before.union(&waiting),
-                None => waiting,
-            });
-        }
+        offered.wake();
         if let (Some(pipeline), Some(guard)) =
             (self.pipeline.get(), pushed_guard(region, &self.input))
         {
@@ -2537,7 +2559,6 @@ fn finish_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, pipeline: Pipelin
 
 #[cfg(test)]
 mod tests {
-
     /// A chain of diamonds: each layer's two pipelines read the one below, and the pipeline
     /// above reads both. A path of reads to the bottom doubles at each layer, and a quiescence
     /// check of the top reads each pipeline once.

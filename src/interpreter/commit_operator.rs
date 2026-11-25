@@ -930,7 +930,7 @@ fn consume_store<S: SteppedStore>(store: &mut S, input: InputId, guard: TileGuar
         store.breaker_mut().snapshot = Some(tile);
         // A position its input has not decided yet stops the steps: the package's rest stays
         // unreleased, and the scope keeps it waiting for inputs until a push brings what decides
-        // it (`Body::waiting`).
+        // it (`Offered::retry`).
         if !progressed {
             return;
         }
