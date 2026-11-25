@@ -524,26 +524,28 @@ impl Body {
         }
     }
 
-    /// The positions of the scope's input a request left undecided, waiting for inputs: the next
-    /// request runs them, and the scope's pipeline stays open while any wait.
-    pub(super) fn waiting(&self) -> Option<TileGuard> {
+    /// The positions that waited for inputs when a request begins, which it runs
+    /// ([`Offered::take_waited`]).
+    pub(super) fn take_waited(&self) -> Option<TileGuard> {
         self.offers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .waiting
-            .clone()
+            .take_waited()
     }
 
-    /// Set the positions waiting for inputs ([`waiting`](Self::waiting)): a push that reaches one
-    /// of the scope's entries and no pipeline there takes offers them again
+    /// Set the positions waiting for inputs (`Offered::waiting`): the first push that reaches one
+    /// of the scope's entries and no pipeline there takes them and offers them again
     /// (`Entry::wake`), so `entry`, the placement of an entry the body does not place, is marked
-    /// the scope's too. A push that woke the scope while nothing waited ([`Offered::woken`])
-    /// arrived before the positions waited, so it offers them once.
+    /// the scope's too. A push that woke the scope while nothing waited ([`Offered::woken`]) may
+    /// have grown an input after the request read it, so the positions are offered once here.
     pub(super) fn set_waiting(&self, waiting: Option<TileGuard>, entry: Option<&Placement>) {
         if let Some(entry) = entry {
             entry.set_scope(Some(self.offers.clone()));
         }
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        // A push that took positions while a request ran took ones that request covered: what it
+        // left undecided is `waiting` now.
+        offered.offered_waiting = None;
         if let Some(waiting) = &waiting
             && std::mem::take(&mut offered.woken)
         {
@@ -574,6 +576,8 @@ struct Request {
     /// The positions the request runs: its package's, and those an earlier request left waiting
     /// for inputs.
     covers: TileGuard,
+    /// Whether positions waited for inputs when the request began ([`Body::take_waited`]).
+    waited: bool,
     round: Round,
     package: WorkPackage,
 }
@@ -921,8 +925,9 @@ impl InductionStoreProducer {
             self.run().request.is_none(),
             "a loop completes one request before starting another"
         );
-        let covers = match self.run().body.waiting() {
-            Some(waiting) => package.guard.union(&waiting),
+        let waited = self.run().body.take_waited();
+        let covers = match &waited {
+            Some(waited) => package.guard.union(waited),
             None => package.guard.clone(),
         };
         if !self.run().opened {
@@ -939,13 +944,14 @@ impl InductionStoreProducer {
         }
         // The store takes first what the body has decided since positions began to wait, so the
         // drive emits the next position past the ones now decided.
-        if let Some(waiting) = self.run().body.waiting() {
-            self.placed(|scope| scope.step_round(&waiting));
+        if let Some(waited) = &waited {
+            self.placed(|scope| scope.step_round(waited));
         }
         self.run_mut().request = Some(Request {
             read: rows,
             emitted: false,
             covers,
+            waited: waited.is_some(),
             round: Round::Selecting,
             package,
         });
@@ -959,18 +965,19 @@ impl InductionStoreProducer {
         self.run().body.set_waiting(Some(waiting), entry.as_ref());
     }
 
-    /// End a request over `covers`. For a flat store, the positions of `covers` the store has not
+    /// End a request over `covers`; `waited` is whether positions waited for inputs when the
+    /// request began. For a flat store, the positions of `covers` the store has not
     /// decided wait for inputs until the store is terminal: a request that ends before the
     /// drive's source delivers a position leaves its undecided positions waiting, so the push that
     /// delivers one wakes the scope (`Entry::wake`) and offers them again, since the drive's
     /// source entry queues nothing itself. A nested loop's rows wait only where positions waited
     /// before: the loop around it gives a row again with each round. None wait once all are
     /// decided.
-    fn keep_undecided(&mut self, covers: &TileGuard) {
+    fn keep_undecided(&mut self, covers: &TileGuard, waited: bool) {
         let undecided = guard_minus(covers, &self.input_released(InputId::ONLY));
         let rows = !matches!(self.tiling(), Tiling::Store { .. });
         let done = match rows {
-            true => self.run().body.waiting().is_none(),
+            true => !waited,
             false => self.terminal(),
         };
         match undecided.is_empty() || done {
@@ -1003,7 +1010,7 @@ impl InductionStoreProducer {
                 return (Some(request.package), RoundWork::default());
             }
             Round::Closed => {
-                self.keep_undecided(&request.covers);
+                self.keep_undecided(&request.covers, request.waited);
                 return (Some(request.package), RoundWork::default());
             }
             Round::Position(_) | Round::Closing => {
@@ -1049,7 +1056,7 @@ impl InductionStoreProducer {
                 && !self.terminal()
                 && !guard_minus(&request.covers, &self.input_released(InputId::ONLY)).is_empty());
         if !closing {
-            self.keep_undecided(&request.covers);
+            self.keep_undecided(&request.covers, request.waited);
             return (Some(request.package), RoundWork::default());
         }
         let mut work = self.placed(|scope| {
@@ -1162,7 +1169,7 @@ impl InductionStoreProducer {
 
     /// Step the store after the round's body and held pushes have settled. The store steps the
     /// positions of the round its input has decided; positions not decided yet stay unreleased,
-    /// and the scope keeps them waiting for inputs ([`Body::waiting`]).
+    /// and the scope keeps them waiting for inputs (`Offered::waiting`).
     fn step_round(&mut self, guard: &TileGuard) {
         self.consume_impl(InputId::ONLY, guard.clone());
     }

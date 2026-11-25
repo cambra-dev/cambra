@@ -220,7 +220,7 @@ impl CommitProducer {
         self.begin_attempt();
         let mark = self.stall_mark();
         let run = self.writer_run_mut(writer);
-        let guard = match run.body.waiting() {
+        let guard = match run.body.take_waited() {
             Some(waiting) => package.guard.union(&waiting),
             None => package.guard.clone(),
         };

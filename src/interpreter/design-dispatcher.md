@@ -249,14 +249,16 @@ A scope's body entries are placed, and marked the scope's, when the scope is att
 source's first poll of the run does, reaches them.
 
 A push that reaches one of the scope's entries and that no pipeline there takes wakes the scope
-(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake offers
-the scope its waiting positions, and a placed entry records what reached it (`Offered::grown`). The
-next request runs the waiting positions, and its first round or attempt queues what grew on the
-pipelines it reached, so they read it. A closing round queues what grew too: it runs its rows'
-readers, a nested loop's among them, and a nested loop is offered only the positions its readers
-have read. A loop first steps its store over the waiting positions, so its drive emits past the ones
-now decided, and runs again the round it left undecided. A push can wake the scope while no
-position waits (`Offered::woken`). Positions that begin to wait after such a push are offered once
+(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake
+offers the scope its waiting positions and takes them (`Offered::offered_waiting`), so a later push
+offers them only after the next request leaves them waiting again. A placed entry records what
+reached it (`Offered::grown`). The next request runs the positions that waited
+(`Offered::take_waited`), and its first round or attempt queues what grew on the pipelines it
+reached, so they read it. A closing round queues what grew too: it runs its rows' readers, a nested
+loop's among them, and a nested loop is offered only the positions its readers have read. A loop
+first steps its store over the waiting positions, so its drive emits past the ones now decided, and
+runs again the round it left undecided. A push can wake the scope while no position waits
+(`Offered::woken`). Positions that begin to wait after such a push are offered once
 (`Body::set_waiting`), since the push may have grown an input after the request that left them
 undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
