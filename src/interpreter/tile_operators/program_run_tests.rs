@@ -3730,6 +3730,11 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 /// cover. Each crash point is also tried with only each proper prefix of the batches not yet
 /// durable kept, as a store that stops partway through making them durable leaves. A step's records
 /// form one batch (`Durability::step`), so no crash keeps part of a step.
+///
+/// Every case runs at one worker and at four. With four the coordinator's steps, and so the crash
+/// points, differ from run to run: a rerun that cuts at a crash point may end before reaching it,
+/// and two writers may commit in another order, so their replies hold for some order of their
+/// commits ([`Answer::SomeSerialOrder`]).
 #[rstest_log::rstest]
 #[case::a_map(
     "[x * 10 for x in source1()]",
@@ -3838,7 +3843,10 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             pool := pool + 10 * y
             out << pool
     out
-"}, "[`out<<#1(u0) -> 104, `out<<#1(u1) -> 124, `out<<#1(u2) -> 154, `out<<#1(u3) -> 185, `out<<#1(u4) -> 235, `out<<(u0) -> 99, `out<<(u1) -> 97, `out<<(u2) -> 94, `out<<(u3) -> 150, `out<<(u4) -> 145]")]
+"}, Answer::SomeSerialOrder {
+    start: 100,
+    writers: &[("`out<<", &[-1, -2, -3, -4, -5]), ("`out<<#1", &[10, 20, 30, 40, 50])],
+})]
 #[case::a_memo_read_twice(indoc! {"
     xs = source1()
     [x + sum(xs) for x in xs]
@@ -3866,36 +3874,171 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 "}, "225")]
 fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     #[case] source: &str,
-    #[case] expected: &str,
+    #[case] expected: Answer,
     #[values(1, usize::MAX)] rows: usize,
     #[values(false, true)] retains: bool,
+    #[values(1, 4)] workers: usize,
 ) {
+    let run = Run {
+        source,
+        expected: &expected,
+        rows,
+        retains,
+        workers,
+    };
     assert!(
-        recovers(source, expected, rows, retains, LAG, None).is_some(),
+        recovers(&run, LAG, None).is_some(),
         "a run checkpointed at its first pause recovers: {source}"
     );
     for lag in [1, LAG] {
         let mut step = 1;
-        while let Some(pending) = recovers(
-            source,
-            expected,
-            rows,
-            retains,
-            lag,
-            Some(Crash::after(step)),
-        ) {
+        while let Some(pending) = recovers(&run, lag, Some(Crash::after(step))) {
             for kept in 1..pending {
                 let crash = Crash {
                     after: step,
                     kept: Some(kept),
                 };
-                recovers(source, expected, rows, retains, lag, Some(crash))
-                    .expect("a run that reached a crash point reaches it again");
+                let reached = recovers(&run, lag, Some(crash)).is_some();
+                assert!(
+                    reached || workers > 1,
+                    "a run that reached a crash point reaches it again"
+                );
             }
             step += 1;
         }
         assert!(step > 1, "a run takes a step: {source}");
     }
+}
+
+/// Two writers' replies hold for the orders their commits can take, the one a run at one worker
+/// gives and one a run at four gave, and not for replies no order gives.
+#[rstest_log::rstest]
+#[case::one_worker(
+    "[`b(u0) -> 104, `b(u1) -> 124, `b(u2) -> 154, `b(u3) -> 185, `b(u4) -> 235, `a(u0) -> 99, \
+     `a(u1) -> 97, `a(u2) -> 94, `a(u3) -> 150, `a(u4) -> 145]",
+    true
+)]
+#[case::four_workers(
+    "[`b(u0) -> 104, `b(u1) -> 115, `b(u2) -> 145, `b(u3) -> 185, `b(u4) -> 235, `a(u0) -> 99, \
+     `a(u1) -> 97, `a(u2) -> 94, `a(u3) -> 100, `a(u4) -> 95]",
+    true
+)]
+#[case::a_commit_counted_twice(
+    "[`b(u0) -> 104, `b(u1) -> 124, `b(u2) -> 154, `b(u3) -> 185, `b(u4) -> 235, `a(u0) -> 99, \
+     `a(u1) -> 97, `a(u2) -> 94, `a(u3) -> 150, `a(u4) -> 144]",
+    false
+)]
+#[case::a_missing_reply("[`a(u0) -> 99]", false)]
+fn replies_hold_for_some_serial_order(#[case] rendered: &str, #[case] holds: bool) {
+    let answer = Answer::SomeSerialOrder {
+        start: 100,
+        writers: &[("`a", &[-1, -2, -3, -4, -5]), ("`b", &[10, 20, 30, 40, 50])],
+    };
+    assert_eq!(answer.holds(rendered), holds);
+}
+
+/// One configuration of [`a_run_recovered_from_a_checkpoint_answers_as_one_run`].
+struct Run<'a> {
+    source: &'a str,
+    expected: &'a Answer,
+    /// The most rows a package of a source holds.
+    rows: usize,
+    /// Whether the recovered source holds what the first process released ([`recovers`]).
+    retains: bool,
+    workers: usize,
+}
+
+/// What a run of [`a_run_recovered_from_a_checkpoint_answers_as_one_run`] answers.
+enum Answer {
+    /// The `main` output rendered in key order, which every run gives.
+    Exactly(String),
+    /// Replies to transactions on one integer, each the integer after its transaction, from
+    /// writers that commit in no fixed order. A writer is its reply's tag and the change each of
+    /// its items makes, in item order. The replies must be those of some order of the commits
+    /// that keeps each writer's items in order, starting from `start`.
+    SomeSerialOrder {
+        start: i64,
+        writers: &'static [(&'static str, &'static [i64])],
+    },
+}
+
+impl std::str::FromStr for Answer {
+    type Err = std::convert::Infallible;
+
+    fn from_str(rendered: &str) -> Result<Self, Self::Err> {
+        Ok(Answer::Exactly(rendered.to_owned()))
+    }
+}
+
+impl Answer {
+    /// Whether `rendered`, the `main` output in key order, is this answer.
+    fn holds(&self, rendered: &str) -> bool {
+        match self {
+            Answer::Exactly(expected) => rendered == expected,
+            Answer::SomeSerialOrder { start, writers } => serial_replies(rendered, *start, writers),
+        }
+    }
+}
+
+/// Whether `rendered`, entries `` `tag(u𝑛) -> 𝑣 `` in key order, holds the replies of some order of
+/// the `writers`' commits ([`Answer::SomeSerialOrder`]).
+fn serial_replies(rendered: &str, start: i64, writers: &[(&str, &[i64])]) -> bool {
+    let mut replies: Vec<Vec<i64>> = writers.iter().map(|_| Vec::new()).collect();
+    for entry in rendered
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(", ")
+    {
+        let Some((key, reply)) = entry.split_once(" -> ") else {
+            return false;
+        };
+        let tag = key.split('(').next().unwrap_or(key);
+        let Some(writer) = writers.iter().position(|(name, _)| *name == tag) else {
+            return false;
+        };
+        let Ok(reply) = reply.parse() else {
+            return false;
+        };
+        replies[writer].push(reply);
+    }
+    if replies
+        .iter()
+        .zip(writers)
+        .any(|(replies, (_, changes))| replies.len() != changes.len())
+    {
+        return false;
+    }
+    // A search over how many items of each writer have committed: the integer after them is
+    // their changes' sum, so a writer's next item commits next where its reply is that sum plus
+    // its change.
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier = vec![vec![0; writers.len()]];
+    while let Some(taken) = frontier.pop() {
+        if taken
+            .iter()
+            .zip(writers)
+            .all(|(taken, (_, changes))| *taken == changes.len())
+        {
+            return true;
+        }
+        let value = start
+            + taken
+                .iter()
+                .zip(writers)
+                .map(|(taken, (_, changes))| changes[..*taken].iter().sum::<i64>())
+                .sum::<i64>();
+        for (writer, (_, changes)) in writers.iter().enumerate() {
+            let next = taken[writer];
+            if next < changes.len() && replies[writer][next] == value + changes[next] {
+                let mut after = taken.clone();
+                after[writer] += 1;
+                if seen.insert(after.clone()) {
+                    frontier.push(after);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// How many steps the store of [`a_run_recovered_from_a_checkpoint_answers_as_one_run`] lets pass
@@ -4109,23 +4252,23 @@ fn compiled_over_source1(
     (ctx, feed, slot, targets)
 }
 
-/// Run `source` over `two_batches` in a process that stops, recover in another from the store it
-/// leaves, run what is left, and check the answer. Answers how many writes were not durable yet
-/// at the crash, before the crash made any durable (0 without a crash), and `None`, checking
-/// nothing, where the run ends before the crash point `crash` names.
+/// Run `run`'s source over `two_batches` in a process that stops, recover in another from the
+/// store it leaves, run what is left, and check the answer. Answers how many batches were not
+/// durable yet at the crash, before the crash made any durable (0 without a crash). Where the run
+/// ends before the crash point `crash` names, it checks that run's answer and answers `None`.
 ///
 /// With `crash` `None`, the process stops at the first delivery's pause and every write is
 /// durable there. Otherwise it crashes as `crash` says ([`Persisting`]), and the writes not yet
-/// durable are lost. Both runs use one worker, so no worker steps while the durability does. The
-/// crash points are every top-level step, so the test is quadratic in a program's steps.
-fn recovers(
-    source: &str,
-    expected: &str,
-    rows: usize,
-    retains: bool,
-    lag: usize,
-    crash: Option<Crash>,
-) -> Option<usize> {
+/// durable are lost. Both runs use `workers` workers. The crash points are the coordinator's
+/// top-level steps, so the test is quadratic in a program's steps.
+fn recovers(run: &Run<'_>, lag: usize, crash: Option<Crash>) -> Option<usize> {
+    let Run {
+        source,
+        expected,
+        rows,
+        retains,
+        workers,
+    } = *run;
     use crate::interpreter::dispatcher::Ended;
     use crate::interpreter::durability::MemoryStore;
     let main = std::sync::Arc::new(MainAnswers::default());
@@ -4149,7 +4292,7 @@ fn recovers(
             crash,
         );
         let run = |observer: &mut Persisting| match targets
-            .run_with_workers(rows, 1, observer)
+            .run_with_workers(rows, workers, observer)
             .unwrap_or_else(|refused| panic!("{refused}"))
         {
             Ended::Paused(_) => true,
@@ -4175,7 +4318,17 @@ fn recovers(
         }));
         match (crashed, crash) {
             (Ok(()), None) => store.flush(),
-            (Ok(()), Some(_)) => return None,
+            (Ok(()), Some(_)) => {
+                // The run ended before the crash point, so it ran whole in one process, and its
+                // answer is checked as one run's.
+                let value = main.kept.value().expect("the `main` output's value");
+                let rendered = rendered_in_key_order(&value);
+                assert!(
+                    expected.holds(&rendered),
+                    "{source}, ending before {crash:?}, at {workers} workers: {rendered}"
+                );
+                return None;
+            }
             (Err(payload), Some(_)) if payload.is::<Crashed>() => {}
             (Err(payload), _) => std::panic::resume_unwind(payload),
         }
@@ -4209,7 +4362,7 @@ fn recovers(
     );
     let mut run = || {
         targets
-            .run_with_workers(rows, 1, &mut observer)
+            .run_with_workers(rows, workers, &mut observer)
             .unwrap_or_else(|refused| panic!("{refused}"))
     };
     if delivered == 1 {
@@ -4227,10 +4380,10 @@ fn recovers(
         "the recovered run ends after the last delivery: {source}, crash after {crash:?}"
     );
     let value = main.kept.value().expect("the `main` output's value");
-    assert_eq!(
-        rendered_in_key_order(&value),
-        expected,
-        "{source}, crash after {crash:?}"
+    let rendered = rendered_in_key_order(&value);
+    assert!(
+        expected.holds(&rendered),
+        "{source}, crash after {crash:?}, at {workers} workers: {rendered}"
     );
     let released = feed
         .read()

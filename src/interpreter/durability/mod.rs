@@ -65,7 +65,13 @@
 //! batches not yet durable kept
 //! (`program_run_tests::a_run_recovered_from_a_checkpoint_answers_as_one_run`).
 //!
-//! Five gaps remain:
+//! With several workers a step copies the breakers one after another while workers consume, so
+//! the copies in a batch are taken at different times. The walk copies a breaker's gates and
+//! state under the breaker's lock, so no consume of that breaker runs between them. It copies the
+//! breakers a store reads under the store's lock ([`walk`]), so no commit runs between the copies
+//! of a transaction's store, writer and drive. The recovery test runs at one and at four workers.
+//!
+//! Four gaps remain:
 //!
 //! - A breaker's key is its position in [`walk`], checked by its kind, tiling and input roles. That
 //!   holds only between two compilations of one text in one version.
@@ -74,11 +80,6 @@
 //!   frontier, starts empty, so replaying its consumer's release does not reproduce the release
 //!   it had sent upstream. Its own releases upstream pass no gate.
 //! - `FanOutShared::released_position`, which a reload's handover reads, is not rebuilt.
-//! - A durable run is tested at one worker. The copy of a breaker reads its gates before its state,
-//!   so the state covers every release `taken` holds; with several workers a consume can also run
-//!   between the two reads, and the copy then holds rows past `taken`, which recovery delivers
-//!   again. The recovery test assumes one worker: a rerun reaches the crash point it cuts at, and
-//!   two writers commit in one order.
 //! - A source's credit does not count the releases its readers' gates hold, so a store that makes
 //!   batches durable slowly grows what each input keeps instead of slowing the source.
 
