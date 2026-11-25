@@ -6757,13 +6757,10 @@ impl InductionDriverProducer {
 /// fresh position and a re-pull at an unchanged one emits nothing.
 ///
 /// Both halves of that intersection are load-bearing for the window bound
-/// ([`MAX_LIVE_ATTEMPTS`]), including the body's. A compiled body fans this input
-/// through a `Memo`, which releases each row as it consumes it; a body chain that
-/// released only when its own output was released would leave the intersection
-/// standing at the writer's ack, and a superseded row could not be reclaimed
-/// until its item finished — the window would grow one row per retry with the
-/// writer's supersession release still in place. Measured both ways by
-/// `a_contended_item_keeps_the_drive_window_flat`.
+/// ([`MAX_LIVE_ATTEMPTS`]), including the body's. The writer makes both: when it supersedes
+/// an attempt it releases the attempt on its slot and on the body, and the body passes the
+/// release down to its slot as it passes the commit-ack's. Without the body's half, a
+/// superseded row stays until its item finishes, and the window grows one row per retry.
 pub struct TransactDriver {
     base: OperatorBase,
     /// The source positions the retired drive this one replaces had released, exactly, or
@@ -8261,11 +8258,14 @@ impl Breaker for TransactWriterProducer {
         if let Some(pos) = &newest
             && let Some(through) = last_position_below(domain_positions(&driver_tile), pos)
         {
-            state
-                .driver_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::at_or_below(through.into_value()),
-                )));
+            let superseded = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+                through.into_value(),
+            )));
+            state.driver_producer.release(superseded.clone());
+            // The body's decisions for those attempts are dead too, and their release is the
+            // body's half of the driver's release intersection. Without it a superseded row
+            // stays in the driver's window until the item's commit-ack releases the body.
+            state.body_producer.release(superseded);
         }
         // Decide a position once. A *new* newest position is a fresh attempt (a
         // new item, or a retry of this one at a moved frontier); an unchanged one

@@ -494,7 +494,8 @@ and two or more read slots of a memoized `FanOut`, so a single reader pays for n
 the `Memo`. A leaf arm (a store read) is a source over its own domain and reads none. Without the
 `Memo`, the lone arm sees the input's deleted rows and releases the input only when its own consumer
 does, so an arm chain that does not hand back what it consumes holds the producer upstream. A
-`Transact` writer body therefore reads the driver's slot through a `Memo`.
+`Transact` writer body reads the driver's slot directly: its consumer, the writer, releases the
+attempts it supersedes and the items it finishes, and the body passes both releases down.
 
 ### A product value is a record of tiles
 
