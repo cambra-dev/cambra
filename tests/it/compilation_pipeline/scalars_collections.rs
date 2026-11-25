@@ -305,10 +305,20 @@ fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
     check_compile_error(code, "Nothing determines the type of this expression");
 }
 
+// A map's entry is a key and a value, so an entry of any other width is refused rather than
+// read for its first two components.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::three("map([(1, 10, 100), (2, 20, 200)])")]
+#[case::one("map([(1,), (2,)])")]
+fn a_map_entry_is_a_pair(#[case] code: &str) {
+    check_compile_error(code, "tuples of different widths are different types");
+}
+
 // `map` does not accept an empty literal. The literal is bound once, so the empty-literal
 // pin decides its one binding (`src/ccl/design/collections.md`, "A group-by's collection is
-// bound once"), but the pin gives the element no width, and `map` reads each entry's
-// positions. The rejection is an inference error rather than a diagnosis of the construct.
+// bound once"), but the pin decides no component of the pair an entry is declared to be. The
+// rejection is an inference error rather than a diagnosis of the construct.
 // `empty_map()` is the spelling that works, because it states its type rather than deriving
 // one from entries it does not have (CHL spec, "3.11 List, tuple, record literals").
 #[rstest]
@@ -319,7 +329,7 @@ fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
     m
 "#})]
 fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
-    check_compile_error(code, "No field .1");
+    check_compile_error(code, "Nothing determines the type of this expression");
 }
 
 /// `set([])` is the empty set: the empty-literal pin decides the one binding of its literal.
