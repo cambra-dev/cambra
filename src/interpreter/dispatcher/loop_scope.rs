@@ -534,19 +534,22 @@ impl Body {
             .clone()
     }
 
-    /// Set the positions waiting for inputs ([`waiting`](Self::waiting)): a push that reaches one
-    /// of the scope's entries and no pipeline there takes offers them again
+    /// Set the positions waiting for inputs ([`waiting`](Self::waiting)): the first push that
+    /// reaches one of the scope's entries and no pipeline there takes offers them again
     /// (`Entry::wake`), so `entry`, the placement of an entry the body does not place, is marked
-    /// the scope's too. A push that woke the scope while nothing waited ([`Offered::woken`])
-    /// arrived before the positions waited, so it offers them once.
+    /// the scope's too. Setting them clears [`Offered::waiting_offered`]. A push that woke the
+    /// scope without an offer ([`Offered::woken`]) may have grown an input after the request
+    /// read it, so the positions are offered once here, under the lock that sets them.
     pub(super) fn set_waiting(&self, waiting: Option<TileGuard>, entry: Option<&Placement>) {
         if let Some(entry) = entry {
             entry.set_scope(Some(self.offers.clone()));
         }
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        offered.waiting_offered = false;
         if let Some(waiting) = &waiting
             && std::mem::take(&mut offered.woken)
         {
+            offered.waiting_offered = true;
             offered.region = Some(match offered.region.take() {
                 Some(before) => before.union(waiting),
                 None => waiting.clone(),

@@ -2102,11 +2102,17 @@ pub struct Offered {
     /// that reaches one of the scope's entries and no pipeline there takes offers them again
     /// ([`Entry::wake`]).
     pub waiting: Option<TileGuard>,
-    /// Whether a push woke the scope while no position waited, since positions last began to wait
-    /// ([`Entry::wake`]). Positions that begin to wait after such a push are offered once
-    /// (`Body::set_waiting`), since the push may have grown an input after the request that left
-    /// them undecided read it.
+    /// Whether a push woke the scope without offering it positions, since positions last began to
+    /// wait ([`Entry::wake`]): no position waited, or the waiting positions were already offered.
+    /// Positions that begin to wait after such a push are offered once (`Body::set_waiting`),
+    /// since the push may have grown an input after the request that left them undecided read it.
+    /// A push that wakes the scope while nothing waits can leave it set across a request that
+    /// leaves nothing waiting, which offers the next positions to wait once more than needed.
     pub woken: bool,
+    /// Whether a push has offered the waiting positions since they began to wait: they are in
+    /// `region` or queued. A later push sets `woken` instead of offering them again.
+    /// `Body::set_waiting` clears it when the next positions begin to wait.
+    pub waiting_offered: bool,
 }
 
 /// A scope's [`Offered`], shared with the entry in front of its drive's source.
@@ -2205,7 +2211,8 @@ impl Entry {
     /// Offer the scope the entry sits in its positions waiting for inputs, for a push no pipeline
     /// here takes: something the scope's body reads has grown, so a request may now decide them.
     /// The region pushed names what grew, not which waiting positions it decides, so all of them
-    /// are offered.
+    /// are offered. Between two `Body::set_waiting` calls the waiting positions are offered at most
+    /// once (`Offered::waiting_offered`); a later push sets `Offered::woken`.
     ///
     /// A placed entry records what reached it (`Offered::grown`), whether or not positions wait, so
     /// its pipeline reads it with the next round or attempt: a push that arrives while a round or
@@ -2215,8 +2222,10 @@ impl Entry {
             return;
         };
         let mut offered = scope.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.woken |= offered.waiting.is_none();
-        if let Some(waiting) = offered.waiting.clone() {
+        offered.woken |= offered.waiting.is_none() || offered.waiting_offered;
+        if let Some(waiting) = offered.waiting.clone()
+            && !std::mem::replace(&mut offered.waiting_offered, true)
+        {
             offered.region = Some(match offered.region.take() {
                 Some(before) => before.union(&waiting),
                 None => waiting,

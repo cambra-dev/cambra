@@ -255,10 +255,11 @@ next request runs the waiting positions, and its first round or attempt queues w
 pipelines it reached, so they read it. A closing round queues what grew too: it runs its rows'
 readers, a nested loop's among them, and a nested loop is offered only the positions its readers
 have read. A loop first steps its store over the waiting positions, so its drive emits past the ones
-now decided, and runs again the round it left undecided. A push can wake the scope while no
-position waits (`Offered::woken`). Positions that begin to wait after such a push are offered once
-(`Body::set_waiting`), since the push may have grown an input after the request that left them
-undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
+now decided, and runs again the round it left undecided. The waiting positions are offered at most
+once until the next request sets what waits (`Offered::waiting_offered`). A push can wake the scope
+while no position waits, or after the waiting positions were offered (`Offered::woken`). Positions
+that begin to wait after such a push are offered once (`Body::set_waiting`), since the push may have
+grown an input after the request that left them undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
 A nested loop holds each row the round around it gives it until its drive's source delivers the row
 (`Body::ready_rows`). A held row the source has not delivered does not hold back the round around
