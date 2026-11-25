@@ -2098,14 +2098,14 @@ pub struct Offered {
     /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
     /// reads what grew.
     pub grown: Vec<(PipelineId, TileGuard)>,
-    /// The positions of the scope's input a request left undecided, waiting for inputs: a push
-    /// that reaches one of the scope's entries and no pipeline there takes offers them again
-    /// ([`Entry::wake`]).
+    /// The positions of the scope's input a request left undecided, waiting for inputs: the first
+    /// push that reaches one of the scope's entries and no pipeline there takes them and offers
+    /// them again ([`Entry::wake`]).
     pub waiting: Option<TileGuard>,
     /// Whether a push woke the scope while no position waited, since positions last began to wait
-    /// ([`Entry::wake`]). Positions that begin to wait after such a push are offered once
-    /// (`Body::set_waiting`), since the push may have grown an input after the request that left
-    /// them undecided read it.
+    /// ([`Entry::wake`]): before any did, or after an earlier push took them. Positions that begin
+    /// to wait after such a push are offered once (`Body::set_waiting`), since the push may have
+    /// grown an input after the request that left them undecided read it.
     pub woken: bool,
 }
 
@@ -2205,7 +2205,8 @@ impl Entry {
     /// Offer the scope the entry sits in its positions waiting for inputs, for a push no pipeline
     /// here takes: something the scope's body reads has grown, so a request may now decide them.
     /// The region pushed names what grew, not which waiting positions it decides, so all of them
-    /// are offered.
+    /// are offered. The offer takes them: a later push finds none waiting and leaves the offer to
+    /// the end of the request this one brings, which keeps what it left undecided waiting.
     ///
     /// A placed entry records what reached it (`Offered::grown`), whether or not positions wait, so
     /// its pipeline reads it with the next round or attempt: a push that arrives while a round or
@@ -2216,7 +2217,7 @@ impl Entry {
         };
         let mut offered = scope.lock().unwrap_or_else(PoisonError::into_inner);
         offered.woken |= offered.waiting.is_none();
-        if let Some(waiting) = offered.waiting.clone() {
+        if let Some(waiting) = offered.waiting.take() {
             offered.region = Some(match offered.region.take() {
                 Some(before) => before.union(&waiting),
                 None => waiting,
