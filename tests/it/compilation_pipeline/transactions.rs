@@ -6024,3 +6024,32 @@ fn a_feed_under_a_condition_on_a_block_value() {
         "[90]",
     );
 }
+
+/// In a writer body whose `let` binding is its only reader of the drive's rows, the operator
+/// after the drive's `Memo` is the binding's, with no fan-out between them.
+#[test]
+fn a_writer_body_read_through_its_binding_fans_out_nothing_for_the_body() {
+    let kinds = operator_kinds_over_source1(indoc! {"
+        out: Feed(_)
+        pool: Mut(Int, Txn) := 100
+        for x in source1():
+            with begin():
+                pool := pool - x
+                out << pool
+        out
+    "});
+    let drive = kinds
+        .iter()
+        .position(|kind| *kind == "TransactDriver")
+        .unwrap_or_else(|| panic!("a transaction has a drive: {kinds:?}"));
+    assert_eq!(
+        kinds[drive..drive + 3],
+        ["TransactDriver", "FanOutSlot", "Memo"],
+        "the body reads the drive through one slot and a `Memo`: {kinds:?}"
+    );
+    assert_ne!(
+        kinds.get(drive + 3),
+        Some(&"FanOutSlot"),
+        "the body's `let` fans the drive's rows out to no second reader: {kinds:?}"
+    );
+}

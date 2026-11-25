@@ -144,7 +144,7 @@ fn convert_root(
             body,
         } => {
             let mut scope = ctx.enter_scope();
-            compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
+            compile_let_binding(expr.node_id(), binding, bound_expr, body, None, &mut scope)?;
             convert_root(body, &mut scope)
         }
         _ => ctx.bind_output(expr),
@@ -164,10 +164,15 @@ fn convert_root(
 /// invariant hold whoever calls.
 ///
 /// The caller enters the scope, because the body is converted in it.
+///
+/// `input` is fanned to the bound expression and to `body` only where `body` can read it other
+/// than through the binding ([`may_read_input`]). Otherwise the binding is the input's one
+/// reader, and `body` receives `input` without keeping it.
 fn compile_let_binding(
     let_id: NodeId,
     binding: &crate::ccl::TypedBinding,
     bound_expr: &Expr,
+    body: &Expr,
     input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Option<Arc<dyn TileOperator>>, ConversionError> {
@@ -208,6 +213,9 @@ fn compile_let_binding(
     }
 
     let (bound_input, body_input) = match input {
+        Some(input) if !may_read_input(body, ctx, &binding.name) => {
+            (Some(input.clone()), Some(input))
+        }
         Some(input) => {
             let fan_out = Arc::new(FanOut::new(input));
             (Some(fan_out.slot()), Some(fan_out.slot()))
@@ -216,6 +224,49 @@ fn compile_let_binding(
     };
     ctx.bind_let(&binding.name, bound_expr, bound_input)?;
     Ok(body_input)
+}
+
+/// Whether converting `expr` over an input can keep that input. `own` names the binding the
+/// enclosing `Let` makes of the input, and a read of it does not count.
+///
+/// Answers `false` only for these terms:
+///
+/// - `own`, which `compile_let_binding` binds over the input at this scope.
+/// - Any other binding of kind [`BindingKind::Aligned`] whose depth, level and key-narrowing count
+///   equal the current ones. The [`Var`] arm reads such a binding through and drops the input.
+/// - A composition whose first element answers `false`, since only that element receives the
+///   input.
+/// - A `zip` all of whose arms answer `false`, since `zip` hands the input to its arms alone.
+///
+/// Every other term answers `true`, an `Apply` of any other function included, since `map`,
+/// `strength_over`, `filter_values` and the generic arm keep the input themselves.
+///
+/// [`Var`]: TypedExprNode::Var
+fn may_read_input(expr: &Expr, ctx: &OpConversionContext, own: &Name) -> bool {
+    match &expr.node {
+        TypedExprNode::Var(name) if name == own => false,
+        TypedExprNode::Var(name) => ctx.lookup(name).is_none_or(|binding| {
+            binding.kind != BindingKind::Aligned
+                || binding.depth != ctx.iterations.len()
+                || binding.level != ctx.level
+                || binding.narrowed != ctx.narrowed
+        }),
+        TypedExprNode::Compose(elts) => elts
+            .first()
+            .is_none_or(|first| may_read_input(first, ctx, own)),
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Zip) =>
+        {
+            match &argument.node {
+                TypedExprNode::Tuple(elts) => elts.iter().any(|elt| may_read_input(elt, ctx, own)),
+                TypedExprNode::Record(fields) => fields
+                    .iter()
+                    .any(|field| may_read_input(&field.value, ctx, own)),
+                _ => true,
+            }
+        }
+        _ => true,
+    }
 }
 
 /// Compile a `Let* Record{…}` tree into one operator per output, sharing scope
@@ -252,7 +303,7 @@ fn convert_outputs(
             let mut scope = ctx.enter_scope();
             // No surrounding iteration here — this entry point compiles a
             // `Let* Record` chain from the top — so every binding is free.
-            compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
+            compile_let_binding(expr.node_id(), binding, bound_expr, body, None, &mut scope)?;
             convert_outputs(body, &mut scope)
         }
         TypedExprNode::Record(outs) => outs
@@ -2299,8 +2350,10 @@ fn convert_impl_inner(
         //   let v = (λx→def) in (λx→body[v ↦ x ▷ v])` transformation,
         // `bound_expr` may reference the lambda's parameter (via the
         // point-free `id` builtin) and so needs the surrounding
-        // iteration's input stream.  We fan the surrounding `input` out
-        // to *both* `bound_expr` and `body` so each can consume it.
+        // iteration's input stream. `compile_let_binding` fans that input
+        // to `bound_expr` and `body` where `body` can read it other than
+        // through `v` ([`may_read_input`]), and otherwise hands it to
+        // `bound_expr` alone.
         //
         // When `v` is used 0/1 times in `body`, this materialises the
         // iteration twice instead of inlining — a runtime cost we accept
@@ -2313,7 +2366,7 @@ fn convert_impl_inner(
         } => {
             let mut scope = ctx.enter_scope();
             let body_input =
-                compile_let_binding(expr.node_id(), binding, bound_expr, input, &mut scope)?;
+                compile_let_binding(expr.node_id(), binding, bound_expr, body, input, &mut scope)?;
             convert_impl(body, body_input, &mut scope)
         }
 
