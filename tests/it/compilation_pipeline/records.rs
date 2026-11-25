@@ -542,7 +542,8 @@ fn test_list_of_records_holding_collections() {
                             vec![0, 2],
                             ColumnValue::UInts(vec![0, 1, 0, 1]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
-                            Predicate::False,
+                            // Every element's list is complete, as the literal states.
+                            Predicate::True,
                             BitSet::new(),
                         ),
                     ),

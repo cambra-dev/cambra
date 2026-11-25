@@ -6029,3 +6029,39 @@ fn a_feed_under_a_condition_on_a_block_value() {
         "[90]",
     );
 }
+
+/// A program whose value is its last binding, `let 𝑥 = 𝑒 in 𝑥`, reads `𝑒` as its output: one
+/// fan-out stands in front of the sink, with no binding's `Memo` and fan-out before it.
+#[test]
+fn a_program_whose_value_is_its_last_binding_reads_that_term_as_its_output() {
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    ));
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let program = LoadedProgram::test(indoc! {"
+        out: Feed(_)
+        pool: Mut(Int, Txn) := 100
+        for x in source1():
+            with begin():
+                pool := pool - x
+                out << pool
+        out
+    "});
+    let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
+    let kinds: Vec<&str> = compiled
+        .operator_graph
+        .nodes()
+        .iter()
+        .map(|node| match node {
+            cambra::interpreter::operator_graph::GraphNode::Operator { kind, .. } => *kind,
+            cambra::interpreter::operator_graph::GraphNode::Sink { .. } => "Sink",
+        })
+        .collect();
+    assert!(
+        kinds.ends_with(&["VariantProject", "FanOutSlot", "Sink"]),
+        "the output's fan-out alone stands before the sink: {kinds:?}"
+    );
+}

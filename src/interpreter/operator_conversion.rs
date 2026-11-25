@@ -133,11 +133,24 @@ pub type OutputOperators = Vec<(SmolStr, Arc<dyn TileOperator>)>;
 
 /// The program's value: its top-level bindings, then the value they are bound over, which the
 /// main output reads ([`OpConversionContext::bind_output`]).
+///
+/// A last binding that is the program's value, `let 𝑥 = 𝑒 in 𝑥`, is converted as the output
+/// `𝑒` itself. Outside every iteration a binding and an output both convert their term with no
+/// input, so the two compute the same thing.
 fn convert_root(
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Arc<dyn TileOperator>, ConversionError> {
     match &expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } if matches!(&body.node, TypedExprNode::Var(name) if *name == binding.name)
+            && !matches!(bound_expr.node, TypedExprNode::Transact { .. }) =>
+        {
+            ctx.bind_output(bound_expr)
+        }
         TypedExprNode::Let {
             binding,
             bound_expr,
