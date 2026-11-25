@@ -6,7 +6,25 @@
 use super::loop_scope::{Body, RoundWork};
 use super::*;
 use crate::interpreter::commit_operator::CommitProducer;
-use crate::interpreter::tile_operators::StoreCell;
+use crate::interpreter::tile_operators::{StoreBorrow, StoreCell};
+
+/// A seed claim owns the store through its breaker call. The borrow ends before the
+/// resulting pushes land, since a reader can reach the same store.
+pub(super) struct ReservedSeed<'a> {
+    pub(super) store: StoreBorrow<'a>,
+    pub(super) input: InputId,
+}
+
+impl ReservedSeed<'_> {
+    pub(super) fn reach(mut self, call: &mut Call<'_>) {
+        call(
+            self.store
+                .as_breaking_mut()
+                .expect("a transaction seed breaker"),
+            self.input,
+        );
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -183,7 +201,7 @@ impl WriterRun {
     }
 }
 
-pub(super) struct TransactionBorrow<'a>(crate::interpreter::tile_operators::StoreBorrow<'a>);
+pub(super) struct TransactionBorrow<'a>(StoreBorrow<'a>);
 impl std::ops::Deref for TransactionBorrow<'_> {
     type Target = CommitProducer;
     fn deref(&self) -> &Self::Target {

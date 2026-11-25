@@ -197,12 +197,12 @@ impl Queue {
 
     /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
     /// names no region a package in flight names.
-    fn claim(
+    fn claim<R>(
         &self,
         pipeline: usize,
         ordered: bool,
-        can_claim: impl FnOnce() -> bool,
-    ) -> Option<WorkPackage> {
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<(WorkPackage, R)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // A pipeline can be notified of a region again before its package for the region is
         // acknowledged, as a reader keyed by one row is at each push of what it reads. Two
@@ -218,20 +218,20 @@ impl Queue {
         };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
         // after observing it under the lock; the check reads counters and takes no queue lock.
-        if state.ready.is_empty()
-            || (ordered && !state.in_flight.is_empty())
-            || overlaps(&state)
-            || !can_claim()
-        {
+        if state.ready.is_empty() || (ordered && !state.in_flight.is_empty()) || overlaps(&state) {
             return None;
         }
+        let reservation = reserve()?;
         let (index, guard) = state.ready.pop_front()?;
         state.in_flight.insert(index, guard.clone());
-        Some(WorkPackage {
-            pipeline: PipelineId(pipeline),
-            guard,
-            index,
-        })
+        Some((
+            WorkPackage {
+                pipeline: PipelineId(pipeline),
+                guard,
+                index,
+            },
+            reservation,
+        ))
     }
 
     /// Remove a matching claim, and answer whether it was one: `None` where no claim matches, and
@@ -1190,16 +1190,20 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one after observing its dependencies' progress. An ordered pipeline has at most one package
     /// in flight.
-    fn claim_from(&self, pipeline: usize, claimed: &dyn Fn()) -> Option<WorkPackage> {
+    fn claim_from<R>(
+        &self,
+        pipeline: usize,
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<(WorkPackage, R)> {
         let state = &self.states[pipeline];
         state
             .queue
             .claim(pipeline, self.infos[pipeline].ordered, || {
-                if !self.takes_from(pipeline) {
-                    return false;
+                if self.takes_from(pipeline) {
+                    reserve()
+                } else {
+                    None
                 }
-                claimed();
-                true
             })
     }
 
@@ -1219,11 +1223,19 @@ impl Dispatcher {
     }
 
     /// Claim the finish only from a closed queue's final reservation count.
-    fn try_begin_finish(&self, pipeline: usize) -> bool {
-        self.ready_to_finish(pipeline)
-            && self.states[pipeline]
-                .phase
-                .moved(Phase::Running, Phase::Finishing)
+    fn try_begin_finish<R>(
+        &self,
+        pipeline: usize,
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<R> {
+        if !self.ready_to_finish(pipeline) {
+            return None;
+        }
+        let reservation = reserve()?;
+        self.states[pipeline]
+            .phase
+            .moved(Phase::Running, Phase::Finishing)
+            .then_some(reservation)
     }
 
     /// What to do next, without blocking. A claim takes the package at the front of `preferred`'s
@@ -1234,61 +1246,57 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_where(preferred, &|_| true, &|_| true)
+        self.try_claim_with(preferred, &|_| true, &|_| true, &|_| Some(()), &|| {})
+            .0
     }
 
-    /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
-    /// and to the finishes of the pipelines `finishes` admits: a claimant that runs only some
-    /// breakers, as a worker of the pool runs the admitted ones. After
-    /// [`stop_claims`](Self::stop_claims) it answers [`Next::Done`].
-    pub(crate) fn try_claim_where(
+    /// A successful reservation stays with its claim. A losing finish drops its reservation
+    /// before the scan tries another pipeline.
+    fn try_claim_with<R: Default>(
         &self,
         preferred: Option<PipelineId>,
         takes: &dyn Fn(PipelineId) -> bool,
         finishes: &dyn Fn(PipelineId) -> bool,
-    ) -> Next {
-        self.try_claim_with(preferred, takes, finishes, &|| {})
-    }
-
-    fn try_claim_with(
-        &self,
-        preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: &dyn Fn(PipelineId) -> bool,
+        reserve: &dyn Fn(PipelineId) -> Option<R>,
         claimed: &dyn Fn(),
-    ) -> Next {
+    ) -> (Next, R) {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
         let generation = self.generation.load(Ordering::SeqCst);
         if self.failed.load(Ordering::SeqCst) {
-            return Next::Failed;
+            return (Next::Failed, R::default());
         }
         if self.stopped.load(Ordering::SeqCst) {
-            return Next::Done;
+            return (Next::Done, R::default());
         }
         let count = self.infos.len();
         if let Some(preferred) = preferred {
             self.state(preferred);
         }
         let scan = preferred.map(|p| p.0).into_iter().chain(0..count);
-        if let Some(package) = scan
-            .filter(|&p| takes(PipelineId(p)))
-            .find_map(|p| self.claim_from(p, claimed))
-        {
-            return Next::Package(package);
+        if let Some((package, reservation)) = scan.filter(|&p| takes(PipelineId(p))).find_map(|p| {
+            self.claim_from(p, || {
+                let reservation = reserve(PipelineId(p))?;
+                claimed();
+                Some(reservation)
+            })
+        }) {
+            return (Next::Package(package), reservation);
         }
         for p in (0..count).filter(|&p| finishes(PipelineId(p))) {
-            let begun = self.try_begin_finish(p);
-            if begun {
-                return Next::Finish {
-                    pipeline: PipelineId(p),
-                };
+            if let Some(reservation) = self.try_begin_finish(p, || reserve(PipelineId(p))) {
+                return (
+                    Next::Finish {
+                        pipeline: PipelineId(p),
+                    },
+                    reservation,
+                );
             }
         }
         if self.unfinished.load(Ordering::Acquire) == 0 {
-            return Next::Done;
+            return (Next::Done, R::default());
         }
-        Next::Wait(Generation(generation))
+        (Next::Wait(Generation(generation)), R::default())
     }
 
     /// What to do next, blocking while there is nothing to: [`try_claim`](Self::try_claim) and
@@ -1447,7 +1455,7 @@ impl Dispatcher {
     pub fn begin_finish(&self, pipeline: PipelineId) {
         let p = pipeline.0;
         self.state(pipeline);
-        self.ensure(self.try_begin_finish(p), || {
+        self.ensure(self.try_begin_finish(p, || Some(())).is_some(), || {
             format!("pipeline {p} finishes once, after its queue is closed and consumed and its hold is released")
         });
     }
@@ -1602,13 +1610,14 @@ impl Dispatcher {
     /// recorded as claimed. Unlike a claim, it never begins a finish.
     #[cfg(test)]
     pub(crate) fn pop(&self) -> Option<WorkPackage> {
-        (0..self.infos.len()).find_map(|p| self.claim_from(p, &|| {}))
+        (0..self.infos.len()).find_map(|p| self.claim_of(PipelineId(p)))
     }
 
     /// The package at the front of `pipeline`'s queue, claimed, where a claim may take one.
     #[cfg(test)]
     pub(crate) fn claim_of(&self, pipeline: PipelineId) -> Option<WorkPackage> {
-        self.claim_from(pipeline.0, &|| {})
+        self.claim_from(pipeline.0, || Some(()))
+            .map(|(package, ())| package)
     }
 
     /// Finish `pipeline` as a claim does, with `push` in place of the breaker: begin the finish,

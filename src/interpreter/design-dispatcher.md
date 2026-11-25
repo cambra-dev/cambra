@@ -577,7 +577,7 @@ consumed input through the existing producer chain.
 
 ### Who claims what
 
-A pipeline is **admitted** when all of these hold:
+A chain or sink pipeline is **admitted** when all of these hold:
 
 - It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
   loop's or transaction writer's body. A sink is admitted only where its packages run at once.
@@ -596,15 +596,16 @@ its guard overlaps a package in flight.
 A pipeline admitted for the second reason alone is **serial**: the planner orders it, so one package
 of it is in flight at a time, on any thread. A worker runs the finish of every admitted pipeline no
 scope's pipeline reads. A push into a scope's pipeline offers the scope requests, which the
-coordinator queues after the consume or finish that pushed them, so a pipeline a scope's pipeline
-reads stays the coordinator's. A loop's drive source offers through its entry instead
+coordinator queues after the consume or finish that pushed them, so a serial chain read directly
+by a scope stays on the coordinator. A loop's drive source offers through its entry instead
 (`CompletionTarget`); the coordinator's resume pass queues what it offered.
 
 With more than one worker, two kinds of claimant share the dispatcher:
 
-- A worker thread claims packages of admitted breaker and scope pipelines and the finishes of
-  admitted breakers. It sleeps in `Dispatcher::wait` when no claim or scope can advance.
-- The coordinator claims any package and any finish (`Dispatcher::try_claim_where`). A claim of an
+- A worker thread claims packages of admitted breaker and scope pipelines, including transaction
+  seeds. It can finish a seed even when writer scopes read it. It sleeps in `Dispatcher::wait`
+  when no claim or scope can advance.
+- The coordinator claims any package and any finish (`WorkerPool::next`). A claim of an
   admitted pipeline runs as a worker's would (`WorkerPool::consume_on_coordinator`,
   `WorkerPool::finish_on_coordinator`). It also runs the shared settlement pass
   ([A loop in rounds](#a-loop-in-rounds)) and polls live sources.
@@ -676,8 +677,10 @@ No two threads wait on each other through these rules:
 - A scope handler takes its schedule lock before its store and releases the store before queuing
   body packages. A writer validates commits under the shared store lock. Publication of an
   independent body takes the schedule lock with `try_lock` and releases the store before walking
-  breaker handles. The coordinator reserves an ordinary store input before claiming its package
-  or finish, so it can keep looking for work when a transition owns that store.
+  breaker handles. Any claimant can run a transaction seed's package or finish. It tries to
+  reserve the store only when that work is ready. If the store is busy it tries other pipelines.
+  After the seed publishes, scope settlement admits pending writers and closes their request
+  pipelines once their reads have finished.
 
 A wait for a handle is therefore a wait on a thread that holds a handle further upstream and waits
 for nothing but handles further upstream still. The pipelines form a DAG, since a loop's cycle runs

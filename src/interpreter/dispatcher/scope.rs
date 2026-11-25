@@ -284,18 +284,24 @@ impl Scope {
     }
 }
 
-/// A scope's ordered dispatcher pipeline. Request and step claims use the same scope state.
-pub(super) struct ScopePipeline {
-    pub(super) scope: Arc<Scope>,
-    pub(super) step: bool,
+/// An ordered scope pipeline that any worker may claim.
+pub(super) enum ScopePipeline {
+    Request(Arc<Scope>),
+    Step(Arc<Scope>),
+    Seed(StoreCell, InputId),
 }
 
 impl ScopePipeline {
-    pub(super) fn consume(&self, dispatcher: &Dispatcher, package: WorkPackage) {
-        if self.step {
-            self.scope.step(dispatcher, package)
-        } else {
-            self.scope.begin(dispatcher, package)
+    pub(super) fn consume(
+        &self,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+        reach: &mut Reach<'_>,
+    ) {
+        match self {
+            Self::Request(scope) => scope.begin(dispatcher, package),
+            Self::Step(scope) => scope.step(dispatcher, package),
+            Self::Seed(..) => consume_with(dispatcher, reach, package),
         }
     }
 }

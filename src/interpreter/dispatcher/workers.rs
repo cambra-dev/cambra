@@ -2,6 +2,7 @@
 //! from the run's dispatcher. See `src/interpreter/design-dispatcher.md`, "Shared native pipeline
 //! execution".
 use super::scope::{ScopePipeline, ScopeSteps};
+use super::transaction_scope::ReservedSeed;
 use super::*;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -177,7 +178,11 @@ impl WorkerPool {
     /// Whether `pipeline`'s finish is the workers' to claim.
     pub(super) fn finishes(&self, pipeline: PipelineId) -> bool {
         self.admits(pipeline)
-            && matches!(&self.pipelines[pipeline.0], Some(WorkerPipeline::Breaker(spec)) if spec.finishes)
+            && match &self.pipelines[pipeline.0] {
+                Some(WorkerPipeline::Breaker(spec)) => spec.finishes,
+                Some(WorkerPipeline::Scope(ScopePipeline::Seed(..))) => true,
+                _ => false,
+            }
     }
 
     /// The admitted pipelines whose packages do not run beside each other, which the run orders
@@ -211,7 +216,7 @@ impl WorkerPool {
         // A thread the system refuses leaves the run with the workers it has. Panicking instead
         // would leave the workers already started asleep, and the scope waiting for them.
         let mut handles = Vec::new();
-        // The coordinator claims as one of the run's workers (`Execution::next`), so the run
+        // The coordinator claims as one of the run's workers (`WorkerPool::next`), so the run
         // starts one thread fewer than it has workers.
         for worker in 1..self.count {
             match thread::Builder::new().spawn_scoped(scope, move || self.work(dispatcher, worker))
@@ -226,6 +231,33 @@ impl WorkerPool {
         handles
     }
 
+    /// Reserve a seed's store only after its package or finish is ready. A busy
+    /// store leaves the work available and the claimant continues scanning.
+    pub(super) fn next(
+        &self,
+        dispatcher: &Dispatcher,
+        preferred: Option<PipelineId>,
+        takes: &dyn Fn(PipelineId) -> bool,
+        finishes: &dyn Fn(PipelineId) -> bool,
+        claimed: &dyn Fn(),
+    ) -> (Next, Option<ReservedSeed<'_>>) {
+        dispatcher.try_claim_with(
+            preferred,
+            takes,
+            finishes,
+            &|id| match &self.pipelines[id.0] {
+                Some(WorkerPipeline::Scope(ScopePipeline::Seed(store, input))) => {
+                    Some(Some(ReservedSeed {
+                        store: store.try_write().ok()?,
+                        input: *input,
+                    }))
+                }
+                _ => Some(None),
+            },
+            claimed,
+        )
+    }
+
     /// One worker's claims: consume, publish and acknowledge each package of an admitted pipeline.
     fn work(&self, dispatcher: &Dispatcher, worker: usize) {
         #[cfg(not(test))]
@@ -235,19 +267,27 @@ impl WorkerPool {
             let _worker = dispatcher.worker();
             let mut preferred = None;
             loop {
-                match dispatcher.try_claim_with(
+                let (next, mut reserved) = self.next(
+                    dispatcher,
                     preferred,
                     &|pipeline| self.admits(pipeline),
                     &|pipeline| self.finishes(pipeline),
                     &|| {
                         self.busy.fetch_add(1, Ordering::SeqCst);
                     },
-                ) {
+                );
+                let mut reach_seed = |_: PipelineId, call: &mut Call<'_>| {
+                    reserved
+                        .take()
+                        .expect("a seed claim reserves its store")
+                        .reach(call);
+                };
+                match next {
                     Next::Package(package) => {
                         preferred = Some(package.pipeline);
                         #[cfg(test)]
                         self.count_claim(dispatcher, &package, worker);
-                        self.consume(dispatcher, package);
+                        self.consume(dispatcher, package, &mut reach_seed);
                         while self.poll(dispatcher) {}
                         #[cfg(test)]
                         self.collect_counters();
@@ -258,7 +298,7 @@ impl WorkerPool {
                     }
                     Next::Finish { pipeline } => {
                         self.busy.fetch_add(1, Ordering::SeqCst);
-                        self.finish(dispatcher, pipeline);
+                        self.finish(dispatcher, pipeline, &mut reach_seed);
                         while self.poll(dispatcher) {}
                         self.busy.fetch_sub(1, Ordering::SeqCst);
                         dispatcher.wake_claimants();
@@ -318,32 +358,42 @@ impl WorkerPool {
     /// [`consume`](Self::consume) on the coordinator, which claims as worker 0. It wakes the
     /// claimants after, as a worker thread does, so a claimant that waits on the pool's busy count
     /// sees the claim end.
-    pub(super) fn consume_on_coordinator(&self, dispatcher: &Dispatcher, package: WorkPackage) {
+    pub(super) fn consume_on_coordinator(
+        &self,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+        reach: &mut Reach<'_>,
+    ) {
         #[cfg(test)]
         self.count_claim(dispatcher, &package, 0);
         self.busy.fetch_add(1, Ordering::SeqCst);
         dispatcher.wake_claimants();
-        self.consume(dispatcher, package);
+        self.consume(dispatcher, package, reach);
         self.busy.fetch_sub(1, Ordering::SeqCst);
         dispatcher.wake_claimants();
     }
 
     /// [`finish`](Self::finish) on the coordinator, waking the claimants after as a worker
     /// thread does.
-    pub(super) fn finish_on_coordinator(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
-        self.finish(dispatcher, pipeline);
+    pub(super) fn finish_on_coordinator(
+        &self,
+        dispatcher: &Dispatcher,
+        pipeline: PipelineId,
+        reach: &mut Reach<'_>,
+    ) {
+        self.finish(dispatcher, pipeline, reach);
         dispatcher.wake_claimants();
     }
 
     /// Consume `package` under the breaker's handle held shared, publish the pipeline under it
     /// held exclusively, land the pushes with no handle held, and acknowledge the package.
-    fn consume(&self, dispatcher: &Dispatcher, package: WorkPackage) {
+    fn consume(&self, dispatcher: &Dispatcher, package: WorkPackage, reach: &mut Reach<'_>) {
         let pipeline = package.pipeline;
         let spec = match self.pipelines[pipeline.0]
             .as_ref()
             .expect("an admitted pipeline")
         {
-            WorkerPipeline::Scope(action) => return action.consume(dispatcher, package),
+            WorkerPipeline::Scope(action) => return action.consume(dispatcher, package, reach),
             WorkerPipeline::Breaker(spec) => spec,
         };
         let target = &spec.target;
@@ -425,9 +475,13 @@ impl WorkerPool {
 
     /// Finish `pipeline`, whose finish this worker claimed: release a parallel input whole, then
     /// push what the breaker completed and mark the pipeline finished (`finish_with`).
-    fn finish(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
-        let Some(WorkerPipeline::Breaker(spec)) = &self.pipelines[pipeline.0] else {
-            unreachable!("a worker finishes only admitted breakers")
+    fn finish(&self, dispatcher: &Dispatcher, pipeline: PipelineId, reach: &mut Reach<'_>) {
+        let spec = match &self.pipelines[pipeline.0] {
+            Some(WorkerPipeline::Breaker(spec)) => spec,
+            Some(WorkerPipeline::Scope(ScopePipeline::Seed(..))) => {
+                return finish_with(dispatcher, reach, pipeline);
+            }
+            _ => unreachable!("a worker finishes an admitted breaker or a seed"),
         };
         let mut reach = |reached: PipelineId, call: &mut Call<'_>| {
             debug_assert_eq!(
@@ -705,6 +759,31 @@ mod tests {
                     run.planned
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_worker_seed_opens_a_transaction_after_its_input_loop_finishes() {
+        use crate::interpreter::{ColumnValue, tiling::Tile};
+        let source = indoc::indoc! {"
+            initial := 0
+            for x in [1, 2, 3, 4]:
+                initial += x
+            total: Mut(Int, Txn) := initial
+            for r in [1, 2]:
+                with begin():
+                    total := total - r
+            await_final(total)
+        "};
+        for dop in [1, 2, 4] {
+            let run = evaluate(source, dop);
+            assert_eq!(run.main, Some(Tile::Scalar(ColumnValue::Ints(vec![7]))));
+            let seed = run
+                .planned
+                .iter()
+                .find(|p| p.name.starts_with("Commit") && p.rounds.is_empty())
+                .expect("the transaction seed has its own pipeline");
+            assert_eq!(seed.worker_claims > 0, dop > 1);
         }
     }
 
