@@ -3467,14 +3467,9 @@ fn is_printed(tile: &crate::interpreter::Tile) -> bool {
 
 impl crate::interpreter::DataSink for MainAnswers {
     fn process(&self, tile: &crate::interpreter::Tile) {
-        if let crate::interpreter::Tile::DataFunction {
-            domain, deleted, ..
-        } = tile
-        {
-            self.keys.fetch_add(
-                domain.len() - deleted.len(),
-                std::sync::atomic::Ordering::SeqCst,
-            );
+        if let crate::interpreter::Tile::DataFunction { domain, .. } = tile {
+            self.keys
+                .fetch_add(domain.len(), std::sync::atomic::Ordering::SeqCst);
         }
         if is_printed(tile) {
             self.printed
