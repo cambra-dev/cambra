@@ -383,11 +383,11 @@ an acknowledged package can enter a newly composed graph.
 
 ## Transaction requests and attempts
 
-A writer's request retains the delivered source region while an attempt runs. As for a loop
-scope, request and step handlers bound the recurrence: both kinds of scope sit behind
-`Handler::Request` and `Handler::Step` as a `Scope`. Both keep their inner pipelines in a `Body`
-(`loop_scope.rs`): the planned graph, its members and entries, the driver, and where execution
-appends the graph to the run's shared dispatcher (`Execution::attach_body`). The driver, body
+A writer's request retains the delivered source region while an attempt runs. The coordinator's
+request handler owns the writer phase or loop schedule. Its step handler refers back to that
+request pipeline. The store keeps the shared transaction epoch, snapshots and releases. Both
+kinds of scope keep their planned graph and entries in a `Body`. Attaching the graph assigns its
+global pipeline IDs and connects its followers to the body hold. The driver, body
 breakers and writer are ordinary pipelines planned by the same dependency and notification rules as
 other pipelines. The main claim loop consumes them; transaction control queues work and never
 claims or consumes a body pipeline itself.
@@ -435,9 +435,10 @@ Transaction control retains no dispatcher handle and constructs no additional pr
 
 ## A loop in rounds
 
-An induction store owns its accumulator, published snapshot and optional run-local controller.
-The request, body and store-step pipelines share the program's dispatcher. The controller maps
-those pipelines to the store for one run; it does not retain a handle back to its own store cell.
+An induction store owns its accumulator, published snapshot and body metadata. The coordinator
+owns the active request and round, the position to retry on a wake, and the finish phase. The step
+uses the guard of that round. Its outstanding dispatcher package prevents a second admission
+before the coordinator settles it. Writers use the same admission rule with their attempt guard.
 
 A request remains unacknowledged until all its positions and any closing round have stepped. Each
 position first runs the body, publishes held output, and then steps the store. The next position
@@ -459,15 +460,11 @@ A scope queues an offered request only once every pipeline its pipeline reads is
 drive pulls its source through, which a worker may still consume. A request begun before they have
 would find no position and run a closing round over positions the drive emits later.
 
-Finishing a request closes its body sources and waits for the body and step pipelines to finish.
-A loop's step takes arrivals, and its scope closes them once the body is finishing, no step is
-pending, and every body pipeline has finished (`Body::close_step_when_settled`). The step reads the
-body, and closing on the body's finish alone would let it finish before the scope queues the last
-round's step. While the body finishes, the resume pass publishes its inner pipelines' held output
-and releases their followers, as while a request is open.
-The store's final publication precedes completion of the request pipeline. Run cleanup clears
-controller metadata and entry placements on completion, pause, refusal or unwinding; it preserves
-the store's values and releases.
+After the loop's requests settle, its finish closes the body's sources. The coordinator publishes
+held output and releases followers while the body drains. Once every inner pipeline has finished,
+the coordinator closes the step's arrivals. When the step finishes, the coordinator publishes the
+store's final output and completes the request pipeline. Run cleanup discards scheduling state and
+placements while preserving the store's values and releases.
 
 Nested rounds use projections naming full paths. An operator pulled inside a round at a level it
 does not restate is pulled at the nearest level above that it restates, and its answer is cut to

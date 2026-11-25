@@ -42,11 +42,10 @@ impl TransactionRun {
 
 pub(super) struct WriterRun {
     pub(super) body: Body,
-    phase: WriterPhase,
 }
 
 #[derive(Default)]
-enum WriterPhase {
+pub(super) enum WriterPhase {
     #[default]
     Idle,
     Attempt {
@@ -60,17 +59,17 @@ enum WriterPhase {
     Finished,
 }
 
-impl WriterRun {
-    pub(super) fn new(body: Body) -> Self {
-        Self {
-            body,
-            phase: WriterPhase::Idle,
+impl WriterPhase {
+    pub(super) fn step_guard(&self) -> Option<&TileGuard> {
+        match self {
+            Self::Attempt { guard, .. } => Some(guard),
+            _ => None,
         }
     }
 
     pub(super) fn has_request(&self) -> bool {
         matches!(
-            self.phase,
+            self,
             WriterPhase::Attempt {
                 request: Some(_),
                 ..
@@ -79,37 +78,21 @@ impl WriterRun {
     }
 
     /// Whether the writer's followers wait on it: a request or a finish is open.
-    fn open(&self) -> bool {
-        matches!(
-            self.phase,
-            WriterPhase::Attempt { .. } | WriterPhase::Draining
-        )
+    pub(super) fn open(&self) -> bool {
+        matches!(self, WriterPhase::Attempt { .. } | WriterPhase::Draining)
     }
+}
 
-    pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
-        if self.open() {
-            self.body.hold_followers(dispatcher);
-        }
-    }
-
-    pub(super) fn release_followers(
-        &mut self,
-        dispatcher: &Dispatcher,
-        read: FollowersHold,
-    ) -> bool {
-        self.open() && self.body.release_followers(dispatcher, read)
-    }
-
-    /// The body's follower hold, read before a publication pass, or `None` before the writer is
-    /// attached.
-    pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
-        self.body.followers_hold(dispatcher)
+impl WriterRun {
+    pub(super) fn new(body: Body) -> Self {
+        Self { body }
     }
 
     /// Activate the body for an attempt queued at the store's progress epoch `queued_at`, and
     /// answer the attempt's work, which is queued once the store is released.
     fn queue(
         &mut self,
+        phase: &mut WriterPhase,
         dispatcher: &Dispatcher,
         request: Option<WorkPackage>,
         guard: TileGuard,
@@ -131,8 +114,7 @@ impl WriterRun {
         }
         self.body.queue_grown(&mut work);
         work.queue_round(self.body.global(self.body.driver), &guard);
-        self.body.end_round_with(&guard);
-        self.phase = WriterPhase::Attempt {
+        *phase = WriterPhase::Attempt {
             request,
             guard,
             queued_at,
@@ -140,18 +122,22 @@ impl WriterRun {
         work
     }
 
-    pub(super) fn drain(&mut self, dispatcher: &Dispatcher) {
-        self.phase = WriterPhase::Draining;
+    pub(super) fn drain(&mut self, phase: &mut WriterPhase, dispatcher: &Dispatcher) {
+        *phase = WriterPhase::Draining;
         self.body.close_sources(dispatcher);
         dispatcher.close(self.body.attached().step);
     }
 
-    pub(super) fn take_finish(&mut self, dispatcher: &Dispatcher) -> Option<PipelineId> {
-        if !matches!(self.phase, WriterPhase::Draining) {
+    pub(super) fn take_finish(
+        &mut self,
+        phase: &mut WriterPhase,
+        dispatcher: &Dispatcher,
+    ) -> Option<PipelineId> {
+        if !matches!(phase, WriterPhase::Draining) {
             return None;
         }
         let pipeline = self.body.finished_pipeline(dispatcher)?;
-        self.phase = WriterPhase::Finished;
+        *phase = WriterPhase::Finished;
         Some(pipeline)
     }
 }
@@ -210,13 +196,14 @@ impl CommitProducer {
 
     pub(super) fn begin_request(
         &mut self,
+        phase: &mut WriterPhase,
         dispatcher: &Dispatcher,
         writer: usize,
         package: WorkPackage,
     ) -> RoundWork {
         let input = self.writer_input(writer);
         assert!(
-            matches!(self.writer_run(writer).phase, WriterPhase::Idle),
+            matches!(phase, WriterPhase::Idle),
             "a writer completes its request before another starts"
         );
         self.begin_delivery(input);
@@ -227,10 +214,11 @@ impl CommitProducer {
             Some(waiting) => package.guard.union(&waiting),
             None => package.guard.clone(),
         };
-        run.queue(dispatcher, Some(package), guard, mark)
+        run.queue(phase, dispatcher, Some(package), guard, mark)
     }
     pub(super) fn finish_request(
         &mut self,
+        phase: &mut WriterPhase,
         dispatcher: &Dispatcher,
         writer: usize,
     ) -> (Option<WorkPackage>, RoundWork) {
@@ -240,7 +228,7 @@ impl CommitProducer {
             request,
             guard,
             queued_at,
-        } = std::mem::take(&mut transaction.writers[writer].phase)
+        } = std::mem::take(phase)
         else {
             unreachable!("a writer's step completes an attempt it queued")
         };
@@ -257,10 +245,10 @@ impl CommitProducer {
                 return (
                     None,
                     self.writer_run_mut(writer)
-                        .queue(dispatcher, None, guard, mark),
+                        .queue(phase, dispatcher, None, guard, mark),
                 );
             }
-            self.writer_run_mut(writer).drain(dispatcher);
+            self.writer_run_mut(writer).drain(phase, dispatcher);
             return (None, RoundWork::default());
         };
         if self.request_complete(self.writer_input(writer), &guard) {
@@ -296,16 +284,17 @@ impl CommitProducer {
         (
             None,
             self.writer_run_mut(writer)
-                .queue(dispatcher, Some(package), guard, mark),
+                .queue(phase, dispatcher, Some(package), guard, mark),
         )
     }
     pub(super) fn begin_transaction_finish(
         &mut self,
+        phase: &mut WriterPhase,
         dispatcher: &Dispatcher,
         writer: usize,
     ) -> RoundWork {
         assert!(
-            matches!(self.writer_run(writer).phase, WriterPhase::Idle),
+            matches!(phase, WriterPhase::Idle),
             "a writer finishes after its requests settle"
         );
         let whole = self
@@ -314,6 +303,6 @@ impl CommitProducer {
         self.begin_attempt();
         let mark = self.progress_epoch();
         let run = self.writer_run_mut(writer);
-        run.queue(dispatcher, None, whole, mark)
+        run.queue(phase, dispatcher, None, whole, mark)
     }
 }
