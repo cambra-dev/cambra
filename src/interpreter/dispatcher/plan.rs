@@ -1149,9 +1149,9 @@ impl Scope {
     fn step(&self, dispatcher: &Dispatcher, package: WorkPackage) {
         let (completed, work) = match self {
             Scope::Loop(store) => {
-                induction(store).complete_round();
+                let (request, outcome) = induction(store).complete_round();
                 dispatcher.acknowledge(package);
-                induction(store).queue_package_round(dispatcher)
+                induction(store).queue_package_round(dispatcher, request, outcome)
             }
             Scope::Writer { store, writer } => {
                 dispatcher.acknowledge(package);
