@@ -3711,6 +3711,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 
 /// A run recovers from its durable checkpoints alone and answers as one run, whether it stops at
 /// the first delivery's pause or crashes at any crash point of its two deliveries ([`recovers`]).
+/// The recovered run also releases every source position.
 ///
 /// After the stop, the test drops the run's context, compiled program, producers and source. A
 /// second compilation of the same text starts from the store the crash leaves
@@ -4230,6 +4231,20 @@ fn recovers(
         rendered_in_key_order(&value),
         expected,
         "{source}, crash after {crash:?}"
+    );
+    let released = feed
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_released_predicate();
+    let unreleased: Vec<Value> = batches
+        .iter()
+        .flat_map(|(entries, _)| entries.iter().map(|(key, _)| key.clone()))
+        .filter(|key| !released.contains(key))
+        .collect();
+    assert!(
+        unreleased.is_empty(),
+        "the recovered run releases every source position, not {unreleased:?}: {source}, crash \
+         after {crash:?}"
     );
     assert!(
         main.printed
