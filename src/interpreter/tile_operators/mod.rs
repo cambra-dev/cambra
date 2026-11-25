@@ -2416,6 +2416,17 @@ pub trait TileProducer: Send + Sync {
     /// it.
     fn reader_released(&self, _released: &TileGuard) {}
 
+    /// What a reader behind this producer's fan-out that acknowledges positions has finished with:
+    /// the positions `acknowledged` names, whatever the other readers have released. The
+    /// transaction writer acknowledges the drive's attempt whose decision committed
+    /// (`TransactWriterProducer::ack_through`), and the drive finishes the attempt's item there,
+    /// within the step of the commit, while its row stays until every reader releases it.
+    ///
+    /// The fan-out forwards it from a slot as it does [`reader_released`](Self::reader_released),
+    /// with the fan-out's shared state read-locked, and a producer that no reader acknowledges
+    /// ignores it.
+    fn acknowledge(&self, _acknowledged: &TileGuard) {}
+
     /// Where this producer is a loop's drive, the target the entry in front of its source records
     /// a decided push at while the drive reads the source by pull, and `None` for any other
     /// producer ([`CompletionTarget`](crate::interpreter::dispatcher::CompletionTarget)).

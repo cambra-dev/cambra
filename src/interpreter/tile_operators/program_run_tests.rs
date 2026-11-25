@@ -3723,67 +3723,61 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
 /// finds nothing. With `retains`, it holds everything, as a topic does, so such a breaker counts
 /// the position twice.
 ///
-/// Each crash point is tried over a store that makes its writes durable after every step, and,
-/// where `lag` is above 1, over one that makes them durable after every `lag`-th step, so a crash
-/// loses the writes of up to `lag - 1` steps and the release gates keep every source position those
-/// writes cover. Where `lag` is above 1, each crash point is also tried with only each proper
-/// prefix of that step's writes durable, as a store that stops partway through making them durable
-/// leaves. A case with a transaction has a `lag` of 1, since it does not recover from a lagging
-/// store: a transaction's acknowledging releases pass no gate
-/// (`BreakingProducer::releases_acknowledge`).
+/// Each crash point is tried over a store that makes each step's batch durable after the step, and
+/// over one that makes the batches durable after every [`LAG`]-th step, so a crash loses the
+/// batches of up to `LAG - 1` steps and the release gates keep every source position those batches
+/// cover. Each crash point is also tried with only each proper prefix of the batches not yet
+/// durable kept, as a store that stops partway through making them durable leaves. A step's records
+/// form one batch (`Durability::step`), so no crash keeps part of a step.
 #[rstest_log::rstest]
 #[case::a_map(
     "[x * 10 for x in source1()]",
-    "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]",
-    3
+    "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]"
 )]
 #[case::a_filter(
     "[x for x in source1() if x != 2]",
-    "[u0 -> 1, u2 -> 3, u3 -> 4, u4 -> 5]",
-    3
+    "[u0 -> 1, u2 -> 3, u3 -> 4, u4 -> 5]"
 )]
-#[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15", 3)]
-#[case::a_sum("sum(source1())", "15", 3)]
-#[case::a_live_product("sum([x * y for x in source1() for y in source1()])", "225", 3)]
-#[case::a_live_static_product("sum([x * y for x in source1() for y in [10, 20]])", "450", 3)]
+#[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15")]
+#[case::a_sum("sum(source1())", "15")]
+#[case::a_live_product("sum([x * y for x in source1() for y in source1()])", "225")]
+#[case::a_live_static_product("sum([x * y for x in source1() for y in [10, 20]])", "450")]
 #[case::a_static_read(
     "[x + sum([1, 2]) for x in source1()]",
-    "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]",
-    3
+    "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]"
 )]
 #[case::a_live_read(
     "[x + sum(source1()) for x in source1()]",
-    "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]",
-    3
+    "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]"
 )]
 #[case::a_loop(indoc! {"
     total := 0
     for x in source1():
         total += x
     total
-"}, "15", 3)]
+"}, "15")]
 #[case::a_loop_over_a_binding(indoc! {"
     xs = source1()
     total := 0
     for x in xs:
         total += x
     total
-"}, "15", 3)]
+"}, "15")]
 #[case::a_transaction(indoc! {"
     pool: Mut(Int, Txn) := 100
     for x in source1():
         with begin():
             pool := pool - x
     await_final(pool)
-"}, "85", 1)]
+"}, "85")]
 #[case::a_choice_on_a_sum(indoc! {"
     s = sum(source1())
     1 if s > 10 else 0
-"}, "1", 3)]
+"}, "1")]
 #[case::a_choice_per_element(indoc! {"
     s = sum(source1())
     [x if s > 10 else 0 for x in source1()]
-"}, "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]", 3)]
+"}, "[u0 -> 1, u1 -> 2, u2 -> 3, u3 -> 4, u4 -> 5]")]
 #[case::a_reply_per_transaction(indoc! {"
     out: Feed(_)
     pool: Mut(Int, Txn) := 100
@@ -3792,7 +3786,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             pool := pool - x
             out << pool
     out
-"}, "[u0 -> 99, u1 -> 97, u2 -> 94, u3 -> 90, u4 -> 85]", 1)]
+"}, "[u0 -> 99, u1 -> 97, u2 -> 94, u3 -> 90, u4 -> 85]")]
 #[case::a_reply_over_a_concatenation(indoc! {"
     out: Feed(_)
     pool: Mut(Int, Txn) := 100
@@ -3801,7 +3795,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             pool := pool - x
             out << x
     out
-"}, "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10]", 1)]
+"}, "[`0(u0) -> 1, `0(u1) -> 2, `0(u2) -> 3, `0(u3) -> 4, `0(u4) -> 5, `1(u0) -> 10]")]
 #[case::a_conditional_write(indoc! {"
     xs = [x for x in source1()]
     total := 0
@@ -3809,7 +3803,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         if x > 2:
             total := x
     total
-"}, "5", 3)]
+"}, "5")]
 #[case::two_writers_on_one_store(indoc! {"
     pool: Mut(Int, Txn) := 100
     for x in source1():
@@ -3819,7 +3813,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
         with begin():
             pool := pool + y
     await_final(pool)
-"}, "100", 1)]
+"}, "100")]
 #[case::a_second_writer_that_never_writes(indoc! {"
     pool: Mut(Int, Txn) := 100
     for x in source1():
@@ -3830,46 +3824,43 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
             if y > 100:
                 pool := pool + y
     await_final(pool)
-"}, "85", 1)]
+"}, "85")]
 #[case::a_memo_read_twice(indoc! {"
     xs = source1()
     [x + sum(xs) for x in xs]
-"}, "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]", 3)]
+"}, "[u0 -> 16, u1 -> 17, u2 -> 18, u3 -> 19, u4 -> 20]")]
 #[case::a_nested_loop(indoc! {"
     total := 0
     for x in source1():
         for y in [1, 2]:
             total += x * y
     total
-"}, "45", 3)]
+"}, "45")]
 #[case::a_nested_loop_of_three_positions(indoc! {"
     total := 0
     for x in source1():
         for y in [1, 2, 3]:
             total += x * y
     total
-"}, "90", 3)]
+"}, "90")]
 #[case::a_nested_loop_over_the_source(indoc! {"
     total := 0
     for x in source1():
         for y in source1():
             total += x * y
     total
-"}, "225", 3)]
+"}, "225")]
 fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     #[case] source: &str,
     #[case] expected: &str,
-    #[case] lag: usize,
     #[values(1, usize::MAX)] rows: usize,
     #[values(false, true)] retains: bool,
 ) {
     assert!(
-        recovers(source, expected, rows, retains, lag, None).is_some(),
+        recovers(source, expected, rows, retains, LAG, None).is_some(),
         "a run checkpointed at its first pause recovers: {source}"
     );
-    let cuts = lag > 1;
-    let lags = if lag == 1 { vec![1] } else { vec![1, lag] };
-    for lag in lags {
+    for lag in [1, LAG] {
         let mut step = 1;
         while let Some(pending) = recovers(
             source,
@@ -3879,16 +3870,13 @@ fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
             lag,
             Some(Crash::after(step)),
         ) {
-            // At a lag of 1 the writes pending at a crash are that step's alone.
-            if cuts && lag == 1 {
-                for kept in 1..pending {
-                    let crash = Crash {
-                        after: step,
-                        kept: Some(kept),
-                    };
-                    recovers(source, expected, rows, retains, lag, Some(crash))
-                        .expect("a run that reached a crash point reaches it again");
-                }
+            for kept in 1..pending {
+                let crash = Crash {
+                    after: step,
+                    kept: Some(kept),
+                };
+                recovers(source, expected, rows, retains, lag, Some(crash))
+                    .expect("a run that reached a crash point reaches it again");
             }
             step += 1;
         }
@@ -3896,10 +3884,14 @@ fn a_run_recovered_from_a_checkpoint_answers_as_one_run(
     }
 }
 
-/// Where a process crashes: after the crash point `after`, with the writes made durable at earlier
-/// crash points kept. Where `kept` is set, the store keeps only the first `kept` writes that are
-/// not durable yet at the crash; otherwise it makes them durable at the crash as `lag` says
-/// ([`Persisting`]).
+/// How many steps the store of [`a_run_recovered_from_a_checkpoint_answers_as_one_run`] lets pass
+/// before it makes their batches durable, in the runs over a lagging store.
+const LAG: usize = 3;
+
+/// Where a process crashes: after the crash point `after`, with the batches made durable at
+/// earlier crash points kept. Where `kept` is set, the store keeps only the first `kept` batches
+/// that are not durable yet at the crash; otherwise it makes them durable at the crash as `lag`
+/// says ([`Persisting`]).
 #[derive(Clone, Copy, Debug)]
 struct Crash {
     after: usize,
@@ -3916,7 +3908,7 @@ impl Crash {
 struct Crashed;
 
 /// A durable run's observer: it steps the durability after each step and at each drained
-/// boundary (`Durability::step`), makes the store's writes durable after every `lag`-th step,
+/// boundary (`Durability::step`), makes the store's batches durable after every `lag`-th step,
 /// pauses at every drained boundary, and crashes as `crash` says.
 ///
 /// Every top-level step is a crash point, those inside a loop's or a transaction's open request
@@ -3929,7 +3921,7 @@ struct Persisting {
     /// The crash points passed so far.
     steps: usize,
     crash: Option<Crash>,
-    /// How many writes were not durable yet at the crash, before the crash made any durable.
+    /// How many batches were not durable yet at the crash, before the crash made any durable.
     pending_at_crash: Option<usize>,
 }
 

@@ -57,6 +57,12 @@ impl TileProducer for BreakerReader {
             .unwrap_or_else(PoisonError::into_inner)
             .reader_released(released);
     }
+    fn acknowledge(&self, acknowledged: &TileGuard) {
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .acknowledge(acknowledged);
+    }
     fn restates(&self) -> Restates {
         self.handle
             .read()

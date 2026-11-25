@@ -1504,6 +1504,18 @@ impl TileProducer for FanOutProducer {
         result
     }
 
+    fn acknowledge(&self, acknowledged: &TileGuard) {
+        if let Some(Inner::Owned(producer)) = self
+            .shared()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .producer
+            .as_ref()
+        {
+            producer.acknowledge(acknowledged);
+        }
+    }
+
     fn release_impl(&self, obsolete_guard: TileGuard) {
         let shared_rc = self.shared();
         let mut shared = shared_rc.write().unwrap_or_else(PoisonError::into_inner);

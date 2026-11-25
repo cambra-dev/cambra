@@ -125,12 +125,12 @@ mod tests {
         let gate = ReleaseGate::new(tiling.clone(), tiling.empty_guard());
         gate.issue(&through(3));
         let first = store
-            .put(fence, CheckpointKey::Breaker(0), vec![])
+            .write(fence, vec![(CheckpointKey::Breaker(0), vec![])])
             .expect("the open's fence writes");
         gate.written(first, gate.issued());
         gate.issue(&through(7));
         let second = store
-            .put(fence, CheckpointKey::Breaker(0), vec![])
+            .write(fence, vec![(CheckpointKey::Breaker(0), vec![])])
             .expect("the open's fence writes");
         gate.written(second, gate.issued());
         gate.issue(&through(9));

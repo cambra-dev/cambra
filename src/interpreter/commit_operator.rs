@@ -7246,13 +7246,13 @@ impl TransactDriverProducer {
     }
 
     /// The two standing facts about the live window, checked on both sides of the
-    /// only two things that move it: an emit and the release that acknowledges its item.
+    /// only two things that move it: an emit and the release that reclaims its rows.
     ///
     /// It is **all one item**: rows are emitted only for the item in flight, or, with none in
-    /// flight, for the smallest delivered item, and an acknowledgement removes that item and its
-    /// rows. That is what lets the writer decide the newest position and treat every older live
-    /// one as superseded: if the window ever spanned two items, that rule would abandon a real
-    /// attempt.
+    /// flight, for the smallest delivered item. An acknowledgement removes that item from the
+    /// source, and the readers' releases reclaim its rows. That is what lets the writer decide the
+    /// newest position and treat every older live one as superseded: if the window ever spanned two
+    /// items, that rule would abandon a real attempt.
     ///
     /// And it is **bounded** by [`MAX_LIVE_ATTEMPTS`], which no test asserts
     /// directly because this does: `sustained_contention_conserves_pool` runs a
@@ -7288,7 +7288,7 @@ impl TransactDriverProducer {
         // Read the source after a notification or consuming delivery. Between those arrivals
         // and the drive's own releases its tile does not grow, so the last decode still answers.
         // A release removes what the driver has finished with. The drive
-        // releases each finished item's exact key (`release_impl`), which is why
+        // releases each finished item's exact key (`acknowledge`), which is why
         // an item is named by its domain position rather than by a column index. Without the
         // cache each pull decodes and sorts every item not yet released.
         // A source released whole is not pulled again: the release promised it nothing more.
@@ -7350,12 +7350,13 @@ impl TransactDriverProducer {
         // Positioned, so an item is named by where it sits in the source's own
         // domain rather than by where it sits in the columns still on offer. The item in
         // flight, the one whose rows the window holds, is the only item the drive may emit
-        // until its acknowledgement removes it; then the smallest delivered item is next. An
+        // until every reader releases its rows; then the smallest delivered item is next. An
         // item delivered below the one in flight waits. A concatenation delivers out of position
         // order: its list arm is whole at once, and its live arm arrives later. Emitting a second
         // item would put two items in the window, and the writer, which takes the newest attempt
         // and supersedes every older live one, would abandon one. The drive releases an item from
-        // its source only at its acknowledgement, so the source offers every item in flight.
+        // its source at its acknowledgement, before every reader releases its rows, and emits
+        // nothing for it after.
         let next_item = match state.window.inner_rows().next() {
             Some(row) => Some(one_component(row.item_position.clone()))
                 .filter(|path| state.source.items.contains_key(path)),
@@ -7421,13 +7422,11 @@ impl TransactDriverProducer {
             state.latest_emit = Some((pos, frontier));
         }
         self.debug_assert_window_invariants(state);
-        // Every item has been acked and no more can arrive. An item is acked only once its
-        // decision commits, so an exhausted drive has none in flight.
-        let exhausted = source_complete && next_item.is_none();
-        debug_assert!(
-            !exhausted || state.window.inner_row_count() == 0,
-            "an exhausted drive holds no row: the ack of an item's newest row drops every row"
-        );
+        // Every item has been acknowledged and no more can arrive. An item is acknowledged only
+        // once its decision commits, and its rows stay until every reader releases them, so an
+        // exhausted drive also holds no row.
+        let exhausted =
+            source_complete && next_item.is_none() && state.window.inner_row_count() == 0;
         // Terminal once every item has finished. This is the writer's completeness signal
         // too: it owns no source of its own, so "all transactions attempted" is exactly this
         // tile closing. A live window that is momentarily empty over an incomplete source
@@ -7435,7 +7434,7 @@ impl TransactDriverProducer {
         let done = exhausted;
         // An exhausted drive reads nothing more of its source, since the source can deliver no
         // more. It releases the source whole, as an induction drive does, rather than through the
-        // last item acked, which names positions and not the source.
+        // last item acknowledged, which names positions and not the source.
         if exhausted && !state.source_producer.obsolete_guard().is_universal() {
             state
                 .source_producer
@@ -7607,6 +7606,33 @@ impl TileProducer for TransactDriverProducer {
         }
     }
 
+    /// The writer's acknowledgement of the newest row finishes the row's item: the drive drops it
+    /// from its source and releases it there, within the step that committed the row's decision,
+    /// so the step's batch holds the drive's finish with the commit (`Durability::step`). The row
+    /// stays until every reader releases it ([`release_impl`](TileProducer::release_impl)): the
+    /// body's release passes the body's gate, which a later step forwards.
+    ///
+    /// Only the newest row's acknowledgement finishes the item. An older row is a superseded
+    /// retry, and the window is all one item, so the newest row is the last.
+    fn acknowledge(&self, acknowledged: &TileGuard) {
+        let mut state_guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = &mut *state_guard;
+        let acknowledged = acknowledged.whole_keys();
+        if let Some((pos, row)) = state.window.newest()
+            && acknowledged.contains(pos.value())
+        {
+            let finished = row.item_position.clone();
+            let path = one_component(finished.clone());
+            if state.source.items.remove(&path).is_some() {
+                state.source.held.remove(&path);
+                self.release_source_region(state, Predicate::point(finished.into_value()));
+            }
+        }
+    }
+
     /// The next attempt lies past every attempt a reader has released. A row carries the
     /// store's frontier at its emit. An attempt emitted twice carries two frontiers, and the
     /// body reads one through its `Memo` while the writer reads the other from the drive, so one
@@ -7614,9 +7640,12 @@ impl TileProducer for TransactDriverProducer {
     ///
     /// A release names an attempt the drive has not emitted only where recovery replays the
     /// releases its readers made after the drive's latest copy, before the drive's first step.
-    /// The drive then holds no rows: a copy that held rows the readers later superseded would
-    /// read the writer's replayed supersession release as its item's finish
-    /// (`release_impl`), and the assertion below rules that case out rather than handling it.
+    /// The copy holds at most the rows of an item the writer had acknowledged: the drive finishes
+    /// an item in the step of its commit, which writes the drive's record, and reclaims the
+    /// item's rows only once the body's gated release reaches it, which writes none. A reader
+    /// that released an attempt past them is done with them, so the drive reclaims them here. A
+    /// row of an unfinished item would need the acknowledgement recovery does not replay, and the
+    /// assertion below rules that case out rather than handling it.
     fn reader_released(&self, released: &TileGuard) {
         let TileGuard::Function(FunctionGuard::Domain(released)) = released else {
             return;
@@ -7637,10 +7666,23 @@ impl TileProducer for TransactDriverProducer {
                  after the drive's first step",
                 state.window.attempts
             );
+            let unfinished: Vec<Position> = state
+                .window
+                .inner_rows()
+                .map(|row| row.item_position.clone())
+                .filter(|item| !state.source_released.contains(item.value()))
+                .collect();
+            assert!(
+                unfinished.is_empty(),
+                "a drive skips attempts only past rows of items it finished, not of {unfinished:?}"
+            );
+            state
+                .window
+                .acknowledge(&Predicate::at_or_below(Value::UInt(highest)));
             assert_eq!(
                 state.window.inner_row_count(),
                 0,
-                "a drive skips attempts only from an empty window"
+                "a release past every attempt the drive emitted names all its rows"
             );
             state.window.skip_attempts_through(highest);
         }
@@ -7677,32 +7719,13 @@ impl TileProducer for TransactDriverProducer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = &mut *state_guard;
 
-        // The commit-ack, because this producer sits behind a `FanOut` whose slots are the body
-        // and the writer, so what arrives here is their intersection. The body releases a row as
-        // soon as it has consumed it, which is not an ack. The writer releases its newest row
-        // once the store commits the row's decision (`CommitProducer::commit_ready`), so the
-        // intersection's release of the newest row finishes the item. Superseded retries for the
-        // same item share an attempt prefix and give the same answer, so the rule is idempotent
-        // under any order.
+        // This producer sits behind a `FanOut` whose slots are the body and the writer, so what
+        // arrives here is their intersection, and it reclaims rows. The item a row is for
+        // finishes earlier, on the writer's acknowledgement ([`TileProducer::acknowledge`]).
         //
         // The window holds rows, so it acts on the rows the release names whole. What the
         // release names of a row's values is withheld from the output (`get_impl`).
         let pred = &obsolete_guard.whole_keys();
-        // Only the **newest** live row's release is the item's finish. An older one
-        // is a superseded retry, which the writer releases as soon as a newer
-        // attempt replaces it — reclaiming that row must not acknowledge
-        // an item still in flight, which is the same mistake as taking the body's
-        // consume-release for an ack. The window is all one item, so the newest row
-        // is the last, and superseded rows are exactly the prefix compacted below.
-        if let Some((pos, row)) = state.window.newest()
-            && pred.contains(pos.value())
-        {
-            let finished = row.item_position.clone();
-            let path = one_component(finished.clone());
-            state.source.items.remove(&path);
-            state.source.held.remove(&path);
-            self.release_source_region(state, Predicate::point(finished.into_value()));
-        }
         state.window.acknowledge(pred);
         self.debug_assert_window_invariants(state);
     }
@@ -8371,18 +8394,20 @@ impl TransactWriterProducer {
         )
     }
 
-    /// Ack every attempt at or below `pos` — issued when an attempt finishes: a
-    /// deny (no proposal to commit) or a commit-ack on the proposal it produced.
+    /// Acknowledge every attempt at or below `pos`, once the decision made from it commits.
     ///
-    /// It releases both driver slots this writer controls: its **own**, which
-    /// is the half of the driver's release intersection meaning "finished" (the
-    /// body's half only means "consumed"), and the body's decision prefix, which
-    /// bounds the body sub-operator's caches. Positions are absolute, so the
-    /// windows slide forward without renumbering.
+    /// The acknowledgement finishes the newest attempt's item in the drive
+    /// ([`TileProducer::acknowledge`]). It comes before the releases: the writer's release of the
+    /// driver slot completes the intersection that reclaims the attempt's row, and the drive
+    /// finishes an item only while it holds the item's newest row. The releases cover both driver
+    /// slots this writer controls: its own, and the body's decision prefix, which bounds the body
+    /// sub-operator's caches. Positions are absolute, so the windows slide forward without
+    /// renumbering.
     fn ack_through(&self, state: &mut TransactionWriterState, pos: &Position) {
         let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
             pos.value().clone(),
         )));
+        state.driver_producer.acknowledge(&guard);
         state.driver_producer.release(guard.clone());
         state.body_producer.release(guard);
     }
@@ -8696,9 +8721,9 @@ impl Breaker for TransactWriterProducer {
                 // O(1).
                 self.drop_superseded(state, &pos);
                 state.last_decided_pos = Some(pos.clone());
-                // The body-input row stays live until the commit-ack: it is the attempt in
-                // flight, and releasing it now would tell the driver this item is finished
-                // before it has committed.
+                // The body-input row stays live until the commit's acknowledgement: it is the
+                // attempt in flight, and releasing it now would let the drive reclaim the row
+                // before the decision commits.
                 state.emitted.push(InFlightProposal {
                     snapshot: frontier,
                     reads,
@@ -11235,9 +11260,221 @@ mod tests {
         driver.read_in_pipeline(driver.tiling().universal_guard())
     }
 
+    /// The source position of the newest attempt row in a drive's tile.
+    fn newest_item(rows: &Tile) -> Option<Value> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = rows
+        else {
+            return None;
+        };
+        let newest = (0..domain.len()).max_by_key(|&at| Position::new(domain.index_at(at)))?;
+        let Tile::Record { fields, .. } = &**codomain else {
+            panic!("attempt rows are records: {rows:?}")
+        };
+        let Some(Tile::Scalar(items)) = fields.get(F_ITEM_POSITION) else {
+            panic!("an attempt row names its item: {rows:?}")
+        };
+        Some(items.index_at(newest))
+    }
+
+    /// The breaker a subscription of a drive reads, through any fan-out slot and reader.
+    fn drive_breaker(
+        producer: &mut dyn TileProducer,
+        visit: &mut dyn FnMut(&mut dyn BreakingProducer),
+    ) {
+        if let Some(breaker) = producer.as_breaking_mut() {
+            visit(breaker);
+            return;
+        }
+        producer.visit_input_producers_mut(&mut |_, input| drive_breaker(input, visit));
+    }
+
+    /// Step a drive read through `reader` and read its rows there.
+    fn advance_through(reader: &mut Box<dyn TileProducer>) -> Tile {
+        drive_breaker(&mut **reader, &mut |breaker| {
+            let whole = breaker.input_tiling(InputId::ONLY).universal_guard();
+            breaker.consume_in_pipeline(InputId::ONLY, whole);
+        });
+        reader.read_in_pipeline(reader.tiling().universal_guard())
+    }
+
+    fn through(attempt: u64) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+            attempt,
+        ))))
+    }
+
+    /// The writer's acknowledgement reaches the drive through its fan-out slot and finishes the
+    /// item before the body's slot releases the item's row. The drive emits the next item once
+    /// both slots release the row. Without the acknowledgement, the same two releases reclaim the
+    /// row and leave the item unfinished: the drive emits neither the next item nor, at an
+    /// unchanged frontier, the same item again.
+    #[rstest_log::rstest]
+    #[case::acknowledged(true)]
+    #[case::not_acknowledged(false)]
+    fn a_drive_finishes_an_item_on_the_acknowledgement_through_its_fan(#[case] acknowledged: bool) {
+        use crate::interpreter::tile_operators::test_helpers::NotifyingOp;
+        let tiling = store_tiling(&["pool"]);
+        let engine = CommitEngine::new(balances(&[("pool", 100)]));
+        let (store, _, _, _) =
+            NotifyingOp::scripted(engine.render_full_store_tile(&tiling), tiling.clone());
+        let fan = Arc::new(FanOut::new(Arc::new(TransactDriver::new(
+            Arc::new(store),
+            Arc::new(ItemSource::new(&[-1, -2])),
+            vec![acct("pool")],
+            vec![value_extent()],
+            value_extent(),
+            None,
+        ))));
+        let mut cx = SubscribeContext::new();
+        let mut subscribe = || {
+            let slot = fan.slot();
+            let guard = slot.tiling().universal_guard();
+            slot.subscribe(guard, Box::new(|| {}), &mut cx)
+        };
+        let mut body = subscribe();
+        let mut writer = subscribe();
+        let rows = advance_through(&mut writer);
+        assert_eq!(newest_item(&rows), Some(Value::UInt(0)));
+        body.read_in_pipeline(body.tiling().universal_guard());
+        if acknowledged {
+            writer.acknowledge(&through(0));
+            assert_eq!(
+                newest_item(&advance_through(&mut writer)),
+                Some(Value::UInt(0)),
+                "the drive keeps the finished item's row until the body releases it"
+            );
+        }
+        writer.release(through(0));
+        body.release(through(0));
+        let rows = advance_through(&mut writer);
+        let next = acknowledged.then(|| (pos(1), Value::UInt(1)));
+        assert_eq!(
+            newest_body_position(&rows).zip(newest_item(&rows)),
+            next,
+            "acknowledged: {acknowledged}"
+        );
+    }
+
+    /// The writer acknowledges the attempt whose decision committed, and only the newest row's
+    /// acknowledgement finishes the item: an older row is a superseded retry of the same item.
+    #[test]
+    fn acknowledging_a_superseded_row_finishes_no_item() {
+        use crate::interpreter::tile_operators::test_helpers::NotifyingOp;
+        let tiling = store_tiling(&["pool"]);
+        let mut engine = CommitEngine::new(balances(&[("pool", 100)]));
+        let (store, _, snapshot, _) =
+            NotifyingOp::scripted(engine.render_full_store_tile(&tiling), tiling.clone());
+        let driver = Arc::new(TransactDriver::new(
+            Arc::new(store),
+            Arc::new(ItemSource::new(&[-1, -2])),
+            vec![acct("pool")],
+            vec![value_extent()],
+            value_extent(),
+            None,
+        ));
+        let mut driver = driver.clone().subscribe(
+            driver.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut SubscribeContext::new(),
+        );
+        assert_eq!(
+            newest_body_position(&advance_drive(&mut driver)),
+            Some(pos(0))
+        );
+        // Another writer commits, so the drive emits the item again at the new frontier.
+        assert!(matches!(
+            engine.attempt(Proposal {
+                snapshot: pos(0),
+                reads: balances(&[("pool", 100)]),
+                writes: balances(&[("pool", 90)]),
+            }),
+            CommitOutcome::Committed { .. }
+        ));
+        *snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            engine.render_full_store_tile(&tiling);
+        let rows = advance_drive(&mut driver);
+        assert_eq!(newest_body_position(&rows), Some(pos(1)));
+        assert_eq!(newest_item(&rows), Some(Value::UInt(0)));
+        driver.acknowledge(&through(0));
+        driver.release(through(0));
+        let rows = advance_drive(&mut driver);
+        assert_eq!(
+            (newest_body_position(&rows), newest_item(&rows)),
+            (Some(pos(1)), Some(Value::UInt(0))),
+            "the superseded row's acknowledgement leaves the item in flight"
+        );
+        driver.acknowledge(&through(1));
+        driver.release(through(1));
+        let rows = advance_drive(&mut driver);
+        assert_eq!(
+            (newest_body_position(&rows), newest_item(&rows)),
+            (Some(pos(2)), Some(Value::UInt(1))),
+            "the newest row's acknowledgement finishes the item"
+        );
+    }
+
+    /// A drive copied after the writer acknowledged its item, and before the body's release
+    /// reclaimed the item's row, holds that row. Recovery replays a reader's release past every
+    /// attempt the copy emitted: the drive reclaims the finished row, skips the released attempts
+    /// and emits the next item.
+    #[test]
+    fn a_drive_copied_with_a_finished_row_skips_past_a_replayed_release() {
+        use crate::interpreter::tile_operators::test_helpers::NotifyingOp;
+        let tiling = store_tiling(&["pool"]);
+        let engine = CommitEngine::new(balances(&[("pool", 100)]));
+        let drive = || {
+            let (store, _, _, _) =
+                NotifyingOp::scripted(engine.render_full_store_tile(&tiling), tiling.clone());
+            let driver = Arc::new(TransactDriver::new(
+                Arc::new(store),
+                Arc::new(ItemSource::new(&[-1, -2])),
+                vec![acct("pool")],
+                vec![value_extent()],
+                value_extent(),
+                None,
+            ));
+            driver.clone().subscribe(
+                driver.tiling().universal_guard(),
+                Box::new(|| {}),
+                &mut SubscribeContext::new(),
+            )
+        };
+        let through = |attempt| {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+                attempt,
+            ))))
+        };
+        let mut first = drive();
+        assert_eq!(
+            newest_body_position(&advance_drive(&mut first)),
+            Some(pos(0))
+        );
+        first.acknowledge(&through(0));
+        let mut copy = None;
+        first.visit_input_producers_mut(&mut |_, producer| {
+            copy = Some(producer.as_breaking_mut().expect("the drive").checkpoint());
+        });
+        let copy = copy.expect("the drive has a breaker");
+        let mut recovered = drive();
+        recovered.visit_input_producers_mut(&mut |_, producer| {
+            let breaker = producer.as_breaking_mut().expect("the drive");
+            breaker.restore(&copy);
+            breaker.reader_released(&through(1));
+        });
+        assert_eq!(
+            newest_body_position(&advance_drive(&mut recovered)),
+            Some(pos(2)),
+            "the recovered drive emits the next item past the released attempts"
+        );
+    }
+
     /// An item whose decision goes stale at every frontier is emitted again at each, and the
-    /// release of each superseded row keeps the window within [`MAX_LIVE_ATTEMPTS`]. The release
-    /// of the newest row, the commit's acknowledgement, finishes the item and the drive.
+    /// release of each superseded row keeps the window within [`MAX_LIVE_ATTEMPTS`]. The commit's
+    /// acknowledgement of the newest row finishes the item, and with the row's release the drive.
     #[test]
     fn a_repeatedly_retried_item_keeps_the_drive_window_flat() {
         use crate::interpreter::tile_operators::test_helpers::NotifyingOp;
@@ -11286,9 +11523,16 @@ mod tests {
                 )));
             }
         }
-        driver.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::at_or_below(Value::UInt(8)),
+        let committed = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(8),
         )));
+        driver.acknowledge(&committed);
+        let rows = advance_drive(&mut driver);
+        assert!(
+            !rows.is_terminal(),
+            "the drive holds the finished item's row until its readers release it: {rows:?}"
+        );
+        driver.release(committed);
         let rows = advance_drive(&mut driver);
         assert!(
             rows.is_terminal(),

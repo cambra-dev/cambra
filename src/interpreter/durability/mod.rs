@@ -6,9 +6,10 @@
 //! [`Durability::step`] after each top-level step and at each drained boundary
 //! (`RunObserver::stepped`). The start restores the graph from the store's records and installs a
 //! [`ReleaseGate`] on each input of each breaker and on each root. A step writes a checkpoint of
-//! each breaker whose issued releases changed, and of each root whose release changed, then passes
-//! on to each input what a durable checkpoint covers. So no input reclaims a region before a
-//! durable checkpoint holds what its breaker needs of it.
+//! each breaker whose issued releases changed, and of each root whose release changed, as one
+//! batch, which the store makes durable whole. Then it passes on to each input what a durable
+//! checkpoint covers. So no input reclaims a region before a durable checkpoint holds what its
+//! breaker needs of it.
 //!
 //! A held region reads as released to the input's consumer and to the dispatcher: the input's
 //! `obsolete_guard` answers the gate's issued guard, and a pull of the input answers nothing in it.
@@ -17,10 +18,15 @@
 //!
 //! The inputs of a breaker whose releases acknowledge pass no gate
 //! ([`BreakingProducer::releases_acknowledge`]): its inputs need the release within the step that
-//! issues it, and a gate passes a release on at a later step. `docs/durability.md` has the commit
-//! operator acknowledge a commit once the decision's entry in the observation log is durable, and
-//! no observation log exists yet, so a transaction's commits are as durable as the store's
-//! checkpoint at the end of the step.
+//! issues it, and a gate passes a release on at a later step. A commit, the writer's
+//! acknowledgement of the attempt it decided and the drive's finish of the attempt's item happen
+//! within one step ([`TileProducer::acknowledge`]), so their records are in the step's one batch,
+//! and a crash keeps all of them or none. The drive's finish does not wait for the body's release
+//! of the attempt's row, which passes the body's gate and so reaches the drive at a later step.
+//! `docs/durability.md` has the commit operator acknowledge a commit once the decision's entry in
+//! the observation log is durable. No observation log exists yet. The step's batch takes the
+//! entry's place: it holds the store's record of the commit, because a commit changes the store's
+//! issued releases and every step writes a record of each breaker whose issued releases changed.
 //!
 //! A checkpoint record holds, per breaker, the state [`BreakingProducer::checkpoint`] encodes and
 //! the guard the breaker issued to each input it visits, and, per root, the guard its sink
@@ -47,10 +53,11 @@
 //! A loop's store is gated like any breaker whose releases do not acknowledge. Its release of its
 //! body stops at the body's gate, so the drive reclaims an emitted row, and releases its source,
 //! only once a durable checkpoint of the store holds the decision that row fed. The recovery test
-//! crashes nested loops over a lagging store, and with each prefix of a step's writes durable
+//! crashes loops, nested loops and transactions over a lagging store, and with each prefix of the
+//! batches not yet durable kept
 //! (`program_run_tests::a_run_recovered_from_a_checkpoint_answers_as_one_run`).
 //!
-//! Six gaps remain:
+//! Five gaps remain:
 //!
 //! - A breaker's key is its position in [`walk`], checked by its kind, tiling and input roles. That
 //!   holds only between two compilations of one text in one version.
@@ -62,10 +69,8 @@
 //! - A durable run uses one worker. The copy of a breaker reads its gates before its state, so the
 //!   state covers every release `taken` holds; with several workers a consume can also run between
 //!   the two reads, and the copy then holds rows past `taken`, which recovery delivers again.
-//! - A transaction's commits are as durable as the store's checkpoint at the end of the step, since
-//!   the releases that acknowledge them pass no gate.
 //! - A source's credit does not count the releases its readers' gates hold, so a store that makes
-//!   writes durable slowly grows what each input keeps instead of slowing the source.
+//!   batches durable slowly grows what each input keeps instead of slowing the source.
 
 // Only tests start a durable run: the one store is `MemoryStore`, and no store on disk exists yet.
 #![cfg_attr(
@@ -269,8 +274,8 @@ impl Durability {
     }
 
     /// Write a checkpoint of each breaker whose issued releases differ from its latest record,
-    /// and of each root whose record would, then pass on to each input what a durable checkpoint
-    /// covers ([`ReleaseGate::durable`]).
+    /// and of each root whose record would, all of them as one batch. Then pass on to each input
+    /// what a durable checkpoint covers ([`ReleaseGate::durable`]).
     ///
     /// Writes nothing where a store is borrowed and the walk reached only part of the graph,
     /// since a breaker's key is its position in the walk. With one worker no step ends with a
@@ -278,7 +283,7 @@ impl Durability {
     ///
     /// # Panics
     ///
-    /// Where the store refuses a write: a later open has fenced this run out.
+    /// Where the store refuses the batch: a later open has fenced this run out.
     pub(crate) fn step(&mut self, roots: &[ProducerSlot]) {
         let mut copies = Vec::new();
         let mut at = 0;
@@ -301,16 +306,27 @@ impl Durability {
         });
         if complete {
             debug_assert_eq!(at, self.identities.len(), "a walk reaches every breaker");
+            // One batch holds the step's records, so a crash keeps all of them or none. A commit,
+            // the writer's acknowledgement of the attempt it decided and the drive's finish of the
+            // attempt's item happen within one step (`TileProducer::acknowledge`), so a
+            // transaction's commit is durable exactly when the writer's and the drive's records
+            // of it are.
+            let mut batch = Vec::new();
+            // Each gate the batch covers, with the guard its record holds.
+            let mut covered: Vec<(Arc<ReleaseGate>, TileGuard)> = Vec::new();
             for (at, gates, taken, state) in copies {
                 let record = BreakerRecord {
                     identity: self.identities[at].clone(),
                     state,
                     taken,
                 };
-                let ticket = self.put(CheckpointKey::Breaker(at), &record);
-                for (gate, taken) in gates.iter().zip(&record.taken) {
+                batch.push((
+                    CheckpointKey::Breaker(at),
+                    encode("a breaker record", &record),
+                ));
+                for (gate, taken) in gates.into_iter().zip(&record.taken) {
                     if let Some(gate) = gate {
-                        gate.written(ticket, taken.clone());
+                        covered.push((gate, taken.clone()));
                     }
                 }
                 self.written[at] = Some(record.taken);
@@ -334,18 +350,23 @@ impl Durability {
                 {
                     continue;
                 }
-                let ticket = self.put(CheckpointKey::Root(at), &record);
-                gate.written(ticket, record.released.clone());
+                batch.push((CheckpointKey::Root(at), encode("a root record", &record)));
+                covered.push((gate, record.released.clone()));
                 self.roots_written[at] = Some(record);
+            }
+            if !batch.is_empty() {
+                let ticket = self
+                    .store
+                    .write(self.fence, batch)
+                    .unwrap_or_else(|refused| {
+                        panic!("the store refuses the step's batch: {refused:?}")
+                    });
+                for (gate, taken) in covered {
+                    gate.written(ticket, taken);
+                }
             }
         }
         self.forward(roots);
-    }
-
-    fn put<T: Serialize>(&self, key: CheckpointKey, record: &T) -> Ticket {
-        self.store
-            .put(self.fence, key, encode("a checkpoint record", record))
-            .unwrap_or_else(|refused| panic!("the store refuses {key:?}: {refused:?}"))
     }
 
     /// Pass on to each gated input, and each root, what the store's durable checkpoints cover.

@@ -4311,12 +4311,12 @@ fn build_commit_store(
             item_extent,
             drive_resume,
         );
-        // Two slots of the driver: the body consumes rows, and the writer acks
-        // finished attempts. The driver removes its source item on the release
-        // *intersection*, so a body's consume-release cannot acknowledge an
-        // attempt still in flight — and so this is the one fan whose input is **not**
-        // memoized. A `Memo` releases its input as soon as it caches, which reaches the
-        // driver as an ack for an attempt no slot has finished.
+        // Two slots of the driver: the body consumes rows, and the writer acknowledges finished
+        // attempts. The driver finishes an item on the writer's acknowledgement
+        // (`TileProducer::acknowledge`) and reclaims a row on the release intersection, so a
+        // body's consume-release reclaims nothing the writer has not released. This is the one
+        // fan whose input is not memoized: a `Memo` over the driver would release its input as
+        // soon as it caches, so the drive would reclaim rows the writer has not decided.
         let driver_fan = Arc::new(FanOut::new(Arc::new(driver)));
         // The body's half of that intersection is the writer's: it releases the body's
         // decisions for the attempts it supersedes and for the item it finishes
