@@ -105,16 +105,36 @@ Emptiness is what makes the choice unobservable. A nonempty comprehension such a
 program that has no type. The pinning pass walks expression children, not copies stored in
 refinement predicate type slots.
 
-### The empty collection has no key morphism [Interim]
+### The empty collection's key type comes from its uses
 
-`map([])` fails inference. Its key type is derived from
-[the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and the empty source
-supplies no key value. The source is bound once
-([A group-by's collection is bound once](#a-group-bys-collection-is-bound-once)), so the
-empty-literal pin decides its element, but the pin decides no position of the element, and `map`
-reads each entry's positions. `a_re_keying_constructor_rejects_an_empty_literal` also covers
-`box(map([]))` under an explicit `Map(String, Int)` annotation. `set([])` reads no position, so it
-is the empty set (`a_set_of_an_empty_literal_is_empty`).
+`map([])` and `set([])` derive their key type from
+[the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and an empty source
+supplies no key value, so the literal's element type is pinned as any empty literal's is. Three
+things carry its uses to the pin:
+
+- **One literal.** The group-by's expansion copies its collection into the key domain's predicate
+  and the groups' refinement, and a copy in a predicate keeps its own variables, which the pin,
+  walking terms only, never reaches. Lowering binds the literal once
+  ([A group-by's collection is bound once](#a-group-bys-collection-is-bound-once)), and every
+  copy reads the one binding the pin decides.
+- **The annotation's key type.** A `Set(𝐾)` or `Map(𝐾, 𝑉)` annotation meets the boxed key domain as
+  a membership in `SubtypesOf(𝐾)`, recorded on the key variable without a bound. The type of a
+  position reads that membership as a demand
+  ([The type of a position](type-inference.md#the-type-of-a-position)), so the element takes `𝐾`.
+  A mutable variable's annotation reaches it the same way.
+- **A joined collection's key type.** `box(set(["a"])) if c else box(set([]))` joins two sums,
+  each listing its own key domain as a candidate. The other candidate's base is the key type the
+  empty one takes, as a joined value is a use of an empty list's element.
+
+A `def` returning an empty re-keyed literal leaves its key type to no use: the key is a candidate
+of the sum the `def` returns, which instantiation does not generalize, so the `def`'s calls do not
+reach it (`a_def_returning_an_empty_set_takes_no_key_from_its_calls_yet`).
+
+`map`'s entry is declared a pair, so its element is the pair `(𝐾, 𝑉)`, and the pin decides each
+component that no value reaches the same way. With no use, the element is unit, and a map's is
+`(unit, unit)`.
+
+### `empty_map()` [Interim]
 
 `empty_map()` constructs a keyed sum without deriving a type from entries:
 `Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉`. A `Map(𝐾, 𝑉)` annotation fixes its parameters. A `Set(𝐾)`
@@ -137,9 +157,7 @@ inferred type. No entry is available from which to recover its key or value type
 
 `TypeKind` has no inference-variable form. Generalizing the empty constructor across kinds
 would require a representation and inference rules for an unknown kind; this remains a proposal,
-not an implemented replacement for `empty_map()`. The decided nominal `Set` and `Map` replace it
-with the two values `Set::empty` and `Map::empty`; see
-[Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided).
+not an implemented replacement for `empty_map()`.
 
 ### A map's entry is declared a pair by lowering [Interim]
 

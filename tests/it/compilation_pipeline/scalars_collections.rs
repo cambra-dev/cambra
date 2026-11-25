@@ -315,32 +315,83 @@ fn a_map_entry_is_a_pair(#[case] code: &str) {
     check_compile_error(code, "tuples of different widths are different types");
 }
 
-// `map` does not accept an empty literal. The literal is bound once, so the empty-literal
-// pin decides its one binding (`src/ccl/design/collections.md`, "A group-by's collection is
-// bound once"), but the pin decides no component of the pair an entry is declared to be. The
-// rejection is an inference error rather than a diagnosis of the construct.
-// `empty_map()` is the spelling that works, because it states its type rather than deriving
-// one from entries it does not have (CHL spec, "3.11 List, tuple, record literals").
+// A re-keying constructor takes an empty literal, whose element type comes from the
+// constructor's uses as any empty literal's does (`src/ccl/design/collections.md`, "The empty
+// collection's key type comes from its uses"). An annotation gives the key type: a `Set(String)`
+// annotation is met by a `String` key, and an element type chosen without it would be refused.
+// With no use the element is unit, as a positional literal's is.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::map("map([])")]
-#[case::map_under_an_annotation(indoc! {r#"
-    m: Map(String, Int) = box(map([]))
-    m
+#[case::set_under_an_annotation("s: Set(String) = box(set([]))\nsum([1 for _ in s])")]
+#[case::map_under_an_annotation("m: Map(String, Int) = box(map([]))\nsum([1 for _ in m])")]
+#[case::set("s = set([])\nsum([1 for _ in s])")]
+#[case::map("m = map([])\nsum([1 for _ in m])")]
+#[case::boxed_set("s = box(set([]))\nsum([1 for _ in s])")]
+#[case::boxed_group_by("g = box(groupby([], \\x -> x))\nsum([1 for _ in g])")]
+#[case::empty_comprehension("s: Set(String) = box(set([x for x in []]))\nsum([1 for _ in s])")]
+#[case::beside_a_nonempty_set(indoc! {r#"
+    s: Set(String) = box(set([]))
+    t: Set(String) = box(set(["a"]))
+    sum([1 for _ in s]) + sum([1 for _ in t])
 "#})]
-fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
-    check_compile_error(code, "Nothing determines the type of this expression");
+fn a_re_keying_constructor_takes_an_empty_literal(#[case] code: &str) {
+    let expected = if code.contains(r#"["a"]"#) { 1 } else { 0 };
+    check_scalar(code, Value::Int(expected));
 }
 
-/// `set([])` is the empty set: the empty-literal pin decides the one binding of its literal.
+/// An empty re-keyed literal joined with another takes the other's key type, as a joined value
+/// is a use of an empty literal's element, and a mutable variable's annotation is a use as a
+/// `let`'s is (`src/ccl/design/collections.md`, "The empty collection's key type comes from its
+/// uses").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_joined_map(indoc! {r#"
+    c = 1 == 1
+    m = box(map([("a", 1)])) if c else box(map([]))
+    sum([1 for _ in m])
+"#}, 1)]
+#[case::a_joined_set(indoc! {r#"
+    c = 1 == 1
+    s = box(set(["a"])) if c else box(set([]))
+    sum([1 for _ in s])
+"#}, 1)]
+#[case::a_joined_set_under_an_annotation(indoc! {r#"
+    c = 1 == 1
+    s: Set(String) = box(set(["a"])) if c else box(set([]))
+    sum([1 for _ in s])
+"#}, 1)]
+#[case::a_mutable_set(indoc! {r#"
+    seen: Mut(Set(String), Txn) := box(set([]))
+    0
+"#}, 0)]
+#[case::a_mutable_map(indoc! {r#"
+    seen: Mut(Map(String, Int), Txn) := box(map([]))
+    0
+"#}, 0)]
+fn an_empty_re_keyed_literal_takes_its_key_from_its_uses(#[case] code: &str, #[case] count: i64) {
+    check_scalar(code, Value::Int(count));
+}
+
+/// Pinned: a `def` returning an empty re-keyed literal keeps its key type as a candidate of the
+/// sum it returns, which instantiation does not generalize, so a call's annotation reaches the
+/// definition's own variable after the definition was read. A debug build stops at the solver's
+/// ordering assertion; a release build reaches the refusal that nothing determines the key.
+/// Expected: `0`.
 #[test]
-fn a_set_of_an_empty_literal_is_empty() {
-    check_sink(
+#[cfg_attr(debug_assertions, should_panic(expected = "ordering invariant"))]
+#[cfg_attr(
+    not(debug_assertions),
+    should_panic(expected = "Nothing determines the type of this expression")
+)]
+fn a_def_returning_an_empty_set_takes_no_key_from_its_calls_yet() {
+    check_scalar(
         indoc! {"
-            out = test_sink()
-            out << set([])
+            def mk():
+                box(set([]))
+            a: Set(String) = mk()
+            sum([1 for _ in a])
         "},
-        "[() -> []]",
+        Value::Int(0),
     );
 }
 
