@@ -504,7 +504,9 @@ removes its entry, even when an earlier package is still running. A package whos
 region of a package in flight is not claimed, and the packages behind it wait with it, until that
 package is acknowledged (`Queue::claim`). A pipeline can be notified of a region again before its
 package for the region is acknowledged, as a reader keyed by one row is at each push of what it
-reads, and two packages naming one region would read it at once. Package indices increase for the
+reads, and two packages naming one region would read it at once. A partial-field pull reads its
+enclosing row, so the claim and acknowledgement checks compare those rows too. Packages for
+disjoint inner keys can still run together. Package indices increase for the
 run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
 pipelines permit at most one package in flight. No queue lock is held while an operator executes.
 A delivery takes no lock beyond what each consumer's own state needs

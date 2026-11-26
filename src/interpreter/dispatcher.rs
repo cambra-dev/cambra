@@ -212,6 +212,22 @@ impl Queue {
         self.append_locked(&mut state, morsels)
     }
 
+    /// A pull for part of a value reads its enclosing row (`TileProducer::get`).
+    /// Two disjoint field guards can therefore read and release the same payload.
+    fn reads_overlap(left: &TileGuard, right: &TileGuard) -> bool {
+        if !left.intersect(right).is_empty() {
+            return true;
+        }
+        if !Projection::may_name_inner_level(left) && !Projection::may_name_inner_level(right) {
+            return false;
+        }
+        let (Ok(left), Ok(right)) = (Projection::of(left), Projection::of(right)) else {
+            return true;
+        };
+        (left.names_part_of_values() || right.names_part_of_values())
+            && left.rows().intersect(&right.rows()) != Projection::Nothing
+    }
+
     /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
     /// names no region a package in flight names.
     fn claim<R>(
@@ -230,7 +246,7 @@ impl Queue {
                 state
                     .in_flight
                     .values()
-                    .any(|running| !next.intersect(running).is_empty())
+                    .any(|running| Self::reads_overlap(next, running))
             })
         };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
@@ -265,7 +281,7 @@ impl Queue {
         let freed_head = state
             .ready
             .front()
-            .is_some_and(|(_, next)| !next.intersect(&package.guard).is_empty());
+            .is_some_and(|(_, next)| Self::reads_overlap(next, &package.guard));
         Some(freed_head)
     }
 
@@ -3117,6 +3133,44 @@ mod tests {
         for package in [disjoint, overlapping] {
             dispatcher.acknowledge(package);
         }
+    }
+
+    #[test]
+    fn disjoint_fields_serialize_only_when_they_pull_the_same_row() {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record([("a".into(), scalar.clone()), ("b".into(), scalar)].into()),
+        );
+        let field = |key, name| {
+            Projection::within(
+                crate::interpreter::CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(key)),
+                Projection::of_field(name, Projection::Everything),
+            )
+            .guard(&tiling)
+        };
+        let first = field(0, "a");
+        let other = field(1, "b");
+        let same = field(0, "b");
+        assert!(first.intersect(&same).is_empty());
+        let queue = Queue::new();
+        queue.append(&[first, other, same]);
+        let claim = || {
+            queue
+                .claim(0, false, || Some(()))
+                .map(|(package, ())| package)
+        };
+        let first = claim().unwrap();
+        let other = claim().expect("independent rows can be read together");
+        assert!(claim().is_none(), "the second field would read row 0 again");
+        assert_eq!(queue.acknowledge(&other, || {}), Some(false));
+        assert_eq!(
+            queue.acknowledge(&first, || {}),
+            Some(true),
+            "wake the waiter for row 0"
+        );
+        assert!(claim().is_some());
     }
 
     /// The acknowledgement that frees a package waiting on an overlapping one wakes a claimant
