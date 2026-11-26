@@ -6,7 +6,25 @@
 use super::loop_scope::{Body, RoundWork};
 use super::*;
 use crate::interpreter::commit_operator::CommitProducer;
-use crate::interpreter::tile_operators::StoreCell;
+use crate::interpreter::tile_operators::{StoreBorrow, StoreCell};
+
+/// A seed claim owns the store through its breaker call. The borrow ends before the
+/// resulting pushes land, since a reader can reach the same store.
+pub(super) struct ReservedSeed<'a> {
+    pub(super) store: StoreBorrow<'a>,
+    pub(super) input: InputId,
+}
+
+impl ReservedSeed<'_> {
+    pub(super) fn reach(mut self, call: &mut Call<'_>) {
+        call(
+            self.store
+                .as_breaking_mut()
+                .expect("a transaction seed breaker"),
+            self.input,
+        );
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -60,6 +78,47 @@ pub(super) enum WriterPhase {
 }
 
 impl WriterPhase {
+    pub(super) fn begin(
+        &mut self,
+        store: &StoreCell,
+        writer: usize,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+    ) {
+        let work = transaction(store).begin_request(self, dispatcher, writer, package);
+        work.queue(dispatcher);
+    }
+
+    pub(super) fn step(
+        &mut self,
+        store: &StoreCell,
+        writer: usize,
+        dispatcher: &Dispatcher,
+        package: WorkPackage,
+    ) {
+        #[cfg(test)]
+        let pipeline = package.pipeline;
+        dispatcher.acknowledge(package);
+        let (done, work) = {
+            let mut store = transaction(store);
+            #[cfg(test)]
+            if let Some(probe) = &dispatcher.scope_step_probe {
+                probe(pipeline);
+            }
+            store.finish_request(self, dispatcher, writer)
+        };
+        work.queue(dispatcher);
+        if self.open() {
+            transaction(store)
+                .writer_run(writer)
+                .body
+                .hold_followers(dispatcher);
+        }
+        scope::complete_request(dispatcher, done, |pushes| {
+            pushes.push_final(&*transaction(store))
+        });
+    }
+
     pub(super) fn step_guard(&self) -> Option<&TileGuard> {
         match self {
             Self::Attempt { guard, .. } => Some(guard),
@@ -142,7 +201,7 @@ impl WriterRun {
     }
 }
 
-pub(super) struct TransactionBorrow<'a>(crate::interpreter::tile_operators::StoreBorrow<'a>);
+pub(super) struct TransactionBorrow<'a>(StoreBorrow<'a>);
 impl std::ops::Deref for TransactionBorrow<'_> {
     type Target = CommitProducer;
     fn deref(&self) -> &Self::Target {
