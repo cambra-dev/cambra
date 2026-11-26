@@ -643,6 +643,7 @@ mod tests {
         FlatMemo,
         NestedMemo,
         NestedMemoReleasing,
+        RecordMemoReleasing,
     }
 
     #[rstest_log::rstest]
@@ -651,6 +652,7 @@ mod tests {
     #[case::flat_memo(TestBreaker::FlatMemo)]
     #[case::nested_memo(TestBreaker::NestedMemo)]
     #[case::nested_memo_releasing(TestBreaker::NestedMemoReleasing)]
+    #[case::record_memo_releasing(TestBreaker::RecordMemoReleasing)]
     fn acknowledges_while_a_peer_is_still_consuming(#[case] target: TestBreaker) {
         use super::*;
         use crate::ccl::AggregateKind;
@@ -716,11 +718,20 @@ mod tests {
 
         // Both nested claims contribute to row 0 of a two-row collection. Finishing
         // the merge closes only row 0, leaving row 1 open.
+        let record = matches!(target, TestBreaker::RecordMemoReleasing);
+        let field = |key| if key == 0 { "left" } else { "right" };
+        let record_tiling = Tiling::Record(
+            ["left", "right"]
+                .map(|name| (name.into(), Tiling::Scalar(Extent::Base(BaseType::Int))))
+                .into(),
+        );
         let releasing = matches!(target, TestBreaker::NestedMemoReleasing);
         let nested = matches!(target, TestBreaker::NestedMemo) || releasing;
         let point = |key| Predicate::point(Value::UInt(key));
         let claim = |key| {
-            if nested {
+            if record {
+                Projection::of_field(field(key), Projection::Everything).guard(&record_tiling)
+            } else if nested {
                 let inner = if key == 0 {
                     point(0).union(&point(1))
                 } else {
@@ -735,6 +746,21 @@ mod tests {
         let (release, resume) = mpsc::channel();
         let input = Box::new(PausedInput {
             inner: match target {
+                TestBreaker::RecordMemoReleasing => {
+                    let tile = Tile::record(
+                        [("left", 11), ("right", 22)]
+                            .map(|(name, value)| {
+                                (
+                                    name.into(),
+                                    Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![
+                                        value,
+                                    ])),
+                                )
+                            })
+                            .into(),
+                    );
+                    Box::new(ProjectionSpy::new(tile, record_tiling.clone()).0)
+                }
                 TestBreaker::FlatMemo => Box::new(Input::over(&source(0..2))),
                 TestBreaker::NestedMemo | TestBreaker::NestedMemoReleasing => {
                     let (tile, tiling) = two_levels_of_ints();
@@ -743,7 +769,7 @@ mod tests {
                 _ => Box::new(NestedInput::over(&source(0..2))),
             },
             paused: claim(0),
-            pause_on_release: releasing,
+            pause_on_release: releasing || record,
             entered,
             resume: Mutex::new(resume),
         });
@@ -751,7 +777,10 @@ mod tests {
         let reader = PipelineId(1);
         let mut memo = None;
         let handle = match target {
-            TestBreaker::FlatMemo | TestBreaker::NestedMemo | TestBreaker::NestedMemoReleasing => {
+            TestBreaker::FlatMemo
+            | TestBreaker::NestedMemo
+            | TestBreaker::NestedMemoReleasing
+            | TestBreaker::RecordMemoReleasing => {
                 let tiling = input.tiling().clone();
                 let mut producer = MemoProducer::over(input, &tiling);
                 producer.base_mut().downstream = Some(Arc::new(Entry::new(reader, tiling)));
@@ -819,7 +848,21 @@ mod tests {
             assert_eq!(package.pipeline, reader);
             let memo = memo.read().unwrap();
             let tile = in_a_run(|| memo.get(package.guard.clone()));
-            if nested {
+            if record {
+                assert_eq!(package.guard, claim(key));
+                let Tile::Record { fields, .. } = tile else {
+                    panic!("expected a record")
+                };
+                assert_eq!(
+                    fields[field(key)],
+                    Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![if key == 0 {
+                        11
+                    } else {
+                        22
+                    }]))
+                );
+                assert!(fields[field(1 - key)].is_empty());
+            } else if nested {
                 let row = keys_between(0, 0);
                 let closing_claim = if releasing { 1 } else { 0 };
                 let expected = if key == closing_claim {
@@ -908,13 +951,13 @@ mod tests {
         push_to(&mut memo, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
         let requested = keys_between(0, 5);
-        let consume = |guard, expect_snapshot| {
+        let consume = |guard| {
             let mut pushes = dispatcher.pushes(PipelineId(0));
             let snapshot = memo.consume_for_dispatch(InputId::ONLY, guard, &mut pushes);
-            assert_eq!(snapshot.is_some(), expect_snapshot);
-            if let Some(producer) = snapshot {
-                pushes.push_final(producer);
-            }
+            assert!(
+                snapshot.is_none(),
+                "each package publishes its own completion"
+            );
             dispatcher.land(pushes);
             let mut received = Vec::new();
             while let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(1))) {
@@ -925,16 +968,16 @@ mod tests {
         };
         let point = |k| keys_between(k, k);
         assert_eq!(
-            consume(requested.clone(), false),
+            consume(requested.clone()),
             vec![point(0).union(&point(2)), point(4)]
         );
-        assert!(consume(requested.clone(), false).is_empty());
+        assert!(consume(requested.clone()).is_empty());
         source.write().unwrap().closed = true;
         let absent = point(1).union(&point(3)).union(&point(5));
-        assert_eq!(consume(requested.clone(), false), vec![absent]);
+        assert_eq!(consume(requested.clone()), vec![absent]);
         // Completing the remaining positions closes the whole finite collection.
         let rest = guard_minus(&ints().universal_guard(), &requested);
-        assert_eq!(consume(keys_between(6, 11), true), vec![rest]);
+        assert_eq!(consume(keys_between(6, 11)), vec![rest]);
     }
 
     /// The first handler holds its schedule and its store until a distinct worker enters the
