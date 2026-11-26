@@ -1250,11 +1250,19 @@ impl CommitProducer {
         writer: usize,
         f: impl FnOnce(&dyn TileProducer) -> R,
     ) -> R {
-        drive_source(
-            &*state.writer_producers[writer],
-            &mut Some(|source: &dyn TileProducer, _| f(source)),
-        )
-        .expect("a transaction writer reads its drive, which reads a source")
+        let mut visit = Some(|source: &dyn TileProducer, _| f(source));
+        if let Some(run) = &self.run {
+            // A peer can own the fan-out while it reads the driver. During execution
+            // the plan already holds the driver, whose source remains accessible.
+            let driver = run
+                .writer_driver(writer)
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return drive_source(&*driver, &mut visit)
+                .expect("a planned transaction driver has a source");
+        }
+        drive_source(&*state.writer_producers[writer], &mut visit)
+            .expect("a transaction writer reads its drive, which reads a source")
     }
 }
 
@@ -3576,13 +3584,13 @@ impl InductionStoreProducer {
 
     /// Publish a flat store's seed before its source delivers the first loop position.
     /// A carried seed must remain available to the next handover while the source is idle.
-    pub(crate) fn initialize_seed(&mut self) -> bool {
+    pub(crate) fn initialize_seed_if(&mut self, inputs_ready: impl FnOnce() -> bool) -> bool {
         let mut state_guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = &mut *state_guard;
-        if !matches!(state.engines, Engines::Store(None)) {
+        if !matches!(state.engines, Engines::Store(None)) || !inputs_ready() {
             return false;
         }
         let row = Path::default();
