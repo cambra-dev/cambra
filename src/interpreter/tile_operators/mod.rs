@@ -62,7 +62,7 @@ pub(crate) mod fanout;
 #[cfg(test)]
 mod forwarding_tests;
 #[cfg(test)]
-mod growing;
+pub(crate) mod growing;
 mod helpers;
 mod iterate;
 mod lookup;

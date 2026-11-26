@@ -19,16 +19,6 @@ pub(super) enum WorkerBreaker {
 }
 
 impl WorkerBreaker {
-    /// `f` on the breaker, held shared.
-    fn read<R>(&self, f: impl FnOnce(&dyn Breaker) -> R) -> R {
-        match self {
-            WorkerBreaker::Chain(handle) => {
-                f(&*handle.read().unwrap_or_else(PoisonError::into_inner))
-            }
-            WorkerBreaker::Sink(sink) => f(&*sink.read().unwrap_or_else(PoisonError::into_inner)),
-        }
-    }
-
     /// `f` on the breaker, held exclusively.
     fn write<R>(&self, f: impl FnOnce(&mut dyn Breaker) -> R) -> R {
         match self {
@@ -477,8 +467,7 @@ impl WorkerPool {
         }
     }
 
-    /// Consume `package` under the breaker's handle held shared, publish the pipeline under it
-    /// held exclusively, land the pushes with no handle held, and acknowledge the package.
+    /// Consume the package, publish any incremental output, then acknowledge the claim.
     fn consume(&self, dispatcher: &Dispatcher, package: WorkPackage, reach: &mut Reach<'_>) {
         let pipeline = package.pipeline;
         let spec = match self.pipelines[pipeline.0]
@@ -488,62 +477,55 @@ impl WorkerPool {
             WorkerPipeline::Scope(action) => return action.consume(dispatcher, package, reach),
             WorkerPipeline::Breaker(spec) => spec,
         };
-        let target = &spec.target;
-        let pushes = if !spec.concurrent {
-            // One package at a time, under the handle held exclusively, as on the coordinator
-            // (`consume_with`).
-            target.write(|breaker| {
-                debug_assert!(
-                    package
-                        .guard
-                        .check_from(&breaker.input_tiling(InputId::ONLY)),
-                    "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
-                    pipeline.0,
-                    package.guard
-                );
-                breaker.consume_impl(InputId::ONLY, package.guard.clone());
-                breaker
-                    .as_producer()
-                    .filter(|producer| producer.pushes_while_consuming())
-                    .map(|producer| {
-                        let mut pushes = dispatcher.pushes(pipeline);
-                        pushes.push_final(producer);
-                        pushes
-                    })
-            })
-        } else {
-            // A package beside others names its region exactly: every pusher queues a projection of
-            // its reader's input.
+        let consume = |breaker: &dyn Breaker| {
+            debug_assert!(
+                package
+                    .guard
+                    .check_from(&breaker.input_tiling(InputId::ONLY)),
+                "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
+                pipeline.0,
+                package.guard
+            );
+            breaker.consume_impl(InputId::ONLY, package.guard.clone());
+        };
+        let publish = |producer: &dyn BreakingProducer| {
+            let mut pushes = dispatcher.pushes(pipeline);
+            pushes.push_final(producer);
+            pushes
+        };
+        let pushes = if spec.concurrent {
             debug_assert!(
                 Projection::of(&package.guard).is_ok(),
                 "pipeline {} runs a package beside others that names no projection: {:?}",
                 pipeline.0,
                 package.guard
             );
-            target.read(|breaker| {
-                debug_assert!(
-                    package
-                        .guard
-                        .check_from(&breaker.input_tiling(InputId::ONLY)),
-                    "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
-                    pipeline.0,
-                    package.guard
-                );
-                breaker.consume_impl(InputId::ONLY, package.guard.clone());
-            });
-            // Exclusive, so the push sees no consume between the merge of its rows and the release of
-            // its input, which the readers it wakes rely on. A breaker that publishes only at its
-            // finish or in the resume pass pushes nothing here, as on the coordinator
-            // (`consume_with`).
-            target.write(|breaker| {
+            match &spec.target {
+                WorkerBreaker::Sink(sink) => {
+                    consume(&*sink.read().unwrap_or_else(PoisonError::into_inner));
+                    None
+                }
+                WorkerBreaker::Chain(handle) => {
+                    let publishes = {
+                        let breaker = handle.read().unwrap_or_else(PoisonError::into_inner);
+                        consume(&*breaker);
+                        breaker.pushes_while_consuming()
+                    };
+                    publishes.then(|| {
+                        // A reader may act on this push immediately. Take a snapshot between
+                        // consumes, after each consume has both merged and released its input.
+                        let breaker = handle.write().unwrap_or_else(PoisonError::into_inner);
+                        publish(&*breaker)
+                    })
+                }
+            }
+        } else {
+            spec.target.write(|breaker| {
+                consume(breaker);
                 breaker
                     .as_producer()
-                    .filter(|producer| producer.pushes_while_consuming())
-                    .map(|producer| {
-                        let mut pushes = dispatcher.pushes(pipeline);
-                        pushes.push_final(producer);
-                        pushes
-                    })
+                    .filter(|p| p.pushes_while_consuming())
+                    .map(publish)
             })
         };
         if let Some(pushes) = pushes {
@@ -670,6 +652,151 @@ mod tests {
             compile_program(&mut context, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
         run_program_with_workers(&mut program, 8, dop).unwrap()
     }
+    #[rstest_log::rstest]
+    #[case::sink(false)]
+    #[case::map_aggregate(true)]
+    fn acknowledges_while_a_peer_is_still_pulling(#[case] aggregate: bool) {
+        use super::*;
+        use crate::ccl::AggregateKind;
+        use crate::interpreter::{
+            DataSink, Tile,
+            tile_operators::{
+                ProducerBase, SinkBreaker, TileProducer,
+                growing::{KEYS, NestedInput, source},
+                map_aggregate_over,
+                test_helpers::keys_between,
+            },
+            types::BaseType,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct PausedInput {
+            inner: NestedInput,
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl TileProducer for PausedInput {
+            fn base(&self) -> &ProducerBase {
+                self.inner.base()
+            }
+            fn base_mut(&mut self) -> &mut ProducerBase {
+                self.inner.base_mut()
+            }
+            fn get_impl(&self, guard: TileGuard) -> Tile {
+                if guard == keys_between(0, 0) {
+                    self.entered.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                }
+                self.inner.get_impl(guard)
+            }
+            fn release_impl(&self, guard: TileGuard) {
+                self.inner.release_impl(guard);
+            }
+        }
+        struct Sink(mpsc::Sender<Tile>);
+        impl DataSink for Sink {
+            fn process(&self, tile: &Tile) {
+                self.0.send(tile.clone()).unwrap();
+            }
+        }
+
+        let (entered, pulling) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let input = Box::new(PausedInput {
+            inner: NestedInput::over(&source(0..2)),
+            entered,
+            resume: Mutex::new(resume),
+        });
+        let (delivered, tiles) = mpsc::channel();
+        let reader = PipelineId(1);
+        let handle = if aggregate {
+            let output = Tiling::data_function(
+                Extent::uint_range(KEYS),
+                Tiling::Aggregation {
+                    kind: AggregateKind::Sum,
+                    accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+                },
+            );
+            let chain = map_aggregate_over(input, &output, AggregateKind::Sum);
+            chain.write().unwrap().base_mut().downstream =
+                Some(Arc::new(Entry::new(reader, output)));
+            WorkerBreaker::Chain(chain)
+        } else {
+            let sink = SinkBreaker::new(
+                Arc::new(RwLock::new(Some(input))),
+                Arc::new(Sink(delivered)),
+            );
+            WorkerBreaker::Sink(Arc::new(RwLock::new(sink)))
+        };
+        let workers = WorkerPool::new(
+            2,
+            vec![
+                Some(WorkerTarget {
+                    handle,
+                    concurrent: true,
+                }),
+                None,
+            ],
+            vec![None; 2],
+            vec![None, None],
+            ScopeSteps::default(),
+        );
+        let dispatcher = Dispatcher::new(
+            if aggregate {
+                vec![vec![], vec![0]]
+            } else {
+                vec![vec![], vec![]]
+            },
+            1,
+        );
+        let pipeline = PipelineId(0);
+        for key in 0..2 {
+            dispatcher.queue_for(pipeline, &keys_between(key, key));
+        }
+        dispatcher.close(pipeline);
+        let consume = || {
+            let Next::Package(package) = dispatcher.try_claim(None) else {
+                panic!("expected a disjoint package");
+            };
+            workers.consume(&dispatcher, package, &mut |_, _| unreachable!());
+        };
+        let timeout = Duration::from_secs(5);
+        thread::scope(|threads| {
+            threads.spawn(consume);
+            pulling.recv_timeout(timeout).unwrap();
+            let (done, acknowledged) = mpsc::channel();
+            threads.spawn(move || {
+                consume();
+                let _ = done.send(());
+            });
+            let completed = acknowledged.recv_timeout(timeout);
+            let outstanding = dispatcher.outstanding(pipeline);
+            let waiting = matches!(dispatcher.try_claim(None), Next::Wait(_));
+            release.send(()).unwrap();
+            completed.expect("the second package can acknowledge before the first pull returns");
+            assert_eq!(outstanding, 1);
+            assert!(waiting, "finish still waits for the first package");
+        });
+        assert_eq!(dispatcher.outstanding(reader), 0, "no incremental push");
+        let Next::Finish { pipeline } = dispatcher.try_claim(None) else {
+            panic!("both packages acknowledged");
+        };
+        workers.finish(&dispatcher, pipeline, &mut |_, _| unreachable!());
+        if aggregate {
+            assert!(
+                dispatcher.outstanding(reader) > 0,
+                "finish publishes the held groups"
+            );
+        } else {
+            assert_eq!(tiles.try_iter().count(), 2, "one delivery per key");
+        }
+    }
+
     /// The first handler holds its schedule and its store until a distinct worker enters the
     /// second one and advances it another round without waiting for the first.
     #[rstest_log::rstest]
