@@ -416,6 +416,14 @@ enum Val {
     Wrap(FieldKey, Box<Val>, Extent),
 }
 
+/// The value of an `==` or `!=` comparison as [`Parser::comparison`] reads it.
+enum Comparison {
+    /// A column of `Bool`s in this slot.
+    Computed(Slot),
+    /// The same answer at every row, known while parsing.
+    Decided(bool),
+}
+
 struct Parser<'t> {
     /// The extent of a type, as operator conversion reads it. The parser reads a union's arms
     /// from it, since the payload of a `variant_wrap` or of a variant constant names only its own
@@ -424,8 +432,10 @@ struct Parser<'t> {
     /// The instructions emitted so far. Instructions are appended, and removed only by
     /// [`Parser::truncate`].
     instrs: Vec<Instr>,
-    /// The `Input` instruction of each path read so far, so a path read twice is one slot.
-    reads: HashMap<Vec<SmolStr>, Slot>,
+    /// The slot of each instruction emitted so far other than a constructor, so an equal
+    /// instruction is one slot: a path read twice, a constant written twice, or an operation on
+    /// the same slots computed twice ([`Parser::emit`]).
+    slots: HashMap<Instr, Slot>,
     /// How many operations the chain read so far. The identity and a composition of others count
     /// as none, a `zip` as two whatever its arity, and every other element as one. A prefix is
     /// taken only when it reads two or more ([`fuse_prefix`]), so a `zip` alone is taken.
@@ -433,16 +443,29 @@ struct Parser<'t> {
 }
 
 impl Parser<'_> {
+    /// The slot of `instr`: an equal instruction's slot when one was emitted, or a new one. An
+    /// instruction's value is a function of its fields and of the slots it reads, so equal
+    /// instructions compute equal columns. Constructors are always new, since each is read by the
+    /// one constructor it is a field or payload of
+    /// ([`ScalarProgram::constructors_build_only_the_result`]).
     fn emit(&mut self, instr: Instr) -> Slot {
+        if let Some(&slot) = self.slots.get(&instr) {
+            return slot;
+        }
+        let slot = self.instrs.len() as Slot;
+        if !instr.is_constructor() {
+            self.slots.insert(instr.clone(), slot);
+        }
         self.instrs.push(instr);
-        (self.instrs.len() - 1) as Slot
+        slot
     }
 
-    /// Discard instructions from `len` onward and their cached input reads. Keep the operation
-    /// count: probing an output must not undo the count accumulated by [`Parser::step`].
+    /// Discard instructions from `len` onward, with their entries in [`Parser::slots`]. Keep the
+    /// operation count: probing an output must not undo the count accumulated by
+    /// [`Parser::step`].
     fn truncate(&mut self, len: usize) {
         self.instrs.truncate(len);
-        self.reads.retain(|_, slot| (*slot as usize) < len);
+        self.slots.retain(|_, slot| (*slot as usize) < len);
     }
 
     /// Return a scalar slot, emitting an input or constant instruction when needed. Records and
@@ -458,16 +481,11 @@ impl Parser<'_> {
         }
     }
 
-    /// The `Input` instruction reading `path`, emitted on the first read of it.
+    /// The `Input` instruction reading `path`.
     fn input(&mut self, path: &[SmolStr]) -> Slot {
-        if let Some(&slot) = self.reads.get(path) {
-            return slot;
-        }
-        let slot = self.emit(Instr::Input {
+        self.emit(Instr::Input {
             path: path.to_vec(),
-        });
-        self.reads.insert(path.to_vec(), slot);
-        slot
+        })
     }
 
     /// An input or constant with no view as a slot: a `Unit` one, or a union read from the input.
@@ -541,66 +559,90 @@ impl Parser<'_> {
         }
     }
 
-    /// `a op b` for a binary operation. Two records compare field by field over the fields
-    /// [`compared_fields`] names, as `compare_records` compares the columns of two: `==` is the
-    /// conjunction of the fields' comparisons and `!=` their disjunction. A field whose compared
-    /// values hold only `unit` is equal at every row, so it drops out of either
-    /// ([`Parser::compares_only_units`]). A record against anything but a record, two records whose
-    /// shared fields all hold only `unit`, and any other operation on a record have no program.
+    /// `a op b` for a binary operation. `==` and `!=` read as [`Parser::comparison`] reads them. A
+    /// comparison decided while parsing computes no column, so it has no program here.
     fn operation(&mut self, op: InterpreterBinOp, a: &Val, b: &Val) -> Option<(Slot, Extent)> {
         let InterpreterBinOp::Compare(kind @ (CompareKind::Equals | CompareKind::NotEquals)) = op
         else {
             let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
             return Some((self.emit(Instr::Bin(op, a, b)), binop_output_extent(&op)));
         };
-        match (Self::fields_of(a), Self::fields_of(b)) {
-            (None, None) => {
-                let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
-                Some((self.emit(Instr::Bin(op, a, b)), binop_output_extent(&op)))
-            }
-            (Some(left), Some(right)) => {
-                let join = InterpreterBinOp::BoolLogic(if kind == CompareKind::Equals {
-                    LogicKind::And
-                } else {
-                    LogicKind::Or
-                });
-                // In name order, so that equal chains give equal programs.
-                let mut fields: Vec<_> = compared_fields(&left, &right)
-                    .filter(|(_, l, r)| !Self::compares_only_units(l, r))
-                    .collect();
-                fields.sort_by_key(|(name, ..)| *name);
-                let mut joined: Option<Slot> = None;
-                for (_, l, r) in fields {
-                    let (slot, _) = self.operation(op, l, r)?;
-                    joined = Some(match joined {
-                        None => slot,
-                        Some(prev) => self.emit(Instr::Bin(join, prev, slot)),
-                    });
-                }
-                Some((joined?, binop_output_extent(&join)))
-            }
-            _ => None,
+        match self.comparison(kind, a, b)? {
+            Comparison::Computed(slot) => Some((slot, binop_output_extent(&op))),
+            Comparison::Decided(_) => None,
         }
     }
 
-    /// Whether a comparison of `l` and `r` reads only `unit`, so the two are equal at every row, as
-    /// `apply_binop_into` compares two `Units` columns. Both are of type `Unit`, or both are
-    /// records sharing at least one field, and every shared field compares only `unit`. Two
-    /// records sharing no field have no column to compare (`compare_records` reads none).
-    fn compares_only_units(l: &Val, r: &Val) -> bool {
+    /// `a == b` or `a != b`, as `kind` names, by the rules `apply_binop_into` evaluates it by:
+    ///
+    /// - Two `unit` values are equal at every row.
+    /// - Two variants of one tag compare their payloads, and two of different tags differ at every
+    ///   row.
+    /// - Two records compare field by field over the fields [`compared_fields`] names: `==` is the
+    ///   conjunction of the fields' comparisons and `!=` their disjunction. A field decided while
+    ///   parsing drops out of the join when its answer is the join's identity, `true` under `and`
+    ///   and `false` under `or`. Any other decided field decides the whole comparison.
+    ///
+    /// A record's fields are the ones its extent names, inside a variant's payload as at the top
+    /// level. A record against anything but a record, a variant against anything but a variant, a
+    /// union read from the input, and two records sharing no field have no program.
+    fn comparison(&mut self, kind: CompareKind, a: &Val, b: &Val) -> Option<Comparison> {
+        let equals = kind == CompareKind::Equals;
         let is_unit = |v: &Val| {
             matches!(
                 v,
                 Val::Read(_, Extent::Base(BaseType::Unit)) | Val::Const(Value::Unit, _)
             )
         };
-        match (Self::fields_of(l), Self::fields_of(r)) {
-            (Some(left), Some(right)) => {
-                let mut shared = compared_fields(&left, &right).peekable();
-                shared.peek().is_some() && shared.all(|(_, l, r)| Self::compares_only_units(l, r))
-            }
-            _ => is_unit(l) && is_unit(r),
+        if is_unit(a) && is_unit(b) {
+            return Some(Comparison::Decided(equals));
         }
+        if let (Val::Wrap(a_tag, a, _), Val::Wrap(b_tag, b, _)) = (a, b) {
+            if a_tag != b_tag {
+                return Some(Comparison::Decided(!equals));
+            }
+            return self.comparison(kind, a, b);
+        }
+        let (left, right) = match (Self::fields_of(a), Self::fields_of(b)) {
+            (None, None) => {
+                let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
+                let op = InterpreterBinOp::Compare(kind);
+                return Some(Comparison::Computed(self.emit(Instr::Bin(op, a, b))));
+            }
+            (Some(left), Some(right)) => (left, right),
+            _ => return None,
+        };
+        let join = InterpreterBinOp::BoolLogic(if equals {
+            LogicKind::And
+        } else {
+            LogicKind::Or
+        });
+        // In name order, so that equal chains give equal programs.
+        let mut fields: Vec<_> = compared_fields(&left, &right).collect();
+        if fields.is_empty() {
+            return None;
+        }
+        fields.sort_by_key(|(name, ..)| *name);
+        let start = self.instrs.len();
+        let mut joined: Option<Slot> = None;
+        for (_, l, r) in fields {
+            match self.comparison(kind, l, r)? {
+                Comparison::Decided(answer) if answer == equals => {}
+                Comparison::Decided(answer) => {
+                    // The answer reads no column the earlier fields computed, and no value outside
+                    // this comparison holds a slot emitted after `start`.
+                    self.truncate(start);
+                    return Some(Comparison::Decided(answer));
+                }
+                Comparison::Computed(slot) => {
+                    joined = Some(match joined {
+                        None => slot,
+                        Some(prev) => self.emit(Instr::Bin(join, prev, slot)),
+                    });
+                }
+            }
+        }
+        Some(joined.map_or(Comparison::Decided(equals), Comparison::Computed))
     }
 
     /// Extend an input field path. Projections of computed products are not recognized here;
@@ -707,14 +749,12 @@ impl Parser<'_> {
     /// does not require a scalar program.
     fn root_of(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
-            Val::Slot(slot, extent) => {
-                debug_assert_eq!(
-                    *slot as usize + 1,
-                    self.instrs.len(),
-                    "an element that yields a computed value emits its operation last"
-                );
+            // The program's result is its last instruction. A computed value equal to an earlier
+            // one is that earlier slot (`Parser::emit`), so a prefix ending at it has no result.
+            Val::Slot(slot, extent) if *slot as usize + 1 == self.instrs.len() => {
                 Some((*slot, extent.clone()))
             }
+            Val::Slot(..) => None,
             Val::Tuple(_) | Val::Record(_) | Val::Wrap(..) => self.output(v),
             Val::Read(..) | Val::Const(..) => None,
         }
@@ -805,7 +845,7 @@ pub fn fuse_prefix(
     let mut parser = Parser {
         extent_of,
         instrs: Vec::new(),
-        reads: HashMap::new(),
+        slots: HashMap::new(),
         ops: 0,
     };
     let mut cur = Val::Read(Vec::new(), input.clone());
@@ -1684,6 +1724,13 @@ mod tests {
             .with_ty(Type::fun(Type::Base(BaseType::Int), option_type()))
     }
 
+    /// ``(`some(n) ▷ const) : Int ⇒ {`none | `some{Int}}``.
+    fn some(n: i64) -> Expr {
+        let ctor = Expr::variant_ctor("some", Occurrence::mint(), Expr::lit(Lit::Int(n)));
+        Expr::apply(ctor, Expr::builtin(Builtin::Const))
+            .with_ty(Type::fun(Type::Base(BaseType::Int), option_type()))
+    }
+
     /// A wrap at the end of a chain yields a union column of one arm, numbered by input row
     /// across blocks: ``x + 1 ≫ variant_wrap(`some)`` over 2,500 rows.
     #[test]
@@ -1953,16 +2000,189 @@ mod tests {
         );
     }
 
-    /// No operation reads a variant, so the prefix ends before a comparison of two:
-    /// ``(variant_wrap(`some), `none(unit) ▷ const) ▷ zip ≫ eq`` fuses the `zip` alone.
+    /// Two variants of one tag compare their payloads, so the program builds no union:
+    /// ``(x + 1 ≫ variant_wrap(`some), `some(3) ▷ const) ▷ zip ≫ eq`` is `x + 1 == 3`.
     #[test]
-    fn an_operation_does_not_read_a_variant() {
-        let chain = vec![
-            zip(vec![wrap("some"), none()]),
-            binop(BinOpKind::Compare(CompareKind::Equals)),
-        ];
-        let fused = fuse_options(&chain, &int()).expect("the zip builds a product of variants");
-        assert_eq!(fused.consumed, 1);
+    fn variants_of_one_tag_compare_their_payloads() {
+        let some_plus_one = Expr::compose(vec![arith(ArithmeticKind::Add, 1), wrap("some")]);
+        for (kind, want) in [
+            (CompareKind::Equals, vec![false, true, false]),
+            (CompareKind::NotEquals, vec![true, false, true]),
+        ] {
+            let chain = vec![
+                zip(vec![some_plus_one.clone(), some(3)]),
+                binop(BinOpKind::Compare(kind)),
+            ];
+            let fused = fuse_options(&chain, &int()).expect("the payloads are compared");
+            assert_eq!(fused.consumed, 2);
+            assert!(
+                !fused.program.instrs.iter().any(Instr::is_constructor),
+                "no union is built: {}",
+                fused.program
+            );
+            assert_eq!(
+                bools(fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3]))),
+                want
+            );
+        }
+    }
+
+    /// Two variants of different tags differ at every row, so the comparison is decided while
+    /// parsing and has no program: the prefix ends at the `zip` before it, under `==` and `!=`,
+    /// alone or as a field that decides a record comparison. In the record, the deciding field `z`
+    /// is compared after the computed field `b`.
+    #[test]
+    fn variants_of_different_tags_decide_the_comparison() {
+        let bare = zip(vec![wrap("some"), none()]);
+        let in_records = zip(vec![
+            zip_record(vec![("b", id()), ("z", wrap("some"))]),
+            zip_record(vec![("b", constant(2)), ("z", none())]),
+        ]);
+        for product in [bare, in_records] {
+            for kind in [CompareKind::Equals, CompareKind::NotEquals] {
+                let chain = vec![product.clone(), binop(BinOpKind::Compare(kind))];
+                let fused = fuse_options(&chain, &int()).expect("the zip builds the product");
+                assert_eq!(fused.consumed, 1, "{kind:?}");
+            }
+        }
+    }
+
+    /// A field decided as the join's identity drops out, `true` under `==` and `false` under `!=`:
+    /// ``(a: `none(unit), b: x + 1) == (a: `none(unit), b: 3)`` compares `b` alone, since two
+    /// `unit` payloads are equal at every row.
+    #[test]
+    fn a_field_decided_as_the_identity_drops_out() {
+        for (kind, want) in [
+            (CompareKind::Equals, vec![false, true, false]),
+            (CompareKind::NotEquals, vec![true, false, true]),
+        ] {
+            let chain = vec![
+                zip(vec![
+                    zip_record(vec![("a", none()), ("b", arith(ArithmeticKind::Add, 1))]),
+                    zip_record(vec![("a", none()), ("b", constant(3))]),
+                ]),
+                binop(BinOpKind::Compare(kind)),
+            ];
+            let fused = fuse_options(&chain, &int()).expect("`b` is compared");
+            assert_eq!(fused.consumed, 2, "{kind:?}");
+            let got = bools(fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3])));
+            assert_eq!(got, want, "{kind:?}");
+        }
+    }
+
+    /// A comparison recurses through nested variants and into a record payload: ``x ≫
+    /// variant_wrap(`inner) ≫ variant_wrap(`outer)`` against `` `outer(`inner(3)) `` is `x == 3`,
+    /// against `` `outer(`other(unit)) `` it is decided, and ``(a: x + 1, b: x) ≫
+    /// variant_wrap(`r)`` against `` `r((a: 3, b: 2)) `` compares both fields.
+    #[test]
+    fn a_comparison_recurses_through_variant_payloads() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let inner_ty = Type::variant(vec![
+            (tag("inner"), int_ty()),
+            (tag("other"), Type::Base(BaseType::Unit)),
+        ]);
+        let outer_ty = Type::variant(vec![(tag("outer"), inner_ty.clone())]);
+        let inner = Extent::Union(TagMap::from_arms(vec![
+            (tag("inner"), int()),
+            (tag("other"), Extent::Base(BaseType::Unit)),
+        ]));
+        let outer = Extent::Union(TagMap::from_arms(vec![(tag("outer"), inner.clone())]));
+        let types = [(inner_ty.clone(), inner), (outer_ty.clone(), outer)];
+        let nested = Expr::compose(vec![
+            wrap_into("inner", int_ty(), inner_ty.clone()),
+            wrap_into("outer", inner_ty, outer_ty.clone()),
+        ]);
+        let outer_of = |name: &str, payload: Expr| {
+            let inner = Expr::variant_ctor(name, Occurrence::mint(), payload);
+            let outer = Expr::variant_ctor("outer", Occurrence::mint(), inner);
+            Expr::apply(outer, Expr::builtin(Builtin::Const))
+                .with_ty(Type::fun(int_ty(), outer_ty.clone()))
+        };
+        let eq = || binop(BinOpKind::Compare(CompareKind::Equals));
+        let three = outer_of("inner", Expr::lit(Lit::Int(3)));
+        let computed = vec![zip(vec![nested.clone(), three]), eq()];
+        let fused = fuse_typed(&computed, &int(), &types).expect("the payloads are compared");
+        assert_eq!(fused.consumed, 2);
+        assert_eq!(
+            bools(fused.program.eval(&ColumnValue::Ints(vec![2, 3, 4]))),
+            vec![false, true, false]
+        );
+        let other = outer_of("other", Expr::lit(Lit::Unit));
+        let decided = vec![zip(vec![nested, other]), eq()];
+        let consumed = fuse_typed(&decided, &int(), &types).map(|fused| fused.consumed);
+        assert_eq!(consumed, Some(1), "the inner tags differ");
+
+        let pair_ty = Type::Record(vec![("a".into(), int_ty()), ("b".into(), int_ty())]);
+        let r_ty = Type::variant(vec![(tag("r"), pair_ty.clone())]);
+        let pair = record_of_extents(vec![("a", int()), ("b", int())]);
+        let r = Extent::Union(TagMap::from_arms(vec![(tag("r"), pair)]));
+        let product = Expr::compose(vec![
+            zip_record(vec![("a", arith(ArithmeticKind::Add, 1)), ("b", id())]),
+            wrap_into("r", pair_ty, r_ty.clone()),
+        ]);
+        let entry =
+            |name: &str, n: i64| RecordEntry::new(name, Occurrence::mint(), Expr::lit(Lit::Int(n)));
+        let literal = Expr::new(TypedExprNode::Record(vec![entry("a", 3), entry("b", 2)]));
+        let constant = Expr::apply(
+            Expr::variant_ctor("r", Occurrence::mint(), literal),
+            Expr::builtin(Builtin::Const),
+        )
+        .with_ty(Type::fun(int_ty(), r_ty.clone()));
+        let chain = vec![zip(vec![product, constant]), eq()];
+        let fused = fuse_typed(&chain, &int(), &[(r_ty, r)]).expect("both fields are compared");
+        assert!(
+            !fused.program.instrs.iter().any(Instr::is_constructor),
+            "no record or union is built: {}",
+            fused.program
+        );
+        assert_eq!(
+            bools(fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3]))),
+            vec![false, true, false]
+        );
+    }
+
+    /// An operation written twice is computed once: `(x + 1, x + 1)`, written as two arms, computes
+    /// `x + 1` once and holds the constant `1` once.
+    #[test]
+    fn equal_computations_share_a_slot() {
+        let chain = vec![zip(vec![
+            arith(ArithmeticKind::Add, 1),
+            arith(ArithmeticKind::Add, 1),
+        ])];
+        let fused = fuse(&chain, &int()).expect("a product of two operations");
+        assert_eq!(
+            fused.program.to_string(),
+            "s0 = _; s1 = 1; s2 = +(s0, s1); s3 = (_0: s2, _1: s2); => s3"
+        );
+        let out = fused.program.eval(&ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![2, 3]));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![2, 3]));
+    }
+
+    /// A program's result is its last instruction, so a computed value that shares an earlier
+    /// slot is no result.
+    #[test]
+    fn a_computed_value_in_an_earlier_slot_is_no_result() {
+        let no_types = |ty: &Type| panic!("no type is read, read {ty}");
+        let mut parser = Parser {
+            extent_of: &no_types,
+            instrs: Vec::new(),
+            slots: HashMap::new(),
+            ops: 0,
+        };
+        let x = parser.emit(Instr::Input { path: Vec::new() });
+        let one = parser.emit(Instr::Const(Value::Int(1)));
+        let add = InterpreterBinOp::from(BinOpKind::Arithmetic(ArithmeticKind::Add));
+        let sum = parser.emit(Instr::Bin(add, x, one));
+        assert!(parser.root_of(&Val::Slot(sum, int())).is_some());
+        assert_eq!(
+            parser.emit(Instr::Bin(add, x, one)),
+            sum,
+            "an equal operation shares"
+        );
+        let negated = parser.emit(Instr::Un(UnaryOpKind::Neg, sum));
+        assert!(parser.root_of(&Val::Slot(sum, int())).is_none());
+        assert!(parser.root_of(&Val::Slot(negated, int())).is_some());
     }
 
     /// A computed value that two fields and an operation read is one slot, computed once and copied

@@ -688,29 +688,33 @@ boundary and is rejected.
 ### Element-wise chains
 
 `operator_conversion::fusable_prefix` reads each `Compose` chain at every position where an input
-operator exists. It takes the longest prefix that is a function of the input column built from
-`id`, projections, closed constants (a literal, or a tuple, record or variant of them), binary and
-unary scalar builtins, `variant_wrap`, and `zip`s of such chains, and converts it to
-`MapResult(input, Constant(FunctionDef::Scalar(program)))` (`interpreter/scalar_expr.rs`,
-`fuse_prefix`). The program is a straight-line sequence of instructions over slots, so a value that
-two operations read is computed once, and a field path is read from the input as one slice. The
-arms of a `zip` in the prefix read the same input, so the fused chain has no `Memo`, `FanOut`, `Zip`
-or intermediate pair. A prefix is taken only when it holds at least two operations: `id` and a
-composition count as none, a `zip` as two, and every other element as one. A `zip` alone meets the
-count, so `(x, x)` and the one-field `(a=x)` fuse. A lone unary operation keeps its own conversion,
-since it is one operator either way. A comparison of two records, `==` or `!=`, is read as one
-comparison per field both records carry, joined by `and` or `or`. A field whose compared values
-hold only `unit` is equal at every row, so it is left out. Each record is read from the input, a
-constant, or built by a `zip` in the prefix. A record against a non-record, two records whose
-shared fields all hold only `unit`, and an ordering of records have no program, and the prefix
-ends before them.
+operator exists. It takes the longest prefix that is a function of the input column built from `id`,
+projections, closed constants (a literal, or a tuple, record or variant of them), binary and unary
+scalar builtins, `variant_wrap`, and `zip`s of such chains, and converts it to `MapResult(input,
+Constant(FunctionDef::Scalar(program)))` (`interpreter/scalar_expr.rs`, `fuse_prefix`). The program
+is a straight-line sequence of instructions over slots. Equal instructions share a slot, so a value
+is computed once however many times the chain expresses it, and a field path is read from the input
+as one slice. The arms of a `zip` in the prefix read the same input, so the fused chain has no
+`Memo`, `FanOut`, `Zip` or intermediate pair. A prefix is taken only when it holds at least two
+operations: `id` and a composition count as none, a `zip` as two, and every other element as one. A
+`zip` alone meets the count, so `(x, x)` and the one-field `(a=x)` fuse. A lone unary operation
+keeps its own conversion, since it is one operator either way. A comparison of two records, `==` or
+`!=`, is read as one comparison per field both records carry, joined by `and` or `or`. Each record
+is read from the input, a constant, or built by a `zip` in the prefix. Two variants built in the
+prefix or held as constants compare their payloads when their tags agree, so the program builds no
+union. Two variants of different tags differ at every row, and two `unit` values are equal at every
+row, so those comparisons are decided while parsing. A decided field that cannot change the join is
+left out, and one that can decides the whole comparison. A comparison decided as a whole, a record
+against a non-record, a union read from the input, and an ordering of records or of variants have no
+program, and the prefix ends before them.
 
 A ``variant_wrap(`𝑐)`` or a variant constant yields a union column with the one arm `𝑐`, which
 holds every row. An absent arm reads as an empty one, so the program builds no other arm. A union
 with an arm that holds a collection is a union of tiles, not a column, so its wrap and its
 constants stay operators. The union's extent comes from the node's codomain
 (`OpConversionContext::extent_of`), since the payload names only its own arm. No operation reads a
-variant, so the prefix ends before a comparison of two variants or a `variant_project`.
+union column, so the prefix ends before a `variant_project`, a `variant_is`, or a comparison that
+reads a union from the input.
 
 The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
 a store read, or a constant that is not closed stays an operator. Conversion also declines when

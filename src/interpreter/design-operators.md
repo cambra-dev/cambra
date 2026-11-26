@@ -1277,17 +1277,29 @@ slot 𝑖, and operands refer only to earlier slots. The last instruction produc
 `Bool`, never a constructor or a `Unit` or union column (`ScalarProgram::operands_have_views`). A
 constructor is the last instruction or a field or payload of a later constructor, so constructors
 build only the result (`ScalarProgram::constructors_build_only_the_result`). A variant constant is
-recognized as the `Wrap` of its payload. Record equality and inequality are expanded during
-recognition: `Parser::operation` recursively compares the fields selected by
-`binop::compared_fields`, joining results with `and` for `==` or `or` for `!=`. A field whose
-compared values hold only `unit` is left out, since it is equal at every row. Operands may be input
-records, constants, or products constructed by `zip`.
+recognized as the `Wrap` of its payload.
 
-Repeated reads of an input field path share one `Input` instruction. References to an already
-computed value reuse its slot, including when several `zip` arms read it. The parser does not merge
-independently expressed equal computations. Failed recognition and output probes discard their
-temporary instructions; field-name sorting makes record instruction order deterministic.
-`ScalarProgram` equality compares these instruction sequences, not semantic equivalence.
+`==` and `!=` are expanded during recognition (`Parser::comparison`). Two records compare the
+fields selected by `binop::compared_fields`, joining the results with `and` for `==` or `or` for
+`!=`. Two variants of one tag compare their payloads, so the program builds no union for them. A
+record inside a payload compares the fields its extent names, as one at the top level does.
+`binop::equal_rows`, which compares two union columns unfused, compares whole values instead, so it
+also reads a field that width subtyping left in a column. Two `unit` values are
+equal at every row, and two variants of different tags differ at every row, so their comparison is
+decided while parsing. A decided field drops out of the join when its answer is the join's identity
+(`true` under `and`, `false` under `or`), and decides the whole comparison otherwise. A comparison
+decided as a whole computes no column, so it has no program. Operands may be input records,
+constants, or products and variants constructed in the chain. A union read from the input is
+compared by no program.
+
+Equal instructions share one slot: `Parser::emit` returns the slot of an equal `Input`, `Const`,
+`Bin` or `Un` emitted before, so a path read twice, a constant written twice, and an operation
+written twice on the same slots are each computed once. A constructor is always a new slot, since it
+is the last instruction or a field or payload of exactly one later constructor. The result is the
+last instruction, so a prefix whose computed value shares an earlier slot is not taken there. Failed
+recognition, output probes, and comparisons decided while parsing discard their temporary
+instructions; field-name sorting makes record instruction order deterministic. `ScalarProgram`
+equality compares these instruction sequences, not semantic equivalence.
 
 `fuse_prefix` accepts input projections, but a projection of a computed product ends recognition.
 Its eligible forms, operation-count threshold, and operator-conversion boundaries are specified in
@@ -1302,8 +1314,9 @@ payload's block, recursively for nested constructors. A `Wrap` numbers the block
 input positions (`UnionArm::extend_rows`). A `Unit` or union input has no view, so a constructor
 copies its block (`ColumnValue::slice`), and a `Unit` constant adds rows to a `Units` column.
 Output capacity for all input rows is reserved before evaluation, except in a union column, whose
-arms grow block by block. Intermediate columns hold at most one block each rather than one column per full input. An empty
-input still runs one zero-length block and produces a correctly typed empty output.
+arms grow block by block. Intermediate columns hold at most one block each rather than one column
+per full input. An empty input still runs one zero-length block and produces a correctly typed empty
+output.
 
 #### Column views
 
