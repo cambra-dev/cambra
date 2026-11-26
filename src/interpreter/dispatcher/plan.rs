@@ -3948,10 +3948,9 @@ mod tests {
         );
         run.writers[0].body.set_waiting(Some(waiting.clone()), None);
         assert!(run.settle(1, queued_at, false));
-        let dispatcher = Dispatcher::new(vec![vec![]], 1);
-        assert!(!run.writers[0].body.has_offers(&dispatcher));
+        assert!(!run.writers[0].body.offers.lock().unwrap().has_work());
         assert!(!run.settle(1, queued_at, true));
-        assert!(run.writers[0].body.has_offers(&dispatcher));
+        assert!(run.writers[0].body.offers.lock().unwrap().has_work());
         assert_eq!(run.writers[0].body.take_waited(), Some(waiting));
         assert!(
             !run.settle(0, queued_at, false),

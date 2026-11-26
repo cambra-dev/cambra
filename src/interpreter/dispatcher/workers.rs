@@ -113,7 +113,7 @@ pub(super) struct WorkerPool {
     busy: AtomicUsize,
     #[cfg(test)]
     stats: Vec<Stats>,
-    /// The test counters the worker threads counted: a transaction store's stale decisions
+    /// The test counters the worker threads counted: a transaction driver's reissued attempts
     /// (`RETRIES`) and its stalled requests (`STALLS`). The coordinator adds them to its own
     /// ([`hand_over_counters`](Self::hand_over_counters)), so a test that runs a program reads
     /// every thread's counts on its own thread.
