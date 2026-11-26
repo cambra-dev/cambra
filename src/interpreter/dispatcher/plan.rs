@@ -8,7 +8,9 @@ use std::sync::{PoisonError, RwLock};
 
 use smol_str::SmolStr;
 
-use super::loop_scope::{self, Body, LoopSchedule, Member, induction};
+use super::loop_scope::{self, Body, Member, induction};
+use super::scope::{Scope, ScopePipeline, ScopeSteps};
+#[cfg(test)]
 use super::transaction_scope::WriterPhase;
 use super::workers::{WorkerBreaker, WorkerPool, WorkerTarget};
 use super::*;
@@ -18,7 +20,6 @@ use crate::interpreter::sinks::ProducerSlot;
 use crate::interpreter::tile_operators::StoreCell;
 use crate::interpreter::tiling::Tile;
 use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent};
-use std::cell::RefCell;
 
 /// Run `program`'s pipelines through a dispatcher of `morsel_rows` on the calling thread.
 /// The breakers are the producers in the chains under its sinks' producers and its `main` output's that are pipeline
@@ -822,6 +823,8 @@ fn run_targets(
             let writer = transaction_scope::transaction(store).writer_of(InputId(*input));
             if let Some(writer) = writer {
                 execution.attach_transaction(store, writer, PipelineId(pipeline), &mut dispatcher);
+            } else {
+                execution.handlers[pipeline] = Handler::Seed(store.clone(), InputId(*input));
             }
         }
     }
@@ -863,6 +866,7 @@ fn run_targets(
             dispatcher.queue_for(*pipeline, guard);
         }
     }
+    let local_steps = execution.local_steps(&dispatcher, workers);
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
@@ -883,7 +887,7 @@ fn run_targets(
         .collect();
     // A push into a scope's pipeline offers the scope requests, which the coordinator queues after
     // the consume or the finish that pushed them (`Execution::consume`, `Execution::finish`), so
-    // a pipeline a scope's pipeline reads stays the coordinator's. A loop's drive source offers
+    // a serial chain read directly by a scope stays on the coordinator. A loop's drive source offers
     // through its entry instead (`CompletionTarget`), which no scope reads: a worker may run it,
     // and the coordinator's resume pass queues what it offered (`Scope::resume`).
     let mut read_by_scope = vec![false; execution.handlers.len()];
@@ -923,7 +927,13 @@ fn run_targets(
         })
         .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
-    let workers = WorkerPool::new(workers, worker_targets, execution.bodies_by_pipeline());
+    let workers = WorkerPool::new(
+        workers,
+        worker_targets,
+        execution.bodies_by_pipeline(),
+        execution.scope_pipelines(),
+        local_steps,
+    );
     for pipeline in workers.serial() {
         dispatcher.order(pipeline);
     }
@@ -1054,269 +1064,19 @@ impl Drop for ScopeRuns {
 // no handle to itself through its handlers.
 enum Handler {
     Root,
+    Seed(StoreCell, InputId),
     Body(BreakerHandle),
     /// A scope's own pipeline, whose claims are the scope's requests.
-    Request(Box<Scope>),
+    Request(Arc<Scope>),
     /// A scope's step, whose claim ends a round or an attempt.
     Step(PipelineId),
 }
 
-/// A scope whose inner pipelines run on the run's shared dispatcher, between its request and
-/// step handlers.
-pub(super) enum Scope {
-    /// A loop: the store's rounds.
-    Loop(StoreCell, RefCell<LoopSchedule>),
-    /// One writer of a transaction store: its attempts.
-    Writer {
-        store: StoreCell,
-        writer: usize,
-        // shared-state-ok: the writer's attempt lifecycle. Only the coordinator reads or advances
-        // it, through `Execution::consume` and `Execution::finish`. It holds a work package and a
-        // guard of the writer's input, never a tile.
-        phase: RefCell<WriterPhase>,
-    },
-}
-
-impl Scope {
-    fn reach(&self, call: &mut Call<'_>) {
-        match self {
-            Scope::Loop(store, _) => call(&mut *induction(store), InputId::ONLY),
-            Scope::Writer { store, writer, .. } => {
-                let mut producer = transaction_scope::transaction(store);
-                let input = producer.writer_input(*writer);
-                call(&mut *producer, input);
-            }
-        }
-    }
-
-    /// Call `f` with the scope's inner pipelines.
-    fn with_body<R>(&self, f: impl FnOnce(&mut Body) -> R) -> R {
-        match self {
-            Scope::Loop(store, _) => f(induction(store).body_mut()),
-            Scope::Writer { store, writer, .. } => f(&mut transaction_scope::transaction(store)
-                .writer_run_mut(*writer)
-                .body),
-        }
-    }
-
-    /// Whether a request is open, whose claim is in flight until it completes.
-    fn has_request(&self) -> bool {
-        match self {
-            Scope::Loop(_, schedule) => schedule.borrow().has_request(),
-            Scope::Writer { phase, .. } => phase.borrow().has_request(),
-        }
-    }
-
-    fn hold_followers(&self, dispatcher: &Dispatcher) {
-        if let Scope::Writer { phase, .. } = self
-            && !phase.borrow().open()
-        {
-            return;
-        }
-        self.with_body(|body| body.hold_followers(dispatcher));
-    }
-
-    /// Land and acknowledge a request the scope has completed.
-    fn complete(&self, dispatcher: &Dispatcher, package: Option<WorkPackage>) {
-        let Some(package) = package else { return };
-        let mut pushes = dispatcher.pushes(package.pipeline);
-        match self {
-            Scope::Loop(store, _) => {
-                let store = induction(store);
-                if store.pushes_while_consuming() {
-                    pushes.push_final(&*store);
-                }
-            }
-            Scope::Writer { store, .. } => {
-                pushes.push_final(&*transaction_scope::transaction(store));
-            }
-        }
-        dispatcher.land(pushes);
-        dispatcher.acknowledge(package);
-    }
-
-    /// Open the request `package`, a claim of the scope's own pipeline.
-    fn begin(&self, dispatcher: &Dispatcher, package: WorkPackage) {
-        // Each store guard is a temporary of its `let`, released before the work is queued.
-        match self {
-            Scope::Loop(store, schedule) => {
-                let (completed, work) =
-                    induction(store).begin_shared(&mut schedule.borrow_mut(), dispatcher, package);
-                work.queue(dispatcher);
-                self.complete(dispatcher, completed);
-            }
-            Scope::Writer {
-                store,
-                writer,
-                phase,
-            } => {
-                let work = transaction_scope::transaction(store).begin_request(
-                    &mut phase.borrow_mut(),
-                    dispatcher,
-                    *writer,
-                    package,
-                );
-                work.queue(dispatcher);
-            }
-        }
-    }
-
-    /// End the round or attempt whose step claimed `package`, and start the next or complete
-    /// the request.
-    fn step(&self, dispatcher: &Dispatcher, package: WorkPackage) {
-        let (completed, work) = match self {
-            Scope::Loop(store, schedule) => {
-                let (request, outcome) =
-                    induction(store).complete_round(&mut schedule.borrow_mut());
-                dispatcher.acknowledge(package);
-                induction(store).queue_package_round(
-                    &mut schedule.borrow_mut(),
-                    dispatcher,
-                    request,
-                    outcome,
-                )
-            }
-            Scope::Writer {
-                store,
-                writer,
-                phase,
-            } => {
-                dispatcher.acknowledge(package);
-                transaction_scope::transaction(store).finish_request(
-                    &mut phase.borrow_mut(),
-                    dispatcher,
-                    *writer,
-                )
-            }
-        };
-        // Each store guard above is a temporary of its arm's tail expression, which edition 2024
-        // drops at the end of the arm, so the store is released before the round is queued.
-        work.queue(dispatcher);
-        self.complete(dispatcher, completed);
-    }
-
-    fn begin_finish(&self, dispatcher: &Dispatcher) {
-        match self {
-            Scope::Loop(store, schedule) => {
-                induction(store).begin_shared_finish(&mut schedule.borrow_mut(), dispatcher)
-            }
-            Scope::Writer {
-                store,
-                writer,
-                phase,
-            } => {
-                let work = transaction_scope::transaction(store).begin_transaction_finish(
-                    &mut phase.borrow_mut(),
-                    dispatcher,
-                    *writer,
-                );
-                work.queue(dispatcher);
-            }
-        }
-    }
-
-    /// Advance a scope the coordinator found waiting: finish its pipeline once the inner
-    /// pipelines have, or publish what they hold and let their followers run. Whether anything
-    /// changed.
-    fn resume(
-        &self,
-        dispatcher: &Dispatcher,
-        reach: &mut Reach<'_>,
-        execution: &Execution,
-    ) -> bool {
-        let mut progressed = false;
-        if let Scope::Loop(store, _) = self {
-            progressed |= induction(store).initialize_seed();
-        }
-        // A scope's requests reach the scope, which queues them once they can run.
-        if self.queue_requests(dispatcher) {
-            return true;
-        }
-        let finished = match self {
-            Scope::Loop(store, schedule) => {
-                let mut store = induction(store);
-                let body = store.body_mut();
-                let mut schedule = schedule.borrow_mut();
-                if schedule.close_step(body, dispatcher) {
-                    return true;
-                }
-                schedule.take_finish(body, dispatcher)
-            }
-            Scope::Writer {
-                store,
-                writer,
-                phase,
-            } => transaction_scope::transaction(store)
-                .writer_run_mut(*writer)
-                .take_finish(&mut phase.borrow_mut(), dispatcher),
-        };
-        if let Some(pipeline) = finished {
-            finish_with(dispatcher, reach, pipeline);
-            self.with_body(|body| body.unplace());
-            return true;
-        }
-        // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
-        // The body's hold is read first: a worker's claim of the body after it holds the
-        // followers again, so the release below fails rather than pass output this pass missed.
-        let (pipelines, hold) = match self {
-            Scope::Loop(store, schedule) => {
-                let store = induction(store);
-                (
-                    store.settlement_pipelines(&schedule.borrow(), |id| {
-                        execution.request_scope(id).has_request()
-                    }),
-                    store.followers_hold(dispatcher),
-                )
-            }
-            Scope::Writer { store, writer, .. } => {
-                let transaction = transaction_scope::transaction(store);
-                let run = transaction.writer_run(*writer);
-                (run.body.pipelines(), run.body.followers_hold(dispatcher))
-            }
-        };
-        let before = dispatcher.changes();
-        push_held(dispatcher, reach, pipelines);
-        // A change here is these pushes, or a worker's publication during the pass, which counts
-        // as progress too: the coordinator claims again and reaches the same fixed point.
-        if dispatcher.changes() != before {
-            return true;
-        }
-        let released = hold.is_some_and(|hold| match self {
-            Scope::Loop(store, schedule) => {
-                induction(store).release_followers(&schedule.borrow(), dispatcher, hold)
-            }
-            Scope::Writer { phase, .. } => {
-                phase.borrow().open()
-                    && self.with_body(|body| body.release_followers(dispatcher, hold))
-            }
-        });
-        progressed | released
-    }
-
-    /// Queue the requests offered to the scope where they can run: a loop's at once, a writer's
-    /// once its store is open. Whether it queued or closed anything.
-    fn queue_requests(&self, dispatcher: &Dispatcher) -> bool {
-        match self {
-            Scope::Loop(..) => self.with_body(|body| body.queue_offered(dispatcher, true)),
-            Scope::Writer { store, writer, .. } => {
-                transaction_scope::transaction(store).queue_requests(dispatcher, *writer)
-            }
-        }
-    }
-
-    /// Queue the step of the open round or attempt where its work has run
-    /// ([`Body::queue_step`]). Whether it queued it.
-    pub(super) fn queue_step(&self, dispatcher: &Dispatcher) -> bool {
-        let queue = |guard: &TileGuard| self.with_body(|body| body.queue_step(dispatcher, guard));
-        match self {
-            Scope::Loop(_, schedule) => schedule.borrow().step_guard().is_some_and(queue),
-            Scope::Writer { phase, .. } => phase.borrow().step_guard().is_some_and(queue),
-        }
-    }
-}
-
 pub(super) struct Execution {
     handlers: Vec<Handler>,
+    /// Handler at which the coordinator resumes its search for the next settled scope.
+    // shared-state-ok: only the coordinator rotates its search through eligible scopes.
+    step_cursor: Cell<usize>,
     roots: usize,
     /// Each scope's inner pipelines, its step, its own pipeline and its body's follower hold, as
     /// attached.
@@ -1332,6 +1092,7 @@ impl Execution {
         let mut execution = Self {
             handlers: (0..scopes.len()).map(|_| Handler::Root).collect(),
             roots: scopes.len(),
+            step_cursor: Cell::new(0),
             bodies: Vec::new(),
             closes_on_reads: Vec::new(),
         };
@@ -1397,7 +1158,7 @@ impl Execution {
         });
         self.bodies
             .push((base..base + members.len(), step, pipeline, hold));
-        self.handlers[pipeline.0] = Handler::Request(Box::new(scope));
+        self.handlers[pipeline.0] = Handler::Request(Arc::new(scope));
         self.handlers.push(Handler::Step(pipeline));
         step
     }
@@ -1412,7 +1173,7 @@ impl Execution {
         let scope = Scope::Writer {
             store: store.clone(),
             writer,
-            phase: RefCell::default(),
+            phase: Mutex::default(),
         };
         let step = self.attach_body(scope, request, dispatcher);
         // An attempt's step is closed once the finish's attempt has run (`WriterRun::drain`).
@@ -1426,7 +1187,10 @@ impl Execution {
         pipeline: PipelineId,
     ) {
         let step = self.attach_body(
-            Scope::Loop(store.clone(), RefCell::default()),
+            Scope::Loop {
+                store: store.clone(),
+                schedule: Mutex::default(),
+            },
             pipeline,
             dispatcher,
         );
@@ -1447,7 +1211,7 @@ impl Execution {
 
     pub(super) fn reach(&self, pipeline: PipelineId, root: &mut Reach<'_>, call: &mut Call<'_>) {
         match &self.handlers[pipeline.0] {
-            Handler::Root => root(pipeline, call),
+            Handler::Root | Handler::Seed(..) => root(pipeline, call),
             Handler::Body(handle) => call(
                 &mut *handle.write().unwrap_or_else(PoisonError::into_inner),
                 InputId::ONLY,
@@ -1502,6 +1266,36 @@ impl Execution {
             .collect()
     }
 
+    fn local_steps(&self, dispatcher: &Dispatcher, workers: usize) -> ScopeSteps {
+        if workers < 2 {
+            return ScopeSteps::default();
+        }
+        ScopeSteps::plan(
+            dispatcher,
+            self.handlers.iter().filter_map(|handler| match handler {
+                Handler::Request(scope) => Some(scope.clone()),
+                _ => None,
+            }),
+        )
+    }
+
+    fn scope_pipelines(&self) -> Vec<Option<ScopePipeline>> {
+        self.handlers
+            .iter()
+            .map(|handler| match handler {
+                Handler::Request(scope) => Some(ScopePipeline::Request(scope.clone())),
+                Handler::Step(id) => {
+                    let Handler::Request(scope) = &self.handlers[id.0] else {
+                        unreachable!("a scope owner")
+                    };
+                    Some(ScopePipeline::Step(scope.clone()))
+                }
+                Handler::Seed(store, input) => Some(ScopePipeline::Seed(store.clone(), *input)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every scope, each at its request handler.
     fn scopes(&self) -> impl Iterator<Item = &Scope> {
         self.handlers.iter().filter_map(|handler| match handler {
@@ -1511,8 +1305,9 @@ impl Execution {
     }
 
     fn hold_followers(&self, dispatcher: &Dispatcher) {
-        for scope in self.scopes() {
-            scope.hold_followers(dispatcher);
+        for &(_, _, request, hold) in &self.bodies {
+            self.request_scope(request)
+                .hold_followers(dispatcher, request, hold);
         }
     }
 
@@ -1525,7 +1320,7 @@ impl Execution {
         match &self.handlers[package.pipeline.0] {
             Handler::Request(scope) => scope.begin(dispatcher, package),
             Handler::Step(id) => self.request_scope(*id).step(dispatcher, package),
-            Handler::Root | Handler::Body(_) => {
+            Handler::Root | Handler::Body(_) | Handler::Seed(..) => {
                 consume_with(dispatcher, reach, package);
                 self.queue_scope_requests(dispatcher);
             }
@@ -1539,7 +1334,7 @@ impl Execution {
     fn queue_scope_requests(&self, dispatcher: &Dispatcher) {
         for handler in &self.handlers {
             if let Handler::Request(scope) = handler {
-                scope.queue_requests(dispatcher);
+                scope.try_queue_requests(dispatcher, false);
             }
         }
     }
@@ -1553,7 +1348,7 @@ impl Execution {
         match &self.handlers[pipeline.0] {
             Handler::Request(scope) => scope.begin_finish(dispatcher),
             Handler::Step(_) => dispatcher.finish(dispatcher.pushes(pipeline)),
-            Handler::Root | Handler::Body(_) => {
+            Handler::Root | Handler::Body(_) | Handler::Seed(..) => {
                 self.queue_scope_requests(dispatcher);
                 finish_with(dispatcher, reach, pipeline);
                 for &reader in &dispatcher.infos[pipeline.0].readers {
@@ -1579,14 +1374,14 @@ impl Execution {
             .into_iter()
             .map(|(pipeline, claim)| {
                 let kind = match &self.handlers[pipeline] {
-                    Handler::Root => "a pipeline of the program",
+                    Handler::Root | Handler::Seed(..) => "a pipeline of the program",
                     Handler::Body(_) => "a loop body",
                     Handler::Request(scope) => match scope.as_ref() {
-                        Scope::Loop(..) => "a loop's store",
+                        Scope::Loop { .. } => "a loop's store",
                         Scope::Writer { .. } => "a transaction request",
                     },
                     Handler::Step(id) => match self.request_scope(*id) {
-                        Scope::Loop(..) => "a loop's step",
+                        Scope::Loop { .. } => "a loop's step",
                         Scope::Writer { .. } => "a transaction attempt",
                     },
                 };
@@ -1632,9 +1427,7 @@ impl Execution {
         {
             return false;
         }
-        let scope = self.request_scope(id);
-        scope.with_body(|body| body.close_offers());
-        scope.queue_requests(dispatcher)
+        self.request_scope(id).try_queue_requests(dispatcher, true)
     }
 
     /// Close the scope's pipeline `pipeline` once its scope has queued every request offered to
@@ -1650,12 +1443,27 @@ impl Execution {
     pub(super) fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
         let mut progressed = self.close_scopes_reading(dispatcher);
         for scope in self.scopes() {
-            progressed |= scope.resume(dispatcher, reach, self);
+            progressed |=
+                scope.resume(dispatcher, reach, |id| self.request_scope(id).has_request());
         }
-        // A step runs on what its round settled, and one scope's step can bring another scope's
-        // body work, as a writer's commit does for a writer that reads the store: so a pass with
-        // nothing else to do queues one step, and the next pass reads the bodies again.
-        progressed || self.scopes().any(|scope| scope.queue_step(dispatcher))
+        progressed
+            || self.queue_one_step(|index| match &self.handlers[index] {
+                Handler::Request(scope) => scope.queue_step(dispatcher),
+                _ => false,
+            })
+    }
+
+    /// Queue at most one step per settlement pass. Start after the previous winner so a writer
+    /// retrying at the beginning of the handler table gives an already eligible peer a turn.
+    fn queue_one_step(&self, mut queue: impl FnMut(usize) -> bool) -> bool {
+        let start = self.step_cursor.get();
+        for index in (start..self.handlers.len()).chain(0..start) {
+            if queue(index) {
+                self.step_cursor.set(index + 1);
+                return true;
+            }
+        }
+        false
     }
 
     fn push_held(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
@@ -1704,18 +1512,27 @@ impl Execution {
         workers: &WorkerPool,
     ) -> Claimed {
         loop {
-            match workers.next(dispatcher) {
-                Next::Package(package) if workers.admits(package.pipeline) => {
-                    workers.consume_on_coordinator(dispatcher, package)
+            let (next, mut reserved) = workers.next(dispatcher, None, &|_| true, &|_| true, &|| {});
+            let mut claim_reach = |id: PipelineId, call: &mut Call<'_>| {
+                if let Some(seed) = reserved.take() {
+                    seed.reach(call);
+                } else {
+                    reach(id, call);
                 }
-                Next::Package(package) => self.consume(dispatcher, reach, package),
+            };
+            match next {
+                Next::Package(package) if workers.admits(package.pipeline) => {
+                    workers.consume_on_coordinator(dispatcher, package, &mut claim_reach)
+                }
+                Next::Package(package) => self.consume(dispatcher, &mut claim_reach, package),
                 Next::Finish { pipeline } if workers.finishes(pipeline) => {
-                    workers.finish_on_coordinator(dispatcher, pipeline)
+                    workers.finish_on_coordinator(dispatcher, pipeline, &mut claim_reach)
                 }
                 Next::Finish { pipeline } => {
-                    workers.finishing(pipeline, reach);
-                    self.finish(dispatcher, reach, pipeline)
+                    workers.finishing(pipeline, &mut claim_reach);
+                    self.finish(dispatcher, &mut claim_reach, pipeline)
                 }
+                Next::Wait(_) if workers.poll(dispatcher) => {}
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {
                     dispatcher.wait(generation)
                 }
@@ -3869,6 +3686,8 @@ fn drive_live(
         }
         #[cfg(debug_assertions)]
         execution.assert_nothing_in_flight(dispatcher);
+        #[cfg(test)]
+        workers.hand_over_counters();
         if observer.drained(changed).is_break() {
             return false;
         }
@@ -3878,6 +3697,23 @@ fn drive_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_continuously_ready_scope_yields_to_another_ready_step() {
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![]], usize::MAX);
+        let execution = Execution::new(&[None, None, None], &mut dispatcher);
+        let mut steps = Vec::new();
+        for _ in 0..4 {
+            assert!(execution.queue_one_step(|index| {
+                if index == 1 {
+                    return false;
+                }
+                steps.push(index);
+                true
+            }));
+        }
+        assert_eq!(steps, [0, 2, 0, 2]);
+    }
 
     /// A record range over a source field yields a prefix where that field's yield is every
     /// position at or below one, whatever its other fields hold.
@@ -3919,10 +3755,9 @@ mod tests {
         assert!(yields_a_prefix(&path, &yielded(Predicate::True)));
     }
 
-    fn two_writer_run() -> transaction_scope::TransactionRun {
+    fn two_writer_fan() -> Arc<crate::interpreter::tile_operators::FanOut> {
         use crate::ccl::context::{GlobalContext, compile_program};
         use crate::ccl::load::LoadedProgram;
-        use crate::interpreter::tile_operators::StoreRead;
 
         let source = indoc::indoc! {"
             out = test_sink()
@@ -3940,30 +3775,243 @@ mod tests {
         let _program =
             compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
         let operators = ctx.take_operator_map();
-        let fan = operators
+        operators
             .operators()
             .into_iter()
             .find(|fan| fan.cached_tile().is_some())
-            .unwrap();
+            .unwrap()
+    }
+
+    fn two_writer_run() -> (StoreCell, transaction_scope::TransactionRun) {
+        use crate::interpreter::tile_operators::StoreRead;
+        let fan = two_writer_fan();
         let mut planner = Planner::default();
         planner.store_pipeline(StoreRead {
             fan: fan.id(),
             store: fan.store().unwrap(),
         });
         let mut runs = ScopeRuns::new();
-        transaction_scope::TransactionRun {
+        let run = transaction_scope::TransactionRun {
             writers: (0..2)
                 .map(|i| planner.build_transaction(i, 1, &mut runs))
                 .collect(),
             progress: 0,
+        };
+        (fan.store().unwrap(), run)
+    }
+
+    #[test]
+    fn a_worker_skips_a_busy_seed_and_reserves_it_for_each_claim() {
+        let store = two_writer_fan().store().unwrap();
+        let peer_store = two_writer_fan().store().unwrap();
+        let dispatcher = Dispatcher::new(vec![vec![], vec![]], 1);
+        let workers = WorkerPool::new(
+            2,
+            vec![None, None],
+            vec![None; 2],
+            vec![
+                Some(ScopePipeline::Seed(store.clone(), InputId::ONLY)),
+                Some(ScopePipeline::Seed(peer_store, InputId::ONLY)),
+            ],
+            ScopeSteps::default(),
+        );
+        let seed = PipelineId(0);
+        let peer = PipelineId(1);
+        dispatcher.queue_for(
+            seed,
+            &transaction_scope::transaction(&store)
+                .input_tiling(InputId::ONLY)
+                .universal_guard(),
+        );
+        dispatcher.close(seed);
+        dispatcher.close(peer);
+
+        let next = || {
+            workers.next(
+                &dispatcher,
+                None,
+                &|p| workers.admits(p),
+                &|p| workers.finishes(p),
+                &|| {},
+            )
+        };
+        let transition = store.write();
+        let (Next::Finish { pipeline }, Some(peer_claim)) = next() else {
+            panic!("a busy seed package leaves the peer finish claimable");
+        };
+        assert_eq!(pipeline, peer);
+        drop(peer_claim);
+        dispatcher.finish(dispatcher.pushes(peer));
+        drop(transition);
+
+        let (Next::Package(package), Some(claim)) = next() else {
+            panic!("the seed package becomes eligible")
+        };
+        assert_eq!(package.pipeline, seed);
+        assert!(store.try_write().is_err());
+        drop(claim);
+        dispatcher.acknowledge(package);
+
+        let transition = store.write();
+        assert!(
+            matches!(next(), (Next::Wait(_), None)),
+            "a busy seed finish stays in the dispatcher"
+        );
+        drop(transition);
+        let (Next::Finish { pipeline }, Some(_claim)) = next() else {
+            panic!("the seed finish becomes eligible");
+        };
+        assert_eq!(pipeline, seed);
+        assert!(store.try_write().is_err());
+    }
+
+    #[test]
+    fn a_background_worker_consumes_and_finishes_a_seed_without_coordinator_claims() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let fan = two_writer_fan();
+        let store = fan.store().unwrap();
+        let input = InputId::ONLY;
+        let guard = {
+            let mut txn = transaction_scope::transaction(&store);
+            assert!(txn.writer_of(input).is_none());
+            txn.begin_run();
+            txn.input_tiling(input).universal_guard()
+        };
+        let dispatcher = Dispatcher::new(vec![vec![]], 1);
+        let seed = PipelineId(0);
+        let workers = WorkerPool::new(
+            2,
+            vec![None],
+            vec![None],
+            vec![Some(ScopePipeline::Seed(store.clone(), input))],
+            ScopeSteps::default(),
+        );
+        dispatcher.queue_for(seed, &guard);
+        dispatcher.close(seed);
+        thread::scope(|threads| {
+            let handles = workers.spawn(threads, &dispatcher);
+            let (done, result) = mpsc::channel();
+            threads.spawn(move || {
+                WorkerPool::join(handles);
+                let _ = done.send(());
+            });
+            let completed = result.recv_timeout(Duration::from_secs(5));
+            dispatcher.stop_claims();
+            completed.expect("the worker can consume the seed and finish its pipeline");
+        });
+        assert!(dispatcher.states[seed.0].phase.load() == Phase::Finished);
+        assert!(
+            transaction_scope::transaction(&store)
+                .input_released(input)
+                .is_universal()
+        );
+    }
+
+    #[test]
+    fn a_busy_body_member_leaves_the_scope_held_and_peer_work_claimable() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let request = PipelineId(0);
+        let peer = PipelineId(1);
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], 1);
+        let mut execution = Execution::new(&[None, None], &mut dispatcher);
+        let (store, run) = two_writer_run();
+        let mut runs = ScopeRuns::new();
+        runs.install_transaction(&store, 0, run.writers.into_iter().next().unwrap());
+        execution.attach_transaction(&store, 0, request, &mut dispatcher);
+        let steps = execution.local_steps(&dispatcher, 2);
+        let scope = execution.request_scope(request);
+        let Scope::Writer { phase, .. } = scope else {
+            unreachable!()
+        };
+        let guard = keys_between(0, 0);
+        *phase.lock().unwrap() = WriterPhase::Attempt {
+            request: None,
+            guard: guard.clone(),
+            queued_at: 0,
+        };
+        let (member, hold, step) = scope.with_body(|body| {
+            let Member::Chain(member) = &body.members[0] else {
+                unreachable!()
+            };
+            (member.clone(), body.attached().hold, body.attached().step)
+        });
+        dispatcher.queue_for(peer, &guard);
+        let (locked, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|threads| {
+            threads.spawn(move || {
+                let _reader = member.read().unwrap();
+                locked.send(()).unwrap();
+                released
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("settlement waited for the busy member");
+            });
+            ready.recv().unwrap();
+            assert!(
+                !steps.poll(&dispatcher),
+                "a busy check alone makes no progress"
+            );
+            assert_ne!(dispatcher.followers_hold(hold).0 & 1, 0);
+            assert_eq!(dispatcher.outstanding(step), 0);
+            let Next::Package(package) = dispatcher.try_claim(None) else {
+                panic!("claim the peer")
+            };
+            assert_eq!(package.pipeline, peer);
+            dispatcher.acknowledge(package);
+            release.send(()).unwrap();
+        });
+        assert!(steps.poll(&dispatcher));
+        assert_eq!(
+            dispatcher.outstanding(step),
+            1,
+            "the next pass admits the deferred step"
+        );
+        assert!(!steps.poll(&dispatcher), "only one step is outstanding");
+    }
+
+    #[test]
+    fn shared_writers_and_downstream_scopes_settle_separately() {
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![], vec![0, 2], vec![]], 1);
+        let mut execution = Execution::new(&[None, None, None, None, None], &mut dispatcher);
+        let mut runs = ScopeRuns::new();
+        for roots in [&[0, 1][..], &[2], &[3], &[4]] {
+            let (store, run) = two_writer_run();
+            for (writer, (root, body)) in roots.iter().zip(run.writers).enumerate() {
+                runs.install_transaction(&store, writer, body);
+                execution.attach_transaction(&store, writer, PipelineId(*root), &mut dispatcher);
+            }
         }
+        let steps = execution.local_steps(&dispatcher, 4);
+        let guard = crate::interpreter::tile_operators::test_helpers::keys_between(0, 0);
+        // Scope 4 has its own store and reads no other scope.
+        execution.offer_request(PipelineId(4), &guard);
+        assert!(!steps.shared_work_pending(&dispatcher));
+        for id in 0..4 {
+            dispatcher.queue_for(PipelineId(id), &guard);
+            assert!(steps.shared_work_pending(&dispatcher));
+            let package = dispatcher
+                .claim_of(PipelineId(id))
+                .expect("the test request");
+            assert!(steps.shared_work_pending(&dispatcher));
+            dispatcher.acknowledge(package);
+            assert!(!steps.shared_work_pending(&dispatcher));
+        }
+        execution.offer_request(PipelineId(1), &guard);
+        assert!(
+            steps.shared_work_pending(&dispatcher),
+            "yield even before a shared writer's offer is queued"
+        );
     }
 
     #[test]
     fn a_parked_writer_wakes_on_peer_progress_and_an_older_attempt_retries() {
         use crate::interpreter::tile_operators::test_helpers::keys_between;
 
-        let mut run = two_writer_run();
+        let (_, mut run) = two_writer_run();
         let waiting = keys_between(0, 0);
         let queued_at = run.progress;
         assert!(
@@ -3984,7 +4032,7 @@ mod tests {
 
     #[test]
     fn a_draining_writer_finishes_once_after_its_step() {
-        let mut run = two_writer_run();
+        let (_, mut run) = two_writer_run();
         let writer = &mut run.writers[0];
         let scope = PipelineId(0);
         let mut dispatcher = Dispatcher::new(vec![vec![]], 1);
