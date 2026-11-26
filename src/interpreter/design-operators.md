@@ -1143,7 +1143,12 @@ pipelines around its recurrence is no read and records nothing. An induction sto
 scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of
 it, so its queue closes once the last of them has finished. The pipelines of
 one store share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is
-pushed twice, and `plan_edges` plans their edges into one reader as one. The planner refuses:
+pushed twice, and `plan_edges` plans their edges into one reader as one. Closing a transaction
+key can leave the clock at the same tick. The store sends the region beyond that tick to the
+key's change-stream and final-value readers. The change stream is now complete there, and
+the final-value reader widens the notice to the whole value.
+
+The planner refuses:
 
 - outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
   morsel does not name;

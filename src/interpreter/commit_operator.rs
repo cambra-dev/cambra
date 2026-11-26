@@ -1331,6 +1331,7 @@ impl Breaker for CommitProducer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = &mut *state_guard;
 
+        self.pushed_closed.clear();
         state.breaker.last_finishes = 0;
         if state.breaker.snapshot.is_none() && state.seed_producers.is_empty() {
             assert!(self.open_store(state), "constant seeds open without input");
@@ -1437,7 +1438,7 @@ impl Breaker for CommitProducer {
         }
         finish_store(self, state);
         drop(state_guard);
-        pushes.push_final(self);
+        self.push_store(pushes);
     }
 
     /// Steps the store over its seed input `input` ([`consume_store`]); a writer's requests run
@@ -1553,6 +1554,44 @@ impl BreakingProducer for CommitProducer {
     }
 }
 impl CommitProducer {
+    /// A key can close without a commit. Its change stream gains the rest of the clock as
+    /// decided absence, while a final-value reader widens that notification to its scalar.
+    pub(crate) fn push_store(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>) {
+        pushes.push_final(self);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let breaker = &state.breaker;
+        let Some(Tile::Store {
+            closed_keys,
+            frontier,
+            terminal: false,
+            ..
+        }) = &breaker.snapshot
+        else {
+            // Whole-store completion already reaches every reader through push_final.
+            return;
+        };
+        if closed_keys.len() == self.pushed_closed.len() {
+            return;
+        }
+        let tail = Projection::admitting(Predicate::True.minus(&running_frontier(frontier)));
+        let cycle = breaker
+            .cycle
+            .as_ref()
+            .expect("a publishing store has a cycle");
+        for reader in cycle.readers() {
+            if let Some(key) = reader.as_ref().completion_key()
+                && closed_keys.contains(key)
+                && !self.pushed_closed.contains(key)
+            {
+                pushes.push_to(reader, tail.clone());
+            }
+        }
+        self.pushed_closed.clone_from(closed_keys);
+    }
+
     fn complete_in_state(&self, state: &CommitState) -> TileGuard {
         if state.breaker.terminal() {
             return self.tiling().universal_guard();
@@ -2560,6 +2599,7 @@ impl TileOperator for CommitOperator {
             seed_placements,
             writer_placements: placements.clone(),
             writer_write_keys: self.writer_write_keys.clone(),
+            pushed_closed: Vec::new(),
             state: std::sync::Mutex::new(CommitState {
                 stale: vec![false; n],
                 writer_producers,
@@ -2591,6 +2631,8 @@ pub struct CommitProducer {
     /// aligned with [`Self::writer_terminal`]. The two together give per-key
     /// closure: a key is closed once every writer listing it is terminal.
     writer_write_keys: Vec<Vec<Value>>,
+    /// Keys whose completion has already been pushed in this run.
+    pushed_closed: Vec<Value>,
     state: std::sync::Mutex<CommitState>,
     pub(crate) run: Option<crate::interpreter::dispatcher::transaction_scope::TransactionRun>,
 }
@@ -4208,6 +4250,26 @@ fn inherited_release(store_producer: &dyn TileProducer, output: &Tiling) -> Tile
     inherited.clone()
 }
 
+/// A direct subscription to a store whose output also becomes complete when this key closes.
+struct KeyCompletion {
+    key: Value,
+    downstream: Box<dyn Consumer>,
+}
+
+impl Consumer for KeyCompletion {
+    fn completion_key(&self) -> Option<&Value> {
+        Some(&self.key)
+    }
+
+    fn notify(
+        &self,
+        region: &Projection,
+        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
+    ) {
+        self.downstream.notify(region, landing);
+    }
+}
+
 impl TileOperator for StoreValueStream {
     impl_operator_base!();
 
@@ -4224,7 +4286,17 @@ impl TileOperator for StoreValueStream {
 
         // The stream is keyed by the store's commit ticks, so a region of ticks the store
         // decided names the stream's keys as it is.
-        let store_producer = subscribe_forwarding_keeping_keys(&self.store_op, &consumer, cx);
+        let mut forward = forwarding_consumer_keeping_keys(&consumer);
+        if !self.carry_forward {
+            forward = Box::new(KeyCompletion {
+                key: self.key.clone(),
+                downstream: forward,
+            });
+        }
+        let store_producer =
+            self.store_op
+                .clone()
+                .subscribe(self.store_op.tiling().universal_guard(), forward, cx);
         let mut base = ProducerBase::new(
             StoreValueStreamProducer::alloc_id(),
             self.tiling(),
@@ -4447,7 +4519,10 @@ impl TileOperator for StoreFinalRead {
 
         let forward = forwarding_consumer_keeping_keys(&consumer);
         let forward: Box<dyn Consumer> = if self.levels_above == 0 {
-            crate::interpreter::widening(forward)
+            Box::new(KeyCompletion {
+                key: self.key.clone(),
+                downstream: crate::interpreter::widening(forward),
+            })
         } else {
             crate::interpreter::notifications::through_values(
                 CurryLevel::new(self.levels_above),

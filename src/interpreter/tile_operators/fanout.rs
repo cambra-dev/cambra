@@ -494,6 +494,11 @@ pub struct Cycle {
 }
 
 impl Cycle {
+    /// The downstream reader slots that receive this store's pushes.
+    pub(crate) fn readers(&self) -> Vec<SharedConsumer> {
+        reader_consumers(&self.shared)
+    }
+
     /// The id of the fan-out, which its recurrence slots answer ([`TileProducer::recurrence_of`]).
     pub(crate) fn fan(&self) -> usize {
         self.shared
@@ -556,26 +561,24 @@ impl Consumer for FanOutInput {
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        for c in &self.reader_consumers() {
+        for c in &reader_consumers(&self.shared) {
             crate::interpreter::notifications::notify_shared(c, region, landing);
         }
     }
 }
 
-impl FanOutInput {
-    /// The consumers of the live reader slots, which a push reaches, and none of a recurrence
-    /// slot. A clone of each handle, so no read of the fan-out is held while a push climbs past.
-    fn reader_consumers(&self) -> Vec<SharedConsumer> {
-        let Some(shared_rc) = self.shared.upgrade() else {
-            return Vec::new();
-        };
-        let shared = shared_rc.read().unwrap_or_else(PoisonError::into_inner);
-        shared
-            .live_indices()
-            .filter(|&i| !shared.recurrence[i])
-            .map(|i| shared.consumers[i].clone())
-            .collect()
-    }
+/// The consumers of the live reader slots, which a push reaches, and none of a recurrence
+/// slot. A clone of each handle, so no read of the fan-out is held while a push climbs past.
+fn reader_consumers(fan: &Weak<RwLock<FanOutShared>>) -> Vec<SharedConsumer> {
+    let Some(shared_rc) = fan.upgrade() else {
+        return Vec::new();
+    };
+    let shared = shared_rc.read().unwrap_or_else(PoisonError::into_inner);
+    shared
+        .live_indices()
+        .filter(|&i| !shared.recurrence[i])
+        .map(|i| shared.consumers[i].clone())
+        .collect()
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created

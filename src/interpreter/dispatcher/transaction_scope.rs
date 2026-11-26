@@ -124,7 +124,7 @@ impl WriterPhase {
                 .hold_followers(dispatcher);
         }
         scope::complete_request(dispatcher, done, |pushes| {
-            pushes.push_final(&*transaction(store))
+            transaction(store).push_store(pushes)
         });
     }
 

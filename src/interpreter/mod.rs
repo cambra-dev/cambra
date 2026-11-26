@@ -58,6 +58,11 @@ use std::sync::{Arc, Weak};
 /// is not walked. A delivery that reaches a reader the walk of its pipeline did not reach fails
 /// the run (`src/interpreter/design-dispatcher.md`, "Running a compiled program").
 pub trait Consumer: Send + Sync {
+    /// The store key whose closure completes this direct subscription, if any.
+    fn completion_key(&self) -> Option<&Value> {
+        None
+    }
+
     /// Record an announced region and deliver it toward its dispatcher entries.
     ///
     /// It takes `&self`, so delivery takes no lock on the consumer: state it records sits behind

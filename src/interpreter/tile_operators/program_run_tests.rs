@@ -4341,6 +4341,72 @@ fn a_parked_writer_finishes_while_an_unrelated_live_source_stays_open(
     assert_eq!(boundaries, 2);
 }
 
+/// Closing the first writer without another commit completes its scalar and reply stream
+/// while the other writer can still commit to the same store.
+#[test]
+fn closing_a_key_without_a_new_commit_notifies_its_readers() {
+    use crate::interpreter::{Predicate, SinkReadError};
+    let mut ctx = GlobalContext::default();
+    let feeds = live_int_sources(&mut ctx, &["source1", "source2"]);
+    let a = ctx.register_test_sink("final_a");
+    let b = ctx.register_test_sink("final_b");
+    let replies = ctx.register_test_sink("reply_sum");
+    let code = indoc! {"
+        final_a = test_sink()
+        final_b = test_sink()
+        reply_sum = test_sink()
+        replies: Feed(_)
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in source1():
+            with begin():
+                a += x
+                b += x
+                replies << x
+        for x in source2():
+            with begin():
+                b += x
+        final_a << await_final(a)
+        final_b << await_final(b)
+        reply_sum << sum(replies)
+    "};
+    let mut program =
+        compile_program(&mut ctx, &LoadedProgram::test(code), Box::new(|| {})).unwrap();
+    deliver_one(&feeds[0], 0, 3);
+    deliver_one(&feeds[1], 0, 100);
+    let close = |i: usize| {
+        feeds[i]
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_yield_predicate(Predicate::True)
+    };
+    let mut boundary = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, 1, &mut || {
+        assert_eq!(b.written_so_far(), Err(SinkReadError::NothingWritten));
+        match boundary {
+            0 => {
+                assert_eq!(a.written_so_far(), Err(SinkReadError::NothingWritten));
+                assert_eq!(replies.written_so_far(), Err(SinkReadError::NothingWritten));
+                close(0);
+            }
+            1 | 2 => {
+                assert_eq!(single_value(&a.value().unwrap()), Value::Int(3));
+                assert_eq!(single_value(&replies.value().unwrap()), Value::Int(3));
+                if boundary == 1 {
+                    deliver_one(&feeds[1], 1, 5);
+                } else {
+                    close(1);
+                }
+            }
+            _ => panic!("both writers have closed"),
+        }
+        boundary += 1;
+    })
+    .unwrap();
+    assert_eq!(boundary, 3);
+    assert_eq!(single_value(&b.value().unwrap()), Value::Int(108));
+}
+
 /// A writer's attempt that waits for its input keeps the snapshot it read while another writer
 /// commits past it. The waiting writer's store-slot release stops below that snapshot
 /// (`TransactWriterProducer::consume_impl`), so its proposal still reads the store there, which a

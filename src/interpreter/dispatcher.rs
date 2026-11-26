@@ -969,7 +969,7 @@ impl Dispatcher {
             to: None,
             dispatcher: self,
             pipeline: pipeline.0,
-            morsels: Vec::new(),
+            pending: Vec::new(),
             unspelled: false,
         }
     }
@@ -1493,31 +1493,31 @@ impl Dispatcher {
             "a pipeline lands its pushes through its own dispatcher"
         );
         let p = pushes.pipeline;
-        let morsels = std::mem::take(&mut pushes.morsels);
+        let pending = std::mem::take(&mut pushes.pending);
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
-        if morsels.is_empty() {
+        if pending.is_empty() {
             return;
         }
         self.ensure(self.states[p].phase.load() != Phase::Finished, || {
             format!("pipeline {p} lands its pushes before it finishes")
         });
-        self.land_in(p, &morsels, pushes.to.as_ref());
+        self.land_in(p, &pending, pushes.to.as_ref());
         self.advance();
     }
 
-    /// Push `morsels`, pushed by `pipeline`, through `to`, its breaker's consumer, one region of
-    /// the breaker's keys per morsel, a projection at any level. Each reader's queue stays open
+    /// Deliver a pipeline's morsels through its breaker consumer and its reader-specific
+    /// completions through the subscriptions they name. Each reader's queue stays open
     /// until the last pipeline it reads finishes.
-    fn land_in(&self, pipeline: usize, morsels: &[TileGuard], to: Option<&SharedConsumer>) {
-        if morsels.is_empty() {
-            return;
-        }
+    fn land_in(&self, pipeline: usize, pending: &[Push], to: Option<&SharedConsumer>) {
         let mut landing = Landing::push(self, PipelineId(pipeline));
-        match to {
-            Some(to) => {
-                for morsel in morsels {
+        for push in pending {
+            match (push, to) {
+                (Push::Reader(reader, region), _) => {
+                    crate::interpreter::notifications::notify_shared(reader, region, &mut landing);
+                }
+                (Push::Morsel(morsel), Some(to)) => {
                     let region = Projection::of(morsel).unwrap_or_else(|why| {
                         self.refuse(format!(
                             "pipeline {pipeline} pushes regions of its keys: {why}"
@@ -1525,18 +1525,18 @@ impl Dispatcher {
                     });
                     crate::interpreter::notifications::notify_shared(to, &region, &mut landing);
                 }
-            }
-            // A test's push ([`Pushes::push`]) names no consumer and lands in each reader as it is.
-            #[cfg(test)]
-            None => {
-                for &reader in &self.infos[pipeline].readers {
-                    for morsel in morsels {
+                // A test push names no consumer and lands in each reader as it is.
+                #[cfg(test)]
+                (Push::Morsel(morsel), None) => {
+                    for &reader in &self.infos[pipeline].readers {
                         landing.queue(PipelineId(reader), morsel);
                     }
                 }
+                #[cfg(not(test))]
+                (Push::Morsel(_), None) => {
+                    unreachable!("a breaker's push names the consumer it climbs")
+                }
             }
-            #[cfg(not(test))]
-            None => unreachable!("a breaker's push names the consumer it climbs"),
         }
     }
 
@@ -1556,7 +1556,7 @@ impl Dispatcher {
             "a pipeline finishes through its own dispatcher's pushes"
         );
         let p = pushes.pipeline;
-        let morsels = std::mem::take(&mut pushes.morsels);
+        let pending = std::mem::take(&mut pushes.pending);
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
@@ -1569,7 +1569,7 @@ impl Dispatcher {
         // Recorded before the reader's queue is closed, which lets the reader finish.
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
-        self.land_in(p, &morsels, pushes.to.as_ref());
+        self.land_in(p, &pending, pushes.to.as_ref());
         for &reader in &self.infos[p].readers {
             self.count_toward_close(reader);
         }
@@ -1771,7 +1771,7 @@ impl Drop for Worker<'_> {
 pub struct Pushes<'d> {
     dispatcher: &'d Dispatcher,
     pipeline: usize,
-    morsels: Vec<TileGuard>,
+    pending: Vec<Push>,
     /// The consumer the morsels climb, the pushing breaker's.
     to: Option<SharedConsumer>,
     /// Whether the breaker completed a region no projection spells, which no push names yet
@@ -1779,7 +1779,21 @@ pub struct Pushes<'d> {
     unspelled: bool,
 }
 
+enum Push {
+    Morsel(TileGuard),
+    /// A region completed for one subscription independently of the breaker's clock.
+    Reader(SharedConsumer, Projection),
+}
+
 impl Pushes<'_> {
+    /// Deliver a completion through the reader's usual notification path once the breaker
+    /// has released its borrow. Other readers of the breaker keep their own frontier.
+    pub(crate) fn push_to(&mut self, reader: SharedConsumer, region: Projection) {
+        if !self.dispatcher.infos[self.pipeline].readers.is_empty() {
+            self.pending.push(Push::Reader(reader, region));
+        }
+    }
+
     /// Push what `breaker` has completed and the pipeline has not pushed before, its final guard
     /// less the region pushed, for the pipelines that read it: one package per morsel the breaker
     /// cuts it into, in the breaker's order. A push of nothing new pushes nothing, and so does a
@@ -1870,7 +1884,7 @@ impl Pushes<'_> {
             "the morsels of a pushed guard partition it: {}",
             partition_gap(guard, &morsels).unwrap_or_default()
         );
-        self.morsels.extend(morsels);
+        self.pending.extend(morsels.into_iter().map(Push::Morsel));
     }
 }
 
@@ -1878,7 +1892,7 @@ impl Drop for Pushes<'_> {
     /// Refuses to drop pushes that never landed, which would lose the reader's packages.
     fn drop(&mut self) {
         if !thread::panicking() {
-            let landed = self.morsels.is_empty();
+            let landed = self.pending.is_empty();
             self.dispatcher.ensure(landed, || {
                 format!(
                     "pipeline {} lands its pushes through Dispatcher::land or \
@@ -2734,7 +2748,7 @@ fn try_push_held(
             };
         }
         if let Some(pushes) = landed {
-            published |= !pushes.morsels.is_empty();
+            published |= !pushes.pending.is_empty();
             dispatcher.land(pushes);
         }
     }
