@@ -132,8 +132,7 @@ struct TxnFrame {
 /// An open channel: what a feed declaration or `test_sink()` made.
 ///
 /// A feed nests: `target << value` appends `value` as one element (`docs/chl-spec.md`, "3.7
-/// Feed operator `<<`"), keyed by its site's iteration domain (`docs/chl-spec.md`, "8.4 Feeds
-/// are the second form of mutability"). So `out << [2, 4, 6]` is one contribution holding a
+/// Feed operator `<<`"), keyed by its site's iteration domain (`docs/chl-spec.md`, "8.4 Deferred collections"). So `out << [2, 4, 6]` is one contribution holding a
 /// three-element collection, and `for x in xs: out << e` is one contribution per iteration,
 /// under the key `x` was drawn from.
 #[derive(Default)]
@@ -148,7 +147,7 @@ struct Channel {
     /// Every feed site naming this channel.
     ///
     /// A channel fed from more than one place is a union (`++`) of those places
-    /// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and its keys are
+    /// (`docs/chl-spec.md`, "8.4 Deferred collections"), and its keys are
     /// tagged by which one. The tagging is a property of the program text, so a site that
     /// never fires still counts. A site reached through a call joins when it first fires.
     sites: Vec<FeedPath>,
@@ -986,7 +985,7 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
             sub(left);
             sub(right);
         }
-        Expr::UnaryOp { operand, .. } => sub(operand),
+        Expr::Borrow(operand) | Expr::UnaryOp { operand, .. } => sub(operand),
         Expr::BoolOp { operands, .. } => operands.iter().for_each(sub),
         Expr::Compare {
             left, comparators, ..
@@ -1279,6 +1278,11 @@ fn is_txn_annotation(annotation: &TypeAnnotation) -> bool {
 fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
     matches!(&annotation.ty.node, Expr::Call { func, .. }
         if matches!(&func.node, Expr::Name(n) if n == "Mut"))
+}
+
+fn is_place_annotation(annotation: &TypeAnnotation) -> bool {
+    matches!(&annotation.ty.node, Expr::Call { func, .. }
+        if matches!(&func.node, Expr::Name(n) if n == "Mut" || n == "Feed"))
 }
 
 impl Interp {
@@ -1697,8 +1701,8 @@ impl Interp {
                     params: params
                         .iter()
                         .map(|p| {
-                            let by_ref = p.annotation.as_ref().is_some_and(is_mut_annotation);
-                            (p.name.to_string(), by_ref)
+                            let borrows = p.annotation.as_ref().is_some_and(is_place_annotation);
+                            (p.name.to_string(), borrows)
                         })
                         .collect(),
                     body: body.clone(),
@@ -3406,15 +3410,19 @@ impl Interp {
             ));
         }
         let mut params = Scope::with_capacity(args.len());
-        for ((param, by_ref), arg) in function.params.iter().zip(args) {
-            let slot = if *by_ref {
-                let Expr::Name(n) = &arg.node else {
-                    return err(format!("`{param}` takes a mutable variable"));
+        for ((param, borrows), arg) in function.params.iter().zip(args) {
+            let slot = if let Expr::Borrow(place) = &arg.node {
+                let Expr::Name(n) = &place.node else {
+                    return err(format!("`{param}` borrows a place by name"));
                 };
-                let Some(cell) = self.mut_cell(n) else {
-                    return err(format!("`{n}` is not a mutable variable"));
-                };
-                Slot::Mut(cell)
+                match self.slot(n) {
+                    Some(slot @ (Slot::Mut(_) | Slot::Chan(_))) => slot.clone(),
+                    _ => return err(format!("`{n}` does not name a place")),
+                }
+            } else if *borrows {
+                return err(format!(
+                    "`{param}` borrows a place; mark the argument with `&`"
+                ));
             } else {
                 self.binding_of(arg)?
             };
@@ -3423,7 +3431,7 @@ impl Interp {
         self.run_call(function, params)
     }
 
-    /// Call `function` with `values` for its parameters, none of them by reference: an
+    /// Call `function` with `values` for its parameters, none of which borrows: an
     /// associated function called as a method, its receiver already evaluated.
     fn call_with_values(
         &mut self,
@@ -3497,11 +3505,6 @@ impl Interp {
             }))),
             Expr::Name(n) if let Some(Slot::Fn(function)) = self.slot(n) => {
                 Ok(Slot::Fn(function.clone()))
-            }
-            // A channel handle is a value like any other (`docs/chl-spec.md`, "Declaring a
-            // feed"): binding one names the same channel.
-            Expr::Name(n) if let Some(Slot::Chan(key)) = self.slot(n) => {
-                Ok(Slot::Chan(key.clone()))
             }
             // A function of an instance: the function that calls it with its arguments
             // (`docs/chl-spec.md`, "Summoning an instance").
@@ -4463,7 +4466,7 @@ mod tests {
                 acc := acc * 10 + v
             acc := 0
             for v in map([("b", 1), ("a", 2)]):
-                step(acc, v)
+                step(&acc, v)
             out = test_sink()
             out << acc
         "#});
@@ -4568,8 +4571,8 @@ mod tests {
             def g(o, x):
                 o << x
             h: Feed(_)
-            g(h, 4)
-            g(h, 3)
+            g(&h, 4)
+            g(&h, 3)
             out = test_sink()
             out << sum(h)
         "#});
@@ -4599,7 +4602,7 @@ mod tests {
                 p := r
             for r in [2, 3]:
                 with begin():
-                    set(pool, r)
+                    set(&pool, r)
             with begin():
                 pool := pool + 1
                 out << pool
@@ -4726,8 +4729,8 @@ mod tests {
                 c += 1
 
             n := 1
-            bump(n)
-            bump(n)
+            bump(&n)
+            bump(&n)
             out = test_sink()
             out << n
         "#});

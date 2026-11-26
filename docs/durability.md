@@ -523,8 +523,8 @@ decides the comparison `true` once the elements seen sum to `100`. With `a₀ = 
 The supports within one map are closed under union ([Well-formed maps](#well-formed-maps)), so the
 runtime can keep any of them.
 
-The alarm feed of `time::alarms()` is not an escape. Its path from feed to source runs through the
-runtime, and its held rows are a producer state ([`time::alarms()`](#timealarms)).
+An alarm sink is not an escape. Its path from sink to source runs through the runtime, and its held
+rows are a producer state ([Alarms](#alarms)).
 
 **[Decided]** — an observation in `𝑂ᵣ` keeps its value for the rest of the run; one outside it was
 never observed ([The durability condition](#the-durability-condition)). Recovery asks an observation
@@ -659,7 +659,7 @@ acknowledged.
 ### Outputs are keyed
 
 A feed is a function over its domain
-([8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)),
+([8.4 Deferred collections](chl-spec.md#84-deferred-collections)),
 so every row appended to a feed has a key, its **feed key**: the site of the `<<` and the position
 at which it ran, `(𝑠, 𝑝)`. The position is the full position, because a feed declared inside a loop
 is a new feed at each iteration. A row fed inside a transaction's body leaves with the attempt that
@@ -942,7 +942,7 @@ What a checkpoint holds depends on the producer:
   released points holds their count and their sum, because the count alone does not give the next
   average. A `Memo` holds its cache, because it releases everything it merges
   ([A `Memo` releases everything it takes](../src/interpreter/design-operators.md#a-memo-releases-everything-it-takes)).
-- **A producer that holds rows it has not released**, such as a join's open rows or the alarm pair's
+- **A producer that holds rows it has not released**, such as a join's open rows or an alarm module's
   held rows, checkpoints them and then releases what they cover. Until it does, its inputs keep what
   the rows were computed from. A producer releases a region of its input only once it has produced
   every output that the region and the producer's internal state determine, so a row it holds
@@ -1108,7 +1108,7 @@ either. What the source persists for it depends on what the system it reads give
 | What the system it reads gives back                              | Example                                     | The source position an element takes                   | What the source persists   | A crash before the element's entry is persisted                              |
 | ---------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------ | -------------------------- | ---------------------------------------------------------------------------- |
 | The element at a permanent address, until the source releases it | a topic partition                           | its address, the offset                                | that the position is taken | the source reads the address again, and the element takes the same position  |
-| The element again, until the source acknowledges it              | a message queue; `time::alarms()`           | the position the run recorded for its message identity | the message identity       | the queue delivers it again, and another element may take its position first |
+| The element again, until the source acknowledges it              | a message queue; an alarm module           | the position the run recorded for its message identity | the message identity       | the queue delivers it again, and another element may take its position first |
 | Nothing                                                          | standard input, a UDP feed, an HTTP request | its arrival order                                      | the element                | the element is lost                                                          |
 
 Two rules apply to every kind:
@@ -1141,34 +1141,33 @@ the next record the partition holds, so a read that returns a later offset than 
 states `none` at the offsets between. An offset the source took and has not released, and that
 retention has since removed, fails recovery under the rule above.
 
-#### `time::alarms()`
+#### Alarms
 
-`time::alarms()` returns a pair: a `set_expiry` feed and an `expiries` source
-([`time::alarms()`](chl-spec.md#timealarms)). The program feeds alarm rows to `set_expiry`, and each
-row comes out of `expiries` once the clock reads at or after the row's `at` field. A row fed to the
-pair does not escape the run. The rows the pair holds, its pending alarms, are its producer state
-and are checkpointed as [Checkpoints](#checkpoints) describes. An alarm row
-is persisted in one of two places:
+An alarm module's public interface remains open
+([chl-spec.md, "Alarms"](chl-spec.md#alarms)). The module holds each alarm row until the clock
+reads at or after its `time::at` field, then yields it. A row fed into the module does not escape
+the run. Pending alarms are producer state, checkpointed as [Checkpoints](#checkpoints) describes.
+An alarm row is persisted in one of two places:
 
-1. **In the pair's checkpoint**, from the checkpoint after the row is fed to `set_expiry`
-   until the row comes out of `expiries`.
-2. **In the observation log**, from when `expiries` takes the row.
+1. **In the module's checkpoint**, from the checkpoint after the row is fed into it until the
+   module yields the row.
+2. **In the observation log**, from when the alarm source takes the row.
 
-The pair is a message queue in the table above: it hands a row back until its entry is persisted,
+The module is a message queue in the table above: it hands a row back until its entry is persisted,
 and the row's message identity is its feed key ([Outputs are keyed](#outputs-are-keyed)). A row
 appended with `<<` has a feed key no other row shares. The rows one `<<=` defines share a site and
 a position, so their feed keys also need each row's key in the defined collection
 ([Consequences for other documents](#consequences-for-other-documents), 4.4). The entry that
-`expiries` appends for a row records the row's feed key. The entry is persisted before the pair
+the alarm source appends for a row records the row's feed key. The entry is persisted before the module
 persists its state without the row, so no alarm is lost between the two writes. A crash between
 them leaves the row in both, and recovery removes from the recovered held rows every row whose feed
 key already has an entry. A crash before the entry is persisted leaves the row only in the held
-rows, and `expiries` takes it again at the next source position. No output depended on the lost
+rows, and the alarm source takes it again at the next source position. No output depended on the lost
 entry, because outputs wait for their entries
 ([The observation log](#the-observation-log)).
 
-Numbering alarms by the order the pair releases them does not work: recovery would bring back the
-held row beside its durable entry at source position `𝑝`, and `expiries` would take it again at a
+Numbering alarms by the order the module releases them does not work: recovery would bring back the
+held row beside its durable entry at source position `𝑝`, and the alarm source would take it again at a
 later position, a second arrival that commits a second time any transaction it drives. Equal row
 values cannot tell the two apart either, because two identical alarms can both be legitimate. The
 feed key identifies the row, so its second appearance is the same message.
@@ -1179,7 +1178,7 @@ A transaction refuses `AffectWorld`
 ([Transactions are keyed](#transactions-are-keyed-by-their-site-and-position)). Work that has to
 happen after a commit is appended to a feed inside the transaction, which holds the row until the
 transaction commits and drops it if it does not
-([8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)).
+([8.4 Deferred collections](chl-spec.md#84-deferred-collections)).
 A loop outside any transaction consumes the feed and makes the call, passing the row's feed key as
 the call's idempotency key:
 
@@ -1365,9 +1364,9 @@ The model's consequences:
   `<<=` takes one more component in its feed key: the defined collection's operator in its
   generation, and the row's key in it, as a loop over a collection contributes ([Terms](#terms)).
   Without it, two alarms defined by one `<<=` share a message identity, and recovery drops the
-  second ([`time::alarms()`](#timealarms)). Whether `<<=` survives at all is **[Open]** in 4.4.
+  second ([Alarms](#alarms)). Whether `<<=` survives at all is **[Open]** in 4.4.
 
-- **[8.4 Feeds are the second form of mutability](chl-spec.md#84-feeds-are-the-second-form-of-mutability)**
+- **[8.4 Deferred collections](chl-spec.md#84-deferred-collections)**
   indexes a reply inside a transaction by commit tick, and mutability.md's `by_commit_time` keys a
   reply by `Txn`. Under the model a reply's key is its feed key, the transaction's position without
   the attempt index ([Outputs are keyed](#outputs-are-keyed)), as #809 keys it. CHL also has no
@@ -1381,9 +1380,9 @@ The model's consequences:
   transactional clock. #585's
   section 7.5 still carries a clock floor and needs to drop it.
 
-- **[`time::alarms()`](chl-spec.md#timealarms)** says a process exit discards held rows. Held rows
+- **[Alarms](chl-spec.md#alarms)** says a process exit discards held rows. Held rows
   are a producer state and are recovered, and each row's message identity is its feed key
-  ([`time::alarms()`](#timealarms)).
+  ([Alarms](#alarms)).
 
 - **The effects work's readings** state that a reading belongs to its version of the program, that
   a reload may take it again, and that a reading survives a crash only as the producer state

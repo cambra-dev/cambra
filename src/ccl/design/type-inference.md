@@ -276,9 +276,11 @@ The entry points are `infer` in `infer/api.rs` and `run` in `infer/mod.rs`. Thei
 2. Resolve the operand requirements accumulated during emission. This sweep runs before
    materialization, while generalized definitions and their variables remain available for blame.
 3. Run `coalesce_pass`, including binder-slot resolution and specialization.
-4. In debug builds, check term-variable scope validity and the absence of free witnesses.
-5. On success, clear expression and binder annotations. On failure, retain annotations for
-   diagnostics.
+4. Check writable-reference discipline and [reference lifetimes](mutability.md#feed-is-a-ccl-type)
+   on the specialized tree, before inlining erases parameter boundaries.
+5. In debug builds, check term-variable scope validity and the absence of free witnesses.
+6. On success, clear expression and binder annotations. On failure, retain
+   them for diagnostics.
 
 Emission returns at its first error. Coalescing can accumulate multiple errors and returns before
 the scope check if it finds any. The requirement sweep also has debug checks around it:
@@ -439,17 +441,18 @@ length is part of the type**, and the only part of the binder that is: the Fun/F
 two functions only when both take lists of one length or both take one parameter
 (`FunBinder::parameter_count`), and dropping an unread binder keeps a list's length
 (`FunBinder::unread`). The codomain edge aligns the two binders name for name
-(`Subst::aligned_binders`). A lambda's parameters form one signature
-for contributions
-([A handle received through a parameter](#a-handle-received-through-a-parameter)).
+(`Subst::aligned_binders`). A lambda's parameters form one signature, which its first parameter
+names (`InferCtx::parameter_groups`): a contribution crossing one of them crosses the signature's
+earlier parameters too
+([A contribution crosses the binders after its target](#a-contribution-crosses-the-binders-after-its-target)).
 
 A call passing other than one argument passes their list (`TypedExprNode::Arguments`), which
 A-normalization may have put under `let`s naming its operands; a tuple passed as one argument is
 an ordinary `Tuple`. `emit_apply` reads the list's length, refuses a callee whose type already
 states another (`emit::call_arity`, `InferError::CallArity`), and otherwise expects a function of a
 parameter list that long, each parameter discharged to its argument (`Typing::apply`). A builtin
-takes the tuple of its operands as one argument. The callee is emitted first for a list. An
-argument its parameter takes by reference passes its handle; the others pass values.
+takes the tuple of its operands as one argument. The callee is emitted first for a list. Each
+argument passes a value or, with `&`, the place it names.
 
 **Where a later parameter's type reads an earlier one, each argument meets its own parameter, the
 earlier parameters discharged at the earlier arguments**, as the result is: `f(𝑥, 𝑦)` of
@@ -515,8 +518,8 @@ arg_ty <: domain
 ```
 
 This is schematic compute-function notation. `InferCtx::apply` also carries function-kind
-information and discharges the dependent result binder to the argument term. Mutable
-pass-by-reference arguments and checked lookup have additional rules in `emit_apply`; the two
+information and discharges the dependent result binder to the argument term. Borrowed mutable
+arguments and checked lookup have additional rules in `emit_apply`; the two
 edges above are not a complete specification of those cases.
 
 The rule does not emit a reverse `domain <: arg_ty` edge to determine a projection's width.
@@ -828,8 +831,8 @@ lambda parameter, let binding, match payload, or loop target automatically.
   receives planned `LetRec` or `Transact` nodes.
 
 A slot is not filled by copying the RHS type. An unannotated ordinary let can agree with its RHS,
-but a dereferenced copy binds a value while its RHS is a history handle, and a mutable declaration
-binds a handle while its initializer is a value. `resolve_binder_slot` preserves the emitted
+but a dereferenced copy binds a value while its RHS is a place, and a mutable declaration
+binds a place while its initializer is a value. `resolve_binder_slot` preserves the emitted
 binding rule.
 
 Resolving structure alone is insufficient. Predicates carried by a binder type have their own
@@ -1713,7 +1716,7 @@ another thread for teardown.
 
 The solver operates on `ccl::Type`. Annotation normalization prepares its input; compaction and
 coalescing materialize the resulting bound graph. This section specifies tagged variants,
-refinements, history handles, and annotation forms.
+refinements, place types, and annotation forms.
 
 #### The unified tagged sum
 
@@ -2064,8 +2067,8 @@ order.
 #### Refinement-aware shape and post-inference checks
 
 A refinement restricts values without changing the base's shape. Shape accessors use
-`Type::peel_refinements`; `mut_value_type`, `as_feed`, and `is_handle` preserve that distinction
-when recognizing handles. Trait narrowing likewise examines operand structure without treating
+`Type::peel_refinements`; `mut_value_type`, `as_feed`, and `is_place` preserve that distinction
+when recognizing place types. Trait narrowing likewise examines operand structure without treating
 the predicate as another type constructor to narrow.
 
 Post-inference checks retain refinements in both adjacency constraints and reconstructed-result
@@ -2095,21 +2098,21 @@ The following construction sites preserve this requirement:
   refinements. Stamping the builtin with an unrefined type while its application retains the
   refined input would leave the two nodes unreconcilable.
 
-#### Feed handles as invariant histories
+#### Feed places as invariant histories
 
-A feed handle is `Type::History` with `history_kind: HistoryKind::Append`, domain `𝐷`, and
+A feed place's type is `Type::History` with `history_kind: HistoryKind::Append`, domain `𝐷`, and
 value type `𝑉`. Its read view is the data function `𝐷 ⤇ 𝑉`; display writes `feed(𝐷 ⤇ 𝑉)`.
 The same type constructor with `HistoryKind::Overwrite` represents `Mut(𝑉, 𝐷)`.
 These are distinct types, not interchangeable spellings.
 
 `emit_defer` creates fresh domain and value variables. For a bare `Defer` let RHS, `emit_let`
 replaces the domain with rigid `ChanDom(d)`. `emit_feed` contributes a channel from its fed value;
-`emit_define` constrains against the definition's entire type. Both statements return `Unit`.
-The fresh domain in a feed contribution is constrained against the rigid channel name, not left
-unconstrained. `channelize` later substitutes the assembled domain and removes defer constructs
-and append-history handles. Downstream passes consume the resulting channel/value, not the handle.
+`emit_define` constrains against the definition's entire type. Both statements return `Unit`. The
+fresh domain in a feed contribution is constrained against the rigid channel name, not left
+unconstrained. `channelize` later substitutes the assembled domain and removes defer constructs and
+append-history place types. Downstream passes consume the resulting channel/value, not the place.
 
-A structurally opaque target such as a lambda parameter receives a feed-handle demand. Invariance
+A structurally opaque target such as a lambda parameter receives a feed-place demand. Invariance
 carries contributions back to the caller's channel. A bare defer binding is monomorphic; one
 inside a generalized definition freshens with that definition. Captured variables still obey the
 scheme cutoff, so freshening does not copy every history indiscriminately.
@@ -2119,22 +2122,20 @@ scheme cutoff, so freshening does not copy every history indiscriminately.
 | Relation | Behavior |
 | --- | --- |
 | Histories of the same kind | Constrain both value types and both domains in both directions. |
-| Append history against a non-history consumer | Compare its reconstructed data-function read view with the consumer: a feed is below the collection it reads as. |
-| Non-append shape against an append-history demand | Return `NotAFeed`; a scalar, a collection or an overwrite handle cannot become a feed. |
+| History against a non-history consumer | Reject; value-position typing emits reads explicitly. |
+| Non-append shape against an append-history demand | Return `NotAFeed`; a scalar, a collection or an overwrite place cannot acquire feed capability. |
 
 The invariant child constraints run under identity substitutions, not the Pi discharges accumulated
-outside the handle. Transporting non-invertible discharges in both directions can make incompatible
-substitutions meet on one child variable. Consequently, a binder-dependent refinement inside a fed
-value is not discharged across the handle by this rule. Feed-through-UDF support remains bounded
-by that limitation.
+outside the place type. Transporting non-invertible discharges in both directions can make
+incompatible substitutions meet on one child variable. Consequently, a binder-dependent refinement
+inside a fed value is not discharged across the place type by this rule. Feed-through-UDF support
+remains bounded by that limitation.
 
-Overwrite histories have no transparent subtype dereference: expression typing emits their value
-reads explicitly. A feed read is explicit too wherever the operand is typed as a feed
-(`emit_value_read`); the append read-view row reads a feed that reaches its reader as an inference
-variable, as a call's result does (`src/ccl/design/mutability.md`, "A feed read is a deref, and a
-feed is below its collection"). The reverse cross-kind direction need not report `NotAFeed`: that
-error is the append-demand arm's diagnostic. Both directions still reject equating the two
-history kinds.
+Neither history kind has a transparent subtype dereference. Expression typing emits value reads
+through the shared `Type::read_value_type` operation before adding constraints. A Feed yields its
+collection, and a Mut yields its value with refinements. Explicit borrow arguments preserve
+places; ordinary arguments read values. Borrowing is inferred from the parameter's uses, and a
+place annotation asserts it.
 
 Invariant histories require these solver treatments:
 
@@ -2144,21 +2145,13 @@ Invariant histories require these solver treatments:
 - Compaction stores kind, value, and domain in `CompactType::history_slot`. Materialization and
   simplification visit the children at the same polarity; the constraints have already propagated
   information in both directions.
-- `dissolve_read_feeds` settles an append-history contribution against the position's others by
-  the order a feed sits below its read view. At a positive position it replaces the feed by its
-  channel function when the position also has atom, product, variant, function, or variable
-  contributions; the replacement preserves positional refinements. At a negative position the meet
-  of a feed and a function is the feed, so the function contribution is dropped and the feed kept,
-  which leaves a parameter the body feeds and reads (or returns) a feed. A lone feed or an
-  overwrite history retains its constructor.
-
 These are history-specific rules. Data-function domains also have an
 [invariance contract](#data-domains-are-invariant); histories are not the only invariant position.
 
 ### The binder slot, and why annotations do not outlive inference
 
 A binder's `ty` is the type its references have, not necessarily its initializer's type.
-An immutable deref-copy binds a value while its initializer can be a history handle. A mutable
+An immutable deref-copy binds a value while its initializer can be a place. A mutable
 introduction binds a history while its initializer is a value. Emission records the binding rule;
 [Binder-slot resolution](#binder-slot-resolution) specifies how coalescing resolves it in place.
 
@@ -2173,8 +2166,8 @@ Both traversals combine the type-slot and predicate walkers; see
 [Type-slot coverage](#type-slot-coverage) for the shared traversal surface and regression test.
 
 Later passes classify mutable binders from the resolved representation and binding construct,
-not the erased annotation. `MutDecl` and pass-by-reference lambda parameters bind mutable
-handles; ordinary lets read through mutable initializers.
+not the erased annotation. `MutDecl` and borrowed lambda parameters bind mutable
+places; ordinary lets read through mutable initializers.
 
 ### Annotation kinds: exact and bounded
 
@@ -2255,16 +2248,17 @@ Incompatible annotations are reported as `AnnotationMismatch`; filling does not 
 
 An annotation on `:=` must be an exact history annotation. `check_mut_decl_annotation` rejects a
 plain value annotation `𝑥 : 𝑉 := 𝑒` and a bounded history annotation `𝑥 <: Mut(𝑉) := 𝑒`.
-`mut_param_history_type` also rejects a bounded pass-by-reference parameter.
+`mut_param_history_type` also rejects a bounded borrowed parameter.
 
-The binder denotes the read/write handle, whose value and domain are invariant. A bound on that
-handle is not a bound only on future stored values. Distributing the marker into
+The binder denotes the read/write place, whose value and domain are invariant. A bound on that
+place is not a bound only on future stored values. Distributing the marker into
 `Mut(BoundedHole(𝑉), 𝐷)` would change the meaning of the written annotation.
 The surface syntax provides no nested value-ceiling form; see
 [Exact and bounded annotations](../../../docs/chl-spec.md#two-annotation-forms-exact-and-bounded).
 
-`normalize_annotation` rejects a `BoundedHole` wrapping a handle. This keeps the mutable binder's
-type structurally recognizable by `mut_value_type`, write typing, and later mutable-variable passes.
+`normalize_annotation` rejects a `BoundedHole` wrapping a place type. This keeps the mutable
+binder's type structurally recognizable by `mut_value_type`, write typing, and later
+mutable-variable passes.
 
 #### Exact annotations bound monomorphization
 
@@ -2980,6 +2974,16 @@ reads the same entry when it lifts a `let` body's type past its binding:
 A kept binder inside a joined binder of the crossing holds one value per value of the joined one,
 so it is joined over as well.
 
+A place received through a parameter contributes to its incoming contract. Named parameters
+in one source signature share a group. The contribution crosses the
+target and earlier parameters in that group, except names explicitly mentioned in the history
+annotation. Thus `def emit(v: Int, out: Feed(_))` does not infer a write contract depending on the
+particular value of `v`. An explicit dependency in a written element type remains in scope.
+Nested source functions start their own parameter groups. A place is identified by its declaration
+or borrowed parameter; source `=` bindings read values and create no writable aliases.
+The same declaration identity determines storage scope and feed-place count. Every feed uses
+`require_feed`; an unknown incoming contract falls back to the ordinary contribution join there.
+
 A feed also records its **row** on the `Feed` node: the fed value's type with every binder of the
 crossing exited except the loops' (`InferCtx::feed_row`). A loop's variable and position stay in
 scope, and still join the kept binders inside them, so a read binder `mut_read` mints in a loop body
@@ -3033,40 +3037,12 @@ A `def`'s parameter is joined over however many calls reach the `def`. Inference
 once, before any call site supplies an argument, so `def f(y): out << [v for v in xs if v > y]` is
 refused with `NoJoinOverBinder` when `f` is called once as well.
 
-A `def` whose body writes to a handle declared outside it is generalized like any other `def`, so a
+A `def` whose body writes to a place declared outside it is generalized like any other `def`, so a
 variable its contribution carries must not be quantified. A `let` of a `Defer` binds
 monomorphically, and `emit_let` mints the channel's element variable at the binding's level rather
 than the right-hand side's. The edge from `def f(y): out << y` into `out` then lowers `y`'s variable
 to that level, `f` is monomorphic in `y`, and the channel receives what each call passes rather
 than the generic variable.
-
-#### A handle received through a parameter
-
-A feed's target can be an alias or a projection of the binding that holds the channel. Inference
-resolves the target to that binding through transparent aliases and projections of product
-literals (`InferCtx::target_origin`, `ccl_utils::resolve_product_reference`). The resolved binding
-decides the target's scope in the crossing, the contract the feed is checked against, and the
-places that feed the channel, so an alias introduces no scope of its own.
-
-Where the resolved binding is a joined binder, such as a lambda's parameter, the contribution
-crosses it as well as the binders after it. A projection of a product that is not a literal
-resolves to the product's binder.
-
-A lambda's parameters form one signature, which its first parameter names
-(`InferCtx::parameter_groups`). A contribution to a handle received through one of them crosses the
-target and the signature's earlier parameters, except the ones its history type names
-(`InferCtx::contribution_crossing`). So `def emit(v: Int, out: Feed(_))` infers a row that does not
-depend on the value of `v`: joining over `v` drops the value facts about it, and refuses a
-collection domain that varies with `v`, as every join does. A function defined in another's body
-starts its own signature.
-
-Where the resolved binding is a feed binding, the feed is checked against that binding's contract,
-which holds the key binder a projected handle's own type lacks (`InferCtx::feed_contract`).
-Otherwise the target is required to be a feed, `target <: Feed(𝜌)` (`emit::feed_channel`).
-
-The places that feed a channel (`emit::feed_places`) follow the same resolution. Two aliases that
-feed one channel are two places. A call that receives only a computed component of a product
-holding the handle is not one.
 
 #### A history's value may depend on its position
 
@@ -4110,10 +4086,10 @@ opening the codomain at the name.
 ### Flattening
 
 `flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`. Its type rule takes
-`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to `(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads
-of `𝑝.0` and `𝑝.1` into references to the new components. The reshaping is an operation in the
-types as at run time. A feed under several loops takes its flat key (`docs/chl-spec.md`, "8.4
-Feeds are the second form of mutability") from one `uncurry(𝑛)` over its levels instead
+`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to `(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads of
+`𝑝.0` and `𝑝.1` into references to the new components. The reshaping is an operation in the types as
+at run time. A feed under several loops takes its flat key
+(`docs/chl-spec.md`, "8.4 Deferred collections") from one `uncurry(𝑛)` over its levels instead
 (`feed_nest::flatten_nested_contribution`), as a comprehension over several generators does
 ([ir.md, "Several generators"](ir.md#several-generators)).
 
@@ -4511,7 +4487,7 @@ reading at all.
 
 `Iterable(𝐶)` holds of a structural collection, whose `Elements` is the collection itself. A loop's
 source `𝑐` lowers to `𝑐 ▷ Iterable::elements` (`lower_loop_source`), and over a data function, a
-sum, or a feed handle that call returns its argument. No row states it, so it is a **collection
+sum, or a feed that call returns its argument. No row states it, so it is a **collection
 rule**: a candidate beside the rows, whose state an obligation records (`CollectionRule`). Only a
 trait with a collection reading has the rule (`Trait::reads_collections`), and only `Iterable` has
 one.
@@ -4567,9 +4543,9 @@ A contribution arriving at a position is one of six things, and each has its own
 | contribution | example | outcome |
 |---|---|---|
 | a **base** or a **nominal type** | `Int`, `Two(Int)` | narrows the candidate set by its head, and by a nominal type's arguments where the instances differ below it ([An instance's arguments](#an-instances-arguments)) |
-| **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately, to every trait but `Iterable` | nothing to say |
+| **not determined yet** | a variable, a hole, a `Feed` place whose payload arrives separately, to every trait but `Iterable` | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
-| a **collection** | a function, a sum; a feed handle, to `Iterable` | answered by `Iterable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
+| a **collection** | a function, a sum; a feed, to `Iterable` | answered by `Iterable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
 | **determined, and none of these** | a variant | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
 | a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
@@ -4686,14 +4662,31 @@ Two problems look like they want an obligation of their own, and are not:
 
 * **A mutable variable's value type** is the *join* over its seed and every write, and the join is already the lattice's: every contribution is a *lower* bound of the mutable variable's value variable, and a positive-position read intersects refinement sets, so a refinement survives exactly when every contribution establishes it. Nothing needs to weaken a contribution to get that — the three rules that emit a contribution edge (`MutWrite`, a mutable binding's initializer, and a `Transact` key's seed) each flow theirs in verbatim. The first two are what define a `:=` mutable variable's `V`; the third is the same rule shape one variable over, on the planning-time `Transact`, whose key has its own value variable and is checked long after `V` is concrete. A mutable variable with a single contribution therefore *keeps* its refinement (`x := 1` is a `Mut(1)`), which is correct: it really does hold that value at every position.
 
-  A write reaching a mutable variable **through a `Mut` parameter** is one of those writes, and it arrives by the ordinary invariance rule rather than by a mechanism of its own. `emit_apply` decides pass-by-reference from the parameter read off the head of the application spine, and passes the argument's handle through intact; the `(History, History)` arm then relates the two value types in both directions, which is what makes the callee's writes and the caller's declaration one constraint. Reading the parameter's `Mut` syntactically is sound at that one site, since a pass-by-reference parameter is bound at its `Mut(V, D)` by the only code that mints one. While a deref *coercion* sat in the relation this could not work — the handle met a fresh variable and was read through before invariance could see it — so the contribution had to be supplied separately.
-
-  The parameter is read off the **head of the application spine**, not off the function being applied. An n-ary surface call lowers to a curried `Apply` spine, and `apply` types every application as a fresh variable, so the immediately-applied type is a bare `Infer` for every argument after the first — reading it there would contribute for `fw(x, out)` and silently skip `fw(out, x)`. The spine's length is the argument's position, and its parameter is the domain reached by peeling that many codomains off the head (`parameter_type`). For the same reason there is no composite to walk into: rule 2 of the mutability discipline rejects a `Mut` at every position but a domain's root, so a mutable variable is the parameter or it is nowhere.
+  A write reaching a mutable variable through a borrowed parameter uses the ordinary
+  invariance rule. `emit_apply` preserves an explicit `Borrow` argument's place type and reads
+  every unmarked argument as a value. The `(History, History)` arm relates the caller's and
+  callee's value types in both directions, carrying writes back to the declaration. Borrowing
+  does not depend on finding a declared parameter through the application's inferred type.
 
   A syntactic strip cannot stand in for any of this: `strip_refinements` returns a `Type::Infer` untouched, so it covers a *literal* seed and nothing else — `x := r.a` would type the mutable variable as `{Int | __elem == 0}`. A second strip, on `MutWrite`'s *target*, would weaken a check that should hold; a target that is not a mutable variable is instead refused where the write is emitted (`MutWriteToNonMutable`).
 * **A projection's domain** resolving to its open-product *demand* rather than to the value flowing in. Replacing the codomain with a field-selection rule does not fix this, because the demand is load-bearing *inference*: `λ 𝑟 → 𝑟.x` infers `{x: ?} ⇒ ?` from that demand alone, and restoring it as a bound puts the narrow record back on the domain. The problem is that a negative position resolves to its demand, which is the same thing the opposite-polarity fallback exists for — see [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass).
 
 A **mutable variable** keeps its extent because nothing strips it. A seed contributes verbatim, so `c := [v for v in xs if 𝑝]` types as the filtered collection it is. That shape then fails downstream: it does not terminate in join planning's `insert_iterate_markers`, while everything before it completes (inference, the post-letrec `typecheck`, group-by recognition, `simplify`). A loop body's write computed from the collection's own value, such as `c := [v + 𝑖 for v in c]`, does not finish compiling either. A constant whole-collection write (`c := [3, 4]`) and a keyed write (`m[𝑘] := 𝑣`) compile (`tests/it/differential_interp.rs`). The non-terminating cases are planning bugs to fix alongside mutable-collection support, not restrictions to encode in the type system.
+
+### An inferred borrow has a separate read type
+
+A borrowed parameter can acquire its place type by forwarding it to another function. Its
+ordinary uses must read values before that place type is known. `Typing::prepare_place_read`
+records the internal `__PlaceValue(P)` requirement and its associated `Output`. Emission maps
+ordinary reads of the parameter's inference variable to that output. Explicit borrows retain `P`.
+A scope exit transports a place's read type alongside its place type through the same discharge.
+The consuming context chooses which type it needs; internal `Let` results can still name places.
+
+This uses the existing trait obligations, watches, generalization and specialization. A
+`StructuralReading::PlaceValue` rule obtains `Output` from `Type::read_value_type` once a place
+bound arrives. Mutable and deferred bounds both settle the rule. The collection-element rule
+uses the same structural-rule state beside the instance table. No public trait or annotation
+syntax names this compiler requirement.
 
 ### Delivery: the watch follows the edge
 
@@ -4744,7 +4737,7 @@ included, for a name.
   argument no instance accepts fails the obligation where it arrives, as an operator's operand
   does. A `let` binding a name to a function of an instance is generalized (`should_generalize`),
   so each use of the name opens the signature afresh.
-- **A signature with reference parameters has one product domain.** `function_over` uses the
+- **A signature with borrowed parameters has one product domain.** `function_over` uses the
   single input alone, a tuple for several inputs, and unit for none, matching a `def`'s parameter
   list. An instance function takes each parameter's annotation from the signature. Calls pass
   one argument tuple, and inlining substitutes its components for the instance's named parameters.
@@ -4872,19 +4865,19 @@ its own state, a private variable or one of a run it declares, as `Module::*`
 
 ### Capability variables
 
-A `CapabilityVar` holds **capabilities**, **edges** and **upper bounds**. A capability is one
-requirement or effect, with the depth of the function body that binds the variable it names: the
-number of function bodies around the binder, 0 at the top level, and none for a capability naming no
-variable. A capability also records the node where it entered its variable (`ScopedCapability::at`),
+A `CapabilityVar` holds **capabilities**, **edges** and **upper bounds**, and stands in the
+telescope of the walk where it is minted, as an `InferVar` does. A capability is one requirement or
+effect. A capability also records the node where it entered its variable (`LocatedCapability::at`),
 which equality and ordering leave out. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the
 edge's filter, 𝑣 holds too. An edge standing for a node, a call, a statement or an argument, stamps
 that node on each capability crossing it (`Filter::at`). `CapabilityVar::resolved` is the fixpoint
 over the edges reaching a variable.
 
 Emission keeps a stack of frames, one for the module's top level and one for each function body
-under emission (`InferCtx::capability_frames`), and gives each node its own capability variable
-("Capabilities on every expression" below). A function's capabilities are its body's, through its
-frame's filter. Capabilities are recorded on the node that does them:
+under emission (`InferCtx::capability_frames`), each holding the telescope its function stands in,
+and gives each node its own capability variable ("Capabilities on every expression" below). A
+function's capabilities are its body's, through an edge from the body's variable into the variable
+of the function's type. Capabilities are recorded on the node that does them:
 
 | Node | Capability |
 | --- | --- |
@@ -4895,41 +4888,46 @@ frame's filter. Capabilities are recorded on the node that does them:
 | `Reading` | `ObserveWorld` |
 | a sink binding's `Defer` (`lower::SINK_BINDING`) | `AffectWorld` |
 | the declaration of a transactional variable 𝑥, which a module's top level holds (`InferCtx::bind_capability_name`) | `WriteTxn(𝑥)` |
-| the declaration of a public feed 𝑓 at a module's top level | `Append(𝑓)` |
+| an exported function appending to the private feed 𝑓 | `Append(𝑓)` |
 | a value read of a transactional variable 𝑥 | `ReadTxn(𝑥)` and `Transaction` |
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
-| an `Apply` passing 𝑎 to a `Mut` parameter | `Read(𝑎)` and `Write(𝑎)`, or `ReadTxn(𝑎)` and `WriteTxn(𝑎)` when 𝑎 is transactional |
-| an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
+| a call borrowing `&𝑎` of a `Mut` 𝑎 | `Read(𝑎)` and `Write(𝑎)`, or `ReadTxn(𝑎)` and `WriteTxn(𝑎)` when 𝑎 is transactional |
+| a call borrowing `&𝑎` of a feed 𝑎 | `Append(𝑎)` |
 | `Raise` of a value of type 𝐸 | `Raise(𝐸)`, identified by the `Raise` node and an instance each use's copy renews (`Raised`) |
 
-A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
-passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history is
-its argument's, so a capability naming a parameter is `CapabilityBound::Parameter`, which no
-function body's filter admits: the nodes doing it keep it, a statement's below among them. A
-`MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`).
+A value read is a mention whose place becomes its value (`read_value` in `emit.rs`). A mention
+borrowed with `&`, or passed to `await_final`, stays a place and reads nothing.
+
+**A scope ends the history of each variable it binds.** On every edge, a capability naming a
+variable enters the receiving variable only when that variable's telescope binds the variable it
+names (`CapabilityVar::in_scope`). A function type's variable is minted outside the function and its
+body's variables inside it, so what names a variable the body binds, its parameters included, stays
+out of the function's type. A node's variable is minted at the node, so a `MutDecl` or `let` node's
+variable does not hold what names its own binder. The root scope binds each run-owned variable, a
+public feed or a declared transactional variable, before emission mints anything
+(`InferCtx::enter_run_owned`): it is in every telescope, and no scope ends its history. A copy of a
+capability variable stands where a copy of an `InferVar` minted beside it does
+(`FreshenCache::copied_telescope`). A borrowed parameter is an ordinary binder of its function: its
+function's type does not name it, a function nested in the body does, and the call records the
+capability for the place it lends (`emit::borrowed_arguments`). A `MutDecl` binder is declared, not
+a parameter (`Typing::declare_mutable`). What a read, a write or a written clause records of a
+variable is read off its binding while its binder's code is emitted (`InferCtx::places`).
 `InferCtx::record_capability` records a read or a write of a transactional variable, a declared one
 or a `Mut(V, Txn)` parameter, as `ReadTxn(𝑥)` or `WriteTxn(𝑥)` (`InferCtx::of_family`), which belong
-to the run, so no scope discharges them; a `Mut(V)` parameter's is `Read(𝑥)` or `Write(𝑥)`. A
-parameter's capability is bound at the parameter, and the call records its argument's. Lowering
+to the run, so no scope discharges them; a `Mut(V)` parameter's is `Read(𝑥)` or `Write(𝑥)`. Lowering
 refuses a transactional variable declared in a function body, so every declared transactional binder
-is at depth 0. A written `Read(𝑥)` or `Write(𝑥)` naming a transactional variable is refused
-(`InferError::ClauseNamesNoVariable`).
+is bound at the module's top level. A written `Read(𝑥)` or `Write(𝑥)` naming a transactional
+variable is refused (`InferError::ClauseNamesNoVariable`).
 
-**A feed reached through another name is not tracked.** A capability is keyed by the name it is
-recorded through. A `Mut` handle cannot travel, so for a `Mut` that name is always the variable.
-A feed handle is a value, so it can be reached through an unannotated parameter, an alias or a
-projection, and the capability then names that instead: passing `out` to an unannotated
-parameter `o` records `Append(o)`, an alias `log: Feed(_) = out` records `Append(log)`, and
-`q = (out, v).0` records `Append(q)`. A parameter annotated
-`Feed(V)` is a parameter, so a call passing `out` to it records `Append(out)`. The mutability
-redesign decides how a feed travels; `a_feed_reached_through_another_name` in
-`tests/it/compilation_pipeline/capabilities.rs` pins the current output.
+**A capability names the place variable it acts on.** A place never travels: a binding, a
+product or a projection of one reads its value, and a function reaches a caller's place only
+through a parameter that borrows it. So a capability naming a `Mut` or a feed names its
+declaration or a borrowed parameter, and a call lending `&out` to a parameter that appends records
+`Append(out)` for the place it lends (`emit::borrowed_arguments`).
 
-**A frame's filter keeps what is the function's own out of its type.** A capability reaches the
-function's type from its body when the variable it names is bound outside the frame's body: its
-depth is below the frame's, and it is no parameter's. A `Begin` node drops `Transaction` from what
-its body does. A capability naming no variable always passes. `Read(𝑥)` is filtered as `Write(𝑥)`
-is: inside the scope binding 𝑥, every call has a position in its history.
+A `Begin` node drops `Transaction` from what its body does. A capability naming no variable passes
+every edge's scope. `Read(𝑥)` is scoped as `Write(𝑥)` is: inside the scope binding 𝑥, every call
+has a position in its history.
 
 **A call relates the callee's capabilities to the caller's.** `InferCtx::apply` puts a fresh call
 variable on the expected function type and an edge from it into the call's node. The
@@ -4994,8 +4992,8 @@ of a variable by the top less its `except` (`bound_written`, `freshen_capability
 or a top taking away other than what the rest of its clause shares prints in parentheses
 (`capabilities::clauses`). A top holding writes or reads names every mutable variable, and one
 holding appends every feed (`Every::names_mutable_variables`, `Every::names_feeds`), so a function
-whose type holds one leaves no body that declares what it names (`InferCtx::body_binds`) and is no
-public member of a module whose top level binds one. A top holding writes or exceptions orders a
+whose type holds one leaves no body that declares what it names (`CapabilityFrame::declares`) and is
+no public member of a module whose top level binds one. A top holding writes or exceptions orders a
 loop running it, and one holding `Raise(*)` raises every type, so a `try` around it is refused
 (`InferError::ExceptAroundEveryRaise`, `Every::raises_anything`). A clause variable's bound, and an
 associated effect type's, may take capabilities away (`TypeParam::clause_except`): opening the
@@ -5059,14 +5057,18 @@ a secondary label. The bound is copied at each instantiation, and the copy notes
 (`CapabilityVar::note_use`), so a call through a polymorphic definition's parameter is refused at
 each use that passes a committing function, with the call inside the definition as a secondary
 label. Each function body's result is noted with the value it returns (`Typing::note_result`), and a
-function in its type requiring or causing a capability bound at the body's depth or deeper is
-refused at that value, with the function as a secondary label (`InferCtx::escaping_results`,
-`InferError::EscapesItsVariable`): it would outlive the variable. So
-is one a write or an append hands a variable bound outside that capability's scope
-(`Typing::note_handed_out`, `InferError::HandsOutItsVariable`): the target's type, read through the
-lower bounds of the inference variables in it, may hold no function with a capability bound below
-the target's scope, which for the run's state is every scope and for a `Mut` or `Feed` parameter the
-function's own. A `Transaction` the top level requires is supplied by nothing, since only a block's
+function in its type requiring or causing a capability naming a variable outside the telescope the
+function stands in is refused at that value, with the function as a secondary label (`InferCtx::escaping_results`,
+`InferError::EscapesItsVariable`): it would outlive the variable. Each write or append notes the
+target and the value handed to it (`Typing::note_handed_out`). The value's type, read through the
+lower bounds of the inference variables in it, may hold no function causing a write or an append,
+since no place is inside a place (`InferError::HandsOutAWriter`). It may hold no function with a
+capability naming a variable that the telescope inside the target's binder does not hold
+(`InferError::HandsOutItsVariable`). The check reads the value's
+type, since the target's capability variables are minted outside the scopes the check is about and
+so hold nothing naming their variables. That telescope is the root's
+for the run's state, which binds only run-owned variables, and the one the function stands in for a
+`Mut` or `Feed` parameter. A `Transaction` the top level requires is supplied by nothing, since only a block's
 body supplies one, so each read or write of a transactional variable that no block encloses,
 directly or through a call, is refused at the node it entered the top level at
 (`InferError::TransactionOutsideBlock`). A block whose body causes nothing does nothing, and is
@@ -5077,19 +5079,20 @@ statement inside such a block is not reported again.
 capability variable of its own around its expression's, which keeps every capability, the enclosing
 function's own variables' included, as every node's does (`Typing::statement`; lowering labels each
 one `lower::EXPRESSION_STATEMENT`, which `lower::marked_nodes` reads). A parameter's capability is
-`Bound::Parameter`: it reaches the statement's variable and no function body's type. A statement
+bound by its function: it reaches the statement's variable and no type of that function. A
+statement
 whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches a call
 variable with nothing flowing into it, the call of a function a polymorphic definition takes as a
 parameter, which only each use determines (`InferCtx::does_nothing`). Inference returns the
 inert statements, and the compile reports them only where inference reports no error: an argument
-passed wrongly by reference, which inference refuses, is the more precise diagnosis. The last
+lent wrongly, which inference refuses, is the more precise diagnosis. The last
 statement of a block ending a function body is the function's value, which lowering builds as a
 statement: where its type is not `unit`, inference refuses it as not compiled rather than inert
 (`values_ending_function_blocks`).
 
 **Public members.** Every function nested in a public member's type is checked, including functions
-in products and returned functions. Its capabilities naming an induction variable of the top level,
-`Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
+in products and returned functions. Its capabilities naming an induction variable the top level
+binds are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
 private feed instead joins the top level's capabilities, since other modules append to the feed
 through the function (`InferCtx::exported_capabilities`).
 
@@ -5195,8 +5198,7 @@ resolves the node's type, so a specialization's clone has its own copies
 which flows into the node's, and a node's variable flows into its parent's, but into a `with
 begin():` block's less `Transaction`, which the block supplies, and not into a lambda's: making a
 function does nothing. A function body's frame is its body node's variable seen through the frame's
-filter, which keeps out what names a variable the body binds or a parameter, whose history is its
-argument's (`Bound::Parameter`).
+filter, which keeps out what names a variable the body binds, a parameter's included.
 
 A clone takes its use's copies (`capabilities::UseCapabilities`): a copy holds what the use's
 arguments bring where the definition's effect parameters stand, which a fresh copy does not, so one
@@ -5318,7 +5320,7 @@ relation. Placing the scrutinee and expected variant below a common fresh variab
 not propagate payload types from one into the other.
 
 Branch bodies are value reads. Selecting between mutable variables selects their values,
-not a write-through handle; this does not relax the restriction on writable argument nodes.
+not a write-through place; this does not relax the restriction on writable argument nodes.
 
 #### Arm facts
 
@@ -5522,14 +5524,14 @@ witness-kind children and refinement predicates. Shared predicates are visited o
 `PredicateId`.
 
 The strict check rejects holes, shared holes, unresolved bounded annotations and inference
-variables, including those nested in other types. It also rejects surviving history handles
+variables, including those nested in other types. It also rejects surviving place types
 and nominal channel domains. Failures carry the relevant expression or binding context;
 holes and variables use `UnresolvedHole` and `UnresolvedInfer`, while a bounded marker
 uses `UnresolvedBoundedHole`.
 
 This is the annotation-completeness phase of `typecheck`, not the structural compatibility
 check itself. Before channelization and mutability elimination, `typecheck` can instead use
-`Strictness::PreChannelize`, which permits transient inference variables and handles.
+`Strictness::PreChannelize`, which permits transient inference variables and place types.
 Holes and bounded markers remain errors in that mode.
 [The post-inference check](#the-post-inference-check-shared-rules) owns the shared structural
 rules and their use at compiler boundaries.

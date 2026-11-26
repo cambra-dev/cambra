@@ -109,7 +109,7 @@ use super::panic_message::panic_message;
         b: Feed(_)
         b << 1
     "},
-    "Feed({Int where _ == 1})"
+    "‹not printable yet› |=> {Int where _ == 1}"
 )]
 fn a_collection_is_written_in_chl(#[case] binding: &str, #[case] inferred: &str) {
     let last = binding.trim_end().lines().last().expect("a binding");

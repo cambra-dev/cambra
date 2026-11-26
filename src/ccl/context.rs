@@ -103,7 +103,7 @@ pub enum CompileError {
         related: Vec<(Span, String)>,
     },
     /// Defer/Feed/Define channelization rejected the program (e.g. a defer
-    /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
+    /// binding with no feeds, mixed `<<`/`<<=` on the same feed place, or a
     /// `<<=` inside a non-top-level scope).
     ///
     /// Channelization runs after inference (so type errors report against
@@ -442,6 +442,27 @@ impl<'a> Blame<'a> {
             .collect()
     }
 
+    /// The outermost statement that instantiates `name`'s declaration in this program.
+    fn declaration_run(&self, name: &Name) -> Option<Span> {
+        let runs = self.runs?;
+        let mut home = name.home()?;
+        let mut found = None;
+        loop {
+            if let Some(sites) = runs.statements.get(home) {
+                for (span, _) in sites {
+                    found = Some(*span);
+                    if span.file == self.program.file {
+                        return found;
+                    }
+                }
+            }
+            let Some(parent) = runs.parents.get(home) else {
+                return found;
+            };
+            home = parent;
+        }
+    }
+
     /// A blame over the same lowering projection, with no phase projections:
     /// one for another tree, which its own phases derive.
     fn fresh(&self) -> Blame<'a> {
@@ -605,6 +626,31 @@ impl<'a> Blame<'a> {
             }
             error => error,
         }
+    }
+
+    fn channelize(
+        &self,
+        Located { error, node_id, .. }: Located<channelize::DeferError>,
+        lowering: &LoweringContext,
+    ) -> Vec<CompileError> {
+        let declared = self.span(node_id, None);
+        let span = if matches!(error, channelize::DeferError::NoFeedOrDefine(_)) {
+            self.declaration_run(error.defer()).unwrap_or(declared)
+        } else {
+            declared
+        };
+        let subject = lowering.deferred_subject(error.defer());
+        let mut related = self.run_labels(node_id, declared, None);
+        related.retain(|(at, _)| *at != span);
+        if span != declared {
+            related.push((declared, "the unfilled output is declared here".to_string()));
+        }
+        vec![CompileError::ChannelizeDefers {
+            error,
+            subject,
+            span,
+            related,
+        }]
     }
 
     fn unsupported(&self, error: Located<String>, tree: Option<&Expr>) -> Vec<CompileError> {
@@ -862,7 +908,7 @@ impl SourceSinkRegistry {
     fn absorb(&mut self, lowering: &mut LoweringContext) {
         self.sources.extend(
             lowering
-                .registered_sources()
+                .runtime_sources()
                 .map(|(n, s)| (n.to_string(), s.clone())),
         );
         self.shared_servers.extend(lowering.take_servers());
@@ -2641,7 +2687,7 @@ struct Obstacle {
 /// (`span`). `None` when it is shareable.
 fn obstacle(
     statements: &[crate::ccl::lower::modules::ModuleStatement],
-    top_level: &[crate::ccl::capabilities::ScopedCapability],
+    top_level: &[crate::ccl::capabilities::LocatedCapability],
     span: impl Fn(NodeId) -> Span,
 ) -> Option<Obstacle> {
     if let Some(run) = statements.iter().find(|s| s.runs) {
@@ -3154,7 +3200,7 @@ fn run_passes(
     // channelize routes feeds and before the unified letrec phase folds writers,
     // both of which need their targets lexically present. Inlining runs on the
     // still-defer-bearing tree (Defer/Feed nodes and `Feed` types present) via
-    // the defer-aware `Subst` engine (which renames a fed-to handle on
+    // the defer-aware `Subst` engine (which renames a fed-to place on
     // beta-reduction) and preserves defer-returning generators, so the
     // post-inline wall is the relaxed `check_pre_channelize`, not strict
     // `typecheck`.
@@ -3208,6 +3254,8 @@ fn run_passes(
         return Ok(expr);
     }
     inline::check_calls_resolved(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
+    channelize::check_definition_scopes(&expr)
+        .map_err(|error| blame.channelize(error, ctx.lowering_ctx()))?;
 
     // Transactional slice of the unified phase: rewrite every `with begin():`
     // writer of a `Mut(_, Txn)` mutable variable into a `get_prev_txn`-guarded `LetRec`
@@ -3328,16 +3376,7 @@ fn run_passes(
     let channelized = recorded(capture_provenance, Phase::Channelize, || {
         channelize::run(phase_out)
     })
-    .map_err(|Located { error, node_id, .. }| {
-        let span = blame.span(node_id, None);
-        let subject = ctx.lowering_ctx().deferred_subject(error.defer());
-        vec![CompileError::ChannelizeDefers {
-            error,
-            subject,
-            span,
-            related: blame.run_labels(node_id, span, None),
-        }]
-    })?;
+    .map_err(|error| blame.channelize(error, ctx.lowering_ctx()))?;
     settle(
         &channelized,
         "post-channelize",
@@ -3973,7 +4012,7 @@ Error: parse error
    │      │ │
    │      ╰──── while parsing expression
    │        │
-   │        ╰── found 'newline', expected expression, or '-'
+   │        ╰── found 'newline', expected expression, '-', or '&'
 ───╯
 Error: lowering error
    ╭─[<test>:2:5]
@@ -4212,14 +4251,12 @@ Error: lowering error
         x += 2
         x
         "#}, "x += 2", 0)]
-    #[case::mut_rule_1(indoc::indoc! {r#"
-        def bump(c: Mut(Int)):
-            c += 1
-        x := 0
-        y := 1
-        bump(x if True else y)
-        x
-        "#}, "x if True else y", 0)]
+    #[case::borrow_outside_a_call(indoc::indoc! {r#"
+        def g(n):
+            z := n
+            &z
+        g(5)
+        "#}, "&z", 0)]
     // An undetermined type is reported at the innermost node holding it, the first read of `x`.
     #[case::ambiguous_program(indoc::indoc! {r#"
         f = \x -> [x, x]

@@ -21,7 +21,7 @@
 //!
 //! Inference checks defer constructs on the user-shaped tree; channelization
 //! validates the channel shapes it consumes. For the history constraint rules,
-//! see `design/type-inference.md`, "Feed handles as invariant histories".
+//! see `design/type-inference.md`, "Feed places as invariant histories".
 //!
 //! **Type-preserving by construction.** Every channel node this module builds is
 //! stamped with its concrete type from its children (mirroring how
@@ -43,7 +43,7 @@
 //! those variants as `unreachable!`.
 //!
 //! A feed under nested loops is keyed by the tuple of the loops' positions
-//! (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability";
+//! (`docs/chl-spec.md`, "8.4 Deferred collections";
 //! [`crate::ccl::feed_nest`]). How many levels are positions is the number of loops the walk
 //! crossed to reach the feed ([`Contribution`]), never read off a type. Each
 //! contribution is recorded as the product of the `Feed` it came from (`channelize.feed`).
@@ -178,9 +178,9 @@ pub enum DeferError {
     /// A `Define` appeared inside a context where it is not allowed
     /// (e.g. inside a Loop body, Compose element, or Case branch).
     NestedDefinition(Name),
-    /// A `Feed` references a defer-handle that was never bound by a
+    /// A `Feed` references a feed place that was never bound by a
     /// surrounding `let d = Defer`.
-    UnboundDeferHandle(Name),
+    UnboundDeferPlace(Name),
     /// A cluster of defers has channels that reference each other
     /// cyclically (e.g. `x ≪= y; y ≪= x`). Channels are `Feed`-kind letrec
     /// bindings and carry no `get_prev_*` guard, so a cycle has no
@@ -189,10 +189,11 @@ pub enum DeferError {
     /// governs overwrite recursion. The payload names one of the defers on the
     /// cycle.
     MutuallyRecursiveCycle(Name),
-    /// A feed or define whose target is a feed handle no deferred binding's cluster reached,
-    /// as one taken out of a data structure (`docs/chl-spec.md`, "A deferred collection inside
-    /// a data structure \[Open\]"). The payload names the target.
-    UnreachedFeedHandle(Name),
+    /// A feed or define whose declaration no deferred binding's cluster reached.
+    /// Compiler parameter transport retains references until inlining resolves them;
+    /// source data structures store collection reads (`docs/chl-spec.md`,
+    /// "A deferred collection inside a data structure"). The payload names the target.
+    UnreachedFeedPlace(Name),
     /// A feed under a condition on a value a recursive group computes, whose value's type reads
     /// the iteration it is fed in: the gate's projection has no type for it
     /// ([`crate::ccl::ccl_utils::gate_values`]). The payload names the defer.
@@ -214,9 +215,9 @@ impl DeferError {
             | DeferError::MultipleDefinitions(name)
             | DeferError::FeedsAndDefinesMixed(name)
             | DeferError::NestedDefinition(name)
-            | DeferError::UnboundDeferHandle(name)
+            | DeferError::UnboundDeferPlace(name)
             | DeferError::MutuallyRecursiveCycle(name)
-            | DeferError::UnreachedFeedHandle(name)
+            | DeferError::UnreachedFeedPlace(name)
             | DeferError::GatedValueReadsItsIteration(name) => name,
         }
     }
@@ -231,17 +232,16 @@ impl DeferError {
                 format!("{subject} has both feeds and a define")
             }
             DeferError::NestedDefinition(_) => "<<= must occur as a top-level statement".into(),
-            DeferError::UnboundDeferHandle(name) => format!(
-                "feed/define references unbound defer handle '{}'",
+            DeferError::UnboundDeferPlace(name) => format!(
+                "feed/define references unbound feed place '{}'",
                 name.base()
             ),
             DeferError::MutuallyRecursiveCycle(_) => {
                 format!("deferred bindings form a mutually recursive cycle through {subject}")
             }
-            DeferError::UnreachedFeedHandle(_) => "this feeds a feed taken out of a data \
-                 structure, which this compiler does not follow back to the feed's \
-                 declaration, so what it is fed would be lost; a feed reaches its declaration \
-                 out of a tuple or record literal that is used only through projections"
+            DeferError::UnreachedFeedPlace(_) => "internal compiler error: this feeds a place \
+                 that inlining did not resolve to its declaration, so what it is fed would be \
+                 lost"
                 .into(),
             DeferError::GatedValueReadsItsIteration(_) => "a feed whose value's type depends \
                  on the iteration it is fed in, under a condition on a value the loop computes, \
@@ -668,7 +668,7 @@ struct DeferLift {
     expr: Expr,
     /// The inner defer binder, which the lift renamed to the outer name.
     inner_name: Name,
-    /// The channel domain of the inner handle the lift replaced, when its type
+    /// The channel domain of the inner place the lift replaced, when its type
     /// records one.
     inner_chan_dom: Option<(Name, crate::ccl::ChanLevel)>,
 }
@@ -747,17 +747,15 @@ fn lift_defer(
         "`lift_defer` requires the spine to end in `let x = Defer in body_x` with a \
          defer-returning `body_x` — check `is_lift_shape` first"
     );
-    // Read the inner handle's channel domain off the binding this lift replaces:
+    // Read the inner place's channel domain off the binding this lift replaces:
     // the entry the caller records has to key on the domain name consumer types
     // carry, which for a specialization clone differs from the term binder name.
-    let inner_chan_dom =
-        handle_chan_dom(&inner_binding.ty).or_else(|| handle_chan_dom(&inner_be.ty));
-    // Keep the inner defer's recorded handle type (`feed(ChanDom(F) ⤇ V)`) — the
+    let inner_chan_dom = channel_domain(&inner_binding.ty).or_else(|| channel_domain(&inner_be.ty));
+    // Keep the inner defer's recorded place type (`feed(ChanDom(F) ⤇ V)`) — the
     // lifted binding must carry it so cluster discovery keys the channel by the
     // domain name consumer types reference, not by the term name. (`Hole` on an
     // untyped tree, harmlessly.)
-    let (inner_name, inner_handle_ty, inner_body_x) =
-        (inner_binding.name, inner_be.ty, *inner_body);
+    let (inner_name, inner_place_ty, inner_body_x) = (inner_binding.name, inner_be.ty, *inner_body);
 
     // `body_x[x → y]` — also renames Feed/Define targets named `x` to `y`.
     let inner_subst = channelize_rename(inner_body_x, &inner_name, binding_name);
@@ -824,11 +822,11 @@ fn lift_defer(
     let spliced = replace_result_var(inner_subst, new_outer_body);
 
     // Rebuild the lifted let type-preservingly: the `Defer` node (and, via
-    // `let_bind`, the binding slot) carries the inner handle type, and the
+    // `let_bind`, the binding slot) carries the inner place type, and the
     // `Let` node itself the body's type.
     let out_ty = spliced.ty.clone();
     let mut defer_node = Expr::new(TypedExprNode::Defer);
-    defer_node.ty = inner_handle_ty;
+    defer_node.ty = inner_place_ty;
     let mut lifted = Expr::let_bind(binding_name, binding_occurrence, defer_node, spliced);
     lifted.ty = out_ty;
     DeferLift {
@@ -858,7 +856,7 @@ fn is_defer_returning(expr: &Expr, name: &Name) -> bool {
 /// statement's type is its body's, so a spine whose terminal is swapped for a
 /// value of another type has a stale type at every node above the swap. The
 /// stale type outlives channelization — a `let` that carried the lifted
-/// defer's handle type still claims it over a body that now ends in the
+/// defer's place type still claims it over a body that now ends in the
 /// program's result — and surfaces as an `Expected function type` at the
 /// letrec-recognition typecheck rather than here.
 ///
@@ -1029,8 +1027,8 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 ///
 /// Replace every free occurrence of `Var(name)` with `replacement` during
 /// channelization, renaming `Feed`/`Define` targets along the way: when
-/// `replacement` is a `Var(new_name)`, handle uses of `name` become
-/// `new_name` — the α-renaming that makes alias-inlining for defer handles
+/// `replacement` is a `Var(new_name)`, place uses of `name` become
+/// `new_name` — the α-renaming that makes alias-inlining for feed places
 /// correct.
 ///
 /// A thin wrapper over the uniform engine's in-place mode
@@ -1108,10 +1106,10 @@ impl ChannelizeCtx {
 /// Walks the expression top-down.  Every `let d = Defer in body` triggers
 /// the channelization rewrite described in the module docs.  After this
 /// pass returns, no `Defer`, `Feed`, or `Define` nodes remain — any
-/// residue is reported as [`DeferError::UnboundDeferHandle`].
+/// residue is reported as [`DeferError::UnboundDeferPlace`].
 ///
 /// **Runs on an inferred tree.** The pass reads types it cannot re-derive — a
-/// feed handle's rigid `ChanDom`, a channel's concrete domain — and closes the
+/// feed place's rigid `ChanDom`, a channel's concrete domain — and closes the
 /// tree by substituting each `ChanDom(d)` to its assembled channel's domain. Its
 /// unit tests type their fixtures for the same reason.
 ///
@@ -1175,14 +1173,13 @@ fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
     Ok(rewritten)
 }
 
-/// The channel-domain name (and its inference level) carried by a feed
-/// handle's recorded type — `feed(ChanDom(n) ⤇ V)`, through refinements.
+/// The channel-domain name and inference level of a Feed or its collection read.
 /// This is the name consumer types actually reference. For a specialization
 /// clone it differs from the term binder name (channel identity is
 /// per-instantiation, freshened at `specialize_use`), so channel recording
 /// and lift-alias entries key on it, never on the term name.
-fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
-    match ty.as_feed()?.0.peel_refinements() {
+fn channel_domain(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
+    match ty.read_value_type().domain()?.peel_refinements() {
         Type::ChanDom(n, l) => Some((n.clone(), *l)),
         _ => None,
     }
@@ -1234,7 +1231,7 @@ fn subst_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
         if let Some(dom) = map.get(name) {
             *ty = dom.clone();
             // The substituted domain is drawn from a *constructed* channel
-            // type; it may nest another feed handle only through an unmapped
+            // type; it may nest another feed place only through an unmapped
             // alias, which the residue assert flags. Recurse for totality —
             // the closed map cannot re-introduce a mapped name, so this
             // terminates.
@@ -1259,7 +1256,7 @@ fn erase_chan_domains_in_type(
         history_kind: HistoryKind::Append,
     } = ty
     {
-        // The handle names its channel, and the channel's assembled type is what says
+        // The place names its channel, and the channel's assembled type is what says
         // whether the read view binds a witness. Read it before the domain is substituted:
         // afterwards the domain is a bare reference, and a reference carries no kind.
         let Type::Fun {
@@ -1341,6 +1338,75 @@ fn predicates_hold_type(
     found
 }
 
+/// A definition stays in the scope that declares its Feed. Check after inlining, before
+/// transaction and induction lowering consume statement chains that cannot contain `Define`.
+pub(crate) fn check_definition_scopes(expr: &Expr) -> Result<(), Located<DeferError>> {
+    fn go(
+        expr: &Expr,
+        depth: usize,
+        declarations: &mut HashMap<Name, usize>,
+    ) -> Result<(), Located<DeferError>> {
+        match &expr.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } if matches!(bound_expr.node, TypedExprNode::Defer) => {
+                let previous = declarations.insert(binding.name.clone(), depth);
+                let result = go(body, depth, declarations);
+                if let Some(previous) = previous {
+                    declarations.insert(binding.name.clone(), previous);
+                } else {
+                    declarations.remove(&binding.name);
+                }
+                return result;
+            }
+            TypedExprNode::Define { name, .. }
+                if declarations
+                    .get(name)
+                    .is_some_and(|declared| *declared != depth) =>
+            {
+                return Err(Located::new(
+                    DeferError::NestedDefinition(name.clone()),
+                    expr.node_id(),
+                ));
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                go(iter, depth, declarations)?;
+                return go(body, depth + 1, declarations);
+            }
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+                ..
+            } => {
+                if let Some(scrutinee) = scrutinee {
+                    go(scrutinee, depth, declarations)?;
+                }
+                for branch in branches {
+                    go(&branch.guard, depth + 1, declarations)?;
+                    go(&branch.body, depth + 1, declarations)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        let depth = depth
+            + usize::from(matches!(
+                expr.node,
+                TypedExprNode::Lambda { .. } | TypedExprNode::Begin { .. }
+            ));
+        let mut result = Ok(());
+        expr.walk_children(|child| {
+            if result.is_ok() {
+                result = go(child, depth, declarations);
+            }
+        });
+        result
+    }
+    go(expr, 0, &mut HashMap::new())
+}
+
 /// Report the first error in a `defer` block that a refinement predicate in `expr` holds.
 ///
 /// This pass leaves a predicate holding a `defer` in source form, and planning channelizes
@@ -1395,7 +1461,7 @@ fn slot_holds_type(
 /// A predicate over a channel-domain source carries that domain in its node types.
 /// The post-channelization type check visits predicates and rejects residual
 /// channel domains. See `src/ccl/design/type-inference.md`,
-/// "Feed handles as invariant histories".
+/// "Feed places as invariant histories".
 ///
 /// A predicate's own type slots go back through [`erase_chan_domains_in_slot`], so a
 /// refinement sitting in one has its predicate erased too. `walk_refined_predicates_mut`
@@ -1464,7 +1530,7 @@ fn erase_chan_domains(
     predicates: &PredMemo<()>,
 ) {
     // Erase this node's binder-declared type slots — both the declared type and
-    // the annotation, since a handle can ride either. Deliberately *not*
+    // the annotation, since a place type can ride either. Deliberately *not*
     // `walk_type_slots_mut` (which `mut_elim::erase_mut` uses): the slots here are
     // visited in three separate phases — binders, then children, then this node's
     // own `ty`/annotation *after* the `Let`-discharge below has updated `map` —
@@ -1654,7 +1720,7 @@ fn gated_contribution(
 enum Bound {
     /// Another binding's value, `log = out`.
     Alias(Name),
-    /// A feed handle: a `Defer`, or a value of a feed type.
+    /// A feed place: a `Defer`, or a value of a feed type.
     Feed,
     /// Any other value.
     Other,
@@ -1694,7 +1760,7 @@ fn bound_through_aliases<'a>(name: &Name, bound: &'a HashMap<Name, Bound>) -> Op
 
 /// Refuse a feed or define every cluster has passed over, which [`drop_expr_stmts`] would
 /// otherwise drop with the statement it stands in, and its contribution with it: one into a
-/// feed taken out of a data structure.
+/// place a compiler `let` still transports, which inlining should have resolved.
 ///
 /// Inference has made every target a feed, so a target bound to anything else is a compiler
 /// bug. A target a binder other than a `let` binds is a parameter of a function nothing
@@ -1708,7 +1774,7 @@ fn check_unrouted_feeds(
         match bound_through_aliases(name, bound) {
             Some(Bound::Feed) => {
                 return Err(Located::new(
-                    DeferError::UnreachedFeedHandle(name.clone()),
+                    DeferError::UnreachedFeedPlace(name.clone()),
                     expr.node_id,
                 ));
             }
@@ -1803,6 +1869,7 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
             "a Raise or Try reached channelize; exception elimination removes every one"
         ),
+        TypedExprNode::Borrow(_) => unreachable!("a borrow reached channelization"),
         TypedExprNode::Comprehension { .. } => {
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
@@ -1891,6 +1958,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
             "a Raise or Try reached channelize; exception elimination removes every one"
         ),
+        TypedExprNode::Borrow(_) => unreachable!("a borrow reached channelization"),
         TypedExprNode::Comprehension { .. } => {
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
@@ -1929,11 +1997,11 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         }
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::Defer => Err(Located::new(
-            DeferError::UnboundDeferHandle(Name::from("<defer>")),
+            DeferError::UnboundDeferPlace(Name::from("<defer>")),
             expr.node_id,
         )),
         TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } => Err(Located::new(
-            DeferError::UnboundDeferHandle(name.clone()),
+            DeferError::UnboundDeferPlace(name.clone()),
             expr.node_id,
         )),
         // Children in `walk_children` order, stopping at the first residue.
@@ -2017,19 +2085,19 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // [0,1]` (where x depends on y) or `x ≪= [0,1]; y ≪= x`
             // (where y depends on x) — the wrap site doesn't know which.
             // Alongside the term names, capture each defer's *channel-domain
-            // name* off its recorded handle type — the name consumer types
+            // name* off its recorded place type — the name consumer types
             // carry, which the cluster's domain recording keys on (it differs
             // from the term name for a specialization clone).
             // And each defer's element type, which types the union of its feeds.
             let mut chan_names: HashMap<Name, Name> = HashMap::new();
             let mut elements: HashMap<Name, Type> = HashMap::new();
             let mut record =
-                |name: &Name, handles: [&Type; 2], decl: NodeId, ctx: &mut ChannelizeCtx| {
-                    if let Some((n, _)) = handles.iter().find_map(|ty| handle_chan_dom(ty)) {
+                |name: &Name, place_tys: [&Type; 2], decl: NodeId, ctx: &mut ChannelizeCtx| {
+                    if let Some((n, _)) = place_tys.iter().find_map(|ty| channel_domain(ty)) {
                         chan_names.insert(name.clone(), n);
                     }
                     ctx.defer_decls.insert(name.clone(), decl);
-                    if let Some(element) = handles.iter().find_map(|ty| handle_element(ty)) {
+                    if let Some(element) = place_tys.iter().find_map(|ty| place_element(ty)) {
                         elements.insert(name.clone(), element);
                     }
                 };
@@ -2060,7 +2128,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // The recording names the **outermost** `let d = Defer`: the cluster's
             // whole product replaces it. A cluster's inner defers are consumed too but
             // are not named, because naming them would assert they die, and a
-            // defer whose handle survives in a type does not.
+            // defer whose place survives in a type does not.
             let _g =
                 provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
             channelize_cluster(defer_names, &chan_names, &elements, body_rewritten, ctx)
@@ -2083,7 +2151,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // body_y`, and the lift collapses the two scopes.
             if is_lift_shape(&bound_expr) {
                 // Read before the lift consumes the binding.
-                let (outer, lvl) = handle_chan_dom(&binding.ty)
+                let (outer, lvl) = channel_domain(&binding.ty)
                     .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
                 // The lift *mints*: `channelize_substitute` replaces the inner
                 // scope's trailing `Var` with the outer body, and any `ExprStmt`
@@ -2111,15 +2179,15 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 };
                 // The lift renames the inner defer binder to the outer name,
                 // but *consumer types outside the lifted subtree* may carry
-                // the inner handle's rigid `ChanDom`. Record the alias so the
+                // the inner place's rigid `ChanDom`. Record the alias so the
                 // final substitution closes `chan(inner) ↦ chan(outer) ↦
                 // concrete`. Both sides key on the *channel-domain names the
-                // recorded handle types carry* — for a specialization clone
+                // recorded place types carry* — for a specialization clone
                 // these differ from the term binder names (channel identity
                 // is per-instantiation, freshened at `specialize_use`), and
                 // post-freshening the two scopes usually already share one
                 // name, in which case no entry is needed. Term names are the
-                // fallback for handles whose type records no domain.
+                // fallback for places whose type records no domain.
                 let inner_key = lift
                     .inner_chan_dom
                     .map(|(n, _)| n)
@@ -2165,11 +2233,11 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 // name for subsequent passes.
                 let renamed = channelize_rename(spliced, &inner_name, &binding.name);
                 // Same alias recording as the lift above — types outside this
-                // subtree may carry the inner handle's rigid name.
-                let inner_key = handle_chan_dom(&inner_binding.ty)
+                // subtree may carry the inner place's rigid name.
+                let inner_key = channel_domain(&inner_binding.ty)
                     .map(|(n, _)| n)
                     .unwrap_or_else(|| inner_name.clone());
-                let (outer, lvl) = handle_chan_dom(&binding.ty)
+                let (outer, lvl) = channel_domain(&binding.ty)
                     .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
                 if inner_key != outer {
                     ctx.resolved_domains
@@ -2195,8 +2263,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // a bare-`Var` alias before this pass runs — post-uniquify its
             // `!is_let_bound(x)` guard always holds, since a unique `x` is never
             // re-bound in the body. So a bare-`Var` alias whose body feeds the
-            // alias handle must never reach here; a survivor would silently
-            // mis-route `Feed(y, …)` to the wrong handle. Assert that loudly in
+            // alias place must never reach here; a survivor would silently
+            // mis-route `Feed(y, …)` to the wrong place. Assert that loudly in
             // debug rather than re-implementing the collapse. (The defer-*returning*
             // lifts above — `lift_defer` / the collapse — survive `inline`
             // because their bound-expr is a `let`, not a bare `Var`.)
@@ -2246,9 +2314,9 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
     }
 }
 
-/// The element type of a feed handle: what one `<<` appends. It types a channel's union
+/// The element type of a feed place: what one `<<` appends. It types a channel's union
 /// ([`copair_type`]), and decides nothing about the channel's shape.
-fn handle_element(ty: &Type) -> Option<Type> {
+fn place_element(ty: &Type) -> Option<Type> {
     ty.as_feed().map(|(_, element)| element.clone())
 }
 
@@ -2329,13 +2397,13 @@ fn channelize_cluster(
         channels.insert(name.clone(), channel);
     }
     // Record each channel's concrete domain under its nominal name — the
-    // *channel-domain name off the defer's handle type* (`chan_names`), not
+    // *channel-domain name off the defer's place type* (`chan_names`), not
     // the term binder name: a specialization clone's binder is uid-shared
-    // across specializations while its handle carries the per-instantiation
+    // across specializations while its place type carries the per-instantiation
     // freshened name consumer types reference. The domain comes off the
     // assembled channel's constructed type (`Fun`), or — for an alias channel
     // that is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`) — off
-    // the read's handle type, whose domain is the referenced channel's own
+    // the read's place type, whose domain is the referenced channel's own
     // `ChanDom` (closed later).
     for (name, _) in &defer_names {
         if let Some(ch) = channels.get(name) {
@@ -2372,6 +2440,7 @@ fn channelize_cluster(
         if let Some(channel) = channels.remove(&name) {
             group.push((
                 TypedBinding {
+                    parameter_mode: Default::default(),
                     name,
                     occurrence,
                     ty: channel.ty.clone(),
@@ -2584,7 +2653,7 @@ fn bind_cluster_at_scope_in(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Exp
 /// direction) need no ordering. Recognition flattens the (causality-checked,
 /// therefore acyclic) group back to plain `let`s in dependency order for
 /// planning. An alias channel (`x <<= y`) leaves its binding typed by the
-/// read's handle, whose rigid `ChanDom` the final [`erase_chan_domains`]
+/// read's place type, whose rigid `ChanDom` the final [`erase_chan_domains`]
 /// substitution closes.
 fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
     if group.is_empty() {
@@ -2613,6 +2682,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
                 "a Raise or Try reached channelize; exception elimination removes every one"
             ),
+            TypedExprNode::Borrow(_) => unreachable!("a borrow reached channelization"),
             TypedExprNode::Comprehension { .. } => unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             ),
@@ -2821,8 +2891,8 @@ fn site_tags(sites: &[Option<Rc<crate::ccl::site::Site>>]) -> Vec<FieldKey> {
 ///
 /// The union is stamped with its type at construction (mirroring
 /// `emit_copair`): one `FieldKey::Index(i)` domain tag per operand
-/// `i`, over the shared element codomain, `element` where the handle states it. A
-/// defer-read operand contributes its handle's rigid `ChanDom` domain, closed by the final
+/// `i`, over the shared element codomain, `element` where the place states it. A
+/// defer-read operand contributes its place's rigid `ChanDom` domain, closed by the final
 /// [`erase_chan_domains`] substitution.
 fn combine_feed_values(
     mut feeds: Vec<Expr>,
@@ -2859,14 +2929,14 @@ fn combine_feed_values(
 /// The type of an N-ary channel union: `Variant[tagᵢ ↦ domainᵢ] ⤇ element`, where each
 /// operand contributes its domain under its site's tag, `sites[i]`. Returns [`Type::Hole`] when an operand is not a
 /// function-shaped type at all (the untyped-mode pipeline); a defer-read operand is
-/// function-shaped via its handle's read view, so typed-mode unions are
+/// function-shaped via its place type's read view, so typed-mode unions are
 /// concrete-modulo-`ChanDom` at construction.
 ///
-/// The element type is the channel's, off its handle: inference constrains every contribution
+/// The element type is the channel's, off its place: inference constrains every contribution
 /// into it, so it is their join. The operands' own codomains say more or less than that. `c <<
 /// 1` and `c << 2` contribute `{Int | __elem == 1}` and `{Int | __elem == 2}` where the channel
 /// holds `Int`, and two jagged rows `box([1])` and `box([2, 3])` differ in their witness
-/// kinds. So no operand's codomain stands in for the channel's, and the handle is the one
+/// kinds. So no operand's codomain stands in for the channel's, and the place is the one
 /// source of it.
 fn copair_type(feeds: &[Expr], sites: &[FieldKey], element: Option<&Type>) -> Type {
     let mut tags: Vec<(FieldKey, Type)> = Vec::with_capacity(feeds.len());
@@ -2880,7 +2950,7 @@ fn copair_type(feeds: &[Expr], sites: &[FieldKey], element: Option<&Type>) -> Ty
     }
     let element = element.unwrap_or_else(|| {
         panic!(
-            "a channel whose contributions are typed has a handle typed by inference, which \
+            "a channel whose contributions are typed has a place typed by inference, which \
              states the channel's element type"
         )
     });
@@ -2991,6 +3061,7 @@ fn extract_for_defer_impl(
         TypedExprNode::Raise { .. } | TypedExprNode::Try { .. } => unreachable!(
             "a Raise or Try reached channelize; exception elimination removes every one"
         ),
+        TypedExprNode::Borrow(_) => unreachable!("a borrow reached channelization"),
         TypedExprNode::Comprehension { .. } => {
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
@@ -3038,7 +3109,7 @@ fn extract_for_defer_impl(
                     site: fed_at.clone(),
                 }
             } else {
-                // The channel is a collection — inference says so on the handle, and every
+                // The channel is a collection — inference says so on the place, and every
                 // read of it is `⤇`. `Expr::lambda` declares `Compute`, so the wrap has to
                 // restate what the thing being wrapped is.
                 Contribution {
@@ -3118,7 +3189,7 @@ fn extract_for_defer_impl(
                 // [`free_reads`](crate::ccl::ccl_utils::free_reads): the binding may be
                 // referenced only through a `user_annotation` / refinement predicate (a
                 // filter-feed guard), which it traverses, so guard-referenced bindings are
-                // kept while dead ones are dropped, and a defer handle another feed in the
+                // kept while dead ones are dropped, and a feed place another feed in the
                 // channel writes is not a binding to copy. Inner lets wrap first as the walk
                 // unwinds, so a transitively-referenced binding is exposed as
                 // free here by the time this (outer) let checks.
@@ -3566,7 +3637,7 @@ fn extract_for_defer_impl(
                             // type, so the companion value lambda is fully typed.
                             // The compose type is `Fun(prefix-domain, v.ty)`;
                             // a prefix that is itself a defer read carries its
-                            // handle's rigid `ChanDom` domain, closed by the
+                            // place's rigid `ChanDom` domain, closed by the
                             // final `erase_chan_domains` substitution.
                             let channel_expr = v.lambda(&param, None).after(new_elts.clone());
                             // The loop keys the feed by its positions: one more level.
@@ -3969,7 +4040,7 @@ mod tests {
     /// Type a hand-built fixture, so the test drives this pass at the position
     /// the pipeline runs it: after inference.
     ///
-    /// The pass reads types it cannot re-derive — a feed handle's rigid
+    /// The pass reads types it cannot re-derive — a feed place's rigid
     /// `ChanDom`, a channel's concrete domain — so an untyped fixture would
     /// exercise fallback paths that no real program reaches.
     fn typed(expr: Expr) -> Expr {

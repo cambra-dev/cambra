@@ -363,34 +363,39 @@ fn importing_a_module_that_runs_another_is_refused() {
     assert_eq!(report_count(&errors), 1, "{errors}");
 }
 
-/// The root serving a route a run serves is refused at the root's `http_serve`, naming
-/// the run, with a note at its `run` statement.
+/// A root HTTP run cannot serve a route already served by a nested run.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn the_root_serving_a_runs_route_is_refused() {
     let errors = compile_errors(&program(
         indoc! {r#"
             run service as eu
-            reqs, resps = http_serve("0", "GET", "/ping")
+            run std::http(port="0", method="GET", path="/ping") as http_resps
+            http_resps_replies: Feed(String)
+            reqs = http_resps::requests
             for r in reqs:
-                resps << "pong"
+                http_resps_replies << "pong"
+            http_resps::respond(http_resps_replies)
         "#},
         &[(
             "service",
             indoc! {r#"
-                reqs, resps = http_serve("0", "GET", "/ping")
+                run std::http(port="0", method="GET", path="/ping") as http_resps
+                http_resps_replies: Feed(String)
+                reqs = http_resps::requests
                 for r in reqs:
-                    resps << "pong"
+                    http_resps_replies << "pong"
+                http_resps::respond(http_resps_replies)
             "#},
         )],
     ));
     assert!(
         errors.contains(
-            "this program serves port=0, method=GET, path=/ping, which the run `eu` already serves"
+            "the run `http_resps` serves port=0, method=GET, path=/ping, which the run `eu::http_resps` already serves"
         ),
         "{errors}"
     );
-    assert!(errors.contains("the run that serves it"), "{errors}");
+    assert!(errors.contains("the run that serves it first"), "{errors}");
 }
 
 /// A sink's name has one binding in its module, the declaration, as in the root: a later
@@ -428,9 +433,12 @@ fn a_run_rebinding_a_sink_is_refused() {
 #[timeout(Duration::from_secs(10))]
 fn two_runs_serving_one_route_are_refused() {
     let service = indoc! {r#"
-        reqs, resps = http_serve("0", "GET", "/ping")
+        run std::http(port="0", method="GET", path="/ping") as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
-            resps << "pong"
+            http_resps_replies << "pong"
+        http_resps::respond(http_resps_replies)
     "#};
     let errors = compile_errors(&program(
         indoc! {"
@@ -441,7 +449,7 @@ fn two_runs_serving_one_route_are_refused() {
     ));
     assert!(
         errors.contains(
-            "the run `us` serves port=0, method=GET, path=/ping, which the run `eu` already serves"
+            "the run `us::http_resps` serves port=0, method=GET, path=/ping, which the run `eu::http_resps` already serves"
         ),
         "{errors}"
     );
@@ -457,17 +465,20 @@ fn two_runs_serving_one_route_are_refused() {
         run service(path="/ping") as eu
         run service(path="/ping") as us
     "#},
-    "the run `us` serves port=0, method=GET, path=/ping, which the run `eu` already serves"
+    "the run `us::http_resps` serves port=0, method=GET, path=/ping, which the run `eu::http_resps` already serves"
 )]
 #[case::the_roots(
     indoc! {r#"
         const param path: String = "/ping"
         run service(path="/ping") as eu
-        reqs, resps = http_serve("0", "GET", path)
+        run std::http(port="0", method="GET", path=path) as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
-            resps << "pong"
+            http_resps_replies << "pong"
+        http_resps::respond(http_resps_replies)
     "#},
-    "this program serves port=0, method=GET, path=/ping, which the run `eu` already serves"
+    "the run `http_resps` serves port=0, method=GET, path=/ping, which the run `eu::http_resps` already serves"
 )]
 #[case::not_a_port(
     "run service(path=\"/ping\", port=\"http\") as eu\n",
@@ -478,9 +489,12 @@ fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &s
     let service = indoc! {r#"
         const param path: String
         const param port: String = "0"
-        reqs, resps = http_serve(port, "GET", path)
+        run std::http(port=port, method="GET", path=path) as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
-            resps << "pong"
+            http_resps_replies << "pong"
+        http_resps::respond(http_resps_replies)
     "#};
     let errors = compile_errors(&program(root, &[("service", service)]));
     assert!(errors.contains(needle), "{errors}");
@@ -492,20 +506,26 @@ fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &s
 #[case::not_a_constant(
     indoc! {r#"
         param path: String
-        reqs, resps = http_serve("0", "GET", path)
+        run std::http(port="0", method="GET", path=path) as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
-            resps << "pong"
+            http_resps_replies << "pong"
+        http_resps::respond(http_resps_replies)
     "#},
     "`path` is a parameter without `const`"
 )]
 #[case::not_a_string(
     indoc! {r#"
         const param path: String
-        reqs, resps = http_serve(8080, "GET", path)
+        run std::http(port=8080, method="GET", path=path) as http_resps
+        http_resps_replies: Feed(String)
+        reqs = http_resps::requests
         for r in reqs:
-            resps << "pong"
+            http_resps_replies << "pong"
+        http_resps::respond(http_resps_replies)
     "#},
-    "http_serve's arguments are strings, and one is `8080`"
+    "a route's address is a string, and this run gives `8080`"
 )]
 #[timeout(Duration::from_secs(10))]
 fn a_routes_address_is_a_string_constant(#[case] service: &str, #[case] needle: &str) {
@@ -774,24 +794,27 @@ fn a_parameter_takes_a_polymorphic_function() {
     );
 }
 
-/// A module feeds a run's public feed through its run name, in a loop or once
+/// A module calls a run's input function, in a loop or once
 /// (`docs/chl-spec.md`, "9.9 Running").
 #[rstest]
 #[case::in_a_loop(indoc! {"
     run audit as a
     for x in [1, 2]:
-        a::events << x
+        a::emit(x)
     a::total
 "}, 3)]
 #[case::once(indoc! {"
     run audit as a
-    a::events << 5
+    a::emit(5)
     a::total
 "}, 5)]
 #[timeout(Duration::from_secs(10))]
 fn a_module_feeds_a_runs_feed(#[case] root: &str, #[case] expected: i64) {
     let audit = indoc! {"
-        pub events: Feed(_)
+        _events: Feed(_)
+        pub events = _events
+        pub def emit(value):
+            _events << value
         pub total = sum([e for e in events])
     "};
     check_program_scalar(&program(root, &[("audit", audit)]), Value::Int(expected));
@@ -866,5 +889,136 @@ fn a_run_given_a_run_is_run() {
             ],
         ),
         Value::Int(4),
+    );
+}
+
+#[test]
+fn module_parameters_borrow_feeds_explicitly() {
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        out: Feed(Int)
+        run sinker(sink=&out) as first
+        run sinker(sink=&out) as second
+        first::push(2)
+        second::push(3)
+        sum(out)
+    "#},
+            &[(
+                "sinker",
+                indoc! {r#"
+        param sink: Feed(Int)
+        pub def push(value):
+            sink << value
+    "#},
+            )],
+        ),
+        Value::Int(5),
+    );
+}
+
+#[test]
+fn a_module_borrow_keeps_mutable_reads_at_their_source_positions() {
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        counter := 0
+        run accumulator(counter=&counter) as acc
+        acc::total + counter
+    "#},
+            &[(
+                "accumulator",
+                indoc! {r#"
+        param counter: Mut(Int)
+        for value in [1, 2, 3]:
+            counter += value
+        pub total = counter
+    "#},
+            )],
+        ),
+        Value::Int(12),
+    );
+}
+
+#[rstest]
+#[case::missing_marker("sink=out", "Feed(Int)", "borrows a place; pass it with `&`")]
+#[case::value_parameter(
+    "sink=&out",
+    "List(Int)",
+    "receives a value, so it cannot borrow a place"
+)]
+fn module_place_arguments_require_the_borrow_mode(
+    #[case] argument: &str,
+    #[case] ty: &str,
+    #[case] needle: &str,
+) {
+    let root = formatdoc! {r#"
+        out: Feed(Int)
+        run sinker({argument})
+        0
+    "#};
+    let module = format!("param sink: {ty}");
+    assert_refused(&program(&root, &[("sinker", &module)]), needle);
+}
+
+#[test]
+fn an_unknown_module_argument_reports_no_borrow_mode() {
+    let errors = compile_errors(&program(
+        indoc! {r#"
+            out: Feed(Int)
+            run sinker(sink=&out, nope=&out)
+            0
+        "#},
+        &[("sinker", "param sink: Feed(Int)")],
+    ));
+    assert!(
+        errors.contains("module `sinker` has no parameter `nope`"),
+        "{errors}"
+    );
+    assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
+#[test]
+fn a_module_borrow_cannot_escape_in_an_exported_mutable_writer() {
+    assert_refused(
+        &program(
+            indoc! {r#"
+        counter: Mut(Int, Txn) := 0
+        run holder(state=&counter) as h
+        0
+    "#},
+            &[(
+                "holder",
+                indoc! {r#"
+        param state: Mut(Int, Txn)
+        pub def deposit(value):
+            state += value
+    "#},
+            )],
+        ),
+        "`deposit` is public and its type has `WriteTxn(state)`",
+    );
+}
+
+#[test]
+fn a_module_borrows_transactional_state_for_its_run() {
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        counter: Mut(Int, Txn) := 0
+        run accumulator(counter=&counter)
+        await_final(counter)
+    "#},
+            &[(
+                "accumulator",
+                indoc! {r#"
+        param counter: Mut(Int, Txn)
+        for value in [1, 2, 3]:
+            with begin():
+                counter += value
+    "#},
+            )],
+        ),
+        Value::Int(6),
     );
 }

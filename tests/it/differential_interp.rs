@@ -513,7 +513,7 @@ fn a_nested_write_reads_its_binders(#[case] term: &str) {
 }
 
 /// A feed under nested loops is keyed by the position of every loop around it
-/// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), whether the loops
+/// (`docs/chl-spec.md`, "8.4 Deferred collections"), whether the loops
 /// only feed or the outer one carries a mutable variable.
 #[rstest]
 #[case::two_loops(indoc! {r#"
@@ -1073,7 +1073,7 @@ fn a_constant_overwrite_through_a_mut_parameter() {
             c := 5
         c := 0
         for x in [1, 2]:
-            fw(c)
+            fw(&c)
         out = test_sink()
         out << c
     "#});
@@ -1254,8 +1254,8 @@ fn a_function_writing_through_a_mut_parameter() {
             c += 1
 
         n := 1
-        bump(n)
-        bump(n)
+        bump(&n)
+        bump(&n)
         out = test_sink()
         out << n
     "#});
@@ -1382,7 +1382,7 @@ fn a_constant_whole_map_write_through_a_mut_parameter() {
             m := box(map([(5, 50), (6, 60)]))
         m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
         for x in [3, 4]:
-            put(m)
+            put(&m)
         out = test_sink()
         out << sum(m)
     "#});

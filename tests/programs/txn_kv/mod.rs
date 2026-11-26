@@ -18,21 +18,17 @@
 //! by concurrent HTTP handlers is only correct if its state is transactional)
 //! and `hit_counter` (the request-stream aggregate).
 //!
-//! **Currently blocked at loading.**  The whole program parses, its `case`
-//! arms on their `case` lines included (`docs/chl-spec.md`, "An arm on its
-//! `case` line"), so the first error is the loader finding no `http` module in
-//! the std root for `import std::http`.  Behind it: `requires Transaction`
-//! (refused by lowering), `with begin()`, map-index assignment,
-//! structured requests, and `restrict` / `count`.  This pins the loading error,
-//! and that no parse error precedes it.
+//! The HTTP runs load, and the program parses, including its inline `case` arms
+//! (`docs/chl-spec.md`, "An arm on its `case` line"). Indexed response assignment
+//! remains unsupported. Structured requests and time-pinned aggregates are sketches.
 
 use super::common::expect_compile_error_past;
 
 #[test]
-fn txn_kv_currently_blocked_at_loading() {
+fn txn_kv_currently_blocked_at_indexed_response() {
     expect_compile_error_past(
         include_str!("program.cambra"),
-        "no module `std::http`",
+        "`m[k]` is a keyed write",
         "parse error",
     );
 }

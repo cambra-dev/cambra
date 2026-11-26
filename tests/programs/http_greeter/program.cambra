@@ -8,15 +8,24 @@
 
 prefix = "Hello, "
 
-greet_reqs, greet_resps = http_serve("{PORT}", "GET", "/greet")
-echo_reqs, echo_resps = http_serve("{PORT}", "POST", "/echo")
-shout_reqs, shout_resps = http_serve("{PORT}", "POST", "/shout")
+run std::http(port="{PORT}", method="GET", path="/greet") as http_greet_resps
+http_greet_resps_replies: Feed(String)
+greet_reqs = http_greet_resps::requests
+run std::http(port="{PORT}", method="POST", path="/echo") as http_echo_resps
+http_echo_resps_replies: Feed(String)
+echo_reqs = http_echo_resps::requests
+run std::http(port="{PORT}", method="POST", path="/shout") as http_shout_resps
+http_shout_resps_replies: Feed(String)
+shout_reqs = http_shout_resps::requests
 
 for req in greet_reqs:
-    greet_resps << prefix + "stranger!\n"
+    http_greet_resps_replies << prefix + "stranger!\n"
 
 for req in echo_reqs:
-    echo_resps << "You said: " + req + "\n"
+    http_echo_resps_replies << "You said: " + req + "\n"
 
 for req in shout_reqs:
-    shout_resps << prefix + req + "!!!\n"
+    http_shout_resps_replies << prefix + req + "!!!\n"
+http_greet_resps::respond(http_greet_resps_replies)
+http_echo_resps::respond(http_echo_resps_replies)
+http_shout_resps::respond(http_shout_resps_replies)

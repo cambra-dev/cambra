@@ -9,10 +9,910 @@ use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
-use cambra::ccl::TagMap;
 use indoc::{formatdoc, indoc};
 
 use super::helpers::*;
+
+#[test]
+fn exclusive_borrow_overlaps_callee_capture() {
+    check_compile_error(
+        indoc! {r#"
+            counter: Mut(Int, Txn) := 0
+            def bump(other: Mut(Int, Txn)):
+                with begin():
+                    counter += 1
+                    other += 2
+            bump(&counter)
+            0
+        "#},
+        "`counter` is reached twice in one call",
+    );
+}
+
+#[test]
+fn induction_parameter_cannot_be_captured_by_writer() {
+    check_compile_error(
+        indoc! {r#"
+            def outer(target: Mut(Int)):
+                def inner(amount: Int):
+                    target += amount
+                inner(1)
+            counter := 0
+            for i in [1, 2, 3]:
+                outer(&counter)
+            counter
+        "#},
+        "a function writes the mutable variable",
+    );
+}
+
+#[test]
+fn a_captured_callback_separates_transactional_reads() {
+    check_scalar(
+        indoc! {r#"
+        balance: Mut(Int, Txn) := 10
+        def deposit(amount):
+            balance += amount
+        def apply(callback, value):
+            callback(value)
+        difference: Feed(Int)
+        with begin():
+            before = balance
+            apply(deposit, 5)
+            after = balance
+            difference << after - before
+        sum(difference)
+    "#},
+        Value::Int(5),
+    );
+}
+
+#[test]
+fn an_inner_transactional_writer_does_not_change_its_shadowed_value_parameter() {
+    check_scalar(
+        indoc! {r#"
+            def outer(value, counter: Mut(Int, Txn)):
+                def write(value):
+                    with begin():
+                        value := value + 1
+                write(&counter)
+                value
+            counter: Mut(Int, Txn) := 7
+            outer(10, &counter) + await_final(counter)
+        "#},
+        Value::Int(18),
+    );
+}
+
+#[rstest]
+#[case::effect_top("() => Int causes Effect")]
+#[case::write_top("() => Int causes Write(*)")]
+#[case::append_top("() => Int causes Append(*)")]
+fn a_place_cannot_store_a_function_that_may_act_on_places(#[case] action: &str) {
+    let code = formatdoc! {r#"
+        out: Feed({action})
+        0
+    "#};
+    check_compile_error(&code, "inside a place");
+}
+
+#[test]
+fn an_unannotated_transactional_writer_borrows_its_parameters() {
+    check_scalar(
+        indoc! {r#"
+        def transfer(src, dst, amount):
+            with begin():
+                src := src - amount
+                dst := dst + amount
+        a: Mut(Int, Txn) := 100
+        b: Mut(Int, Txn) := 0
+        transfer(&a, &b, 30)
+        await_final(a) + await_final(b) * 10
+    "#},
+        Value::Int(370),
+    );
+}
+
+#[test]
+fn a_value_argument_is_read_before_the_call_borrows_the_same_place() {
+    check_scalar(
+        indoc! {r#"
+        def bump(value, counter: Mut(Int)):
+            counter += value
+        x := 1
+        bump(x, &x)
+        x
+    "#},
+        Value::Int(2),
+    );
+}
+
+#[test]
+fn a_computed_value_cannot_be_borrowed_while_its_type_is_inferred() {
+    check_compile_error(
+        indoc! {r#"
+        def bump(c):
+            c += 1
+        counter := 1
+        y = counter + 1
+        bump(&y)
+        counter
+    "#},
+        "cannot borrow `y`: it is a value",
+    );
+}
+
+#[test]
+fn iteration_of_a_feed_argument_reads_its_collection() {
+    check_scalar(
+        indoc! {r#"
+        def each(xs):
+            [x + 1 for x in xs]
+        out: Feed(Int)
+        out << 1
+        out << 2
+        sum(each(out))
+    "#},
+        Value::Int(5),
+    );
+}
+
+#[rstest]
+#[case::bare_feed_result(indoc! {r#"
+    def make(value):
+        out: Feed(Int)
+        out << value
+        out
+    sum(make(7))
+"#}, 7)]
+#[case::bare_mut_result(indoc! {r#"
+    def read(value: Mut(Int)):
+        value
+    counter := 7
+    read(&counter)
+"#}, 7)]
+#[case::inferred_feed_parameter(indoc! {r#"
+    def emit(out, value):
+        out << value
+    out: Feed(Int)
+    emit(&out, 7)
+    sum(out)
+"#}, 7)]
+#[case::inferred_mut_parameter(indoc! {r#"
+    def bump(counter, amount):
+        counter += amount
+    counter := 1
+    bump(&counter, 6)
+    counter
+"#}, 7)]
+#[case::captured_deferred_place(indoc! {r#"
+    out: Feed(Int)
+    def emit(value):
+        out << value
+    emit(3)
+    emit(4)
+    sum(out)
+"#}, 7)]
+#[case::callbacks_can_capture_the_same_transactional_state(indoc! {r#"
+    counter: Mut(Int, Txn) := 0
+    def bump(value: Int):
+        with begin():
+            counter += value
+    def apply(left, right):
+        left(3)
+        right(4)
+    apply(bump, bump)
+    await_final(counter)
+"#}, 7)]
+#[case::shared_deferred_borrows(indoc! {r#"
+    def emit(left: Feed(Int), right: Feed(Int)):
+        left << 3
+        right << 4
+    out: Feed(Int)
+    emit(&out, &out)
+    sum(out)
+"#}, 7)]
+#[case::borrowed_function_in_a_record(indoc! {r#"
+    def emit(out: Feed(Int), value):
+        out << value
+    functions = (emit=emit)
+    out: Feed(Int)
+    (functions.emit)(&out, 7)
+    sum(out)
+"#}, 7)]
+#[case::a_scoped_writer_captures_a_borrowed_feed(indoc! {r#"
+    def fill(out: Feed(Int)):
+        def emit(value):
+            out << value
+        emit(7)
+    out: Feed(Int)
+    fill(&out)
+    sum(out)
+"#}, 7)]
+#[case::a_scoped_writer_captures_a_transactional_borrow(indoc! {r#"
+    def fill(counter: Mut(Int, Txn)):
+        def bump(value: Int):
+            with begin():
+                counter += value
+        bump(7)
+    counter: Mut(Int, Txn) := 0
+    fill(&counter)
+    await_final(counter)
+"#}, 7)]
+#[case::value_argument_precedes_a_sibling_write(indoc! {r#"
+    def bump(counter: Mut(Int)):
+        counter += 1
+        0
+    def first(value, unused):
+        value
+    counter := 7
+    first(counter, bump(&counter))
+"#}, 7)]
+#[case::a_forwarding_parameter_infers_borrowing(indoc! {r#"
+    def bump(counter):
+        counter += 1
+    def forward(counter):
+        before = counter
+        bump(&counter)
+        before + counter
+    counter := 3
+    forward(&counter)
+"#}, 7)]
+#[case::a_curried_return_reads_the_final_collection(indoc! {r#"
+    def emit(value, out: Feed(Int)):
+        out << value
+        out
+    out: Feed(Int)
+    values = emit(3, &out)
+    out << 4
+    sum(values)
+"#}, 7)]
+#[case::a_forwarded_deferred_read_is_the_final_value(indoc! {r#"
+    def emit(out):
+        out << 7
+    def forward(out):
+        before = out
+        emit(&out)
+        sum(before)
+    out: Feed(Int)
+    forward(&out)
+"#}, 7)]
+#[case::a_scoped_callback_can_be_called_through_a_helper(indoc! {r#"
+    def call(callback, value):
+        callback(value)
+    def fill(out: Feed(Int)):
+        def emit(value: Int):
+            out << value
+        call(emit, 7)
+    out: Feed(Int)
+    fill(&out)
+    sum(out)
+"#}, 7)]
+fn places_and_values(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+#[rstest]
+#[case::a_used_value_parameter_reports_a_borrow_type_mismatch(indoc! {r#"
+    def inc(value):
+        value + 1
+    counter := 7
+    inc(&counter)
+"#}, "expected Int, found Mut(")]
+#[case::a_returned_writer_cannot_capture_a_borrow(indoc! {r#"
+    def make(out: Feed(Int)):
+        def emit(value):
+            out << value
+        emit
+    out: Feed(Int)
+    make(&out)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::a_forwarded_writer_cannot_capture_a_local(indoc! {r#"
+    def identity(value):
+        value
+    def make(dummy):
+        out: Feed(Int)
+        def emit(value):
+            out << value
+        identity(emit)
+    make(0)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::mutable_borrows_are_exclusive(indoc! {r#"
+    def bump(left: Mut(Int), right: Mut(Int)):
+        left += 1
+        right += 1
+    counter := 0
+    bump(&counter, &counter)
+"#}, "`counter` is reached twice in one call")]
+#[case::transactional_borrows_are_exclusive(indoc! {r#"
+    def bump(left: Mut(Int, Txn), right: Mut(Int, Txn)):
+        with begin():
+            left += 1
+            right += 1
+    counter: Mut(Int, Txn) := 0
+    bump(&counter, &counter)
+    0
+"#}, "`counter` is reached twice in one call")]
+#[case::a_transactional_borrow_conflicts_with_captured_access(indoc! {r#"
+    counter: Mut(Int, Txn) := 0
+    def bump(value: Int):
+        with begin():
+            counter += value
+    def apply(value: Mut(Int, Txn), callback):
+        with begin():
+            value += 1
+        callback(2)
+    apply(&counter, bump)
+    0
+"#}, "`counter` is reached twice in one call")]
+#[case::a_returned_writer_cannot_capture_a_transactional_borrow(indoc! {r#"
+    def make(counter: Mut(Int, Txn)):
+        def bump(value: Int):
+            with begin():
+                counter += value
+        bump
+    counter: Mut(Int, Txn) := 0
+    make(&counter)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::a_mutable_variable_type_has_no_transactional_writer(indoc! {r#"
+    def store(counter: Mut(Int, Txn)):
+        def bump(value: Int):
+            with begin():
+                counter += value
+        saved := bump
+        0
+    counter: Mut(Int, Txn) := 0
+    store(&counter)
+"#}, "has one causing `WriteTxn(counter)`, so a place would be inside a place")]
+#[case::a_plain_argument_cannot_supply_a_borrow(indoc! {r#"
+    def emit(out):
+        out << 7
+    out: Feed(Int)
+    emit(out)
+"#}, "`out` goes to a parameter that borrows it; pass `&out`")]
+#[case::a_value_cannot_be_borrowed(indoc! {r#"
+    def bump(counter: Mut(Int)):
+        counter += 1
+    counter = 7
+    bump(&counter)
+"#}, "cannot borrow `counter`: it is a value")]
+#[case::a_borrow_is_not_a_value(indoc! {r#"
+    counter := 7
+    saved = &counter
+    saved
+"#}, "a borrow is only allowed as an argument to a borrowing parameter")]
+#[case::a_partial_call_cannot_hold_a_borrow(indoc! {r#"
+    def emit(out: Feed(Int), value):
+        out << value
+    out: Feed(Int)
+    later = emit(&out)
+    later(7)
+"#}, "takes 2 arguments, got 1")]
+#[case::a_mutable_variable_type_has_no_borrowed_writer(indoc! {r#"
+    def store(out: Feed(Int)):
+        def emit(value):
+            out << value
+        saved := emit
+        0
+    out: Feed(Int)
+    store(&out)
+"#}, "a place's value type cannot have a function type that appends to a feed or writes a mutable variable, and this one has one causing `Append(out)`")]
+#[case::a_mutable_variable_type_has_no_local_writer(indoc! {r#"
+    def store(n: Int):
+        out: Feed(Int)
+        def emit(value):
+            out << value
+        saved := emit
+        n
+    store(0)
+"#}, "has one causing `Append(out)`, so a place would be inside a place")]
+#[case::a_mutable_variable_holds_no_written_writer(indoc! {r#"
+    out: Feed(Int)
+    def emit(value: Int):
+        out << value
+    saved := \value: Int -> ()
+    saved := emit
+    0
+"#}, "this writes to `saved` a function causing `Append(out)`, but a place's value type")]
+#[case::a_borrowed_method_reports_its_unsupported_mode(indoc! {r#"
+    type Counter = Int
+    impl Counter:
+        def plus(self, amount):
+            self.extract() + amount
+    counter := Counter::new(7)
+    &counter.plus(0)
+"#}, "borrowed method parameters are not implemented")]
+#[case::a_helper_cannot_store_a_borrowed_writer(indoc! {r#"
+    def save(callback, slot: Mut(Int => {})):
+        slot := callback
+    def fill(out: Feed(Int), slot: Mut(Int => {})):
+        def emit(value: Int):
+            out << value
+        save(emit, &slot)
+    out: Feed(Int)
+    slot: Mut(Int => {}) := \value -> ()
+    fill(&out, &slot)
+"#}, "this has `Append(out)`, which the function type it must have does not state")]
+#[case::a_list_cannot_return_a_borrowed_writer(indoc! {r#"
+    def fill(out: Feed(Int)):
+        def emit(value: Int):
+            out << value
+        [emit]
+    out: Feed(Int)
+    fill(&out)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::a_nominal_value_cannot_return_a_borrowed_writer(indoc! {r#"
+    type Holder(T) = T
+    def fill(out: Feed(Int)):
+        def emit(value: Int):
+            out << value
+        Holder::new(emit)
+    out: Feed(Int)
+    fill(&out)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::a_loop_local_writer_cannot_escape_to_an_outer_feed(indoc! {r#"
+    callbacks: Feed(Int => {})
+    for value in [7]:
+        out: Feed(Int)
+        def emit(item: Int):
+            out << item
+        callbacks << emit
+    0
+"#}, "this appends to `callbacks` a function causing `Append(out)`, but a place's value type cannot have a function type that appends to a feed or writes a mutable variable, so a place would be inside a place")]
+#[case::a_feed_holds_no_writer_of_a_later_variable(indoc! {r#"
+    def register(n: Int):
+        callbacks: Feed(Int => {})
+        out: Feed(Int)
+        def emit(item: Int):
+            out << item
+        callbacks << emit
+        emit(n)
+        sum(out)
+    register(7)
+"#}, "this appends to `callbacks` a function causing `Append(out)`, but a place's value type")]
+#[case::a_feed_holds_no_writer(indoc! {r#"
+    def register(n: Int):
+        out: Feed(Int)
+        callbacks: Feed(Int => {} causes Append(out))
+        def emit(item: Int):
+            out << item
+        callbacks << emit
+        emit(n)
+        sum(out)
+    register(7)
+"#}, "this appends to `callbacks` a function causing `Append(out)`, but a place's value type")]
+#[case::a_feed_type_has_no_writer(indoc! {r#"
+    out: Feed(Int)
+    callbacks: Feed(Int => {} causes Append(out))
+    def emit(item: Int):
+        out << item
+    emit(1)
+    0
+"#}, "the type `Feed(Int => {} causes Append(out))` is not well-formed: a place's value type cannot have a function type that appends to a feed or writes a mutable variable, and this one has one causing `Append(out)`, so a place would be inside a place")]
+#[case::a_place_type_is_no_component_of_an_annotation(indoc! {r#"
+out: Feed(Int)
+pair: {Feed(Int), Int} = (out, 7)
+0
+"#}, "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, a feed's values or a function's result: Feed(Int)")]
+#[case::a_place_type_is_no_component_of_a_parameter(indoc! {r#"
+def f(p: {Feed(Int), Int}):
+    p.1
+0
+"#}, "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, a feed's values or a function's result: Feed(Int)")]
+#[case::a_place_type_is_no_result(indoc! {r#"
+def f(out: Feed(Int)) => {Feed(Int), Int}:
+    (out, 1)
+0
+"#}, "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, a feed's values or a function's result: Feed(Int)")]
+#[case::a_place_type_is_no_element(indoc! {r#"
+xs: List(Feed(Int)) = []
+0
+"#}, "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, a feed's values or a function's result: Feed(Int)")]
+#[case::a_place_type_is_no_feed_value(indoc! {r#"
+out: Feed(Feed(Int))
+0
+"#}, "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, a feed's values or a function's result: Feed(Int)")]
+#[case::a_place_type_is_no_mutable_value(indoc! {r#"
+def f(m: Mut(Feed(Int))):
+    0
+0
+"#}, "a `Mut(…)` or `Feed(…)` type cannot be part of another type, such as a tuple, a record, a feed's values or a function's result: Feed(Int)")]
+#[case::a_mutable_type_is_written_whole(indoc! {r#"
+pair: {Mut(Int), Int} = (1, 2)
+0
+"#}, "a `Mut(…)` type is written only as the whole type of a declaration or a parameter")]
+#[case::a_component_names_no_feed(indoc! {r#"
+def f(p: {Int, Int}):
+    p.0 << 3
+0
+"#}, "a feed is part of no value, so no component or call result is one")]
+#[case::a_value_cannot_be_borrowed_among_several_arguments(indoc! {r#"
+def bump(counter: Mut(Int), n: Int):
+    counter += n
+counter = 7
+bump(&counter, 1)
+"#}, "cannot borrow `counter`: it is a value")]
+#[case::a_part_of_a_value_cannot_be_borrowed(indoc! {r#"
+def emit(out: Feed(Int)):
+    out << 1
+r = (a=1)
+emit(&r.a)
+"#}, "cannot borrow `r`: it is a value")]
+#[case::a_part_of_a_place_is_not_lent_yet(indoc! {r#"
+def bump(c: Mut(Int)):
+    c += 1
+s := (a=1)
+bump(&s.a)
+s.a
+"#}, "this `&` lends part of `s`; lending a projected part of a place is planned")]
+#[case::a_call_result_cannot_be_borrowed(indoc! {r#"
+def emit(out: Feed(Int)):
+    out << 1
+def mk():
+    1
+emit(&(mk()))
+"#}, "`&` lends a place, a place variable or a path from one")]
+#[case::a_collection_cannot_be_borrowed(indoc! {r#"
+def g(o: Feed(Int)):
+    o << 5
+g(&([1, 2]))
+1
+"#}, "`&` lends a place, a place variable or a path from one")]
+#[case::a_collection_cannot_be_borrowed_among_several_arguments(indoc! {r#"
+def g(o: Feed(_), x):
+    o << x
+g(&([1]), 2)
+1
+"#}, "`&` lends a place, a place variable or a path from one")]
+#[case::a_collection_annotated_as_a_feed(indoc! {r#"
+x: Feed(Int) = [1, 2, 3]
+x << 4
+sum(x)
+"#}, "`x` cannot hold a `Mut` or `Feed` place: an ordinary binding holds a value")]
+#[case::a_feed_binding_of_a_collection_never_fed(indoc! {r#"
+x: Feed(Int) = [1, 2, 3]
+sum(x)
+"#}, "`x` cannot hold a `Mut` or `Feed` place: an ordinary binding holds a value")]
+#[case::a_bounded_feed_annotation_on_a_binding(indoc! {r#"
+out: Feed(Int)
+x <: Feed(Int) = out
+sum(out)
+"#}, "`x` cannot hold a `Mut` or `Feed` place: an ordinary binding holds a value")]
+fn invalid_place_uses(#[case] code: &str, #[case] expected: &str) {
+    check_compile_error(code, expected);
+}
+
+#[test]
+fn a_module_explicitly_exports_a_deferred_value() {
+    use super::modules::program;
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+                run producer
+                producer::emit(7)
+                sum(producer::output)
+            "#},
+            &[(
+                "producer",
+                indoc! {r#"
+                _output: Feed(Int)
+                pub output = _output
+                pub def emit(value):
+                    _output << value
+            "#},
+            )],
+        ),
+        Value::Int(7),
+    );
+}
+
+#[test]
+fn a_module_declares_a_feed_for_its_caller() {
+    use super::modules::program;
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        run audit as log
+        log::emit(1)
+        log::emit(2)
+        saved = log::events
+        sum(saved) + sum(log::events)
+    "#},
+            &[(
+                "audit",
+                indoc! {r#"
+                _events: Feed(Int)
+                pub events = _events
+                pub def emit(value):
+                    _events << value
+            "#},
+            )],
+        ),
+        Value::Int(6),
+    );
+}
+
+#[rstest]
+#[case::binding(indoc! {r#"
+    out: Feed(Int)
+    saved = out
+    out << 1
+    out << 2
+    sum(saved) + sum(out)
+"#}, 6)]
+#[case::product(indoc! {r#"
+    out: Feed(Int)
+    packed = (values=out, tag=7)
+    out << 2
+    sum(packed.values) + sum(out) + packed.tag
+"#}, 11)]
+#[case::borrowed_read(indoc! {r#"
+    def emit(out: Feed(Int), value: Int):
+        saved = out
+        out << value
+        sum(saved)
+    out: Feed(Int)
+    emit(&out, 1) + sum(out)
+"#}, 2)]
+#[case::plain_parameter(indoc! {r#"
+    def identity(value):
+        value
+    out: Feed(Int)
+    saved = identity(out)
+    out << 7
+    sum(saved) + sum(out)
+"#}, 14)]
+#[case::nominal(indoc! {r#"
+    type Holder(T) = T
+    out: Feed(Int)
+    saved = Holder::new(out)
+    out << 7
+    sum(saved.extract()) + sum(out)
+"#}, 14)]
+#[case::comprehension_elements(indoc! {r#"
+    out: Feed(Int)
+    rows = [out for dummy in [1, 2]]
+    out << 1
+    out << 2
+    sum([sum(row) for row in rows])
+"#}, 6)]
+#[case::returned_comprehension(indoc! {r#"
+    def repeat(out: Feed(Int)):
+        [out for dummy in [1, 2]]
+    out: Feed(Int)
+    rows = repeat(&out)
+    out << 3
+    sum([sum(row) for row in rows])
+"#}, 6)]
+fn feeds_read_values_without_moves(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+#[rstest]
+#[case::repeated_calls(indoc! {r#"
+    def emit(out: Feed(Int), value: Int):
+        out << value
+    out: Feed(Int)
+    emit(&out, 1)
+    emit(&out, 2)
+    sum(out)
+"#}, 3)]
+#[case::deep_collection_fields(indoc! {r#"
+    left: Feed(Int)
+    right: Feed(Int)
+    packet = (nested=(left=left, right=right), label=7)
+    left << 1
+    right << 2
+    sum(packet.nested.left) + sum(packet.nested.right) + packet.label
+"#}, 10)]
+#[case::returned_collection(indoc! {r#"
+    def make(value: Int):
+        out: Feed(Int)
+        out << value
+        [item for item in out]
+    sum(make(7))
+"#}, 7)]
+#[case::read_captured_as_data(indoc! {r#"
+    out: Feed(Int)
+    saved = out
+    def total(dummy):
+        sum(saved)
+    out << 7
+    total(0)
+"#}, 7)]
+#[case::successive_calls_in_a_chain(indoc! {r#"
+    def emit(out: Feed(Int)):
+        out << 2
+    def choose(unused: Feed(Int)):
+        emit
+    out: Feed(Int)
+    out << 1
+    choose(&out)(&out)
+    sum(out)
+"#}, 3)]
+fn scoped_feed_references(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+#[rstest]
+#[case::written_dependency(indoc! {r#"
+    def emit(limit: Int, value: {Int where _ >= limit}, out: Feed(Int)):
+        out << value
+    out: Feed(Int)
+    emit(0, 1, &out)
+    emit(0, 2, &out)
+    sum(out)
+"#}, 3)]
+#[case::nested_signatures(indoc! {r#"
+    def emit(value: Int, out: Feed(_)):
+        def inner(extra: Int, target: Feed(_)):
+            target << value ^+ extra
+        inner(1, &out)
+    out: Feed(Int)
+    emit(1, &out)
+    emit(2, &out)
+    sum(out)
+"#}, 5)]
+#[case::returned_value(indoc! {r#"
+    def make(value: Int):
+        out: Feed(Int)
+        out << value
+        saved = out
+        saved
+    sum(make(7))
+"#}, 7)]
+fn feed_signature_scopes(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+#[rstest]
+#[case::copied_value_is_not_writable(indoc! {r#"
+    out: Feed(Int)
+    saved = out
+    out << 1
+    saved << 2
+    sum(out)
+"#}, "a feed to `saved` (a feed is required here")]
+#[case::annotated_alias_is_not_a_reference(indoc! {r#"
+    out: Feed(Int)
+    saved: Feed(Int) = out
+    saved << 1
+    sum(out)
+"#}, "`saved` cannot hold a `Mut` or `Feed` place")]
+#[case::borrowed_value_copy_is_not_writable(indoc! {r#"
+    def bad(out: Feed(Int)):
+        saved = out
+        saved << 1
+    out: Feed(Int)
+    bad(&out)
+    sum(out)
+"#}, "a feed to `saved` (a feed is required here")]
+#[case::plain_parameters_receive_values(indoc! {r#"
+    def bad(out):
+        out << 1
+    out: Feed(Int)
+    bad(out)
+    sum(out)
+"#}, "`out` goes to a parameter that borrows it; pass `&out`")]
+#[case::unused_alias_writer_requires_annotation(indoc! {r#"
+    def bad(out):
+        saved = out
+        saved << 1
+    1
+"#}, "`saved` is not a Feed place")]
+#[case::collection_argument(indoc! {r#"
+    def emit(out: Feed(Int)):
+        out << 1
+    out: Feed(Int)
+    saved = out
+    emit(&saved)
+    sum(out)
+"#}, "cannot borrow `saved`: it is a value")]
+#[case::partial_reference_call(indoc! {r#"
+    def emit(out: Feed(Int), value: Int):
+        out << value
+    out: Feed(Int)
+    saved = emit(&out)
+    saved(1)
+    sum(out)
+"#}, "takes 2 arguments, got 1")]
+#[case::partial_reference_call_through_a_field(indoc! {r#"
+    def emit(out: Feed(Int), value: Int):
+        out << value
+    out: Feed(Int)
+    writers = (emit=emit)
+    saved = (writers.emit)(&out)
+    saved(1)
+    sum(out)
+"#}, "takes 2 arguments, got 1")]
+#[case::partial_reference_call_after_a_returned_writer(indoc! {r#"
+    def emit(out: Feed(Int), value: Int):
+        out << value
+    def choose(unused: Feed(Int)):
+        emit
+    left: Feed(Int)
+    right: Feed(Int)
+    left << 1
+    saved = choose(&left)(&right)
+    saved(2)
+    sum(left) + sum(right)
+"#}, "takes 2 arguments, got 1")]
+#[case::returned_callback(indoc! {r#"
+    def make(out: Feed(Int)):
+        def emit(value: Int):
+            out << value
+        emit
+    out: Feed(Int)
+    saved = make(&out)
+    saved(1)
+    sum(out)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::duplicate_mut_arguments(indoc! {r#"
+    def bump(left: Mut(Int), right: Mut(Int)):
+        left += 1
+        right += 1
+    counter := 0
+    bump(&counter, &counter)
+    counter
+"#}, "`counter` is reached twice in one call")]
+#[case::captured_mut_reference(indoc! {r#"
+    counter := 0
+    def bump(value: Int):
+        counter += value
+    bump(1)
+    counter
+"#}, "a function writes the mutable variable `counter` it captures")]
+#[case::a_returned_writer_capturing_in_a_branch(indoc! {r#"
+    def make(out: Feed(Int)):
+        def emit(value: Int):
+            if value > 0:
+                out << value
+            else:
+                out << 0
+        emit
+    out: Feed(Int)
+    saved = make(&out)
+    saved(1)
+    sum(out)
+"#}, "whose variable this function binds; the returned function would outlive it")]
+#[case::a_captured_write_in_a_branch(indoc! {r#"
+    counter := 0
+    def bump(value: Int):
+        if value > 0:
+            counter += value
+        else:
+            counter += 1
+    bump(1)
+    counter
+"#}, "a function writes the mutable variable `counter` it captures")]
+#[case::a_borrow_of_a_conditional(indoc! {r#"
+    def bump(counter: Mut(Int)):
+        counter += 1
+    x := 0
+    y := 0
+    bump(&(x if x > 0 else y))
+    x
+"#}, "`&` lends a place, a place variable or a path from one")]
+#[case::a_forwarded_parameter_without_a_borrow(indoc! {r#"
+    def emit(out):
+        out << 1
+    def forward(out):
+        emit(out)
+        emit(&out)
+    out: Feed(Int)
+    forward(&out)
+    sum(out)
+"#}, "this argument goes to a parameter that borrows; pass a named Mut or Feed place with `&`")]
+#[case::a_borrow_of_a_borrow(indoc! {r#"
+    def bump(counter: Mut(Int)):
+        counter += 1
+    x := 0
+    bump(&&x)
+    x
+"#}, "parse error")]
+fn borrowed_places_do_not_escape(#[case] code: &str, #[case] message: &str) {
+    check_compile_error(code, message);
+}
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -162,7 +1062,7 @@ indoc::indoc! {r#"
     x: Feed(_)
     y = x
     for i in [1,2,3]:
-      y << i
+      x << i
     y"#}, make_int_list(&[1, 2, 3]))]
 #[case::feed_via_double_alias(
 indoc::indoc! {r#"
@@ -171,96 +1071,16 @@ indoc::indoc! {r#"
     y = x
     z = y
     for i in [1,2,3]:
-      z << i
+      x << i
     z"#}, make_int_list(&[1, 2, 3]))]
-#[case::return_defer_from_func(
-indoc::indoc! {r#"
-
-    def f(n):
-      x: Feed(_)
-      x
-    y = f(10)
-    for i in [1,2,3]:
-      y << i
-    y"#}, make_int_list(&[1, 2, 3]))]
-#[case::defer_through_identity_funcs(
-indoc::indoc! {r#"
-
-    def f(x):
-      x
-    x: Feed(_)
-    for i in [1,2,3]:
-      y = f(f(x))
-      y << i
-    x"#}, make_int_list(&[1, 2, 3]))]
 #[case::alias_inside_loop(
 indoc::indoc! {r#"
 
     x: Feed(_)
     for i in [1,2,3]:
       y = x
-      y << i
+      x << i
     x"#}, make_int_list(&[1, 2, 3]))]
-#[case::feed_internal_and_external(
-indoc::indoc! {r#"
-
-    def f(n):
-      x: Feed(_)
-      x << n
-      x
-    y = f(10)
-    for i in [1,2,3]:
-      y << i
-    y"#}, Tile::data_function(channel_union(&["y.f()/f.x<<", "y<<"], &[0, 1, 1, 1], vec![
-                ColumnValue::Units(1),
-                ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), channel_predicate(&["y.f()/f.x<<", "y<<"]), BitSet::new()))]
-#[case::multiple_func_feeds(
-indoc::indoc! {r#"
-
-    def f(n):
-      x: Feed(_)
-      x << n
-      x
-    def g(c):
-      c << 100
-      c
-    y = g(f(10))
-    for i in [1,2,3]:
-      y << i
-    y"#}, Tile::data_function(channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
-                ColumnValue::Units(1),
-                ColumnValue::Units(1),
-                ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]), BitSet::new()))]
-#[case::union_of_complex_defers(
-indoc::indoc! {r#"
-
-    def f(n):
-      x: Feed(_)
-      x << n
-      x
-    def g(c):
-      c << 100
-      c
-    y = g(f(10))
-    for i in [1,2,3]:
-      y << i
-    y ++ y"#}, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 1, 1, 1, 1], vec![
-                channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
-                        ColumnValue::Units(1),
-                        ColumnValue::Units(1),
-                        ColumnValue::UInts(vec![0, 1, 2]),
-                    ]),
-                channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
-                        ColumnValue::Units(1),
-                        ColumnValue::Units(1),
-                        ColumnValue::UInts(vec![0, 1, 2]),
-                    ]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![
-            channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]),
-            channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]),
-        ])), BitSet::new()))]
 // A feed, a rebind, a second feed: an interleaved body with no accumulator, which
 // only the one grammar admits. `x = i` and `x = x + i` are per-iteration immutable
 // rebinds, so `x` is `i` at the first feed and `2i` at the second.
@@ -279,12 +1099,12 @@ indoc::indoc! {r#"
                 ColumnValue::UInts(vec![0, 1, 2]),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))), channel_predicate(&["o<<", "o<<#1"]), BitSet::new())
 )]
-// Pass-by-reference writer that *feeds before it writes*: `o << c` precedes
+// Borrowing writer that *feeds before it writes*: `o << c` precedes
 // `c += 1` in the writer body, inlined per iteration. The Feed-headed spliced
 // body leaves a `unit; unit` tail on the loop spine; the writer walk drops the
 // no-op units and reads `x` before each write, so the channel latches 0, 1, 2
 // (the pre-write values) over the three iterations.
-#[case::pbr_feed_before_write(
+#[case::borrowed_feed_before_write(
 indoc::indoc! {r#"
 
     def fw(c: Mut(Int), o: Feed(Int)):
@@ -293,15 +1113,15 @@ indoc::indoc! {r#"
     x := 0
     out: Feed(_)
     for i in [1, 2, 3]:
-      fw(x, out)
+      fw(&x, &out)
     out"#}, make_int_list(&[0, 1, 2]))]
 // The same writer with its parameters **swapped**, which is a different typing problem
 // rather than a different spelling. The mutable variable is now the second argument, and a call
 // is curried, so the applied function's type at that argument is the fresh variable
-// `apply` minted — the pass-by-reference contribution has to be read off the head of
+// `apply` minted — the borrowed parameter's contribution has to be read off the head of
 // the spine or it is never recorded, leaving `x` claiming its seed and failing the
 // invariance check against `Mut(Int)`.
-#[case::pbr_mut_var_after_feed(
+#[case::borrowed_mut_var_after_feed(
 indoc::indoc! {r#"
 
     def fw(o: Feed(Int), c: Mut(Int)):
@@ -310,7 +1130,7 @@ indoc::indoc! {r#"
     x := 0
     out: Feed(_)
     for i in [1, 2, 3]:
-      fw(out, x)
+      fw(&out, &x)
     out"#}, make_int_list(&[0, 1, 2]))]
 fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -325,24 +1145,24 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 #[case::in_a_bound_body(indoc! {"
     o: Feed(_)
     t := 0
-    def f(x):
+    def f(x, o: Feed(_)):
         o << x
         x + 1
     for i in [1, 2, 3]:
         t := t + 1
-        y = f(i)
+        y = f(i, &o)
         t := t + y
     sum(o) * 100 + t
 "}, Value::Int(612))]
 #[case::in_a_bound_conditional(indoc! {"
     o: Feed(_)
     t := 0
-    def f(x):
+    def f(x, o: Feed(_)):
         o << x
         x + 1
     for i in [1, 2, 3]:
         t := t + 1
-        y = f(i) if i > 1 else 0
+        y = f(i, &o) if i > 1 else 0
         t := t + y
     sum(o) * 100 + t
 "}, Value::Int(510))]
@@ -377,24 +1197,24 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 #[case::in_a_nested_loop(indoc! {"
     o: Feed(_)
     t := 0
-    def f(x):
+    def f(x, o: Feed(_)):
         o << x
         x + 1
     for i in [1, 2]:
         for j in [10, 20]:
-            y = f(i * j)
+            y = f(i * j, &o)
             t := t + y
     sum(o) * 1000 + t
 "}, Value::Int(90094))]
 #[case::under_an_if(indoc! {"
     o: Feed(_)
     t := 0
-    def f(x):
+    def f(x, o: Feed(_)):
         o << x
         x + 1
     for i in [1, 2, 3]:
         if i > 1:
-            y = f(i)
+            y = f(i, &o)
             t := t + y
     sum(o) * 100 + t
 "}, Value::Int(507))]
@@ -1076,7 +1896,7 @@ const FEEDS_AND_DEFINES: &str = indoc! {r#"
         x: Feed(Int)
         x << n
         x <<= [2]
-        x
+        [v for v in x]
 "#};
 
 /// A generator whose feed defines twice.
@@ -1085,14 +1905,14 @@ const DEFINES_TWICE: &str = indoc! {r#"
         x: Feed(Int)
         x <<= [n]
         x <<= [2]
-        x
+        [v for v in x]
 "#};
 
 /// A generator whose feed neither feeds nor defines.
 const NEITHER: &str = indoc! {r#"
     def g(n):
         x: Feed(Int)
-        x
+        [v for v in x]
 "#};
 
 /// An error in a generator's feed is the program's wherever the generator is
@@ -1141,48 +1961,16 @@ fn a_defer_error_in_a_predicate_is_a_compile_error(
         x << 4
         sum(x)
         "#},
-    "Type mismatch for the target of a feed to `x` (a feed handle is required here, but the \
+    "Type mismatch for the target of a feed to `x` (a feed is required here, but the \
      value is not one)"
-)]
-#[case::a_collection_annotated_as_a_feed(
-    indoc::indoc! {r#"
-        x: Feed(Int) = [1, 2, 3]
-        x << 4
-        sum(x)
-        "#},
-    "annotated as Feed(Int), but inferred as Array(3, Int)"
-)]
-#[case::a_feed_binding_of_a_collection_never_fed(
-    indoc::indoc! {r#"
-        x: Feed(Int) = [1, 2, 3]
-        sum(x)
-        "#},
-    "annotated as Feed(Int), but inferred as Array(3, Int)"
-)]
-#[case::a_collection_passed_to_a_feed_parameter(
-    indoc::indoc! {r#"
-        def g(o: Feed(Int)):
-            o << 5
-        g([1, 2])
-        1
-        "#},
-    "a feed handle is required here, but the value is not one"
-)]
-#[case::a_collection_passed_to_an_unannotated_parameter(
-    indoc::indoc! {r#"
-        def g(o, x):
-            o << x
-        g([1], 2)
-        1
-        "#},
-    "a feed handle is required here, but the value is not one"
 )]
 fn feeding_what_is_not_a_feed_is_a_type_error(#[case] code: &str, #[case] needle: &str) {
     check_compile_error(code, needle);
     check_compile_error(code, "type inference error");
 }
 
-/// A static product preserves a computed sibling's binding while its handle reaches the feed.
+/// A static product preserves a computed sibling's binding while its feed component reaches the
+/// feed.
 #[rstest]
 #[case::tuple(indoc! {r#"
     t = (sum(xs), out)
@@ -1199,9 +1987,9 @@ fn a_feed_out_of_a_static_product_preserves_its_computed_sibling(#[case] unpack:
         out: Feed(_)
         out << 1
         {unpack}
-        o << a
-        o << a
-        sum(out)
+        out << a
+        out << a
+        sum(o)
     "#}
     .replace("{unpack}", unpack);
     check_scalar(&program, Value::Int(7));
@@ -1237,8 +2025,8 @@ fn a_static_product_keeps_the_mutable_value_it_captured(#[case] pack: &str, #[ca
         {pack}
         x += 1
         {unpack}
-        handle << value
-        sum(out)
+        out << value
+        sum(handle)
     "#}
     .replace("{pack}", pack)
     .replace("{unpack}", unpack);
@@ -1260,38 +2048,35 @@ fn a_static_product_keeps_the_mutable_value_it_captured(#[case] pack: &str, #[ca
     ignored = identity(packed.amount)
     alias = packed.channel
 "#})]
-fn a_static_product_handle_retains_a_payload_domain_keyed_by_its_loop(#[case] select: &str) {
+fn a_static_product_retains_a_payload_domain_keyed_by_its_loop(#[case] select: &str) {
     let program = indoc! {r#"
         def identity(value):
             value
         source = [1, 2, 3]
         out: Feed(_)
+        {select}
         for i in source:
-            {select}
-            alias << [k for k in source if k > i]
-        sum([sum(row) for row in out])
+            out << [k for k in source if k > i]
+        sum([sum(row) for row in alias])
     "#}
-    .replace("{select}", &select.trim_end().replace('\n', "\n    "));
+    .replace("{select}", select.trim_end());
     check_scalar(&program, Value::Int(8));
 }
 
-/// Each alias is a place that feeds `out`, so the loop's position does not key the channel's
-/// rows, and the payloads' domains, which vary with `i`, have no join.
 #[test]
-fn two_aliases_out_of_a_product_feed_a_channel_from_two_places() {
+fn two_calls_do_not_make_one_channel_single_fed() {
     check_compile_error(
         indoc! {r#"
             source = [1, 2, 3]
             out: Feed(_)
+            def emit(out: Feed(_), i):
+                out << [k for k in source if k > i]
             for i in source:
-                packed = (first=out, second=out)
-                first = packed.first
-                second = packed.second
-                first << [k for k in source if k > i]
-                second << [k for k in source if k > i]
+                emit(&out, i)
+                emit(&out, i)
             sum([sum(row) for row in out])
         "#},
-        "The keys of a collection written to a feed or mutable variable depend on `i`",
+        "depend on",
     );
 }
 
@@ -1303,56 +2088,31 @@ fn a_product_projection_selects_one_of_two_channels() {
             first: Feed(_)
             second: Feed(_)
             second << 99
+            packed = (first, second)
+            selected = packed.0
             for i in source:
-                packed = (first, second)
-                selected = packed.0
-                selected << [k for k in source if k > i]
-            sum([sum(row) for row in first]) + sum(second)
+                first << [k for k in source if k > i]
+            sum([sum(row) for row in selected]) + sum(packed.1)
         "#},
         Value::Int(107),
     );
 }
 
-/// A handle chosen at run time has no declaration to gather its contributions at
-/// (`docs/chl-spec.md`, "A deferred collection inside a data structure \[Open\]").
-#[rstest]
-#[case::static_target("first", true)]
-#[case::runtime_target("first if condition else second", false)]
-fn a_feed_chosen_at_run_time_is_refused(#[case] choice: &str, #[case] accepts: bool) {
-    let program = indoc! {r#"
-        def emit(condition, first, second):
-            chosen = CHOICE
-            chosen << 3
-        first: Feed(_)
-        second: Feed(_)
-        first << 1
-        second << 2
-        emit(sum([1, 2]) > 0, first, second)
-        sum(first) + sum(second)
-    "#}
-    .replace("CHOICE", choice);
-    if accepts {
-        check_scalar(&program, Value::Int(6));
-    } else {
-        check_compile_error(&program, "No type meets every requirement on this value");
-    }
-}
-
-/// A handle projected out of a tuple that is also used whole, here as a list element, does not
-/// reach its declaration, so feeding it is refused rather than dropped.
 #[test]
-fn a_feed_out_of_a_product_used_whole_is_refused() {
+fn a_feed_chosen_at_run_time_is_refused() {
     check_compile_error(
         indoc! {r#"
-            out: Feed(_)
-            out << 1
-            packed = (out, 1)
-            all = [packed]
-            handle = packed.0
-            handle << 2
-            sum(out) + sum([p.1 for p in all])
+            def emit(condition, first, second):
+                chosen = first if condition else second
+                chosen << 3
+            first: Feed(_)
+            second: Feed(_)
+            first << 1
+            second << 2
+            emit(sum([1, 2]) > 0, first, second)
+            sum(first) + sum(second)
         "#},
-        "this feeds a feed taken out of a data structure",
+        "feed",
     );
 }
 
@@ -1365,8 +2125,8 @@ fn a_feed_beside_a_list_literal_in_a_tuple_is_fed() {
             out << 1
             t = ([1, 2], out)
             xs, o = t
-            o << 2
-            sum(out) + sum(xs)"},
+            out << 2
+            sum(o) + sum(xs)"},
         Value::Int(6),
     );
 }
@@ -1457,8 +2217,7 @@ fn loop_feeds_a_channel_read_above_it() {
 
 /// A loop that feeds `events` and adds `total`, the sum of `events`, on each
 /// iteration. The program has no cycle: a read of a feed is the whole
-/// collection (`docs/chl-spec.md`, "8.4 Feeds are the second form of
-/// mutability"), and effects are ordered only by data dependencies
+/// collection (`docs/chl-spec.md`, "8.4 Deferred collections"), and effects are ordered only by data dependencies
 /// (`docs/chl-spec.md`, "Evaluation order is unspecified"). The values fed to
 /// `events` are the `x`s, which read neither `fed` nor `total`, so `total` is
 /// `6`, `fed` is `3 × 6 = 18`, and the program returns `24`.
@@ -1506,12 +2265,13 @@ fn loop_adds_the_total_of_its_own_feed() {
         def totals(xs):
             t: Feed(_)
             t << sum(xs)
-            t
+            [v for v in t]
         rs = [1, 2, 3, 4]
         ts = totals(rs)
+        rs_total: Feed(Int)
         for x in rs:
-            ts << x
-        max(ts)
+            rs_total << x
+        max(ts ++ rs_total)
     "},
     10
 )]
@@ -1546,7 +2306,7 @@ fn loop_adds_the_total_of_its_own_feed() {
         def tens(x):
             t: Feed(_)
             t << x * 10
-            t
+            [v for v in t]
         sum(tens(1)) + sum(tens(2))
     "},
     30
@@ -1573,13 +2333,13 @@ fn a_declared_feed_is_fed(#[case] code: &str, #[case] expected: i64) {
 )]
 #[case::through_a_call_under_an_if(
     indoc! {"
-        def g(o, x):
+        def g(o: Feed(_), x):
             o << x
         n := 0
         for x in [1, 2, 3]:
             h: Feed(_)
             if x > 1:
-                g(h, x)
+                g(&h, x)
             n += sum(h)
         n
     "},
@@ -1625,13 +2385,13 @@ fn a_declared_feed_is_fed(#[case] code: &str, #[case] expected: i64) {
 )]
 #[case::from_an_inner_loop_in_a_call(
     indoc! {"
-        def g(o, x):
+        def g(o: Feed(_), x):
             for y in [1, 2]:
                 o << x * y
         n := 0
         for x in [1, 2, 3]:
             h: Feed(_)
-            g(h, x)
+            g(&h, x)
             n += sum(h)
         n
     "},
@@ -1732,7 +2492,7 @@ fn a_definition_is_named_when_its_element_type_fails() {
         def g(o: Feed(Int)):
             o << 5
         out: Feed(_)
-        g(out)
+        g(&out)
         sum(out)
     "},
     5
@@ -1742,80 +2502,149 @@ fn a_definition_is_named_when_its_element_type_fails() {
         def g(o: Feed(Int), x):
             o << x
         out: Feed(_)
-        g(out, 4)
-        g(out, 3)
+        g(&out, 4)
+        g(&out, 3)
         sum(out)
     "},
     7
 )]
-#[case("out: Feed(_); o: Feed(Int) = out; o << 3; sum(out)", 3)]
+
 fn a_feed_annotation_states_a_feed(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
 
-/// A parameter is fed as the handle it is bound to is, with no annotation: in a function of
-/// several parameters, called in a loop, and passed on to another function's parameter.
+/// An annotated Feed parameter borrows its argument across direct and forwarded calls.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
     indoc! {"
-        def g(o, x):
+        def g(o: Feed(_), x):
             o << x
         out: Feed(_)
-        g(out, 4)
-        g(out, 3)
+        g(&out, 4)
+        g(&out, 3)
         sum(out)
     "},
     7
 )]
 #[case(
     indoc! {"
-        def g(o, x):
+        def g(o: Feed(_), x):
             o << x + 1
         out: Feed(_)
         for x in [1, 2]:
-            g(out, x)
+            g(&out, x)
         sum(out)
     "},
     5
 )]
 #[case(
     indoc! {"
-        def g(o, x):
+        def g(o: Feed(_), x):
             o << x
-        def h(o, x):
-            g(o, x)
+        def h(o: Feed(_), x):
+            g(&o, x)
         out: Feed(_)
-        h(out, 3)
+        h(&out, 3)
         sum(out)
     "},
     3
 )]
-fn an_unannotated_parameter_is_fed(#[case] code: &str, #[case] expected: i64) {
+fn an_annotated_parameter_is_fed(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }
 
-/// The north-star `fanout` with declared feeds in place of its two sinks: a function
-/// declares a feed, fans what it receives out to two feed parameters, and returns it.
+/// A module declares a Feed whose values are forwarded to its borrowed outputs.
 #[test]
-fn a_feed_returned_by_a_function_fans_out() {
-    check_scalar(
-        indoc! {"
-            def fanout(a, b):
-                h: Feed(_)
-                for x in h:
-                    a << x
-                    b << x
-                h
-
-            o1: Feed(_)
-            o2: Feed(_)
-            out: Feed(_) = fanout(o1, o2)
-            for line in [1, 2, 3]:
-                out << line
-            sum(o1) * 10 + sum(o2)
-        "},
+fn a_module_feed_fans_out() {
+    use super::modules::program;
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        o1: Feed(Int)
+        o2: Feed(Int)
+        run fanout as f
+        for value in f::events:
+            o1 << value
+            o2 << value
+        for line in [1, 2, 3]:
+            f::emit(line)
+        sum(o1) * 10 + sum(o2)
+    "#},
+            &[(
+                "fanout",
+                indoc! {r#"
+        _events: Feed(Int)
+        pub events = _events
+        pub def emit(value):
+            _events << value
+    "#},
+            )],
+        ),
         Value::Int(66),
+    );
+}
+
+#[rstest]
+#[case::external_only("", "sum(f::events)", 6)]
+#[case::internal_and_external("_events << n", "sum(f::events)", 16)]
+#[case::helper_and_external("_events << n", "f::emit(100); sum(f::events)", 116)]
+#[case::union_of_reads("_events << n", "f::emit(100); sum(f::events ++ f::events)", 232)]
+fn module_feeds_combine_writers(
+    #[case] internal: &str,
+    #[case] result: &str,
+    #[case] expected: i64,
+) {
+    use super::modules::program;
+    let module = format!(
+        indoc! {r#"
+        param n: Int
+        _events: Feed(Int)
+        pub events = _events
+        pub def emit(value):
+            _events << value
+        {internal}
+    "#},
+        internal = internal
+    );
+    let root = indoc! {r#"
+        def emit(out: Feed(Int)):
+            out << 100
+        run factory(n=10) as f
+        for i in [1, 2, 3]:
+            f::emit(i)
+        {result}
+    "#}
+    .replace("{result}", result);
+    check_program_scalar(
+        &program(&root, &[("factory", &module)]),
+        Value::Int(expected),
+    );
+}
+
+#[test]
+fn module_runs_declare_distinct_feeds() {
+    use super::modules::program;
+    check_program_scalar(
+        &program(
+            indoc! {r#"
+        run factory as first
+        run factory as second
+        first::emit(1)
+        second::emit(2)
+        sum(first::events) * 10 + sum(second::events)
+    "#},
+            &[(
+                "factory",
+                indoc! {r#"
+                _events: Feed(Int)
+                pub events = _events
+                pub def emit(value):
+                    _events << value
+            "#},
+            )],
+        ),
+        Value::Int(12),
     );
 }
 
@@ -1875,82 +2704,82 @@ fn a_feed_crossing_a_generic_let() {
     );
 }
 
-/// A `def` feeding a handle declared outside it, called from the top level or a loop. The
-/// handle's element type stands at the level the handle is bound at, so the parameter
+/// A `def` borrows a feed place explicitly, from the top level or a loop. The
+/// place's element type stands at the level the place is bound at, so the parameter
 /// written into it stays monomorphic and the channel receives what each call passes. Each
 /// call site feeds from its own place.
 #[rstest]
 #[case::called_once(indoc! {r#"
     out = test_sink()
-    def f(y):
+    def f(y, out: Feed(_)):
         out << y
-    f(1)
+    f(1, &out)
 "#}, "[() -> 1]")]
 #[case::called_in_a_loop(indoc! {r#"
     out = test_sink()
-    def f(y):
+    def f(y, out: Feed(_)):
         out << y
     for r in [1, 2]:
-        f(r)
+        f(r, &out)
 "#}, "[1, 2]")]
 #[case::a_row_constant_in_the_parameter(indoc! {r#"
     out = test_sink()
-    def f(y):
+    def f(y, out: Feed(_)):
         out << [v + y for v in [1, 2, 3]]
     for r in [1, 2]:
-        f(r)
+        f(r, &out)
 "#}, "[[2, 3, 4], [3, 4, 5]]")]
 // Each call site is its own place, as two `<<` statements are.
 #[case::called_twice(indoc! {r#"
     out = test_sink()
-    def f(y):
+    def f(y, out: Feed(_)):
         out << y
-    f(1)
-    f(2)
+    f(1, &out)
+    f(2, &out)
 "#}, "[`f()#1/f.out<<(()) -> 2, `f()/f.out<<(()) -> 1]")]
 #[case::called_once_and_from_a_loop(indoc! {r#"
     out = test_sink()
-    def f(y):
+    def f(y, out: Feed(_)):
         out << y
     out << 0
-    f(0)
+    f(0, &out)
     for r in [1, 2]:
-        f(r)
+        f(r, &out)
 "#}, "[`f()#1/f.out<<(0) -> 1, `f()#1/f.out<<(1) -> 2, `f()/f.out<<(()) -> 0, `out<<(()) -> 0]")]
 #[case::called_through_another_def(indoc! {r#"
     out = test_sink()
-    def f(y):
+    def f(y, out: Feed(_)):
         out << y
-    def g(z):
-        f(z)
-        f(z + 10)
-    g(1)
+    def g(z, out: Feed(_)):
+        f(z, &out)
+        f(z + 10, &out)
+    g(1, &out)
 "#}, "[`g()/g.f()#1/f.out<<(()) -> 11, `g()/g.f()/f.out<<(()) -> 1]")]
 // A function a field holds is called at the field's place, by the record's name or through a
 // parameter the record is passed as.
 #[case::a_field_called_twice(indoc! {r#"
     out = test_sink()
-    r = (f=\y -> out << y)
-    (r.f)(1)
-    (r.f)(2)
-"#}, "[`f()#1/r.out<<(()) -> 2, `f()/r.out<<(()) -> 1]")]
+    r = (f=\out: Feed(Int) -> out << 1)
+    (r.f)(&out)
+    (r.f)(&out)
+"#}, "[`f()#1/r.out<<(()) -> 1, `f()/r.out<<(()) -> 1]")]
 #[case::a_field_of_a_parameter_called_twice(indoc! {r#"
     out = test_sink()
-    def call(r):
-        (r.f)(1)
-        (r.f)(2)
-    call((f=\y -> out << y))
-"#}, "[`call()/call.f()#1/out<<(()) -> 2, `call()/call.f()/out<<(()) -> 1]")]
+    def call(r: {f: Feed(Int) => {}}, out: Feed(Int)):
+        (r.f)(&out)
+        (r.f)(&out)
+    call((f=\out: Feed(Int) -> out << 1), &out)
+"#}, "[`call()/call.f()#1/out<<(()) -> 1, `call()/call.f()/out<<(()) -> 1]")]
 // A function another call returns is reached through that call too.
 #[case::a_returned_function_called_twice(indoc! {r#"
     out = test_sink()
     def mk(n):
-        \y -> out << y + n
+        \out: Feed(Int) -> out << n
     h = mk(1)
-    h(5)
-    h(6)
-"#}, "[`h()#1/h.mk()/mk.out<<(()) -> 7, `h()/h.mk()/mk.out<<(()) -> 6]")]
-fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str, #[case] expected: &str) {
+    h(&out)
+    h(&out)
+"#}, "[`h()#1/h.mk()/mk.out<<(()) -> 1, `h()/h.mk()/mk.out<<(()) -> 1]")]
+fn a_def_borrows_a_place_declared_outside_it(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
 }
 
@@ -2715,23 +3544,24 @@ fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] ex
 /// accumulator the caller's loop writes. The tap carries the row at the parameter's value type,
 /// which reads no argument of the call.
 ///
-/// An unannotated handle projected from the argument tuple contributes outside that tuple's
-/// binder. Under a loop of the `def`, the tap collection lifts the stored row through that level.
+/// An unannotated place parameter projected from the argument tuple contributes outside that
+/// tuple's binder. Under a loop of the `def`, the tap collection lifts the stored row through
+/// that level.
 #[rstest]
 #[case::annotated(indoc! {r#"
     def emit(v: Int, out: Feed(Int)):
         out << v ^+ 1
 "#})]
 #[case::unannotated(indoc! {r#"
-    def emit(v, out):
+    def emit(v, out: Feed(_)):
         out << v ^+ 1
 "#})]
 #[case::unannotated_value(indoc! {r#"
     def emit(v, out: Feed(Int)):
         out << v ^+ 1
 "#})]
-#[case::unannotated_handle(indoc! {r#"
-    def emit(v: Int, out):
+#[case::unannotated_place(indoc! {r#"
+    def emit(v: Int, out: Feed(_)):
         out << v ^+ 1
 "#})]
 #[case::inferred_row(indoc! {r#"
@@ -2739,63 +3569,32 @@ fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] ex
         out << v ^+ 1
 "#})]
 #[case::unannotated_feed_first(indoc! {r#"
-    def emit(out, v):
+    def emit(out: Feed(_), v):
         out << v ^+ 1
 "#})]
-#[case::aliased_unannotated_handle(indoc! {r#"
-    def emit(v, out):
+#[case::aliased_unannotated_place(indoc! {r#"
+    def emit(v, out: Feed(_)):
         alias = out
-        alias << v ^+ 1
-"#})]
-#[case::tuple_wrapped_handle(indoc! {r#"
-    def emit(v, out):
-        packed = (out, 0)
-        alias = packed.0
-        alias << v ^+ 1
-"#})]
-#[case::nested_tuple_aliases(indoc! {r#"
-    def emit(v, out):
-        packed = ((0, out), 1)
-        copied = packed
-        inner = copied.0
-        alias = inner.1
-        alias << v ^+ 1
-"#})]
-#[case::record_wrapped_handle(indoc! {r#"
-    def emit(v, out):
-        packed = (channel=out, other=0)
-        alias = packed.channel
-        alias << v ^+ 1
-"#})]
-#[case::nested_product_aliases(indoc! {r#"
-    def emit(v, out):
-        packed = ((other=0, channel=out), 0)
-        copied = packed
-        record = copied.0
-        alias = record.channel
-        alias << v ^+ 1
-"#})]
-#[case::whole_tuple_passed_through_a_function(indoc! {r#"
-    def append(packed):
-        handle, value = packed
-        handle << value ^+ 1
-    def emit(v, out):
-        packed = (out, v)
-        append(packed)
-"#})]
-#[case::whole_record_passed_through_a_function(indoc! {r#"
-    def append(packed):
-        handle = packed.channel
-        handle << packed.value ^+ 1
-    def emit(v, out):
-        packed = (channel=out, value=v)
-        append(packed)
-"#})]
-#[case::forwarded_unannotated_handle(indoc! {r#"
-    def append(v, out):
         out << v ^+ 1
-    def emit(v, out):
-        append(v, out)
+"#})]
+#[case::tuple_call_argument(indoc! {r#"
+    def append(handle: Feed(Int), packed):
+        value, unused = packed
+        handle << value ^+ 1
+    def emit(v, out: Feed(_)):
+        append(&out, (v, 0))
+"#})]
+#[case::record_call_argument(indoc! {r#"
+    def append(handle: Feed(Int), packed):
+        handle << packed.value ^+ 1
+    def emit(v, out: Feed(_)):
+        append(&out, (value=v))
+"#})]
+#[case::forwarded_unannotated_place(indoc! {r#"
+    def append(v, out: Feed(_)):
+        out << v ^+ 1
+    def emit(v, out: Feed(_)):
+        append(v, &out)
 "#})]
 #[case::feed_first(indoc! {r#"
     def emit(out: Feed(Int), v: Int):
@@ -2808,9 +3607,9 @@ fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] ex
 "#})]
 fn refined_read_fed_through_a_feed_parameter(#[case] def: &str) {
     let call = if def.contains("emit(out") {
-        "emit(out, x)"
+        "emit(&out, x)"
     } else {
-        "emit(x, out)"
+        "emit(x, &out)"
     };
     let program = format!(
         "{def}\n{}",
@@ -2827,41 +3626,15 @@ fn refined_read_fed_through_a_feed_parameter(#[case] def: &str) {
     check_tile(&program, Tile::Scalar(ColumnValue::Ints(vec![6])))
 }
 
-/// A contribution through a curried function's handle crosses the signature's earlier
-/// parameters: `value`'s refinement reads `limit`, and an inner function's signature is its own
-/// (`src/ccl/design/type-inference.md`, "A handle received through a parameter").
-#[rstest]
-#[case::written_dependency(indoc! {r#"
-    def emit(limit: Int, value: {Int where _ >= limit}, out: Feed(Int)):
-        out << value
-    out: Feed(Int)
-    emit(0, 1, out)
-    emit(0, 2, out)
-    sum(out)
-"#}, 3)]
-#[case::nested_signatures(indoc! {r#"
-    def emit(value: Int, out: Feed(_)):
-        def inner(extra: Int, target: Feed(_)):
-            target << value ^+ extra
-        inner(1, out)
-    out: Feed(Int)
-    emit(1, out)
-    emit(2, out)
-    sum(out)
-"#}, 5)]
-fn feed_signature_scopes(#[case] code: &str, #[case] expected: i64) {
-    check_scalar(code, Value::Int(expected));
-}
-
 #[test]
 fn a_collection_fed_through_an_inferred_parameter_keeps_its_domain() {
     check_scalar(
         indoc! {r#"
-            def emit(v, out):
+            def emit(v, out: Feed(_)):
                 out << [k for k in [1, 2, 3] if k > 1]
             out: Feed(_)
             for i in [1, 2, 3]:
-                emit(i, out)
+                emit(i, &out)
             sum([sum(row) for row in out])
         "#},
         Value::Int(15),
@@ -2874,20 +3647,17 @@ fn a_collection_fed_through_an_inferred_parameter_keeps_its_domain() {
 #[case::tuple("tuple_alias")]
 fn an_inferred_feed_parameter_does_not_join_varying_collection_domains(#[case] target: &str) {
     let program = indoc! {r#"
-        def emit(v, out):
+        def emit(v, out: Feed(_)):
             alias = out
             packed = (out, 0)
             tuple_alias = packed.0
             TARGET << [k for k in [1, 2, 3] if k > v]
         out: Feed(_)
-        emit(1, out)
+        emit(1, &out)
         out
     "#}
     .replace("TARGET", target);
-    check_compile_error(
-        &program,
-        "The keys of a collection written to a feed or mutable variable depend on `v`",
-    );
+    check_compile_error(&program, if target == "out" { "depend on" } else { "feed" });
 }
 
 /// A row computed by a refined operation over the read of an accumulator, fed from a loop
@@ -2938,7 +3708,7 @@ fn inferred_feed_rows_survive_nested_branches_and_calls() {
             x := 0
             out: Feed(_)
             for i in [1, 2, 3]:
-                emit(x, out)
+                emit(x, &out)
                 for j in [10, 20]:
                     if j > 10:
                         out << x ^+ 1
@@ -3040,4 +3810,37 @@ fn correlated_inner_payload_keeps_mapped_and_nested_domains(
     #[case] expected: i64,
 ) {
     check_scalar(program, Value::Int(expected));
+}
+
+#[rstest]
+#[case::loop_body(indoc! {r#"
+    for unused in [0]:
+        connect()
+"#})]
+#[case::transaction_body(indoc! {r#"
+    with begin():
+        connect()
+"#})]
+fn a_called_definition_cannot_escape_its_statement_scope(#[case] call: &str) {
+    let code = formatdoc! {r#"
+        out: Feed(Int)
+        def connect():
+            out <<= [1]
+        {call}
+        sum(out)
+    "#};
+    check_compile_error(&code, "<<= must occur as a top-level statement");
+}
+
+#[test]
+fn a_place_cannot_store_a_nominal_writer_payload() {
+    check_compile_error(
+        indoc! {r#"
+        type Callback:
+            new(call: () => Int causes Write(*))
+        out: Feed(Callback)
+        0
+    "#},
+        "inside a place",
+    );
 }

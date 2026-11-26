@@ -941,6 +941,7 @@ pub enum BindingTransparency {
 pub enum AssignTarget {
     /// A bare identifier: `x = ...`.
     Name(SmolStr),
+
     /// A tuple destructuring pattern: `(a, b), c = ...`. May nest.
     Tuple(Vec<Spanned<AssignTarget>>),
     /// One key of a `Map`: `m[k] := v`.
@@ -1033,6 +1034,9 @@ pub enum Expr {
 
     /// A bare identifier — variable or function name.
     Name(SmolStr),
+
+    /// A place lent to a parameter or a method receiver: `&x`.
+    Borrow(Box<Spanned<Expr>>),
 
     /// A qualified reference, `cart::total` or `shop::eu::stock`: a member
     /// reached through an import name, a run name, or a Module-typed parameter

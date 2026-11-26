@@ -18,6 +18,7 @@ use std::{
 use crate::ccl::{
     Level, Name,
     infer::solver::traits::{Supplier, Trait},
+    infer_var::Telescope,
     names::Home,
     provenance::NodeId,
     ty::TraitRequirement,
@@ -543,6 +544,8 @@ impl Hash for Raised {
 
 impl Effect {
     /// The variable this names, if it names one.
+    /// The variable this names: `x` in `Write(x)`, `WriteTxn(x)`, `Append(x)`, `Read(x)` and
+    /// `ReadTxn(x)`.
     pub fn variable(&self) -> Option<&Name> {
         match self {
             Effect::Write(x) | Effect::WriteTxn(x) | Effect::Append(x) => Some(x),
@@ -602,7 +605,8 @@ pub fn discharge(expr: &mut crate::ccl::Expr, discharged: &impl Fn(&Capability) 
 /// it does of its own and what each of its children does, evaluating a node evaluating its
 /// children, and a write, a feed and a block each state their own effect. A lambda's body is
 /// latent in the lambda's type, a `with begin():` block supplies `Transaction` to its body, a
-/// `try` discharges what it catches, and an exception holds one of a subtype.
+/// `try` discharges what it catches, a node binding a variable ends that variable's history
+/// ([`CapabilityVar::in_scope`]), and an exception holds one of a subtype.
 /// A pass that builds a node states its capabilities; this catches one that does not.
 #[expect(
     clippy::mutable_key_type,
@@ -671,8 +675,17 @@ pub fn assert_monotone(expr: &crate::ccl::Expr, after: &str) {
         }
     };
     check(own.clone(), &|| "the node of its own".to_string());
+    let mut bound: Vec<&Name> = Vec::new();
+    expr.walk_binders(|b| bound.push(&b.name));
+    let names_bound = |item: Capability| item.variable().is_some_and(|x| bound.contains(&x));
     expr.walk_children(|child| {
         let mut theirs = child.capabilities.set();
+        theirs
+            .requires
+            .retain(|r| !names_bound(Capability::Requires(r.clone())));
+        theirs
+            .causes
+            .retain(|e| !names_bound(Capability::Causes(e.clone())));
         if matches!(expr.node, N::Begin { .. }) {
             theirs.requires.remove(&Requirement::transaction());
         }
@@ -1613,6 +1626,33 @@ impl Capability {
         }
     }
 
+    /// Whether this may contain `item`, including what a top or clause parameter allows.
+    pub fn may_include(&self, item: &Capability) -> bool {
+        match self {
+            Capability::Every(top) => top.overlaps(item),
+            Capability::Param(param) => Every::of_direction(param.of_causes)
+                .less(
+                    param
+                        .except
+                        .iter()
+                        .chain(&param.param.clause_except)
+                        .cloned(),
+                )
+                .overlaps(item),
+            concrete => match item {
+                Capability::Every(top) => top.holds(concrete),
+                item => concrete == item,
+            },
+        }
+    }
+
+    /// Whether this may write a mutable variable or contribute to a feed.
+    pub fn may_act_on_a_place(&self) -> bool {
+        [Family::Write, Family::WriteTxn, Family::Append]
+            .into_iter()
+            .any(|family| self.may_include(&Capability::Every(family.top())))
+    }
+
     /// The families whose capabilities order a loop whose body causes one (`docs/chl-spec.md`,
     /// "Ordered loops"): a write, and an exception escaping the iteration.
     /// [`Self::orders_a_loop`] and [`Self::may_order_a_loop`] read it.
@@ -1639,76 +1679,54 @@ impl Capability {
     /// [`orders_a_loop`](Self::orders_a_loop), or a clause parameter whose bound, less its
     /// `except`, may hold such a capability.
     pub fn may_order_a_loop(&self) -> bool {
-        match self {
-            Capability::Param(p) if p.of_causes => Self::ORDERING.into_iter().any(|f| {
-                Every::of_direction(true)
-                    .less(p.except.iter().chain(&p.param.clause_except).cloned())
-                    .overlaps(&Capability::Every(f.top()))
-            }),
-            other => other.orders_a_loop(),
-        }
+        Self::ORDERING
+            .into_iter()
+            .any(|family| self.may_include(&Capability::Every(family.top())))
     }
 }
 
-/// A [`Capability`] with where the variable it names is bound, which decides the function bodies
-/// it leaves.
+/// A [`Capability`] with the node it entered at.
 ///
 /// Equality, ordering and hashing leave out [`at`](Self::at): where a capability entered does not
 /// make it another capability, and a set keeps the first place it entered.
 #[derive(Debug, Clone)]
-pub struct ScopedCapability {
+pub struct LocatedCapability {
     pub item: Capability,
-    pub bound: Bound,
     /// The node where the capability entered the variable holding it: the statement recording
     /// it, or the call an edge carried it through. `None` for one a type states.
     pub at: Option<NodeId>,
 }
 
-impl ScopedCapability {
-    fn key(&self) -> (&Capability, Bound) {
-        (&self.item, self.bound)
+impl LocatedCapability {
+    fn key(&self) -> &Capability {
+        &self.item
     }
 }
 
-impl PartialEq for ScopedCapability {
+impl PartialEq for LocatedCapability {
     fn eq(&self, other: &Self) -> bool {
         self.key() == other.key()
     }
 }
 
-impl Eq for ScopedCapability {}
+impl Eq for LocatedCapability {}
 
-impl PartialOrd for ScopedCapability {
+impl PartialOrd for LocatedCapability {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ScopedCapability {
+impl Ord for LocatedCapability {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
+        self.key().cmp(other.key())
     }
 }
 
-impl Hash for ScopedCapability {
+impl Hash for LocatedCapability {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key().hash(state);
     }
-}
-
-/// Where the variable a [`ScopedCapability`] names is bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Bound {
-    /// Nowhere a scope's end discharges: the capability names no variable, or names a public feed,
-    /// which belongs to the run.
-    Escaping,
-    /// In the body of the function this many function bodies deep, `0` at a module's top
-    /// level.
-    At(u32),
-    /// As a parameter. A parameter's history is its argument's, so the call records what is
-    /// done to it, and the capability leaves no function body: only the statement doing it holds it
-    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
-    Parameter,
 }
 
 /// What an edge into a [`CapabilityVar`] lets through
@@ -1721,10 +1739,6 @@ pub struct Filter {
     /// collection is evaluated where it is built, so its body's capabilities are the enclosing
     /// body's, and a lambda that turns out to be a function's are latent in its type.
     pub when_data: Option<Rc<crate::ccl::ty::FunKindVar>>,
-    /// The receiving function's body depth: a capability naming a variable bound at this depth
-    /// or deeper is that function's own, and stops here, as one naming a parameter does
-    /// ([`Bound::Parameter`]).
-    pub below: Option<u32>,
     /// Requirements the edge's context supplies, `Transaction` inside a `with begin():`
     /// body.
     pub discharges: BTreeSet<Requirement>,
@@ -1898,7 +1912,7 @@ impl Filter {
         reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
                   and a trait hashes and orders by its module path and name"
     )]
-    pub fn pass(&self, capability: &ScopedCapability) -> Option<ScopedCapability> {
+    pub fn pass(&self, capability: &LocatedCapability) -> Option<LocatedCapability> {
         if !self.admits(capability) {
             return None;
         }
@@ -1907,7 +1921,7 @@ impl Filter {
                 return Some(capability.clone());
             }
             let except = pruned(p.except.iter().chain(&self.except).cloned());
-            return Some(ScopedCapability {
+            return Some(LocatedCapability {
                 item: Capability::Param(ClauseParam {
                     except,
                     ..p.clone()
@@ -1923,14 +1937,14 @@ impl Filter {
             .iter()
             .map(|r| Capability::Requires(r.clone()));
         let passed = every.less(discharged.chain(self.except.iter().cloned()));
-        (!passed.is_taken()).then(|| ScopedCapability {
+        (!passed.is_taken()).then(|| LocatedCapability {
             item: Capability::Every(passed),
             ..capability.clone()
         })
     }
 
     /// Whether `capability` passes this edge.
-    pub fn admits(&self, capability: &ScopedCapability) -> bool {
+    pub fn admits(&self, capability: &LocatedCapability) -> bool {
         if self
             .of_causes
             .is_some_and(|direction| direction != capability.item.of_causes())
@@ -1958,11 +1972,7 @@ impl Filter {
         {
             return false;
         }
-        match (self.below, capability.bound) {
-            (None, _) | (Some(_), Bound::Escaping) => true,
-            (Some(below), Bound::At(at)) => at < below,
-            (Some(_), Bound::Parameter) => false,
-        }
+        true
     }
 }
 
@@ -1999,9 +2009,13 @@ fn capability_fact_written() {
 pub struct CapabilityVar {
     pub uid: CapabilityVarId,
     level: Cell<Level>,
-    own: RefCell<BTreeSet<ScopedCapability>>,
+    /// The scope the variable is minted in: a capability naming a variable enters it only where
+    /// this binds that variable ([`CapabilityVar::in_scope`]). A function type's variable is
+    /// minted outside the function, so its parameters and its body's variables are not in it.
+    telescope: Telescope,
+    own: RefCell<BTreeSet<LocatedCapability>>,
     incoming: RefCell<Vec<(Rc<CapabilityVar>, Filter)>>,
-    resolved_at: RefCell<Option<(u64, BTreeSet<ScopedCapability>)>>,
+    resolved_at: RefCell<Option<(u64, BTreeSet<LocatedCapability>)>>,
     /// The sets this variable may not exceed, checked once emission is complete
     /// ([`exceeded_uppers`]).
     uppers: RefCell<Vec<Upper>>,
@@ -2110,7 +2124,7 @@ pub enum Blame {
 #[derive(Debug, Clone)]
 pub struct Exceeded {
     /// The first capability beyond the bound.
-    pub capability: ScopedCapability,
+    pub capability: LocatedCapability,
     pub blame: Blame,
 }
 
@@ -2167,10 +2181,11 @@ pub(crate) fn exceeded_uppers() -> Vec<Exceeded> {
 }
 
 impl CapabilityVar {
-    pub fn fresh(level: Level) -> Rc<CapabilityVar> {
+    pub fn fresh(level: Level, telescope: &Telescope) -> Rc<CapabilityVar> {
         Rc::new(CapabilityVar {
             uid: CapabilityVarId(CAPABILITY_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             level: Cell::new(level),
+            telescope: telescope.clone(),
             own: RefCell::new(BTreeSet::new()),
             incoming: RefCell::new(Vec::new()),
             resolved_at: RefCell::new(None),
@@ -2289,11 +2304,7 @@ impl CapabilityVar {
                         of_requires
                     };
                     if side {
-                        hole.record(ScopedCapability {
-                            item,
-                            bound: Bound::Escaping,
-                            at: None,
-                        });
+                        hole.record(LocatedCapability { item, at: None });
                     }
                 }
                 hole.bound_above(Upper {
@@ -2360,8 +2371,26 @@ impl CapabilityVar {
         }
     }
 
+    /// The scope the variable is minted in.
+    pub fn telescope(&self) -> &Telescope {
+        &self.telescope
+    }
+
+    /// Whether `capability` may enter this variable: it names no variable, or one this variable's
+    /// scope binds. A scope ends the history of each variable it binds (`docs/chl-spec.md`,
+    /// "Discharging requirements and effects"), so what names a variable stops at the first
+    /// capability variable minted outside its binder. The root scope binds every run-owned
+    /// variable, so one is in every scope (`InferCtx::enter_run_owned`).
+    pub fn in_scope(&self, capability: &Capability) -> bool {
+        !capability.names_outside(&self.telescope)
+    }
+
     /// Record `capability` on this variable.
-    pub fn record(&self, capability: ScopedCapability) {
+    pub fn record(&self, capability: LocatedCapability) {
+        debug_assert!(
+            self.in_scope(&capability.item),
+            "a capability enters only a variable whose telescope binds its named place"
+        );
         if self.own.borrow_mut().insert(capability) {
             capability_fact_written();
         }
@@ -2396,7 +2425,7 @@ impl CapabilityVar {
         reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
                   and a trait hashes and orders by its module path and name"
     )]
-    pub fn resolved(&self) -> BTreeSet<ScopedCapability> {
+    pub fn resolved(&self) -> BTreeSet<LocatedCapability> {
         self.resolve(None)
             .into_iter()
             .filter(|c| !matches!(&c.item, Capability::Requires(r) if r.is_satisfied()))
@@ -2407,7 +2436,7 @@ impl CapabilityVar {
         clippy::mutable_key_type,
         reason = "requirements hash conditional operands by stable identity"
     )]
-    pub(crate) fn resolved_causes(&self) -> BTreeSet<ScopedCapability> {
+    pub(crate) fn resolved_causes(&self) -> BTreeSet<LocatedCapability> {
         self.resolve(Some(true))
     }
 
@@ -2415,7 +2444,7 @@ impl CapabilityVar {
         clippy::mutable_key_type,
         reason = "requirements hash conditional operands by stable identity"
     )]
-    fn resolve(&self, direction: Option<bool>) -> BTreeSet<ScopedCapability> {
+    fn resolve(&self, direction: Option<bool>) -> BTreeSet<LocatedCapability> {
         let allows = |filter: &Filter| {
             direction.is_none() || filter.of_causes.is_none() || direction == filter.of_causes
         };
@@ -2438,7 +2467,7 @@ impl CapabilityVar {
         // fixpoint, since edges can form cycles and two paths can filter differently.
         let mut nodes: HashMap<CapabilityVarId, Rc<CapabilityVar>> = HashMap::new();
         let mut stack: Vec<Rc<CapabilityVar>> = Vec::new();
-        let mut sets: HashMap<CapabilityVarId, BTreeSet<ScopedCapability>> = HashMap::new();
+        let mut sets: HashMap<CapabilityVarId, BTreeSet<LocatedCapability>> = HashMap::new();
         sets.insert(self.uid, own(self));
         for (v, filter) in self.incoming.borrow().iter() {
             if allows(filter) {
@@ -2464,10 +2493,14 @@ impl CapabilityVar {
                 nodes[&uid].incoming.borrow().clone()
             }
         };
+        let receiver = |uid: CapabilityVarId| -> &CapabilityVar {
+            if uid == self.uid { self } else { &nodes[&uid] }
+        };
         let ids: Vec<CapabilityVarId> = sets.keys().copied().collect();
         loop {
             let mut changed = false;
             for &id in &ids {
+                let into_var = receiver(id);
                 for (src, filter) in incoming_of(id) {
                     if !allows(&filter) || !filter.holds() {
                         continue;
@@ -2484,11 +2517,12 @@ impl CapabilityVar {
                         .filter(|u| matches!(u.blame, Blame::Written(_)))
                         .cloned()
                         .collect();
-                    let flowing: Vec<ScopedCapability> = sets[&src.uid]
+                    let flowing: Vec<LocatedCapability> = sets[&src.uid]
                         .iter()
                         .filter(|l| written.iter().all(|u| u.admits(&l.item)))
                         .filter_map(|l| filter.pass(l))
-                        .map(|l| ScopedCapability {
+                        .filter(|l| into_var.in_scope(&l.item))
+                        .map(|l| LocatedCapability {
                             at: filter.at.or(l.at),
                             ..l
                         })
@@ -2562,7 +2596,7 @@ impl CapabilityVar {
         reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
                   and a trait hashes and orders by its module path and name"
     )]
-    pub fn own(&self) -> BTreeSet<ScopedCapability> {
+    pub fn own(&self) -> BTreeSet<LocatedCapability> {
         self.own.borrow().clone()
     }
 
@@ -2647,7 +2681,7 @@ impl UseCapabilities {
     reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
               and a trait hashes and orders by its module path and name"
 )]
-pub fn set_of(capabilities: &BTreeSet<ScopedCapability>) -> CapabilitySet {
+pub fn set_of(capabilities: &BTreeSet<LocatedCapability>) -> CapabilitySet {
     let mut set = CapabilitySet::default();
     for l in capabilities {
         match &l.item {
@@ -2750,18 +2784,14 @@ impl Capabilities {
 
     /// Each requirement and effect this states, as a capability naming no depth: a known set
     /// comes from a type already materialized, whose variables no scope here binds.
-    pub fn capabilities_of(capabilities: &Capabilities) -> Vec<ScopedCapability> {
+    pub fn capabilities_of(capabilities: &Capabilities) -> Vec<LocatedCapability> {
         let set = capabilities.set();
         set.requires
             .iter()
             .map(|r| Capability::Requires(r.clone()))
             .chain(set.causes.iter().map(|e| Capability::Causes(e.clone())))
             .chain(set.tops.iter().cloned().map(Capability::Every))
-            .map(|item| ScopedCapability {
-                item,
-                bound: Bound::Escaping,
-                at: None,
-            })
+            .map(|item| LocatedCapability { item, at: None })
             .collect()
     }
 
@@ -2815,6 +2845,22 @@ impl fmt::Display for Effect {
 }
 
 impl Capability {
+    /// Whether this names a variable `scope` does not bind: one whose history ends before what
+    /// stands in `scope` does.
+    pub fn names_outside(&self, scope: &Telescope) -> bool {
+        self.variable().is_some_and(|x| !scope.contains(x))
+    }
+
+    /// The effect this causes on a place, a write of a mutable variable or an append to a feed,
+    /// if it is one. No place's value type holds a function type causing one
+    /// (`docs/chl-spec.md`, "Places and values").
+    pub fn effect_on_a_place(&self) -> Option<&Effect> {
+        match self {
+            Capability::Causes(effect) if effect.variable().is_some() => Some(effect),
+            _ => None,
+        }
+    }
+
     /// The variable this names: `x` in `Write(x)`, `WriteTxn(x)`, `Append(x)`, `Read(x)` and
     /// `ReadTxn(x)`.
     pub fn variable(&self) -> Option<&Name> {
@@ -3252,14 +3298,10 @@ mod tests {
         reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
                   and a trait hashes and orders by its module path and name"
     )]
-    fn items_at(items: impl IntoIterator<Item = Capability>) -> BTreeSet<ScopedCapability> {
+    fn items_at(items: impl IntoIterator<Item = Capability>) -> BTreeSet<LocatedCapability> {
         items
             .into_iter()
-            .map(|item| ScopedCapability {
-                item,
-                bound: Bound::Escaping,
-                at: None,
-            })
+            .map(|item| LocatedCapability { item, at: None })
             .collect()
     }
 
@@ -3464,11 +3506,7 @@ mod tests {
             except: [top(Family::Write)].into(),
             ..Filter::default()
         };
-        let at = |item| ScopedCapability {
-            item,
-            bound: Bound::Escaping,
-            at: None,
-        };
+        let at = |item| LocatedCapability { item, at: None };
         let (write_top, every) = (at(top(Family::Write)), at(Capability::Every(effect())));
         assert!(filter.pass(&write_top).is_none());
         let passed = filter.pass(&every).expect("`Effect` passes less writes");

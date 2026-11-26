@@ -1652,12 +1652,12 @@ fn awaiting_a_mut_var_twice_rejected() {
     );
 }
 
-/// Consumption also covers a **pass-by-reference argument**, the one mutable variable mention
+/// Consumption also covers a **borrowed argument**, the one mutable variable mention
 /// lowering's read gate lets through (a `Mut`-typed argument is a bare `Var` by rule).
 /// Inlining beta-reduces it into the callee body, where it becomes the write the
 /// occurrence check finds — which is why that check runs post-inline.
 #[test]
-fn by_ref_pass_after_await_final_rejected() {
+fn borrow_after_await_final_rejected() {
     check_compile_error(
         indoc! {r#"
             def draw(p: Mut(Int, Txn), amt: Int):
@@ -1665,9 +1665,9 @@ fn by_ref_pass_after_await_final_rejected() {
                     p := p - amt
 
             pool: Mut(Int, Txn) := 100
-            draw(pool, 10)
+            draw(&pool, 10)
             f = await_final(pool)
-            draw(pool, 20)
+            draw(&pool, 20)
             f
         "#},
         "unreferenceable after `await_final(pool)`",
@@ -2693,7 +2693,7 @@ fn bare_txn_read_outside_tx_rejected() {
     );
 }
 
-/// The rule follows a `Mut(_, Txn)` **parameter** into the callee: a by-reference pass hands
+/// The rule follows a `Mut(_, Txn)` **parameter** into the callee: a borrow hands
 /// the callee a mutable variable in its own right, so a read of it outside the callee's
 /// block requires `Transaction`, and so does a call of the callee, which no block encloses
 /// here. Reading only inside a block is permanent (the CHL spec, "8.3 Reads"), so it holds
@@ -2707,7 +2707,7 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
                 with begin():
                     p := p - amt
             pool: Mut(Int, Txn) := 100
-            draw(pool, 10)
+            draw(&pool, 10)
             await_final(pool)
         "#},
         "this requires `Transaction` outside a `with begin():` block",
@@ -2719,16 +2719,22 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
 #[test]
 fn computed_live_cross_endpoint_read_compiles() {
     let code = indoc! {r#"
-        set_reqs, set_resps = http_serve("0", "POST", "/s")
-        get_reqs, get_resps = http_serve("0", "GET", "/g")
-        latest: Mut(Int, Txn) := 0
+        run std::http(port="0", method="POST", path="/s") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="0", method="GET", path="/g") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
+        latest: Mut(String, Txn) := ""
         for msg in set_reqs:
             with begin():
-                latest := latest + 1
-            set_resps << "ok"
+                latest := msg
+            http_set_resps_replies << "ok"
         for req in get_reqs:
             with begin():
-                get_resps << latest + 1
+                http_get_resps_replies << latest + "!"
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
 
     "#};
     let mut ctx = GlobalContext::default();
@@ -2744,16 +2750,22 @@ fn computed_live_cross_endpoint_read_compiles() {
 #[test]
 fn live_read_combining_request_and_store_compiles() {
     let code = indoc! {r#"
-        set_reqs, set_resps = http_serve("0", "POST", "/set")
-        get_reqs, get_resps = http_serve("0", "GET", "/get")
+        run std::http(port="0", method="POST", path="/set") as http_set_resps
+        http_set_resps_replies: Feed(String)
+        set_reqs = http_set_resps::requests
+        run std::http(port="0", method="GET", path="/get") as http_get_resps
+        http_get_resps_replies: Feed(String)
+        get_reqs = http_get_resps::requests
         a: Mut(String, Txn) := "a0"
         for msg in set_reqs:
             with begin():
                 a := msg
-            set_resps << "ok\n"
+            http_set_resps_replies << "ok\n"
         for req in get_reqs:
             with begin():
-                get_resps << a + req
+                http_get_resps_replies << a + req
+        http_set_resps::respond(http_set_resps_replies)
+        http_get_resps::respond(http_get_resps_replies)
 
     "#};
     let mut ctx = GlobalContext::default();
@@ -3082,24 +3094,24 @@ fn out_of_block_txn_write_rejected() {
     );
 }
 
-/// C3, by-reference flavor: a `Mut(_, Txn)` writer body that assigns its mutable variable
+/// C3, borrowing flavor: a `Mut(_, Txn)` writer body that assigns its mutable variable
 /// *without* a `with begin():` block requires `Transaction`, so a call of it that no block
 /// encloses is rejected.
 #[test]
-fn by_ref_txn_write_without_block_rejected() {
+fn borrowed_txn_write_without_block_rejected() {
     check_compile_error(
         indoc! {r#"
             store: Mut(Int, Txn) := 0
             def w(p: Mut(Int, Txn)):
                 p := 50
-            w(store)
+            w(&store)
             0
         "#},
         "this requires `Transaction` outside a `with begin():` block",
     );
 }
 
-/// C4: a by-reference transactional writer *called inside* a `with begin():`
+/// C4: a borrowing transactional writer *called inside* a `with begin():`
 /// block is a nested transaction: the call commits, and a block's body may not.
 /// Inference refuses it at the call (the textual nested-`with` check cannot see a
 /// transaction reached via a call).
@@ -3114,7 +3126,7 @@ fn txn_writer_called_inside_block_rejected() {
                     p := p - 10
             with begin():
                 pool := pool - 5
-                y = do_it(pool)
+                y = do_it(&pool)
             with begin():
                 out << pool
             out
@@ -3280,7 +3292,7 @@ fn transaction_handle_binding_rejected() {
         1
     for q in [1, 2]:
         with begin():
-            add(store)
+            add(&store)
     await_final(store)
 "#}, 100)]
 #[case::a_written_clause(indoc! {r#"
@@ -3376,7 +3388,7 @@ fn a_transactional_variable_passed_to_a_mut_parameter_is_refused() {
         def w(p: Mut(Int)) => Int:
             p := 50
             1
-        w(store)
+        w(&store)
     "#}));
     assert!(
         errors.contains(
@@ -4017,7 +4029,7 @@ fn cross_function_transfer_conserves_total() {
                     dst := dst + amt
             a: Mut(Int, Txn) := 100
             b: Mut(Int, Txn) := 0
-            transfer(a, b, 30)
+            transfer(&a, &b, 30)
             await_final(a) + await_final(b)
         "#},
         Tile::Scalar(ColumnValue::Ints(vec![100])),
@@ -4292,7 +4304,7 @@ fn a_one_entry_seed_reaches_a_transactional_keyed_write() {
 }
 
 /// A keyed write through a `Mut` **parameter**: `fw(m, x)` writes one key of the caller's
-/// mutable variable, the pass-by-reference shape `def fw(c: Mut(Int))` already supports for a
+/// mutable variable, the borrowed-parameter shape `def fw(c: Mut(Int))` already supports for a
 /// scalar accumulator.
 ///
 /// The write crosses a function boundary, so the mutable variable's own value type is what the
@@ -4307,7 +4319,7 @@ fn a_one_entry_seed_reaches_a_transactional_keyed_write() {
 ///
 /// Two adjacent shapes are absent. A constant whole-collection write through a parameter
 /// (`m := box(map(…))`) is not keyed; `a_constant_whole_map_write_through_a_mut_parameter` in
-/// `tests/it/differential_interp.rs` covers it. Transactional pass-by-reference is refused at
+/// `tests/it/differential_interp.rs` covers it. Transactional borrowing is refused at
 /// lowering: a `with begin():` block takes writes, bindings, guards and feeds, not a call.
 #[test]
 fn a_keyed_write_through_a_mut_parameter() {
@@ -4316,7 +4328,7 @@ fn a_keyed_write_through_a_mut_parameter() {
             m[k] := 1
         m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
         for x in [3, 4]:
-            fw(m, x)
+            fw(&m, x)
         m
     "#});
     assert_eq!(
@@ -4725,14 +4737,14 @@ fn a_counter_over_an_induction_map_at_an_absent_key() {
 
 /// A keyed write whose key is a mutable variable, `log[n] := 5` after `n := n + 1` in the same
 /// block, does not compile: the transact phase leaves `insert`'s key typed `Mut(Int, Txn)` where
-/// it passes the value `n`, so the post-transact type check refuses the key as an argument to a
-/// `Mut` parameter. A `Map(Int, String)` panics the same way, and a key that is the loop item
+/// it passes the value `n`, so the post-transact type check refuses the key's value where the
+/// variable's type stands. A `Map(Int, String)` panics the same way, and a key that is the loop item
 /// compiles (`a_keyed_write_commits_a_computed_value_at_a_computed_key`). Each transaction writes
 /// the key it has just counted to, so every commit order gives the same map.
 #[test]
 #[should_panic(
-    expected = "post-transact produced an invalid tree: [argument to a `Mut` parameter must be a \
-                mutable variable"
+    expected = "post-transact produced an invalid tree: [Type mismatch for type of (__txp.1, n, 5): \
+                expected Mut(Int, Txn), found Int]"
 )]
 fn a_keyed_write_at_a_mutable_variable_key() {
     let value = final_mut_var_value(indoc! {r#"

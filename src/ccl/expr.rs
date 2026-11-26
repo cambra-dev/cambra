@@ -183,6 +183,7 @@ impl Annotation {
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
 #[derive(Debug, Clone)]
 pub struct TypedBinding {
+    pub parameter_mode: crate::ccl::place::ParameterMode,
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
     pub name: Name,
@@ -270,6 +271,7 @@ impl TypedBinding {
     /// converts the `Hole` to a registered inference variable before type-checking.
     pub fn new_unannotated(name: impl Into<Name>, occurrence: Occurrence) -> Self {
         TypedBinding {
+            parameter_mode: Default::default(),
             name: name.into(),
             occurrence,
             ty: Type::Hole,
@@ -289,6 +291,7 @@ impl TypedBinding {
         annotation: Annotation,
     ) -> Self {
         TypedBinding {
+            parameter_mode: Default::default(),
             name: name.into(),
             occurrence,
             ty: Type::Hole,
@@ -341,6 +344,8 @@ impl TypedBinding {
 /// instead.  See `src/ccl/CLAUDE.md` for the full rationale.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprNode {
+    /// A call argument that lends a place. Inlining consumes it with its call.
+    Borrow(Box<TypedExpr>),
     /// A literal constant.
     Lit(Lit),
 
@@ -843,7 +848,7 @@ pub enum TypedExprNode {
     /// pass that needed to recognize one consulted that annotation as a proxy for
     /// the declaration.
     ///
-    /// A `Lambda` param *can* still bind a mutable variable: that is pass-by-reference,
+    /// A `Lambda` param *can* still bind a mutable variable: that is a borrowed parameter,
     /// where the mutable variable genuinely crosses a function boundary.
     MutDecl {
         /// The mutable variable's binder. Its `ty` is the history `Mut(V, D)`.
@@ -1196,6 +1201,7 @@ impl TypedExprNode {
             TypedExprNode::Defer => "Defer",
             TypedExprNode::Abstract => "Abstract",
             TypedExprNode::Error => "Error",
+            TypedExprNode::Borrow(_) => "Borrow",
         }
     }
 }
@@ -1608,16 +1614,10 @@ impl TypedExpr {
         })
     }
 
-    /// Construct an ExprStmt expression — `expr; body`.
-    ///
-    /// The sequencing node's type **is** its body's, by construction: the
-    /// statement's value is whatever the continuation evaluates to. Carrying it
-    /// here holds that invariant in the module that defines the node, so a pass
-    /// rebuilding a spine does not have to re-derive it. During lowering
-    /// `body.ty` is [`Type::Hole`] and the carry is the identity; after inference
-    /// it is the real type.
+    /// Construct `expr; body` at the type of a value read of `body`.
+    /// Both history kinds read through the shared `Type::read_value_type` rule.
     pub fn expr_stmt(expr: Self, body: Self) -> Self {
-        let ty = body.ty.clone();
+        let ty = body.ty.read_value_type().clone();
         Self::new(TypedExprNode::ExprStmt {
             expr: Box::new(expr),
             body: Box::new(body),
@@ -1629,7 +1629,7 @@ impl TypedExpr {
     /// logical statement rebuilt at a new spine position, carrying `node_id`
     /// rather than minting. See [`preserve`](Self::preserve).
     pub(crate) fn expr_stmt_preserving(node_id: NodeId, expr: Self, body: Self) -> Self {
-        let ty = body.ty.clone();
+        let ty = body.ty.read_value_type().clone();
         Self::preserve(
             node_id,
             TypedExprNode::ExprStmt {
@@ -1789,10 +1789,21 @@ impl TypedExpr {
                 user_annotation: None,
                 transparency,
                 site: None,
+                parameter_mode: Default::default(),
             },
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
         })
+    }
+
+    /// This `let` with its binder keeping the place its initializer names rather than reading
+    /// it: a module's parameter, and a compiler binding that transports one.
+    pub(crate) fn binding_a_place(mut self) -> Self {
+        let TypedExprNode::Let { binding, .. } = &mut self.node else {
+            unreachable!("only a let binds a place here");
+        };
+        binding.parameter_mode = crate::ccl::place::ParameterMode::Borrow;
+        self
     }
 
     /// `let binding = def in body`, typed as `body` — the pre-built-binding form
@@ -1858,6 +1869,7 @@ impl TypedExpr {
     ) -> Self {
         Self::new(TypedExprNode::MutDecl {
             binding: TypedBinding {
+                parameter_mode: Default::default(),
                 name: name.into(),
                 occurrence,
                 ty: history,
@@ -2032,6 +2044,10 @@ impl TypedExpr {
         Self::new(TypedExprNode::UnaryOp(op, Box::new(operand)))
     }
 
+    pub fn borrow(place: Self) -> Self {
+        Self::new(TypedExprNode::Borrow(Box::new(place)))
+    }
+
     /// Construct an n-ary composition expression.
     ///
     /// `exprs` must contain at least two morphisms. The composition is
@@ -2134,6 +2150,11 @@ impl TypedExpr {
     ) -> Self {
         Self::lambda_of(
             vec![TypedBinding {
+                parameter_mode: if param_ty.is_place() {
+                    crate::ccl::place::ParameterMode::Borrow
+                } else {
+                    crate::ccl::place::ParameterMode::Value
+                },
                 name: param.into(),
                 occurrence,
                 ty: param_ty,
@@ -2290,7 +2311,7 @@ impl TypedExpr {
                 f(left.as_ref());
                 f(right.as_ref());
             }
-            TypedExprNode::UnaryOp(_, inner) => f(inner.as_ref()),
+            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Borrow(inner) => f(inner.as_ref()),
             TypedExprNode::Lambda { body, .. } => f(body.as_ref()),
             TypedExprNode::Aggregate { input, .. } => f(input.as_ref()),
             TypedExprNode::Let {
@@ -2505,7 +2526,7 @@ impl TypedExpr {
                 f(left.as_mut());
                 f(right.as_mut());
             }
-            TypedExprNode::UnaryOp(_, inner) => f(inner.as_mut()),
+            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Borrow(inner) => f(inner.as_mut()),
             TypedExprNode::Lambda { body, .. } => f(body.as_mut()),
             TypedExprNode::Aggregate { input, .. } => f(input.as_mut()),
             TypedExprNode::Let {
@@ -2652,6 +2673,7 @@ impl TypedExpr {
             | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
+            | TypedExprNode::Borrow(_)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Method { .. }
             | TypedExprNode::TraitFn { .. }
@@ -2741,6 +2763,7 @@ impl TypedExpr {
             | TypedExprNode::Comprehension { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
+            | TypedExprNode::Borrow(_)
             | TypedExprNode::Lambda { .. }
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Let { .. }
@@ -2814,6 +2837,7 @@ impl TypedExpr {
             | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
+            | TypedExprNode::Borrow(_)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Method { .. }
             | TypedExprNode::TraitFn { .. }
@@ -3049,28 +3073,42 @@ impl TypedExpr {
         binds
     }
 
-    /// The binder of each statement of the chain this node heads, in order: each
-    /// `Let`'s, `MutDecl`'s and `DefGroup`'s, through each `ExprStmt` to the
-    /// statement after it, down to the chain's last expression. A module's top
-    /// level is such a chain.
-    pub fn chain_binders(&self) -> Vec<&TypedBinding> {
-        let mut binders = Vec::new();
+    /// Each binding statement of the chain this node heads, in order: each `Let`, `MutDecl`
+    /// and `DefGroup`, through each `ExprStmt` to the statement after it, down to the chain's
+    /// last expression. A module's top level is such a chain.
+    pub fn chain_statements(&self) -> Vec<&TypedExpr> {
+        let mut statements = Vec::new();
         let mut at = self;
         loop {
             at = match &at.node {
-                TypedExprNode::Let { binding, body, .. }
-                | TypedExprNode::MutDecl { binding, body, .. } => {
-                    binders.push(binding);
-                    body
-                }
-                TypedExprNode::DefGroup { bindings, body } => {
-                    binders.extend(bindings.iter().map(|(binding, _)| binding));
+                TypedExprNode::Let { body, .. }
+                | TypedExprNode::MutDecl { body, .. }
+                | TypedExprNode::DefGroup { body, .. } => {
+                    statements.push(at);
                     body
                 }
                 TypedExprNode::ExprStmt { body, .. } => body,
-                _ => return binders,
+                _ => return statements,
             };
         }
+    }
+
+    /// The binder of each statement of the chain this node heads, in order
+    /// ([`chain_statements`](Self::chain_statements)).
+    pub fn chain_binders(&self) -> Vec<&TypedBinding> {
+        let mut binders = Vec::new();
+        for statement in self.chain_statements() {
+            match &statement.node {
+                TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
+                    binders.push(binding)
+                }
+                TypedExprNode::DefGroup { bindings, .. } => {
+                    binders.extend(bindings.iter().map(|(binding, _)| binding))
+                }
+                _ => unreachable!("a chain statement is a `Let`, a `MutDecl` or a `DefGroup`"),
+            }
+        }
+        binders
     }
 
     /// Mutable analog of [`fold_children`](Self::fold_children).
@@ -3449,6 +3487,7 @@ mod tests {
         // A binder-bearing node: node type + annotation, binder type + annotation.
         let mut lam = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
+                parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: marker("param_ty"),

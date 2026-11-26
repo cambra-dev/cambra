@@ -2123,6 +2123,7 @@ fn elim_lambda_impl(
                     // The rebuilt group replaces the one it is built from, so each
                     // binder keeps its occurrence, as each definition keeps its ids.
                     let binding = crate::ccl::TypedBinding {
+                        parameter_mode: Default::default(),
                         name: b.name.clone(),
                         occurrence: Occurrence::preserve(b.occurrence.id()),
                         ty: def.ty.clone(),
@@ -3795,6 +3796,7 @@ mod tests {
                 head_occurrence: Occurrence::mint(),
                 head: crate::ccl::PatternHead::Tag(tag.into()),
                 binding: TypedBinding {
+                    parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: binder.into(),
                     ty: binder_ty,

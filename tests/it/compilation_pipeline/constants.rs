@@ -659,9 +659,12 @@ fn a_refinement_reading_a_tuple_constant_is_refused(#[case] pairs: &str) {
 "})]
 #[case::route(indoc! {r#"
     port = 1 // 0
-    reqs, resps = http_serve(port, "GET", "/x")
+    run std::http(port=port, method="GET", path="/x") as http_resps
+    http_resps_replies: Feed(String)
+    reqs = http_resps::requests
     for r in reqs:
-        resps << "x"
+        http_resps_replies << "x"
+    http_resps::respond(http_resps_replies)
 "#})]
 #[case::imported(indoc! {"
     import cfg

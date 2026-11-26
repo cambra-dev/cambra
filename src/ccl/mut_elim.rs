@@ -142,7 +142,7 @@ impl StmtSite {
 /// bug, not a user error.
 pub fn run(expr: Expr) -> Expr {
     // Restore the flat-spine invariant first: inlining a `def`-bodied
-    // pass-by-reference writer at a call site can bury a `MutWrite` under
+    // borrowing writer at a call site can bury a `MutWrite` under
     // another `ExprStmt` or inside a `Let`/terminal bound-expression, where
     // the main `rewrite`/`WriterWalk` would mistake it for a pure value
     // and drop its mutable-variable advance. `flatten_spine` commutes those shapes back
@@ -319,7 +319,7 @@ fn erase_mut_in_type(ty: &mut Type) {
             unreachable!("a history's function is an unrefined function")
         };
         *ty = *value;
-        // The unwrapped value may itself be `Mut` (nested handles are not
+        // The unwrapped value may itself be `Mut` (nested place types are not
         // expected, but erasure is total either way) — re-check this slot.
         return erase_mut_in_type(ty);
     }
@@ -465,7 +465,7 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
 }
 
 /// Splice `let binding = ⟨terminal⟩ in body` into the *terminal* position of a
-/// spliced pass-by-reference writer body, lifting every leading statement
+/// spliced borrowing writer body, lifting every leading statement
 /// (`ExprStmt` effect) and intermediate binding (`Let`) onto the outer
 /// statement spine in order. The writer body's terminal value becomes
 /// `binding`'s bound value; a body ending in a bare `MutWrite` has value `unit`
@@ -817,7 +817,7 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
 /// `ExprStmt` — never buried under another `ExprStmt`, nor as a `Let`/terminal
 /// bound-expression.
 ///
-/// Lowering emits a *bare* `MutWrite` (no continuation) for a pass-by-reference
+/// Lowering emits a *bare* `MutWrite` (no continuation) for a borrowing
 /// writer's final statement so inlining can splice the writer's body into its
 /// call site (see `lower_final_stmt`). Post-inline, that splice can land the
 /// write off the spine in several shapes; `flatten_spine` commutes each back on
@@ -885,7 +885,7 @@ fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
         return flatten_spine(Expr::expr_stmt_preserving(outer_id, *a, inner), spine);
     }
     // Lift a writer body's leading binding out of *effect* position. A
-    // pass-by-reference writer called as a bare statement (`f(cnt)`) whose body
+    // borrowing writer called as a bare statement (`f(&cnt)`) whose body
     // computes an intermediate first splices as `ExprStmt(Let(tmp, e, …write…),
     // cont)` — a `Let`-chain in effect position. Re-associate the binding onto
     // the spine (`Let(tmp, e, ExprStmt(…write…, cont))`) so the write lands as a
@@ -1196,8 +1196,8 @@ fn rewrite(mut expr: Expr, declared: &mut Declared) -> Expr {
             return transform_loop(site, *position, target, *iter, *loop_body, *body, declared);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
-        // top-level `cnt += 1`, or an inlined pass-by-reference writer
-        // (`bump(cnt)`) spliced between statements. There is no recurrence to
+        // top-level `cnt += 1`, or an inlined borrowing writer
+        // (`bump(&cnt)`) spliced between statements. There is no recurrence to
         // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
         if let TypedExprNode::MutWrite {
             name_occurrence,
@@ -1621,7 +1621,7 @@ pub fn desugar_keyed_writes(expr: &mut Expr) {
 /// Record each mutable variable's value type, read off the binder that introduces it.
 ///
 /// Two binders introduce one, and both are read here: [`TypedExprNode::MutDecl`], and a
-/// `Lambda` param that takes a mutable variable *by reference* — the case that genuinely
+/// `Lambda` param that borrows a mutable variable — the case that genuinely
 /// crosses a function boundary (see [`TypedExprNode::MutDecl`]'s own docs). Reading only
 /// the declaration leaves a keyed write through a `Mut` parameter with no value type,
 /// which `def bump(m: Mut(Map(Int, Int)), k: Int): m[k] := 1` reaches whenever the writer
@@ -2101,6 +2101,7 @@ fn writes_key_view(h: &Name, hist_ty: &Type, decision_ty: &Type, acc: &Label, vt
 /// makes, its occurrence minted under the open recording.
 pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     TypedBinding {
+        parameter_mode: Default::default(),
         name,
         occurrence: Occurrence::mint(),
         ty,
@@ -2156,7 +2157,7 @@ pub(crate) fn close_recurrence_group(
 
 /// Wrap `body` in one loop per collected in-body feed, feeding each value the loop fed:
 /// `for x in view: defer << x`, over `view` flattened to one level keyed by the tuple of
-/// positions (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). A `Feed`
+/// positions (`docs/chl-spec.md`, "8.4 Deferred collections"). A `Feed`
 /// appends one element, so a loop's whole tap is fed through a loop over it, which
 /// `channelize` routes as it routes any loop's feed. Both the mutation-loop phase and the
 /// transaction phase collect their feeds differently but hoist them through this one
@@ -2302,10 +2303,7 @@ fn transform_loop(
                 lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
                 let map = crate::ccl::ccl_utils::indexed_loop(Some(position), iter, lambda);
                 let cont = rewrite(cont, declared);
-                let cont_ty = cont.ty.clone();
-                let mut stmt = Expr::expr_stmt(map, cont);
-                stmt.ty = cont_ty;
-                return stmt;
+                return Expr::expr_stmt(map, cont);
             }
             return transform_feed_only_loop(
                 loop_site, &position, target, iter, loop_body, cont, declared,
@@ -2853,20 +2851,7 @@ fn transform_feed_only_loop(
     body_out
 }
 
-/// Walk an accumulator-free loop body (an unwrapped `with begin():` block that mentions no
-/// transactional variable:
-/// `Let`s, `Feed`s, terminal `Unit` — no `MutWrite`), collecting the body's
-/// bindings and each feed's `(defer, value closed over the bindings it reads,
-/// site)`.
-///
-/// Each feed leaves the chain for a map of its own, so it takes the bindings it
-/// reads with it ([`close_over`]) rather than their values, as a value leaving a
-/// branch does in a [`WriterWalk`].
-///
-/// The site is the feed statement its map is recorded against, the same
-/// attribution the induction path's [`FeedSite`] carries.
-/// A feed such a block makes: its target and the target's occurrence, its value closed over
-/// the block's bindings, its statement, and its site ([`crate::ccl::site`]).
+/// A feed's target, payload closed over local bindings, statement attribution, and site.
 type FedAt = (
     Name,
     Occurrence,
@@ -2875,7 +2860,9 @@ type FedAt = (
     Option<Rc<crate::ccl::site::Site>>,
 );
 
-fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>) {
+/// Collect an accumulator-free body's feeds, retaining the bindings each payload reads.
+/// Discarded pure results contain no feed or mutable-write markers.
+fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, out: &mut Vec<FedAt>) {
     let stmt_id = expr.node_id();
     match expr.node {
         TypedExprNode::Let {
@@ -2884,7 +2871,7 @@ fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>)
             body,
         } => {
             prefix.push(Kept::Let(Some(stmt_id), binding, *bound_expr));
-            collect_feed_only(*body, prefix, feeds);
+            collect_feed_only(*body, prefix, out);
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             let site = StmtSite::new(stmt_id, effect.node_id());
@@ -2898,14 +2885,22 @@ fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>)
                 } => {
                     let mut value = FeedValue::new(*value, row);
                     close_in_place(&mut value, prefix);
-                    feeds.push((name, name_occurrence, value, site, fed_at));
+                    out.push((name, name_occurrence, value, site, fed_at));
                 }
-                other => panic!(
-                    "letrec phase: unexpected statement in read-only `with begin():` block: {}",
-                    symbolic(&Expr::throwaway(other))
-                ),
+                other => {
+                    let pure = Expr {
+                        node: other,
+                        ..*effect
+                    };
+                    // An inlined call can leave its discarded result after its out.
+                    assert!(
+                        !contains_marker(&pure) && !feeds(&pure),
+                        "letrec phase: unexpected statement in read-only `with begin():` block: {}",
+                        symbolic(&pure)
+                    );
+                }
             }
-            collect_feed_only(*body, prefix, feeds);
+            collect_feed_only(*body, prefix, out);
         }
         TypedExprNode::Lit(Lit::Unit) => {}
         other => panic!(
@@ -2943,7 +2938,7 @@ impl Declared {
         self.0.get(name).unwrap_or_else(|| {
             panic!(
                 "letrec phase: mutable variable `{name}` has no declaring binder in the tree, \
-                 neither a `MutDecl` nor a by-reference parameter"
+                 neither a `MutDecl` nor a borrowed parameter"
             )
         })
     }
@@ -3617,7 +3612,7 @@ impl<'a> WriterWalk<'a> {
                         self.walk_chain(*body, kept)
                     }
                     // A bare `unit` statement is a no-op. This is the discarded terminal
-                    // of a spliced pass-by-reference writer body: inlining a `def f(…): …`
+                    // of a spliced borrowing writer body: inlining a `def f(…): …`
                     // whose body ends in a value-less statement leaves a `unit` before the
                     // call site's continuation.
                     TypedExprNode::Lit(Lit::Unit) => self.walk_chain(*body, kept),
@@ -3685,7 +3680,7 @@ impl<'a> WriterWalk<'a> {
                     } => {
                         // An inner loop whose calls inlined to no write, and which feeds
                         // nothing, is a no-op, as a flat one is: lowering let it through
-                        // only because a call might have hidden a pass-by-reference write.
+                        // only because a call might have hidden a write to a borrowed place.
                         let mut inner_accs = Vec::new();
                         collect_writes(&inner_body, self.declared, &mut inner_accs);
                         if inner_accs.is_empty() && !feeds(&inner_body) {
@@ -4875,6 +4870,7 @@ mod tests {
         let mut for_node = Expr::new(TypedExprNode::For {
             position: Box::new(Name::fresh("pos")),
             target: TypedBinding {
+                parameter_mode: Default::default(),
                 name: i.clone(),
                 occurrence: Occurrence::mint(),
                 ty: int.clone(),

@@ -79,6 +79,7 @@
 //! - `test_sink` — `out = test_sink()` recognition and lowering, built only under
 //!   `cfg(test)`.
 
+use crate::ccl::Label;
 use crate::ccl::Occurrence;
 use crate::ccl::RecordEntry;
 use std::{
@@ -497,6 +498,8 @@ pub struct LoweringContext {
     /// directly; external callers go through the `register_source` /
     /// `take_sources` methods.
     pub(super) sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    /// Route templates supply types while checking modules but have no runtime source.
+    pub(super) module_route_sources: HashSet<String>,
 
     /// Sink bindings discovered during lowering, keyed by the CCL `Let`-binding name
     /// that holds the deferred responses computation (e.g. `"responses"`).  Each entry
@@ -624,6 +627,11 @@ pub struct LoweringContext {
     /// every other position refuses one (`docs/chl-spec.md`, "Tuple width").
     pub(super) open_tuples: OpenTuples,
 
+    /// How many written types [`lower_type_expr`](stmts::lower_type_expr) is inside: `0` at a
+    /// written type's root, where the whole lowered type is checked for a place type standing
+    /// inside another ([`crate::ccl::place::misplaced`]).
+    pub(super) type_depth: u32,
+
     /// The family parameters in scope, of a type declaration or of a `def` or polymorphic type,
     /// each with its index types: a family parameter is written applied, `V(k)`
     /// (`docs/chl-spec.md`, "Family parameters").
@@ -709,22 +717,9 @@ pub struct LoweringContext {
     /// on entering its body scope, pop on exit (see [`LoweringContext::with_shadowed`]).
     pub(super) shadow_depth: HashMap<String, usize>,
 
-    /// Names of `def`s that carry a pass-by-reference `Mut` or `Feed` parameter. Such a
-    /// function is lowered as a **curried** chain of named lambdas rather than the usual
-    /// single tupled-parameter lambda, because such a parameter must stay a named binder
-    /// for inlining to rename the callee's `MutWrite` or `Feed` target to the caller's
-    /// mutable variable or channel (a tuple projection cannot be either target). Its call
-    /// sites must apply curried to match. A block lowers right-to-left, so a call lowers
-    /// before the `def` above it; [`pre_register_txn_decls`] records the name on entering the
-    /// block so [`lower_call`] can pick the matching shape.
-    ///
-    /// **Block-scoped.** Keyed on the surface name (lowering precedes uniquify,
-    /// so no α-unique name exists yet), the set is snapshot/restored around every
-    /// nested block ([`lower_stmts_inner`]) so such a `def` local to one scope cannot
-    /// leak its curried shape onto a same-named `def`/call in an enclosing or sibling
-    /// scope. Within a block, the *last* definition of a name wins (see
-    /// [`pre_register_txn_decls`]).
-    pub(super) history_param_fns: HashSet<String>,
+    /// Unannotated function parameters at the shadow depth of their own binder. A write may
+    /// infer that such a parameter borrows; an inner local with its spelling remains a value.
+    pub(super) unannotated_parameters: HashMap<String, usize>,
 
     /// Whether lowering is currently inside a refinement predicate `{T where p}`
     /// (§6.4). The predicate's anonymous subject is written `_`, and while this
@@ -759,9 +754,11 @@ pub struct LoweringContext {
     /// Each reference to a name a run's `use` clause binds, by its node, with
     /// where it is written ([`Self::reference`]).
     pub(super) run_use_reads: HashMap<crate::ccl::provenance::NodeId, Span>,
-    /// The binder of each sink a run declares, by its key, which the program's
-    /// tail reads in place of the sink's spelling.
-    pub(super) run_sink_names: HashMap<String, Name>,
+    /// The compiler reference and output label of each registered sink, by its key.
+    pub(super) sink_reads: HashMap<String, (Name, Label)>,
+    /// User-facing subjects for compiler-owned deferred outputs, by declaration identity.
+    pub(super) sink_subjects: HashMap<Name, String>,
+
     /// The sinks the module being lowered declares, in the order lowered, which
     /// each run of it registers ([`Self::register_sinks`]).
     declared_sinks: Vec<DeclaredSink>,
@@ -828,12 +825,23 @@ enum DeclaredSink {
     },
     /// `name = test_sink()` at `span`.
     #[cfg(test)]
-    Test { name: String, span: Span },
+    Test {
+        name: String,
+        channel: String,
+        span: Span,
+    },
+}
+
+struct SinkOutput {
+    subject: Option<String>,
+    key: String,
+    binding: String,
+    label: Label,
 }
 
 impl DeclaredSink {
-    /// The binding the module reads the sink through: an `http_serve`'s responses, or a
-    /// test sink's name.
+    /// The name reserved by the declaration: an HTTP response channel or a test sink's
+    /// source binding. A later source declaration cannot shadow this name.
     fn binding(&self) -> &str {
         match self {
             DeclaredSink::Http { responses, .. } => responses,
@@ -881,6 +889,8 @@ fn sinks_at(
                         args_span: *args_span,
                     });
                 }
+                // Missing or refused constant arguments already have a diagnostic at the run.
+                Some(Err(_)) if route.missing_arguments(consts) => {}
                 Some(Err(why)) => errors.push(
                     LoweringError::unsupported(
                         statement,
@@ -985,6 +995,13 @@ impl LoweringContext {
         self.sources.iter().map(|(n, s)| (n.as_str(), s))
     }
 
+    pub(crate) fn runtime_sources(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> {
+        self.registered_sources()
+            .filter(|(name, _)| !self.module_route_sources.contains(*name))
+    }
+
     /// Every `http_serve` route this context knows, by source name.
     pub fn registered_routes(&self) -> impl Iterator<Item = (&str, &LoweredRoute)> {
         self.http_routes.iter().map(|(n, r)| (n.as_str(), r))
@@ -1085,8 +1102,8 @@ impl LoweringContext {
     /// `run` statement, or for the root when `run` is `None`, and return each
     /// one's key with the spelling of the binding it is read through.
     ///
-    /// A sink is keyed by its binding's spelling, qualified in a run by the run
-    /// path, so two runs of one module bind two sinks (`docs/modules.md`,
+    /// A test sink is keyed by its source binder, and an HTTP sink by its response channel.
+    /// A run prefixes the key with its path, so two runs bind two sinks (`docs/modules.md`,
     /// "Registries keyed by spelling"). A test sink binds the sink registered
     /// under its key, and a sink nothing registered is an error: writing to it
     /// would drop the program's output without a trace.
@@ -1094,7 +1111,7 @@ impl LoweringContext {
         &mut self,
         sinks: &[DeclaredSink],
         run: Option<&(RunPath, Span)>,
-    ) -> (Vec<(String, String)>, Vec<LoweringError>) {
+    ) -> (Vec<SinkOutput>, Vec<LoweringError>) {
         let key = |name: &str| match run {
             Some((path, _)) => format!("{path}::{name}"),
             None => name.to_string(),
@@ -1102,7 +1119,7 @@ impl LoweringContext {
         let mut registered = Vec::new();
         let mut errors = Vec::new();
         for sink in sinks {
-            let (name, span, bound) = match sink {
+            let (name, binding, span, bound) = match sink {
                 DeclaredSink::Http {
                     route,
                     responses,
@@ -1110,22 +1127,47 @@ impl LoweringContext {
                     args_span,
                 } => (
                     responses,
+                    responses,
                     *span,
                     self.register_route(route, *args_span, run),
                 ),
                 #[cfg(test)]
-                DeclaredSink::Test { name, span } => {
+                DeclaredSink::Test {
+                    name,
+                    channel,
+                    span,
+                } => {
                     let found = self.test_sinks.get(&key(name)).cloned().ok_or_else(|| {
                         LoweringError::unsupported(
                             *span,
                             format!("no test sink is registered under `{}`", key(name)),
                         )
                     });
-                    (name, *span, found.map(|sink| sink as Arc<dyn DataSink>))
+                    (
+                        name,
+                        channel,
+                        *span,
+                        found.map(|sink| sink as Arc<dyn DataSink>),
+                    )
                 }
             };
             match bound.and_then(|sink| self.register_sink_binding(key(name), sink, span)) {
-                Ok(()) => registered.push((key(name), name.clone())),
+                Ok(()) => registered.push(SinkOutput {
+                    subject: match sink {
+                        DeclaredSink::Http { route, .. } => Some(format!(
+                            "the response collection for HTTP route `{}` (call `respond`)",
+                            route.describe()
+                        )),
+                        #[cfg(test)]
+                        DeclaredSink::Test { .. } => None,
+                    },
+                    key: key(name),
+                    binding: binding.clone(),
+                    label: match run {
+                        Some((path, _)) => Label::in_run(path.clone(), name.as_str()),
+                        None => Label::new(name.as_str()),
+                    },
+                }),
                 Err(error) => errors.push(error),
             }
         }
@@ -1139,7 +1181,7 @@ impl LoweringContext {
     /// each entry to [`GlobalContext`](crate::ccl::context::GlobalContext) so
     /// it can extract the corresponding expressions and subscribe them.
     pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
-        self.run_sink_names.clear();
+        self.sink_reads.clear();
         std::mem::take(&mut self.sink_bindings)
     }
 
@@ -1421,26 +1463,6 @@ impl LoweringContext {
         self.type_params_in_scope.iter().any(|n| n == name)
     }
 
-    /// Record that `def name` carries a pass-by-reference `Mut` or `Feed` parameter, so it
-    /// is lowered — and applied — curried (see [`history_param_fns`](Self::history_param_fns)).
-    pub(super) fn register_history_param_fn(&mut self, name: impl Into<String>) {
-        self.history_param_fns.insert(name.into());
-    }
-
-    /// Undo a [`register_history_param_fn`](Self::register_history_param_fn): `name`'s
-    /// calls lower with the ordinary (tupled) shape. Used when a later `def` in a
-    /// block redefines an earlier one with no pass-by-reference parameter (last
-    /// definition wins, matching CHL's shadowing).
-    pub(super) fn unregister_history_param_fn(&mut self, name: &str) {
-        self.history_param_fns.remove(name);
-    }
-
-    /// Whether `name` is a `def` with a pass-by-reference `Mut` or `Feed` parameter (so
-    /// its calls must be lowered as curried applications).
-    pub(super) fn is_history_param_fn(&self, name: &str) -> bool {
-        self.history_param_fns.contains(name)
-    }
-
     /// Run `f` with each name in `binders` pushed onto the shadow-depth stack
     /// for the duration — the scope of a binder's body. Balanced: every pushed
     /// name is popped before returning, including when `f` short-circuits with an
@@ -1474,7 +1496,14 @@ impl LoweringContext {
         self.shadow_depth.get(name).is_some_and(|&depth| depth > 0)
     }
 
-    /// Mint a unique `__result_N` name for the defer handle in generator functions.
+    pub(super) fn is_unannotated_parameter(&self, name: &str) -> bool {
+        self.unannotated_parameters
+            .get(name)
+            .is_some_and(|depth| self.shadow_depth.get(name) == Some(depth))
+    }
+
+    /// Mint a unique `__result_N` name for the feed place a generator function's `Defer`
+    /// declares.
     ///
     /// Counter-minted to avoid collisions when user code contains a binding
     /// named `__result` inside the same generator body.
@@ -1546,6 +1575,9 @@ impl LoweringContext {
     /// How a diagnostic names the deferred binding `name`: the call a minted channel stands
     /// for, or the binding the program wrote, `deferred binding 'out'`.
     pub fn deferred_subject(&self, name: &Name) -> String {
+        if let Some(subject) = self.sink_subjects.get(name) {
+            return subject.clone();
+        }
         match self.minted_channels.get(name.base()) {
             Some(spelled) => spelled.clone(),
             None => format!("deferred binding '{}'", name.base()),
@@ -1561,12 +1593,6 @@ pub fn http_requests_source_name(port: u16, method: &str, path: &str) -> String 
         "__http_requests_{}",
         http_route_id(&port.to_string(), method, path)
     )
-}
-
-/// The name the response channel of `http_serve(port, method, path)` is bound under, and the
-/// field of the program's sink record that carries it.
-pub(super) fn http_responses_sink_name(port: &str, method: &str, path: &str) -> String {
-    format!("__http_responses_{}", http_route_id(port, method, path))
 }
 
 /// The part of a name minted for `http_serve(port, method, path)` from its arguments as
@@ -1609,6 +1635,10 @@ fn lower_expr_inner(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &expr.node {
+        ChlExpr::Borrow(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "a borrow is only allowed as an argument to a borrowing parameter",
+        )),
         ChlExpr::Lit(lit) => lower_constant(lit),
         ChlExpr::Name(id) => {
             let name = id.as_str();
@@ -2029,7 +2059,7 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
         ctx,
     ));
     ctx.run_use_reads.clear();
-    let value = if errors.is_empty() {
+    let mut value = if errors.is_empty() {
         // `pub` decides what an importer reaches, which the interface records,
         // and an `import` binds a name lowering resolves through the module's
         // scope. Neither leaves anything in the lowered tree.
@@ -2052,7 +2082,7 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     } else {
         None
     };
-    if let Some(chain) = &value {
+    if let Some(chain) = &mut value {
         errors.extend(ctx.uses_above_their_runs(chain));
         errors.extend(traits::private_names_in_public_traits(&module.body, ctx));
     }

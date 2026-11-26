@@ -548,6 +548,7 @@ fn hash_payload<'a>(
 ) {
     use TypedExprNode as N;
     match &e.node {
+        N::Borrow(_) => {}
         // The shape — how many generators, and how many guards each holds —
         // plus each generator's binder. The sources, guards and element are
         // children, reached by the scoped fold.

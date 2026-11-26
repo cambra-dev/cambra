@@ -28,7 +28,9 @@ Lowering extracts the literal `(port, method, path)` at compile time and constru
 
 1. A `SharedHttpServer` is created (or reused) for the port and binds the TCP socket synchronously — a bind failure becomes a `LoweringError` before any operator graph is built.
 2. An `HttpServerDataSource` is registered as the `requests` source.
-3. The `DataSink` (`HttpServerSharedState`) is stored in `LoweringContext::sink_bindings` keyed by the name the response channel is bound under, which lowering mints from the route (`http_responses_sink_name`), whatever the program's pattern calls it.
+3. The `DataSink` (`HttpServerSharedState`) is stored in `LoweringContext::sink_bindings` under
+   the response place's declaration name. The special assignment declares that place directly;
+   no ordinary tuple contains it.
 
 The CCL AST carries **no representation of the configuration** — the rendezvous between the source/sink objects and the compiled operator graph is entirely through these registries.  This is why lowering must special-case `http_serve`: it needs the literal arguments at compile time to create the objects.
 

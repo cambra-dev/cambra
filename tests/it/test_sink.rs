@@ -74,6 +74,17 @@ fn a_scalar_feed_is_one_contribution_keyed_by_unit() {
     assert_eq!(format!("{}", v.expect("a value")), "Function [ () -> 3 ]");
 }
 
+#[test]
+fn reading_a_sink_feed_leaves_its_registered_output_writable() {
+    let value = observe_one(indoc! {r#"
+        out = test_sink()
+        packet = (channel=out, label=7)
+        moved = packet.channel
+        out << packet.label
+    "#});
+    assert_eq!(value.expect("a value").to_string(), "Function [ () -> 7 ]");
+}
+
 /// A collection fed at a site that does not iterate is one contribution keyed by unit, holding
 /// the collection (`docs/chl-spec.md`, "3.7 Feed operator `<<`"), not the collection's own
 /// keys.

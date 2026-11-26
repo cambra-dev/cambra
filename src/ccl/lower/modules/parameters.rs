@@ -202,7 +202,25 @@ impl LoweringContext {
                         .push((arg.name.node.clone(), spelling, span));
                 }
                 _ => {
-                    let value = crate::ccl::lower::lower_expr(&arg.value, self)?;
+                    let borrows = parameter
+                        .and_then(Parameter::annotation)
+                        .is_some_and(Type::is_place);
+                    let borrowed = super::super::exprs::borrowed_place(&arg.value).is_some();
+                    if parameter.is_some() && borrows != borrowed {
+                        let message = if borrows {
+                            format!(
+                                "module parameter `{}` borrows a place; pass it with `&`",
+                                arg.name.node
+                            )
+                        } else {
+                            format!(
+                                "module parameter `{}` receives a value, so it cannot borrow a place",
+                                arg.name.node
+                            )
+                        };
+                        return Err(LoweringError::unsupported(arg.value.span, message));
+                    }
+                    let value = super::super::exprs::lower_call_arg(&arg.value, self)?;
                     arguments.values.push((arg.name.node.clone(), span, value));
                 }
             }
@@ -305,6 +323,15 @@ impl LoweringContext {
             .fold(run, |body, (parameter, span, value)| {
                 let bound = argument_name(name, &QualifiedName::new(parameter.clone()));
                 let bound = match parameters.get(&parameter).cloned().flatten() {
+                    // A parameter typed as a place transports the place the run passed.
+                    Some(ty) if ty.is_place() => Expr::let_bind_annotated(
+                        bound,
+                        Occurrence::mint(),
+                        value,
+                        body,
+                        Annotation::new(ty, Occurrence::mint()),
+                    )
+                    .binding_a_place(),
                     Some(ty) => Expr::let_bind_annotated(
                         bound,
                         Occurrence::mint(),
@@ -666,68 +693,6 @@ pub(super) fn rebind_entry(
         .expect("an entry's `let` carries the entry's type");
     let bound = Expr::let_bind_annotated(binder.raw(), Occurrence::mint(), member, *body, ty);
     *at = ctx.tag_image(bound, span);
-}
-
-/// Rebind, in `chain`, a copy of a module's chain, the transactional variable the Module-typed
-/// parameter's entry `binder`, `p::stock`, declares: a run reaches the argument's own variable
-/// under the entry's spelling ([`mut_entries`]), so the declaration goes, and in its place a
-/// function nothing calls reads and writes the variable at the entry's value type `value`,
-/// which checks the argument's variable is of it both ways, as `Mut` is invariant. It is
-/// imaged at the argument at `span`, so a variable of another type is the argument's error.
-pub(super) fn rebind_mut_entry(
-    chain: &mut Expr,
-    binder: &QualifiedName,
-    value: Type,
-    span: Span,
-    ctx: &mut LoweringContext,
-) {
-    let at = parameter_let(chain, &binder.to_string());
-    let TypedExprNode::MutDecl { body, .. } = std::mem::take(at).node else {
-        unreachable!("a transactional variable's entry declares one");
-    };
-    const LABEL: &str = "link.mut_entry_fits";
-    let fits = QualifiedName::new("__fits").then(binder);
-    let given = Name::raw("__fits_value");
-    let read = fits.child("read").raw();
-    let mut node = |expr: Expr| ctx.tag_machinery(expr, span, LABEL);
-    let written = node(Expr::var(given.clone()));
-    let write = node(Expr::mut_write(binder.raw(), Occurrence::mint(), written));
-    let variable = node(Expr::var(binder.raw()));
-    let result = node(Expr::var(read.clone()));
-    let reread = node(Expr::let_bind_annotated(
-        read,
-        Occurrence::mint(),
-        variable,
-        result,
-        Annotation::new(value.clone(), Occurrence::mint()),
-    ));
-    let checks = node(Expr::expr_stmt(write, reread));
-    let check = node(Expr::lambda(given, Occurrence::mint(), value, checks));
-    *at = ctx.tag_image(
-        Expr::let_bind(fits.raw(), Occurrence::mint(), check, *body),
-        span,
-    );
-}
-
-/// The argument's variable each transactional entry of the Module-typed parameter `parameter`
-/// of type `ty` reaches, among `names`, what the module passed reaches, spelled as the entry:
-/// `p::stock` to the argument's `stock`, which a run's scope resolves the module's references
-/// through ([`rebind_mut_entry`]).
-pub(super) fn mut_entries(
-    parameter: &str,
-    ty: &ModuleType,
-    names: &HashMap<QualifiedName, Name>,
-) -> Vec<(QualifiedName, Name)> {
-    let parameter = QualifiedName::new(parameter);
-    let mut lets = Vec::new();
-    ModuleView::of(&parameter, ty, &mut lets);
-    lets.into_iter()
-        .filter(|(_, ty)| crate::ccl::lower::stmts::is_mut_entry(ty))
-        .filter_map(|(binder, _)| {
-            let entry = binder.strip_prefix(&parameter)?;
-            Some((binder, names.get(&entry)?.clone()))
-        })
-        .collect()
 }
 
 /// The `let` of the parameter `parameter` in `chain`, a copy of a module's

@@ -1,20 +1,12 @@
-//! `http_serve`: recognizing `𝑝 = http_serve(port, method, path)`, and lowering the call to
-//! the tuple of a `Source` and a `Defer` whose sink is the route's reply sink, which `𝑝` takes
-//! apart like any other value. Each argument is a constant (`docs/chl-spec.md`, "9.19
-//! Constants"), so a module's route may take its address from a `const` parameter, and each
-//! run of the module serves the address its arguments give ([`HttpRoute::at`]).
-//!
-//! [`sink_declaration`](super::sink_declaration) recognizes the statement through
-//! [`http_serve_decl`], and [`lower_middle_stmt`](super::lower_middle_stmt) lowers it through
-//! [`lower_http_serve`] at the top level only.
+//! The embedded `std::http` declaration primitive. It binds a request source and
+//! response Feed directly, and records the route's sink outside the pure CCL tree.
+//! Constant module parameters supply the address for each run.
 
 use super::constants::Refused;
 use super::*;
 use crate::ccl::constant::ConstTerm;
 use crate::chl_parser::SurfaceBuiltin;
-use crate::chl_parser::ast::{
-    AssignTarget, BindingTransparency as ChlTransparency, Expr as ChlExpr, Span, Spanned,
-};
+use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned};
 use crate::interpreter::HttpServerDataSource;
 
 /// `http_serve(port, method, path)`, with its arguments read off.
@@ -49,32 +41,41 @@ pub(super) fn http_serve_decl(value: &Spanned<ChlExpr>) -> Option<HttpServeDecl>
     })
 }
 
-/// Lower `target = http_serve(…)` at `span`, whose arguments sit at `args_span`, in front of
-/// `body`:
-///
-/// ```text
-/// let __http_responses_N = Defer in
-/// <target> = (Source("__http_requests_N"), __http_responses_N) in
-/// <body>
-/// ```
-///
-/// The channel is bound under a name minted from the route, so the program's sink record
-/// reads it whatever `target` binds. A sink's binding must be in scope at the record, which
-/// is why the call is accepted only as the whole value of a top-level statement. The route
-/// is recorded as a [`DeclaredSink`] and registered for each run of the module
-/// ([`LoweringContext::register_sinks`]). An address that reads a `const` parameter names the
-/// source and the channel by the statement ([`RouteAddress::Constant`]), and each run's copy
-/// of the source is renamed to the address the run gives it.
+/// Bind the embedded module's `requests` source and `responses` Feed before `body`.
+/// The response declaration is also the sink's compiler reference. No product
+/// transports a writable reference. Only the embedded `std::http` module calls this.
 pub(super) fn lower_http_serve(
     decl: HttpServeDecl,
     target: &Spanned<AssignTarget>,
-    transparency: ChlTransparency,
     span: Span,
     args_span: Span,
     body: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let bindings = AssignmentBindings::of(target, transparency, span, ctx)?;
+    if ctx
+        .module
+        .labels
+        .as_ref()
+        .is_none_or(|module| module.to_string() != "std::http")
+    {
+        return Err(LoweringError::unsupported(
+            span,
+            "HTTP routes are declared by running `std::http(port=…, method=…, path=…) as server`; read `server::requests` and call `server::respond(values)`",
+        ));
+    }
+    let AssignTarget::Tuple(names) = &target.node else {
+        unreachable!("the embedded HTTP module declares requests and responses together");
+    };
+    let [requests, responses_target] = names.as_slice() else {
+        unreachable!("the embedded HTTP module declares two names");
+    };
+    let AssignTarget::Name(requests_name) = &requests.node else {
+        unreachable!("the embedded HTTP module names its request source")
+    };
+    let AssignTarget::Name(responses_name) = &responses_target.node else {
+        unreachable!("the embedded HTTP module names its response Feed")
+    };
+
     let HttpServeDecl { port, method, path } = decl;
     let mut terms = Vec::new();
     for arg in [&port, &method, &path] {
@@ -85,15 +86,16 @@ pub(super) fn lower_http_serve(
             // target binds a value that reports nothing more.
             Err(Refused(None)) => {
                 let value = ctx.tag_machinery(Expr::error(), span, "lower.http_serve");
-                return Ok(bindings.wrap(value, body, span, ctx));
+                let occurrence = ctx.occurrence_at(requests.span);
+                return Ok(ctx.tag_image(
+                    Expr::let_bind(requests_name.as_str(), occurrence, value, body),
+                    span,
+                ));
             }
         }
     }
     let terms: [ConstTerm; 3] = terms.try_into().expect("three arguments");
-    let spelled = format!(
-        "the response channel of `http_serve({}, {}, {})`",
-        terms[0], terms[1], terms[2]
-    );
+
     let (route, responses) = match &terms {
         [
             ConstTerm::Lit(Lit::String(port)),
@@ -108,7 +110,7 @@ pub(super) fn lower_http_serve(
                 ctx.declare_unopened_route(&route.source_name);
                 ctx.checked_routes.insert(route.source_name.clone());
             }
-            (route, http_responses_sink_name(port, method, path))
+            (route, responses_name.to_string())
         }
         // An argument that reads no parameter is the same in every run, so one that is no
         // string is refused here, once, rather than at each run.
@@ -127,8 +129,9 @@ pub(super) fn lower_http_serve(
                 source_name: format!("__http_route_{}_{}", span.file.index(), span.start),
                 address: RouteAddress::Constant { port, method, path },
             };
-            let responses = format!("__http_responses_{}_{}", span.file.index(), span.start);
+            let responses = responses_name.to_string();
             // A module checked alone reads its requests' type off the source by this name.
+            ctx.module_route_sources.insert(route.source_name.clone());
             ctx.declare_unopened_routes(&[DeclaredSink::Http {
                 route: Box::new(route.clone()),
                 responses: responses.clone(),
@@ -138,7 +141,6 @@ pub(super) fn lower_http_serve(
             (route, responses)
         }
     };
-    ctx.minted_channels.insert(responses.clone(), spelled);
     let source_name = route.source_name.clone();
     ctx.declared_sinks.push(DeclaredSink::Http {
         route: Box::new(route),
@@ -151,20 +153,31 @@ pub(super) fn lower_http_serve(
         span,
         "lower.http_serve",
     );
-    let responses_read = ctx.tag_machinery(Expr::var(responses.as_str()), span, "lower.http_serve");
-    let value = ctx.tag_machinery(
-        Expr::tuple(vec![requests_expr, responses_read]),
+    let requests_occurrence = ctx.occurrence_at(requests.span);
+    let requests_binding = ctx.tag_image(
+        Expr::let_bind(
+            requests_name.as_str(),
+            requests_occurrence,
+            requests_expr,
+            body,
+        ),
         span,
-        "lower.http_serve",
     );
-    let bound = bindings.wrap(value, body, span, ctx);
-    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, SINK_BINDING);
-    // The channel's `let` is manufactured plumbing, and its `Defer` binds the route's sink; the
-    // bindings `target` makes image the assignment statement.
-    Ok(ctx.tag_machinery(
-        Expr::let_bind(responses, Occurrence::mint(), channel, bound),
+    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
+    let responses_occurrence = ctx.occurrence_at(responses_target.span);
+    let annotation_occurrence = ctx.occurrence_at(responses_target.span);
+    Ok(ctx.tag_image(
+        Expr::let_bind_annotated(
+            responses_name.as_str(),
+            responses_occurrence,
+            channel,
+            requests_binding,
+            crate::ccl::Annotation::new(
+                Type::feed(Type::Hole, Type::Base(crate::ccl::BaseType::String)),
+                annotation_occurrence,
+            ),
+        ),
         span,
-        "lower.http_serve",
     ))
 }
 
@@ -193,6 +206,17 @@ pub(super) enum RouteAddress {
 }
 
 impl HttpRoute {
+    pub(super) fn describe(&self) -> String {
+        match &self.address {
+            RouteAddress::Fixed { port, method, path } => {
+                format!("`{method} {path}` on port {port}")
+            }
+            RouteAddress::Constant { port, method, path } => {
+                format!("`{method} {path}` on port {port}")
+            }
+        }
+    }
+
     /// The route at the address `port`, `method` and `path`, or why it has none: a port is a
     /// number below 65536.
     fn fixed(port: &str, method: &str, path: &str) -> Result<HttpRoute, String> {
@@ -212,6 +236,19 @@ impl HttpRoute {
     /// The name of the source its requests arrive on.
     pub(super) fn source_name(&self) -> &str {
         &self.source_name
+    }
+
+    pub(super) fn missing_arguments(
+        &self,
+        consts: &HashMap<crate::ccl::TypeParamId, ConstTerm>,
+    ) -> bool {
+        match &self.address {
+            RouteAddress::Constant { port, method, path } => [port, method, path]
+                .iter()
+                .flat_map(|term| term.params())
+                .any(|param| !consts.contains_key(&param.id)),
+            RouteAddress::Fixed { .. } => false,
+        }
     }
 
     /// The route a run whose `const` parameters take `consts` serves, with the name its

@@ -97,12 +97,10 @@ to a new domain. §8 shows the one place that claim is cashed in — the changel
 
 ### Two merge laws, one object
 
-A feed (`o << e`) is the **same object** — a function over the same kind of domain — and
-therefore the **second form of mutability**, not a separate concept. `o << e` is
-surface-impure in exactly the way `x := e` is: action at a distance on something bound
-elsewhere.
-
-The two differ only in their merge/read law:
+The compiler represents Mut and Feed with one internal `History` carrier and two merge laws.
+A Feed is an immutable place defined by contributions, with no surface history. A read gives its
+final collection. A Mut read gives its value at the source position. The shared carrier lets the
+eliminator compile both forms into pure dataflow.
 
 ```
   overwrite  (:=)                        append  (<<)
@@ -233,7 +231,7 @@ for req in reqs:
   commitment, so a transactional mutable variable is always spelled `Mut(𝑉, Txn)`.
 - **A `:=`/`+=` to a name that is not mutable is a type error**, not a silent rebind.
   This is the one rule that makes "declare it with `:=`" a real discipline.
-- **`Mut(𝑉)` is legal as a parameter annotation** — pass-by-reference, so a callee writes
+- **`Mut(𝑉)` is legal as a parameter annotation** — a borrowed parameter, so a callee writes
   the caller's variable.
 
 ### The read rules
@@ -399,7 +397,7 @@ the surface-CCL → pure-CCL step: the mutability analog of `lambda_elim`.
 
 Inlining runs **before** all of them so that a UDF writing a `Mut` parameter is
 beta-reduced to its call site, where its writes land in the scope of the variable they
-target. Pass-by-reference needs no machinery of its own — it is substitution.
+target. Borrowing needs no machinery of its own — it is substitution.
 
 Lifespans are more useful than a stage list:
 
@@ -575,7 +573,7 @@ would otherwise become a shadowing `let` that quietly discards committed values.
 
 `flatten_spine` → check → `rewrite` → `erase_mut` → assert.
 
-The first step is the one to know about: inlining a pass-by-reference writer splices its
+The first step is the one to know about: inlining a borrowing writer splices its
 body at the call site and can bury a `MutWrite` off the statement spine, where the main walk
 would read it as a pure value and drop the update. Commuting conversions lift those back, and
 the check after them panics on any write still off a spine. The asserts fire in **release**,
@@ -883,15 +881,15 @@ between them is the letrec's shape:
 
 1. A mutable variable is a **function from a sequencing domain to a value** — extent and
    tiling, applied to time.
-2. Overwrite and append are **two merge laws on one object**, which is why `<<` is the
-   second form of mutability and why the eliminator has two halves.
+2. Mutable and deferred places share an internal history carrier with overwrite and append
+   merge laws. A Feed has no surface history; its reads give the final collection.
 3. Three domains — statement, induction, `Txn` — with **causal accessors** that make the
    recursion well-founded.
 4. An induction variable's domain **is** its writer's; a transactional one's is not, so
    its history goes **through commit records** — from which atomicity, multi-writer
    merge, and denial all fall out.
 5. Mutability is **a type**, and a read is **an explicit operation** at the rule that
-   emits the operand — which is what makes the handle positions enumerable and lets
+   emits the operand — which is what makes the place positions enumerable and lets
    invariance do its own job.
 6. Everything meets one node (`Transact`) and is dispatched to an engine **by its
    domain** — two stores over one engine, each closing its recurrence through a cyclic

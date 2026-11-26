@@ -1664,7 +1664,7 @@ pub enum Type {
     /// `DataSource`, it has no enumerable static domain — its positions exist only
     /// in the tile. See src/ccl/design/mutability.md.
     Txn,
-    /// The type of a **history** handle: a function `domain ⤇ value` that a
+    /// The **place type** of a history: a function `domain ⤇ value` that a
     /// `:=` mutable variable or a `defer`/`<<` channel writes incrementally. One variant
     /// for both — a mutable variable and a feed channel are the same object (an
     /// invariant, deref-transparent `domain ⤇ value`); they differ only in the
@@ -1696,12 +1696,11 @@ pub enum Type {
     /// cannot ask where either came from.
     ///
     /// **The rule is what enforces that across a function boundary**, and it can be
-    /// because the handle reaches the parameter: `emit_apply` decides pass-by-reference
-    /// from the parameter read off the head of the application spine and leaves the
-    /// argument's `Mut` intact, so the `(History, History)` arm relates the two value
-    /// types directly. Both directions come from the one rule rather than being
+    /// because the place reaches the parameter: a call lends it with `&`, which keeps the
+    /// argument's place type intact (`emit::emit_borrow`), so the `(History, History)` arm
+    /// relates the two value types directly. Both directions come from the one rule rather than being
     /// assembled from an application edge plus a compensating write contribution — the
-    /// shape this needed while a deref coercion erased the handle before invariance
+    /// shape this needed while a deref coercion erased the place type before invariance
     /// could see it. The property is still pinned by test
     /// (`a_mut_vars_value_type_is_invariant_across_a_mut_parameter`), which is what
     /// would catch a future consolidation quietly dropping one direction.
@@ -3194,7 +3193,7 @@ impl Witness {
     }
 }
 
-/// Which flavour of [`Type::History`] a handle is — a mutable variable (`:=`) or a
+/// Which flavour of [`Type::History`] a place is — a mutable variable (`:=`) or a
 /// feed channel (`defer` / `<<`). The two are the same object (a `domain ⤇
 /// value` history) but read and materialize differently; see [`Type::History`].
 ///
@@ -4144,10 +4143,10 @@ impl Type {
     /// **A feed channel is a function too**, before `channelize` has made it one: a
     /// [`HistoryKind::Append`] history states the collection `domain ⤇ value`, and
     /// `channelize::erase_chan_domains_in_type` erases it to exactly that. A pass that
-    /// rebuilds around a still-unerased handle — the chain a per-iteration feed becomes —
+    /// rebuilds around a still-unerased place type — the chain a per-iteration feed becomes —
     /// has a kind to copy, and taking the `Compute` default there declares a collection a
-    /// compute function. ([`HistoryKind::Overwrite`] is not this case: a mutable variable handle
-    /// erases to its *value*, so it states no function type to copy.)
+    /// compute function. ([`HistoryKind::Overwrite`] is not this case: a mutable variable's
+    /// place type erases to its *value*, so it states no function type to copy.)
     ///
     /// **A sum is a function.** `Σ (𝑤 : 𝐾). (𝑤 ⤇ 𝑉)` is a collection exactly as `𝐷 ⤇ 𝑉`
     /// is; the witness binder only says its domain is whichever candidate was taken. So
@@ -4318,7 +4317,7 @@ impl Type {
     /// refinement is a claim about a value, not part of the shape carrying it, so
     /// `{(𝐷 ⇒ 𝑉) | 𝑝}` *is* a function and `{Mut(𝑉, 𝐷) | 𝑝}` *is* a mutable variable.
     /// Anything that dispatches on or destructures a shape peels first — including
-    /// the handle accessors below.
+    /// the place accessors below.
     ///
     /// The all-depths counterpart, [`crate::ccl::ccl_utils::strip_refinements`],
     /// is a different operation: it drops claims rather than looking past them,
@@ -4412,8 +4411,46 @@ impl Type {
         }
     }
 
+    /// The exact type of an ordinary value read. Mutable variables yield their
+    /// value and Feeds yield their collection. Value refinements are retained.
+    pub fn read_value_type(&self) -> &Type {
+        self.as_place().map_or(self, |place| place.value)
+    }
+
+    /// This type as a place, with its kind and the type a read of it has, or `None` for a
+    /// value type.
+    pub fn as_place(&self) -> Option<crate::ccl::place::PlaceType<'_>> {
+        use crate::ccl::place::{PlaceKind, PlaceType};
+        match self.peel_refinements() {
+            Type::History {
+                history_kind: HistoryKind::Overwrite,
+                ..
+            } => {
+                let (domain, value, _) = self
+                    .history_parts()
+                    .expect("an overwrite history holds a value");
+                Some(PlaceType {
+                    kind: if matches!(domain.peel_refinements(), Type::Txn) {
+                        PlaceKind::Transactional
+                    } else {
+                        PlaceKind::Mutable
+                    },
+                    value,
+                })
+            }
+            Type::History {
+                function,
+                history_kind: HistoryKind::Append,
+            } => Some(PlaceType {
+                kind: PlaceKind::Deferred,
+                value: function,
+            }),
+            _ => None,
+        }
+    }
+
     /// The **read view** of this type: what a reference to it denotes when read, with
-    /// refinement tags looked through and a handle resolved to the state behind it.
+    /// refinement tags looked through and a place type resolved to the state behind it.
     ///
     /// The view is kind-specific. A mutable variable reads as one value
     /// ([`Type::mut_value_type`]); a feed channel reads as the whole collection it has
@@ -4424,7 +4461,7 @@ impl Type {
     ///
     /// **No read view carries a Σ.** A history's function is `Data(None)`, with no witness
     /// binders, so a consumer reading witness binders off a channel's read view finds none —
-    /// because a handle holds none, not because the view dropped them.
+    /// because a place holds none, not because the view dropped them.
     pub fn read_view(&self) -> Cow<'_, Type> {
         let mut peeled = self.peel_refinements();
         while let Some(value) = peeled.mut_value_type() {
@@ -4440,15 +4477,9 @@ impl Type {
         }
     }
 
-    /// Whether this denotes a **handle** to state introduced elsewhere — a mutable
-    /// variable or a feed channel, either [`HistoryKind`].
-    ///
-    /// This is the question that does not care which [`HistoryKind`] it is, and the thing
-    /// that asks it is a *binding*: naming a handle aliases the state behind it either way,
-    /// so the choice between binding the handle and binding a copy of its value
-    /// turns on handle-ness alone.
-    pub fn is_handle(&self) -> bool {
-        matches!(self.peel_refinements(), Type::History { .. })
+    /// Whether this type names a mutable or deferred place.
+    pub fn is_place(&self) -> bool {
+        self.as_place().is_some()
     }
 
     /// Whether this denotes a **collection**: a data function, which the runtime sweeps.
@@ -5977,6 +6008,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Cast { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
+        | N::Borrow(_)
         | N::Lambda { .. }
         | N::Aggregate { .. }
         | N::Let { .. }
@@ -6035,6 +6067,7 @@ fn eq_term_modulo_ty_slots_go(
     match (&a.node, &b.node) {
         (N::Lit(x), N::Lit(y)) => x == y,
         (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
+        (N::Borrow(x), N::Borrow(y)) => eq_term_modulo_ty_slots_go(x, y, pairs),
         (N::Builtin(x), N::Builtin(y)) => x == y,
         (
             N::TraitFn {
@@ -6375,7 +6408,7 @@ fn eq_term_modulo_ty_slots_go(
                 value: v2,
             },
             // A `Feed`/`Define` name is a *use* of the binder that introduced
-            // the handle (`ccl::scope`), so it resolves like any reference.
+            // the place (`ccl::scope`), so it resolves like any reference.
         ) => paired_refs_match(pairs, n1, n2) && eq_term_modulo_ty_slots_go(v1, v2, pairs),
         _ => {
             // **A missing arm is not "unequal", it is unanswered.** Falling through with
@@ -7887,12 +7920,12 @@ mod tests {
 
     /// A shape test looks *through* a refinement: a refined mutable variable is still
     /// one and a refined channel is still a channel. Nothing in the pipeline
-    /// wraps a handle today — a handle type is built structurally rather than
+    /// wraps a place type today — a place type is built structurally rather than
     /// resolved from a variable, so no position accumulates a refinement onto one — which
     /// is exactly why the rule needs stating here: it is the accessors' contract,
     /// not a shape a program can be written to exercise.
     #[test]
-    fn handle_accessors_see_through_a_refinement() {
+    fn place_accessors_see_through_a_refinement() {
         let refinement = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
         let refine = |t: Type| Type::refined_one(t, refinement.clone());
         let int = Type::Base(BaseType::Int);
@@ -7904,14 +7937,14 @@ mod tests {
             refine(channel.clone()).as_feed(),
             Some((&Type::UIntRange(3), &int))
         );
-        assert!(refine(mut_var).is_handle() && refine(channel.clone()).is_handle());
+        assert!(refine(mut_var).is_place() && refine(channel.clone()).is_place());
 
         // The two kinds are not interchangeable: a channel reads as its whole
         // collection, a mutable variable as one value, so neither accessor answers for the other.
         assert_eq!(channel.mut_value_type(), None);
         assert_eq!(Type::mutable(Type::Txn, int.clone()).as_feed(), None);
 
-        // A refined *non*-handle peels to a non-handle, which is the case every
+        // A refined *non*-place type peels to a non-place type, which is the case every
         // caller of these accessors actually hits (`x = 0; x += 1`).
         assert_eq!(refine(int).mut_value_type(), None);
     }

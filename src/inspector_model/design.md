@@ -21,6 +21,10 @@ compile reads the lowering projection alone.
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
 | `span` | throughout: `{file, start, end}`, the byte range `start..end` of the **CHL source text** of the file `file` indexes in the compilation's `SourceMap`, never an offset into a rendered pane. The payload carries one file, the root, as `source`, so every span in it names the root. A diagnostic located in another file of the compilation names that file in its message and has no span, and a program of several modules gets the degraded payload, whose one diagnostic says the inspector shows one file. The std root's files do not count as modules of the program: a node's span in a std module's file does not ship (`wire_spans`), and neither does a definition whose use or binder stands outside the root. Nothing in the payload addresses a pane's text |
 
+The one-file restriction includes embedded std modules, so HTTP module programs currently receive
+this degraded payload. The gallery test compiles these programs through planning before accepting
+that diagnostic, keeping the inspector restriction separate from compiler failures.
+
 ## The usage model
 
 ### One payload per program; every lookup is the consumer's

@@ -57,12 +57,12 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
     ("nested3_mut_source", "dup_union", "CompilerRejects"),
-    ("nested3_mut_source", "generator_coll", "CompilerPanics"),
+    ("nested3_mut_source", "generator_coll", "CompilerRejects"),
     ("nested3_mut_source", "map_arrow", "InterpreterGap"),
     ("nested3_mut_source", "map_lit", "InterpreterGap"),
     ("nested3_mut_source", "union", "CompilerRejects"),
     ("nested_mut_source", "dup_union", "CompilerRejects"),
-    ("nested_mut_source", "generator_coll", "CompilerPanics"),
+    ("nested_mut_source", "generator_coll", "CompilerRejects"),
     ("nested_mut_source", "map_arrow", "InterpreterGap"),
     ("nested_mut_source", "map_lit", "InterpreterGap"),
     ("nested_mut_source", "union", "CompilerRejects"),
@@ -693,27 +693,27 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << sum(ch)
         "#}},
-        // A `def` feeding a handle declared outside it feeds from each call site naming it.
+        // A `def` feeding a feed place declared outside it feeds from each call site naming it.
         Skeleton { name: "def_feed_called_twice", hole: Ty::Int, scope: &[("y", Ty::Int)], body: indoc! {r#"
             out = test_sink()
-            def feed_under_test(y):
+            def feed_under_test(y, out: Feed(_)):
                 out << {}
-            feed_under_test(1)
-            feed_under_test(2)
+            feed_under_test(1, &out)
+            feed_under_test(2, &out)
         "#}},
         Skeleton { name: "def_feed_through_a_def", hole: Ty::Int, scope: &[("y", Ty::Int)], body: indoc! {r#"
             out = test_sink()
-            def feed_under_test(y):
+            def feed_under_test(y, out: Feed(_)):
                 out << {}
-            def caller(z):
-                feed_under_test(z)
+            def caller(z, out: Feed(_)):
+                feed_under_test(z, &out)
             out << 0
-            caller(1)
+            caller(1, &out)
         "#}},
         // A `def` never called feeds from nowhere.
         Skeleton { name: "def_feed_never_called", hole: Ty::Int, scope: &[("y", Ty::Int)], body: indoc! {r#"
             out = test_sink()
-            def feed_under_test(y):
+            def feed_under_test(y, out: Feed(_)):
                 out << {}
             out << 0
         "#}},

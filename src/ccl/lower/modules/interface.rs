@@ -298,9 +298,6 @@ pub struct Member {
     pub public: bool,
     /// The statement that binds it.
     pub declared: Span,
-    /// Whether it is a `def` with a `Mut(…)` or `Feed(…)` parameter, whose calls pass a bare
-    /// mutable variable or feed there.
-    pub history_param: bool,
 }
 
 /// One top-level type alias of a module.
@@ -517,7 +514,6 @@ pub struct AssociatedMember {
 #[derive(Debug, Clone)]
 pub struct Reference {
     pub name: QualifiedName,
-    pub history_param: bool,
 }
 
 impl Interface {
@@ -786,7 +782,6 @@ impl Interface {
                 Member {
                     public: binding.public,
                     declared: binding.span,
-                    history_param: ctx.is_history_param_fn(&binding.name),
                 },
             );
         }
@@ -1143,10 +1138,6 @@ impl Interface {
                     Some(member) if !member.public => {
                         missing.push(format!("`{name}` is private to module `{module}`"));
                     }
-                    Some(member) if member.history_param => missing.push(format!(
-                        "`{name}` takes a `Mut(…)` or `Feed(…)` parameter, and a parameter's \
-                         Module type does not reach one yet"
-                    )),
                     Some(_) => {}
                     None if self.may_be_unparsed(name) => {}
                     None => missing.push(format!("module `{module}` has no member `{name}`")),

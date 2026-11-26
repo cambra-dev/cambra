@@ -7,7 +7,7 @@
 # reply rides its commit keyed by the GET request, which is how the HTTP response sink
 # dispatches replies to their requests.
 #
-# The POST reply `set_resps << "ok\n"` is a sibling of the `with begin():` block,
+# The POST reply `http_set_resps_replies << "ok\n"` is a sibling of the `with begin():` block,
 # so it rides the POST request loop (request-indexed), matching how the HTTP
 # response sink dispatches replies to their requests.
 #
@@ -21,16 +21,22 @@
 #     curl -X POST -d 'bob'   localhost:8080/set
 #     curl localhost:8080/get        # -> bob
 
-set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
-get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
+http_set_resps_replies: Feed(String)
+set_reqs = http_set_resps::requests
+run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
+http_get_resps_replies: Feed(String)
+get_reqs = http_get_resps::requests
 
 latest: Mut(String, Txn) := "(none)"
 
 for msg in set_reqs:
     with begin():
         latest := msg
-    set_resps << "ok\n"
+    http_set_resps_replies << "ok\n"
 
 for req in get_reqs:
     with begin():
-        get_resps << latest
+        http_get_resps_replies << latest
+http_set_resps::respond(http_set_resps_replies)
+http_get_resps::respond(http_get_resps_replies)

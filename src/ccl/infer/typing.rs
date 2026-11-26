@@ -45,15 +45,6 @@ pub(super) enum MethodCallsEnd {
     Failed,
 }
 
-/// The written argument an A-normalization temp names, before reading mutable variables.
-#[derive(Clone)]
-pub(super) enum TempNames {
-    /// A source variable, by name and at its own type rather than the type of its read value.
-    Variable(Name, Type),
-    /// A computed expression, which supplies no variable to pass by reference.
-    Computed,
-}
-
 /// The operations a typing rule needs from its surrounding pass.
 ///
 /// Each per-node rule (`emit_apply`, `emit_let`, …) is written once against
@@ -121,15 +112,6 @@ pub(super) trait Typing {
         reads_before: usize,
     ) -> Result<(), LocatedInferError>;
 
-    /// Record what the A-normalization temp `temp` names ([`super::emit::written_variable`]),
-    /// for a pass-by-reference argument the temp is.
-    fn note_temp(&mut self, temp: &Name, written: TempNames);
-
-    /// What [`Self::note_temp`] recorded for `temp`. Every A-normalization temp is recorded
-    /// by its `let` before its body is emitted, in both Emit and Check mode. A missing
-    /// record violates that ordering invariant.
-    fn temp_written(&self, temp: &Name) -> Option<TempNames>;
-
     /// Pass over a statement whose expression is the [`Error`](crate::ccl::TypedExprNode::Error)
     /// stand-in for one that failed in an earlier run ([`super::run_with_params`]): it is
     /// typed as a failed statement is, reporting nothing, and counts toward
@@ -145,6 +127,11 @@ pub(super) trait Typing {
     /// resolves no method calls, so it answers `false`.
     fn binds(&self, name: &Name) -> bool;
 
+    /// Whether `name` is a place variable, a declared `Mut` or `Feed` or a parameter that
+    /// borrows, which a borrow of a path from it asks before the path is typed. Check meets no
+    /// such borrow, since emission refuses it, so it answers `false`.
+    fn binds_place(&self, name: &Name) -> bool;
+
     /// How many errors emission has recovered from so far ([`Self::recover`]), reported
     /// or not. A statement recovered from leaves its nodes untyped. Check returns the
     /// error rather than recovering, so it answers `0`.
@@ -154,6 +141,18 @@ pub(super) trait Typing {
     /// via [`emit_node`](super::emit::emit_node), emitting the child's
     /// constraints and writing its inferred type onto the child node.
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError>;
+
+    fn read_value_type(&self, ty: &Type) -> Type {
+        ty.read_value_type().clone()
+    }
+
+    fn prepare_place_read(
+        &mut self,
+        _parameter: &TypedBinding,
+        _ty: &Type,
+    ) -> Result<(), LocatedInferError> {
+        Ok(())
+    }
 
     /// A fresh existential type variable at the current level.
     fn fresh(&mut self) -> Type;
@@ -444,9 +443,10 @@ pub(super) trait Typing {
     fn note_result(&mut self, _ty: &Type, _returned: NodeId) {}
 
     /// Note that a write (or, with `appends`, an append) of the node being emitted hands a
-    /// value to `target`, whose type is `ty`: a function `target` holds may not require or
-    /// cause anything naming a variable whose scope ends before `target`'s. Check notes
-    /// nothing.
+    /// value of type `ty` to `target`: a function the value holds may not require or cause
+    /// anything naming a variable whose scope ends before `target`'s. The value's type, not the
+    /// target's: a capability naming a variable stops at a capability variable minted outside
+    /// its scope, which the target's are. Check notes nothing.
     fn note_handed_out(&mut self, _target: &Name, _ty: &Type, _appends: bool) {}
 
     /// How many links of associated effect types wait on their obligations
@@ -724,15 +724,6 @@ pub(super) trait Typing {
     /// the binder's name still in it, and the binder's own type is what a later
     /// query learns about that name.
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type;
-
-    /// State the parameters the components of `tuple`, a call's argument tuple, pass to, one
-    /// per component, which `tuple`'s rule takes ([`Self::take_arguments`]): a component a
-    /// parameter takes by reference passes the handle it names rather than its value.
-    fn pass_arguments(&mut self, tuple: NodeId, params: Vec<Type>);
-
-    /// Take the parameters [`Self::pass_arguments`] stated for `tuple`, if it is a call's
-    /// argument tuple.
-    fn take_arguments(&mut self, tuple: NodeId) -> Option<Vec<Type>>;
 
     /// Lift a `Case` arm's type `body_ty` past the arm's pattern binder `binder`, after
     /// [`Self::scoped`] has restored the enclosing scope.

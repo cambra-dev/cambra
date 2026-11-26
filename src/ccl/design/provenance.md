@@ -237,6 +237,7 @@ pub struct TypedBinding {
     pub ty: Type,
     pub user_annotation: Option<Annotation>,
     pub transparency: BindingTransparency,
+    pub parameter_mode: ParameterMode,
 }
 
 pub struct Annotation {

@@ -97,7 +97,7 @@ use rstest_log::rstest;
             raise x
         x
     y = try:
-            g(5, o) + f(1)
+            g(5, &o) + f(1)
         except Int as e:
             e
     y * 100 + sum(o)
