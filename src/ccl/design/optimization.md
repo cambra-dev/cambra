@@ -716,11 +716,12 @@ constants stay operators. The union's extent comes from the node's codomain
 union column, so the prefix ends before a `variant_project`, a `variant_is`, or a comparison that
 reads a union from the input.
 
-The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
-a store read, or a constant that is not closed stays an operator. Conversion also declines when
-the input is a bare product, whose fields are tiles, or when its values at the current level hold
-a collection, since neither is a column. An input column of base values, records and unions is
-taken. A chain over it reads base fields and copies union fields.
+The prefix ends before the first element outside that set. An aggregate, a lookup, a store read,
+a constant that is not closed, and a conditional whose arms are not proved to split the rows
+([A conditional in an element-wise chain](#a-conditional-in-an-element-wise-chain)) stay operators.
+Conversion also declines when the input is a bare product, whose fields are tiles, or when its
+values at the current level hold a collection, since neither is a column. An input column of base
+values, records and unions is taken. A chain over it reads base fields and copies union fields.
 
 Of the prefixes the parse reads, conversion takes the longest that ends at an operation or at a
 `zip`. A prefix that ends at a `zip` yields one column of records, `Tiling::Scalar` of a record
@@ -741,6 +742,60 @@ and compiled as a shared history store. End-to-end cases are in
 `tests/it/compilation_pipeline/`.
 See [Operator Conversion](../../interpreter/design-operators.md#operator-conversion-interpreteroperator_conversionrs)
 for the operator-level contracts.
+
+#### A conditional in an element-wise chain
+
+A value `if` and a `match` reach conversion as a `DisjointJoin`, `𝑎₁ ⊔ … ⊔ 𝑎ₙ`, whose operands
+are partial maps over the input's domain ([Conditional expressions and
+filters](#conditional-expressions-and-filters)). When each operand is a gate followed by an
+element-wise chain, and the gates split the rows, the join fuses into the enclosing program as one
+program `Case` over arms whose instructions run only on their own rows
+([Conditional programs](../../interpreter/design-operators.md#conditional-programs)). An operand
+takes one of three forms:
+
+- `(𝑔 ▷ filter_values) ≫ 𝑒`, where `𝑔` is an element-wise chain yielding `Bool`. The arm holds the
+  rows where `𝑔` holds.
+- ``𝑠 ≫ variant_project(`𝑐) ≫ 𝑒``, where `𝑠` is an element-wise chain yielding a union. The arm
+  holds the rows whose value of `𝑠` carries `𝑐`, and `𝑒` reads the payload.
+- ``(id, 𝑠 ≫ variant_project(`𝑐)) ▷ zip ≫ 𝑒``: the arm holds the same rows, and `𝑒` reads the pair
+  of the element and the payload.
+
+`𝑔` and `𝑠` are parsed in the scope enclosing the join, `𝑒` in the arm's own. A value of the
+enclosing scope that `𝑒` reads is narrowed to the arm's rows.
+
+The gates must split the rows: every row belongs to exactly one arm. Without that the join is not
+element-wise, since a row in no arm leaves the output and a row in two arms is answered twice.
+
+- Gates of the first form are proved by their truth values. Each gate is a formula of `and`, `or`
+  and `not` over atoms, the `Bool` slots no such operation produces. Equal comparisons are one atom,
+  because equal instructions share a slot. Every assignment of truth values to the atoms must make
+  exactly one gate hold. The proof assigns one atom at a time and evaluates every gate on the
+  partial assignment as true, false or undecided. A branch ends once every gate is decided, and the
+  proof fails once two gates are true or every gate is false. On `lambda_elim`'s first-match gates,
+  `𝜋ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁` with a final guard of `true` (`synthesize_arm_predicate`), the
+  proof reaches one leaf per arm. It visits at most 4096 search nodes (`SPLIT_BUDGET`), a
+  compile-time budget: a conditional whose proof needs more is not fused.
+- Gates of the second and third forms split the rows when they read one `𝑠`, name distinct tags,
+  and name every tag of `𝑠`'s extent.
+- A join that mixes the two kinds of gate is not fused.
+
+A `𝑠` built in the chain carries one known tag, so the arm naming it holds every row and the
+others hold none: the join reads as that arm alone, and the program builds no `Case`. Each arm's
+result must have a column, as a prefix's result must. The result's extent is the join node's
+codomain (`OpConversionContext::extent_of`), so arms that wrap different tags yield one union
+column holding each arm's tag. A `DisjointJoin` counts as one operation, and its arms' elements
+count as the elements of a chain do.
+
+`[x // 2 if x > 0 else 0 - x for x in source1()]` plans to:
+
+```
+((id, 0 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div
+  ⊔ ((id, 0 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ (0 ▷ const, id) ▷ zip ≫ sub
+```
+
+The two gates read one atom, `gt` of the input and `0`, which is one slot. The first gate holds
+where the atom is true and the second where it is false, so they split the rows. The join fuses to
+one map, and `floor_div` runs only on rows where `x > 0`.
 
 ### `Let` nodes compile to a shared binding, not `Apply(Lambda)`
 

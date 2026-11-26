@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::mem::replace;
+use std::ops::Range;
 
 use smol_str::SmolStr;
 
@@ -23,9 +24,45 @@ use super::{
 /// The index of an instruction, which is also the slot it writes.
 type Slot = u32;
 
-/// One instruction of a [`ScalarProgram`].
+/// The rows an instruction runs on: [`ROOT`], every row of the block, or the rows of the `Arm`
+/// whose slot it is ([`Op::Arm`]).
+type Scope = Slot;
+
+/// The scope holding every row of the block.
+const ROOT: Scope = Slot::MAX;
+
+/// One instruction of a [`ScalarProgram`]: an operation and the scope it runs in. An `Input` and a
+/// `Const` are in [`ROOT`]; a constant reads as one value repeated to any scope's length.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Instr {
+struct Instr {
+    scope: Scope,
+    op: Op,
+}
+
+/// The empty column of a payload's type, which a block whose union column lacks the arm reads.
+///
+/// `ColumnValue` has no `Hash`, so a shape hashes as nothing; `Eq` still compares it, which keeps
+/// equal instructions hashing equally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shape(ColumnValue);
+
+impl std::hash::Hash for Shape {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+/// What a [`Op::Arm`] selects the rows of its enclosing scope by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Gate {
+    /// The rows where the `Bool` slot holds.
+    Holds(Slot),
+    /// The rows whose value in the union slot carries the tag.
+    Tag(Slot, FieldKey),
+}
+
+/// What an instruction computes. Every slot an operation reads is in the instruction's scope or
+/// is a constant ([`ScalarProgram::scopes_are_consistent`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Op {
     /// The column at `path` inside the map's input value; an empty path is the value itself. The
     /// column is of a base type or a union. A `Unit` or union column has no view, so no operation
     /// reads one ([`ScalarProgram::operands_have_views`]), and a constructor copies its rows.
@@ -46,18 +83,49 @@ enum Instr {
     /// A union column whose every row carries `tag`, with the payload in `payload`. The column
     /// holds only that arm, since an absent arm reads as an empty one ([`ColumnValue::Union`]).
     ///
-    /// A constructor, as [`Instr::Record`] is.
+    /// A constructor, as [`Op::Record`] is.
     Wrap {
         tag: FieldKey,
         payload: Slot,
     },
+    /// Opens the scope this slot names: the rows of the instruction's scope that `gate` selects.
+    /// It is no column, so nothing but a scope's instructions and a `Case` reads it.
+    Arm {
+        gate: Gate,
+    },
+    /// In an arm's scope, the rows of `from`, a slot of the enclosing scope, that the arm holds.
+    Narrow {
+        from: Slot,
+    },
+    /// In the scope of an arm with a `Tag` gate, the payloads of the rows it holds, at `path`
+    /// inside them.
+    Payload {
+        path: Vec<SmolStr>,
+        shape: Shape,
+    },
+    /// Each row's value from the one arm holding it: `arms` lists each `Arm` slot with the slot of
+    /// its result. The arms split the rows of the instruction's scope. A `Case` that `constructs`
+    /// is a constructor, as [`Op::Record`] is; one that does not yields a column with a view and
+    /// writes a scratch column.
+    Case {
+        arms: Vec<(Slot, Slot)>,
+        constructs: bool,
+    },
 }
 
-impl Instr {
-    /// Whether this instruction builds part of the result: a [`Instr::Record`] or a
-    /// [`Instr::Wrap`].
+impl Op {
+    /// Whether this operation builds part of the result: a [`Op::Record`], a [`Op::Wrap`], or a
+    /// [`Op::Case`] that constructs.
     fn is_constructor(&self) -> bool {
-        matches!(self, Instr::Record(_) | Instr::Wrap { .. })
+        matches!(
+            self,
+            Op::Record(_)
+                | Op::Wrap { .. }
+                | Op::Case {
+                    constructs: true,
+                    ..
+                }
+        )
     }
 }
 
@@ -97,12 +165,27 @@ fn const_view(value: &Value, len: usize) -> ColumnView<'_> {
     }
 }
 
+/// An arm's rows in the current block.
+#[derive(Default)]
+struct ArmRows {
+    /// The ascending positions, within the enclosing scope's rows, that the arm holds.
+    selection: Vec<u32>,
+    /// For a `Tag` gate, the slots of the gate's `UnionArm` that hold those rows; empty for a
+    /// `Holds` gate or a tag the union column lacks.
+    run: Range<usize>,
+}
+
 /// Per-evaluation buffers reused across blocks. Inputs and constants are borrowed views.
 struct Scratch<'a> {
     input: &'a ColumnValue,
-    /// `Units(0)` marks unwritten slots; no operation produces that column variant. Inputs,
-    /// constants, constructors, and the last instruction never write a scratch slot.
+    /// The empty column of each slot's type; `None` for an `Arm`, which is no column.
+    empties: Vec<Option<ColumnValue>>,
+    /// `Units(0)` marks unwritten slots. An operation, a `Narrow`, a `Case` that does not
+    /// construct, and a `Payload` with no view write their block here; the last instruction does
+    /// not.
     slots: Vec<ColumnValue>,
+    /// The rows of each `Arm` slot in the current block.
+    arms: Vec<ArmRows>,
     /// The current block: the rows `start..start + len` of the input.
     start: usize,
     len: usize,
@@ -110,48 +193,114 @@ struct Scratch<'a> {
 
 impl<'a> Scratch<'a> {
     fn new(input: &'a ColumnValue, program: &ScalarProgram) -> Self {
+        let n = program.instrs.len();
         Self {
             input,
-            slots: vec![ColumnValue::Units(0); program.instrs.len()],
+            empties: program.empties(input),
+            slots: vec![ColumnValue::Units(0); n],
+            arms: (0..n).map(|_| ArmRows::default()).collect(),
             start: 0,
             len: 0,
         }
     }
 
-    /// The block of instruction `slot` as a view.
-    fn view<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> ColumnView<'s> {
-        match &program.instrs[slot] {
-            Instr::Input { path } => field(self.input, path)
-                .view()
-                .unwrap_or_else(|| panic!("the input at {path:?} is a column of a base type"))
-                .range(self.start..self.start + self.len),
-            Instr::Const(value) => const_view(value, self.len),
-            Instr::Bin(..) | Instr::Un(..) => self.slots[slot]
-                .view()
-                .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
-            Instr::Record(_) | Instr::Wrap { .. } => {
-                unreachable!("no instruction views the constructor s{slot}")
-            }
+    /// How many rows `scope` holds in the current block.
+    fn len_of(&self, scope: Scope) -> usize {
+        if scope == ROOT {
+            self.len
+        } else {
+            self.arms[scope as usize].selection.len()
         }
     }
 
-    /// Append the current block of `slot` to `out`, which must have its type. A constructor
-    /// builds its block in place. A `Unit` or union input has no view, so its block is copied. A
-    /// `Unit` constant adds the block's rows to a `Units` column.
-    fn append(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
-        let rows = self.start..self.start + self.len;
-        match &program.instrs[slot] {
-            instr if instr.is_constructor() => self.run(program, slot, out),
-            Instr::Input { path } if field(self.input, path).view().is_none() => {
-                out.append(field(self.input, path).slice(rows))
+    /// The current block of the union column in `slot`, with the row its block starts at: the
+    /// input's column numbers its rows across the whole input, a scratch column from 0.
+    fn union_block<'s>(&'s self, program: &ScalarProgram, slot: Slot) -> (&'s ColumnValue, usize) {
+        match &program.instrs[slot as usize].op {
+            Op::Input { path } => (field(self.input, path), self.start),
+            Op::Narrow { .. } | Op::Payload { .. } => (&self.slots[slot as usize], 0),
+            op => unreachable!("a union is read from the input or a scratch column, got {op:?}"),
+        }
+    }
+
+    /// The payload column of the `Tag` arm `scope`, at `path`, for the rows the arm holds in the
+    /// current block.
+    fn payload<'s>(
+        &'s self,
+        program: &'s ScalarProgram,
+        scope: Scope,
+        path: &[SmolStr],
+        shape: &'s Shape,
+    ) -> (&'s ColumnValue, Range<usize>) {
+        let Op::Arm {
+            gate: Gate::Tag(union, tag),
+        } = &program.instrs[scope as usize].op
+        else {
+            unreachable!("a payload is read in the scope of a `Tag` arm")
+        };
+        let (column, _) = self.union_block(program, *union);
+        let ColumnValue::Union(arms) = column else {
+            unreachable!("a `Tag` gate reads a union column, got {column:?}")
+        };
+        match arms.get(tag) {
+            Some(arm) => (
+                field(arm.values(), path),
+                self.arms[scope as usize].run.clone(),
+            ),
+            None => (&shape.0, 0..0),
+        }
+    }
+
+    /// The block of instruction `slot` as a view, at `len` rows: the length of the scope reading
+    /// it, which a constant repeats to.
+    fn view<'s>(&'s self, program: &'s ScalarProgram, slot: usize, len: usize) -> ColumnView<'s> {
+        let instr = &program.instrs[slot];
+        let view = match &instr.op {
+            Op::Input { path } => field(self.input, path)
+                .view()
+                .unwrap_or_else(|| panic!("the input at {path:?} is a column of a base type"))
+                .range(self.start..self.start + self.len),
+            Op::Const(value) => return const_view(value, len),
+            Op::Payload { path, shape } => {
+                let (column, run) = self.payload(program, instr.scope, path, shape);
+                column
+                    .view()
+                    .unwrap_or_else(|| panic!("the payload s{slot} is a column of a base type"))
+                    .range(run)
             }
-            Instr::Const(Value::Unit) => out.append(ColumnValue::Units(rows.len())),
-            _ => out.extend_from_view(self.view(program, slot)),
+            Op::Bin(..) | Op::Un(..) | Op::Narrow { .. } | Op::Case { .. } => self.slots[slot]
+                .view()
+                .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
+            Op::Record(_) | Op::Wrap { .. } | Op::Arm { .. } => {
+                unreachable!("no instruction views s{slot}, which is no column with a view")
+            }
+        };
+        debug_assert_eq!(view.len(), len, "s{slot} is read at its own scope's length");
+        view
+    }
+
+    /// Append the current block of `slot` to `out`, which must have its type, for a reader in
+    /// `scope`. A constructor builds its block in place. A `Unit` or union input has no view, so
+    /// its block is copied, and so is a column with no view in a scratch slot. A `Unit` constant
+    /// adds the scope's rows to a `Units` column.
+    fn append(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue, scope: Scope) {
+        let instr = &program.instrs[slot];
+        let len = self.len_of(scope);
+        match &instr.op {
+            op if op.is_constructor() => self.run(program, slot, out),
+            Op::Input { path } if field(self.input, path).view().is_none() => {
+                out.append(field(self.input, path).slice(self.start..self.start + self.len))
+            }
+            Op::Const(Value::Unit) => out.append(ColumnValue::Units(len)),
+            Op::Narrow { .. } | Op::Payload { .. } if !self.has_view(program, slot) => {
+                out.append(self.slots[slot].clone())
+            }
+            _ => out.extend_from_view(self.view(program, slot, len)),
         }
     }
 
     /// Append the result for `start..start + len` to `out`, prepared by
-    /// [`ScalarProgram::empty_output`]. No instruction reads the last slot, so its result can be
+    /// [`ScalarProgram::empties`]. No instruction reads the last slot, so its result can be
     /// appended directly without a scratch buffer.
     fn block(&mut self, program: &ScalarProgram, start: usize, len: usize, out: &mut ColumnValue) {
         self.start = start;
@@ -163,47 +312,147 @@ impl<'a> Scratch<'a> {
         self.run(program, last, out);
     }
 
-    /// Evaluate an operation into its scratch buffer. Other instructions have no scratch output.
+    /// Evaluate one instruction for the current block into its scratch slot, or, for an `Arm`, its
+    /// rows. Inputs, constants and constructors write nothing.
     fn run_into_slot(&mut self, program: &ScalarProgram, slot: usize) {
         let instr = &program.instrs[slot];
-        if !matches!(instr, Instr::Bin(..) | Instr::Un(..)) {
-            return;
+        match &instr.op {
+            Op::Arm { gate } => self.arms[slot] = self.select(program, instr.scope, gate),
+            Op::Narrow { from } => {
+                let column = self.narrow(program, instr.scope, *from);
+                self.slots[slot] = column;
+            }
+            Op::Payload { path, shape } => {
+                let (column, run) = self.payload(program, instr.scope, path, shape);
+                if column.view().is_none() {
+                    let copy = if run.is_empty() {
+                        column.empty_like()
+                    } else {
+                        column.slice(run)
+                    };
+                    self.slots[slot] = copy;
+                }
+            }
+            Op::Bin(..)
+            | Op::Un(..)
+            | Op::Case {
+                constructs: false, ..
+            } => {
+                let mut column = self.slot_column(slot);
+                self.run(program, slot, &mut column);
+                self.slots[slot] = column;
+            }
+            Op::Input { .. } | Op::Const(_) | Op::Record(_) | Op::Wrap { .. } | Op::Case { .. } => {
+            }
         }
-        let mut column = self.slot_column(program, slot, instr);
-        self.run(program, slot, &mut column);
-        self.slots[slot] = column;
+    }
+
+    /// The rows of the enclosing scope `scope` that `gate` selects in the current block.
+    fn select(&self, program: &ScalarProgram, scope: Scope, gate: &Gate) -> ArmRows {
+        let len = self.len_of(scope);
+        match gate {
+            Gate::Holds(slot) => {
+                let ColumnView::Bools(holds) = self.view(program, *slot as usize, len) else {
+                    unreachable!("a `Holds` gate reads a `Bool` column")
+                };
+                let selection = (0..len)
+                    .filter(|&p| *holds.get(p))
+                    .map(|p| p as u32)
+                    .collect();
+                ArmRows {
+                    selection,
+                    run: 0..0,
+                }
+            }
+            // The arm's rows are ascending, so those in the block are one run of them.
+            Gate::Tag(union, tag) => {
+                let (column, offset) = self.union_block(program, *union);
+                let ColumnValue::Union(arms) = column else {
+                    unreachable!("a `Tag` gate reads a union column, got {column:?}")
+                };
+                let Some(arm) = arms.get(tag) else {
+                    return ArmRows::default();
+                };
+                let rows = arm.rows();
+                let run = rows.partition_point(|&r| r < offset)
+                    ..rows.partition_point(|&r| r < offset + len);
+                let selection = rows[run.clone()]
+                    .iter()
+                    .map(|&r| (r - offset) as u32)
+                    .collect();
+                ArmRows { selection, run }
+            }
+        }
+    }
+
+    /// Whether `slot` reads as a view in the current block: an operation, a `Case` that does not
+    /// construct, or an input, `Narrow` or `Payload` of a base type other than `Unit`.
+    fn has_view(&self, program: &ScalarProgram, slot: usize) -> bool {
+        let instr = &program.instrs[slot];
+        match &instr.op {
+            Op::Input { path } => field(self.input, path).view().is_some(),
+            Op::Const(value) => !matches!(value, Value::Unit),
+            Op::Bin(..)
+            | Op::Un(..)
+            | Op::Case {
+                constructs: false, ..
+            } => true,
+            Op::Narrow { .. } => self.slots[slot].view().is_some(),
+            Op::Payload { path, shape } => self
+                .payload(program, instr.scope, path, shape)
+                .0
+                .view()
+                .is_some(),
+            Op::Record(_) | Op::Wrap { .. } | Op::Arm { .. } | Op::Case { .. } => false,
+        }
+    }
+
+    /// The rows of `from`, a slot of the scope enclosing the arm `scope`, that the arm holds.
+    fn narrow(&self, program: &ScalarProgram, scope: Scope, from: Slot) -> ColumnValue {
+        let selection = &self.arms[scope as usize].selection;
+        let enclosing = program.instrs[scope as usize].scope;
+        if self.has_view(program, from as usize) {
+            let len = self.len_of(enclosing);
+            return self.view(program, from as usize, len).gather(selection);
+        }
+        let (column, offset) = match &program.instrs[from as usize].op {
+            Op::Input { path } => (field(self.input, path), self.start),
+            _ => (&self.slots[from as usize], 0),
+        };
+        column.select_indices(
+            selection.iter().map(|&p| offset + p as usize),
+            selection.len(),
+        )
     }
 
     /// The column an operation writes its block into: its slot's buffer, cleared, or on the first
     /// block a new empty column of the operation's result type.
-    fn slot_column(&mut self, program: &ScalarProgram, slot: usize, instr: &Instr) -> ColumnValue {
+    fn slot_column(&mut self, slot: usize) -> ColumnValue {
         let mut column = take(&mut self.slots[slot]);
         if !matches!(column, ColumnValue::Units(_)) {
             column.clear();
             return column;
         }
-        match instr {
-            Instr::Un(op, a) => unaryop_result_column(*op, &self.view(program, *a as usize)),
-            Instr::Bin(op, a, _) => binop_result_column(*op, &self.view(program, *a as usize)),
-            Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) | Instr::Wrap { .. } => {
-                unreachable!("only an operation writes a slot")
-            }
-        }
+        self.empties[slot]
+            .clone()
+            .expect("an operation's result is a column")
     }
 
     /// Append an operation or constructor's current block to `out`, which must have its result
     /// type. Nested constructors are built recursively because they have no scratch columns.
     fn run(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
-        match &program.instrs[slot] {
-            Instr::Un(op, a) => apply_unaryop_views(*op, &self.view(program, *a as usize), out),
-            Instr::Bin(op, a, b) => {
+        let instr = &program.instrs[slot];
+        let len = self.len_of(instr.scope);
+        match &instr.op {
+            Op::Un(op, a) => apply_unaryop_views(*op, &self.view(program, *a as usize, len), out),
+            Op::Bin(op, a, b) => {
                 let (a, b) = (
-                    self.view(program, *a as usize),
-                    self.view(program, *b as usize),
+                    self.view(program, *a as usize, len),
+                    self.view(program, *b as usize, len),
                 );
                 apply_binop_views(*op, &a, &b, out);
             }
-            Instr::Record(fields) => {
+            Op::Record(fields) => {
                 let ColumnValue::Records(columns) = out else {
                     panic!("a record is appended to a record column, got {out:?}")
                 };
@@ -211,27 +460,152 @@ impl<'a> Scratch<'a> {
                     let column = columns
                         .get_mut(name)
                         .unwrap_or_else(|| panic!("the result has a column for the field {name}"));
-                    self.append(program, *field as usize, column);
+                    self.append(program, *field as usize, column, instr.scope);
                 }
             }
-            Instr::Wrap { tag, payload } => {
+            Op::Wrap { tag, payload } => {
+                let rows = out.len()..out.len() + len;
                 let ColumnValue::Union(arms) = out else {
                     panic!("a wrap is appended to a union column, got {out:?}")
                 };
                 let arm = arms
                     .get_mut(tag)
                     .unwrap_or_else(|| panic!("the result has an arm for the tag {tag}"));
-                // A union's rows are numbered across the whole column, and every row of the
-                // result carries this one arm, so the block's rows are its positions in the input.
-                arm.extend_rows(self.start..self.start + self.len, |values| {
-                    self.append(program, *payload as usize, values)
+                // Every row the wrap builds carries this one arm, so its rows follow the rows the
+                // column already holds.
+                arm.extend_rows(rows, |values| {
+                    self.append(program, *payload as usize, values, instr.scope)
                 });
             }
-            Instr::Input { .. } | Instr::Const(_) => unreachable!(
-                "s{slot} runs only as an operation, the last instruction or a field or payload \
-                 that is a constructor, and the last instruction is an operation or a constructor"
-            ),
+            Op::Case {
+                arms,
+                constructs: false,
+            } => {
+                let parts: Vec<_> = arms
+                    .iter()
+                    .map(|&(arm, result)| {
+                        let selection = &self.arms[arm as usize].selection;
+                        let view = self.view(program, result as usize, selection.len());
+                        (view, selection.as_slice())
+                    })
+                    .collect();
+                ColumnView::scatter_into(&parts, len, out);
+            }
+            Op::Case {
+                arms,
+                constructs: true,
+            } => {
+                let parts = arms
+                    .iter()
+                    .map(|&(arm, result)| {
+                        let mut part = self.empties[result as usize]
+                            .clone()
+                            .expect("an arm's result is a column");
+                        self.append(program, result as usize, &mut part, arm);
+                        (part, self.arms[arm as usize].selection.as_slice())
+                    })
+                    .collect();
+                out.append(merge_parts(parts, len));
+            }
+            Op::Input { .. }
+            | Op::Const(_)
+            | Op::Arm { .. }
+            | Op::Narrow { .. }
+            | Op::Payload { .. } => {
+                unreachable!(
+                    "s{slot} runs only as an operation, the last instruction or a field or \
+                     payload that is a constructor, and the last instruction is an operation or a \
+                     constructor"
+                )
+            }
         }
+    }
+}
+
+/// One arm of a merged union column: its tag, the parts' payloads for it concatenated, and each
+/// row's position in the merged column with its index in those payloads.
+type MergedArm = (FieldKey, ColumnValue, Vec<(u32, usize)>);
+
+/// One column of `len` rows from `parts`: the row at position `p` is the next row of the one part
+/// whose positions hold `p`. The parts' positions are ascending and together hold each of `0..len`
+/// once. A record merges field by field, and a union arm by arm, each row keeping its tag.
+fn merge_parts(parts: Vec<(ColumnValue, &[u32])>, len: usize) -> ColumnValue {
+    let first = &parts.first().expect("a `Case` has an arm").0;
+    if first.view().is_some() {
+        let mut out = first.empty_like();
+        let views: Vec<_> = parts
+            .iter()
+            .map(|(column, positions)| (column.view().expect("parts of one type"), *positions))
+            .collect();
+        ColumnView::scatter_into(&views, len, &mut out);
+        return out;
+    }
+    match first {
+        ColumnValue::Units(_) => ColumnValue::Units(len),
+        ColumnValue::Records(fields) => {
+            let names: Vec<SmolStr> = fields.keys().cloned().collect();
+            let mut parts = parts;
+            ColumnValue::Records(
+                names
+                    .into_iter()
+                    .map(|name| {
+                        let field_parts = parts
+                            .iter_mut()
+                            .map(|(column, positions)| {
+                                let ColumnValue::Records(fields) = column else {
+                                    panic!("parts of one type")
+                                };
+                                let field = fields.remove(&name).expect("parts of one type");
+                                (field, *positions)
+                            })
+                            .collect();
+                        (name, merge_parts(field_parts, len))
+                    })
+                    .collect(),
+            )
+        }
+        ColumnValue::Union(_) => {
+            // Each part's union rows are numbered within the part; a row's position in the
+            // merged column is the part's position for it. An arm's payloads are the parts'
+            // payloads for that tag, concatenated and then taken in position order.
+            let mut by_tag: Vec<MergedArm> = Vec::new();
+            for (column, positions) in parts {
+                let ColumnValue::Union(arms) = column else {
+                    panic!("parts of one type")
+                };
+                for (tag, arm) in arms {
+                    let i = match by_tag.iter().position(|(t, ..)| *t == tag) {
+                        Some(i) => i,
+                        None => {
+                            by_tag.push((tag, arm.values().empty_like(), Vec::new()));
+                            by_tag.len() - 1
+                        }
+                    };
+                    let (_, values, rows) = &mut by_tag[i];
+                    let base = values.len();
+                    rows.extend(
+                        arm.rows()
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, &row)| (positions[row], base + slot)),
+                    );
+                    values.append(arm.values().clone());
+                }
+            }
+            ColumnValue::Union(TagMap::from_arms(
+                by_tag
+                    .into_iter()
+                    .map(|(tag, values, mut rows)| {
+                        rows.sort_unstable_by_key(|(position, _)| *position);
+                        let values =
+                            values.select_indices(rows.iter().map(|(_, i)| *i), rows.len());
+                        let rows = rows.iter().map(|(p, _)| *p as usize).collect();
+                        (tag, UnionArm::new(rows, values))
+                    })
+                    .collect(),
+            ))
+        }
+        other => panic!("a `Case` merges columns of base types, records and unions, got {other:?}"),
     }
 }
 
@@ -248,7 +622,12 @@ impl ScalarProgram {
     pub fn eval(&self, input: &ColumnValue) -> ColumnValue {
         let len = input.len();
         let mut scratch = Scratch::new(input, self);
-        let mut out = self.empty_output(input);
+        let mut out = scratch
+            .empties
+            .last()
+            .cloned()
+            .flatten()
+            .expect("a program's result is a column");
         out.reserve(len);
         let mut start = 0;
         loop {
@@ -268,48 +647,80 @@ impl ScalarProgram {
         out
     }
 
-    /// The empty column the result is appended to: a column of the last instruction's type, found
-    /// from the input's columns and the instructions' types without evaluating any block.
-    fn empty_output(&self, input: &ColumnValue) -> ColumnValue {
-        let mut empties: Vec<ColumnValue> = Vec::with_capacity(self.instrs.len());
+    /// The empty column of each slot's type, found from the input's columns and the instructions'
+    /// types without evaluating any block; `None` for an `Arm`, which is no column.
+    fn empties(&self, input: &ColumnValue) -> Vec<Option<ColumnValue>> {
+        let mut empties: Vec<Option<ColumnValue>> = Vec::with_capacity(self.instrs.len());
         for instr in &self.instrs {
-            let empty = match instr {
-                Instr::Input { path } => field(input, path).empty_like(),
-                Instr::Const(value) => ColumnValue::single(value.clone()).empty_like(),
-                // `neg` and `not` keep their operand's type.
-                Instr::Un(_, a) => empties[*a as usize].clone(),
-                Instr::Bin(op, a, _) => {
-                    let operand = empties[*a as usize]
+            let of = |slot: &Slot| -> ColumnValue {
+                empties[*slot as usize]
+                    .clone()
+                    .expect("an operand is a column")
+            };
+            let empty = match &instr.op {
+                Op::Input { path } => field(input, path).empty_like(),
+                Op::Const(value) => ColumnValue::single(value.clone()).empty_like(),
+                Op::Un(op, a) => {
+                    let operand = of(a);
+                    let operand = operand
+                        .view()
+                        .expect("an operand is a column of a base type");
+                    unaryop_result_column(*op, &operand)
+                }
+                Op::Bin(op, a, _) => {
+                    let operand = of(a);
+                    let operand = operand
                         .view()
                         .expect("an operand is a column of a base type");
                     binop_result_column(*op, &operand)
                 }
-                Instr::Record(fields) => ColumnValue::Records(
+                Op::Record(fields) => ColumnValue::Records(
                     fields
                         .iter()
-                        .map(|(name, field)| (name.clone(), empties[*field as usize].clone()))
+                        .map(|(name, field)| (name.clone(), of(field)))
                         .collect(),
                 ),
-                Instr::Wrap { tag, payload } => ColumnValue::Union(TagMap::from_arms(vec![(
+                Op::Wrap { tag, payload } => ColumnValue::Union(TagMap::from_arms(vec![(
                     tag.clone(),
-                    UnionArm::new(Vec::new(), empties[*payload as usize].clone()),
+                    UnionArm::new(Vec::new(), of(payload)),
                 )])),
+                Op::Arm { .. } => {
+                    empties.push(None);
+                    continue;
+                }
+                Op::Narrow { from } => of(from),
+                Op::Payload { shape, .. } => shape.0.clone(),
+                // A union `Case` holds each arm's tags, so the arms' empty columns are appended.
+                Op::Case { arms, .. } => {
+                    let mut arms = arms.iter().map(|(_, result)| of(result));
+                    let mut empty = arms.next().expect("a `Case` has an arm");
+                    arms.for_each(|arm| empty.append(arm));
+                    empty
+                }
             };
-            empties.push(empty);
+            empties.push(Some(empty));
         }
-        empties.pop().expect("a program has a last instruction")
+        empties
     }
 
     /// Check that constructors are used only to build the result, never as operation operands:
-    /// each is the last instruction or a field or payload of a later constructor. The last
-    /// instruction must be an operation or a constructor, not a borrowed input or constant.
+    /// each is the last instruction or a field, payload or arm result of a later constructor. The
+    /// last instruction must be an operation or a constructor, not a borrowed input, constant,
+    /// arm, narrowed column or payload.
     fn constructors_build_only_the_result(&self) -> bool {
-        let is_constructor = |slot: &Slot| self.instrs[*slot as usize].is_constructor();
+        let is_constructor = |slot: &Slot| self.instrs[*slot as usize].op.is_constructor();
         let last = self.instrs.len() - 1;
-        let result_is_built = !matches!(self.instrs[last], Instr::Input { .. } | Instr::Const(_));
-        let builds = |later: &Instr, slot: usize| match later {
-            Instr::Record(fields) => fields.iter().any(|(_, field)| *field as usize == slot),
-            Instr::Wrap { payload, .. } => *payload as usize == slot,
+        let result_is_built = matches!(
+            self.instrs[last].op,
+            Op::Bin(..) | Op::Un(..) | Op::Record(_) | Op::Wrap { .. } | Op::Case { .. }
+        );
+        let builds = |later: &Op, slot: usize| match later {
+            Op::Record(fields) => fields.iter().any(|(_, field)| *field as usize == slot),
+            Op::Wrap { payload, .. } => *payload as usize == slot,
+            Op::Case {
+                arms,
+                constructs: true,
+            } => arms.iter().any(|(_, result)| *result as usize == slot),
             _ => false,
         };
         result_is_built
@@ -317,52 +728,133 @@ impl ScalarProgram {
                 .instrs
                 .iter()
                 .enumerate()
-                .all(|(slot, instr)| match instr {
-                    Instr::Bin(_, a, b) => !is_constructor(a) && !is_constructor(b),
-                    Instr::Un(_, a) => !is_constructor(a),
-                    Instr::Record(_) | Instr::Wrap { .. } => {
+                .all(|(slot, instr)| match &instr.op {
+                    Op::Bin(_, a, b) => !is_constructor(a) && !is_constructor(b),
+                    Op::Un(_, a) => !is_constructor(a),
+                    Op::Case {
+                        arms,
+                        constructs: false,
+                    } => arms.iter().all(|(_, result)| !is_constructor(result)),
+                    Op::Narrow { from } => !is_constructor(from),
+                    Op::Arm {
+                        gate: Gate::Holds(b) | Gate::Tag(b, _),
+                    } => !is_constructor(b),
+                    op if op.is_constructor() => {
                         slot == last
                             || self.instrs[slot + 1..]
                                 .iter()
-                                .any(|later| builds(later, slot))
+                                .any(|later| builds(&later.op, slot))
                     }
-                    Instr::Input { .. } | Instr::Const(_) => true,
+                    _ => true,
                 })
     }
 
     /// Check that every operand of an operation has a view, for a program applied to values of
-    /// `input`. An operand has a view when it is an operation, or an input or constant whose
-    /// extent has one ([`has_view`]). A constructor, a `Unit` constant, and a `Unit` or union input
-    /// have none.
+    /// `input`. An operand has a view when it is an operation, a `Case` that does not construct,
+    /// or an input, constant, `Narrow` or `Payload` whose column has one ([`has_view`]). A
+    /// constructor, an `Arm`, a `Unit` constant, and a `Unit` or union column have none. A `Holds`
+    /// gate and the arm results of a `Case` that does not construct are operands too.
     fn operands_have_views(&self, input: &Extent) -> bool {
-        let has_a_view = |slot: &Slot| match &self.instrs[*slot as usize] {
-            Instr::Input { path } => path
-                .iter()
-                .try_fold(input, |extent, name| extent.record_fields()?.get(name))
-                .is_some_and(has_view),
-            Instr::Const(value) => value_extent(value).as_ref().is_some_and(has_view),
-            Instr::Bin(..) | Instr::Un(..) => true,
-            Instr::Record(_) | Instr::Wrap { .. } => false,
-        };
-        self.instrs.iter().all(|instr| match instr {
-            Instr::Bin(_, a, b) => has_a_view(a) && has_a_view(b),
-            Instr::Un(_, a) => has_a_view(a),
-            Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) | Instr::Wrap { .. } => true,
+        fn has_a_view(program: &ScalarProgram, input: &Extent, slot: Slot) -> bool {
+            match &program.instrs[slot as usize].op {
+                Op::Input { path } => path
+                    .iter()
+                    .try_fold(input, |extent, name| extent.record_fields()?.get(name))
+                    .is_some_and(has_view),
+                Op::Const(value) => value_extent(value).as_ref().is_some_and(has_view),
+                Op::Bin(..)
+                | Op::Un(..)
+                | Op::Case {
+                    constructs: false, ..
+                } => true,
+                Op::Narrow { from } => has_a_view(program, input, *from),
+                Op::Payload { shape, .. } => shape.0.view().is_some(),
+                Op::Record(_) | Op::Wrap { .. } | Op::Arm { .. } | Op::Case { .. } => false,
+            }
+        }
+        let has = |slot: &Slot| has_a_view(self, input, *slot);
+        self.instrs.iter().all(|instr| match &instr.op {
+            Op::Bin(_, a, b) => has(a) && has(b),
+            Op::Un(_, a) => has(a),
+            Op::Arm {
+                gate: Gate::Holds(b),
+            } => has(b),
+            Op::Case {
+                arms,
+                constructs: false,
+            } => arms.iter().all(|(_, result)| has(result)),
+            _ => true,
         })
+    }
+
+    /// Check that every instruction reads slots of its own scope or constants, and that scopes
+    /// nest: an `Arm`'s gate is in the arm's enclosing scope, a `Narrow` reads its arm's
+    /// enclosing scope, a `Payload` is in a `Tag` arm, a `Case`'s arms open inside its scope and
+    /// each result is in its arm, and the result is in [`ROOT`].
+    fn scopes_are_consistent(&self) -> bool {
+        let scope_of = |slot: &Slot| self.instrs[*slot as usize].scope;
+        let is_const = |slot: &Slot| matches!(self.instrs[*slot as usize].op, Op::Const(_));
+        let reads_in = |slot: &Slot, scope: Scope| is_const(slot) || scope_of(slot) == scope;
+        let is_arm = |slot: Slot| matches!(self.instrs[slot as usize].op, Op::Arm { .. });
+        self.instrs.last().is_some_and(|last| last.scope == ROOT)
+            && self.instrs.iter().enumerate().all(|(slot, instr)| {
+                let scope = instr.scope;
+                let opens = |arm: Slot| arm == ROOT || (arm as usize) < slot && is_arm(arm);
+                opens(scope)
+                    && match &instr.op {
+                        Op::Input { .. } | Op::Const(_) => scope == ROOT,
+                        Op::Bin(_, a, b) => reads_in(a, scope) && reads_in(b, scope),
+                        Op::Un(_, a) => reads_in(a, scope),
+                        Op::Record(fields) => fields.iter().all(|(_, f)| reads_in(f, scope)),
+                        Op::Wrap { payload, .. } => reads_in(payload, scope),
+                        Op::Arm {
+                            gate: Gate::Holds(b),
+                        } => reads_in(b, scope),
+                        // A union is read from the input or from a scratch column of this scope.
+                        Op::Arm {
+                            gate: Gate::Tag(u, _),
+                        } => {
+                            scope_of(u) == scope
+                                && matches!(
+                                    self.instrs[*u as usize].op,
+                                    Op::Input { .. } | Op::Narrow { .. } | Op::Payload { .. }
+                                )
+                        }
+                        Op::Narrow { from } => {
+                            scope != ROOT
+                                && !is_const(from)
+                                && scope_of(from) == self.instrs[scope as usize].scope
+                        }
+                        Op::Payload { .. } => {
+                            scope != ROOT
+                                && matches!(
+                                    self.instrs[scope as usize].op,
+                                    Op::Arm {
+                                        gate: Gate::Tag(..)
+                                    }
+                                )
+                        }
+                        Op::Case { arms, .. } => arms.iter().all(|&(arm, result)| {
+                            is_arm(arm)
+                                && self.instrs[arm as usize].scope == scope
+                                && reads_in(&result, arm)
+                        }),
+                    }
+            })
     }
 }
 
 impl std::fmt::Display for Instr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Instr::Input { path } if path.is_empty() => write!(f, "_"),
-            Instr::Input { path } => write!(f, "_.{}", path.join(".")),
-            Instr::Const(value) => write!(f, "{value}"),
-            Instr::Un(op, a) => write!(f, "{op:?}(s{a})"),
-            Instr::Bin(op, a, b) => {
+        match &self.op {
+            Op::Input { path } if path.is_empty() => write!(f, "_"),
+            Op::Input { path } => write!(f, "_.{}", path.join(".")),
+            Op::Const(value) => write!(f, "{value}"),
+            Op::Un(op, a) => write!(f, "{op:?}(s{a})"),
+            Op::Bin(op, a, b) => {
                 write!(f, "{}(s{a}, s{b})", crate::pretty_graph::fmt_binop(op))
             }
-            Instr::Record(fields) => {
+            Op::Record(fields) => {
                 write!(f, "(")?;
                 for (i, (name, field)) in fields.iter().enumerate() {
                     if i > 0 {
@@ -372,8 +864,31 @@ impl std::fmt::Display for Instr {
                 }
                 write!(f, ")")
             }
-            Instr::Wrap { tag, payload } => write!(f, "`{tag}(s{payload})"),
+            Op::Wrap { tag, payload } => write!(f, "`{tag}(s{payload})"),
+            Op::Arm {
+                gate: Gate::Holds(b),
+            } => write!(f, "arm s{b}"),
+            Op::Arm {
+                gate: Gate::Tag(u, tag),
+            } => write!(f, "arm s{u} is `{tag}"),
+            Op::Narrow { from } => write!(f, "narrow s{from}"),
+            Op::Payload { path, .. } if path.is_empty() => write!(f, "payload"),
+            Op::Payload { path, .. } => write!(f, "payload.{}", path.join(".")),
+            Op::Case { arms, .. } => {
+                write!(f, "case(")?;
+                for (i, (arm, result)) in arms.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "s{arm}: s{result}")?;
+                }
+                write!(f, ")")
+            }
+        }?;
+        if self.scope != ROOT {
+            write!(f, " in s{}", self.scope)?;
         }
+        Ok(())
     }
 }
 
@@ -414,6 +929,129 @@ enum Val {
     /// The payload of a variant at `tag`, with the extent of the whole union: what a
     /// `variant_wrap` builds, or a variant constant. Only [`Parser::output`] reads it.
     Wrap(FieldKey, Box<Val>, Extent),
+    /// In the scope of a `Tag` arm, the payloads of the rows it holds, or a field path into them,
+    /// not yet read into a slot, with the extent of their values.
+    Payload(Slot, Vec<SmolStr>, Extent),
+    /// A `Case` that constructs, with its extent. Only [`Parser::output`] reads it.
+    Built(Slot, Extent),
+}
+
+/// The union slot a `Tag` gate reads, with the tags of its extent.
+type Scrutinee = (Slot, Vec<FieldKey>);
+
+/// What a `DisjointJoin` operand's gate opens ([`Parser::gate`]).
+enum Opened {
+    /// An `Arm` slot, and the value its operand's chain continues from.
+    Arm(Slot, Val),
+    /// A `variant_project` of a variant built in the chain, whose tag is known: the payload when
+    /// the tag is the one projected, and `None` when the operand holds no row.
+    Known(Option<Val>),
+}
+
+/// The most search nodes [`gates_split_the_rows`] visits before it gives up on a conditional, a
+/// compile-time budget: a conditional whose proof needs more is not fused.
+const SPLIT_BUDGET: usize = 4096;
+
+/// One node of [`Formulas`]. A node's operands come before it.
+enum Node {
+    /// A `Bool` slot no `and`, `or` or `not` produces; the node stands for one slot.
+    Atom,
+    Known(bool),
+    Not(usize),
+    And(usize, usize),
+    Or(usize, usize),
+}
+
+/// Gates as formulas over atoms, held as one graph: a formula two gates share, or that one gate
+/// reads twice, is one node.
+#[derive(Default)]
+struct Formulas {
+    nodes: Vec<Node>,
+}
+
+impl Formulas {
+    fn push(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// Every node's value under `assignment`, which assigns atom nodes, in three-valued logic:
+    /// `None` while a node depends on an atom `assignment` does not assign.
+    fn values(&self, assignment: &[Option<bool>]) -> Vec<Option<bool>> {
+        let mut values: Vec<Option<bool>> = Vec::with_capacity(self.nodes.len());
+        for (i, node) in self.nodes.iter().enumerate() {
+            let value = match *node {
+                Node::Atom => assignment[i],
+                Node::Known(value) => Some(value),
+                Node::Not(a) => values[a].map(|value| !value),
+                Node::And(a, b) => match (values[a], values[b]) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                Node::Or(a, b) => match (values[a], values[b]) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+            };
+            values.push(value);
+        }
+        values
+    }
+
+    /// An atom node that `gate` reads and `values` leaves undecided.
+    fn undecided_atom(&self, gate: usize, values: &[Option<bool>]) -> Option<usize> {
+        if values[gate].is_some() {
+            return None;
+        }
+        match self.nodes[gate] {
+            Node::Atom => Some(gate),
+            Node::Known(_) => None,
+            Node::Not(a) => self.undecided_atom(a, values),
+            Node::And(a, b) | Node::Or(a, b) => self
+                .undecided_atom(a, values)
+                .or_else(|| self.undecided_atom(b, values)),
+        }
+    }
+}
+
+/// Whether every row is held by exactly one of `gates`, nodes of `formulas`: every assignment of
+/// truth values to their atoms makes exactly one gate true. Atoms are assigned one at a time, and
+/// a branch ends once every gate is decided. It fails once two gates are true or every gate is
+/// false, and gives up after visiting [`SPLIT_BUDGET`] search nodes.
+fn gates_split_the_rows(formulas: &Formulas, gates: &[usize]) -> bool {
+    fn search(
+        formulas: &Formulas,
+        gates: &[usize],
+        assignment: &mut Vec<Option<bool>>,
+        budget: &mut usize,
+    ) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let values = formulas.values(assignment);
+        let holding = gates.iter().filter(|&&g| values[g] == Some(true)).count();
+        if holding > 1 || gates.iter().all(|&g| values[g] == Some(false)) {
+            return false;
+        }
+        let Some(atom) = gates
+            .iter()
+            .find_map(|&g| formulas.undecided_atom(g, &values))
+        else {
+            return true;
+        };
+        [true, false].into_iter().all(|value| {
+            assignment[atom] = Some(value);
+            let split = search(formulas, gates, assignment, budget);
+            assignment[atom] = None;
+            split
+        })
+    }
+    let mut budget = SPLIT_BUDGET;
+    let mut assignment = vec![None; formulas.nodes.len()];
+    search(formulas, gates, &mut assignment, &mut budget)
 }
 
 /// The value of an `==` or `!=` comparison as [`Parser::comparison`] reads it.
@@ -425,6 +1063,8 @@ enum Comparison {
 }
 
 struct Parser<'t> {
+    /// The scope the next instruction runs in: [`ROOT`], or the `Arm` whose operand is parsed.
+    scope: Scope,
     /// The extent of a type, as operator conversion reads it. The parser reads a union's arms
     /// from it, since the payload of a `variant_wrap` or of a variant constant names only its own
     /// arm.
@@ -443,21 +1083,61 @@ struct Parser<'t> {
 }
 
 impl Parser<'_> {
-    /// The slot of `instr`: an equal instruction's slot when one was emitted, or a new one. An
-    /// instruction's value is a function of its fields and of the slots it reads, so equal
-    /// instructions compute equal columns. Constructors are always new, since each is read by the
-    /// one constructor it is a field or payload of
+    /// The slot of `op` in the current scope, or in [`ROOT`] for an `Input` or a `Const`.
+    fn emit(&mut self, op: Op) -> Slot {
+        let scope = match op {
+            Op::Input { .. } | Op::Const(_) => ROOT,
+            _ => self.scope,
+        };
+        self.emit_in(scope, op)
+    }
+
+    /// The slot of `op` in `scope`: an equal instruction's slot when one was emitted, or a new one.
+    /// An instruction's value is a function of its scope, its fields and the slots it reads, so
+    /// equal instructions compute equal columns. Constructors are always new, since each is read by
+    /// the one constructor it is a field or payload of
     /// ([`ScalarProgram::constructors_build_only_the_result`]).
-    fn emit(&mut self, instr: Instr) -> Slot {
+    fn emit_in(&mut self, scope: Scope, op: Op) -> Slot {
+        let instr = Instr { scope, op };
         if let Some(&slot) = self.slots.get(&instr) {
             return slot;
         }
         let slot = self.instrs.len() as Slot;
-        if !instr.is_constructor() {
+        if !instr.op.is_constructor() {
             self.slots.insert(instr.clone(), slot);
         }
         self.instrs.push(instr);
         slot
+    }
+
+    /// `slot` read in the current scope: narrowed through each arm between its own scope and the
+    /// current one, which must lie inside it. A constant reads in any scope.
+    fn narrowed(&mut self, slot: Slot) -> Option<Slot> {
+        let home = self.instrs[slot as usize].scope;
+        if matches!(self.instrs[slot as usize].op, Op::Const(_)) || home == self.scope {
+            return Some(slot);
+        }
+        let mut arms = Vec::new();
+        let mut scope = self.scope;
+        while scope != home {
+            if scope == ROOT {
+                return None;
+            }
+            arms.push(scope);
+            scope = self.instrs[scope as usize].scope;
+        }
+        Some(
+            arms.into_iter()
+                .rev()
+                .fold(slot, |from, arm| self.emit_in(arm, Op::Narrow { from })),
+        )
+    }
+
+    /// The `Payload` instruction reading `path` in the `Tag` arm `arm`, whose values have `extent`.
+    fn payload(&mut self, arm: Slot, path: &[SmolStr], extent: &Extent) -> Slot {
+        let shape = Shape(ColumnValue::from_values(Vec::new(), extent));
+        let path = path.to_vec();
+        self.emit_in(arm, Op::Payload { path, shape })
     }
 
     /// Discard instructions from `len` onward, with their entries in [`Parser::slots`]. Keep the
@@ -471,19 +1151,23 @@ impl Parser<'_> {
     /// Return a scalar slot, emitting an input or constant instruction when needed. Records and
     /// tuples have no scalar slot. Repeated reads of one input path share an instruction.
     fn column(&mut self, v: &Val) -> Option<(Slot, Extent)> {
-        match v {
-            Val::Slot(slot, extent) => Some((*slot, extent.clone())),
-            Val::Read(path, extent) if has_view(extent) => Some((self.input(path), extent.clone())),
-            Val::Const(value, extent) if has_view(extent) => {
-                Some((self.emit(Instr::Const(value.clone())), extent.clone()))
-            }
-            Val::Read(..) | Val::Const(..) | Val::Tuple(_) | Val::Record(_) | Val::Wrap(..) => None,
-        }
+        let slot = match v {
+            Val::Slot(slot, _) => *slot,
+            Val::Read(path, extent) if has_view(extent) => self.input(path),
+            Val::Const(value, extent) if has_view(extent) => self.emit(Op::Const(value.clone())),
+            Val::Payload(arm, path, extent) if has_view(extent) => self.payload(*arm, path, extent),
+            _ => return None,
+        };
+        let extent = match v {
+            Val::Slot(_, e) | Val::Read(_, e) | Val::Const(_, e) | Val::Payload(_, _, e) => e,
+            _ => unreachable!("matched above"),
+        };
+        Some((self.narrowed(slot)?, extent.clone()))
     }
 
     /// The `Input` instruction reading `path`.
     fn input(&mut self, path: &[SmolStr]) -> Slot {
-        self.emit(Instr::Input {
+        self.emit(Op::Input {
             path: path.to_vec(),
         })
     }
@@ -491,15 +1175,19 @@ impl Parser<'_> {
     /// An input or constant with no view as a slot: a `Unit` one, or a union read from the input.
     /// Only a constructor reads the slot, copying its rows.
     fn copied(&mut self, v: &Val) -> Option<(Slot, Extent)> {
-        match v {
+        let (slot, extent) = match v {
             Val::Read(path, extent @ (Extent::Base(BaseType::Unit) | Extent::Union(_))) => {
-                Some((self.input(path), extent.clone()))
+                (self.input(path), extent)
+            }
+            Val::Payload(arm, path, extent @ (Extent::Base(BaseType::Unit) | Extent::Union(_))) => {
+                (self.payload(*arm, path, extent), extent)
             }
             Val::Const(value @ Value::Unit, extent) => {
-                Some((self.emit(Instr::Const(value.clone())), extent.clone()))
+                (self.emit(Op::Const(value.clone())), extent)
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some((self.narrowed(slot)?, extent.clone()))
     }
 
     /// `value` at every position, with `extent` the extent of its values. A variant constant is
@@ -545,6 +1233,17 @@ impl Parser<'_> {
                     })
                     .collect(),
             ),
+            Val::Payload(arm, path, extent) => Some(
+                extent
+                    .record_fields()?
+                    .iter()
+                    .map(|(name, field)| {
+                        let mut path = path.clone();
+                        path.push(name.clone());
+                        (name.clone(), Val::Payload(*arm, path, field.clone()))
+                    })
+                    .collect(),
+            ),
             Val::Const(Value::Record(values), extent) => {
                 let extents = extent.record_fields()?;
                 values
@@ -565,7 +1264,7 @@ impl Parser<'_> {
         let InterpreterBinOp::Compare(kind @ (CompareKind::Equals | CompareKind::NotEquals)) = op
         else {
             let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
-            return Some((self.emit(Instr::Bin(op, a, b)), binop_output_extent(&op)));
+            return Some((self.emit(Op::Bin(op, a, b)), binop_output_extent(&op)));
         };
         match self.comparison(kind, a, b)? {
             Comparison::Computed(slot) => Some((slot, binop_output_extent(&op))),
@@ -591,7 +1290,9 @@ impl Parser<'_> {
         let is_unit = |v: &Val| {
             matches!(
                 v,
-                Val::Read(_, Extent::Base(BaseType::Unit)) | Val::Const(Value::Unit, _)
+                Val::Read(_, Extent::Base(BaseType::Unit))
+                    | Val::Payload(_, _, Extent::Base(BaseType::Unit))
+                    | Val::Const(Value::Unit, _)
             )
         };
         if is_unit(a) && is_unit(b) {
@@ -607,7 +1308,7 @@ impl Parser<'_> {
             (None, None) => {
                 let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
                 let op = InterpreterBinOp::Compare(kind);
-                return Some(Comparison::Computed(self.emit(Instr::Bin(op, a, b))));
+                return Some(Comparison::Computed(self.emit(Op::Bin(op, a, b))));
             }
             (Some(left), Some(right)) => (left, right),
             _ => return None,
@@ -637,7 +1338,7 @@ impl Parser<'_> {
                 Comparison::Computed(slot) => {
                     joined = Some(match joined {
                         None => slot,
-                        Some(prev) => self.emit(Instr::Bin(join, prev, slot)),
+                        Some(prev) => self.emit(Op::Bin(join, prev, slot)),
                     });
                 }
             }
@@ -648,16 +1349,23 @@ impl Parser<'_> {
     /// Extend an input field path. Projections of computed products are not recognized here;
     /// any such projection left after simplification ends the prefix.
     fn project(v: Val, key: &ProjKey) -> Option<Val> {
-        let Val::Read(mut path, extent) = v else {
-            return None;
-        };
         let name = match key {
             ProjKey::Index(i) => tuple_field(*i),
             ProjKey::Field(name) => name.runtime_key(),
         };
-        let field = extent.record_fields()?.get(&name)?.clone();
-        path.push(name);
-        Some(Val::Read(path, field))
+        match v {
+            Val::Read(mut path, extent) => {
+                let field = extent.record_fields()?.get(&name)?.clone();
+                path.push(name);
+                Some(Val::Read(path, field))
+            }
+            Val::Payload(arm, mut path, extent) => {
+                let field = extent.record_fields()?.get(&name)?.clone();
+                path.push(name);
+                Some(Val::Payload(arm, path, field))
+            }
+            _ => None,
+        }
     }
 
     /// Read `e` as a function applied to `cur`.
@@ -691,7 +1399,7 @@ impl Parser<'_> {
                     _ => UnaryOpKind::IntToUint,
                 };
                 let extent = op.output_extent(&operand);
-                Some(Val::Slot(self.emit(Instr::Un(op, a)), extent))
+                Some(Val::Slot(self.emit(Op::Un(op, a)), extent))
             }
             // The union's arms come from the node's codomain, since the payload names only `tag`.
             // A union with an arm that holds a collection is a union of tiles
@@ -707,6 +1415,7 @@ impl Parser<'_> {
                 arms.get(tag)?;
                 Some(Val::Wrap(tag.clone(), Box::new(cur), extent))
             }
+            TypedExprNode::DisjointJoin(operands) => self.join(e, operands, cur),
             TypedExprNode::Apply { argument, function } => match &function.node {
                 // `𝑐 ▷ const` for a closed value: the same value at every position. A variant
                 // value names only its own arm, so a value holding one takes its extent from the
@@ -744,6 +1453,260 @@ impl Parser<'_> {
         }
     }
 
+    /// `e`, a `DisjointJoin` of `operands`, applied to `cur`: one `Case` whose arms are the
+    /// operands' gates and whose results are the rest of their chains. The operands' gates must
+    /// split the rows, by [`gates_split_the_rows`] for `Holds` gates and by naming every tag of one
+    /// union for `Tag` gates. A gate on a variant built in the chain has a known tag, so the join
+    /// reads as the one operand naming it. See `src/ccl/design/optimization.md`, "A conditional
+    /// in an element-wise chain".
+    fn join(&mut self, e: &Expr, operands: &[Expr], cur: Val) -> Option<Val> {
+        let enclosing = self.scope;
+        let start = self.instrs.len();
+        let joined = self.join_arms(e, operands, cur);
+        self.scope = enclosing;
+        if joined.is_none() {
+            self.truncate(start);
+        }
+        joined
+    }
+
+    fn join_arms(&mut self, e: &Expr, operands: &[Expr], cur: Val) -> Option<Val> {
+        let enclosing = self.scope;
+        let mut arms: Vec<(Slot, Val)> = Vec::new();
+        let mut known: Option<(Vec<&Expr>, Val)> = None;
+        let mut tags: Option<Scrutinee> = None;
+        for operand in operands {
+            let elements = flattened(operand);
+            let (opened, rest, scrutinee) = self.gate(&elements, cur.clone())?;
+            match opened {
+                Opened::Known(None) => {}
+                Opened::Known(Some(payload)) => {
+                    if known.replace((rest.to_vec(), payload)).is_some() {
+                        return None;
+                    }
+                }
+                Opened::Arm(arm, arm_cur) => {
+                    if let Some((union, union_tags)) = scrutinee {
+                        match &tags {
+                            Some((u, _)) if *u != union => return None,
+                            _ => tags = Some((union, union_tags)),
+                        }
+                    }
+                    self.scope = arm;
+                    let result = rest.iter().try_fold(arm_cur, |cur, e| self.step(e, cur))?;
+                    self.scope = enclosing;
+                    arms.push((arm, result));
+                }
+            }
+        }
+        if let Some((rest, payload)) = known {
+            return if arms.is_empty() {
+                rest.iter().try_fold(payload, |cur, e| self.step(e, cur))
+            } else {
+                None
+            };
+        }
+        let gates: Vec<&Gate> = arms
+            .iter()
+            .map(|(arm, _)| match &self.instrs[*arm as usize].op {
+                Op::Arm { gate } => gate,
+                op => unreachable!("an operand opens an arm, got {op:?}"),
+            })
+            .collect();
+        let split = if gates.iter().all(|g| matches!(g, Gate::Holds(_))) {
+            let mut formulas = Formulas::default();
+            let mut nodes = HashMap::new();
+            let roots: Vec<usize> = gates
+                .iter()
+                .map(|g| match g {
+                    Gate::Holds(b) => self.formula(*b, &mut formulas, &mut nodes),
+                    Gate::Tag(..) => unreachable!("all gates hold"),
+                })
+                .collect();
+            gates_split_the_rows(&formulas, &roots)
+        } else if gates.iter().all(|g| matches!(g, Gate::Tag(..))) {
+            let named: Vec<&FieldKey> = gates
+                .iter()
+                .map(|g| match g {
+                    Gate::Tag(_, tag) => tag,
+                    Gate::Holds(_) => unreachable!("all gates are tags"),
+                })
+                .collect();
+            let distinct = named
+                .iter()
+                .enumerate()
+                .all(|(i, tag)| !named[..i].contains(tag));
+            let (_, union_tags) = tags.as_ref()?;
+            distinct && union_tags.iter().all(|tag| named.contains(&tag))
+        } else {
+            false
+        };
+        if !split {
+            return None;
+        }
+        let codomain = (self.extent_of)(&e.ty.codomain()?)?;
+        let constructs = matches!(
+            codomain,
+            Extent::Record(_) | Extent::Union(_) | Extent::Base(BaseType::Unit)
+        );
+        let mut results = Vec::with_capacity(arms.len());
+        for (arm, result) in &arms {
+            self.scope = *arm;
+            let (slot, extent) = if constructs {
+                self.output(result)?
+            } else {
+                self.column(result)?
+            };
+            // Each arm's column must have the join's layout, which `merge_parts` combines: a
+            // record arm wider than the join's type would carry a field the others lack.
+            if !fits(&extent, &codomain) {
+                return None;
+            }
+            results.push((*arm, slot));
+        }
+        self.scope = enclosing;
+        let case = self.emit(Op::Case {
+            arms: results,
+            constructs,
+        });
+        Some(if constructs {
+            Val::Built(case, codomain)
+        } else {
+            Val::Slot(case, codomain)
+        })
+    }
+
+    /// The gate a `DisjointJoin` operand of `elements` opens on `cur`, with the elements after it,
+    /// and for a `Tag` gate the union slot and its extent's tags. The gate is parsed in the scope
+    /// enclosing the join:
+    ///
+    /// - ``(𝑔 ▷ filter_values) ≫ …`` holds where `𝑔` does.
+    /// - ``𝑠 ≫ variant_project(`𝑐) ≫ …`` holds where `𝑠` carries `𝑐`, and the chain continues
+    ///   from the payload.
+    /// - ``(id, 𝑠 ≫ variant_project(`𝑐)) ▷ zip ≫ …`` holds there too, and the chain continues from
+    ///   the pair of the element and the payload.
+    fn gate<'e>(
+        &mut self,
+        elements: &[&'e Expr],
+        cur: Val,
+    ) -> Option<(Opened, Vec<&'e Expr>, Option<Scrutinee>)> {
+        let (first, rest) = elements.split_first()?;
+        if let TypedExprNode::Apply { argument, function } = &first.node {
+            match &function.node {
+                TypedExprNode::Builtin(Builtin::FilterValues) => {
+                    self.ops += 1;
+                    let holds = self.step(argument, cur.clone())?;
+                    let (b, extent) = self.column(&holds)?;
+                    if !matches!(extent, Extent::Base(BaseType::Bool)) {
+                        return None;
+                    }
+                    let arm = self.emit(Op::Arm {
+                        gate: Gate::Holds(b),
+                    });
+                    return Some((Opened::Arm(arm, cur), rest.to_vec(), None));
+                }
+                TypedExprNode::Builtin(Builtin::Zip) => {
+                    let TypedExprNode::Tuple(items) = &argument.node else {
+                        return None;
+                    };
+                    let projects = |item: &Expr| flattened(item).iter().any(|e| is_project(e));
+                    let k = items.iter().position(projects)?;
+                    if items.iter().filter(|item| projects(item)).count() != 1 {
+                        return None;
+                    }
+                    self.ops += 2;
+                    let mut vals = Vec::with_capacity(items.len());
+                    let mut opened = None;
+                    for (i, item) in items.iter().enumerate() {
+                        if i == k {
+                            let item_elements = flattened(item);
+                            let (o, item_rest, scrutinee) =
+                                self.gate(&item_elements, cur.clone())?;
+                            let Opened::Arm(arm, payload) = o else {
+                                return None;
+                            };
+                            // The rest of the item's chain reads the payload in the arm.
+                            let enclosing = self.scope;
+                            self.scope = arm;
+                            let value = item_rest
+                                .iter()
+                                .try_fold(payload, |cur, e| self.step(e, cur));
+                            self.scope = enclosing;
+                            vals.push(value?);
+                            opened = Some((arm, scrutinee));
+                        } else {
+                            vals.push(self.step(item, cur.clone())?);
+                        }
+                    }
+                    let (arm, scrutinee) = opened?;
+                    return Some((Opened::Arm(arm, Val::Tuple(vals)), rest.to_vec(), scrutinee));
+                }
+                _ => {}
+            }
+        }
+        let k = elements.iter().position(|e| is_project(e))?;
+        let TypedExprNode::Builtin(Builtin::VariantProject(tag)) = &elements[k].node else {
+            unreachable!("found by `is_project`")
+        };
+        let scrutinee = elements[..k]
+            .iter()
+            .try_fold(cur, |cur, e| self.step(e, cur))?;
+        self.ops += 1;
+        let rest = elements[k + 1..].to_vec();
+        let opened = match scrutinee {
+            Val::Wrap(t, payload, _) => {
+                return Some((Opened::Known((t == *tag).then_some(*payload)), rest, None));
+            }
+            ref union @ (Val::Read(_, Extent::Union(ref union_arms))
+            | Val::Payload(_, _, Extent::Union(ref union_arms))) => {
+                let union_tags: Vec<FieldKey> = union_arms.keys().cloned().collect();
+                let payload = (self.extent_of)(&elements[k].ty.codomain()?)?;
+                if !is_plain(&payload) {
+                    return None;
+                }
+                let (u, _) = self.copied(union)?;
+                let arm = self.emit(Op::Arm {
+                    gate: Gate::Tag(u, tag.clone()),
+                });
+                (
+                    Opened::Arm(arm, Val::Payload(arm, Vec::new(), payload)),
+                    Some((u, union_tags)),
+                )
+            }
+            _ => return None,
+        };
+        Some((opened.0, rest, opened.1))
+    }
+
+    /// The node of `formulas` for the gate in the `Bool` slot `slot`, adding the nodes it reads.
+    /// `nodes` holds the node of each slot added so far, so a slot read twice is one node.
+    fn formula(
+        &self,
+        slot: Slot,
+        formulas: &mut Formulas,
+        nodes: &mut HashMap<Slot, usize>,
+    ) -> usize {
+        if let Some(&node) = nodes.get(&slot) {
+            return node;
+        }
+        let node = match &self.instrs[slot as usize].op {
+            Op::Const(Value::Bool(value)) => Node::Known(*value),
+            Op::Un(UnaryOpKind::Not, a) => Node::Not(self.formula(*a, formulas, nodes)),
+            Op::Bin(InterpreterBinOp::BoolLogic(LogicKind::And), a, b) => Node::And(
+                self.formula(*a, formulas, nodes),
+                self.formula(*b, formulas, nodes),
+            ),
+            Op::Bin(InterpreterBinOp::BoolLogic(LogicKind::Or), a, b) => Node::Or(
+                self.formula(*a, formulas, nodes),
+                self.formula(*b, formulas, nodes),
+            ),
+            _ => Node::Atom,
+        };
+        let node = formulas.push(node);
+        nodes.insert(slot, node);
+        node
+    }
+
     /// Return the final instruction and result extent, emitting result records if needed.
     /// Input paths and constants are not eligible results on their own: their ordinary conversion
     /// does not require a scalar program.
@@ -754,9 +1717,12 @@ impl Parser<'_> {
             Val::Slot(slot, extent) if *slot as usize + 1 == self.instrs.len() => {
                 Some((*slot, extent.clone()))
             }
-            Val::Slot(..) => None,
+            Val::Built(slot, extent) if *slot as usize + 1 == self.instrs.len() => {
+                Some((*slot, extent.clone()))
+            }
+            Val::Slot(..) | Val::Built(..) => None,
             Val::Tuple(_) | Val::Record(_) | Val::Wrap(..) => self.output(v),
-            Val::Read(..) | Val::Const(..) => None,
+            Val::Read(..) | Val::Const(..) | Val::Payload(..) => None,
         }
     }
 
@@ -766,10 +1732,15 @@ impl Parser<'_> {
     /// as a constant, or a union read from the input. A product with no field has no column, since
     /// nothing in it counts its rows.
     fn output(&mut self, v: &Val) -> Option<(Slot, Extent)> {
+        // A `Case` that constructs has no column to narrow, so it is read only in its own scope.
+        if let Val::Built(slot, extent) = v {
+            let in_scope = self.instrs[*slot as usize].scope == self.scope;
+            return in_scope.then(|| (*slot, extent.clone()));
+        }
         if let Val::Wrap(tag, payload, extent) = v {
             let (payload, _) = self.output(payload)?;
             let tag = tag.clone();
-            return Some((self.emit(Instr::Wrap { tag, payload }), extent.clone()));
+            return Some((self.emit(Op::Wrap { tag, payload }), extent.clone()));
         }
         let mut fields: Vec<(SmolStr, Val)> = match Self::fields_of(v) {
             Some(fields) => fields.into_iter().collect(),
@@ -787,8 +1758,43 @@ impl Parser<'_> {
             named.push((name.clone(), slot));
             extents.insert(name, extent);
         }
-        Some((self.emit(Instr::Record(named)), Extent::Record(extents)))
+        Some((self.emit(Op::Record(named)), Extent::Record(extents)))
     }
+}
+
+/// Whether a column of `extent` has the layout of a column of `target`: the same record fields, at
+/// every depth, and union arms that `target` names. A variant's column holds only the arms it
+/// carries, so a union fits a wider one; a record does not, since a column holds every field it
+/// has.
+fn fits(extent: &Extent, target: &Extent) -> bool {
+    match (extent, target) {
+        (Extent::Record(fields), Extent::Record(target)) => {
+            fields.len() == target.len()
+                && fields
+                    .iter()
+                    .all(|(name, field)| target.get(name).is_some_and(|t| fits(field, t)))
+        }
+        (Extent::Union(arms), Extent::Union(target)) => arms
+            .iter()
+            .all(|(tag, arm)| target.get(tag).is_some_and(|t| fits(arm, t))),
+        (Extent::Record(_) | Extent::Union(_), _) | (_, Extent::Record(_) | Extent::Union(_)) => {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// The elements of `e` read as a chain: a composition's elements, flattened, or `e` alone.
+fn flattened(e: &Expr) -> Vec<&Expr> {
+    match &e.node {
+        TypedExprNode::Compose(elements) => elements.iter().flat_map(flattened).collect(),
+        _ => vec![e],
+    }
+}
+
+/// Whether `e` is a `variant_project`.
+fn is_project(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Builtin(Builtin::VariantProject(_)))
 }
 
 /// The extent of a closed value, read from the value: a base value or a record of them. A variant
@@ -843,6 +1849,7 @@ pub fn fuse_prefix(
         return None;
     }
     let mut parser = Parser {
+        scope: ROOT,
         extent_of,
         instrs: Vec::new(),
         slots: HashMap::new(),
@@ -885,6 +1892,10 @@ pub fn fuse_prefix(
         program.operands_have_views(input),
         "an operation reads only a column with a view, over {input}; got {program}"
     );
+    debug_assert!(
+        program.scopes_are_consistent(),
+        "every instruction reads its own scope, and scopes nest; got {program}"
+    );
     Some(Fused {
         program,
         domain: input.clone(),
@@ -900,6 +1911,17 @@ mod tests {
     use crate::ccl::RecordEntry;
     use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
     use crate::interpreter::apply_binop_column;
+
+    impl ScalarProgram {
+        /// A program of `ops`, each in the root scope.
+        fn rooted(ops: Vec<Op>) -> Self {
+            let instrs = ops
+                .into_iter()
+                .map(|op| Instr { scope: ROOT, op })
+                .collect();
+            ScalarProgram { instrs }
+        }
+    }
 
     /// [`fuse_prefix`] for a chain that holds no variant, which reads no type's extent.
     fn fuse(chain: &[Expr], input: &Extent) -> Option<Fused> {
@@ -1020,7 +2042,7 @@ mod tests {
             .program
             .instrs
             .iter()
-            .filter(|instr| matches!(instr, Instr::Input { .. }))
+            .filter(|instr| matches!(instr.op, Op::Input { .. }))
             .count();
         assert_eq!(inputs, 1, "{}", fused.program);
     }
@@ -1113,7 +2135,7 @@ mod tests {
                 .program
                 .instrs
                 .iter()
-                .all(|instr| !matches!(instr, Instr::Const(Value::Record(_)))),
+                .all(|instr| !matches!(instr.op, Op::Const(Value::Record(_)))),
             "{}",
             fused.program
         );
@@ -1245,7 +2267,7 @@ mod tests {
             .program
             .instrs
             .iter()
-            .filter(|instr| matches!(instr, Instr::Record(_)))
+            .filter(|instr| matches!(instr.op, Op::Record(_)))
             .count();
         assert_eq!(records, 1, "{}", fused.program);
         let out = fused.program.eval(&ColumnValue::Ints(vec![0, 1, 2]));
@@ -2016,7 +3038,11 @@ mod tests {
             let fused = fuse_options(&chain, &int()).expect("the payloads are compared");
             assert_eq!(fused.consumed, 2);
             assert!(
-                !fused.program.instrs.iter().any(Instr::is_constructor),
+                !fused
+                    .program
+                    .instrs
+                    .iter()
+                    .any(|instr| instr.op.is_constructor()),
                 "no union is built: {}",
                 fused.program
             );
@@ -2131,7 +3157,11 @@ mod tests {
         let chain = vec![zip(vec![product, constant]), eq()];
         let fused = fuse_typed(&chain, &int(), &[(r_ty, r)]).expect("both fields are compared");
         assert!(
-            !fused.program.instrs.iter().any(Instr::is_constructor),
+            !fused
+                .program
+                .instrs
+                .iter()
+                .any(|instr| instr.op.is_constructor()),
             "no record or union is built: {}",
             fused.program
         );
@@ -2199,6 +3229,645 @@ mod tests {
         }
     }
 
+    /// `lambda_elim`'s first-match gates over `n` conditions and a final guard of `true`
+    /// (`synthesize_arm_predicate`): arm `i` holds `𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`.
+    fn first_match(formulas: &mut Formulas, n: usize) -> Vec<usize> {
+        let mut guards: Vec<usize> = (0..n).map(|_| formulas.push(Node::Atom)).collect();
+        guards.push(formulas.push(Node::Known(true)));
+        let negated: Vec<usize> = guards
+            .iter()
+            .map(|&g| formulas.push(Node::Not(g)))
+            .collect();
+        guards
+            .iter()
+            .enumerate()
+            .map(|(i, &guard)| {
+                negated[..i]
+                    .iter()
+                    .fold(guard, |gate, &not| formulas.push(Node::And(gate, not)))
+            })
+            .collect()
+    }
+
+    /// The first-match gates of a 20-way `elif` split the rows within the budget: each branch is
+    /// decided once one condition holds, so the search reaches one leaf per arm, not 2²⁰.
+    #[test]
+    fn first_match_gates_split_the_rows() {
+        for n in [0, 1, 20] {
+            let mut formulas = Formulas::default();
+            let gates = first_match(&mut formulas, n);
+            assert!(gates_split_the_rows(&formulas, &gates), "{n} conditions");
+        }
+    }
+
+    /// Gates that overlap, or that leave a row in no arm, do not split the rows.
+    #[test]
+    fn overlapping_or_uncovering_gates_do_not_split_the_rows() {
+        let mut formulas = Formulas::default();
+        let a = formulas.push(Node::Atom);
+        let b = formulas.push(Node::Atom);
+        let a_or_b = formulas.push(Node::Or(a, b));
+        let a_and_b = formulas.push(Node::And(a, b));
+        let not_a = formulas.push(Node::Not(a));
+        let never = formulas.push(Node::Known(false));
+        assert!(
+            !gates_split_the_rows(&formulas, &[a, a_or_b]),
+            "a row where `a` holds is in both"
+        );
+        assert!(
+            !gates_split_the_rows(&formulas, &[a_and_b, not_a]),
+            "a row where only `a` holds is in neither"
+        );
+        assert!(
+            !gates_split_the_rows(&formulas, &[never]),
+            "no row is in an arm"
+        );
+        assert!(gates_split_the_rows(&formulas, &[a, not_a]));
+    }
+
+    /// A split that needs more branches than the budget is not proved, so its conditional is not
+    /// fused: the parity of thirteen atoms and its negation decide only once every atom is
+    /// assigned, which takes 2¹³ leaves.
+    #[test]
+    fn a_split_beyond_the_budget_is_not_proved() {
+        let parity = |n: Slot| {
+            let mut formulas = Formulas::default();
+            let mut acc = formulas.push(Node::Atom);
+            for _ in 1..n {
+                let b = formulas.push(Node::Atom);
+                let not_acc = formulas.push(Node::Not(acc));
+                let not_b = formulas.push(Node::Not(b));
+                let left = formulas.push(Node::And(acc, not_b));
+                let right = formulas.push(Node::And(not_acc, b));
+                acc = formulas.push(Node::Or(left, right));
+            }
+            let odd = formulas.push(Node::Not(acc));
+            (formulas, [acc, odd])
+        };
+        let (small, gates) = parity(6);
+        assert!(gates_split_the_rows(&small, &gates));
+        let (large, gates) = parity(13);
+        assert!(!gates_split_the_rows(&large, &gates));
+    }
+
+    /// ``(𝑔 ▷ filter_values) ≫ 𝑒`` over `x`, typed `Int ⇒ 𝑇`.
+    fn filtered(gate: Expr, then: Expr, codomain: Type) -> Expr {
+        let filter = Expr::apply(gate, Expr::builtin(Builtin::FilterValues));
+        Expr::compose(vec![filter, then]).with_ty(Type::fun(Type::Base(BaseType::Int), codomain))
+    }
+
+    /// `𝑎₁ ⊔ … ⊔ 𝑎ₙ`, typed `Int ⇒ 𝑇`.
+    fn joined(arms: Vec<Expr>, codomain: Type) -> Expr {
+        Expr::disjoint_join(arms).with_ty(Type::fun(Type::Base(BaseType::Int), codomain))
+    }
+
+    /// A conditional over 2,500 rows answers each row from its arm, merged in row order across
+    /// blocks, and runs `//` only on its arm's rows: ``(x > 1000 ▷ filter_values ≫ 1000 // (x -
+    /// 1000)) ⊔ (x > 1000 ≫ not_fn ▷ filter_values ≫ 0 - x)``, where `1000 // 0` would panic.
+    #[test]
+    fn a_conditional_runs_each_arm_on_its_rows() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let over = compare(CompareKind::Greater, 1000);
+        let divide = Expr::compose(vec![
+            zip(vec![constant(1000), arith(ArithmeticKind::Sub, 1000)]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::FloorDiv)),
+        ]);
+        let negate = Expr::compose(vec![
+            zip(vec![constant(0), id()]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Sub)),
+        ]);
+        let not_over = Expr::compose(vec![over.clone(), Expr::builtin(Builtin::NotFn)]);
+        let chain = vec![joined(
+            vec![
+                filtered(over, divide, int_ty()),
+                filtered(not_over, negate, int_ty()),
+            ],
+            int_ty(),
+        )];
+        let fused =
+            fuse_typed(&chain, &int(), &[(int_ty(), int())]).expect("the gates split the rows");
+        assert_eq!(fused.consumed, 1);
+        let n = 2_500;
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        let want = (0..n)
+            .map(|x| {
+                if x > 1000 {
+                    1000_i64.div_euclid(x - 1000)
+                } else {
+                    -x
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(out, ColumnValue::Ints(want), "{}", fused.program);
+    }
+
+    /// A conditional whose arms build variants is a constructor yielding one union column with
+    /// each arm's tag: ``(x > 1 ▷ filter_values ≫ variant_wrap(`some)) ⊔ (x > 1 ≫ not_fn ▷
+    /// filter_values ≫ `none(unit) ▷ const)`` over 2,500 rows.
+    #[test]
+    fn a_conditional_building_variants_merges_their_tags() {
+        let over = compare(CompareKind::Greater, 1);
+        let not_over = Expr::compose(vec![over.clone(), Expr::builtin(Builtin::NotFn)]);
+        let chain = vec![joined(
+            vec![
+                filtered(over, wrap("some"), option_type()),
+                filtered(not_over, none(), option_type()),
+            ],
+            option_type(),
+        )];
+        let fused = fuse_options(&chain, &int()).expect("the gates split the rows");
+        let n = 2_500;
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        let want: Vec<Value> = (0..n)
+            .map(|x| match x > 1 {
+                true => Value::Union {
+                    tag: tag("some"),
+                    inner: Box::new(Value::Int(x)),
+                },
+                false => Value::Union {
+                    tag: tag("none"),
+                    inner: Box::new(Value::Unit),
+                },
+            })
+            .collect();
+        let got: Vec<Value> = (0..n as usize).map(|i| out.index_at(i)).collect();
+        assert_eq!(got, want, "{}", fused.program);
+    }
+
+    /// A `match` over a union read from the input selects each arm's rows by tag, reading the
+    /// payloads of a block as one run: ``(variant_project(`some) ≫ id * 2) ⊔
+    /// (variant_project(`none) ≫ 0 ▷ const)`` over 2,500 rows that alternate between the tags.
+    #[test]
+    fn a_match_selects_each_arm_by_tag() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let project = |name: &str, payload: Type| {
+            Expr::builtin(Builtin::VariantProject(tag(name)))
+                .with_ty(Type::fun(option_type(), payload))
+        };
+        let chain = vec![joined(
+            vec![
+                Expr::compose(vec![
+                    project("some", int_ty()),
+                    arith(ArithmeticKind::Mul, 2),
+                ]),
+                Expr::compose(vec![
+                    project("none", Type::Base(BaseType::Unit)),
+                    constant(0),
+                ]),
+            ],
+            int_ty(),
+        )];
+        let n = 2_500;
+        let options: Vec<Value> = (0..n)
+            .map(|i| Value::Union {
+                tag: tag(if i % 3 == 0 { "none" } else { "some" }),
+                inner: Box::new(if i % 3 == 0 {
+                    Value::Unit
+                } else {
+                    Value::Int(i)
+                }),
+            })
+            .collect();
+        let input = ColumnValue::from_values(options, &option_extent());
+        let fused = fuse_typed(
+            &chain,
+            &option_extent(),
+            &[
+                (int_ty(), int()),
+                (Type::Base(BaseType::Unit), Extent::Base(BaseType::Unit)),
+            ],
+        )
+        .expect("the arms name every tag");
+        let want = (0..n)
+            .map(|i| if i % 3 == 0 { 0 } else { i * 2 })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fused.program.eval(&input),
+            ColumnValue::Ints(want),
+            "{}",
+            fused.program
+        );
+        let one_arm = vec![joined(
+            vec![Expr::compose(vec![
+                project("some", int_ty()),
+                arith(ArithmeticKind::Mul, 2),
+            ])],
+            int_ty(),
+        )];
+        let types = [(int_ty(), int())];
+        assert!(
+            fuse_typed(&one_arm, &option_extent(), &types).is_none(),
+            "a `match` naming one of two tags leaves rows in no arm"
+        );
+    }
+
+    /// ``variant_project(`name) : {`none | `some{Int}} ⇒ payload``.
+    fn project_option(name: &str, payload: Type) -> Expr {
+        Expr::builtin(Builtin::VariantProject(tag(name))).with_ty(Type::fun(option_type(), payload))
+    }
+
+    /// The types a conditional over options reads, with their extents.
+    fn option_types() -> Vec<(Type, Extent)> {
+        vec![
+            (Type::Base(BaseType::Int), int()),
+            (Type::Base(BaseType::Unit), Extent::Base(BaseType::Unit)),
+            (option_type(), option_extent()),
+        ]
+    }
+
+    /// `𝑥 ≫ not_fn`.
+    fn negated(gate: Expr) -> Expr {
+        Expr::compose(vec![gate, Expr::builtin(Builtin::NotFn)])
+    }
+
+    /// An `if` inside an arm opens an arm inside that arm, which reads `x` narrowed twice:
+    /// ``(x > 1000 ▷ filter_values ≫ ((x > 2000 ▷ filter_values ≫ x * 2) ⊔ (x > 2000 ≫ not_fn ▷
+    /// filter_values ≫ x * 3))) ⊔ (x > 1000 ≫ not_fn ▷ filter_values ≫ 0 - x)`` over 2,500 rows.
+    #[test]
+    fn an_if_inside_an_arm_opens_a_nested_arm() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let (over_1000, over_2000) = (
+            compare(CompareKind::Greater, 1000),
+            compare(CompareKind::Greater, 2000),
+        );
+        let inner = joined(
+            vec![
+                filtered(over_2000.clone(), arith(ArithmeticKind::Mul, 2), int_ty()),
+                filtered(negated(over_2000), arith(ArithmeticKind::Mul, 3), int_ty()),
+            ],
+            int_ty(),
+        );
+        let negate = Expr::compose(vec![
+            zip(vec![constant(0), id()]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Sub)),
+        ]);
+        let chain = vec![joined(
+            vec![
+                filtered(over_1000.clone(), inner, int_ty()),
+                filtered(negated(over_1000), negate, int_ty()),
+            ],
+            int_ty(),
+        )];
+        let fused = fuse_typed(&chain, &int(), &[(int_ty(), int())]).expect("both joins split");
+        let n = 2_500;
+        let want = (0..n)
+            .map(|x| match x {
+                x if x > 2000 => x * 2,
+                x if x > 1000 => x * 3,
+                x => -x,
+            })
+            .collect::<Vec<_>>();
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        assert_eq!(out, ColumnValue::Ints(want), "{}", fused.program);
+        let empty = fused.program.eval(&ColumnValue::Ints(Vec::new()));
+        assert_eq!(empty, ColumnValue::Ints(Vec::new()), "an empty input");
+    }
+
+    /// A `match` inside an `if` arm reads the union narrowed to the arm: over `{k: Int, o: {`none |
+    /// `some{Int}}}`, ``(k > 0 ▷ filter_values ≫ .o ≫ ((variant_project(`some) ≫ id * 2) ⊔
+    /// (variant_project(`none) ≫ 7 ▷ const))) ⊔ (k > 0 ≫ not_fn ▷ filter_values ≫ .k)``.
+    #[test]
+    fn a_match_inside_an_if_arm_reads_the_narrowed_union() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let input = record_of_extents(vec![("k", int()), ("o", option_extent())]);
+        let k_over_0 = Expr::compose(vec![
+            zip(vec![Expr::proj_field("k"), constant(0)]),
+            binop(BinOpKind::Compare(CompareKind::Greater)),
+        ]);
+        let matched = joined(
+            vec![
+                Expr::compose(vec![
+                    project_option("some", int_ty()),
+                    arith(ArithmeticKind::Mul, 2),
+                ]),
+                Expr::compose(vec![
+                    project_option("none", Type::Base(BaseType::Unit)),
+                    constant(7),
+                ]),
+            ],
+            int_ty(),
+        );
+        let chain = vec![joined(
+            vec![
+                filtered(
+                    k_over_0.clone(),
+                    Expr::compose(vec![Expr::proj_field("o"), matched]),
+                    int_ty(),
+                ),
+                filtered(negated(k_over_0), Expr::proj_field("k"), int_ty()),
+            ],
+            int_ty(),
+        )];
+        let fused =
+            fuse_typed(&chain, &input, &option_types()).expect("both conditionals split the rows");
+        let n = 2_500;
+        let k: Vec<i64> = (0..n).map(|i| if i % 4 == 0 { -i } else { i }).collect();
+        let o: Vec<Value> = (0..n)
+            .map(|i| Value::Union {
+                tag: tag(if i % 3 == 0 { "none" } else { "some" }),
+                inner: Box::new(if i % 3 == 0 {
+                    Value::Unit
+                } else {
+                    Value::Int(i)
+                }),
+            })
+            .collect();
+        let column = ColumnValue::Records(HashMap::from([
+            ("k".into(), ColumnValue::Ints(k.clone())),
+            ("o".into(), ColumnValue::from_values(o, &option_extent())),
+        ]));
+        let want = (0..n)
+            .map(|i| match (k[i as usize] > 0, i % 3 == 0) {
+                (false, _) => k[i as usize],
+                (true, true) => 7,
+                (true, false) => i * 2,
+            })
+            .collect::<Vec<_>>();
+        let out = fused.program.eval(&column);
+        assert_eq!(out, ColumnValue::Ints(want), "{}", fused.program);
+    }
+
+    /// A conditional of records merges field by field, and one of `Unit` merges to a `Units`
+    /// column. An arm whose record is wider than the join's type has no program: over
+    /// `{a: Int, b: Int}`, ``(a > 0 ▷ filter_values ≫ id) ⊔ (a > 0 ≫ not_fn ▷ filter_values ≫ (a:
+    /// 0) ▷ const)`` typed `{a: Int}`.
+    #[test]
+    fn a_conditional_of_records_merges_field_by_field() {
+        let pair_ty = Type::Record(vec![
+            ("a".into(), Type::Base(BaseType::Int)),
+            ("b".into(), Type::Base(BaseType::Int)),
+        ]);
+        let pair = record_of_extents(vec![("a", int()), ("b", int())]);
+        let over = compare(CompareKind::Greater, 1);
+        let chain = vec![joined(
+            vec![
+                filtered(
+                    over.clone(),
+                    zip_record(vec![("a", id()), ("b", arith(ArithmeticKind::Mul, 2))]),
+                    pair_ty.clone(),
+                ),
+                filtered(
+                    negated(over.clone()),
+                    zip_record(vec![("a", constant(0)), ("b", id())]),
+                    pair_ty.clone(),
+                ),
+            ],
+            pair_ty.clone(),
+        )];
+        let fused = fuse_typed(&chain, &int(), &[(pair_ty, pair)]).expect("the gates split");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![0, 5, 1, 9]));
+        assert_eq!(field_of(&out, "a"), &ColumnValue::Ints(vec![0, 5, 0, 9]));
+        assert_eq!(field_of(&out, "b"), &ColumnValue::Ints(vec![0, 10, 1, 18]));
+
+        let unit = || Type::Base(BaseType::Unit);
+        let unit_const = || {
+            Expr::apply(Expr::lit(Lit::Unit), Expr::builtin(Builtin::Const))
+                .with_ty(Type::fun(Type::Base(BaseType::Int), unit()))
+        };
+        let units = vec![joined(
+            vec![
+                filtered(over.clone(), unit_const(), unit()),
+                filtered(negated(over.clone()), unit_const(), unit()),
+            ],
+            unit(),
+        )];
+        let types = [(unit(), Extent::Base(BaseType::Unit))];
+        let fused = fuse_typed(&units, &int(), &types).expect("the gates split");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![0, 5, 1]));
+        assert_eq!(out, ColumnValue::Units(3));
+
+        let a_ty = Type::Record(vec![("a".into(), Type::Base(BaseType::Int))]);
+        let a = record_of_extents(vec![("a", int())]);
+        let a_over = Expr::compose(vec![
+            zip(vec![Expr::proj_field("a"), constant(0)]),
+            binop(BinOpKind::Compare(CompareKind::Greater)),
+        ]);
+        let literal = Expr::new(TypedExprNode::Record(vec![RecordEntry::new(
+            "a",
+            Occurrence::mint(),
+            Expr::lit(Lit::Int(0)),
+        )]));
+        let zero = Expr::apply(literal, Expr::builtin(Builtin::Const))
+            .with_ty(Type::fun(a_ty.clone(), a_ty.clone()));
+        let wider = vec![joined(
+            vec![
+                filtered(a_over.clone(), id(), a_ty.clone()),
+                filtered(negated(a_over), zero, a_ty.clone()),
+            ],
+            a_ty.clone(),
+        )];
+        let input = record_of_extents(vec![("a", int()), ("b", int())]);
+        let consumed = fuse_typed(&wider, &input, &[(a_ty, a)]).map(|fused| fused.consumed);
+        assert_eq!(
+            consumed, None,
+            "the first arm carries `b`, which the join's type lacks"
+        );
+    }
+
+    /// A tag the union column does not carry selects no row: a column holding only `` `some ``
+    /// rows, matched by ``(variant_project(`some) ≫ id * 2) ⊔ (variant_project(`none) ≫ 7 ▷
+    /// const)``, reads its `` `none `` payload from the instruction's empty column.
+    #[test]
+    fn a_tag_the_column_lacks_selects_no_row() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let chain = vec![joined(
+            vec![
+                Expr::compose(vec![
+                    project_option("some", int_ty()),
+                    arith(ArithmeticKind::Mul, 2),
+                ]),
+                Expr::compose(vec![
+                    project_option("none", Type::Base(BaseType::Unit)),
+                    constant(7),
+                ]),
+            ],
+            int_ty(),
+        )];
+        let fused =
+            fuse_typed(&chain, &option_extent(), &option_types()).expect("the arms name every tag");
+        let n = 2_500;
+        let some = UnionArm::new((0..n).collect(), ColumnValue::Ints((0..n as i64).collect()));
+        let column = ColumnValue::Union(TagMap::from_arms(vec![(tag("some"), some)]));
+        let want = (0..n as i64).map(|i| i * 2).collect::<Vec<_>>();
+        assert_eq!(fused.program.eval(&column), ColumnValue::Ints(want));
+    }
+
+    /// An operand that pairs the element with the payload, ``(.t, .w ≫ variant_project(`some)) ▷
+    /// zip ≫ add``, holds the rows of its tag and reads both: over `{t: Int, w: {`none |
+    /// `some{Int}}}`, matched together with ``.w ≫ variant_project(`none) ≫ 0 ▷ const``.
+    #[test]
+    fn an_operand_pairs_the_element_with_the_payload() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let input = record_of_extents(vec![("t", int()), ("w", option_extent())]);
+        let some_plus_t = Expr::compose(vec![
+            zip(vec![
+                Expr::proj_field("t"),
+                Expr::compose(vec![
+                    Expr::proj_field("w"),
+                    project_option("some", int_ty()),
+                ]),
+            ]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
+        ]);
+        let none = Expr::compose(vec![
+            Expr::proj_field("w"),
+            project_option("none", Type::Base(BaseType::Unit)),
+            constant(0),
+        ]);
+        let chain = vec![joined(vec![some_plus_t, none], int_ty())];
+        let fused =
+            fuse_typed(&chain, &input, &option_types()).expect("the arms name every tag of `w`");
+        let w: Vec<Value> = (0..4)
+            .map(|i| Value::Union {
+                tag: tag(if i % 2 == 0 { "some" } else { "none" }),
+                inner: Box::new(if i % 2 == 0 {
+                    Value::Int(i * 10)
+                } else {
+                    Value::Unit
+                }),
+            })
+            .collect();
+        let column = ColumnValue::Records(HashMap::from([
+            ("t".into(), ColumnValue::Ints(vec![1, 2, 3, 4])),
+            ("w".into(), ColumnValue::from_values(w, &option_extent())),
+        ]));
+        assert_eq!(
+            fused.program.eval(&column),
+            ColumnValue::Ints(vec![1, 0, 23, 0]),
+            "{}",
+            fused.program
+        );
+    }
+
+    /// A `match` on a variant built in the chain reads as the arm naming its tag, with no arm or
+    /// `Case`: ``x ≫ variant_wrap(`some) ≫ ((variant_project(`some) ≫ id * 2) ⊔
+    /// (variant_project(`none) ≫ 7 ▷ const))``.
+    #[test]
+    fn a_match_on_a_known_tag_reads_as_its_arm() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let chain = vec![
+            wrap("some"),
+            joined(
+                vec![
+                    Expr::compose(vec![
+                        project_option("some", int_ty()),
+                        arith(ArithmeticKind::Mul, 2),
+                    ]),
+                    Expr::compose(vec![
+                        project_option("none", Type::Base(BaseType::Unit)),
+                        constant(7),
+                    ]),
+                ],
+                int_ty(),
+            ),
+        ];
+        let fused = fuse_typed(&chain, &int(), &option_types()).expect("the tag is known");
+        assert!(
+            !fused
+                .program
+                .instrs
+                .iter()
+                .any(|instr| matches!(instr.op, Op::Arm { .. } | Op::Case { .. })),
+            "{}",
+            fused.program
+        );
+        assert_eq!(
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2])),
+            ColumnValue::Ints(vec![2, 4])
+        );
+    }
+
+    /// A join is not fused when its gates mix `Holds` and `Tag`, name one tag twice, or read two
+    /// unions.
+    #[test]
+    fn a_join_whose_gates_do_not_split_by_one_rule_has_no_program() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let input = record_of_extents(vec![
+            ("k", int()),
+            ("v", option_extent()),
+            ("w", option_extent()),
+        ]);
+        let arm = |field: &str, name: &str, then: Expr| {
+            let payload = if name == "some" {
+                int_ty()
+            } else {
+                Type::Base(BaseType::Unit)
+            };
+            Expr::compose(vec![
+                Expr::proj_field(field),
+                project_option(name, payload),
+                then,
+            ])
+        };
+        let k_over_0 = Expr::compose(vec![
+            zip(vec![Expr::proj_field("k"), constant(0)]),
+            binop(BinOpKind::Compare(CompareKind::Greater)),
+        ]);
+        let cases = [
+            (
+                "mixed gates",
+                vec![
+                    filtered(k_over_0, constant(1), int_ty()),
+                    arm("v", "none", constant(0)),
+                ],
+            ),
+            (
+                "one tag twice",
+                vec![
+                    arm("v", "some", constant(1)),
+                    arm("v", "some", constant(2)),
+                    arm("v", "none", constant(0)),
+                ],
+            ),
+            (
+                "two unions",
+                vec![arm("v", "some", constant(1)), arm("w", "none", constant(0))],
+            ),
+        ];
+        for (name, operands) in cases {
+            let chain = vec![joined(operands, int_ty())];
+            assert!(
+                fuse_typed(&chain, &input, &option_types()).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    /// The scope check rejects an instruction that reads another scope, and a `Narrow` outside an
+    /// arm.
+    #[test]
+    fn the_scope_check_rejects_a_read_across_scopes() {
+        let gt = BinOpKind::Compare(CompareKind::Greater).into();
+        let mut program = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Const(Value::Int(0)),
+            Op::Bin(gt, 0, 1),
+            Op::Arm {
+                gate: Gate::Holds(2),
+            },
+            Op::Narrow { from: 0 },
+            Op::Un(UnaryOpKind::Neg, 4),
+            Op::Case {
+                arms: vec![(3, 5)],
+                constructs: false,
+            },
+        ]);
+        program.instrs[4].scope = 3;
+        program.instrs[5].scope = 3;
+        assert!(program.scopes_are_consistent(), "{program}");
+        program.instrs[5].op = Op::Un(UnaryOpKind::Neg, 0);
+        assert!(
+            !program.scopes_are_consistent(),
+            "a root slot read in an arm"
+        );
+        program.instrs[5].op = Op::Un(UnaryOpKind::Neg, 4);
+        program.instrs[4].scope = ROOT;
+        assert!(
+            !program.scopes_are_consistent(),
+            "a `Narrow` in the root scope"
+        );
+    }
+
     /// An operation written twice is computed once: `(x + 1, x + 1)`, written as two arms, computes
     /// `x + 1` once and holds the constant `1` once.
     #[test]
@@ -2223,22 +3892,23 @@ mod tests {
     fn a_computed_value_in_an_earlier_slot_is_no_result() {
         let no_types = |ty: &Type| panic!("no type is read, read {ty}");
         let mut parser = Parser {
+            scope: ROOT,
             extent_of: &no_types,
             instrs: Vec::new(),
             slots: HashMap::new(),
             ops: 0,
         };
-        let x = parser.emit(Instr::Input { path: Vec::new() });
-        let one = parser.emit(Instr::Const(Value::Int(1)));
+        let x = parser.emit(Op::Input { path: Vec::new() });
+        let one = parser.emit(Op::Const(Value::Int(1)));
         let add = InterpreterBinOp::from(BinOpKind::Arithmetic(ArithmeticKind::Add));
-        let sum = parser.emit(Instr::Bin(add, x, one));
+        let sum = parser.emit(Op::Bin(add, x, one));
         assert!(parser.root_of(&Val::Slot(sum, int())).is_some());
         assert_eq!(
-            parser.emit(Instr::Bin(add, x, one)),
+            parser.emit(Op::Bin(add, x, one)),
             sum,
             "an equal operation shares"
         );
-        let negated = parser.emit(Instr::Un(UnaryOpKind::Neg, sum));
+        let negated = parser.emit(Op::Un(UnaryOpKind::Neg, sum));
         assert!(parser.root_of(&Val::Slot(sum, int())).is_none());
         assert!(parser.root_of(&Val::Slot(negated, int())).is_some());
     }
@@ -2257,7 +3927,7 @@ mod tests {
             .program
             .instrs
             .iter()
-            .filter(|instr| matches!(instr, Instr::Bin(InterpreterBinOp::Arithmetic(_), ..)))
+            .filter(|instr| matches!(instr.op, Op::Bin(InterpreterBinOp::Arithmetic(_), ..)))
             .count();
         assert_eq!(adds, 2, "one `add` and one `mul`: {}", fused.program);
         let out = fused.program.eval(&ColumnValue::Ints(vec![1, 2]));
@@ -2276,7 +3946,7 @@ mod tests {
         assert_eq!(fused.consumed, 2);
         assert_eq!(fused.program.instrs.len(), 3, "{}", fused.program);
         assert!(
-            matches!(fused.program.instrs[2], Instr::Bin(..)),
+            matches!(fused.program.instrs[2].op, Op::Bin(..)),
             "{}",
             fused.program
         );
@@ -2349,40 +4019,32 @@ mod tests {
             .instrs
             .iter()
             .enumerate()
-            .filter_map(|(slot, instr)| matches!(instr, Instr::Record(_)).then_some(slot))
+            .filter_map(|(slot, instr)| matches!(instr.op, Op::Record(_)).then_some(slot))
             .collect();
         assert_eq!(records.len(), 2, "{program}");
         assert_eq!(records[1], program.instrs.len() - 1, "{program}");
-        let read = ScalarProgram {
-            instrs: vec![
-                Instr::Input { path: Vec::new() },
-                Instr::Record(vec![("a".into(), 0)]),
-                Instr::Un(UnaryOpKind::Neg, 1),
-            ],
-        };
+        let read = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Record(vec![("a".into(), 0)]),
+            Op::Un(UnaryOpKind::Neg, 1),
+        ]);
         assert!(!read.constructors_build_only_the_result());
-        let unnamed = ScalarProgram {
-            instrs: vec![
-                Instr::Input { path: Vec::new() },
-                Instr::Record(vec![("a".into(), 0)]),
-                Instr::Un(UnaryOpKind::Neg, 0),
-            ],
-        };
+        let unnamed = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Record(vec![("a".into(), 0)]),
+            Op::Un(UnaryOpKind::Neg, 0),
+        ]);
         assert!(!unnamed.constructors_build_only_the_result());
-        let bare_read = ScalarProgram {
-            instrs: vec![Instr::Input { path: Vec::new() }],
-        };
+        let bare_read = ScalarProgram::rooted(vec![Op::Input { path: Vec::new() }]);
         assert!(!bare_read.constructors_build_only_the_result());
-        let wrap_read = ScalarProgram {
-            instrs: vec![
-                Instr::Input { path: Vec::new() },
-                Instr::Wrap {
-                    tag: tag("some"),
-                    payload: 0,
-                },
-                Instr::Un(UnaryOpKind::Neg, 1),
-            ],
-        };
+        let wrap_read = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Wrap {
+                tag: tag("some"),
+                payload: 0,
+            },
+            Op::Un(UnaryOpKind::Neg, 1),
+        ]);
         assert!(!wrap_read.constructors_build_only_the_result());
     }
 
@@ -2390,31 +4052,25 @@ mod tests {
     /// union input, which the program tells apart only by the extent it is applied to.
     #[test]
     fn an_operation_reads_only_a_column_with_a_view() {
-        let compare = |a, b| Instr::Bin(BinOpKind::Compare(CompareKind::Equals).into(), a, b);
-        let ints = ScalarProgram {
-            instrs: vec![
-                Instr::Input { path: Vec::new() },
-                Instr::Const(Value::Int(1)),
-                compare(0, 1),
-            ],
-        };
+        let compare = |a, b| Op::Bin(BinOpKind::Compare(CompareKind::Equals).into(), a, b);
+        let ints = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Const(Value::Int(1)),
+            compare(0, 1),
+        ]);
         assert!(ints.operands_have_views(&int()));
-        let unit_constant = ScalarProgram {
-            instrs: vec![
-                Instr::Input { path: Vec::new() },
-                Instr::Const(Value::Unit),
-                compare(0, 1),
-            ],
-        };
+        let unit_constant = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Const(Value::Unit),
+            compare(0, 1),
+        ]);
         assert!(!unit_constant.operands_have_views(&int()));
-        let negated = ScalarProgram {
-            instrs: vec![
-                Instr::Input {
-                    path: vec!["b".into()],
-                },
-                Instr::Un(UnaryOpKind::Neg, 0),
-            ],
-        };
+        let negated = ScalarProgram::rooted(vec![
+            Op::Input {
+                path: vec!["b".into()],
+            },
+            Op::Un(UnaryOpKind::Neg, 0),
+        ]);
         let with = |b| record_of_extents(vec![("a", int()), ("b", b)]);
         assert!(negated.operands_have_views(&with(int())));
         assert!(!negated.operands_have_views(&with(option_extent())));
@@ -2423,14 +4079,12 @@ mod tests {
             !negated.operands_have_views(&int()),
             "`b` names no field of an `Int`"
         );
-        let chained = ScalarProgram {
-            instrs: vec![
-                Instr::Input { path: Vec::new() },
-                Instr::Const(Value::Int(1)),
-                compare(0, 1),
-                Instr::Un(UnaryOpKind::Not, 2),
-            ],
-        };
+        let chained = ScalarProgram::rooted(vec![
+            Op::Input { path: Vec::new() },
+            Op::Const(Value::Int(1)),
+            compare(0, 1),
+            Op::Un(UnaryOpKind::Not, 2),
+        ]);
         assert!(chained.operands_have_views(&int()));
     }
 
@@ -2445,7 +4099,7 @@ mod tests {
         };
         let listed = fuse(&[zip_record(arms())], &int()).unwrap();
         let reversed = fuse(&[zip_record(arms().into_iter().rev().collect())], &int());
-        let Some(Instr::Record(fields)) = listed.program.instrs.last() else {
+        let Some(Op::Record(fields)) = listed.program.instrs.last().map(|instr| &instr.op) else {
             panic!("a record output, got {}", listed.program)
         };
         let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
@@ -2583,7 +4237,7 @@ mod tests {
         let total = 3 * BLOCK_ROWS;
         let input = ramp(total);
         let mut scratch = Scratch::new(&input, &fused.program);
-        let mut out = fused.program.empty_output(&input);
+        let mut out = scratch.empties.last().cloned().flatten().unwrap();
         out.reserve(total);
         scratch.block(&fused.program, 0, BLOCK_ROWS, &mut out);
         let result = pointer(&out);
@@ -2602,7 +4256,7 @@ mod tests {
         for (slot, instr) in buffers.iter().zip(&fused.program.instrs) {
             assert_eq!(
                 slot.is_some(),
-                matches!(instr, Instr::Bin(..) | Instr::Un(..)),
+                matches!(instr.op, Op::Bin(..) | Op::Un(..)),
                 "{instr}"
             );
         }
@@ -2666,7 +4320,7 @@ mod tests {
                 .program
                 .instrs
                 .iter()
-                .filter(|i| matches!(i, Instr::Input { .. }))
+                .filter(|i| matches!(i.op, Op::Input { .. }))
                 .count()
         };
         assert_eq!(inputs(&separate), 1, "only the full path is read");

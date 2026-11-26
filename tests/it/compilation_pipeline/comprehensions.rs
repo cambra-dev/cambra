@@ -1713,6 +1713,87 @@ fn a_comparison_of_none_fields_reads_the_other_field() {
     );
 }
 
+/// A value conditional whose arms split the rows is one map: its gates are proved to split the
+/// rows, and each arm runs only on its own rows.
+#[rstest]
+#[case::if_else("[x // 2 if x > 0 else 0 - x for x in source1()]")]
+#[case::variants("[`some(x + 1) if x > 1 else `none for x in source1()]")]
+#[case::elif_20(ELIF_20)]
+fn a_conditional_whose_arms_split_the_rows_compiles_to_one_map(#[case] code: &str) {
+    assert_eq!(
+        operator_kinds_over_source1(code),
+        [
+            "IterateExtent",
+            "MapResultWithSource",
+            "Constant",
+            "MapResult"
+        ],
+    );
+}
+
+/// A `match` over a union read from the input is one map: its arms name every tag of the union.
+#[test]
+fn a_match_over_a_union_of_the_input_compiles_to_one_map() {
+    let code = indoc! {"
+        vs = [`a(x) if x > 1 else `b(x) for x in source1()]
+        def payload(v):
+            match v:
+                case `a(p):
+                    p * 3
+                case `b(q):
+                    q - 10
+        [payload(v) for v in vs]"};
+    let kinds = operator_kinds_over_source1(code);
+    for unfused in ["VariantProject", "UnionOperator", "Filter", "Zip"] {
+        assert!(
+            !kinds.contains(&unfused),
+            "both conditionals fuse, got {unfused} in {kinds:?}"
+        );
+    }
+}
+
+/// A fused conditional answers each row from its own arm, and an arm's operations run only on
+/// the rows it holds: `10 // x` never runs where `x` is `0`. These cases check values;
+/// `a_conditional_whose_arms_split_the_rows_compiles_to_one_map` checks that the same shapes fuse.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::if_else("sum([x // 2 if x > 0 else 0 - x for x in [3, -1, 4, 0]])", 4)]
+#[case::partial_operation("sum([10 // x if x != 0 else 0 for x in [2, 0, 5]])", 7)]
+#[case::elif_20(ELIF_20_SUM, 437)]
+#[case::match_on_built_variants(
+    indoc! {"
+        vs = [`a(x) if x > 1 else `b(x) for x in [1, 2, 3]]
+        def payload(v):
+            match v:
+                case `a(p):
+                    p * 3
+                case `b(q):
+                    q - 10
+        sum([payload(v) for v in vs])"},
+    6
+)]
+#[case::variant_results(
+    indoc! {"
+        def payload(o):
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    100
+        sum([payload(`some(x + 1) if x > 1 else `none) for x in [1, 2, 3]])"},
+    107
+)]
+fn a_fused_conditional_answers_each_row_from_its_arm(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// Twenty arms, each a comparison of `x` with one constant, ending in an `else`, summed over a few
+/// rows on both sides of the last arm.
+const ELIF_20_SUM: &str = "sum([0 * x if x == 0 else 1 * x if x == 1 else 2 * x if x == 2 else 3 * x if x == 3 else 4 * x if x == 4 else 5 * x if x == 5 else 6 * x if x == 6 else 7 * x if x == 7 else 8 * x if x == 8 else 9 * x if x == 9 else 10 * x if x == 10 else 11 * x if x == 11 else 12 * x if x == 12 else 13 * x if x == 13 else 14 * x if x == 14 else 15 * x if x == 15 else 16 * x if x == 16 else 17 * x if x == 17 else 18 * x if x == 18 else 19 * x if x == 19 else x for x in [0, 1, 5, 19, 20, 30]])";
+
+/// Twenty arms, each a comparison of `x` with one constant, ending in an `else`.
+const ELIF_20: &str = "[0 * x if x == 0 else 1 * x if x == 1 else 2 * x if x == 2 else 3 * x if x == 3 else 4 * x if x == 4 else 5 * x if x == 5 else 6 * x if x == 6 else 7 * x if x == 7 else 8 * x if x == 8 else 9 * x if x == 9 else 10 * x if x == 10 else 11 * x if x == 11 else 12 * x if x == 12 else 13 * x if x == 13 else 14 * x if x == 14 else 15 * x if x == 15 else 16 * x if x == 16 else 17 * x if x == 17 else 18 * x if x == 18 else 19 * x if x == 19 else x for x in source1()]";
+
 /// A collection of records holding a variant is a column, so a chain reading it fuses as well:
 /// the producer and the consumer are one map each, with no `Zip` between the fields.
 #[test]

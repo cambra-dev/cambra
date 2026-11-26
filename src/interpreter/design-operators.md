@@ -1317,6 +1317,75 @@ arms grow block by block. Intermediate columns hold at most one block each rathe
 per full input. An empty input still runs one zero-length block and produces a correctly typed empty
 output.
 
+#### Conditional programs
+
+A fused conditional is one program in which some instructions run on a subset of the block's rows.
+Each instruction belongs to a scope. The root scope holds every row of the block. An `Arm`
+instruction opens a scope holding the rows of its enclosing scope where its gate holds, and its slot
+names the scope. Every other instruction runs in one scope, and its operands are slots of that
+scope or constants.
+
+| Instruction | Scope | Value |
+|---|---|---|
+| `Arm { gate: Holds(𝑏) }` | opens a scope inside `𝑏`'s | The rows where the `Bool` slot `𝑏` holds |
+| `Arm { gate: Tag(𝑢, 𝑐) }` | opens a scope inside `𝑢`'s | The rows whose value in the union slot `𝑢` carries `𝑐` |
+| `Narrow { from }` | an arm | The rows of `from`, a slot of the arm's enclosing scope, that the arm holds |
+| `Payload { path }` | a `Tag` arm | The payloads of the rows the arm holds, at `path` inside them |
+| `Case { arms, constructs }` | the arms' enclosing scope | Each row's value from the one arm that holds it |
+
+A scope's rows in a block are a selection: the ascending positions, within the enclosing scope's
+rows, that the scope holds, as a `Vec<u32>`. An `Arm` computes its selection once per block, before
+any instruction of its scope runs.
+
+- A `Holds` gate selects the positions where its `Bool` column is `true`.
+- A `Tag` gate reads its union column's `UnionArm` for `𝑐`. That arm's rows are ascending, so its
+  rows inside the block are one contiguous run, found by two binary searches for the block's first
+  and last row. The selection is that run less the block's first row. `Payload` is the matching run
+  of the arm's payload column, a view, so it gathers nothing; a payload with no view is copied into
+  a scratch column. A tag the column does not carry selects no row, and its payload is the empty
+  column of the payload's type, which the instruction holds.
+
+An instruction of an arm runs its kernel on dense columns holding only the arm's rows: `Narrow`
+gathers a slot of the enclosing scope by the arm's selection, and a constant is repeated to the
+arm's length. A row the gate rejected is in no column the arm reads, so a partial operation such as
+`//` or `int_to_uint` never runs on it. A gate itself runs on every row of its enclosing scope, as
+`filter_values` evaluates its predicate on every row.
+
+`Case` merges its arms in row order. The arms' selections split the enclosing scope's rows, so each
+position belongs to one arm.
+The split is proved at recognition
+([A conditional in an element-wise chain](../ccl/design/optimization.md#a-conditional-in-an-element-wise-chain)).
+A `Case` of a base type places each arm's values at its selection's positions
+(`ColumnView::scatter_into`). A record merges field by field, and a union arm by arm: each row keeps
+the tag its arm gave it, and an arm's rows are its parts' positions in order (`merge_parts`). A
+`Case` of `Int`, `UInt`, `String` or `Bool` is an operation: it writes a scratch column that later
+operations read like any other, or the output when it is the last instruction. A `Case` of a record,
+a union or `Unit` constructs: it is the last instruction, or a field, payload or arm result of a
+later constructor. Equal instructions share a slot only within one scope, since a scope is part of
+an instruction. `ScalarProgram::scopes_are_consistent` checks, in debug builds, that every
+instruction reads its own scope and that scopes nest.
+
+`[x // 2 if x > 0 else 0 - x for x in source1()]` compiles to the program below; `in s𝑛` names
+the arm an instruction runs in, and the others run in the root scope.
+
+```
+s0  = _
+s1  = 0
+s2  = >(s0, s1)
+s3  = arm s2                  rows where x > 0
+s4  = narrow s0 in s3
+s5  = 2
+s6  = //(s4, s5) in s3
+s7  = Not(s2)
+s8  = arm s7                  rows where x <= 0
+s9  = narrow s0 in s8
+s10 = -(s1, s9) in s8
+s11 = case(s3: s6, s8: s10)
+```
+
+For a block whose `x` is `[3, -1, 4, 0]`, `s3` selects `[0, 2]` and `s8` selects `[1, 3]`. `s6`
+divides `[3, 4]`, `s10` negates `[-1, 0]`, and `s11` merges them to `[1, 1, 2, 0]`.
+
 #### Column views
 
 `View<T>` (`src/view.rs`) borrows either a slice or one value repeated over a specified length.
