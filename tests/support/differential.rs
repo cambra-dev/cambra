@@ -141,15 +141,9 @@ const DISPATCH_REFUSED: &str = include_str!(concat!(
     "/tests/it/dispatch_refused.txt"
 ));
 
-/// Check that a dispatched run of `source` ([`dispatch`]) completes with a value, or that the
-/// planner refuses it as [`DISPATCH_REFUSED`] pins for the running test. For a test that checks
-/// only that the compiler runs a program, whatever it answers.
-///
-/// # Panics
-///
-/// Where the run produces no value, or is refused where nothing pins it, or a pin names a refusal
-/// the run no longer makes.
-pub fn check_dispatched(source: &str) {
+/// Check each morsel size independently when the program admits several legal serializations.
+/// A planner refusal must match the running test's entry in [`DISPATCH_REFUSED`].
+pub fn check_dispatched_outcomes(source: &str, expected: &[&str]) {
     let test = std::thread::current()
         .name()
         .unwrap_or("an unnamed thread")
@@ -159,25 +153,30 @@ pub fn check_dispatched(source: &str) {
         .filter_map(|line| line.split_once('\t'))
         .find(|(name, _)| *name == test)
         .map(|(_, refusal)| refusal);
-    match (dispatch(source), pin) {
-        (Dispatched::Ran(Compiled::Value(_)), None) => {}
-        (Dispatched::Refused(why), Some(refusal)) => assert!(
-            why.starts_with(refusal),
-            "{test}: the planner refuses the program as `{why}`, where \
+    for rows in [1, usize::MAX] {
+        match (run_dispatched(source, rows), pin) {
+            (Dispatched::Ran(Compiled::Value(value)), None) => assert!(
+                expected.contains(&value.to_string().as_str()),
+                "{test}: unexpected result at {rows} rows per package: {value}; expected one of {expected:?}"
+            ),
+            (Dispatched::Refused(why), Some(refusal)) => assert!(
+                why.starts_with(refusal),
+                "{test}: the planner refuses the program as `{why}`, where \
              tests/it/dispatch_refused.txt pins `{refusal}`"
-        ),
-        (other, Some(refusal)) => panic!(
-            "{test}: the dispatched run is no longer refused ({refusal}): {other}; remove its \
+            ),
+            (other, Some(refusal)) => panic!(
+                "{test}: the dispatched run is no longer refused ({refusal}): {other}; remove its \
              line from tests/it/dispatch_refused.txt"
-        ),
-        (Dispatched::Refused(why), None) => {
-            let line = why.lines().next().unwrap_or_default();
-            panic!(
-                "{test}: the planner refuses the program: {why}\n  pin it in \
+            ),
+            (Dispatched::Refused(why), None) => {
+                let line = why.lines().next().unwrap_or_default();
+                panic!(
+                    "{test}: the planner refuses the program: {why}\n  pin it in \
                  tests/it/dispatch_refused.txt as `{test}<TAB>{line}`, or make it run"
-            )
+                )
+            }
+            (other, None) => panic!("{test}: the dispatched run: {other}\n  program:\n{source}"),
         }
-        (other, None) => panic!("{test}: the dispatched run: {other}\n  program:\n{source}"),
     }
 }
 
