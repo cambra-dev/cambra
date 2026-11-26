@@ -2200,7 +2200,7 @@ impl Tile {
         self.retain_paths_under(level.index(), vec![Vec::new()], keep);
     }
 
-    fn retain_paths_under(
+    pub(super) fn retain_paths_under(
         &mut self,
         depth: usize,
         row_paths: Vec<Vec<Value>>,

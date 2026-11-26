@@ -1706,7 +1706,7 @@ impl InputId {
 ///
 /// [`consume_impl`]: Self::consume_impl
 pub trait Breaker {
-    /// Whether this input pulls individual scalar fields of keyed records.
+    /// Whether this input pulls individual fields and paths within collection fields of keyed records.
     fn reads_input_fields(&self) -> bool {
         false
     }
@@ -1892,7 +1892,7 @@ impl DroppedRows {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer: Send + Sync {
-    /// Whether a pull of a keyed scalar record can deliver its requested fields independently.
+    /// Whether a cached keyed record can deliver fields and paths within collection fields independently.
     fn reads_record_fields(&self) -> bool {
         false
     }

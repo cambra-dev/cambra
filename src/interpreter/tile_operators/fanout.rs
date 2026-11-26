@@ -2114,9 +2114,7 @@ impl BreakingProducer for MemoProducer {
 
 impl TileProducer for MemoProducer {
     fn reads_record_fields(&self) -> bool {
-        matches!(self.tiling(), Tiling::DataFunction { codomain, .. }
-            if matches!(&**codomain, Tiling::Record(fields)
-                if fields.values().all(|t| matches!(t, Tiling::Scalar(_)))))
+        self.tiling().has_projectable_record_fields()
     }
 
     fn state_info(&self) -> ProducerStateInfo {

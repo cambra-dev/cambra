@@ -630,6 +630,7 @@ mod tests {
         context::{GlobalContext, compile_program},
         load::LoadedProgram,
     };
+    use crate::interpreter::{Tile, TileGuard, Tiling};
 
     fn evaluate(source: &str, dop: usize) -> super::super::Run {
         let mut context = GlobalContext::default();
@@ -954,13 +955,140 @@ mod tests {
         #[case] on_release: bool,
     ) {
         use super::*;
+        use crate::interpreter::{ColumnValue, CurryLevel, Tile, types::BaseType};
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record([("a".into(), scalar.clone()), ("b".into(), scalar)].into()),
+        );
+        let record = Tile::record(
+            [
+                ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![17]))),
+                ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![29]))),
+            ]
+            .into(),
+        );
+        let row = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(record),
+            Predicate::False,
+            Default::default(),
+        );
+        let field = |name| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(7)),
+                Projection::of_field(name, Projection::Everything),
+            )
+            .guard(&tiling)
+        };
+        let (mut first, second, remaining) =
+            deliver_sibling_packages(&row, &tiling, [field("a"), field("b")], on_release);
+        first.merge(second);
+        assert_eq!(first, row);
+        assert!(
+            remaining.is_empty(),
+            "releasing both fields reclaims the row"
+        );
+    }
+
+    #[rstest_log::rstest]
+    #[case::during_read(false)]
+    #[case::during_release(true)]
+    fn cached_memo_delivers_item_four_while_item_two_is_paused(#[case] on_release: bool) {
+        use super::*;
+        use crate::interpreter::{ColumnValue, CurryLevel, Tile, types::BaseType};
+        let collection = |values| Tiling::data_function(Extent::uint_range(16), values);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = collection(Tiling::Record(
+            [
+                ("id".into(), scalar.clone()),
+                ("history".into(), collection(collection(scalar))),
+            ]
+            .into(),
+        ));
+        // The same item keys occur on another day and under another customer.
+        let group = |starts, keys, values| {
+            Tile::grouped(
+                starts,
+                ColumnValue::UInts(keys),
+                Box::new(values),
+                Predicate::False,
+                Default::default(),
+            )
+        };
+        let history = group(
+            vec![0, 2],
+            vec![3, 5, 3],
+            group(
+                vec![0, 2, 3],
+                vec![2, 4, 4, 4],
+                Tile::Scalar(ColumnValue::Ints(vec![72, 74, 75, 84])),
+            ),
+        );
+        let mut customers = group(
+            vec![0],
+            vec![7, 8],
+            Tile::record(
+                [
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                    ("history".into(), history),
+                ]
+                .into(),
+            ),
+        );
+        // A closed cache must only restate the requested leaf.
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut customers
+        {
+            *domain_predicate = Predicate::True;
+        }
+        let field = |item| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(7)),
+                Projection::of_field(
+                    "history",
+                    Projection::of_path(&[Value::UInt(3), Value::UInt(item)]),
+                ),
+            )
+            .guard(&tiling)
+        };
+        let (first, second, remaining) =
+            deliver_sibling_packages(&customers, &tiling, [field(2), field(4)], on_release);
+        for (tile, item, value) in [(first, 4, 74), (second, 2, 72)] {
+            assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
+            let Tile::Record { fields, .. } = tile.deepest_values() else {
+                panic!("expected customer record")
+            };
+            assert!(fields["id"].is_empty());
+            assert_eq!(
+                fields["history"].paths_at(CurryLevel::new(1)),
+                [vec![Value::UInt(3), Value::UInt(item)]]
+            );
+            assert_eq!(
+                fields["history"].deepest_values(),
+                &Tile::Scalar(ColumnValue::Ints(vec![value]))
+            );
+        }
+        assert!(!remaining.contains_guarded(&field(2)));
+        assert!(!remaining.contains_guarded(&field(4)));
+    }
+
+    fn deliver_sibling_packages(
+        row: &Tile,
+        tiling: &Tiling,
+        [paused_field, ready_field]: [TileGuard; 2],
+        on_release: bool,
+    ) -> (Tile, Tile, Tile) {
+        use super::*;
         use crate::interpreter::{
-            ColumnValue, CurryLevel, DataSink, Tile,
+            DataSink, Tile,
             tile_operators::{
                 MemoProducer, ProducerBase, SinkBreaker, TileProducer, share_breaker,
                 test_helpers::{ConsumeInPipeline, ProjectionSpy, first_breaker},
             },
-            types::BaseType,
         };
         use std::{sync::mpsc, time::Duration};
 
@@ -1012,46 +1140,22 @@ mod tests {
             }
         }
 
-        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let tiling = Tiling::data_function(
-            Extent::uint_range(16),
-            Tiling::Record([("a".into(), scalar.clone()), ("b".into(), scalar)].into()),
-        );
-        let record = Tile::record(
-            [
-                ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![17]))),
-                ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![29]))),
-            ]
-            .into(),
-        );
-        let row = Tile::data_function(
-            ColumnValue::UInts(vec![7]),
-            Box::new(record),
-            Predicate::False,
-            Default::default(),
-        );
-        let field = |name| {
-            Projection::within(
-                CurryLevel::OUTERMOST,
-                Predicate::point(Value::UInt(7)),
-                Projection::of_field(name, Projection::Everything),
-            )
-            .guard(&tiling)
-        };
         let (spy, _, _) = ProjectionSpy::new(row.clone(), tiling.clone());
-        let mut cache = MemoProducer::over(Box::new(spy), &tiling);
+        let mut cache = MemoProducer::over(Box::new(spy), tiling);
         cache.consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
         let (paused, entered) = mpsc::channel();
         let (resume, resume_rx) = mpsc::channel();
+        let cached_reader = share_breaker(cache);
+        let original = first_breaker(&*cached_reader).unwrap();
         let input = PausedField {
-            input: share_breaker(cache),
-            field: field("a"),
+            input: cached_reader,
+            field: paused_field.clone(),
             on_release,
             paused,
             resume: Mutex::new(Some(resume_rx)),
         };
         let (source, sink) = (PipelineId(0), PipelineId(1));
-        let mut memo = MemoProducer::over(Box::new(input), &tiling);
+        let mut memo = MemoProducer::over(Box::new(input), tiling);
         memo.base_mut().downstream = Some(Arc::new(Entry::new(sink, tiling.clone())));
         let reader = share_breaker(memo);
         let chain = first_breaker(&*reader).unwrap();
@@ -1069,8 +1173,8 @@ mod tests {
                 WorkerBreaker::Sink(output.clone())
             })
         });
-        for name in ["a", "b"] {
-            dispatcher.queue_for(source, &field(name));
+        for guard in [&paused_field, &ready_field] {
+            dispatcher.queue_for(source, guard);
         }
         let consume = |pipeline, expected: TileGuard| {
             let package = dispatcher
@@ -1080,34 +1184,37 @@ mod tests {
             workers.consume(&dispatcher, package, &mut |_, _| unreachable!());
         };
         let timeout = Duration::from_secs(5);
-        thread::scope(|threads| {
-            let worker_a = threads.spawn(|| consume(source, field("a")));
+        let delivered = thread::scope(|threads| {
+            let worker_a = threads.spawn(|| consume(source, paused_field.clone()));
             entered.recv_timeout(timeout).expect("first worker paused");
             threads.spawn(|| {
-                consume(source, field("b"));
-                consume(sink, field("b"));
+                consume(source, ready_field.clone());
+                consume(sink, ready_field.clone());
             });
             let first = tiles.recv_timeout(timeout);
             let released = chain.read().unwrap().obsolete_guard();
             resume.send(()).unwrap();
             worker_a.join().unwrap();
-            let first = first.expect("field b reached the sink while a was paused");
-            assert_eq!(released, field("b"));
-            assert_eq!(first.to_guard(), field("b"));
-            consume(sink, field("a"));
+            let first =
+                first.expect("the ready package reached the sink while its sibling was paused");
+            assert_eq!(released, ready_field);
+            assert_eq!(first.to_guard(), ready_field);
+            consume(sink, paused_field.clone());
             let second = tiles.recv_timeout(timeout).unwrap();
-            assert_eq!(second.to_guard(), field("a"));
-            let mut combined = first;
-            combined.merge(second);
-            assert_eq!(combined, row);
+            assert_eq!(second.to_guard(), paused_field);
+            (first, second)
         });
         assert_eq!(dispatcher.outstanding(sink), 0);
         assert!(tiles.try_recv().is_err());
         let remaining = in_a_run(|| chain.read().unwrap().get(tiling.universal_guard()));
-        assert!(
-            remaining.is_empty(),
-            "releasing both fields reclaims the row"
-        );
+        // Check physical reclamation in the original memo too. The other day and
+        // customer have the same item key and must retain their cells.
+        let mut expected = row.clone();
+        expected.remove_guarded(paused_field.union(&ready_field));
+        expected.compact();
+        let cached = in_a_run(|| original.read().unwrap().get(tiling.universal_guard()));
+        assert_eq!(cached, expected);
+        (delivered.0, delivered.1, remaining)
     }
 
     #[test]

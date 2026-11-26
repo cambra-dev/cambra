@@ -713,7 +713,7 @@ impl Projection {
         }
     }
 
-    /// A set of outer keys and the whole scalar fields selected at each.
+    /// Outer keys and the fields selected at each, including paths within collection fields.
     pub(crate) fn row_fields(&self) -> Option<(&Predicate, &Projection)> {
         let Self::Within {
             level: CurryLevel::OUTERMOST,
@@ -729,7 +729,7 @@ impl Projection {
         fields
             .values()
             .chain(std::iter::once(&**rest))
-            .all(|p| matches!(p, Self::Everything | Self::Nothing))
+            .all(|p| matches!(p, Self::Everything | Self::Nothing | Self::Keys { .. }))
             .then_some((keys, values))
     }
 
@@ -1218,7 +1218,7 @@ fn within_paths(stated: &Predicate, keys: &Predicate, level: usize, depth: usize
 }
 
 impl TileGuard {
-    /// Cached scalar records can answer qualified field reads from their stored columns.
+    /// A cached record can cut a field and its nested keys to the requested path.
     pub(crate) fn read_region_for(self, reads_fields: bool) -> Self {
         if reads_fields
             && matches!(&self, TileGuard::Function(FunctionGuard::Codomain(_)))
@@ -1449,17 +1449,17 @@ impl Tile {
                 }
                 let mut live = self.clone();
                 live.compact();
+                // A collection field has one group per enclosing record. Its projection
+                // names paths relative to each of those groups.
+                let mut paths = vec![Vec::new(); live.rows()];
                 for depth in 0..=level.index() {
                     let at = CurryLevel::new(depth);
+                    paths = live.values_at(at).key_paths(&paths);
                     let admits = match at == *level {
                         true => keys.clone(),
                         false => through_at(keys, *level, at),
                     };
-                    if let Some(path) = live
-                        .paths_at(at)
-                        .into_iter()
-                        .find(|path| !admits.contains_path(path))
-                    {
+                    if let Some(path) = paths.iter().find(|path| !admits.contains_path(path)) {
                         return Err(format!(
                             "it holds the path {path:?}, which {admits:?} omits"
                         ));
@@ -1484,7 +1484,11 @@ impl Tile {
         }
         let stated = self.stated_completeness();
         let allowed = match projection {
-            p if p.row_fields().is_some() => vec![Predicate::False; stated.len()],
+            p if let Some((keys, values)) = p.row_fields() => {
+                let mut cut = self.clone();
+                cut.restrict_to_row_fields(keys, values);
+                cut.stated_completeness()
+            }
             part @ (Projection::Within { .. } | Projection::Or(_)) => {
                 Projection::refuse_part_of_values("Tile::statements_within", part)
             }
@@ -1570,50 +1574,67 @@ impl Tile {
         }
     }
 
+    /// Keep parent keys as addresses. Move any parent completeness into the selected
+    /// collection paths so a leaf answer cannot release a sibling or an ancestor.
+    fn restrict_to_row_fields(&mut self, keys: &Predicate, values: &Projection) {
+        self.restrict_to_keys(keys);
+        let mut row_paths = None;
+        let Tile::DataFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            ..
+        } = self
+        else {
+            unreachable!("a keyed record has a collection tile")
+        };
+        let closed = std::mem::replace(domain_predicate, Predicate::False);
+        let Tile::Record { fields, absent } = &mut **codomain else {
+            unreachable!()
+        };
+        let mut held = vec![false; domain.len()];
+        for (name, field) in fields {
+            let part = values.field(name);
+            if field.is_data_function() {
+                let paths = row_paths.get_or_insert_with(|| {
+                    (0..domain.len())
+                        .map(|i| vec![domain.index_at(i)])
+                        .collect::<Vec<_>>()
+                });
+                cut_collection_field(field, &part, keys, &closed, paths);
+                if part != Projection::Nothing {
+                    // An existing parent's selected collection can be empty. Its
+                    // run is still part of this answer, including any absence it states.
+                    held.fill(true);
+                }
+                continue;
+            }
+            let Tile::Scalar(cells) = field else {
+                unreachable!()
+            };
+            if part == Projection::Nothing && !domain.is_empty() {
+                *cells = cells.select_indices(std::iter::empty(), 0);
+                absent.insert(name.clone(), (0..domain.len()).collect());
+            } else if !cells.is_empty() {
+                let missing = absent.get(name);
+                for (row, held) in held.iter_mut().enumerate() {
+                    *held |= missing.is_none_or(|bits| !bits.contains(row));
+                }
+            }
+        }
+        if held.contains(&false) {
+            self.retain_keys(&held);
+        }
+    }
+
     /// Cut this tile to `projection`.
     ///
     /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
     pub fn restrict_to(&mut self, projection: &Projection, tiling: &Tiling) {
         if let Some((keys, values)) = projection.row_fields()
-            && let Tiling::DataFunction { codomain, .. } = tiling
-            && let Tiling::Record(tilings) = &**codomain
-            && tilings.values().all(|t| matches!(t, Tiling::Scalar(_)))
+            && tiling.has_projectable_record_fields()
         {
-            self.restrict_to_keys(keys);
-            let Tile::DataFunction {
-                domain,
-                codomain,
-                domain_predicate,
-                ..
-            } = self
-            else {
-                unreachable!("a keyed record has a collection tile")
-            };
-            *domain_predicate = Predicate::False;
-            if domain.is_empty() {
-                return;
-            }
-            let Tile::Record { fields, absent } = &mut **codomain else {
-                unreachable!()
-            };
-            let mut held = vec![false; domain.len()];
-            for (name, field) in fields {
-                let Tile::Scalar(cells) = field else {
-                    unreachable!()
-                };
-                if values.field(name) == Projection::Nothing {
-                    *cells = cells.select_indices(std::iter::empty(), 0);
-                    absent.insert(name.clone(), (0..domain.len()).collect());
-                } else if !cells.is_empty() {
-                    let missing = absent.get(name);
-                    for (row, held) in held.iter_mut().enumerate() {
-                        *held |= missing.is_none_or(|bits| !bits.contains(row));
-                    }
-                }
-            }
-            if held.contains(&false) {
-                self.retain_keys(&held);
-            }
+            self.restrict_to_row_fields(keys, values);
             return;
         }
         match projection {
@@ -1634,6 +1655,39 @@ impl Tile {
             }
         }
     }
+}
+
+/// Cut a collection field in place, keeping one group for every retained parent.
+fn cut_collection_field(
+    field: &mut Tile,
+    part: &Projection,
+    parents: &Predicate,
+    closed: &Predicate,
+    row_paths: &[Vec<Value>],
+) {
+    let (relative, keys) = match part {
+        Projection::Everything => (CurryLevel::OUTERMOST, &Predicate::True),
+        Projection::Nothing => (CurryLevel::OUTERMOST, &Predicate::False),
+        Projection::Keys { level, keys } => (*level, keys),
+        _ => unreachable!("a record field selects whole values or collection keys"),
+    };
+    let level = CurryLevel::new(relative.index() + 1);
+    let paths = beneath_keys(keys, parents, relative.index());
+    let through: Vec<_> = (1..=level.index())
+        .map(|at| through_at(&paths, level, CurryLevel::new(at)))
+        .collect();
+    field.retain_paths_under(relative.index(), row_paths.to_vec(), &|path| {
+        through[path.len() - 2].contains_path(path)
+    });
+    let inherited = closed.descend(level.index()).intersect(&paths);
+    cut_statements(
+        field,
+        1,
+        level.index(),
+        &paths,
+        &whole_above(level, &paths),
+        inherited,
+    );
 }
 
 /// Whether `keys`, a region of the outermost keys of a producer with `tiling`, names a key its
@@ -1938,6 +1992,40 @@ mod tests {
             assert_eq!(decoded, selection);
             assert_eq!(decoded.guard(&customers), guard);
         }
+    }
+
+    #[test]
+    fn a_closed_empty_collection_field_keeps_its_parent_and_states_only_the_requested_path() {
+        let collection = |values| Tiling::data_function(Extent::uint_range(16), values);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let history = collection(collection(scalar.clone()));
+        let tiling = collection(Tiling::Record(
+            [("id".into(), scalar), ("history".into(), history.clone())].into(),
+        ));
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    ("history".into(), history.empty_tile()),
+                ]
+                .into(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let asked = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field(
+                "history",
+                Projection::of_path(&[Value::UInt(3), Value::UInt(2)]),
+            ),
+        );
+        tile.restrict_to(&asked, &tiling);
+        assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
+        assert_eq!(tile.to_guard(), asked.guard(&tiling));
+        assert!(tile.within_over(&asked, &tiling).is_ok());
     }
 
     #[test]
