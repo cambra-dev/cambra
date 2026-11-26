@@ -487,11 +487,11 @@ releases the store before trying the body breakers. A busy breaker leaves the fo
 place.
 
 Scopes connected by reads, follows, containment or a shared store belong to one settlement group.
-A claimant publishes held output across the group and lets its runnable body packages drain
-(`LocalSteps::ready_for_decision`). It then queues the step of the first eligible scope in group
-order. This keeps a peer commit from advancing the snapshot while a writer is still processing its
-previous attempt. One claimant at a time chooses a group's step. An unrelated group can publish,
-queue and run its next step while another group's handler is busy.
+A claimant publishes held output across the group and lets its runnable body packages drain.
+It then queues one eligible step, starting after the previous winner. This keeps a peer commit
+from advancing the snapshot while a writer is still processing its previous attempt. Each group has
+its own cursor. An unrelated group can publish, queue and run its next step while another group's
+handler is busy.
 A parked request resumes through its scope's intake when input or peer progress wakes it.
 
 The first request initializes the store after its drive has read the source. A flat store can
