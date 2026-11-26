@@ -47,6 +47,11 @@ use cambra::interpreter::{BaseType, ColumnValue, Predicate, Tile, Value};
         f(n, n ^+ 4)
     g(1)
 "#})]
+#[case::annotated_higher_order(indoc! {r#"
+    def apply(fn: (a: Int, b: {Int where _ >= a}) => Int, x: Int, y: {Int where _ >= x}):
+        fn(x, y)
+    apply(f, 1, 5)
+"#})]
 fn dependent_parameters_take_their_arguments(#[case] call: &str) {
     let definition = indoc! {r#"
         def f(a: Int, b: {Int where _ >= a}):
@@ -167,6 +172,29 @@ fn complete_component_annotation_from_whole_input_parameter() {
         indoc! {r#"
             g: {(a: Int), (b: Int)} => _ = \p: {Int, Int} -> p.0 ^+ p.1
             g((1, 2))
+        "#},
+        Value::Int(3),
+    );
+}
+
+#[test]
+fn dependent_tuple_alias_keeps_its_contract() {
+    check_scalar(
+        indoc! {r#"
+            p: {(a: Int), (b: {Int where _ >= a})} = (1, 5)
+            q: {(x: Int), (y: {Int where _ >= x})} = p
+            q.1
+        "#},
+        Value::Int(5),
+    );
+}
+
+#[test]
+fn project_a_component_whose_bound_depends_on_an_earlier_projection() {
+    check_scalar(
+        indoc! {r#"
+            p: {(a: Int), (b: {Int where _ >= a}), (c: {Int where _ >= b})} = (1, 2, 3)
+            p.2
         "#},
         Value::Int(3),
     );
@@ -636,29 +664,122 @@ fn a_message_names_the_parameters_a_type_reads() {
     );
 }
 
-/// A written type whose component reads an earlier one does not compile yet.
+/// A written dependent tuple holds a value whose later components have their types with the
+/// earlier ones in place, and a projection reads the earlier components of what it projects
+/// (`docs/chl-spec.md`, "Named components").
+#[rstest]
+#[case::a_literal(indoc::indoc! {r#"
+    t: {(n: Int), {Int where _ > n}} = (1, 2)
+    t.0 + t.1
+    "#}, 3)]
+#[case::a_projection_reads_the_earlier_component(indoc::indoc! {r#"
+    p: {(a: Int), (b: {Int where _ >= a})} = (1, 5)
+    r: {Int where _ >= p.0} = p.1
+    r
+    "#}, 5)]
+#[case::an_open_tuple_holds_it(indoc::indoc! {r#"
+    p: {(a: Int), (b: {Int where _ >= a})} = (1, 2)
+    q <: {Int, ..} = p
+    q.0
+    "#}, 1)]
+#[case::a_function_returns_it(indoc::indoc! {r#"
+    def mk(a: {Int where _ >= 0}) => {(x: Int), (y: {Int where _ >= x})}:
+        (0, a)
+    mk(3).1
+    "#}, 3)]
+#[case::a_lambda_annotated_with_a_dependent_parameter_list(indoc::indoc! {r#"
+    g: (lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo} = \lo, x -> x
+    g(1, 5)
+    "#}, 5)]
+#[case::a_collection_keyed_by_dependent_positions(indoc::indoc! {r#"
+    flat: {(i: _), (j: _)} |=> Int = [x for xs in [box([1, 2]), box([3])] for x in xs]
+    sum(flat)
+    "#}, 6)]
+#[case::four_dependent_components(indoc! {r#"
+    p: {(a: Int), (b: {Int where _ >= a}), (c: {Int where _ >= b}), (d: {Int where _ >= c})} = (1, 2, 3, 4)
+    q: {Int where _ >= p.2} = p.3
+    q
+"#}, 4)]
+#[case::a_whole_input_meets_a_dependent_component_contract(indoc! {r#"
+    g: {(a: Int), (b: {Int where _ >= a})} => {Int where _ >= a} = \p: {(x: Int), (y: {Int where _ >= x})} -> p.1
+    g((1, 5))
+"#}, 5)]
+#[case::components_meet_a_dependent_whole_input_contract(indoc! {r#"
+    h: {(a: Int), (b: {Int where _ >= a})} => {Int where _ >= a} = \p: {(x: Int), (y: {Int where _ >= x})} -> p.1
+    g: (p: {(a: Int), (b: {Int where _ >= a})}) => {Int where _ >= p.0} = h
+    g((1, 5))
+"#}, 5)]
+#[case::named_refined_values(indoc! {r#"
+    lo = 1
+    hi = lo ^+ 4
+    p: {(a: Int), (b: {Int where _ >= a})} = (lo, hi)
+    p.1
+"#}, 5)]
+#[case::a_mutable_snapshot(indoc! {r#"
+    x := 1
+    p: {(a: Int), (b: {Int where _ >= a})} = (x, x ^+ 1)
+    p.1
+"#}, 2)]
+#[case::an_unannotated_projection_function(indoc! {r#"
+    def second(p):
+        p.1
+    t: {(a: Int), (b: {Int where _ >= a})} = (1, 5)
+    second(t)
+"#}, 5)]
+fn a_written_dependent_tuple(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A value whose later component does not have its type with the earlier ones in place is
+/// refused, and the message writes the annotation as the program did.
+#[rstest]
+#[case::a_literal(indoc::indoc! {r#"
+    p: {(a: Int), (b: {Int where _ >= a})} = (5, 1)
+    p.1
+    "#})]
+#[case::a_function_result(indoc::indoc! {r#"
+    def mk(n: {Int where _ >= 0}) => {(a: Int), (b: {Int where _ >= a})}:
+        (1, n)
+    mk(3).1
+    "#})]
+fn a_value_outside_a_written_dependent_tuple_is_refused(#[case] code: &str) {
+    check_compile_error(code, "annotated as {(a: Int), {Int where _ >= a}}");
+}
+
 #[test]
-fn a_written_component_reading_an_earlier_one_is_refused() {
-    check_compile_error(
-        indoc::indoc! {r#"
-            t: {(n: Int), {Int where _ > n}} = (1, 2)
-            t.0 + t.1
-        "#},
-        "this component's type reads the component `n` before it",
+fn an_annotated_higher_order_callee_accepts_the_dependent_arguments() {
+    check_scalar(
+        indoc! {r#"
+        def f(a: Int, b: {Int where _ >= a}):
+            b
+        def apply(fn: (a: Int, b: {Int where _ >= a}) => Int, x: Int, y: {Int where _ >= x}):
+            fn(x, y)
+        apply(f, 1, 5)
+    "#},
+        Value::Int(5),
     );
 }
 
 /// An argument outside a type that reads an earlier parameter is refused at the call, the
 /// earlier argument in the parameter's place.
-#[test]
-fn an_argument_outside_a_type_reading_an_earlier_parameter_is_refused() {
+#[rstest]
+#[case::literal("f(5, 1)")]
+#[case::a_named_tuple_s_components(indoc! {r#"
+    pair = (5, 1)
+    f(pair.0, pair.1)
+"#})]
+#[case::higher_order(indoc! {r#"
+    def apply(fn: (a: Int, b: {Int where _ >= a}) => Int, x: Int, y: {Int where _ >= x}):
+        fn(x, y)
+    apply(f, 5, 1)
+"#})]
+fn an_argument_outside_a_type_reading_an_earlier_parameter_is_refused(#[case] call: &str) {
+    let definition = indoc! {r#"
+        def f(a: Int, c: {Int where _ >= a}):
+            c
+    "#};
     check_compile_error(
-        indoc::indoc! {r#"
-            def f(a: Int, c: {Int where _ >= a}):
-                c
-
-            f(5, 1)
-        "#},
+        &format!("{definition}{call}"),
         "Type mismatch for this call",
     );
 }

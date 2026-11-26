@@ -1493,6 +1493,10 @@ mod tests {
         "((Int => Int causes AffectWorld), Int) => Int",
         "((Int => Int causes AffectWorld), Int) => Int"
     )]
+    #[case(
+        "(a: Int, b: {Int where _ >= a}) => Int",
+        "(a: Int, b: {Int where _ >= a}) => Int"
+    )]
     fn a_written_type_prints_as_an_annotation_that_lowers_back(
         #[case] annotation: &str,
         #[case] printed: &str,
