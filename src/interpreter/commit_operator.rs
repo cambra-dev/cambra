@@ -7004,11 +7004,9 @@ struct TransactionDriverState {
     /// The emitted rows — the attempts in flight, including superseded retries
     /// not yet reclaimed.
     ///
-    /// O(1), not O(retries): the writer releases everything below the position it
-    /// decides, so a superseded row is reclaimed on the next release rather than
-    /// waiting for the item to finish. The distinction matters because the body
-    /// re-renders this whole window each pull, so a window that grew with retries
-    /// would make a contended item quadratic.
+    /// At most [`MAX_LIVE_ATTEMPTS`] rows, because the drive emits no row into a full window.
+    /// The writer releases everything below the newest position on its driver slot, so a
+    /// superseded row leaves on the next release rather than at the item's finish.
     window: DriverWindow,
     /// `(item, frontier)` of the latest emit — the retry-suppression key. A row
     /// is a pure function of that pair, so re-emitting at an unchanged pair would
@@ -7018,17 +7016,14 @@ struct TransactionDriverState {
     source_released: Predicate,
 }
 
-/// The most rows this driver's live window may hold: the attempt the writer has
-/// decided, plus at most one newer row emitted since it decided.
+/// The most rows this driver's live window may hold. The driver emits no row into a full window,
+/// and the writer's supersession release frees the slot the next retry takes.
 ///
-/// This bound *is* the O(1) claim the writer's supersession release exists for,
-/// and it holds only because of it. Rows are added at most one per pull and only
-/// for one source item; they leave on the release intersection. The writer contributes
-/// two releases — everything below the position it decides (supersession) and
-/// `≤ attempt` when the item finishes (the ack) — and it is the first that caps
-/// the window. Drop it and the window instead holds one row per retry between
-/// acks: O(retries) rows retained and, because the body re-renders the whole
-/// window each pull, O(retries²) body rows evaluated.
+/// Rows are added at most one per pull and only for one source item; they leave on the release
+/// intersection. The writer contributes two releases: everything below the newest position on
+/// its driver slot (supersession), and `≤ attempt` when the item finishes (the ack). Without the
+/// bound the window would hold one row per retry: O(retries) rows retained and, because the body
+/// re-renders the whole window each pull, O(retries²) body rows evaluated.
 const MAX_LIVE_ATTEMPTS: usize = 2;
 
 impl TransactDriverProducer {
@@ -7072,9 +7067,8 @@ impl TransactDriverProducer {
         );
         debug_assert!(
             state.window.inner_row_count() <= MAX_LIVE_ATTEMPTS,
-            "the driver's live window holds {} attempts (bound {MAX_LIVE_ATTEMPTS}) — a \
-             superseded row is not being reclaimed, so a contended item costs O(retries) \
-             rows retained and O(retries²) body rows evaluated",
+            "the driver's live window holds {} attempts (bound {MAX_LIVE_ATTEMPTS}): a row was \
+             emitted into a full window",
             state.window.inner_row_count()
         );
     }
@@ -7182,11 +7176,17 @@ impl TransactDriverProducer {
 
         // The item in flight is emitted again at every new frontier until its decision commits:
         // a stale decision leaves its row in the window and its item in the source, and the
-        // frontier a retry reads is past the commit that made it stale.
+        // frontier a retry reads is past the commit that made it stale. A full window emits
+        // nothing ([`MAX_LIVE_ATTEMPTS`]). The writer holds a retry until its body or the store's
+        // progress delivers it, and the attempt the retry supersedes stays until the writer's
+        // next consume reads the retry. The next emit needs a later round: the scope queues one
+        // when an attempt makes progress (`CommitProducer::complete_attempt`), which a stale
+        // decision does.
         if let Some(path) = &next_item
             && let Some(frontier) = frontier
             && let pos = Position::new(path[0].clone())
             && state.latest_emit.as_ref() != Some(&(pos.clone(), frontier.clone()))
+            && state.window.inner_row_count() < MAX_LIVE_ATTEMPTS
         {
             #[cfg(test)]
             if state
@@ -7998,35 +7998,33 @@ struct InFlightProposal {
 ///
 /// The writer reads the driver slot and the body over the driver's positions. Both deliver each
 /// attempt's position, and a body with breakers in it delivers it in a later landing. The driver
-/// slot's delivery of a first attempt is held until the body delivers that position, so the
-/// writer does not consume before its body has a decision there. These pass on alone and mark
-/// their rows pending, together with any held rows:
+/// slot's delivery of an attempt is held until the body delivers that position, so the writer
+/// does not consume before its body has a decision there. Two driver deliveries pass on alone and
+/// mark their rows pending, together with any held rows:
 ///
-/// - a delivery while the writer has an attempt live ([`set_live`](Self::set_live)), which is a
-///   retry: the consume releases the attempt it supersedes;
-/// - a delivery while another row is held, which is also a retry of the held attempt;
+/// - a delivery while another row is held, which is a retry of the held attempt;
 /// - the store's progress, which reaches the driver slot widened to every row.
 ///
 /// The body releases a position without delivering it only after the writer released it as
-/// superseded, and the writer does that only in a consume a retry queued. So a held first attempt
-/// is announced by the body's delivery or passed on by its retry. A body delivery passes on at
-/// held rows and at rows neither held nor pending, which become pending. It is dropped at pending
-/// rows: their delivery queued the writer, or woke its scope, and the consume that follows reads
-/// the body there. The writer calls [`consumed`](Self::consumed) at the start of each consume,
-/// before it reads either input, so a delivery after that call passes on.
+/// superseded, which the writer does in a consume that reads a newer position on its driver slot.
+/// So a held attempt is announced by the body's delivery or passed on by its retry. Holding a
+/// retry leaves the attempt it supersedes live until the writer consumes, and the driver emits no
+/// further retry while those two fill its window (`MAX_LIVE_ATTEMPTS`). A body delivery passes on
+/// at held rows and at rows neither held nor pending, which become pending. It is dropped at
+/// pending rows: their delivery queued the writer, or woke its scope, and the consume that follows
+/// reads the body there. The writer calls [`consumed`](Self::consumed) at the start of each
+/// consume, before it reads either input, so a delivery after that call passes on.
 pub(crate) struct AttemptDeliveries {
     // shared-state-ok: what the writer's two input consumers and its consume have recorded since
-    // the last consume; what crosses it is predicates and a flag, never a tile.
+    // the last consume; what crosses it is predicates, never a tile.
     state: std::sync::Arc<std::sync::Mutex<Delivered>>,
 }
 
 struct Delivered {
     /// Positions whose delivery queued the writer, or woke its scope, since its last consume.
     pending: Predicate,
-    /// Positions of first attempts the driver slot delivered that wait for the body's delivery.
+    /// Positions the driver slot delivered that wait for the body's delivery.
     held: Predicate,
-    /// Whether the writer has an attempt live ([`AttemptDeliveries::set_live`]).
-    live: bool,
 }
 
 impl AttemptDeliveries {
@@ -8035,7 +8033,6 @@ impl AttemptDeliveries {
             state: std::sync::Arc::new(std::sync::Mutex::new(Delivered {
                 pending: Predicate::False,
                 held: Predicate::False,
-                live: false,
             })),
         }
     }
@@ -8067,15 +8064,6 @@ impl AttemptDeliveries {
         state.pending = Predicate::False;
         state.held = Predicate::False;
     }
-
-    /// Record whether the writer has an attempt live: at the end of each consume, and when the
-    /// store's commit-ack finishes the attempts in flight, before the ack releases the driver.
-    fn set_live(&self, live: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .live = live;
-    }
 }
 
 enum AttemptInput {
@@ -8086,7 +8074,7 @@ enum AttemptInput {
 struct AttemptConsumer {
     input: AttemptInput,
     // shared-state-ok: the [`AttemptDeliveries`] record this input's consumer shares with the
-    // other input's and with the writer; what crosses it is predicates and a flag, never a tile.
+    // other input's and with the writer; what crosses it is predicates, never a tile.
     state: std::sync::Arc<std::sync::Mutex<Delivered>>,
     consumer: Box<dyn Consumer>,
 }
@@ -8112,7 +8100,7 @@ impl Consumer for AttemptConsumer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let passed = match self.input {
-            AttemptInput::Driver => match state.live || !state.held.is_false() || delta.is_true() {
+            AttemptInput::Driver => match !state.held.is_false() || delta.is_true() {
                 true => {
                     state.pending = state.pending.union(&delta).union(&state.held);
                     state.held = Predicate::False;
@@ -8432,9 +8420,6 @@ impl Breaker for TransactWriterProducer {
             .get(state.driver_producer.tiling().universal_guard());
         state.driver_terminal = driver_tile.is_terminal();
         let newest = newest_body_position(&driver_tile);
-        // The driver's newest position stays live until the store commits its proposal: the
-        // supersession release below leaves it, and only the commit-ack releases it.
-        let live = newest.is_some();
         // The body can run while another writer commits. Its proposal must retain the
         // frontier captured by this attempt, never the frontier at proposal consumption.
         let snapshot = newest.as_ref().map(|position| {
@@ -8586,7 +8571,6 @@ impl Breaker for TransactWriterProducer {
             }
         }
         self.debug_assert_position_invariant(state);
-        self.deliveries.set_live(live);
         if state.driver_terminal && state.emitted.is_empty() {
             state
                 .body_producer
@@ -8712,6 +8696,9 @@ impl TileProducer for TransactWriterProducer {
             .filter(|(i, _)| pred.contains(&Value::UInt(state.committed_base + uint_of_row(*i))))
             .map(|(_, p)| p.attempt.clone())
             .max();
+        if let Some(pos) = ack {
+            self.ack_through(state, &pos);
+        }
         // Drop the released leading prefix and advance the window base. Releases
         // are prefixes (`at_or_below(step)`, accumulated across commits), so the
         // released positions form a run from `committed_base` up. Dropping frees
@@ -8726,12 +8713,6 @@ impl TileProducer for TransactWriterProducer {
         if drop > 0 {
             state.emitted.drain(0..drop);
             state.committed_base += uint_of_row(drop);
-        }
-        // Recorded before the ack releases the driver, which may then emit the next item's first
-        // attempt on another thread.
-        self.deliveries.set_live(!state.emitted.is_empty());
-        if let Some(pos) = ack {
-            self.ack_through(state, &pos);
         }
     }
 }
@@ -8885,12 +8866,11 @@ mod tests {
             assert_eq!(logged(&bodied), [rows(0, 0)], "row 1 is held, not passed");
         }
 
-        /// A retry passes on alone beside a held attempt or a live one, and takes the held
-        /// positions with it. The body is then cut to the positions not pending, and passes on
-        /// once the writer consumes.
+        /// A retry beside a held attempt passes on alone and takes the held position with it. The
+        /// body is then cut to the positions not pending.
         #[test]
-        fn a_retry_passes_and_takes_the_held_attempt() {
-            let (deliveries, driver, driven, body, bodied) = inputs();
+        fn a_retry_beside_a_held_attempt_passes_and_takes_it() {
+            let (_deliveries, driver, driven, body, bodied) = inputs();
             notify_for_test(&*driver, &rows(0, 0));
             notify_for_test(&*driver, &rows(1, 1));
             notify_for_test(&*body, &rows(0, 1));
@@ -8900,14 +8880,20 @@ mod tests {
                 [],
                 "the retry's package reads both positions"
             );
+        }
+
+        /// After a consume, a retry waits for the body like a first attempt, and the body's
+        /// delivery announces it together with the positions not pending.
+        #[test]
+        fn a_retry_after_a_consume_waits_for_the_body() {
+            let (deliveries, driver, driven, body, bodied) = inputs();
+            notify_for_test(&*driver, &rows(0, 0));
+            notify_for_test(&*body, &rows(0, 0));
             deliveries.consumed();
-            deliveries.set_live(true);
-            notify_for_test(&*driver, &rows(2, 2));
-            notify_for_test(&*body, &rows(2, 3));
-            deliveries.consumed();
-            notify_for_test(&*body, &rows(2, 2));
-            assert_eq!(logged(&driven), [rows(1, 1), rows(2, 2)]);
-            assert_eq!(logged(&bodied), [rows(3, 3), rows(2, 2)]);
+            notify_for_test(&*driver, &rows(1, 1));
+            notify_for_test(&*body, &rows(1, 2));
+            assert_eq!(logged(&driven), []);
+            assert_eq!(logged(&bodied), [rows(0, 0), rows(1, 2)]);
         }
 
         /// The store's progress reaches the driver slot widened to every position: it passes on
@@ -11348,6 +11334,72 @@ mod tests {
             "the committed item finishes the drive: {rows:?}"
         );
         assert_eq!(newest_body_position(&rows), None);
+    }
+
+    /// A drive whose window holds [`MAX_LIVE_ATTEMPTS`] rows emits no retry at a new frontier.
+    /// The release of the superseded row frees a slot, and the next pull emits the retry at the
+    /// frontier current then.
+    #[test]
+    fn a_full_window_emits_no_retry_until_a_release() {
+        use crate::interpreter::tile_operators::test_helpers::NotifyingOp;
+        let tiling = store_tiling(&["pool"]);
+        let mut engine = CommitEngine::new(balances(&[("pool", 100)]));
+        let (store, _, snapshot, _) =
+            NotifyingOp::scripted(engine.render_full_store_tile(&tiling), tiling.clone());
+        let driver = Arc::new(TransactDriver::new(
+            Arc::new(store),
+            Arc::new(ItemSource::new(&[-1])),
+            vec![acct("pool")],
+            vec![value_extent()],
+            value_extent(),
+            None,
+        ));
+        let mut driver = driver.clone().subscribe(
+            driver.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut SubscribeContext::new(),
+        );
+        let commit = |engine: &mut CommitEngine, at: u64| {
+            assert!(matches!(
+                engine.attempt(Proposal {
+                    snapshot: pos(at),
+                    reads: balances(&[("pool", 100 - at as i64)]),
+                    writes: balances(&[("pool", 99 - at as i64)])
+                }),
+                CommitOutcome::Committed { .. }
+            ));
+            *snapshot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                engine.render_full_store_tile(&tiling);
+        };
+        let attempts = |rows: &Tile| {
+            let Tile::DataFunction { domain, .. } = rows else {
+                panic!("attempt rows")
+            };
+            domain.len()
+        };
+        assert_eq!(
+            newest_body_position(&advance_drive(&mut driver)),
+            Some(pos(0))
+        );
+        commit(&mut engine, 0);
+        let rows = advance_drive(&mut driver);
+        assert_eq!(newest_body_position(&rows), Some(pos(1)));
+        assert_eq!(attempts(&rows), MAX_LIVE_ATTEMPTS);
+        commit(&mut engine, 1);
+        let rows = advance_drive(&mut driver);
+        assert_eq!(
+            newest_body_position(&rows),
+            Some(pos(1)),
+            "a full window emits no retry: {rows:?}"
+        );
+        driver.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::at_or_below(Value::UInt(0)),
+        )));
+        let rows = advance_drive(&mut driver);
+        assert_eq!(newest_body_position(&rows), Some(pos(2)));
+        assert_eq!(attempts(&rows), MAX_LIVE_ATTEMPTS);
     }
 
     /// Run `at` on the drive that `writer` reads through its driver slot.

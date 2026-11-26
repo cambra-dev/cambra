@@ -5458,14 +5458,16 @@ fn a_writer_with_body_breakers_consumes_once_per_item(
 }
 
 /// Two writers of one store over one live source, each with breakers in its body, contend: a
-/// writer's first attempts wait for its body, and its retries run on the driver alone, which
-/// releases the attempts they supersede. Each item is taken by the first writer whose `if` admits
-/// it, so the store ends at the same value in any order of commits.
+/// writer's first attempts and its retries wait for its body, and each decided retry releases the
+/// attempt it supersedes. Each item is taken by the first writer whose `if` admits it, so the
+/// store ends at the same value in any order of commits.
 #[rstest_log::rstest]
 fn contending_writers_with_body_breakers_retry(
     #[values(1, usize::MAX)] rows: usize,
     #[values(1, 4)] workers: usize,
 ) {
+    use crate::interpreter::commit_operator::RETRIES;
+    use crate::interpreter::dispatcher::transaction_scope::STALLS;
     let source = indoc! {"
         out = test_sink()
         pool: Mut(Int, Txn) := 1000
@@ -5488,6 +5490,8 @@ fn contending_writers_with_body_breakers_retry(
                 other => panic!("an item is an Int: {other:?}"),
             })
             .sum();
+        RETRIES.with(|retries| retries.set(0));
+        STALLS.with(|stalls| stalls.set(0));
         let (value, _) = dispatched_live_observed_on(source, rows, workers, batches, |_, _| {});
         let [binding] = value.as_function().as_slice() else {
             panic!("{source} writes one value: {value:?}")
@@ -5496,6 +5500,15 @@ fn contending_writers_with_body_breakers_retry(
             binding.output,
             Value::Int(1000 - 3 * items),
             "over {delivery}"
+        );
+        assert!(
+            RETRIES.with(std::cell::Cell::get) >= 1,
+            "a writer retried over {delivery}"
+        );
+        assert_eq!(
+            STALLS.with(std::cell::Cell::get),
+            0,
+            "no request parked over {delivery}"
         );
     }
 }

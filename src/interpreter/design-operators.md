@@ -1540,20 +1540,32 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   `a_commit_ack_reaches_the_drive_through_the_writers_body` in `commit_operator.rs` check that the
   writer issues both releases on its body.
 
-  **Each attempt's position queues the writer once.** Both inputs deliver each attempt's
-  position, and a body with breakers in it, such as the `Memo`s of an `if`'s arms, delivers it in
-  a later landing than the driver slot. The writer holds a first attempt's delivery from the
-  driver slot until the body delivers that position, so it does not consume before the body has a
-  decision there. A retry's delivery from the driver slot queues the writer alone, because the
-  consume releases the attempt the retry supersedes. The body releases a position without
-  delivering it only after that release, so a held first attempt is announced by its body or
-  passed on by its retry. A delivery at a position whose delivery already queued the writer, or
-  woke its scope, is dropped until the writer consumes. `AttemptDeliveries` in
-  `commit_operator.rs` keeps this record, and the writer's consume clears it before it reads
-  either input. `a_writer_with_body_breakers_consumes_once_per_item` checks one consume per item
-  on one worker and on four, and `contending_writers_with_body_breakers_retry` checks the retries.
+  **Each attempt's position queues the writer once.** Both inputs deliver each attempt's position,
+  and a body with breakers in it, such as the `Memo`s of an `if`'s arms, delivers it in a later
+  landing than the driver slot. The writer holds an attempt's delivery from the driver slot until
+  the body delivers that position, so it does not consume before the body has a decision there. A
+  retry's delivery passes on alone only while another attempt is held, and it takes the held one
+  with it. The body releases a position without delivering it only after the writer released it as
+  superseded, so a held attempt is announced by its body or passed on by its retry. A held retry
+  leaves the attempt it supersedes live until the writer next consumes, and the driver emits no row
+  into a window of `MAX_LIVE_ATTEMPTS` rows. The scope queues the next round when an attempt makes
+  progress (`CommitProducer::complete_attempt`), as a stale decision does, and that round's pull
+  emits the next retry. A delivery at a position whose delivery already queued the writer, or woke
+  its scope, is dropped until the writer consumes. `AttemptDeliveries` in `commit_operator.rs` keeps
+  this record, and the writer's consume clears it before it reads either input.
+  `a_writer_with_body_breakers_consumes_once_per_item` checks one consume per item on one worker and
+  on four, `contending_writers_with_body_breakers_retry` checks the retries, and
+  `a_full_window_emits_no_retry_until_a_release` checks the driver's bound.
 
-  **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the store has the item's decision": only the release of its newest live row is the ack, as a release from the body alone is not one.
+  **A release is not always an ack, though — supersession reclaims too.** The writer decides only
+  the driver's newest live position, so every older one is abandoned and is released immediately
+  rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the
+  driver's whole live window each pull, so a window that grew one row per retry would make K retries
+  cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`: the driver
+  emits no row into a full window, so the supersession release is what frees the slot the next retry
+  takes. It also means the driver cannot read "a row was released" as "the store has the item's
+  decision": only the release of its newest live row is the ack, as a release from the body alone is
+  not one.
 - **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it, in the tiling of `V` (`Tiling::from_extent`), so a collection-valued key arrives as a level, as every store read hands it out. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_read`, an induction accumulator's trailing read. It samples through `store_current` at the store's closure, so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. It reads the store whole and cuts the settled value and its completeness to the requested output keys. Without enclosing rows, a partial output release hides those keys while retaining the store slot. A universal release retires it and releases the store slot; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream, commit time ⇀ `V`, out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
 - **`RekeySorted` / `RekeySortedProducer`** (`tile_operators/rekey_sorted.rs`) — re-keys a collection of pairs by each pair's first component, `𝐾 ⇀ (𝐽, 𝑉)` to `𝐽 ⇀ 𝑉`, for an input whose new keys are distinct: the `map` constructor's re-keying, with completeness passing through. No CCL term names it. Op-conversion builds it for every reply tap of a commit store, a `with begin():` block's value among them ([mutability.md](../ccl/design/mutability.md#replies-ride-their-transaction), "Replies ride their transaction"): the tap's `StoreValueStream` holds `(item position, value)` at each commit, the `TransactWriter` having paired the value with the position the `TransactDriver`'s row carries (`F_ITEM_POSITION`), and a site commits each item once. `KeyOrder::of_items` reads the order a site commits in off its source's positions. Over a stream, whose `UInt` positions are delivered in their own order, the keys rise with the commit ticks (`KeyOrder::Rising`): once the input is complete through a position, the output is complete through the key carried there, so an item's value is final at its commit rather than when the source ends. That prefix is spelled over the output's domain, the pairs' first component's extent. Any other source's keys come in any order (`KeyOrder::Any`): a product's positions are a record, a concatenation's a union, and a keyed collection's keys arrive as their groups complete, so a site over one commits its items as they arrive: the output is complete at the keys of the rows in the continuous prefix of positions the input states complete, and everywhere once the input completes, and the answer is sorted by key. Its input release is exact, above a gap as well: a direct input read releases the position of each row whose key its consumer released, and a consuming read releases each position it consumed. Completeness is separate from that release. Under either key order it reads only the rows in the continuous prefix of positions the input states complete, so a key above a gap waits for the gap to close although its position may already be released. Under `KeyOrder::Rising`, keys that do not rise stop it with a panic in every build.
