@@ -689,8 +689,8 @@ boundary and is rejected.
 
 `operator_conversion::fusable_prefix` reads each `Compose` chain at every position where an input
 operator exists. It takes the longest prefix that is a function of the input column built from
-`id`, projections, closed constants (a literal, or a tuple or record of them), binary and unary
-scalar builtins, and `zip`s of such chains, and converts it to
+`id`, projections, closed constants (a literal, or a tuple, record or variant of them), binary and
+unary scalar builtins, `variant_wrap`, and `zip`s of such chains, and converts it to
 `MapResult(input, Constant(FunctionDef::Scalar(program)))` (`interpreter/scalar_expr.rs`,
 `fuse_prefix`). The program is a straight-line sequence of instructions over slots, so a value that
 two operations read is computed once, and a field path is read from the input as one slice. The
@@ -699,22 +699,31 @@ or intermediate pair. A prefix is taken only when it holds at least two operatio
 composition count as none, a `zip` as two, and every other element as one. A `zip` alone meets the
 count, so `(x, x)` and the one-field `(a=x)` fuse. A lone unary operation keeps its own conversion,
 since it is one operator either way. A comparison of two records, `==` or `!=`, is read as one
-comparison per field both records carry, joined by `and` or `or`. Each record is read from the
-input, a constant, or built by a `zip` in the prefix. A record against a non-record, two records
-with no field in common, and an ordering of records have no program, and the prefix ends before
-them.
+comparison per field both records carry, joined by `and` or `or`. A field whose compared values
+hold only `unit` is equal at every row, so it is left out. Each record is read from the input, a
+constant, or built by a `zip` in the prefix. A record against a non-record, two records whose
+shared fields all hold only `unit`, and an ordering of records have no program, and the prefix
+ends before them.
+
+A ``variant_wrap(`𝑐)`` or a variant constant yields a union column with the one arm `𝑐`, which
+holds every row. An absent arm reads as an empty one, so the program builds no other arm. A union
+with an arm that holds a collection is a union of tiles, not a column, so its wrap and its
+constants stay operators. The union's extent comes from the node's codomain
+(`OpConversionContext::extent_of`), since the payload names only its own arm. No operation reads a
+variant, so the prefix ends before a comparison of two variants or a `variant_project`.
 
 The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
 a store read, or a constant that is not closed stays an operator. Conversion also declines when
 the input is a bare product, whose fields are tiles, or when its values at the current level hold
-a collection, since neither is a column.
+a collection, since neither is a column. An input column of base values, records and unions is
+taken. A chain over it reads base fields and copies union fields.
 
 Of the prefixes the parse reads, conversion takes the longest that ends at an operation or at a
 `zip`. A prefix that ends at a `zip` yields one column of records, `Tiling::Scalar` of a record
 extent, with a field per arm: `_0`, `_1`, … for a tuple and the arm's name for a record. An arm
 that is itself a `zip` is a column of records inside it. An arm that reads a record from the input,
 or is a record constant, is the record column of its base fields, copied or repeated block by
-block. A field of `Unit` type has no column to read, so a product holding one is not taken. The
+block. A `Unit` field is a `Units` column, and a union field read from the input is copied. The
 `Zip` path yields a record of tiles where the fused map yields a column of records, which is the
 tiling `Tiling::from_extent` gives a record of base values. A projection reads either layout
 (`selects_a_tile`). `Converse` inverts only a column. A `groupby` keyed by a product that fuses,

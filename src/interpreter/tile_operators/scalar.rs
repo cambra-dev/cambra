@@ -282,11 +282,11 @@ fn guard_depth(g: &TileGuard) -> usize {
     }
 }
 
-/// Wrap a dense `payload` column at the `tag` arm: that arm owns every row and
-/// every other arm is present but empty — which is what keeps the column total
-/// over `variant_extents`' tags, so a downstream merge or append has an arm to
-/// pair with. The partition invariant (`rows` covering `0..n` exactly) is
-/// re-checked here rather than assumed.
+/// Wrap a dense `payload` column at the `tag` arm: that arm owns every row, and every
+/// other arm of `variant_extents` is present and empty. An absent arm reads as an empty
+/// one ([`ColumnValue::Union`]), so the empty arms only keep the column total over the
+/// extent's tags. The partition invariant (`rows` covering `0..n` exactly) is re-checked
+/// here rather than assumed.
 fn wrap_variant_column(
     payload: ColumnValue,
     tag: &FieldKey,
