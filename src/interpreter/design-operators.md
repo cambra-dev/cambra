@@ -1279,18 +1279,17 @@ constructor is the last instruction or a field or payload of a later constructor
 build only the result (`ScalarProgram::constructors_build_only_the_result`). A variant constant is
 recognized as the `Wrap` of its payload.
 
-`==` and `!=` are expanded during recognition (`Parser::comparison`). Two records compare the
-fields selected by `binop::compared_fields`, joining the results with `and` for `==` or `or` for
-`!=`. Two variants of one tag compare their payloads, so the program builds no union for them. A
-record inside a payload compares the fields its extent names, as one at the top level does.
-`binop::equal_rows`, which compares two union columns unfused, compares whole values instead, so it
-also reads a field that width subtyping left in a column. Two `unit` values are
-equal at every row, and two variants of different tags differ at every row, so their comparison is
-decided while parsing. A decided field drops out of the join when its answer is the join's identity
-(`true` under `and`, `false` under `or`), and decides the whole comparison otherwise. A comparison
-decided as a whole computes no column, so it has no program. Operands may be input records,
-constants, or products and variants constructed in the chain. A union read from the input is
-compared by no program.
+`==` and `!=` are expanded during recognition (`Parser::comparison`). Two records compare the fields
+selected by `binop::compared_fields`, joining the results with `and` for `==` or `or` for `!=`. Two
+variants of one tag compare their payloads, so the program builds no union for them. A record inside
+a payload compares the fields its extent names, as one at the top level does. `binop::equal_rows`,
+which compares two union columns unfused, compares the fields both values carry
+(`binop::compared_fields`). Two `unit` values are equal at every row, and two variants of different
+tags differ at every row, so their comparison is decided while parsing. A decided field drops out of
+the join when its answer is the join's identity (`true` under `and`, `false` under `or`), and
+decides the whole comparison otherwise. A comparison decided as a whole computes no column, so it
+has no program. Operands may be input records, constants, or products and variants constructed in
+the chain. A union read from the input is compared by no program.
 
 Equal instructions share one slot: `Parser::emit` returns the slot of an equal `Input`, `Const`,
 `Bin` or `Un` emitted before, so a path read twice, a constant written twice, and an operation

@@ -2141,6 +2141,64 @@ mod tests {
         );
     }
 
+    /// The fused and unfused comparisons agree on a record payload whose column carries a field its
+    /// type does not name. The input is typed `{a: Int}`, but its column carries a surplus field
+    /// `w`, as width subtyping can leave one. ``p ≫ variant_wrap(`r)`` against `` `r((a: 3)) ``
+    /// compares `a` alone: fused over the fields the extent names, unfused over the fields both
+    /// values carry. The same union nested in a record field compares the same way unfused.
+    #[test]
+    fn a_surplus_payload_field_is_compared_by_neither_path() {
+        let a_ty = Type::Record(vec![("a".into(), Type::Base(BaseType::Int))]);
+        let r_ty = Type::variant(vec![(tag("r"), a_ty.clone())]);
+        let a = record_of_extents(vec![("a", int())]);
+        let r = Extent::Union(TagMap::from_arms(vec![(tag("r"), a.clone())]));
+        let literal = Expr::new(TypedExprNode::Record(vec![RecordEntry::new(
+            "a",
+            Occurrence::mint(),
+            Expr::lit(Lit::Int(3)),
+        )]));
+        let three = Expr::apply(
+            Expr::variant_ctor("r", Occurrence::mint(), literal),
+            Expr::builtin(Builtin::Const),
+        )
+        .with_ty(Type::fun(a_ty.clone(), r_ty.clone()));
+        let rows = 4;
+        let records = |a: Vec<i64>, w: Option<Vec<i64>>| {
+            let mut fields = HashMap::from([(SmolStr::from("a"), ColumnValue::Ints(a))]);
+            if let Some(w) = w {
+                fields.insert("w".into(), ColumnValue::Ints(w));
+            }
+            ColumnValue::Records(fields)
+        };
+        let wide = records(vec![1, 3, 5, 3], Some(vec![7; rows]));
+        let union = |payloads| {
+            let arm = UnionArm::new((0..rows).collect(), payloads);
+            ColumnValue::Union(TagMap::from_arms(vec![(tag("r"), arm)]))
+        };
+        for (kind, want) in [
+            (CompareKind::Equals, vec![false, true, false, true]),
+            (CompareKind::NotEquals, vec![true, false, true, false]),
+        ] {
+            let op = BinOpKind::Compare(kind);
+            let chain = vec![
+                zip(vec![
+                    wrap_into("r", a_ty.clone(), r_ty.clone()),
+                    three.clone(),
+                ]),
+                binop(op),
+            ];
+            let fused = fuse_typed(&chain, &a, &[(r_ty.clone(), r.clone())])
+                .expect("the payloads are compared");
+            assert_eq!(bools(fused.program.eval(&wide)), want, "fused {kind:?}");
+            let threes = union(records(vec![3; rows], None));
+            let unfused = apply_binop_column(op.into(), &union(wide.clone()), &threes);
+            assert_eq!(bools(unfused), want, "unfused {kind:?}");
+            let field = |column| ColumnValue::Records(HashMap::from([("u".into(), column)]));
+            let nested = apply_binop_column(op.into(), &field(union(wide.clone())), &field(threes));
+            assert_eq!(bools(nested), want, "unfused in a record field {kind:?}");
+        }
+    }
+
     /// An operation written twice is computed once: `(x + 1, x + 1)`, written as two arms, computes
     /// `x + 1` once and holds the constant `1` once.
     #[test]
