@@ -721,16 +721,26 @@ mod tests {
         let record = matches!(target, TestBreaker::RecordMemoReleasing);
         let field = |key| if key == 0 { "left" } else { "right" };
         let record_tiling = Tiling::Record(
-            ["left", "right"]
-                .map(|name| (name.into(), Tiling::Scalar(Extent::Base(BaseType::Int))))
-                .into(),
+            [
+                ("left".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                ("right".into(), two_levels_of_ints().1),
+            ]
+            .into(),
         );
         let releasing = matches!(target, TestBreaker::NestedMemoReleasing);
         let nested = matches!(target, TestBreaker::NestedMemo) || releasing;
         let point = |key| Predicate::point(Value::UInt(key));
         let claim = |key| {
             if record {
-                Projection::of_field(field(key), Projection::Everything).guard(&record_tiling)
+                let part = if key == 0 {
+                    Projection::Everything
+                } else {
+                    Projection::keys_at(
+                        crate::interpreter::CurryLevel::new(1),
+                        Predicate::qualified(point(1), point(2)),
+                    )
+                };
+                Projection::of_field(field(key), part).guard(&record_tiling)
             } else if nested {
                 let inner = if key == 0 {
                     point(0).union(&point(1))
@@ -748,16 +758,14 @@ mod tests {
             inner: match target {
                 TestBreaker::RecordMemoReleasing => {
                     let tile = Tile::record(
-                        [("left", 11), ("right", 22)]
-                            .map(|(name, value)| {
-                                (
-                                    name.into(),
-                                    Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![
-                                        value,
-                                    ])),
-                                )
-                            })
-                            .into(),
+                        [
+                            (
+                                "left".into(),
+                                Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![11])),
+                            ),
+                            ("right".into(), two_levels_of_ints().0),
+                        ]
+                        .into(),
                     );
                     Box::new(ProjectionSpy::new(tile, record_tiling.clone()).0)
                 }
@@ -854,12 +862,12 @@ mod tests {
                     panic!("expected a record")
                 };
                 assert_eq!(
-                    fields[field(key)],
-                    Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![if key == 0 {
+                    fields[field(key)].deepest_values(),
+                    &Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![if key == 0 {
                         11
                     } else {
-                        22
-                    }]))
+                        12
+                    }])),
                 );
                 assert!(fields[field(1 - key)].is_empty());
             } else if nested {
