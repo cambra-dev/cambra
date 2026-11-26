@@ -276,7 +276,7 @@ pub(super) struct ScopeSteps {
 struct StepGroup {
     scopes: Vec<LocalSteps>,
     // shared-state-ok: one claimant chooses the next step among connected scopes at a time.
-    choosing: Mutex<()>,
+    next: Mutex<usize>,
 }
 
 impl ScopeSteps {
@@ -372,7 +372,7 @@ impl ScopeSteps {
             }
             steps.groups.push(StepGroup {
                 scopes: connected,
-                choosing: Mutex::default(),
+                next: Mutex::default(),
             });
         }
         steps
@@ -394,7 +394,7 @@ impl StepGroup {
         if let [scope] = &self.scopes[..] {
             return scope.poll(dispatcher, true);
         }
-        let Ok(_choosing) = self.choosing.try_lock() else {
+        let Ok(mut next) = self.next.try_lock() else {
             return false;
         };
         // Publish every body's held output before choosing a step. A queued or running
@@ -411,9 +411,13 @@ impl StepGroup {
         {
             return published;
         }
-        self.scopes
-            .iter()
-            .any(|scope| scope.try_queue_step(dispatcher))
+        for index in (*next..self.scopes.len()).chain(0..*next) {
+            if self.scopes[index].try_queue_step(dispatcher) {
+                *next = (index + 1) % self.scopes.len();
+                return true;
+            }
+        }
+        false
     }
 }
 

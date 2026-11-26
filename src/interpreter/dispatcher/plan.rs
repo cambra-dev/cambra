@@ -3936,6 +3936,73 @@ mod tests {
     }
 
     #[test]
+    fn workers_rotate_connected_scopes_while_an_independent_scope_advances() {
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![], vec![0, 2], vec![]], 1);
+        let mut execution = Execution::new(&[None, None, None, None, None], &mut dispatcher);
+        let mut runs = ScopeRuns::new();
+        for roots in [&[0, 1][..], &[2], &[3], &[4]] {
+            let (store, run) = two_writer_run();
+            for (writer, (root, body)) in roots.iter().zip(run.writers).enumerate() {
+                runs.install_transaction(&store, writer, body);
+                execution.attach_transaction(&store, writer, PipelineId(*root), &mut dispatcher);
+            }
+        }
+        let steps = execution.scope_steps(&dispatcher);
+        let guard = crate::interpreter::tile_operators::test_helpers::keys_between(0, 0);
+        let controls: Vec<_> = (0..5)
+            .map(|id| {
+                let scope = execution.request_scope(PipelineId(id));
+                let Scope::Writer { phase, store, .. } = scope else {
+                    unreachable!()
+                };
+                *phase.lock().unwrap() = WriterPhase::Attempt {
+                    request: None,
+                    guard: guard.clone(),
+                    queued_at: 0,
+                };
+                (store.clone(), scope.with_body(|body| body.attached().step))
+            })
+            .collect();
+        // The connected writer has claimed a driver package against the current snapshot.
+        let driver = execution
+            .request_scope(PipelineId(1))
+            .with_body(|body| body.global(body.driver));
+        dispatcher.queue_for(driver, &guard);
+        let package = dispatcher.claim_of(driver).expect("the writer's driver");
+        let running = controls[0].0.write();
+        assert!(steps.poll(&dispatcher));
+        assert_eq!(dispatcher.outstanding(controls[4].1), 1);
+        drop(running);
+        while steps.poll(&dispatcher) {}
+        assert!(
+            controls[..4]
+                .iter()
+                .all(|(_, step)| dispatcher.outstanding(*step) == 0),
+            "a connected decision would advance the driver's snapshot"
+        );
+        dispatcher.acknowledge(package);
+        // Keep every writer eligible. Each connected writer gets a turn before any repeats.
+        let mut winners = Vec::new();
+        for _ in 0..4 {
+            while steps.poll(&dispatcher) {}
+            let eligible: Vec<_> = (0..4)
+                .filter(|&id| dispatcher.outstanding(controls[id].1) != 0)
+                .collect();
+            assert_eq!(eligible.len(), 1);
+            let id = eligible[0];
+            assert!(
+                !winners.contains(&id),
+                "a ready writer repeated before a peer ran"
+            );
+            winners.push(id);
+            let step = dispatcher
+                .claim_of(controls[id].1)
+                .expect("the admitted step");
+            dispatcher.acknowledge(step);
+        }
+    }
+
+    #[test]
     fn a_parked_writer_wakes_on_peer_progress_and_an_older_attempt_retries() {
         use crate::interpreter::tile_operators::test_helpers::keys_between;
 
