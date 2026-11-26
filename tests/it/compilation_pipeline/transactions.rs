@@ -5884,7 +5884,7 @@ fn a_function_ending_in_a_valued_block_is_refused(#[case] code: &str) {
 /// The function's value bound from its block, and a block ending in a feed, compile.
 #[test]
 fn a_function_ending_in_a_bound_block_value_or_a_feed() {
-    check_sink(
+    crate::it::differential::check_dispatched_outcomes(
         indoc! {"
             pool: Mut(Int, Txn) := 100
             out = test_sink()
@@ -5900,7 +5900,10 @@ fn a_function_ending_in_a_bound_block_value_or_a_feed() {
             out << take(10)
             spend(20)
         "},
-        "[`out<<(()) -> 90, `spend()/spend.out<<(0) -> 70]",
+        &[
+            "[`out<<(()) -> 90, `spend()/spend.out<<(0) -> 70]",
+            "[`out<<(()) -> 70, `spend()/spend.out<<(0) -> 80]",
+        ],
     );
 }
 
