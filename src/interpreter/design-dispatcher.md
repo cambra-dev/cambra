@@ -428,7 +428,7 @@ or parks. A writer's final attempt retries a stale item at the new frontier befo
 A writer runs attempts for one request at a time. Each active attempt owns its guard and the
 epoch at which it was queued. At finish, a final attempt observes source completion. Once that
 attempt settles, the writer enters `Draining`, closes its inner sources and step, and continues
-to release their followers. When all those pipelines have finished, the coordinator finishes the
+to release their followers. When the step finishes, its claimant finishes the
 writer's request pipeline exactly once.
 Run cleanup removes the transaction metadata and its placements, as it does for loop scopes.
 Transaction control retains no dispatcher handle and constructs no additional producer instances.
@@ -470,11 +470,11 @@ A scope queues an offered request only once every pipeline its pipeline reads is
 drive pulls its source through, which a worker may still consume. A request begun before they have
 would find no position and run a closing round over positions the drive emits later.
 
-After the loop's requests settle, its finish closes the body's sources. The coordinator publishes
-held output and releases followers while the body drains. Once every inner pipeline has finished,
-the coordinator closes the step's arrivals. When the step finishes, the coordinator publishes the
-store's final output and completes the request pipeline. Run cleanup discards scheduling state and
-placements while preserving the store's values and releases.
+After the loop's requests settle, the request finish closes the body's sources and the step's
+arrivals. The step reads every body member, so its queue closes only after all their final pushes
+have landed. The worker claiming the step's finish publishes the store's final output, completes
+the request pipeline, and removes the body's placements. Run cleanup preserves the store's values
+and releases.
 
 Nested rounds use projections naming full paths. An operator pulled inside a round at a level it
 does not restate is pulled at the nearest level above that it restates, and its answer is cut to
@@ -557,8 +557,8 @@ such a breaker reads (`order_inputs_of_ordered_breakers`). So do a loop's store 
 pipeline it reads, transitively: a loop runs its positions in order and takes a request none of
 whose positions is next as one that only closes absent positions, so its input is published in
 position order, one package in flight per pipeline. The store's step reads the body and seeds no
-ordering, so the body is not ordered by this. Control scopes, a sink whose input has no ordered
-keys, and shapes without independent position projections keep their coordinator handlers.
+ordering. Scope handlers and serial chains execute one package at a time on any worker. A sink
+whose input has no ordered keys runs on the coordinator.
 
 A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
 `TestSink` merges them in arrival order and reads the merged value in key order
@@ -577,11 +577,8 @@ consumed input through the existing producer chain.
 
 ### Who claims what
 
-A chain or sink pipeline is **admitted** when all of these hold:
-
-- It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
-  loop's or transaction writer's body. A sink is admitted only where its packages run at once.
-- Its packages run at once, or no scope's pipeline reads it.
+Workers can claim packages and finishes for every chain in the program and inside a scope.
+A sink is admitted when its packages can run concurrently over ordered keys.
 
 A pipeline's packages run beside each other where its breaker consumes concurrently and its input is
 keyed by ordered keys (`consumes_at_once`). A breaker consumes concurrently unless it opts out
@@ -593,18 +590,17 @@ it restates, and the answer is cut to the keys asked for (`TileProducer::get`). 
 a projection, which a debug build asserts. A package runs beside the pipeline's others except where
 its guard overlaps a package in flight.
 
-A pipeline admitted for the second reason alone is **serial**: the planner orders it, so one package
-of it is in flight at a time, on any thread. A worker runs the finish of every admitted pipeline no
-scope's pipeline reads. A push into a scope's pipeline offers the scope requests, which the
-coordinator queues after the consume or finish that pushed them, so a serial chain read directly
-by a scope stays on the coordinator. A loop's drive source offers through its entry instead
-(`CompletionTarget`); the coordinator's resume pass queues what it offered.
+The planner orders an admitted serial chain so only one of its packages is in flight at a time.
+After a chain publishes, its claimant asks each scope that reads it directly to admit its pending
+requests. A busy scope retries during settlement. When a scope's arrivals close with its reads,
+the dispatcher counts each upstream finish after its pushes have landed. The last read therefore
+delivers its final offers before the scope closes its intake.
 
 With more than one worker, two kinds of claimant share the dispatcher:
 
-- A worker thread claims packages of admitted breaker and scope pipelines, including transaction
-  seeds. It can finish a seed even when writer scopes read it. It sleeps in `Dispatcher::wait`
-  when no claim or scope can advance.
+- A worker thread claims packages and finishes of admitted breakers, requests, steps, and seeds.
+  A request's finish starts the drain. The step's finish publishes the scope's final output.
+  The worker sleeps in `Dispatcher::wait` when no claim or scope can advance.
 - The coordinator claims any package and any finish (`WorkerPool::next`). A claim of an
   admitted pipeline runs as a worker's would (`WorkerPool::consume_on_coordinator`,
   `WorkerPool::finish_on_coordinator`). It also runs the shared settlement pass
@@ -651,8 +647,8 @@ pipeline has finished, the run has failed, or the run is quiescent. A coordinato
 `Next::Wait` goes on in this order:
 
 1. It first gives independent scopes a chance to advance. While a worker can still publish, or an
-   admitted breaker can run, it sleeps in `Dispatcher::wait`. A worker registers a package claim
-   under its queue lock. A retained scope request may span several claims and idle intervals.
+   admitted breaker can run, it sleeps in `Dispatcher::wait`. A worker registers activity before taking a package or finish and releases it after publication.
+   A retained request or a draining scope may span several claims and idle intervals.
 2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
    the routine answers that the run is quiescent. A run with no live source panics. A live run

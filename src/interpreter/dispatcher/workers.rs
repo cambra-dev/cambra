@@ -42,16 +42,11 @@ impl WorkerBreaker {
     }
 }
 
-/// A pipeline the workers may run: its breaker, whether its packages run beside each other, and
-/// whether a worker runs its finish.
+/// A breaker the workers can run and whether they may consume its packages concurrently.
 pub(super) struct WorkerTarget {
     pub(super) handle: WorkerBreaker,
     /// Whether packages run beside each other: the breaker consumes concurrently over keyed input.
     pub(super) concurrent: bool,
-    /// Whether the workers consume the pipeline although its packages do not run beside each
-    /// other, one package at a time, and run its finish: no scope's pipeline reads it, so no
-    /// consume or finish of it offers a scope requests.
-    pub(super) serial: bool,
 }
 
 /// An admitted pipeline's breaker and whether its packages run beside each other.
@@ -60,8 +55,6 @@ struct Spec {
     /// Whether its packages run beside each other ([`WorkerTarget::concurrent`]); otherwise they
     /// are consumed one at a time, in queue order.
     concurrent: bool,
-    /// Whether a worker runs the pipeline's finish.
-    finishes: bool,
     /// For a pipeline of a loop's or transaction writer's body, the body's follower hold, which a
     /// claim holds again before it is acknowledged.
     body: Option<HoldGroup>,
@@ -80,6 +73,20 @@ struct Stats {
     /// One bit per worker that consumed a claim of the pipeline.
     used: AtomicU64,
     incremental: AtomicUsize,
+}
+
+/// Count execution until the worker has published and polled. A scope request
+/// may stay in the dispatcher's finishing phase after this claim returns.
+struct ActiveClaim<'a> {
+    busy: &'a AtomicUsize,
+    dispatcher: &'a Dispatcher,
+}
+
+impl Drop for ActiveClaim<'_> {
+    fn drop(&mut self) {
+        self.busy.fetch_sub(1, Ordering::SeqCst);
+        self.dispatcher.wake_claimants();
+    }
 }
 
 /// The run's worker threads, and which pipelines they claim from.
@@ -133,15 +140,10 @@ impl WorkerPool {
                     debug_assert!(target.is_none());
                     return Some(WorkerPipeline::Scope(action));
                 }
-                let WorkerTarget {
-                    handle,
-                    concurrent,
-                    serial,
-                } = target?;
-                (concurrent || serial).then_some(WorkerPipeline::Breaker(Spec {
+                let WorkerTarget { handle, concurrent } = target?;
+                Some(WorkerPipeline::Breaker(Spec {
                     target: handle,
                     concurrent,
-                    finishes: serial,
                     body,
                 }))
             })
@@ -173,16 +175,6 @@ impl WorkerPool {
         self.threaded()
             && !self.unstarted.load(Ordering::SeqCst)
             && self.pipelines[pipeline.0].is_some()
-    }
-
-    /// Whether `pipeline`'s finish is the workers' to claim.
-    pub(super) fn finishes(&self, pipeline: PipelineId) -> bool {
-        self.admits(pipeline)
-            && match &self.pipelines[pipeline.0] {
-                Some(WorkerPipeline::Breaker(spec)) => spec.finishes,
-                Some(WorkerPipeline::Scope(ScopePipeline::Seed(..))) => true,
-                _ => false,
-            }
     }
 
     /// The admitted pipelines whose packages do not run beside each other, which the run orders
@@ -233,29 +225,32 @@ impl WorkerPool {
 
     /// Reserve a seed's store only after its package or finish is ready. A busy
     /// store leaves the work available and the claimant continues scanning.
+    fn reserve_seed(&self, id: PipelineId) -> Result<Option<ReservedSeed<'_>>, ()> {
+        match &self.pipelines[id.0] {
+            Some(WorkerPipeline::Scope(ScopePipeline::Seed(store, input))) => {
+                Ok(Some(ReservedSeed {
+                    store: store.try_write()?,
+                    input: *input,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn next(
         &self,
         dispatcher: &Dispatcher,
-        preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: &dyn Fn(PipelineId) -> bool,
-        claimed: &dyn Fn(),
+        admits: &dyn Fn(PipelineId) -> bool,
     ) -> (Next, Option<ReservedSeed<'_>>) {
-        dispatcher.try_claim_with(
-            preferred,
-            takes,
-            finishes,
-            &|id| match &self.pipelines[id.0] {
-                Some(WorkerPipeline::Scope(ScopePipeline::Seed(store, input))) => {
-                    Some(Some(ReservedSeed {
-                        store: store.try_write().ok()?,
-                        input: *input,
-                    }))
-                }
-                _ => Some(None),
-            },
-            claimed,
-        )
+        dispatcher.try_claim_with(None, admits, &|id| self.reserve_seed(id).ok())
+    }
+
+    fn active_claim<'a>(&'a self, dispatcher: &'a Dispatcher) -> ActiveClaim<'a> {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        ActiveClaim {
+            busy: &self.busy,
+            dispatcher,
+        }
     }
 
     /// One worker's claims: consume, publish and acknowledge each package of an admitted pipeline.
@@ -267,15 +262,11 @@ impl WorkerPool {
             let _worker = dispatcher.worker();
             let mut preferred = None;
             loop {
-                let (next, mut reserved) = self.next(
-                    dispatcher,
-                    preferred,
-                    &|pipeline| self.admits(pipeline),
-                    &|pipeline| self.finishes(pipeline),
-                    &|| {
-                        self.busy.fetch_add(1, Ordering::SeqCst);
-                    },
-                );
+                let (next, (mut reserved, _activity)) =
+                    dispatcher.try_claim_with(preferred, &|p| self.admits(p), &|p| {
+                        let seed = self.reserve_seed(p).ok()?;
+                        Some((seed, Some(self.active_claim(dispatcher))))
+                    });
                 let mut reach_seed = |_: PipelineId, call: &mut Call<'_>| {
                     reserved
                         .take()
@@ -291,17 +282,10 @@ impl WorkerPool {
                         while self.poll(dispatcher) {}
                         #[cfg(test)]
                         self.collect_counters();
-                        // A coordinator asleep because this package was in flight wakes to see the
-                        // claim ended, whether or not the acknowledgement advanced the generation.
-                        self.busy.fetch_sub(1, Ordering::SeqCst);
-                        dispatcher.wake_claimants();
                     }
                     Next::Finish { pipeline } => {
-                        self.busy.fetch_add(1, Ordering::SeqCst);
                         self.finish(dispatcher, pipeline, &mut reach_seed);
                         while self.poll(dispatcher) {}
-                        self.busy.fetch_sub(1, Ordering::SeqCst);
-                        dispatcher.wake_claimants();
                     }
                     Next::Done | Next::Failed => break,
                     Next::Wait(generation) => {
@@ -366,11 +350,9 @@ impl WorkerPool {
     ) {
         #[cfg(test)]
         self.count_claim(dispatcher, &package, 0);
-        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _activity = self.active_claim(dispatcher);
         dispatcher.wake_claimants();
         self.consume(dispatcher, package, reach);
-        self.busy.fetch_sub(1, Ordering::SeqCst);
-        dispatcher.wake_claimants();
     }
 
     /// [`finish`](Self::finish) on the coordinator, waking the claimants after as a worker
@@ -381,8 +363,18 @@ impl WorkerPool {
         pipeline: PipelineId,
         reach: &mut Reach<'_>,
     ) {
+        let _activity = self.active_claim(dispatcher);
         self.finish(dispatcher, pipeline, reach);
-        dispatcher.wake_claimants();
+    }
+
+    /// Offers from the upstream breaker have landed. A scope with other reads
+    /// still running keeps its offers until those reads publish or settlement retries.
+    fn admit_readers(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
+        for &reader in &dispatcher.infos[pipeline.0].readers {
+            if let Some(WorkerPipeline::Scope(action)) = &self.pipelines[reader] {
+                action.admit_after_read(dispatcher, PipelineId(reader));
+            }
+        }
     }
 
     /// Consume `package` under the breaker's handle held shared, publish the pipeline under it
@@ -397,10 +389,10 @@ impl WorkerPool {
             WorkerPipeline::Breaker(spec) => spec,
         };
         let target = &spec.target;
-        if !spec.concurrent {
+        let pushes = if !spec.concurrent {
             // One package at a time, under the handle held exclusively, as on the coordinator
             // (`consume_with`).
-            let pushes = target.write(|breaker| {
+            target.write(|breaker| {
                 debug_assert!(
                     package
                         .guard
@@ -418,49 +410,42 @@ impl WorkerPool {
                         pushes.push_final(producer);
                         pushes
                     })
-            });
-            if let Some(pushes) = pushes {
-                dispatcher.land(pushes);
-            }
-            if let Some(body) = &spec.body {
-                dispatcher.hold_followers(*body);
-            }
-            dispatcher.acknowledge(package);
-            return;
-        }
-        // A package beside others names its region exactly: every pusher queues a projection of
-        // its reader's input.
-        debug_assert!(
-            Projection::of(&package.guard).is_ok(),
-            "pipeline {} runs a package beside others that names no projection: {:?}",
-            pipeline.0,
-            package.guard
-        );
-        target.read(|breaker| {
+            })
+        } else {
+            // A package beside others names its region exactly: every pusher queues a projection of
+            // its reader's input.
             debug_assert!(
-                package
-                    .guard
-                    .check_from(&breaker.input_tiling(InputId::ONLY)),
-                "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
+                Projection::of(&package.guard).is_ok(),
+                "pipeline {} runs a package beside others that names no projection: {:?}",
                 pipeline.0,
                 package.guard
             );
-            breaker.consume_impl(InputId::ONLY, package.guard.clone());
-        });
-        // Exclusive, so the push sees no consume between the merge of its rows and the release of
-        // its input, which the readers it wakes rely on. A breaker that publishes only at its
-        // finish or in the resume pass pushes nothing here, as on the coordinator
-        // (`consume_with`).
-        let pushes = target.write(|breaker| {
-            breaker
-                .as_producer()
-                .filter(|producer| producer.pushes_while_consuming())
-                .map(|producer| {
-                    let mut pushes = dispatcher.pushes(pipeline);
-                    pushes.push_final(producer);
-                    pushes
-                })
-        });
+            target.read(|breaker| {
+                debug_assert!(
+                    package
+                        .guard
+                        .check_from(&breaker.input_tiling(InputId::ONLY)),
+                    "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
+                    pipeline.0,
+                    package.guard
+                );
+                breaker.consume_impl(InputId::ONLY, package.guard.clone());
+            });
+            // Exclusive, so the push sees no consume between the merge of its rows and the release of
+            // its input, which the readers it wakes rely on. A breaker that publishes only at its
+            // finish or in the resume pass pushes nothing here, as on the coordinator
+            // (`consume_with`).
+            target.write(|breaker| {
+                breaker
+                    .as_producer()
+                    .filter(|producer| producer.pushes_while_consuming())
+                    .map(|producer| {
+                        let mut pushes = dispatcher.pushes(pipeline);
+                        pushes.push_final(producer);
+                        pushes
+                    })
+            })
+        };
         if let Some(pushes) = pushes {
             dispatcher.land(pushes);
         }
@@ -471,6 +456,7 @@ impl WorkerPool {
             dispatcher.hold_followers(*body);
         }
         dispatcher.acknowledge(package);
+        self.admit_readers(dispatcher, pipeline);
     }
 
     /// Finish `pipeline`, whose finish this worker claimed: release a parallel input whole, then
@@ -478,10 +464,13 @@ impl WorkerPool {
     fn finish(&self, dispatcher: &Dispatcher, pipeline: PipelineId, reach: &mut Reach<'_>) {
         let spec = match &self.pipelines[pipeline.0] {
             Some(WorkerPipeline::Breaker(spec)) => spec,
-            Some(WorkerPipeline::Scope(ScopePipeline::Seed(..))) => {
-                return finish_with(dispatcher, reach, pipeline);
+            Some(WorkerPipeline::Scope(scope)) => {
+                if let Some(published) = scope.finish(dispatcher, pipeline, reach) {
+                    self.admit_readers(dispatcher, published);
+                }
+                return;
             }
-            _ => unreachable!("a worker finishes an admitted breaker or a seed"),
+            None => unreachable!("a worker finishes an admitted pipeline"),
         };
         let mut reach = |reached: PipelineId, call: &mut Call<'_>| {
             debug_assert_eq!(
@@ -496,6 +485,7 @@ impl WorkerPool {
         // No follower hold, unlike a consume: the finish lands everything the breaker completed,
         // and a hold taken once the scope's body is inactive is never released.
         finish_with(dispatcher, &mut reach, pipeline);
+        self.admit_readers(dispatcher, pipeline);
     }
 
     /// Join the workers, and resume a worker's panic on this thread.
@@ -516,11 +506,10 @@ impl WorkerPool {
     pub(super) fn may_progress(&self, dispatcher: &Dispatcher) -> bool {
         self.threaded()
             && !self.unstarted.load(Ordering::SeqCst)
-            && (self.busy.load(Ordering::SeqCst) > 0
-                || dispatcher.may_claim_where(&|pipeline| {
-                    matches!(self.pipelines[pipeline.0], Some(WorkerPipeline::Breaker(_)))
-                })
-                || dispatcher.may_finish_where(&|pipeline| self.finishes(pipeline)))
+            && (dispatcher.may_claim_where(&|pipeline| {
+                matches!(self.pipelines[pipeline.0], Some(WorkerPipeline::Breaker(_)))
+            }) || dispatcher.may_finish_where(&|pipeline| self.admits(pipeline))
+                || self.busy.load(Ordering::SeqCst) > 0)
     }
 
     /// Before the coordinator finishes an admitted pipeline, release its input whole.

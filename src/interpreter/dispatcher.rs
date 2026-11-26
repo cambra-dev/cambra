@@ -810,6 +810,13 @@ impl Dispatcher {
         }
     }
 
+    /// For a scope that closes its own arrivals after its reads, the extra arrival
+    /// is the last count once every upstream finish has landed its final pushes.
+    fn only_arrivals_remain(&self, pipeline: PipelineId) -> bool {
+        debug_assert!(self.infos[pipeline.0].arrivals);
+        self.states[pipeline.0].unfinished.load(Ordering::Acquire) == 1
+    }
+
     /// Count one feed of `reader`'s queue finished: a pipeline it reads, or the end of
     /// its arrivals. The last of them closes the queue.
     ///
@@ -1246,8 +1253,7 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_with(preferred, &|_| true, &|_| true, &|_| Some(()), &|| {})
-            .0
+        self.try_claim_with(preferred, &|_| true, &|_| Some(())).0
     }
 
     /// A successful reservation stays with its claim. A losing finish drops its reservation
@@ -1255,10 +1261,8 @@ impl Dispatcher {
     fn try_claim_with<R: Default>(
         &self,
         preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: &dyn Fn(PipelineId) -> bool,
+        admits: &dyn Fn(PipelineId) -> bool,
         reserve: &dyn Fn(PipelineId) -> Option<R>,
-        claimed: &dyn Fn(),
     ) -> (Next, R) {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
@@ -1274,16 +1278,13 @@ impl Dispatcher {
             self.state(preferred);
         }
         let scan = preferred.map(|p| p.0).into_iter().chain(0..count);
-        if let Some((package, reservation)) = scan.filter(|&p| takes(PipelineId(p))).find_map(|p| {
-            self.claim_from(p, || {
-                let reservation = reserve(PipelineId(p))?;
-                claimed();
-                Some(reservation)
-            })
-        }) {
+        if let Some((package, reservation)) = scan
+            .filter(|&p| admits(PipelineId(p)))
+            .find_map(|p| self.claim_from(p, || reserve(PipelineId(p))))
+        {
             return (Next::Package(package), reservation);
         }
-        for p in (0..count).filter(|&p| finishes(PipelineId(p))) {
+        for p in (0..count).filter(|&p| admits(PipelineId(p))) {
             if let Some(reservation) = self.try_begin_finish(p, || reserve(PipelineId(p))) {
                 return (
                     Next::Finish {
@@ -1335,12 +1336,12 @@ impl Dispatcher {
         !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
     }
 
-    /// Whether a pipeline `finishes` admits is finishing, or may begin to: a claimant restricted to
-    /// those finishes may still change the run.
+    /// A worker registers activity before claiming a finish. A request already
+    /// finishing can be waiting for its body and needs the shared settlement pass.
     pub(crate) fn may_finish_where(&self, finishes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| finishes(PipelineId(p)))
-            .any(|p| self.states[p].phase.load() == Phase::Finishing || self.ready_to_finish(p))
+            .any(|p| self.ready_to_finish(p))
     }
 
     /// Whether the generation has advanced past `generation`: something changed that can make a
@@ -2802,6 +2803,50 @@ fn finish_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, pipeline: Pipelin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_read_counts_as_finished_for_intake_only_after_its_last_push_lands() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        struct LastPush {
+            reader: PipelineId,
+        }
+        impl Consumer for LastPush {
+            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
+                let Target::Queue { dispatcher, .. } = &landing.target else {
+                    unreachable!()
+                };
+                assert!(
+                    dispatcher.infos[self.reader.0]
+                        .reads
+                        .iter()
+                        .all(|&p| dispatcher.states[p].phase.load() == Phase::Finished)
+                );
+                assert!(!dispatcher.only_arrivals_remain(self.reader));
+                landing.queue(self.reader, &keys_between(0, 0));
+            }
+        }
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], 1);
+        let reader = PipelineId(2);
+        dispatcher.take_arrivals(reader);
+        for p in [PipelineId(0), PipelineId(1)] {
+            dispatcher.close(p);
+            dispatcher.begin_finish(p);
+        }
+        dispatcher.finish(dispatcher.pushes(PipelineId(0)));
+        let mut pushes = dispatcher.pushes(PipelineId(1));
+        pushes.push(&keys_between(0, 0), |guard, _| vec![guard.clone()]);
+        pushes.to = Some(Arc::new(LastPush { reader }));
+        dispatcher.finish(pushes);
+        assert!(dispatcher.only_arrivals_remain(reader));
+        dispatcher.close(reader);
+        let package = dispatcher
+            .claim_of(reader)
+            .expect("the last push is claimable");
+        assert!(!dispatcher.ready_to_finish(reader.0));
+        dispatcher.acknowledge(package);
+        assert!(dispatcher.ready_to_finish(reader.0));
+    }
+
     /// A chain of diamonds: each layer's two pipelines read the one below, and the pipeline
     /// above reads both. A path of reads to the bottom doubles at each layer, and a quiescence
     /// check of the top reads each pipeline once.

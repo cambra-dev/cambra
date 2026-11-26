@@ -851,11 +851,7 @@ fn run_targets(
             && !members.reads[pipeline].is_empty()
             && !arrivals[pipeline]
         {
-            if !dispatcher.takes_arrivals(pipeline) {
-                dispatcher.take_arrivals(PipelineId(pipeline));
-            }
-            // Registered in pipeline order for lookup from a finished dependency's readers.
-            execution.closes_on_reads.push(PipelineId(pipeline));
+            execution.close_on_reads(&mut dispatcher, PipelineId(pipeline));
         }
     }
     for (pipeline, guard) in &start_regions {
@@ -866,77 +862,16 @@ fn run_targets(
             dispatcher.queue_for(*pipeline, guard);
         }
     }
-    let local_steps = execution.local_steps(&dispatcher, workers);
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
     };
-    let worker_targets: Vec<Option<WorkerBreaker>> = execution
-        .handlers
-        .iter()
-        .enumerate()
-        .map(|(pipeline, handler)| match handler {
-            Handler::Root => match &members.located[pipeline] {
-                Located::Chain(handle) => Some(WorkerBreaker::Chain(handle.clone())),
-                Located::Sink(sink) => Some(WorkerBreaker::Sink(sink_breakers[*sink].clone())),
-                _ => None,
-            },
-            Handler::Body(handle) => Some(WorkerBreaker::Chain(handle.clone())),
-            _ => None,
-        })
-        .collect();
-    // A push into a scope's pipeline offers the scope requests, which the coordinator queues after
-    // the consume or the finish that pushed them (`Execution::consume`, `Execution::finish`), so
-    // a serial chain read directly by a scope stays on the coordinator. A loop's drive source offers
-    // through its entry instead (`CompletionTarget`), which no scope reads: a worker may run it,
-    // and the coordinator's resume pass queues what it offered (`Scope::resume`).
-    let mut read_by_scope = vec![false; execution.handlers.len()];
-    for (pipeline, handler) in execution.handlers.iter().enumerate() {
-        if matches!(handler, Handler::Request(_)) {
-            for &read in &dispatcher.infos[pipeline].reads {
-                read_by_scope[read] = true;
-            }
-        }
-    }
-    let worker_targets = worker_targets
-        .into_iter()
-        .zip(read_by_scope)
-        .map(|(target, read_by_scope)| {
-            target.and_then(|handle| {
-                let concurrent = match &handle {
-                    WorkerBreaker::Chain(chain) => {
-                        let chain = chain.read().unwrap_or_else(PoisonError::into_inner);
-                        chain.as_producer().is_some() && consumes_at_once(&*chain)
-                    }
-                    WorkerBreaker::Sink(sink) => {
-                        // A sink is the workers' only where its packages run at once: one handed
-                        // a package at a time stays on the coordinator.
-                        if !consumes_at_once(&*sink.read().unwrap_or_else(PoisonError::into_inner))
-                        {
-                            return None;
-                        }
-                        true
-                    }
-                };
-                Some(WorkerTarget {
-                    concurrent,
-                    serial: !read_by_scope,
-                    handle,
-                })
-            })
-        })
-        .collect();
     order_inputs_of_ordered_breakers(&mut dispatcher, &mut reach, &execution.steps());
-    let workers = WorkerPool::new(
-        workers,
-        worker_targets,
-        execution.bodies_by_pipeline(),
-        execution.scope_pipelines(),
-        local_steps,
-    );
-    for pipeline in workers.serial() {
-        dispatcher.order(pipeline);
-    }
+    let workers = execution.worker_pool(&mut dispatcher, workers, |p| match &members.located[p] {
+        Located::Chain(handle) => Some(WorkerBreaker::Chain(handle.clone())),
+        Located::Sink(sink) => Some(WorkerBreaker::Sink(sink_breakers[*sink].clone())),
+        _ => None,
+    });
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher);
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
@@ -1194,8 +1129,8 @@ impl Execution {
             pipeline,
             dispatcher,
         );
-        // A loop's step is closed by its scope once the last round's step is queued
-        // (`LoopSchedule::close_step`).
+        // The loop ends step arrivals when its requests finish. Body dependencies
+        // keep the step's queue open until their final publications have landed.
         dispatcher.take_arrivals(step);
         // A drive's source offers its pushes only to a scope that takes its positions from them,
         // which the run sets once its scopes are attached.
@@ -1266,6 +1201,55 @@ impl Execution {
             .collect()
     }
 
+    pub(super) fn worker_pool(
+        &self,
+        dispatcher: &mut Dispatcher,
+        count: usize,
+        root: impl Fn(usize) -> Option<WorkerBreaker>,
+    ) -> WorkerPool {
+        let targets = self
+            .handlers
+            .iter()
+            .enumerate()
+            .map(|(p, handler)| {
+                let target = match handler {
+                    Handler::Root => root(p)?,
+                    Handler::Body(handle) => WorkerBreaker::Chain(handle.clone()),
+                    _ => return None,
+                };
+                let concurrent = match &target {
+                    WorkerBreaker::Chain(handle) => {
+                        let chain = handle.read().unwrap_or_else(PoisonError::into_inner);
+                        chain.as_producer().is_some() && consumes_at_once(&*chain)
+                    }
+                    WorkerBreaker::Sink(handle) => {
+                        if !consumes_at_once(
+                            &*handle.read().unwrap_or_else(PoisonError::into_inner),
+                        ) {
+                            return None;
+                        }
+                        true
+                    }
+                };
+                Some(WorkerTarget {
+                    handle: target,
+                    concurrent,
+                })
+            })
+            .collect();
+        let workers = WorkerPool::new(
+            count,
+            targets,
+            self.bodies_by_pipeline(),
+            self.scope_pipelines(),
+            self.local_steps(dispatcher, count),
+        );
+        for pipeline in workers.serial() {
+            dispatcher.order(pipeline);
+        }
+        workers
+    }
+
     fn local_steps(&self, dispatcher: &Dispatcher, workers: usize) -> ScopeSteps {
         if workers < 2 {
             return ScopeSteps::default();
@@ -1282,8 +1266,15 @@ impl Execution {
     fn scope_pipelines(&self) -> Vec<Option<ScopePipeline>> {
         self.handlers
             .iter()
-            .map(|handler| match handler {
-                Handler::Request(scope) => Some(ScopePipeline::Request(scope.clone())),
+            .enumerate()
+            .map(|(id, handler)| match handler {
+                Handler::Request(scope) => Some(ScopePipeline::Request {
+                    scope: scope.clone(),
+                    closes_on_reads: self
+                        .closes_on_reads
+                        .binary_search_by_key(&id, |p| p.0)
+                        .is_ok(),
+                }),
                 Handler::Step(id) => {
                     let Handler::Request(scope) = &self.handlers[id.0] else {
                         unreachable!("a scope owner")
@@ -1347,7 +1338,9 @@ impl Execution {
     ) {
         match &self.handlers[pipeline.0] {
             Handler::Request(scope) => scope.begin_finish(dispatcher),
-            Handler::Step(_) => dispatcher.finish(dispatcher.pushes(pipeline)),
+            Handler::Step(owner) => {
+                self.request_scope(*owner).finish_step(dispatcher, pipeline);
+            }
             Handler::Root | Handler::Body(_) | Handler::Seed(..) => {
                 self.queue_scope_requests(dispatcher);
                 finish_with(dispatcher, reach, pipeline);
@@ -1405,10 +1398,18 @@ impl Execution {
         true
     }
 
+    pub(super) fn close_on_reads(&mut self, dispatcher: &mut Dispatcher, pipeline: PipelineId) {
+        if !dispatcher.takes_arrivals(pipeline.0) {
+            dispatcher.take_arrivals(pipeline);
+        }
+        // Registered in pipeline order for lookup from a finished dependency's readers.
+        self.closes_on_reads.push(pipeline);
+    }
+
     /// Close the pipeline of each scope that reads no live source and every one of whose reads has
     /// finished, once the scope has queued what was offered and no position waits for inputs
-    /// ([`Body::queue_offered`](loop_scope::Body::queue_offered)). A read may be another scope's
-    /// pipeline, which finishes on the resume pass, so the pass checks too. A scope a live source
+    /// ([`Body::queue_offered`](loop_scope::Body::queue_offered)). This retries admission that
+    /// found the scope busy when the last read published. A scope a live source
     /// feeds closes when that source completes (`close_requests`). Whether it queued or closed
     /// anything.
     fn close_scopes_reading(&self, dispatcher: &Dispatcher) -> bool {
@@ -1420,11 +1421,9 @@ impl Execution {
     }
 
     fn close_after_reads(&self, dispatcher: &Dispatcher, id: PipelineId) -> bool {
-        if !dispatcher.infos[id.0]
-            .reads
-            .iter()
-            .all(|&read| dispatcher.states[read].phase.load() == Phase::Finished)
-        {
+        // Each dependency counts down after its final pushes land. The scope owns
+        // the last count (its arrivals) until all offers have been admitted.
+        if !dispatcher.only_arrivals_remain(id) {
             return false;
         }
         self.request_scope(id).try_queue_requests(dispatcher, true)
@@ -1512,7 +1511,7 @@ impl Execution {
         workers: &WorkerPool,
     ) -> Claimed {
         loop {
-            let (next, mut reserved) = workers.next(dispatcher, None, &|_| true, &|_| true, &|| {});
+            let (next, mut reserved) = workers.next(dispatcher, &|_| true);
             let mut claim_reach = |id: PipelineId, call: &mut Call<'_>| {
                 if let Some(seed) = reserved.take() {
                     seed.reach(call);
@@ -1525,7 +1524,7 @@ impl Execution {
                     workers.consume_on_coordinator(dispatcher, package, &mut claim_reach)
                 }
                 Next::Package(package) => self.consume(dispatcher, &mut claim_reach, package),
-                Next::Finish { pipeline } if workers.finishes(pipeline) => {
+                Next::Finish { pipeline } if workers.admits(pipeline) => {
                     workers.finish_on_coordinator(dispatcher, pipeline, &mut claim_reach)
                 }
                 Next::Finish { pipeline } => {
@@ -3826,15 +3825,7 @@ mod tests {
         dispatcher.close(seed);
         dispatcher.close(peer);
 
-        let next = || {
-            workers.next(
-                &dispatcher,
-                None,
-                &|p| workers.admits(p),
-                &|p| workers.finishes(p),
-                &|| {},
-            )
-        };
+        let next = || workers.next(&dispatcher, &|p| workers.admits(p));
         let transition = store.write();
         let (Next::Finish { pipeline }, Some(peer_claim)) = next() else {
             panic!("a busy seed package leaves the peer finish claimable");

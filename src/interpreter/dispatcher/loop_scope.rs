@@ -42,8 +42,7 @@ enum LoopPhase {
     #[default]
     New,
     Running,
-    DrainingBody,
-    DrainingStep,
+    Draining,
     Finished,
 }
 
@@ -103,25 +102,7 @@ impl LoopSchedule {
     }
 
     fn publishing(&self) -> bool {
-        self.has_request()
-            || matches!(
-                self.phase,
-                LoopPhase::DrainingBody | LoopPhase::DrainingStep
-            )
-    }
-
-    pub(super) fn close_step(&mut self, body: &Body, dispatcher: &Dispatcher) -> bool {
-        if self.phase != LoopPhase::DrainingBody
-            || !body
-                .pipelines()
-                .iter()
-                .all(|id| dispatcher.states[id.0].phase.load() == Phase::Finished)
-        {
-            return false;
-        }
-        dispatcher.close(body.attached().step);
-        self.phase = LoopPhase::DrainingStep;
-        true
+        self.has_request() || self.phase == LoopPhase::Draining
     }
 
     pub(super) fn take_finish(
@@ -129,7 +110,7 @@ impl LoopSchedule {
         body: &Body,
         dispatcher: &Dispatcher,
     ) -> Option<PipelineId> {
-        if self.phase != LoopPhase::DrainingStep {
+        if self.phase != LoopPhase::Draining {
             return None;
         }
         let pipeline = body.finished_pipeline(dispatcher)?;
@@ -428,12 +409,6 @@ impl Body {
         }
     }
 
-    /// The inner pipelines and the step.
-    fn with_step(&self) -> impl Iterator<Item = PipelineId> + use<> {
-        let step = self.attached().step;
-        self.pipelines().into_iter().chain(std::iter::once(step))
-    }
-
     /// Place each inner pipeline's entries at its global id, except a source's. Whether this call
     /// activated the body: it does so once.
     pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
@@ -502,10 +477,9 @@ impl Body {
 
     /// The scope pipeline once all its inner pipelines and its step have finished.
     pub(super) fn finished_pipeline(&self, dispatcher: &Dispatcher) -> Option<PipelineId> {
-        let pipeline = self.attachment()?.pipeline;
-        self.with_step()
-            .all(|id| dispatcher.states[id.0].phase.load() == Phase::Finished)
-            .then_some(pipeline)
+        let attached = self.attachment()?;
+        (dispatcher.states[attached.step.0].phase.load() == Phase::Finished)
+            .then_some(attached.pipeline)
     }
 
     /// Call `call` with the breaker of the inner pipeline `local`.
@@ -884,8 +858,9 @@ impl InductionStoreProducer {
         );
         self.activate(dispatcher);
         let body = &mut self.run_mut().body;
-        schedule.phase = LoopPhase::DrainingBody;
+        schedule.phase = LoopPhase::Draining;
         body.close_sources(dispatcher);
+        dispatcher.close(body.attached().step);
     }
 
     /// Place local entries for a planning probe; attached execution keeps global entries live.
@@ -1517,6 +1492,10 @@ mod tests {
 
     impl Compiled {
         fn of(source: &str) -> Self {
+            Self::over(source, Dispatcher::new(vec![vec![]], usize::MAX))
+        }
+
+        fn over(source: &str, mut dispatcher: Dispatcher) -> Self {
             let mut ctx = GlobalContext::default();
             let _sink = ctx.register_test_sink("out");
             let loaded = LoadedProgram::test(source);
@@ -1538,9 +1517,10 @@ mod tests {
             let mut runs = ScopeRuns::new();
             let scope = planner.build_scope(0, usize::MAX, &mut runs);
             induction(&scope).begin_run();
-            let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
             dispatcher.order(PipelineId(0));
-            let execution = Execution::new(&[Some(scope.clone())], &mut dispatcher);
+            let mut scopes = vec![None; dispatcher.infos.len()];
+            scopes[0] = Some(scope.clone());
+            let execution = Execution::new(&scopes, &mut dispatcher);
             Self {
                 _runs: runs,
                 _program: program,
@@ -1676,6 +1656,66 @@ mod tests {
         assert_eq!(compiled.dispatcher.outstanding(PipelineId(0)), 1);
         compiled.drain_request();
         assert!(compiled.snapshot().is_terminal());
+        assert_eq!(compiled.value(), Value::Int(6));
+    }
+
+    #[test]
+    fn a_worker_runs_a_serial_feeder_and_finishes_its_dependent_loop() {
+        use crate::interpreter::{
+            BaseType, ColumnValue,
+            tile_operators::{MemoProducer, test_helpers::ProjectionSpy},
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // A scalar feeder has one package. Its publication offers the three positions
+        // of SUM. Only the background worker may claim, including both scope finishes.
+        struct OfferRows(Offers);
+        impl Consumer for OfferRows {
+            fn notify(&self, _: &Projection, _: &mut Landing<'_>) {
+                self.0.lock().unwrap().offer(keys_between(0, 2));
+            }
+        }
+        let request = PipelineId(0);
+        let feeder = PipelineId(1);
+        let mut compiled = Compiled::over(
+            SUM,
+            Dispatcher::new(vec![vec![feeder.0], vec![]], usize::MAX),
+        );
+        compiled
+            .execution
+            .close_on_reads(&mut compiled.dispatcher, request);
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let (input, _, _) =
+            ProjectionSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+        let mut memo = MemoProducer::over(Box::new(input), &tiling);
+        memo.base_mut().downstream = Some(Arc::new(OfferRows(
+            induction(&compiled.scope).body_mut().offers.clone(),
+        )));
+        let handle: BreakerHandle = Arc::new(RwLock::new(memo));
+        let workers = compiled
+            .execution
+            .worker_pool(&mut compiled.dispatcher, 2, |p| {
+                assert_eq!(p, feeder.0);
+                Some(workers::WorkerBreaker::Chain(handle.clone()))
+            });
+        let dispatcher = &compiled.dispatcher;
+        assert!(dispatcher.infos[feeder.0].ordered);
+        dispatcher.notify(feeder, &tiling.universal_guard());
+        dispatcher.close(feeder);
+        thread::scope(|threads| {
+            let handles = workers.spawn(threads, dispatcher);
+            let (done, result) = mpsc::channel();
+            threads.spawn(move || {
+                workers::WorkerPool::join(handles);
+                let _ = done.send(());
+            });
+            let completed = result.recv_timeout(Duration::from_secs(5));
+            dispatcher.stop_claims();
+            completed.expect("the worker drains the scope without a coordinator finish claim");
+        });
+        assert!(dispatcher.states[request.0].phase.load() == Phase::Finished);
+        assert!(!induction(&compiled.scope).body_mut().is_active());
         assert_eq!(compiled.value(), Value::Int(6));
     }
 

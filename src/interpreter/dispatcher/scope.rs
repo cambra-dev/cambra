@@ -157,31 +157,15 @@ impl Scope {
         }
     }
 
-    /// Advance a scope the coordinator found waiting: finish its pipeline once the inner
-    /// pipelines have, or publish what they hold and let their followers run. Whether anything
-    /// changed.
-    pub(super) fn resume(
-        &self,
-        dispatcher: &Dispatcher,
-        reach: &mut Reach<'_>,
-        child_active: impl Fn(PipelineId) -> bool,
-    ) -> bool {
-        let mut progressed = false;
-        if let Scope::Loop { store, .. } = self {
-            progressed |= induction(store).initialize_seed();
-        }
-        // A scope's requests reach the scope, which queues them once they can run.
-        if self.queue_requests(dispatcher) {
-            return true;
-        }
+    /// The step reads every body member. Its unique finish claimant also
+    /// publishes the enclosing request's final output after the body has drained.
+    pub(super) fn finish_step(&self, dispatcher: &Dispatcher, step: PipelineId) -> PipelineId {
+        dispatcher.finish(dispatcher.pushes(step));
         let finished = match self {
             Scope::Loop { store, schedule } => {
                 let mut schedule = scope_state(schedule);
                 let mut store = induction(store);
                 let body = store.body_mut();
-                if schedule.close_step(body, dispatcher) {
-                    return true;
-                }
                 schedule.take_finish(body, dispatcher)
             }
             Scope::Writer {
@@ -195,9 +179,25 @@ impl Scope {
                     .take_finish(&mut phase, dispatcher)
             }
         };
-        if let Some(pipeline) = finished {
-            finish_with(dispatcher, reach, pipeline);
-            self.with_body(|body| body.unplace());
+        let request = finished.expect("a closed step finishes its draining scope");
+        finish_with(dispatcher, &mut |_, call| self.reach(call), request);
+        self.with_body(|body| body.unplace());
+        request
+    }
+
+    /// Admit pending requests and publish what the body holds during shared settlement.
+    pub(super) fn resume(
+        &self,
+        dispatcher: &Dispatcher,
+        reach: &mut Reach<'_>,
+        child_active: impl Fn(PipelineId) -> bool,
+    ) -> bool {
+        let mut progressed = false;
+        if let Scope::Loop { store, .. } = self {
+            progressed |= induction(store).initialize_seed();
+        }
+        // A scope's requests reach the scope, which queues them once they can run.
+        if self.queue_requests(dispatcher) {
             return true;
         }
         // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
@@ -286,12 +286,49 @@ impl Scope {
 
 /// An ordered scope pipeline that any worker may claim.
 pub(super) enum ScopePipeline {
-    Request(Arc<Scope>),
+    Request {
+        scope: Arc<Scope>,
+        closes_on_reads: bool,
+    },
     Step(Arc<Scope>),
     Seed(StoreCell, InputId),
 }
 
 impl ScopePipeline {
+    pub(super) fn admit_after_read(&self, dispatcher: &Dispatcher, reader: PipelineId) {
+        if let Self::Request {
+            scope,
+            closes_on_reads,
+        } = self
+        {
+            scope.try_queue_requests(
+                dispatcher,
+                *closes_on_reads && dispatcher.only_arrivals_remain(reader),
+            );
+        }
+    }
+
+    /// The pipeline whose final publication landed. A request starts draining;
+    /// its step makes the final publication once its body has finished.
+    pub(super) fn finish(
+        &self,
+        dispatcher: &Dispatcher,
+        pipeline: PipelineId,
+        reach: &mut Reach<'_>,
+    ) -> Option<PipelineId> {
+        match self {
+            Self::Request { scope, .. } => {
+                scope.begin_finish(dispatcher);
+                None
+            }
+            Self::Step(scope) => Some(scope.finish_step(dispatcher, pipeline)),
+            Self::Seed(..) => {
+                finish_with(dispatcher, reach, pipeline);
+                Some(pipeline)
+            }
+        }
+    }
+
     pub(super) fn consume(
         &self,
         dispatcher: &Dispatcher,
@@ -299,7 +336,7 @@ impl ScopePipeline {
         reach: &mut Reach<'_>,
     ) {
         match self {
-            Self::Request(scope) => scope.begin(dispatcher, package),
+            Self::Request { scope, .. } => scope.begin(dispatcher, package),
             Self::Step(scope) => scope.step(dispatcher, package),
             Self::Seed(..) => consume_with(dispatcher, reach, package),
         }
