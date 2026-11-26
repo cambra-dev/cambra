@@ -199,7 +199,8 @@ impl Breaker for SinkBreaker {
             }
             return;
         }
-        let answer = merged.unwrap_or(rest);
+        // Packages merge in the order they finish, so the answer is put in key order once, here.
+        let answer = merged.unwrap_or(rest).in_key_order();
         debug_assert!(
             answer.is_terminal(),
             "a `main` output is handed a terminal answer at its finish"

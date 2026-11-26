@@ -4721,7 +4721,12 @@ fn a_checked_lookup_at_keys_off_a_source_in_a_writing_block() {
     let mut producer = crate::it::serving::ProgramRunner::new(compiled);
     let mut result = producer.run();
     result.compact();
-    assert_eq!(result, reply_stream(&[0, 1, 2], &[10, 0, 10]));
+    // The live `main` output hands each package's answer as it lands, so the rows arrive in
+    // package order.
+    assert_eq!(
+        result.in_key_order(),
+        reply_stream(&[0, 1, 2], &[10, 0, 10])
+    );
 }
 
 /// A checked lookup answers against its own transaction's snapshot: the first transaction's
