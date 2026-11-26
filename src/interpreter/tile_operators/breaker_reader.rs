@@ -28,6 +28,13 @@ struct BreakerReader {
 impl TileProducer for BreakerReader {
     impl_producer_base!();
 
+    fn reads_record_fields(&self) -> bool {
+        self.handle
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reads_record_fields()
+    }
+
     fn get(&self, guard: TileGuard) -> Tile {
         #[cfg(debug_assertions)]
         pull_levels::check_input_level(pull_levels::address_of(self), || self.name(), &guard);

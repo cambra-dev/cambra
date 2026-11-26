@@ -1708,10 +1708,50 @@ impl MemoProducer {
 }
 
 impl MemoProducer {
+    /// An exact field pull carries its own publication delta. The input cache can serve
+    /// independent fields concurrently. Serialize only the merge with local reclamation.
+    fn consume_fields(
+        &self,
+        guard: TileGuard,
+        projection: &Projection,
+        pushes: Option<&mut Pushes<'_>>,
+    ) {
+        let mut answer = self.input.get(guard);
+        let released = answer.to_guard();
+        answer.compact();
+        let held = {
+            let mut cache = self
+                .cached_tile
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let obsolete = self.obsolete_guard();
+            if !obsolete.is_empty() {
+                answer.remove_guarded(obsolete);
+                answer.compact();
+                // A release can remove the last selected field from a row.
+                answer.restrict_to(projection, self.tiling());
+            }
+            let held = answer.to_guard();
+            if !held.is_empty() {
+                cache.merge(answer);
+            }
+            held
+        };
+        self.input.release(released);
+        if let Some(pushes) = pushes.filter(|p| p.has_readers()) {
+            let remaining = guard_minus(&held, &self.obsolete_guard());
+            pushes.push_region(self, &remaining, |part, _| vec![part.clone()]);
+        }
+    }
+
     /// Merge the input answer and release it before the dispatcher can land this claim's pushes.
     fn consume_input(&self, guard: TileGuard, pushes: Option<&mut Pushes<'_>>) {
         assert!(guard.check_from(self.input.tiling()));
         let projection = guard.projection_for(self);
+        if projection.row_fields().is_some() && self.input.reads_record_fields() {
+            self.consume_fields(guard, &projection, pushes);
+            return;
+        }
         let _reading = self
             .reading_input
             .read()
@@ -1975,6 +2015,10 @@ fn position_closure(tile: &Tile, tiling: &Tiling) -> Option<Predicate> {
 }
 
 impl Breaker for MemoProducer {
+    fn reads_input_fields(&self) -> bool {
+        self.input.reads_record_fields()
+    }
+
     /// A consume caches the answer and releases what it states ([`MemoProducer::consume_input`]).
     ///
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller asks
@@ -2069,6 +2113,12 @@ impl BreakingProducer for MemoProducer {
 }
 
 impl TileProducer for MemoProducer {
+    fn reads_record_fields(&self) -> bool {
+        matches!(self.tiling(), Tiling::DataFunction { codomain, .. }
+            if matches!(&**codomain, Tiling::Record(fields)
+                if fields.values().all(|t| matches!(t, Tiling::Scalar(_)))))
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(
             self.cached_tile
@@ -2113,7 +2163,15 @@ impl TileProducer for MemoProducer {
             .cached_tile
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        cache.remove_guarded(guard.clone());
+        // Releasing complementary fields can complete the release of their row. Apply
+        // the accumulated guard so a later whole-row read cannot return its bare key.
+        if matches!(guard, TileGuard::Function(FunctionGuard::Codomain(_)))
+            && self.reads_record_fields()
+        {
+            cache.remove_guarded(self.obsolete_guard());
+        } else {
+            cache.remove_guarded(guard.clone());
+        }
         cache.compact();
         drop(cache);
         self.input.release(guard);

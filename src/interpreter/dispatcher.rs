@@ -167,6 +167,7 @@ const CLOSED: usize = 1 << (usize::BITS - 1);
 
 /// Unclaimed and in-flight packages of one pipeline. Acknowledged packages retain no entry.
 struct Queue {
+    reads_record_fields: bool,
     // shared-state-ok: package lifecycle and guards naming input regions; never tiles.
     state: Mutex<QueueState>,
     /// Reservations include packages whose append still holds the queue lock. Closing freezes
@@ -185,6 +186,7 @@ struct QueueState {
 impl Queue {
     fn new() -> Self {
         Queue {
+            reads_record_fields: false,
             state: Mutex::new(QueueState::default()),
             reserved: AtomicUsize::new(0),
         }
@@ -201,7 +203,10 @@ impl Queue {
             return false;
         };
         for (index, morsel) in (first..).zip(morsels) {
-            state.ready.push_back((index, morsel.clone().read_region()));
+            state.ready.push_back((
+                index,
+                morsel.clone().read_region_for(self.reads_record_fields),
+            ));
         }
         true
     }

@@ -590,17 +590,29 @@ impl Tile {
         s_deleted.extend(o_deleted.iter().map(|i| i + shift));
     }
 
+    fn has_absent_fields(&self) -> bool {
+        matches!(self, Tile::Record { absent, .. } if !absent.is_empty())
+    }
+
+    /// Complementary fragments of a record can grow under the same key.
+    fn matches_keys_with(&self, other: &Tile) -> bool {
+        self.holds_a_level() || self.has_absent_fields() || other.has_absent_fields()
+    }
+
     /// `merge`, knowing whether this tile is the whole value or sits under one.
     fn merge_part(&mut self, other: Tile, whole: bool) {
-        if self.is_data_function() && other.is_data_function() {
+        if let (
+            Tile::DataFunction { codomain, .. },
+            Tile::DataFunction {
+                codomain: incoming, ..
+            },
+        ) = (&*self, &other)
+        {
             // Where no key can match, the merge is a concatenation, done in place so a
             // collection delivered a part at a time costs the part and not what is already
             // held. Rows under a collection never match, and a whole value's keys match only
             // where what they hold can grow.
-            let Tile::DataFunction { codomain, .. } = &*self else {
-                unreachable!("checked above")
-            };
-            if !whole || !codomain.holds_a_level() {
+            if !whole || !codomain.matches_keys_with(incoming) {
                 self.append_keys(other, whole);
                 debug_assert!(
                     !whole || validate_tile(self),
@@ -1370,6 +1382,14 @@ impl Tile {
                 let domain_predicate = &complete;
                 if domain_predicate.is_true() {
                     return TileGuard::Function(FunctionGuard::Domain(Predicate::True));
+                }
+                if !codomain.holds_a_level() && codomain.has_absent_fields() {
+                    return TileGuard::flatten_or(vec![
+                        TileGuard::Function(FunctionGuard::Domain(complete)),
+                        TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                            codomain.held_guard(&self.key_paths(row_paths)),
+                        ))),
+                    ]);
                 }
                 if !codomain.holds_a_level() {
                     // The guard is the held keys' points joined with the statement. A held key
@@ -3255,7 +3275,7 @@ fn merged_rows(
                         let (l_from, l_to) = level_run(l_offsets, *l_row, l_domain.len());
                         let (r_from, r_to) = level_run(r_offsets, *r_row, r_domain.len());
                         // A key matches only where what it holds can grow ([`Tile::merge`]).
-                        if l_codomain.holds_a_level() {
+                        if l_codomain.matches_keys_with(r_codomain) {
                             keys.extend(matched_keys(
                                 l_domain,
                                 l_from..l_to,

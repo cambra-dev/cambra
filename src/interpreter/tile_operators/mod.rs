@@ -1706,6 +1706,11 @@ impl InputId {
 ///
 /// [`consume_impl`]: Self::consume_impl
 pub trait Breaker {
+    /// Whether this input pulls individual scalar fields of keyed records.
+    fn reads_input_fields(&self) -> bool {
+        false
+    }
+
     /// Whether packages naming disjoint regions of the input may run this breaker's consume at
     /// once. The dispatcher runs a package beside others only where the input is also keyed by
     /// ordered keys (`src/interpreter/design-dispatcher.md`, "Shared native pipeline execution").
@@ -1887,6 +1892,11 @@ impl DroppedRows {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer: Send + Sync {
+    /// Whether a pull of a keyed scalar record can deliver its requested fields independently.
+    fn reads_record_fields(&self) -> bool {
+        false
+    }
+
     /// The entry before `input`, where an enclosing breaker's planner can receive that input's
     /// pushes in its own keys. Unplaced inputs remain read by pull.
     fn input_entry(&self, _input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
@@ -1986,7 +1996,7 @@ pub trait TileProducer: Send + Sync {
     /// it restates, and the answer is cut to the projection.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&self, projection_guard: TileGuard) -> Tile {
-        let projection_guard = projection_guard.read_region();
+        let projection_guard = projection_guard.read_region_for(self.reads_record_fields());
         // A pull at keys of a level the producer does not restate pulls the keys above them at
         // the nearest level it restates, and the answer is cut to the keys asked for: pulling
         // more is sound for a `get`, so every producer answers a projection at every level.

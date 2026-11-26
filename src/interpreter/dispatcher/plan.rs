@@ -854,14 +854,6 @@ fn run_targets(
             execution.close_on_reads(&mut dispatcher, PipelineId(pipeline));
         }
     }
-    for (pipeline, guard) in &start_regions {
-        if offered_by_reads[pipeline.0] {
-            continue;
-        }
-        if !execution.offer_request(*pipeline, guard) {
-            dispatcher.queue_for(*pipeline, guard);
-        }
-    }
     let mut root_reach = reach;
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call);
@@ -872,6 +864,15 @@ fn run_targets(
         Located::Sink(sink) => Some(WorkerBreaker::Sink(sink_breakers[*sink].clone())),
         _ => None,
     });
+    // Queue the first pulls with the read granularity of their planned inputs.
+    for (pipeline, guard) in &start_regions {
+        if offered_by_reads[pipeline.0] {
+            continue;
+        }
+        if !execution.offer_request(*pipeline, guard) {
+            dispatcher.queue_for(*pipeline, guard);
+        }
+    }
     let done = thread::scope(|scope| {
         let threads = workers.spawn(scope, &dispatcher, !live.is_empty());
         // Caught so a worker's panic, which failed the run first, is the one resumed: the
@@ -1212,10 +1213,13 @@ impl Execution {
                 let concurrent = match &target {
                     WorkerBreaker::Chain(handle) => {
                         let chain = handle.read().unwrap_or_else(PoisonError::into_inner);
+                        dispatcher.states[p].queue.reads_record_fields = chain.reads_input_fields();
                         chain.as_producer().is_some() && consumes_at_once(&*chain)
                     }
                     WorkerBreaker::Sink(handle) => {
-                        consumes_at_once(&*handle.read().unwrap_or_else(PoisonError::into_inner))
+                        let sink = handle.read().unwrap_or_else(PoisonError::into_inner);
+                        dispatcher.states[p].queue.reads_record_fields = sink.reads_input_fields();
+                        consumes_at_once(&*sink)
                     }
                 };
                 Some(WorkerTarget {

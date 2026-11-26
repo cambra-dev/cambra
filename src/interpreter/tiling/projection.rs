@@ -713,6 +713,26 @@ impl Projection {
         }
     }
 
+    /// A set of outer keys and the whole scalar fields selected at each.
+    pub(crate) fn row_fields(&self) -> Option<(&Predicate, &Projection)> {
+        let Self::Within {
+            level: CurryLevel::OUTERMOST,
+            keys,
+            values,
+        } = self
+        else {
+            return None;
+        };
+        let Self::Fields { fields, rest } = &**values else {
+            return None;
+        };
+        fields
+            .values()
+            .chain(std::iter::once(&**rest))
+            .all(|p| matches!(p, Self::Everything | Self::Nothing))
+            .then_some((keys, values))
+    }
+
     /// Whether this projection names part of some value: a [`Within`](Self::Within) or an `Or`
     /// with one.
     pub fn names_part_of_values(&self) -> bool {
@@ -1198,6 +1218,17 @@ fn within_paths(stated: &Predicate, keys: &Predicate, level: usize, depth: usize
 }
 
 impl TileGuard {
+    /// Cached scalar records can answer qualified field reads from their stored columns.
+    pub(crate) fn read_region_for(self, reads_fields: bool) -> Self {
+        if reads_fields
+            && matches!(&self, TileGuard::Function(FunctionGuard::Codomain(_)))
+            && Projection::of(&self).is_ok_and(|p| p.row_fields().is_some())
+        {
+            return self;
+        }
+        self.read_region()
+    }
+
     /// The region a pull can return. A partial value within a collection reads its
     /// enclosing row. Independent fields at the root of a record keep their own
     /// read regions. Use the same guard to reserve the package and to read it.
@@ -1374,6 +1405,12 @@ impl Tile {
 
     /// [`within`](Self::within) for the keys and cells the tile holds.
     fn cells_within(&self, projection: &Projection) -> Result<(), String> {
+        if let Some((keys, fields)) = projection.row_fields()
+            && let Tile::DataFunction { codomain, .. } = self
+        {
+            self.cells_within(&Projection::admitting(keys.clone()))?;
+            return codomain.cells_within(fields);
+        }
         match projection {
             part @ (Projection::Within { .. } | Projection::Or(_)) => {
                 Projection::refuse_part_of_values("Tile::cells_within", part)
@@ -1447,6 +1484,7 @@ impl Tile {
         }
         let stated = self.stated_completeness();
         let allowed = match projection {
+            p if p.row_fields().is_some() => vec![Predicate::False; stated.len()],
             part @ (Projection::Within { .. } | Projection::Or(_)) => {
                 Projection::refuse_part_of_values("Tile::statements_within", part)
             }
@@ -1536,6 +1574,48 @@ impl Tile {
     ///
     /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
     pub fn restrict_to(&mut self, projection: &Projection, tiling: &Tiling) {
+        if let Some((keys, values)) = projection.row_fields()
+            && let Tiling::DataFunction { codomain, .. } = tiling
+            && let Tiling::Record(tilings) = &**codomain
+            && tilings.values().all(|t| matches!(t, Tiling::Scalar(_)))
+        {
+            self.restrict_to_keys(keys);
+            let Tile::DataFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                ..
+            } = self
+            else {
+                unreachable!("a keyed record has a collection tile")
+            };
+            *domain_predicate = Predicate::False;
+            if domain.is_empty() {
+                return;
+            }
+            let Tile::Record { fields, absent } = &mut **codomain else {
+                unreachable!()
+            };
+            let mut held = vec![false; domain.len()];
+            for (name, field) in fields {
+                let Tile::Scalar(cells) = field else {
+                    unreachable!()
+                };
+                if values.field(name) == Projection::Nothing {
+                    *cells = cells.select_indices(std::iter::empty(), 0);
+                    absent.insert(name.clone(), (0..domain.len()).collect());
+                } else if !cells.is_empty() {
+                    let missing = absent.get(name);
+                    for (row, held) in held.iter_mut().enumerate() {
+                        *held |= missing.is_none_or(|bits| !bits.contains(row));
+                    }
+                }
+            }
+            if held.contains(&false) {
+                self.retain_keys(&held);
+            }
+            return;
+        }
         match projection {
             part @ (Projection::Within { .. } | Projection::Or(_)) => {
                 Projection::refuse_part_of_values("Tile::restrict_to", part)

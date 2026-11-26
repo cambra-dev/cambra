@@ -945,6 +945,171 @@ mod tests {
         }
     }
 
+    /// Both packages read row 7. Pause A during its pull or during release after its merge. B must
+    /// publish, reach the sink and release just its field before A can return.
+    #[rstest_log::rstest]
+    #[case::during_read(false)]
+    #[case::during_release(true)]
+    fn cached_memo_delivers_a_sibling_field_while_the_first_worker_is_paused(
+        #[case] on_release: bool,
+    ) {
+        use super::*;
+        use crate::interpreter::{
+            ColumnValue, CurryLevel, DataSink, Tile,
+            tile_operators::{
+                MemoProducer, ProducerBase, SinkBreaker, TileProducer, share_breaker,
+                test_helpers::{ConsumeInPipeline, ProjectionSpy, first_breaker},
+            },
+            types::BaseType,
+        };
+        use std::{sync::mpsc, time::Duration};
+
+        struct PausedField {
+            input: Box<dyn TileProducer>,
+            field: TileGuard,
+            on_release: bool,
+            paused: mpsc::Sender<()>,
+            resume: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl PausedField {
+            fn pause(&self, guard: &TileGuard, releasing: bool) {
+                if self.on_release == releasing
+                    && *guard == self.field
+                    && let Some(resume) = self.resume.lock().unwrap().take()
+                {
+                    self.paused.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(15)).unwrap();
+                }
+            }
+        }
+        impl TileProducer for PausedField {
+            fn base(&self) -> &ProducerBase {
+                self.input.base()
+            }
+            fn base_mut(&mut self) -> &mut ProducerBase {
+                self.input.base_mut()
+            }
+            fn reads_record_fields(&self) -> bool {
+                self.input.reads_record_fields()
+            }
+            fn get(&self, guard: TileGuard) -> Tile {
+                let answer = self.input.get(guard.clone());
+                self.pause(&guard, false);
+                answer
+            }
+            fn get_impl(&self, _: TileGuard) -> Tile {
+                unreachable!()
+            }
+            fn release_impl(&self, guard: TileGuard) {
+                self.pause(&guard, true);
+                self.input.release_impl(guard);
+            }
+        }
+        struct Output(mpsc::Sender<Tile>);
+        impl DataSink for Output {
+            fn process(&self, tile: &Tile) {
+                self.0.send(tile.clone()).unwrap();
+            }
+        }
+
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record([("a".into(), scalar.clone()), ("b".into(), scalar)].into()),
+        );
+        let record = Tile::record(
+            [
+                ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![17]))),
+                ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![29]))),
+            ]
+            .into(),
+        );
+        let row = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(record),
+            Predicate::False,
+            Default::default(),
+        );
+        let field = |name| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(7)),
+                Projection::of_field(name, Projection::Everything),
+            )
+            .guard(&tiling)
+        };
+        let (spy, _, _) = ProjectionSpy::new(row.clone(), tiling.clone());
+        let mut cache = MemoProducer::over(Box::new(spy), &tiling);
+        cache.consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
+        let (paused, entered) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        let input = PausedField {
+            input: share_breaker(cache),
+            field: field("a"),
+            on_release,
+            paused,
+            resume: Mutex::new(Some(resume_rx)),
+        };
+        let (source, sink) = (PipelineId(0), PipelineId(1));
+        let mut memo = MemoProducer::over(Box::new(input), &tiling);
+        memo.base_mut().downstream = Some(Arc::new(Entry::new(sink, tiling.clone())));
+        let reader = share_breaker(memo);
+        let chain = first_breaker(&*reader).unwrap();
+        let (sent, tiles) = mpsc::channel();
+        let output = Arc::new(RwLock::new(SinkBreaker::new(
+            Arc::new(RwLock::new(Some(reader))),
+            Arc::new(Output(sent)),
+        )));
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 16);
+        let execution = plan::Execution::new(&[None, None], &mut dispatcher);
+        let workers = execution.worker_pool(&mut dispatcher, 2, |id| {
+            Some(if id == source.0 {
+                WorkerBreaker::Chain(chain.clone())
+            } else {
+                WorkerBreaker::Sink(output.clone())
+            })
+        });
+        for name in ["a", "b"] {
+            dispatcher.queue_for(source, &field(name));
+        }
+        let consume = |pipeline, expected: TileGuard| {
+            let package = dispatcher
+                .claim_of(pipeline)
+                .expect("independent field ready");
+            assert_eq!(package.guard, expected);
+            workers.consume(&dispatcher, package, &mut |_, _| unreachable!());
+        };
+        let timeout = Duration::from_secs(5);
+        thread::scope(|threads| {
+            let worker_a = threads.spawn(|| consume(source, field("a")));
+            entered.recv_timeout(timeout).expect("first worker paused");
+            threads.spawn(|| {
+                consume(source, field("b"));
+                consume(sink, field("b"));
+            });
+            let first = tiles.recv_timeout(timeout);
+            let released = chain.read().unwrap().obsolete_guard();
+            resume.send(()).unwrap();
+            worker_a.join().unwrap();
+            let first = first.expect("field b reached the sink while a was paused");
+            assert_eq!(released, field("b"));
+            assert_eq!(first.to_guard(), field("b"));
+            consume(sink, field("a"));
+            let second = tiles.recv_timeout(timeout).unwrap();
+            assert_eq!(second.to_guard(), field("a"));
+            let mut combined = first;
+            combined.merge(second);
+            assert_eq!(combined, row);
+        });
+        assert_eq!(dispatcher.outstanding(sink), 0);
+        assert!(tiles.try_recv().is_err());
+        let remaining = in_a_run(|| chain.read().unwrap().get(tiling.universal_guard()));
+        assert!(
+            remaining.is_empty(),
+            "releasing both fields reclaims the row"
+        );
+    }
+
     #[test]
     fn flat_memo_publishes_partial_answers_and_later_absences_once() {
         use super::*;
