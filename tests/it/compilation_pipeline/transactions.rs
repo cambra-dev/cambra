@@ -1285,54 +1285,6 @@ fn an_unfired_arm_carries_its_key_past_a_concurrent_write() {
     }
 }
 
-/// A blind write and concurrent increments of one key commit as one serialization.
-///
-/// The resetting writer's footprint reads nothing, so it never goes stale; each increment reads
-/// `x` and goes stale whenever a reset commits after its snapshot. In commit order the
-/// replies are therefore a sequence in which each value is `0` (a reset) or one more than the
-/// value before it (an increment). An increment validated against a snapshot older than the
-/// latest reset would commit a value larger than that.
-#[test]
-fn a_blind_write_serializes_with_concurrent_increments() {
-    let resets = 5;
-    let increments = 10;
-    let code = indoc! {r#"
-        out: Feed(_)
-        x: Mut(Int, Txn) := 0
-        for r in [1, 2, 3, 4, 5]:
-            with begin():
-                x := 0
-                out << 0
-        for r in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
-            with begin():
-                x := x + 1
-                out << x
-        out
-    "#};
-    let tile = run_pipeline(code);
-    let Tile::DataFunction { codomain, .. } = &tile else {
-        panic!("expected a reply stream over commit ticks, got {tile:?}");
-    };
-    let Tile::Scalar(ColumnValue::Ints(replies)) = codomain.as_ref() else {
-        panic!("expected Int replies, got {codomain:?}");
-    };
-    assert_eq!(replies.len(), resets + increments, "one reply per commit");
-    let mut current = 0;
-    for &reply in replies {
-        assert!(
-            reply == 0 || reply == current + 1,
-            "reply {reply} follows {current}: not a serialization of resets and increments \
-             (replies in commit order: {replies:?})"
-        );
-        current = reply;
-    }
-    assert_eq!(
-        replies.iter().filter(|&&r| r == 0).count(),
-        resets,
-        "every reset commits once (replies {replies:?})"
-    );
-}
-
 /// Two writer sites writing distinct keys of one map both land.
 ///
 /// `keyed_writes_at_distinct_keys_compose_across_transactions` covers one site, whose

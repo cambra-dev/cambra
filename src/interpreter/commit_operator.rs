@@ -8692,6 +8692,7 @@ mod tests {
         _ctx: crate::ccl::context::GlobalContext,
         program: crate::ccl::context::CompiledProgram,
         fan: Arc<FanOut>,
+        out: Arc<crate::interpreter::TestSink>,
     }
 
     impl std::ops::Deref for DispatchedStore {
@@ -8713,7 +8714,7 @@ mod tests {
             };
             let mut ctx = GlobalContext::default();
             setup(&mut ctx);
-            ctx.register_test_sink("out");
+            let out = ctx.register_test_sink("out");
             let program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
                 .unwrap_or_else(|errors| panic!("{source}: {errors:?}"));
             let operators = ctx.take_operator_map();
@@ -8727,6 +8728,7 @@ mod tests {
                 _ctx: ctx,
                 program,
                 fan,
+                out,
             }
         }
 
@@ -10618,6 +10620,113 @@ mod tests {
         assert!(
             [30, 50].contains(&value),
             "the stale draw retries and denies"
+        );
+    }
+
+    /// The store orders changes by commit tick. Each reply is keyed by the site and source
+    /// item that produced it. Record the item in a blind write alongside x to relate the two.
+    #[test]
+    fn a_blind_write_serializes_with_concurrent_increments() {
+        let mut store = DispatchedStore::new(indoc::indoc! {r#"
+            out = test_sink()
+            x: Mut(Int, Txn) := 0
+            item: Mut(Int, Txn) := 0
+            for r in [-1, -2, -3, -4, -5]:
+                with begin():
+                    x := 0
+                    item := r
+                    out << 0
+            for r in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                with begin():
+                    x := x + 1
+                    item := r
+                    out << x
+        "#});
+        let tile = store.snapshot();
+        let changes = changelog_of(&tile, "x");
+        let items = changelog_of(&tile, "item");
+        let mut pending: BTreeSet<i64> = (-5..=-1).chain(1..=10).collect();
+        assert_eq!(changes.len(), pending.len());
+        assert_eq!(items.len(), changes.len());
+        let mut expected_replies = HashMap::new();
+        let mut current = 0;
+        for (index, ((tick, value), (item_tick, item))) in
+            changes.into_iter().zip(items).enumerate()
+        {
+            assert_eq!(tick, index as u64 + 1);
+            assert_eq!(item_tick, tick);
+            let Value::Int(item) = item else {
+                panic!("expected an integer item")
+            };
+            assert!(pending.remove(&item), "unexpected or repeated item {item}");
+            let site = if item < 0 {
+                current = 0;
+                "out<<"
+            } else {
+                current += 1;
+                "out<<#1"
+            };
+            assert_eq!(
+                value,
+                int(current),
+                "store value at tick {tick} for item {item}"
+            );
+            let key = Value::Union {
+                tag: FieldKey::Name(site.into()),
+                inner: Box::new(Value::UInt(item.unsigned_abs() - 1)),
+            };
+            expected_replies.insert(key, value);
+        }
+
+        let Value::Function(replies) = store.out.value().expect("a complete reply stream") else {
+            panic!("expected replies keyed by source item")
+        };
+        for reply in replies {
+            assert_eq!(
+                expected_replies.remove(&reply.input),
+                Some(reply.output),
+                "reply at {:?}",
+                reply.input
+            );
+        }
+        assert!(
+            expected_replies.is_empty(),
+            "missing replies: {expected_replies:?}"
+        );
+    }
+
+    /// An increment planned before the intervening reset must retry at the reset's tick.
+    #[test]
+    fn an_increment_retries_after_a_blind_reset_between_increments() {
+        let mut engine = CommitEngine::new(balances(&[("x", 0)]));
+        let increment = |tick, previous| Proposal {
+            snapshot: pos(tick),
+            reads: balances(&[("x", previous)]),
+            writes: balances(&[("x", previous + 1)]),
+        };
+        assert_eq!(
+            engine.attempt(increment(0, 0)),
+            CommitOutcome::Committed { ts: pos(1) }
+        );
+        let next = increment(1, 1);
+        let reset = Proposal {
+            snapshot: pos(0),
+            reads: HashMap::new(),
+            writes: balances(&[("x", 0)]),
+        };
+        assert_eq!(
+            engine.attempt(reset),
+            CommitOutcome::Committed { ts: pos(2) }
+        );
+        assert_eq!(engine.attempt(next), CommitOutcome::Stale);
+        assert_eq!(
+            engine.attempt(increment(2, 0)),
+            CommitOutcome::Committed { ts: pos(3) }
+        );
+        let tile = engine.render_full_store_tile(&store_tiling(&["x"]));
+        assert_eq!(
+            changelog_of(&tile, "x"),
+            vec![(1, int(1)), (2, int(0)), (3, int(1))]
         );
     }
 
