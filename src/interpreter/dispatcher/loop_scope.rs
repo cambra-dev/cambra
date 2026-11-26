@@ -255,6 +255,15 @@ enum RetryPhase {
 }
 
 impl Offered {
+    pub(super) fn has_work(&self) -> bool {
+        matches!(self.intake, ScopeInput::Ordinary(Some(_)))
+            || self
+                .retry
+                .as_ref()
+                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
+            || self.close == IntakeClose::Requested
+    }
+
     pub(super) fn offer(&mut self, guard: TileGuard) {
         let region = match &mut self.intake {
             ScopeInput::Ordinary(pending) => pending,
@@ -307,7 +316,7 @@ pub(super) struct Body {
     pub(super) driver: PipelineId,
     /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
     /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
-    offers: Offers,
+    pub(super) offers: Offers,
 }
 
 enum BodyLayout {
@@ -396,6 +405,7 @@ impl Body {
             _ => None,
         }
     }
+
     pub(super) fn is_active(&self) -> bool {
         self.attachment().is_some_and(|attached| attached.active)
     }
@@ -603,19 +613,16 @@ impl Body {
         // emit. So the offer waits until every pipeline the scope's pipeline reads is quiescent.
         let reads_ready = dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied());
         let mut offered = self.intake(dispatcher);
+        // A parent-fed loop queues the rows its drive's source has delivered, and a ready retry
+        // with them or alone. Its intake never closes the pipeline.
         let mut region = match &mut offered.intake {
-            ScopeInput::Parent(rows) => {
-                let Some((ready, rest)) = rows.ready() else {
-                    return false;
-                };
+            ScopeInput::Parent(rows) => rows.ready().and_then(|(ready, rest)| {
                 if ready.is_empty() {
-                    return false;
+                    return None;
                 }
                 rows.held = (!rest.is_empty()).then_some(rest);
-                drop(offered);
-                dispatcher.queue_for(pipeline, &ready);
-                return true;
-            }
+                Some(ready)
+            }),
             ScopeInput::Ordinary(pending) if ready && reads_ready => pending.take(),
             ScopeInput::Ordinary(_) => return false,
         };
@@ -623,7 +630,8 @@ impl Body {
         // waiting for inputs, and while any wait: what an input brings queues the request that
         // runs them.
         let idle = dispatcher.outstanding(pipeline) == 0;
-        let closing = offered.close == IntakeClose::Requested
+        let closing = matches!(offered.intake, ScopeInput::Ordinary(_))
+            && offered.close == IntakeClose::Requested
             && idle
             && region.is_none()
             && offered.retry.is_none();
@@ -654,13 +662,7 @@ impl Body {
 
     /// Whether anything offered is not queued yet.
     pub(super) fn has_offers(&self, dispatcher: &Dispatcher) -> bool {
-        let offered = self.intake(dispatcher);
-        matches!(offered.intake, ScopeInput::Ordinary(Some(_)))
-            || offered
-                .retry
-                .as_ref()
-                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
-            || offered.close == IntakeClose::Requested
+        self.intake(dispatcher).has_work()
     }
 
     /// Clear every inner pipeline's entries.
@@ -1384,11 +1386,61 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_before_parking_and_one_after_admission_queue_one_retry() {
+    fn a_parent_between_requests_releases_its_hold_for_a_woken_child() {
+        let compiled = Compiled::of(indoc! {"
+            out = test_sink()
+            total := 0
+            for x in [1, 2, 3]:
+                for y in [1, 2]:
+                    total += x * y
+            out << total
+        "});
+        compiled.consume(keys_between(0, 0));
+        let dispatcher = &compiled.dispatcher;
+        let (hold, child) = {
+            let mut parent = induction(&compiled.scope);
+            let body = parent.body_mut();
+            let child = body
+                .members
+                .iter()
+                .find_map(|member| match member {
+                    Member::Scope(child) => Some(child.clone()),
+                    Member::Chain(_) => None,
+                })
+                .unwrap();
+            (body.attached().hold, child)
+        };
+        let child_request = {
+            let mut child = induction(&child);
+            let body = child.body_mut();
+            body.set_waiting(Some(keys_between(0, 0)), None);
+            body.offers.lock().unwrap().wake();
+            body.attached().pipeline
+        };
+        dispatcher.hold_followers(hold);
+        for _ in 0..dispatcher.infos.len() {
+            compiled.steps.poll(dispatcher);
+            if let Some(package) = dispatcher.claim_of(child_request) {
+                assert_eq!(dispatcher.outstanding(PipelineId(0)), 0);
+                dispatcher.acknowledge(package);
+                return;
+            }
+        }
+        panic!("a ready child retry runs before the parent's next request");
+    }
+
+    #[rstest_log::rstest]
+    #[case::ordinary(false)]
+    #[case::parent_row(true)]
+    fn a_wake_before_parking_and_one_after_admission_queue_one_retry(#[case] parent_row: bool) {
         let compiled = Compiled::of(SUM);
         let mut scope = induction(&compiled.scope);
-        let (entry, placement) = Entry::unplaced(scope.input_tiling(InputId::ONLY));
+        let input = scope.input_tiling(InputId::ONLY);
+        let (entry, placement) = Entry::unplaced(input.clone());
         let body = scope.body_mut();
+        if parent_row {
+            body.take_rows_from_outer(input);
+        }
         placement.set_scope(Some(body.offers.clone()));
         let waiting = keys_between(0, 0);
         entry.wake(&Projection::Everything);
@@ -1895,6 +1947,25 @@ mod tests {
                 index: 1,
             },
         );
+    }
+
+    #[test]
+    fn a_settled_loop_queues_one_step_until_the_coordinator_runs_it() {
+        let compiled = Compiled::of(SUM);
+        let whole = induction(&compiled.scope)
+            .input_tiling(InputId::ONLY)
+            .universal_guard();
+        compiled.dispatcher.notify(PipelineId(0), &whole);
+        let step = induction(&compiled.scope).body_mut().attached().step;
+        for _ in 0..32 {
+            if compiled.dispatcher.outstanding(step) != 0 {
+                break;
+            }
+            compiled.tick();
+        }
+        assert_eq!(compiled.dispatcher.outstanding(step), 1);
+        assert!(!compiled.steps.poll(&compiled.dispatcher));
+        assert_eq!(compiled.dispatcher.outstanding(step), 1);
     }
 
     /// A guarded loop's `Memo`s are inner pipelines, which each round queues the position for and
