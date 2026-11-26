@@ -1224,12 +1224,14 @@ impl Execution {
                 })
             })
             .collect();
+        let steps = self.scope_steps(dispatcher);
+        steps.install_queues(dispatcher);
         let workers = WorkerPool::new(
             count,
             targets,
             self.bodies_by_pipeline(),
             self.scope_pipelines(),
-            self.scope_steps(dispatcher),
+            steps,
         );
         for pipeline in workers.serial() {
             dispatcher.order(pipeline);
@@ -1379,6 +1381,7 @@ impl Execution {
                 dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
             }
         }
+        dispatcher.start_visits();
         match self.claim_until_quiescent(dispatcher, reach, workers, false) {
             Claimed::Done | Claimed::Failed => {}
             Claimed::Quiescent => {
@@ -1410,14 +1413,17 @@ impl Execution {
                 }
             };
             match next {
-                Next::Package(package) => {
+                Next::Package(WorkerPackage::Settle(visit)) => {
+                    workers.settle_visit(dispatcher, visit)
+                }
+                Next::Package(WorkerPackage::Input(package)) => {
                     let pipeline = package.pipeline;
                     if workers.admits(pipeline) {
                         workers.consume_on_coordinator(dispatcher, package, &mut claim_reach);
                     } else {
                         self.consume(dispatcher, &mut claim_reach, package);
                     }
-                    workers.completed_pipeline(dispatcher, pipeline);
+                    workers.wake_scopes(dispatcher, pipeline);
                 }
                 Next::Finish { pipeline } => {
                     if workers.admits(pipeline) {
@@ -1426,9 +1432,8 @@ impl Execution {
                         workers.finishing(pipeline, &mut claim_reach);
                         self.finish(dispatcher, &mut claim_reach, pipeline);
                     }
-                    workers.completed_pipeline(dispatcher, pipeline);
+                    workers.wake_scopes(dispatcher, pipeline);
                 }
-                Next::Wait(_) if workers.settle_one(dispatcher) => {}
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {
                     dispatcher.wait(generation)
                 }
@@ -3534,6 +3539,7 @@ fn drive_live(
             dispatcher.start_source(PipelineId(pipeline), &input, &released);
         }
     }
+    let mut initial_visits = 0..dispatcher.visits.len();
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
         for (_, leaf, _) in live.iter().flat_map(|at| &at.leaves) {
@@ -3556,6 +3562,9 @@ fn drive_live(
                 changed = true;
                 workers.wake_scopes(dispatcher, at.pipeline);
             }
+        }
+        for group in initial_visits.by_ref() {
+            dispatcher.offer_visit(group);
         }
         match execution.claim_until_quiescent(dispatcher, reach, workers, true) {
             Claimed::Done => return true,
@@ -3782,7 +3791,7 @@ mod tests {
         dispatcher.finish(dispatcher.pushes(peer));
         drop(transition);
 
-        let (Next::Package(package), Some(claim)) = next() else {
+        let (Next::Package(WorkerPackage::Input(package)), Some(claim)) = next() else {
             panic!("the seed package becomes eligible")
         };
         assert_eq!(package.pipeline, seed);
@@ -3847,6 +3856,55 @@ mod tests {
     }
 
     #[test]
+    fn wakes_during_a_claim_queue_exactly_one_more_visit() {
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], 1);
+        let mut execution = Execution::new(&[None, None], &mut dispatcher);
+        let mut runs = ScopeRuns::new();
+        for p in 0..2 {
+            let (store, run) = two_writer_run();
+            runs.install_transaction(&store, 0, run.writers.into_iter().next().unwrap());
+            execution.attach_transaction(&store, 0, PipelineId(p), &mut dispatcher);
+        }
+        let workers = execution.worker_pool(&mut dispatcher, 2, |_| None);
+        let next = || workers.next(&dispatcher, None, &|_| true);
+        let claim_visit = || {
+            let (Next::Package(WorkerPackage::Settle(visit)), activity) = next() else {
+                panic!("expected a dispatcher settlement claim");
+            };
+            (visit, activity)
+        };
+        let wake = |p| workers.wake_scopes(&dispatcher, PipelineId(p));
+        wake(0);
+        let (first, first_activity) = claim_visit();
+        let group = first.group;
+
+        // Model a second worker arriving after the owner inspected the group but before ack.
+        wake(0);
+        wake(0);
+        wake(1);
+        let (peer, peer_activity) = claim_visit();
+        assert_ne!(peer.group, group);
+        dispatcher.acknowledge_visit(peer);
+        drop(peer_activity);
+        assert!(
+            matches!(next().0, Next::Wait(_)),
+            "the successor cannot run beside its owner"
+        );
+        dispatcher.acknowledge_visit(first);
+        drop(first_activity);
+
+        wake(0); // This wake coalesces with the successor already queued.
+        let (retry, retry_activity) = claim_visit();
+        assert_eq!(retry.group, group);
+        dispatcher.acknowledge_visit(retry);
+        drop(retry_activity);
+        assert!(
+            matches!(next().0, Next::Wait(_)),
+            "a quiet acknowledgement schedules nothing"
+        );
+    }
+
+    #[test]
     fn a_busy_body_member_leaves_the_scope_held_and_peer_work_claimable() {
         use crate::interpreter::tile_operators::test_helpers::keys_between;
         use std::sync::mpsc;
@@ -3860,7 +3918,8 @@ mod tests {
         let mut runs = ScopeRuns::new();
         runs.install_transaction(&store, 0, run.writers.into_iter().next().unwrap());
         execution.attach_transaction(&store, 0, request, &mut dispatcher);
-        let steps = execution.scope_steps(&dispatcher);
+        let workers = execution.worker_pool(&mut dispatcher, 2, |_| None);
+        workers.begin_drain(&dispatcher, false);
         let scope = execution.request_scope(request);
         let Scope::Writer { phase, .. } = scope else {
             unreachable!()
@@ -3889,10 +3948,16 @@ mod tests {
                     .expect("settlement waited for the busy member");
             });
             ready.recv().unwrap();
-            steps.wake(&dispatcher, request);
-            assert!(steps.settle_one(&dispatcher, || ()));
+            workers.wake_scopes(&dispatcher, request);
+            let (Next::Package(WorkerPackage::Settle(visit)), _reservation) =
+                workers.next(&dispatcher, None, &|_| true)
+            else {
+                panic!("the affected group has a settlement package");
+            };
+            workers.settle_visit(&dispatcher, visit);
+            drop(_reservation);
             assert!(
-                !steps.settle_one(&dispatcher, || ()),
+                dispatcher.claim_visit(|| ()).is_none(),
                 "a busy check does not spin"
             );
             assert_ne!(dispatcher.followers_hold(hold).0 & 1, 0);
@@ -3907,13 +3972,24 @@ mod tests {
         let Next::Wait(generation) = dispatcher.try_claim(None) else {
             panic!("no ordinary claim can advance the scope");
         };
-        assert!(steps.verify_one(&dispatcher, &generation));
+        assert!(
+            !workers.drained(&dispatcher, &generation),
+            "a blocked visit delays the idle boundary"
+        );
+        let (Next::Package(WorkerPackage::Settle(visit)), _reservation) =
+            workers.next(&dispatcher, None, &|_| true)
+        else {
+            panic!("the drain reoffers the blocked group");
+        };
+        workers.settle_visit(&dispatcher, visit);
         assert_eq!(
             dispatcher.outstanding(step),
             1,
             "the quiet retry admits the deferred step"
         );
-        while steps.settle_one(&dispatcher, || ()) {}
+        while let Some((visit, ())) = dispatcher.claim_visit(|| ()) {
+            workers.settle_visit(&dispatcher, visit);
+        }
         assert_eq!(dispatcher.outstanding(step), 1);
     }
 
@@ -3929,7 +4005,12 @@ mod tests {
                 execution.attach_transaction(&store, writer, PipelineId(*root), &mut dispatcher);
             }
         }
-        let steps = execution.scope_steps(&dispatcher);
+        let workers = execution.worker_pool(&mut dispatcher, 2, |_| None);
+        let visit_ready = || {
+            while let Some((visit, ())) = dispatcher.claim_visit(|| ()) {
+                workers.settle_visit(&dispatcher, visit);
+            }
+        };
         let guard = crate::interpreter::tile_operators::test_helpers::keys_between(0, 0);
         let controls: Vec<_> = (0..5)
             .map(|id| {
@@ -3953,12 +4034,12 @@ mod tests {
         let package = dispatcher.claim_of(driver).expect("the writer's driver");
         // Only the four connected writers see this completion. The fifth is ready, so
         // probing it would queue its step and make this assertion fail.
-        steps.wake(&dispatcher, driver);
-        while steps.settle_one(&dispatcher, || ()) {}
+        workers.wake_scopes(&dispatcher, driver);
+        visit_ready();
         assert_eq!(dispatcher.outstanding(controls[4].1), 0);
         let running = controls[0].0.write();
-        steps.wake(&dispatcher, PipelineId(4));
-        while steps.settle_one(&dispatcher, || ()) {}
+        workers.wake_scopes(&dispatcher, PipelineId(4));
+        visit_ready();
         assert_eq!(dispatcher.outstanding(controls[4].1), 1);
         drop(running);
         assert!(
@@ -3968,11 +4049,11 @@ mod tests {
             "a connected decision would advance the driver's snapshot"
         );
         dispatcher.acknowledge(package);
-        steps.wake(&dispatcher, driver);
+        workers.wake_scopes(&dispatcher, driver);
         // Keep every writer eligible. Each connected writer gets a turn before any repeats.
         let mut winners = Vec::new();
         for _ in 0..4 {
-            while steps.settle_one(&dispatcher, || ()) {}
+            visit_ready();
             let eligible: Vec<_> = (0..4)
                 .filter(|&id| dispatcher.outstanding(controls[id].1) != 0)
                 .collect();
@@ -3987,7 +4068,7 @@ mod tests {
                 .claim_of(controls[id].1)
                 .expect("the admitted step");
             dispatcher.acknowledge(step);
-            steps.wake(&dispatcher, controls[id].1);
+            workers.wake_scopes(&dispatcher, controls[id].1);
         }
     }
 

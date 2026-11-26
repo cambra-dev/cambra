@@ -116,8 +116,8 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/dispatcher/workers.rs", "shared cell of `crate::interpreter::tile_operators::SinkBreaker`"),
     # A pipeline's queue: its unclaimed and in-flight packages and the region they partition, which
     # appends grow and claims and acknowledgements take from under the lock, on any thread. What
-    # crosses it is guards naming regions of the pipeline's input, never a tile.
-    ("src/interpreter/dispatcher.rs", "cell of `QueueState`"),
+    # crosses it is guards naming regions of the pipeline's input, or unit for a control visit.
+    ("src/interpreter/dispatcher.rs", "cell of `QueueState<T>`"),
     # The region a pipeline's breaker has pushed to its reader. A push of the breaker's final
     # guard pushes what is not in it and grows it in one step, so two threads pushing for one
     # pipeline push disjoint regions. What crosses it is a guard naming a region, never a tile.
@@ -159,10 +159,9 @@ EXPECTED_EXCEPTIONS = [
     # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
     # what it is handed; nothing reads it back into the graph. See `Collected`.
     ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),
-    # Scope scheduling metadata and the queue of connected groups awaiting settlement.
+    # Scope scheduling metadata and the run-wide idle check.
     ("src/interpreter/dispatcher/scope.rs", "cell of `LoopSchedule`"),
     ("src/interpreter/dispatcher/scope.rs", "cell of `WriterPhase`"),
-    ("src/interpreter/dispatcher/scope.rs", "cell of `GroupWork`"),
     ("src/interpreter/dispatcher/workers.rs", "cell of `Drain`"),
     # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does

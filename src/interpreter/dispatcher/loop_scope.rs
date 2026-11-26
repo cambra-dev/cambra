@@ -1780,7 +1780,7 @@ mod tests {
         // the worker's scope check and the observation of its result.
         dispatcher.notify(peer, &keys_between(0, 0));
         dispatcher.close(peer);
-        let (Next::Package(package), (_, activity)) =
+        let (Next::Package(WorkerPackage::Input(package)), (_, activity)) =
             workers.next(dispatcher, Some(peer), &|_| true)
         else {
             panic!("the coordinator takes the independent package");
@@ -1805,6 +1805,7 @@ mod tests {
             );
         }
 
+        dispatcher.start_visits();
         workers.begin_drain(dispatcher, false);
         let mut generation = Generation(dispatcher.changes());
         thread::scope(|threads| {

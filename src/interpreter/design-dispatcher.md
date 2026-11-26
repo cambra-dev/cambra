@@ -457,10 +457,13 @@ then releases the store before trying the body breakers. A busy breaker leaves t
 in place. A nested loop publishes through its parent once its own request has completed.
 
 Scopes connected by reads, follows, containment or a shared store belong to one settlement group.
-The plan records which groups each pipeline can affect. The first drain offers every group once.
+The plan assigns each group an ordered dispatcher queue and records which groups each pipeline
+can affect. The first drain offers every group once.
 After that, package completion, pipeline finish, live input and held publication wake the affected
-groups. Wakes coalesce while queued. A wake during a claim schedules one more visit when the
-claimant returns its cursor. The queue lock is released before inspecting any scope.
+groups. A wake appends a control package if the queue has no pending visit. Wakes during a claim
+can queue one successor, which becomes claimable at acknowledgement. The worker inspects the scope
+after releasing the queue lock. Visits carry no input guard and do not participate in data-pipeline
+finish accounting.
 A claimant publishes held output across the group and lets its runnable body packages drain.
 It then queues one eligible step, starting after the previous winner. This keeps a peer commit
 from advancing the snapshot while a writer is still processing its previous attempt. Each group has
@@ -658,7 +661,7 @@ that publication. Between polls, any claimant can settle the run:
    opens a flat loop's seed once its input pipelines are quiescent and the seed is available,
    and retries admission after the last read. Each of these checks uses the scope's own state.
 2. Once the queues have no claimable work and the active handlers have returned, one claimant
-   retries groups whose nonblocking visit found a busy handle. In a live run it then publishes
+   reoffers the groups whose nonblocking visit found a busy handle. In a live run it then publishes
    output the breakers have held since the last pass. Other workers can take the work that
    publication produces.
 3. A quiet pass records the dispatcher generation it observed. The driver can report a drained

@@ -64,6 +64,24 @@ pub struct WorkPackage {
     pub(crate) index: usize,
 }
 
+/// A claim on one group's ordered control queue.
+#[derive(Debug)]
+struct ScopeVisit {
+    group: usize,
+    index: usize,
+}
+
+enum WorkerPackage {
+    Input(WorkPackage),
+    Settle(ScopeVisit),
+}
+
+impl From<WorkPackage> for WorkerPackage {
+    fn from(package: WorkPackage) -> Self {
+        Self::Input(package)
+    }
+}
+
 /// What a source's notify did with a region ([`Dispatcher::try_notify`]).
 pub enum Admission {
     /// The region is queued, or names nothing.
@@ -78,10 +96,10 @@ pub enum Admission {
 
 /// What a worker does next, as [`Dispatcher::try_claim`] answers.
 #[cfg_attr(test, derive(Debug))]
-pub enum Next {
+pub enum Next<P = WorkPackage> {
     /// Hand the package to its pipeline's breaker, then [`acknowledge`](Dispatcher::acknowledge)
     /// it.
-    Package(WorkPackage),
+    Package(P),
     /// Finish the pipeline, which the claim moved to finishing, then
     /// [`finish`](Dispatcher::finish) it: push what it completed and no consume pushed, through the
     /// breaker's [`finish`][Breaker::finish], its last call.
@@ -148,34 +166,39 @@ impl AtomicPhase {
 /// The bit of a queue's `reserved` count that says the queue is closed.
 const CLOSED: usize = 1 << (usize::BITS - 1);
 
-/// Unclaimed and in-flight packages of one pipeline. Acknowledged packages retain no entry.
-struct Queue {
-    // shared-state-ok: package lifecycle and guards naming input regions; never tiles.
-    state: Mutex<QueueState>,
+/// Unclaimed and in-flight packages of one pipeline or settlement group.
+struct Queue<T = TileGuard> {
+    // shared-state-ok: claims carry input region guards or unit-valued control visits.
+    state: Mutex<QueueState<T>>,
     /// Reservations include packages whose append still holds the queue lock. Closing freezes
     /// the count, so a finish compares acknowledgements against that count without taking a lock.
     reserved: AtomicUsize,
 }
 
-#[derive(Default)]
-struct QueueState {
+struct QueueState<T> {
     /// External arrivals have ended; upstream pipelines may still append work.
     arrivals_closed: bool,
-    ready: VecDeque<(usize, TileGuard)>,
-    in_flight: HashMap<usize, TileGuard>,
+    ready: VecDeque<(usize, T)>,
+    in_flight: HashMap<usize, T>,
 }
 
-impl Queue {
+impl<T> Queue<T> {
     fn new() -> Self {
         Queue {
-            state: Mutex::new(QueueState::default()),
+            state: Mutex::new(QueueState {
+                arrivals_closed: false,
+                ready: VecDeque::new(),
+                in_flight: HashMap::new(),
+            }),
             reserved: AtomicUsize::new(0),
         }
     }
+}
 
+impl Queue {
     /// Append each of `morsels` as a package. An empty morsel is no package. A closed queue takes
     /// nothing.
-    fn append_locked(&self, state: &mut QueueState, morsels: &[TileGuard]) -> bool {
+    fn append_locked(&self, state: &mut QueueState<TileGuard>, morsels: &[TileGuard]) -> bool {
         let morsels: Vec<&TileGuard> = morsels.iter().filter(|morsel| !morsel.is_empty()).collect();
         if morsels.is_empty() {
             return !self.is_closed();
@@ -194,64 +217,55 @@ impl Queue {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         self.append_locked(&mut state, morsels)
     }
+}
 
-    /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
-    /// names no region a package in flight names.
+impl<T: Clone + PartialEq> Queue<T> {
+    /// Reserve activity and move the head into flight under one lock. Ordered queues run one
+    /// claim at a time. Other queues can run disjoint input regions concurrently.
     fn claim<R>(
         &self,
-        pipeline: usize,
         ordered: bool,
+        overlaps: impl Fn(&T, &T) -> bool,
         reserve: impl FnOnce() -> Option<R>,
-    ) -> Option<(WorkPackage, R)> {
+    ) -> Option<(usize, T, R)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // A pipeline can be notified of a region again before its package for the region is
-        // acknowledged, as a reader keyed by one row is at each push of what it reads. Two
-        // packages naming one region would read it at once, and the first to finish releases what
-        // the other still reads, so the later one waits, and the packages behind it with it.
-        let overlaps = |state: &QueueState| {
-            state.ready.front().is_some_and(|(_, next)| {
-                state
-                    .in_flight
-                    .values()
-                    .any(|running| !next.intersect(running).is_empty())
-            })
-        };
-        // An append publishes prerequisite work before queuing this package. Inspect dependencies
-        // after observing it under the lock; the check reads counters and takes no queue lock.
-        if state.ready.is_empty() || (ordered && !state.in_flight.is_empty()) || overlaps(&state) {
+        let (_, head) = state.ready.front()?;
+        if state
+            .in_flight
+            .values()
+            .any(|running| ordered || overlaps(head, running))
+        {
             return None;
         }
         let reservation = reserve()?;
-        let (index, guard) = state.ready.pop_front()?;
-        state.in_flight.insert(index, guard.clone());
-        Some((
-            WorkPackage {
-                pipeline: PipelineId(pipeline),
-                guard,
-                index,
-            },
-            reservation,
-        ))
+        let (index, item) = state.ready.pop_front()?;
+        state.in_flight.insert(index, item.clone());
+        Some((index, item, reservation))
     }
 
-    /// Remove a matching claim, and answer whether it was one: `None` where no claim matches, and
-    /// otherwise whether the package at the head of the queue met the removed one, which
-    /// [`claim`](Self::claim) holds back while they overlap. Monotonic indices distinguish
-    /// repeated reads of the same guard.
-    fn acknowledge(&self, package: &WorkPackage, on_ack: impl FnOnce()) -> Option<bool> {
+    fn acknowledge(
+        &self,
+        index: usize,
+        item: &T,
+        on_ack: impl FnOnce(),
+        overlaps: impl Fn(&T, &T) -> bool,
+    ) -> Option<bool> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.in_flight.get(&package.index) != Some(&package.guard) {
+        if state.in_flight.get(&index) != Some(item) {
             return None;
         }
         on_ack();
-        state.in_flight.remove(&package.index);
-        let freed_head = state
-            .ready
-            .front()
-            .is_some_and(|(_, next)| !next.intersect(&package.guard).is_empty());
-        Some(freed_head)
+        state.in_flight.remove(&index);
+        Some(
+            state
+                .ready
+                .front()
+                .is_some_and(|(_, head)| overlaps(head, item)),
+        )
     }
+}
 
+impl<T> Queue<T> {
     /// Reserve `count` indices while the queue is open, and answer the first; `None` once it is
     /// closed.
     fn reserve(&self, count: usize) -> Option<usize> {
@@ -394,6 +408,10 @@ pub struct Dispatcher {
     /// a release that read the count before a later hold fails
     /// ([`release_followers_if`](Self::release_followers_if)).
     holds: Vec<AtomicU64>,
+    /// A control queue per settlement group. Visits have no input region or pipeline finish.
+    visits: Vec<Queue<()>>,
+    /// Rotate the first group checked after each successful control claim.
+    next_visit: AtomicUsize,
     /// How many pipelines have not finished. The finish that brings it to zero ends the run.
     unfinished: AtomicUsize,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
@@ -503,6 +521,8 @@ impl Dispatcher {
             infos,
             states,
             holds: Vec::new(),
+            visits: Vec::new(),
+            next_visit: AtomicUsize::new(0),
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -1203,15 +1223,62 @@ impl Dispatcher {
         reserve: impl FnOnce() -> Option<R>,
     ) -> Option<(WorkPackage, R)> {
         let state = &self.states[pipeline];
-        state
-            .queue
-            .claim(pipeline, self.infos[pipeline].ordered, || {
-                if self.takes_from(pipeline) {
-                    reserve()
-                } else {
-                    None
-                }
-            })
+        let (index, guard, reservation) = state.queue.claim(
+            self.infos[pipeline].ordered,
+            |a, b| !a.intersect(b).is_empty(),
+            || self.takes_from(pipeline).then(reserve).flatten(),
+        )?;
+        Some((
+            WorkPackage {
+                pipeline: PipelineId(pipeline),
+                guard,
+                index,
+            },
+            reservation,
+        ))
+    }
+
+    /// Keep one pending visit even if the previous visit is in flight. Testing and appending
+    /// under the queue lock coalesces concurrent wakes on either side of a claim.
+    fn offer_visit(&self, group: usize) {
+        let queue = &self.visits[group];
+        let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.ready.is_empty() {
+            let index = queue.reserve(1).expect("control queues live for the run");
+            state.ready.push_back((index, ()));
+            drop(state);
+            self.advance();
+        }
+    }
+
+    fn start_visits(&self) {
+        for group in 0..self.visits.len() {
+            self.offer_visit(group);
+        }
+    }
+
+    fn claim_visit<R>(&self, reserve: impl Fn() -> R) -> Option<(ScopeVisit, R)> {
+        let count = self.visits.len();
+        let start = self.next_visit.load(Ordering::Relaxed);
+        for group in (start..count).chain(0..start) {
+            if let Some((index, (), activity)) =
+                self.visits[group].claim(true, |_, _| true, || Some(reserve()))
+            {
+                self.next_visit
+                    .store((group + 1) % count, Ordering::Relaxed);
+                return Some((ScopeVisit { group, index }, activity));
+            }
+        }
+        None
+    }
+
+    fn acknowledge_visit(&self, visit: ScopeVisit) {
+        let freed = self.visits[visit.group]
+            .acknowledge(visit.index, &(), || (), |_, _| true)
+            .expect("acknowledge a claimed settlement visit once");
+        if freed {
+            self.advance();
+        }
     }
 
     /// Whether `pipeline` may finish: it is running, its queue is closed and every package in it
@@ -1253,17 +1320,19 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_with(preferred, &|_| true, &|_| Some(())).0
+        self.try_claim_with(preferred, &|_| true, &|_| Some(()), || None)
+            .0
     }
 
     /// A successful reservation stays with its claim. A losing finish drops its reservation
     /// before the scan tries another pipeline.
-    fn try_claim_with<R: Default>(
+    fn try_claim_with<R: Default, P: From<WorkPackage>>(
         &self,
         preferred: Option<PipelineId>,
         admits: &dyn Fn(PipelineId) -> bool,
         reserve: &dyn Fn(PipelineId) -> Option<R>,
-    ) -> (Next, R) {
+        control: impl FnOnce() -> Option<(P, R)>,
+    ) -> (Next<P>, R) {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
         let generation = self.generation.load(Ordering::SeqCst);
@@ -1272,6 +1341,9 @@ impl Dispatcher {
         }
         if self.stopped.load(Ordering::SeqCst) {
             return (Next::Done, R::default());
+        }
+        if let Some((package, reservation)) = control() {
+            return (Next::Package(package), reservation);
         }
         let count = self.infos.len();
         if let Some(preferred) = preferred {
@@ -1282,7 +1354,7 @@ impl Dispatcher {
             .filter(|&p| admits(PipelineId(p)))
             .find_map(|p| self.claim_from(p, || reserve(PipelineId(p))))
         {
-            return (Next::Package(package), reservation);
+            return (Next::Package(package.into()), reservation);
         }
         for p in (0..count).filter(|&p| admits(PipelineId(p))) {
             if let Some(reservation) = self.try_begin_finish(p, || reserve(PipelineId(p))) {
@@ -1419,26 +1491,31 @@ impl Dispatcher {
         let p = package.pipeline.0;
         let state = self.state(package.pipeline);
         let mut acknowledged = 0;
-        let freed_head = state.queue.acknowledge(&package, || {
-            // Record consumption before unlocking the next ordered claim or publishing finish.
-            #[cfg(test)]
-            self.record(Event::Consume {
-                pipeline: package.pipeline,
-                guard: package.guard.clone(),
-            });
-            #[cfg(debug_assertions)]
-            {
-                let mut consumed = state
-                    .consumed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                *consumed = Some(match consumed.take() {
-                    Some(before) => before.union(&package.guard),
-                    None => package.guard.clone(),
+        let freed_head = state.queue.acknowledge(
+            package.index,
+            &package.guard,
+            || {
+                // Record consumption before unlocking the next ordered claim or publishing finish.
+                #[cfg(test)]
+                self.record(Event::Consume {
+                    pipeline: package.pipeline,
+                    guard: package.guard.clone(),
                 });
-            }
-            acknowledged = state.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
-        });
+                #[cfg(debug_assertions)]
+                {
+                    let mut consumed = state
+                        .consumed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    *consumed = Some(match consumed.take() {
+                        Some(before) => before.union(&package.guard),
+                        None => package.guard.clone(),
+                    });
+                }
+                acknowledged = state.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
+            },
+            |a, b| !a.intersect(b).is_empty(),
+        );
         let refused = || match self.infos[p].ordered {
             true => format!(
                 "ordered pipeline {p} consumes the morsel claimed for it, in queue order: {:?}",

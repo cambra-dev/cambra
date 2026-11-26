@@ -92,7 +92,7 @@ impl Drop for ActiveClaim<'_> {
 /// One drain between source polls. Claimants share the last quiet generation so a
 /// worker's completed publication pass also answers the caller's quiescence check.
 #[derive(Default)]
-enum Drain {
+enum DrainPhase {
     #[default]
     Inactive,
     Replay,
@@ -100,6 +100,13 @@ enum Drain {
         live: bool,
         settled_at: Option<u64>,
     },
+}
+
+#[derive(Default)]
+struct Drain {
+    phase: DrainPhase,
+    /// Reoffer these groups once handlers have released the handles they could not inspect.
+    blocked: std::collections::BTreeSet<usize>,
 }
 
 /// The run's worker threads, and which pipelines they claim from.
@@ -220,7 +227,10 @@ impl WorkerPool {
         replay: bool,
     ) -> Vec<ScopedJoinHandle<'scope, ()>> {
         if replay {
-            *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Replay;
+            self.drain
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .phase = DrainPhase::Replay;
         }
         if !self.threaded() {
             return Vec::new();
@@ -262,11 +272,21 @@ impl WorkerPool {
         dispatcher: &'a Dispatcher,
         preferred: Option<PipelineId>,
         admits: &dyn Fn(PipelineId) -> bool,
-    ) -> (Next, (Option<ReservedSeed<'a>>, Option<ActiveClaim<'a>>)) {
-        dispatcher.try_claim_with(preferred, admits, &|p| {
-            let seed = self.reserve_seed(p).ok()?;
-            Some((seed, self.threaded().then(|| self.active_claim(dispatcher))))
-        })
+    ) -> (
+        Next<WorkerPackage>,
+        (Option<ReservedSeed<'a>>, Option<ActiveClaim<'a>>),
+    ) {
+        let activity = || self.threaded().then(|| self.active_claim(dispatcher));
+        dispatcher.try_claim_with(
+            preferred,
+            admits,
+            &|p| Some((self.reserve_seed(p).ok()?, activity())),
+            || {
+                dispatcher
+                    .claim_visit(|| (None, activity()))
+                    .map(|(visit, reservation)| (WorkerPackage::Settle(visit), reservation))
+            },
+        )
     }
 
     fn active_claim<'a>(&'a self, dispatcher: &'a Dispatcher) -> ActiveClaim<'a> {
@@ -296,24 +316,26 @@ impl WorkerPool {
                         .reach(call);
                 };
                 match next {
-                    Next::Package(package) => {
+                    Next::Package(WorkerPackage::Settle(visit)) => {
+                        self.settle_visit(dispatcher, visit)
+                    }
+                    Next::Package(WorkerPackage::Input(package)) => {
                         preferred = Some(package.pipeline);
                         #[cfg(test)]
                         self.count_claim(dispatcher, &package, worker);
                         let pipeline = package.pipeline;
                         self.consume(dispatcher, package, &mut reach_seed);
-                        self.completed_pipeline(dispatcher, pipeline);
+                        self.wake_scopes(dispatcher, pipeline);
                         #[cfg(test)]
                         self.collect_counters();
                     }
                     Next::Finish { pipeline } => {
                         self.finish(dispatcher, pipeline, &mut reach_seed);
-                        self.completed_pipeline(dispatcher, pipeline);
+                        self.wake_scopes(dispatcher, pipeline);
                     }
                     Next::Done | Next::Failed => break,
                     Next::Wait(generation) => {
-                        if !self.settle_one(dispatcher) && !self.try_settle(dispatcher, &generation)
-                        {
+                        if !self.try_settle(dispatcher, &generation) {
                             dispatcher.wait(generation);
                         }
                     }
@@ -328,15 +350,15 @@ impl WorkerPool {
         self.scope_steps.wake(dispatcher, pipeline);
     }
 
-    pub(super) fn completed_pipeline(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
-        self.wake_scopes(dispatcher, pipeline);
-        // The package or finish already counts as active until this visit returns.
-        self.scope_steps.settle_one(dispatcher, || ());
-    }
-
-    pub(super) fn settle_one(&self, dispatcher: &Dispatcher) -> bool {
-        self.scope_steps
-            .settle_one(dispatcher, || self.active_claim(dispatcher))
+    pub(super) fn settle_visit(&self, dispatcher: &Dispatcher, visit: ScopeVisit) {
+        if self.scope_steps.settle(dispatcher, visit.group) {
+            self.drain
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .blocked
+                .insert(visit.group);
+        }
+        dispatcher.acknowledge_visit(visit);
     }
 
     #[cfg(test)]
@@ -350,15 +372,17 @@ impl WorkerPool {
     /// live driver and the workers wait for that publication before touching their inputs.
     pub(super) fn replay_before_sources(&self, dispatcher: &Dispatcher) {
         let mut drain = self.drain.lock().unwrap_or_else(PoisonError::into_inner);
-        if matches!(*drain, Drain::Replay) {
+        if matches!(drain.phase, DrainPhase::Replay) {
             self.publish_held(dispatcher);
-            *drain = Drain::Inactive;
+            drain.phase = DrainPhase::Inactive;
         }
     }
 
     pub(super) fn begin_drain(&self, dispatcher: &Dispatcher, live: bool) {
-        self.scope_steps.start();
-        *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Active {
+        self.drain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .phase = DrainPhase::Active {
             live,
             settled_at: None,
         };
@@ -366,7 +390,10 @@ impl WorkerPool {
     }
 
     pub(super) fn end_drain(&self) {
-        *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Inactive;
+        self.drain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .phase = DrainPhase::Inactive;
     }
 
     /// Workers skip a pass another claimant owns and return to the package queues.
@@ -381,17 +408,17 @@ impl WorkerPool {
     pub(super) fn drained(&self, dispatcher: &Dispatcher, generation: &Generation) -> bool {
         let mut slot = self.drain.lock().unwrap_or_else(PoisonError::into_inner);
         self.settle(dispatcher, generation, &mut slot);
-        let quiet = matches!(*slot, Drain::Active {settled_at: Some(at), ..} if at == generation.0)
+        let quiet = matches!(slot.phase, DrainPhase::Active {settled_at: Some(at), ..} if at == generation.0)
             && !self.may_progress(dispatcher)
             && !dispatcher.changed_since(generation);
         if quiet {
-            *slot = Drain::Inactive;
+            slot.phase = DrainPhase::Inactive;
         }
         quiet
     }
 
     fn settle(&self, dispatcher: &Dispatcher, generation: &Generation, drain: &mut Drain) -> bool {
-        let Drain::Active { live, settled_at } = drain else {
+        let DrainPhase::Active { live, settled_at } = &mut drain.phase else {
             return false;
         };
         if *settled_at == Some(generation.0)
@@ -400,9 +427,13 @@ impl WorkerPool {
         {
             return false;
         }
-        if self.scope_steps.verify_one(dispatcher, generation)
-            || (*live && self.publish_held(dispatcher))
-        {
+        if !drain.blocked.is_empty() {
+            for group in std::mem::take(&mut drain.blocked) {
+                dispatcher.offer_visit(group);
+            }
+            return true;
+        }
+        if *live && self.publish_held(dispatcher) {
             return true;
         }
         *settled_at = Some(generation.0);
