@@ -591,7 +591,7 @@ impl Tile {
     }
 
     fn has_absent_fields(&self) -> bool {
-        matches!(self, Tile::Record { absent, .. } if !absent.is_empty())
+        matches!(self, Tile::Record { fields, absent } if !absent.is_empty() || fields.values().any(Tile::has_absent_fields))
     }
 
     /// Complementary fragments of a record can grow under the same key.

@@ -141,10 +141,10 @@ impl SinkBreaker {
 }
 
 impl Breaker for SinkBreaker {
-    fn reads_input_fields(&self) -> bool {
+    fn input_read_rule(&self) -> ReadRegion {
         Self::reading(&self.producer)
             .as_ref()
-            .is_some_and(|p| p.reads_record_fields())
+            .map_or(enclosing_read_region, |p| p.read_rule())
     }
 
     /// A consume hands the sink what the answer holds and releases it, so a row is handed once. A

@@ -1,7 +1,9 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+use bit_set::BitSet;
 
 use smol_str::SmolStr;
 
@@ -733,6 +735,32 @@ impl Projection {
             .then_some((keys, values))
     }
 
+    /// A cache can retain this projection when it can cut the selected fields
+    /// and represent the omitted fields as empty values over the same rows.
+    fn cached_row_fields(&self, tiling: &Tiling) -> Option<(&Predicate, &Projection)> {
+        fn can_omit(field: &Tiling) -> bool {
+            match field {
+                Tiling::Record(fields) => fields.values().all(can_omit),
+                Tiling::Scalar(_) | Tiling::DataFunction { .. } => true,
+                Tiling::Store { .. } | Tiling::Aggregation { .. } => false,
+            }
+        }
+        let (keys, values) = self.row_fields()?;
+        let Tiling::DataFunction { codomain, .. } = tiling else {
+            return None;
+        };
+        let Tiling::Record(fields) = &**codomain else {
+            return None;
+        };
+        fields
+            .iter()
+            .all(|(name, field)| {
+                matches!(field.deepest_values(), Tiling::Scalar(_))
+                    || (values.field(name) == Projection::Nothing && can_omit(field))
+            })
+            .then_some((keys, values))
+    }
+
     /// Whether this projection names part of some value: a [`Within`](Self::Within) or an `Or`
     /// with one.
     pub fn names_part_of_values(&self) -> bool {
@@ -1024,7 +1052,7 @@ pub(crate) fn skeleton(guards: &[&TileGuard]) -> Option<Tiling> {
             },
             TileGuard::Record(parts) => {
                 let mut fields = match shape {
-                    None => std::collections::HashMap::new(),
+                    None => HashMap::new(),
                     Some(Tiling::Record(fields)) => fields,
                     Some(_) => return None,
                 };
@@ -1219,10 +1247,9 @@ fn within_paths(stated: &Predicate, keys: &Predicate, level: usize, depth: usize
 
 impl TileGuard {
     /// A cached record can cut a field and its nested keys to the requested path.
-    pub(crate) fn read_region_for(self, reads_fields: bool) -> Self {
-        if reads_fields
-            && matches!(&self, TileGuard::Function(FunctionGuard::Codomain(_)))
-            && Projection::of(&self).is_ok_and(|p| p.row_fields().is_some())
+    pub(crate) fn cached_read_region(self, tiling: &Tiling) -> Self {
+        if matches!(&self, TileGuard::Function(FunctionGuard::Codomain(_)))
+            && Projection::of(&self).is_ok_and(|p| p.cached_row_fields(tiling).is_some())
         {
             return self;
         }
@@ -1595,6 +1622,10 @@ impl Tile {
         let mut held = vec![false; domain.len()];
         for (name, field) in fields {
             let part = values.field(name);
+            if part == Projection::Nothing {
+                omit_record_value(field, absent, name, domain.len());
+                continue;
+            }
             if field.is_data_function() {
                 let paths = row_paths.get_or_insert_with(|| {
                     (0..domain.len())
@@ -1602,20 +1633,14 @@ impl Tile {
                         .collect::<Vec<_>>()
                 });
                 cut_collection_field(field, &part, keys, &closed, paths);
-                if part != Projection::Nothing {
-                    // An existing parent's selected collection can be empty. Its
-                    // run is still part of this answer, including any absence it states.
-                    held.fill(true);
-                }
+                // A selected collection can be empty and still state an absence.
+                held.fill(true);
                 continue;
             }
             let Tile::Scalar(cells) = field else {
-                unreachable!()
+                unreachable!("a selected keyless field is scalar")
             };
-            if part == Projection::Nothing && !domain.is_empty() {
-                *cells = cells.select_indices(std::iter::empty(), 0);
-                absent.insert(name.clone(), (0..domain.len()).collect());
-            } else if !cells.is_empty() {
+            if !cells.is_empty() {
                 let missing = absent.get(name);
                 for (row, held) in held.iter_mut().enumerate() {
                     *held |= missing.is_none_or(|bits| !bits.contains(row));
@@ -1631,9 +1656,7 @@ impl Tile {
     ///
     /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
     pub fn restrict_to(&mut self, projection: &Projection, tiling: &Tiling) {
-        if let Some((keys, values)) = projection.row_fields()
-            && tiling.has_projectable_record_fields()
-        {
+        if let Some((keys, values)) = projection.cached_row_fields(tiling) {
             self.restrict_to_row_fields(keys, values);
             return;
         }
@@ -1654,6 +1677,34 @@ impl Tile {
                 }
             }
         }
+    }
+}
+
+/// Omit a field, preserving its parent row positions and clearing its completeness.
+fn omit_record_value(
+    field: &mut Tile,
+    absent: &mut HashMap<SmolStr, BitSet>,
+    name: &SmolStr,
+    rows: usize,
+) {
+    match field {
+        Tile::Scalar(cells) => {
+            *cells = cells.select_indices(std::iter::empty(), 0);
+            if rows > 0 {
+                absent.insert(name.clone(), (0..rows).collect());
+            }
+        }
+        Tile::Record { fields, absent } => {
+            for (name, child) in fields {
+                omit_record_value(child, absent, name, rows);
+            }
+        }
+        Tile::DataFunction { domain, .. } => {
+            let keep = vec![false; domain.len()];
+            field.retain_keys(&keep);
+            cut_statements(field, 1, 1, &Predicate::False, &[], Predicate::False);
+        }
+        _ => unreachable!("the read region requires this omitted field to be representable"),
     }
 }
 
@@ -1992,6 +2043,52 @@ mod tests {
             assert_eq!(decoded, selection);
             assert_eq!(decoded.guard(&customers), guard);
         }
+    }
+
+    #[test]
+    fn omitting_a_nested_record_keeps_the_release_at_the_selected_scalar() {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record(
+                [
+                    ("id".into(), scalar.clone()),
+                    (
+                        "profile".into(),
+                        Tiling::Record([("rank".into(), scalar)].into()),
+                    ),
+                ]
+                .into(),
+            ),
+        );
+        let column = |n| Tile::Scalar(ColumnValue::Ints(vec![n]));
+        let row = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), column(7)),
+                    (
+                        "profile".into(),
+                        Tile::record([("rank".into(), column(1))].into()),
+                    ),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let projection = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field("id", Projection::Everything),
+        );
+        let mut id = row.clone();
+        id.restrict_to(&projection, &tiling);
+        assert_eq!(id.to_guard(), projection.guard(&tiling));
+        let mut rest = row.clone();
+        rest.remove_guarded(id.to_guard());
+        id.merge(rest);
+        assert_eq!(id, row);
     }
 
     #[test]

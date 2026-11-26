@@ -1696,6 +1696,14 @@ impl InputId {
     pub const ONLY: InputId = InputId(0);
 }
 
+/// A pure rule the planner can bind to an input tiling. The queue and the producer
+/// apply the same rule to each requested guard, without locking a live producer.
+pub type ReadRegion = fn(TileGuard, &Tiling) -> TileGuard;
+
+pub(crate) fn enclosing_read_region(requested: TileGuard, _: &Tiling) -> TileGuard {
+    requested.read_region()
+}
+
 /// The end of a pipeline, as the dispatcher drives it: it consumes the pipeline's work packages.
 /// [`consume_impl`] pulls the breaker's input at a guard, merges the answer, and releases the
 /// input at what the answer stated once it has taken delivery of it, so the driver handles no
@@ -1706,9 +1714,9 @@ impl InputId {
 ///
 /// [`consume_impl`]: Self::consume_impl
 pub trait Breaker {
-    /// Whether this input pulls individual fields and paths within collection fields of keyed records.
-    fn reads_input_fields(&self) -> bool {
-        false
+    /// Region this breaker's input will read for a dispatched projection.
+    fn input_read_rule(&self) -> ReadRegion {
+        enclosing_read_region
     }
 
     /// Whether packages naming disjoint regions of the input may run this breaker's consume at
@@ -1892,9 +1900,13 @@ impl DroppedRows {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer: Send + Sync {
-    /// Whether a cached keyed record can deliver fields and paths within collection fields independently.
-    fn reads_record_fields(&self) -> bool {
-        false
+    /// Resolve a requested guard to the region this producer can actually deliver.
+    fn read_rule(&self) -> ReadRegion {
+        enclosing_read_region
+    }
+
+    fn read_region(&self, requested: TileGuard) -> TileGuard {
+        self.read_rule()(requested, self.tiling())
     }
 
     /// The entry before `input`, where an enclosing breaker's planner can receive that input's
@@ -1996,7 +2008,7 @@ pub trait TileProducer: Send + Sync {
     /// it restates, and the answer is cut to the projection.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&self, projection_guard: TileGuard) -> Tile {
-        let projection_guard = projection_guard.read_region_for(self.reads_record_fields());
+        let projection_guard = self.read_region(projection_guard);
         // A pull at keys of a level the producer does not restate pulls the keys above them at
         // the nearest level it restates, and the answer is cut to the keys asked for: pulling
         // more is sound for a `get`, so every producer answers a projection at every level.

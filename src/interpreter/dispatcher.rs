@@ -167,7 +167,7 @@ const CLOSED: usize = 1 << (usize::BITS - 1);
 
 /// Unclaimed and in-flight packages of one pipeline. Acknowledged packages retain no entry.
 struct Queue {
-    reads_record_fields: bool,
+    read_region: Box<dyn Fn(TileGuard) -> TileGuard + Send + Sync>,
     // shared-state-ok: package lifecycle and guards naming input regions; never tiles.
     state: Mutex<QueueState>,
     /// Reservations include packages whose append still holds the queue lock. Closing freezes
@@ -186,10 +186,16 @@ struct QueueState {
 impl Queue {
     fn new() -> Self {
         Queue {
-            reads_record_fields: false,
+            read_region: Box::new(TileGuard::read_region),
             state: Mutex::new(QueueState::default()),
             reserved: AtomicUsize::new(0),
         }
+    }
+
+    fn plan_reads(&mut self, breaker: &dyn Breaker) {
+        let resolve = breaker.input_read_rule();
+        let tiling = breaker.input_tiling(InputId::ONLY);
+        self.read_region = Box::new(move |guard| resolve(guard, &tiling));
     }
 
     /// Append each of `morsels` as a package. An empty morsel is no package. A closed queue takes
@@ -203,10 +209,9 @@ impl Queue {
             return false;
         };
         for (index, morsel) in (first..).zip(morsels) {
-            state.ready.push_back((
-                index,
-                morsel.clone().read_region_for(self.reads_record_fields),
-            ));
+            state
+                .ready
+                .push_back((index, (self.read_region)(morsel.clone())));
         }
         true
     }

@@ -95,22 +95,6 @@ impl Tiling {
         }
     }
 
-    /// A keyed record whose fields are scalar columns or collection levels over scalar columns.
-    pub(crate) fn has_projectable_record_fields(&self) -> bool {
-        let Tiling::DataFunction { codomain, .. } = self else {
-            return false;
-        };
-        let Tiling::Record(fields) = &**codomain else {
-            return false;
-        };
-        fields.values().all(|mut field| {
-            while let Tiling::DataFunction { codomain, .. } = field {
-                field = codomain;
-            }
-            matches!(field, Tiling::Scalar(_))
-        })
-    }
-
     /// This tiling's empty tile at **no rows**, which is what a partial fold seeds with:
     /// its accumulator carries presence in its row count, so an empty one must have none.
     ///

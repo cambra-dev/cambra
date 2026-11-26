@@ -1748,7 +1748,7 @@ impl MemoProducer {
     fn consume_input(&self, guard: TileGuard, pushes: Option<&mut Pushes<'_>>) {
         assert!(guard.check_from(self.input.tiling()));
         let projection = guard.projection_for(self);
-        if projection.row_fields().is_some() && self.input.reads_record_fields() {
+        if projection.row_fields().is_some() && self.input.read_region(guard.clone()) == guard {
             self.consume_fields(guard, &projection, pushes);
             return;
         }
@@ -2015,8 +2015,8 @@ fn position_closure(tile: &Tile, tiling: &Tiling) -> Option<Predicate> {
 }
 
 impl Breaker for MemoProducer {
-    fn reads_input_fields(&self) -> bool {
-        self.input.reads_record_fields()
+    fn input_read_rule(&self) -> ReadRegion {
+        self.input.read_rule()
     }
 
     /// A consume caches the answer and releases what it states ([`MemoProducer::consume_input`]).
@@ -2113,8 +2113,8 @@ impl BreakingProducer for MemoProducer {
 }
 
 impl TileProducer for MemoProducer {
-    fn reads_record_fields(&self) -> bool {
-        self.tiling().has_projectable_record_fields()
+    fn read_rule(&self) -> ReadRegion {
+        TileGuard::cached_read_region
     }
 
     fn state_info(&self) -> ProducerStateInfo {
@@ -2164,7 +2164,7 @@ impl TileProducer for MemoProducer {
         // Releasing complementary fields can complete the release of their row. Apply
         // the accumulated guard so a later whole-row read cannot return its bare key.
         if matches!(guard, TileGuard::Function(FunctionGuard::Codomain(_)))
-            && self.reads_record_fields()
+            && matches!(self.tiling(), Tiling::DataFunction { codomain, .. } if matches!(&**codomain, Tiling::Record(_)))
         {
             cache.remove_guarded(self.obsolete_guard());
         } else {
