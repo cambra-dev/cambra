@@ -1264,36 +1264,29 @@ impl Execution {
             .collect()
     }
 
-    fn hold_followers(&self, dispatcher: &Dispatcher) {
-        for &(_, _, request, hold) in &self.bodies {
-            self.request_scope(request)
-                .hold_followers(dispatcher, request, hold);
-        }
-    }
-
     pub(super) fn consume(
         &self,
         dispatcher: &Dispatcher,
         reach: &mut Reach<'_>,
         package: WorkPackage,
     ) {
-        match &self.handlers[package.pipeline.0] {
+        let pipeline = package.pipeline;
+        match &self.handlers[pipeline.0] {
             Handler::Request(scope) => scope.begin(dispatcher, package),
             Handler::Step(id) => self.request_scope(*id).step(dispatcher, package),
             Handler::Root | Handler::Body(_) | Handler::Seed(..) => {
                 consume_with(dispatcher, reach, package);
-                self.queue_scope_requests(dispatcher);
+                self.queue_scope_requests(dispatcher, pipeline);
             }
         }
-        self.hold_followers(dispatcher);
     }
 
     /// Have each scope queue the requests offered to it where they can run. A push that offers
     /// them lands in a consume, and a store opens on the consume of its seed, both before the
     /// pushing pipeline finishes and closes the queue of the scope's pipeline that reads it.
-    fn queue_scope_requests(&self, dispatcher: &Dispatcher) {
-        for handler in &self.handlers {
-            if let Handler::Request(scope) = handler {
+    fn queue_scope_requests(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
+        for &reader in &dispatcher.infos[pipeline.0].readers {
+            if let Handler::Request(scope) = &self.handlers[reader] {
                 scope.try_queue_requests(dispatcher);
             }
         }
@@ -1311,16 +1304,10 @@ impl Execution {
                 self.request_scope(*owner).finish_step(dispatcher, pipeline);
             }
             Handler::Root | Handler::Body(_) | Handler::Seed(..) => {
-                self.queue_scope_requests(dispatcher);
                 finish_with(dispatcher, reach, pipeline);
-                for &reader in &dispatcher.infos[pipeline.0].readers {
-                    if let Handler::Request(scope) = &self.handlers[reader] {
-                        scope.try_queue_requests(dispatcher);
-                    }
-                }
+                self.queue_scope_requests(dispatcher, pipeline);
             }
         }
-        self.hold_followers(dispatcher);
     }
 
     /// Assert what [`RunObserver::drained`] promises: no claim is in flight. A pause discards what
@@ -1423,18 +1410,25 @@ impl Execution {
                 }
             };
             match next {
-                Next::Package(package) if workers.admits(package.pipeline) => {
-                    workers.consume_on_coordinator(dispatcher, package, &mut claim_reach)
-                }
-                Next::Package(package) => self.consume(dispatcher, &mut claim_reach, package),
-                Next::Finish { pipeline } if workers.admits(pipeline) => {
-                    workers.finish(dispatcher, pipeline, &mut claim_reach)
+                Next::Package(package) => {
+                    let pipeline = package.pipeline;
+                    if workers.admits(pipeline) {
+                        workers.consume_on_coordinator(dispatcher, package, &mut claim_reach);
+                    } else {
+                        self.consume(dispatcher, &mut claim_reach, package);
+                    }
+                    workers.completed_pipeline(dispatcher, pipeline);
                 }
                 Next::Finish { pipeline } => {
-                    workers.finishing(pipeline, &mut claim_reach);
-                    self.finish(dispatcher, &mut claim_reach, pipeline)
+                    if workers.admits(pipeline) {
+                        workers.finish(dispatcher, pipeline, &mut claim_reach);
+                    } else {
+                        workers.finishing(pipeline, &mut claim_reach);
+                        self.finish(dispatcher, &mut claim_reach, pipeline);
+                    }
+                    workers.completed_pipeline(dispatcher, pipeline);
                 }
-                Next::Wait(_) if workers.help_active_claim(dispatcher) => {}
+                Next::Wait(_) if workers.settle_one(dispatcher) => {}
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {
                     dispatcher.wait(generation)
                 }
@@ -3558,7 +3552,10 @@ fn drive_live(
         observer.polled();
         let mut changed = false;
         for at in live.iter_mut() {
-            changed |= at.poll(dispatcher, execution, reach);
+            if at.poll(dispatcher, execution, reach) {
+                changed = true;
+                workers.wake_scopes(dispatcher, at.pipeline);
+            }
         }
         match execution.claim_until_quiescent(dispatcher, reach, workers, true) {
             Claimed::Done => return true,
@@ -3892,9 +3889,11 @@ mod tests {
                     .expect("settlement waited for the busy member");
             });
             ready.recv().unwrap();
+            steps.wake(&dispatcher, request);
+            assert!(steps.settle_one(&dispatcher, || ()));
             assert!(
-                !steps.poll(&dispatcher),
-                "a busy check alone makes no progress"
+                !steps.settle_one(&dispatcher, || ()),
+                "a busy check does not spin"
             );
             assert_ne!(dispatcher.followers_hold(hold).0 & 1, 0);
             assert_eq!(dispatcher.outstanding(step), 0);
@@ -3905,13 +3904,17 @@ mod tests {
             dispatcher.acknowledge(package);
             release.send(()).unwrap();
         });
-        assert!(steps.poll(&dispatcher));
+        let Next::Wait(generation) = dispatcher.try_claim(None) else {
+            panic!("no ordinary claim can advance the scope");
+        };
+        assert!(steps.verify_one(&dispatcher, &generation));
         assert_eq!(
             dispatcher.outstanding(step),
             1,
-            "the next pass admits the deferred step"
+            "the quiet retry admits the deferred step"
         );
-        assert!(!steps.poll(&dispatcher), "only one step is outstanding");
+        while steps.settle_one(&dispatcher, || ()) {}
+        assert_eq!(dispatcher.outstanding(step), 1);
     }
 
     #[test]
@@ -3948,11 +3951,16 @@ mod tests {
             .with_body(|body| body.global(body.driver));
         dispatcher.queue_for(driver, &guard);
         let package = dispatcher.claim_of(driver).expect("the writer's driver");
+        // Only the four connected writers see this completion. The fifth is ready, so
+        // probing it would queue its step and make this assertion fail.
+        steps.wake(&dispatcher, driver);
+        while steps.settle_one(&dispatcher, || ()) {}
+        assert_eq!(dispatcher.outstanding(controls[4].1), 0);
         let running = controls[0].0.write();
-        assert!(steps.poll(&dispatcher));
+        steps.wake(&dispatcher, PipelineId(4));
+        while steps.settle_one(&dispatcher, || ()) {}
         assert_eq!(dispatcher.outstanding(controls[4].1), 1);
         drop(running);
-        while steps.poll(&dispatcher) {}
         assert!(
             controls[..4]
                 .iter()
@@ -3960,10 +3968,11 @@ mod tests {
             "a connected decision would advance the driver's snapshot"
         );
         dispatcher.acknowledge(package);
+        steps.wake(&dispatcher, driver);
         // Keep every writer eligible. Each connected writer gets a turn before any repeats.
         let mut winners = Vec::new();
         for _ in 0..4 {
-            while steps.poll(&dispatcher) {}
+            while steps.settle_one(&dispatcher, || ()) {}
             let eligible: Vec<_> = (0..4)
                 .filter(|&id| dispatcher.outstanding(controls[id].1) != 0)
                 .collect();
@@ -3978,6 +3987,7 @@ mod tests {
                 .claim_of(controls[id].1)
                 .expect("the admitted step");
             dispatcher.acknowledge(step);
+            steps.wake(&dispatcher, controls[id].1);
         }
     }
 

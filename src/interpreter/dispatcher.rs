@@ -2712,6 +2712,9 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
     if let Some(pushes) = landed {
         dispatcher.land(pushes);
     }
+    if let Some(body) = dispatcher.infos[p].hold {
+        dispatcher.hold_followers(body);
+    }
     dispatcher.acknowledge(package);
 }
 
@@ -2725,6 +2728,7 @@ enum Publication {
 fn try_push_held(
     dispatcher: &Dispatcher,
     pipelines: impl IntoIterator<Item = PipelineId>,
+    mut on_publication: impl FnMut(PipelineId),
     mut reach: impl FnMut(PipelineId, &mut Call<'_>) -> bool,
 ) -> Publication {
     let mut published = false;
@@ -2748,8 +2752,12 @@ fn try_push_held(
             };
         }
         if let Some(pushes) = landed {
-            published |= !pushes.pending.is_empty();
+            let changed = !pushes.pending.is_empty();
             dispatcher.land(pushes);
+            if changed {
+                published = true;
+                on_publication(pipeline);
+            }
         }
     }
     if published {

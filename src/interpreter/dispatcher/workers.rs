@@ -300,19 +300,19 @@ impl WorkerPool {
                         preferred = Some(package.pipeline);
                         #[cfg(test)]
                         self.count_claim(dispatcher, &package, worker);
+                        let pipeline = package.pipeline;
                         self.consume(dispatcher, package, &mut reach_seed);
-                        while self.scope_steps.poll(dispatcher) {}
+                        self.completed_pipeline(dispatcher, pipeline);
                         #[cfg(test)]
                         self.collect_counters();
                     }
                     Next::Finish { pipeline } => {
                         self.finish(dispatcher, pipeline, &mut reach_seed);
-                        while self.scope_steps.poll(dispatcher) {}
+                        self.completed_pipeline(dispatcher, pipeline);
                     }
                     Next::Done | Next::Failed => break,
                     Next::Wait(generation) => {
-                        if !self.help_active_claim(dispatcher)
-                            && !self.try_settle(dispatcher, &generation)
+                        if !self.settle_one(dispatcher) && !self.try_settle(dispatcher, &generation)
                         {
                             dispatcher.wait(generation);
                         }
@@ -324,23 +324,19 @@ impl WorkerPool {
         self.collect_counters();
     }
 
-    /// A handler can be inside a transition while another scope becomes runnable. Borrow its
-    /// activity count while checking, so the coordinator cannot report idle during publication.
-    pub(super) fn help_active_claim(&self, dispatcher: &Dispatcher) -> bool {
-        if self
-            .busy
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |busy| {
-                (busy != 0).then_some(busy + 1)
-            })
-            .is_err()
-        {
-            return false;
-        }
-        let advanced = self.scope_steps.poll(dispatcher);
-        if self.busy.fetch_sub(1, Ordering::SeqCst) == 1 {
-            dispatcher.wake_claimants();
-        }
-        advanced
+    pub(super) fn wake_scopes(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
+        self.scope_steps.wake(dispatcher, pipeline);
+    }
+
+    pub(super) fn completed_pipeline(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
+        self.wake_scopes(dispatcher, pipeline);
+        // The package or finish already counts as active until this visit returns.
+        self.scope_steps.settle_one(dispatcher, || ());
+    }
+
+    pub(super) fn settle_one(&self, dispatcher: &Dispatcher) -> bool {
+        self.scope_steps
+            .settle_one(dispatcher, || self.active_claim(dispatcher))
     }
 
     #[cfg(test)]
@@ -361,6 +357,7 @@ impl WorkerPool {
     }
 
     pub(super) fn begin_drain(&self, dispatcher: &Dispatcher, live: bool) {
+        self.scope_steps.start();
         *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Active {
             live,
             settled_at: None,
@@ -403,7 +400,9 @@ impl WorkerPool {
         {
             return false;
         }
-        if self.scope_steps.poll(dispatcher) || (*live && self.publish_held(dispatcher)) {
+        if self.scope_steps.verify_one(dispatcher, generation)
+            || (*live && self.publish_held(dispatcher))
+        {
             return true;
         }
         *settled_at = Some(generation.0);
@@ -416,6 +415,7 @@ impl WorkerPool {
             (0..self.pipelines.len())
                 .filter(|&id| !dispatcher.infos[id].readers.is_empty())
                 .map(PipelineId),
+            |id| self.wake_scopes(dispatcher, id),
             |id, call| {
                 match &self.pipelines[id.0] {
                     Some(WorkerPipeline::Breaker(spec)) => {
