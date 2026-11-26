@@ -185,7 +185,7 @@ use crate::ccl::RecordEntry;
 use crate::ccl::{
     BindingTransparency, Branch, Expr, Name, Type, TypedBinding, TypedExprNode,
     ccl_utils::is_free,
-    mut_scope::{self, Muts, is_mut_var, under_param, with},
+    mut_scope::{self, Muts, is_mut_var, under_params, with},
     opaque_output::is_annotated_result,
     provenance::{self, Nature},
     subst::Subst,
@@ -207,7 +207,8 @@ pub fn run(expr: Expr) -> Expr {
         if holds_raise(&expr) {
             short_circuits_as_branches(&mut expr);
         }
-        let normalized = normalize(expr, &Muts::new());
+        let muts = Muts::of_program(&expr);
+        let normalized = normalize(expr, &muts);
         share_collection_reads(normalized)
     };
     #[cfg(debug_assertions)]
@@ -620,8 +621,8 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             let_chain(binds, spine)
         }
 
-        TypedExprNode::Lambda { param, body } => {
-            let inner = under_param(muts, &param);
+        TypedExprNode::Lambda { params, body } => {
+            let inner = under_params(muts, &params);
             let annotated = is_annotated_result(&body);
             let body = normalize(*body, &inner);
             debug_assert!(
@@ -632,7 +633,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             );
             rebuild(TypedExprNode::Lambda {
                 body: Box::new(body),
-                param,
+                params,
             })
         }
 
@@ -715,6 +716,11 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             let_chain(binds, rebuild(TypedExprNode::Tuple(elts)))
         }
 
+        TypedExprNode::Arguments(elts) => {
+            let (binds, elts) = atomize_list(elts, muts);
+            let_chain(binds, rebuild(TypedExprNode::Arguments(elts)))
+        }
+
         // Lowering builds both of these directly (a `for` loop desugars to
         // `Compose([source, Lambda(...)])`; `++` lowers straight to
         // `Copair`), so both reach this pass, not only post-inference
@@ -769,13 +775,15 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        // A constructor's payload is an operand like a tagged variant's.
+        // A constructor's payload is an operand like a tagged variant's. The payload of a
+        // constructor of several parameters is the tuple of them, which stays where it stands,
+        // its parameters' annotations what discharged its refinements.
         TypedExprNode::NominalCtor {
             decl,
             ctor,
             payload,
         } => {
-            let (binds, payload) = atomize(*payload, muts);
+            let (binds, payload) = atomize_tuple_elements(*payload, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::NominalCtor {
@@ -1165,7 +1173,10 @@ fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// it is a question about the callee's parameter, and inference has not run
 /// (`crate::ccl::mut_read`, "What ends a segment"). So a read in an argument
 /// position is still performed at the call, after any write an argument beside
-/// it performs.
+/// it performs. A call of several arguments to a callee that may take one by reference
+/// keeps its argument tuple in place, each component a handle position
+/// ([`Muts::passes_by_reference`]); any other call's tuple is one compound operand, its
+/// reads named in written order.
 fn atomize_handle(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     if is_mut_var(&e, muts) {
         return (Vec::new(), e);
@@ -1386,6 +1397,39 @@ fn atomize_tuple_elements(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
     (binds, out)
 }
 
+/// Atomize `e`, a call's argument list ([`TypedExprNode::Arguments`]), in place: each argument
+/// passes to one parameter, so the list stays where it stands with each argument atomized. Where the callee
+/// may take an argument by reference (`by_reference`, [`Muts::passes_by_reference`]), a
+/// component is atomized as one argument is ([`atomize_handle`]), since a mutable variable
+/// passed to a `Mut` parameter is a handle, not a read. Elsewhere a mutable variable is read,
+/// and its read is named in written order as any operand's is.
+fn atomize_arguments(
+    e: Expr,
+    by_reference: bool,
+    muts: &Muts,
+) -> (Vec<(TypedBinding, Expr)>, Expr) {
+    let id = e.node_id();
+    let ty = e.ty;
+    let annotation = e.user_annotation;
+    let TypedExprNode::Arguments(elts) = e.node else {
+        unreachable!("guarded above")
+    };
+    let mut binds = Vec::new();
+    let mut out = Vec::with_capacity(elts.len());
+    for elt in elts {
+        let (elt_binds, elt) = if by_reference {
+            atomize_handle(elt, muts)
+        } else {
+            atomize(elt, muts)
+        };
+        binds.extend(elt_binds);
+        out.push(elt);
+    }
+    let mut list = Expr::preserve(id, TypedExprNode::Arguments(out)).with_ty(ty);
+    list.user_annotation = annotation;
+    (binds, list)
+}
+
 /// Normalize an `Apply` spine as one unit: walk `function` through nested
 /// `Apply`s to the head, atomizing the head and every argument, threading
 /// every level's hoisted bindings up to the caller instead of sealing them
@@ -1409,6 +1453,9 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
     let (mut binds, function) = normalize_apply_spine(*function, muts);
     let (arg_binds, argument) = if takes_its_argument_as_a_tuple_term(&function) {
         atomize_tuple_elements(*argument, muts)
+    } else if matches!(argument.node, TypedExprNode::Arguments(_)) {
+        let by_reference = muts.passes_by_reference(&function);
+        atomize_arguments(*argument, by_reference, muts)
     } else {
         atomize_handle(*argument, muts)
     };

@@ -17,6 +17,172 @@ use cambra::ccl::{
 use cambra::chl_parser::{self, FileId};
 use cambra::interpreter::{BaseType, ColumnValue, Predicate, Tile, Value};
 
+/// A later parameter's annotation reads an earlier one, at the argument the call passes for it:
+/// `f(𝑥, 𝑦)` takes `𝑦` at `{Int where _ >= 𝑥}`, whatever `𝑥`'s type has resolved to when the
+/// argument meets its parameter.
+#[rstest]
+#[case::literal("f(1, 5)")]
+#[case::bound_names(indoc! {r#"
+    x = 1
+    y = 5
+    f(x, y)
+"#})]
+#[case::projections(indoc! {r#"
+    pair = (1, 5)
+    f(pair.0, pair.1)
+"#})]
+#[case::a_returned_tuple_s_components(indoc! {r#"
+    def pair():
+        (1, 5)
+    p = pair()
+    f(p.0, p.1)
+"#})]
+#[case::parameters_reading_each_other(indoc! {r#"
+    def g(n: Int, m: {Int where _ >= n}) => Int:
+        f(n, m)
+    g(1, 5)
+"#})]
+#[case::a_refined_sum(indoc! {r#"
+    def g(n: Int) => Int:
+        f(n, n ^+ 4)
+    g(1)
+"#})]
+fn dependent_parameters_take_their_arguments(#[case] call: &str) {
+    let definition = indoc! {r#"
+        def f(a: Int, b: {Int where _ >= a}):
+            b
+    "#};
+    check_scalar(&format!("{definition}{call}"), Value::Int(5));
+}
+
+/// A call whose later argument the earlier one does not bound is refused: an argument known
+/// only by its type bounds nothing.
+#[rstest]
+#[case::literals("f(5, 1)", "expected {Int where _ >= 5}, found {Int where _ == 1}")]
+#[case::an_unrefined_result(indoc! {r#"
+    def one() => Int:
+        1
+    f(one(), 5)
+"#}, "Type mismatch for this call")]
+#[case::an_unrefined_sum(indoc! {r#"
+    def g(n: Int) => Int:
+        f(n, n + 4)
+    g(1)
+"#}, "expected {Int where _ >= n}, found Int")]
+
+fn dependent_parameters_refuse_an_unbounded_argument(#[case] call: &str, #[case] needle: &str) {
+    let definition = indoc! {r#"
+        def f(a: Int, b: {Int where _ >= a}):
+            b
+    "#};
+    check_compile_error(&format!("{definition}{call}"), needle);
+}
+
+#[test]
+fn an_unsolved_higher_order_callee_takes_its_arguments_whole() {
+    check_compile_error(
+        indoc! {r#"
+        def f(a: Int, b: {Int where _ >= a}):
+            b
+        def apply(h, x, y):
+            h(x, y)
+        apply(f, 1, 5)
+    "#},
+        "expected {Int where _ >= x}, found {Int where _ == 5}",
+    );
+}
+
+/// A tuple passed to a function of a parameter list is one argument, which a list of two does not
+/// take (`docs/chl-spec.md`, "Parameter lists").
+#[test]
+fn dependent_parameters_take_no_tuple() {
+    check_compile_error(
+        indoc! {r#"
+            def f(a: Int, b: {Int where _ >= a}):
+                b
+            pair = (1, 5)
+            f(pair)
+        "#},
+        "`f` takes 2 arguments, got 1",
+    );
+}
+
+#[test]
+fn a_late_callee_still_checks_parameter_count() {
+    check_compile_error(
+        indoc! {r#"
+        def inc(x: Int) => Int:
+            x + 1
+        def apply2(h, x):
+            h(x, 1)
+        apply2(inc, 5)
+    "#},
+        "Type mismatch",
+    );
+}
+
+#[test]
+fn a_single_parameter_list_uses_no_comma() {
+    check_compile_error(
+        indoc! {r#"
+            f: (Int,) => Int = \x -> x
+            f(1)
+        "#},
+        "a one-parameter type is A => C",
+    );
+}
+
+#[test]
+fn parameters_in_one_signature_have_distinct_names() {
+    check_compile_error(
+        indoc! {r#"
+        def f(a: Int, a: Int):
+            a
+        f(1, 2)
+    "#},
+        "parameter `a` is declared twice",
+    );
+}
+
+/// An annotation reading its one input whole is completed from a function reading the input's
+/// components by name, and the reverse.
+#[rstest]
+#[case::named_whole(indoc! {r#"
+    h: {(a: Int), (b: Int)} => Int = \p -> p.0 ^+ p.1
+    g: (p: {Int, Int}) => _ = h
+    g((1, 2))
+"#})]
+#[case::unnamed_whole(indoc! {r#"
+    h: {(a: Int), (b: Int)} => Int = \p -> p.0 ^+ p.1
+    g: {Int, Int} => _ = h
+    g((1, 2))
+"#})]
+fn complete_whole_input_annotation_from_component_parameters(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
+}
+
+#[test]
+fn complete_component_annotation_from_whole_input_parameter() {
+    check_scalar(
+        indoc! {r#"
+            g: {(a: Int), (b: Int)} => _ = \p: {Int, Int} -> p.0 ^+ p.1
+            g((1, 2))
+        "#},
+        Value::Int(3),
+    );
+}
+
+#[test]
+fn named_one_tuple_domain_keeps_its_width() {
+    check_scalar(
+        indoc! {r#"
+            f: {(x: Int),} => Int = \p: {Int,} -> p.0
+            f((7,))
+        "#},
+        Value::Int(7),
+    );
+}
+
 #[test]
 fn refinement() {
     check_compile_error(
@@ -44,9 +210,7 @@ fn output_annotation_base() {
             def foo(a: Int, b: Int) => Int:
                 a + b
 
-            x = (4,-1)
-
-            foo(x)
+            foo(4, -1)
             "#},
         Value::Int(3),
     )
@@ -403,35 +567,17 @@ fn type_binop_mismatch() {
     )
 }
 
-/// A parameter's annotation is read in the scope enclosing the binder, so a
-/// reference to a parameter resolves outward and not to the parameter. With
-/// nothing outside to resolve to it is an ordinary unbound variable, at every
-/// shape a parameter list takes: tupled siblings in either order, and the
-/// single parameter that can only be naming itself.
-///
-/// Nothing rejects these earlier. Lowering carries no scope to tell a reference
-/// to the parameter apart from one to an enclosing binder of the same name, and
-/// a name-based rejection there reports the wrong cause for the shadowing case
-/// (`type_scope_outer_shadow`).
+/// A parameter's annotation reads the parameters before it and none after it, nor the
+/// parameter itself (`docs/chl-spec.md`, "4.1 `def` — function definition"). A reference to a
+/// later parameter or to its own resolves outward, and with nothing outside to resolve to it is
+/// an ordinary unbound variable.
 #[rstest]
-#[case::sibling(indoc::indoc! {r#"
-    def f(a: Int, c: {Int where _ >= a}):
-        c
-
-    f
-    "#}, "a")]
-#[case::sibling_reversed(indoc::indoc! {r#"
+#[case::later_sibling(indoc::indoc! {r#"
     def f(c: {Int where _ >= a}, a: Int):
         c
 
     f
     "#}, "a")]
-#[case::sibling_of_three(indoc::indoc! {r#"
-    def f(a: Int, b: Int, c: {Int where _ >= b}):
-        c
-
-    f
-    "#}, "b")]
 #[case::own_binder(indoc::indoc! {r#"
     def f(a: {Int where _ >= a}):
         a
@@ -440,6 +586,81 @@ fn type_binop_mismatch() {
     "#}, "a")]
 fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] name: &str) {
     check_compile_error(code, &format!("Unbound variable: '{name}'"));
+}
+
+/// A later parameter's annotation reads an earlier parameter, and a call is checked with each
+/// earlier argument in its place.
+#[rstest]
+#[case::two(indoc::indoc! {r#"
+    def f(a: Int, c: {Int where _ >= a}):
+        c
+
+    f(1, 5)
+    "#}, 5)]
+#[case::of_three(indoc::indoc! {r#"
+    def f(a: Int, b: Int, c: {Int where _ >= b}):
+        a + c
+
+    f(1, 2, 3)
+    "#}, 4)]
+fn a_parameter_annotation_reads_an_earlier_parameter(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A function type names the parameters of its list, `(lo: Int, x: Int) => Int`, and is the
+/// type `(Int, Int) => Int` (`docs/chl-spec.md`, "Parameter lists").
+#[test]
+fn a_function_type_names_its_parameters() {
+    check_scalar(
+        indoc::indoc! {r#"
+            g: (lo: Int, x: Int) => Int = \lo, x -> lo + x
+            h: (Int, Int) => Int = g
+            h(1, 5)
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// A message writes a function of several parameters with the ones its types read named, as a
+/// program writes the type.
+#[test]
+fn a_message_names_the_parameters_a_type_reads() {
+    check_compile_error(
+        indoc::indoc! {r#"
+            def above(lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo}:
+                x
+            y: Int = above
+            y
+        "#},
+        "inferred as (lo: Int, x: {Int where _ >= lo}) => {Int where _ >= lo}",
+    );
+}
+
+/// A written type whose component reads an earlier one does not compile yet.
+#[test]
+fn a_written_component_reading_an_earlier_one_is_refused() {
+    check_compile_error(
+        indoc::indoc! {r#"
+            t: {(n: Int), {Int where _ > n}} = (1, 2)
+            t.0 + t.1
+        "#},
+        "this component's type reads the component `n` before it",
+    );
+}
+
+/// An argument outside a type that reads an earlier parameter is refused at the call, the
+/// earlier argument in the parameter's place.
+#[test]
+fn an_argument_outside_a_type_reading_an_earlier_parameter_is_refused() {
+    check_compile_error(
+        indoc::indoc! {r#"
+            def f(a: Int, c: {Int where _ >= a}):
+                c
+
+            f(5, 1)
+        "#},
+        "Type mismatch for this call",
+    );
 }
 
 #[test]

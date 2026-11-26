@@ -2286,6 +2286,19 @@ fn broken_names_cells() {
 }
 
 #[test]
+fn a_grouping_lambda_can_filter_on_its_parameter_and_an_enclosing_loop() {
+    for cell in [
+        "lambda_body_in_loop/two_binders_both_filter[e,i]",
+        "lambda_body_in_loop/two_binders_both_filter[i,e]",
+        "lambda_body_in_loop/two_binders_corr_filter[i,e]",
+        "lambda_body_in_loop/two_binders_in_filter[e,i]",
+        "lambda_body_in_loop/two_binders_in_filter[i,e]",
+    ] {
+        assert_eq!(classify(&cell_program(cell)), Outcome::Agrees, "{cell}");
+    }
+}
+
+#[test]
 fn grid_agrees() {
     let outcomes = run_cells();
     let failures: Vec<String> = outcomes

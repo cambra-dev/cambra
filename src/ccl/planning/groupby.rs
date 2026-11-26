@@ -261,7 +261,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
     // `src/ccl/design/collections.md`.)
     let head_ty = crate::ccl::generalize::opened(&head.ty);
     let Type::Fun {
-        name: key_binder,
+        binder: key_binder,
         domain: key_ty,
         codomain: inner,
         ..
@@ -322,7 +322,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
 
     Some(PointfulSite {
         collection: collection.clone_preserving_ids(),
-        key_binder: key_binder.clone(),
+        key_binder: key_binder.whole().cloned(),
         key_fn: partition.key_fn.clone(),
         key_ty: ccl_utils::strip_refinements(key_ty),
         key_dom: (**key_ty).clone(),

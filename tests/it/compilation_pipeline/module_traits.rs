@@ -589,7 +589,7 @@ fn a_checked_module_prints_its_traits() {
             pub trait Container(C) requires e: Equatable(C, C):
                 Elem <: Int
                 first: C => Elem
-                scaled: forall (R) {C, R} => Int requires Multipliable(Int, R)
+                scaled: forall (R) (C, R) => Int requires Multipliable(Int, R)
             pub type Bag = Int
             pub firsts: forall (C) C => Int requires r: Container(C), r::Elem <: Int
         "}

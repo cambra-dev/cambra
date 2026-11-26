@@ -304,7 +304,7 @@ impl<'m> Walk<'m> {
                 ty.held_terms().for_each(|t| self.held(t, false))
             }
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
@@ -317,7 +317,7 @@ impl<'m> Walk<'m> {
                     }
                 }
                 self.ty(domain);
-                self.under(name, |w| w.ty(codomain));
+                self.under(binder.names(), |w| w.ty(codomain));
             }
             Type::Refinement(base, refinements) => {
                 for r in refinements {

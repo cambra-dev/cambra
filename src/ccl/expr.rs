@@ -168,17 +168,6 @@ impl Annotation {
     }
 }
 
-/// The binding operation retained during inference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BindingRole {
-    #[default]
-    Local,
-    /// The outer parameter of a source function or lambda.
-    FunctionParameter,
-    /// Compiler parameter transport or an explicit result binding.
-    Temporary,
-}
-
 /// A typed binding site: a named variable together with its type.
 ///
 /// Used in [`TypedExprNode::Lambda`] and [`TypedExprNode::Let`] to carry
@@ -194,7 +183,6 @@ pub enum BindingRole {
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
 #[derive(Debug, Clone)]
 pub struct TypedBinding {
-    pub role: BindingRole,
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
     pub name: Name,
@@ -242,6 +230,39 @@ impl PartialEq for TypedBinding {
     }
 }
 
+/// The one parameter of a lambda past inlining, which substitutes every parameter list's
+/// arguments (`crate::ccl::inline`).
+///
+/// # Panics
+///
+/// When the lambda has a list of other than one parameter.
+pub fn one_param(params: &[TypedBinding]) -> &TypedBinding {
+    match params {
+        [param] => param,
+        _ => panic!(
+            "past inlining a lambda binds one parameter, got {}",
+            params.len()
+        ),
+    }
+}
+
+/// [`one_param`], mutably.
+pub fn one_param_mut(params: &mut [TypedBinding]) -> &mut TypedBinding {
+    let len = params.len();
+    match params {
+        [param] => param,
+        _ => panic!("past inlining a lambda binds one parameter, got {len}"),
+    }
+}
+
+/// [`one_param`], by value.
+pub fn into_one_param(params: Vec<TypedBinding>) -> TypedBinding {
+    let len = params.len();
+    <[TypedBinding; 1]>::try_from(params)
+        .map(|[param]| param)
+        .unwrap_or_else(|_| panic!("past inlining a lambda binds one parameter, got {len}"))
+}
+
 impl TypedBinding {
     /// Create an unannotated binding with a [`Type::Hole`] placeholder.
     ///
@@ -255,7 +276,6 @@ impl TypedBinding {
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
         }
     }
 
@@ -275,7 +295,6 @@ impl TypedBinding {
             user_annotation: Some(annotation),
             transparency: BindingTransparency::Transparent,
             site: None,
-            role: Default::default(),
         }
     }
 
@@ -428,18 +447,25 @@ pub enum TypedExprNode {
     /// A unary operation.
     UnaryOp(UnaryOpKind, Box<TypedExpr>),
 
-    /// A lambda abstraction.
+    /// A lambda abstraction over a list of parameters.
     ///
-    /// The bound parameter and its type are carried by a [`TypedBinding`].
-    /// `param.ty` starts as [`Type::Hole`] on unannotated lambdas from
+    /// The argument is the product of the parameters' types: the product of one type is that
+    /// type, so a single parameter binds the whole argument, and the product of none is the
+    /// unit. With two or more, the argument is a tuple and each parameter binds one component;
+    /// a later parameter's type may read the earlier ones, so the argument's type is a
+    /// dependent tuple ([`Type::params_domain`]). A list never binds a 1-tuple's component: a
+    /// parameter whose type is `{T,}` binds the 1-tuple whole.
+    ///
+    /// Each parameter's `ty` starts as [`Type::Hole`] on unannotated lambdas from
     /// lowering; [`crate::ccl::infer::infer`] (via Cambra's inference algorithm) fills it with the
     /// inferred concrete type or a `Type::Infer` variable before
-    /// compilation.
+    /// compilation. A later parameter's type reads an earlier one by name.
     ///
     /// Note: `crate::interpreter::Lambda` is an unrelated operator struct.
     Lambda {
-        /// The bound parameter, with its name and inferred/annotated type.
-        param: TypedBinding,
+        /// The bound parameters, outermost first, each with its name and inferred/annotated
+        /// type.
+        params: Vec<TypedBinding>,
         /// The lambda body.
         body: Box<TypedExpr>,
     },
@@ -867,6 +893,19 @@ pub enum TypedExprNode {
     /// (`src/interpreter/design-operators.md`, "A product value is a record of tiles").
     Tuple(Vec<TypedExpr>),
 
+    /// The arguments of a call that passes other than one, `f(a, b)` or `f()`: the
+    /// parameter list the callee must take, which a tuple passed as one argument, `f((a, b))`,
+    /// is not (`docs/chl-spec.md`, "Parameter lists").
+    ///
+    /// Only lowering mints it and only inference reads it: it stands as an [`Apply`]'s
+    /// argument, possibly under the `let`s A-normalization names its operands with, and
+    /// inference checks the call's arity against the callee's parameter list
+    /// ([`crate::ccl::ty::FunBinder::Parameters`]) and then rewrites it to the tuple of its
+    /// components, which is how every later pass passes several values.
+    ///
+    /// [`Apply`]: TypedExprNode::Apply
+    Arguments(Vec<TypedExpr>),
+
     /// A first-class projection morphism `.n` (tuple) or `.name` (record).
     ///
     /// `Proj(k)` represents the morphism `λ t → t.k` in point-free form.
@@ -1140,6 +1179,7 @@ impl TypedExprNode {
             TypedExprNode::For { .. } => "For",
             TypedExprNode::MutWrite { .. } => "MutWrite",
             TypedExprNode::Tuple(_) => "Tuple",
+            TypedExprNode::Arguments(_) => "Arguments",
             TypedExprNode::Proj(_) => "Proj",
             TypedExprNode::Record(_) => "Record",
             TypedExprNode::Source(..) => "Source",
@@ -1749,7 +1789,6 @@ impl TypedExpr {
                 user_annotation: None,
                 transparency,
                 site: None,
-                role: Default::default(),
             },
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
@@ -1825,7 +1864,6 @@ impl TypedExpr {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
             },
             init: Box::new(init),
             body: Box::new(body),
@@ -1887,6 +1925,53 @@ impl TypedExpr {
         Self::new(TypedExprNode::Tuple(elts))
     }
 
+    /// Construct a call's argument list ([`TypedExprNode::Arguments`]).
+    pub fn arguments(elts: Vec<Self>) -> Self {
+        Self::new(TypedExprNode::Arguments(elts))
+    }
+
+    /// Rewrite every call's argument list in the tree to the value it passes: the tuple of
+    /// its components, or unit for the empty list. Inference runs it once it has checked each
+    /// call's arity, and a predicate reads an argument list as that value too.
+    ///
+    /// The terms the tree's types quote are rewritten too, since a call in a comprehension's
+    /// filter stands in the predicate of its source's type: each shared predicate once, its
+    /// copies pointed at the one rewrite, so a predicate keeps its identity across the types
+    /// that carry it.
+    pub fn erase_argument_lists(&mut self) {
+        self.erase_argument_lists_under(&crate::ccl::ccl_utils::PredMemo::replacing());
+    }
+
+    fn erase_argument_lists_under(&mut self, memo: &crate::ccl::ccl_utils::PredMemo) {
+        if let TypedExprNode::Arguments(elts) = &mut self.node {
+            self.node = if elts.is_empty() {
+                TypedExprNode::Lit(Lit::Unit)
+            } else {
+                TypedExprNode::Tuple(std::mem::take(elts))
+            };
+        }
+        self.walk_type_slots_mut(|ty| {
+            crate::ccl::ccl_utils::walk_held_terms_mut(ty, memo, &(), &mut |term, memo| {
+                let holds = term.holds_an_argument_list();
+                if holds {
+                    term.erase_argument_lists_under(memo);
+                }
+                holds
+            });
+        });
+        self.walk_children_mut(|c| c.erase_argument_lists_under(memo));
+    }
+
+    /// Whether an argument list stands anywhere in this term, its types' quoted terms included.
+    fn holds_an_argument_list(&self) -> bool {
+        let mut found = matches!(self.node, TypedExprNode::Arguments(_));
+        self.walk_type_slots(|ty| {
+            ty.walk_held_terms(&mut |t| found |= t.holds_an_argument_list());
+        });
+        self.walk_children(|c| found |= c.holds_an_argument_list());
+        found
+    }
+
     /// Construct a first-class projection morphism node.
     ///
     /// `Proj(Field(f))` acts as the function `λ t → t.f`.
@@ -1900,6 +1985,34 @@ impl TypedExpr {
     /// is lowered as `Expr::apply(t, Expr::proj_index(n))`.
     pub fn proj_index(i: usize) -> Self {
         Self::new(TypedExprNode::Proj(ProjKey::Index(i)))
+    }
+
+    /// `binder ▷ .i`: component `i` of the tuple `binder` binds, typed `tuple_ty`
+    /// ([`Self::projection_of`]).
+    pub fn projection(binder: &Name, tuple_ty: &Type, i: usize) -> Self {
+        let mut var = Self::var(binder.clone());
+        var.ty = tuple_ty.clone();
+        Self::projection_of(&var, i)
+    }
+
+    /// `tuple ▷ .i`: component `i` of `tuple`, a copy of it keeping its ids. A dependent
+    /// tuple's component is typed opened at the projections of the components before it
+    /// ([`Type::component_type`]).
+    ///
+    /// # Panics
+    ///
+    /// When `tuple`'s type is not a product with a component `i`.
+    pub fn projection_of(tuple: &Self, i: usize) -> Self {
+        let projection = tuple
+            .ty
+            .projection_type(i)
+            .unwrap_or_else(|| panic!("component {i} of a product, got {}", tuple.ty));
+        let component = crate::ccl::ccl_utils::applied_type(&projection, tuple);
+        let mut proj = Self::proj_index(i);
+        proj.ty = projection;
+        let mut app = Self::apply(tuple.clone_preserving_ids(), proj);
+        app.ty = component;
+        app
     }
 
     /// The component of a tuple or record literal selected by `key`.
@@ -2004,7 +2117,7 @@ impl TypedExpr {
         })
     }
 
-    /// Build an unannotated or pre-annotated [`TypedExprNode::Lambda`].
+    /// Build an unannotated or pre-annotated [`TypedExprNode::Lambda`] of one parameter.
     ///
     /// Pass [`Type::Hole`] for `param_ty` when the parameter type is not yet
     /// known (lowering phase); pass the concrete type when it is already known.
@@ -2019,26 +2132,35 @@ impl TypedExpr {
         param_ty: Type,
         body: TypedExpr,
     ) -> Self {
-        let param = param.into();
-        let result_ty = Type::fun_over(
-            param.clone(),
-            param_ty.clone(),
-            body.ty.clone(),
-            FunKind::Compute,
-        );
-        Self::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: param,
+        Self::lambda_of(
+            vec![TypedBinding {
+                name: param.into(),
                 occurrence,
                 ty: param_ty,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
+            body,
+        )
+    }
+
+    /// A compute [`TypedExprNode::Lambda`] over `params`, typed by
+    /// [`Type::fun_of_params`].
+    pub fn lambda_of(params: Vec<TypedBinding>, body: TypedExpr) -> Self {
+        let ty = Type::fun_of_params(
+            params
+                .iter()
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect(),
+            body.ty.clone(),
+            FunKind::Compute,
+        );
+        Self::new(TypedExprNode::Lambda {
+            params,
             body: Box::new(body),
         })
-        .with_ty(result_ty)
+        .with_ty(ty)
     }
 
     /// [`Self::lambda`] whose parameter is declared `annotation` ([`TypedBinding::declare`]).
@@ -2050,10 +2172,10 @@ impl TypedExpr {
         body: TypedExpr,
     ) -> Self {
         let mut lambda = Self::lambda(param, occurrence, param_ty, body);
-        let TypedExprNode::Lambda { param, .. } = &mut lambda.node else {
+        let TypedExprNode::Lambda { params, .. } = &mut lambda.node else {
             unreachable!("`lambda` builds a lambda")
         };
-        param.declare(annotation);
+        one_param_mut(params).declare(annotation);
         lambda
     }
 
@@ -2186,6 +2308,7 @@ impl TypedExpr {
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
+            | TypedExprNode::Arguments(elts)
             | TypedExprNode::Compose(elts)
             | TypedExprNode::Copair(elts)
             | TypedExprNode::DisjointJoin(elts)
@@ -2345,7 +2468,7 @@ impl TypedExpr {
     ///
     /// Same caveats as `walk_children`: does not descend through type refinement
     /// predicates and does not visit binder name/type fields. Pure-mutator passes
-    /// that need to mutate `Lambda.param.ty`, `Let.binding.ty`, or the refinement
+    /// that need to mutate a `Lambda` parameter's `ty`, `Let.binding.ty`, or the refinement
     /// predicate must handle those explicitly before (or after) calling this
     /// method.
     pub fn walk_children_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
@@ -2400,6 +2523,7 @@ impl TypedExpr {
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
+            | TypedExprNode::Arguments(elts)
             | TypedExprNode::Compose(elts)
             | TypedExprNode::Copair(elts)
             | TypedExprNode::DisjointJoin(elts)
@@ -2492,8 +2616,8 @@ impl TypedExpr {
             TypedExprNode::Comprehension { generators, .. } => {
                 generators.iter().for_each(|g| f(&g.target));
             }
-            TypedExprNode::Lambda { param, .. }
-            | TypedExprNode::Let { binding: param, .. }
+            TypedExprNode::Lambda { params, .. } => params.iter().for_each(f),
+            TypedExprNode::Let { binding: param, .. }
             | TypedExprNode::MutDecl { binding: param, .. } => f(param),
             TypedExprNode::For { target, .. } => f(target),
             TypedExprNode::LetRec { bindings, .. } | TypedExprNode::DefGroup { bindings, .. } => {
@@ -2535,6 +2659,7 @@ impl TypedExpr {
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
+            | TypedExprNode::Arguments(_)
             | TypedExprNode::Record(_)
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
@@ -2628,6 +2753,7 @@ impl TypedExpr {
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
+            | TypedExprNode::Arguments(_)
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
             | TypedExprNode::DisjointJoin(_)
@@ -2654,8 +2780,8 @@ impl TypedExpr {
             TypedExprNode::Comprehension { generators, .. } => {
                 generators.iter_mut().for_each(|g| f(&mut g.target));
             }
-            TypedExprNode::Lambda { param, .. }
-            | TypedExprNode::Let { binding: param, .. }
+            TypedExprNode::Lambda { params, .. } => params.iter_mut().for_each(f),
+            TypedExprNode::Let { binding: param, .. }
             | TypedExprNode::MutDecl { binding: param, .. } => f(param),
             TypedExprNode::For { target, .. } => f(target),
             TypedExprNode::LetRec { bindings, .. } | TypedExprNode::DefGroup { bindings, .. } => {
@@ -2695,6 +2821,7 @@ impl TypedExpr {
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
+            | TypedExprNode::Arguments(_)
             | TypedExprNode::Record(_)
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
@@ -2771,16 +2898,22 @@ impl TypedExpr {
     /// [`crate::ccl::ccl_utils::distinct_predicate_rcs`].
     pub fn walk_type_slots<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         self.walk_ambient_type_slots(&mut f);
-        if let TypedExprNode::For { target, .. } = &self.node {
-            f(&target.ty);
-            if let Some(annotation) = &target.user_annotation {
+        let scoped = match &self.node {
+            TypedExprNode::For { target, .. } => std::slice::from_ref(target),
+            TypedExprNode::Lambda { params, .. } => params.get(1..).unwrap_or_default(),
+            _ => &[],
+        };
+        for binding in scoped {
+            f(&binding.ty);
+            if let Some(annotation) = &binding.user_annotation {
                 f(&annotation.ty);
             }
         }
     }
 
     /// The type slots of [`walk_type_slots`](Self::walk_type_slots) that sit in the node's own
-    /// scope: every slot but a `For` target's, which the position scopes over
+    /// scope: every slot but a `For` target's, which the position scopes over, and a lambda's
+    /// parameters after the first, which the ones before them scope over
     /// ([`crate::ccl::scope::ScopedItem::TypeSlot`]). A walk reading the names a type reads
     /// takes these here and the others from [`crate::ccl::scope::for_each_scoped_item`].
     pub fn walk_ambient_type_slots<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
@@ -2815,13 +2948,25 @@ impl TypedExpr {
                 f(parameter);
             }
         }
-        if !matches!(self.node, TypedExprNode::For { .. }) {
-            self.walk_binders(|b| {
+        let ambient_binders = match &self.node {
+            TypedExprNode::For { .. } => None,
+            TypedExprNode::Lambda { params, .. } => Some(params.first()),
+            _ => Some(None),
+        };
+        match ambient_binders {
+            None => {}
+            Some(Some(first)) => {
+                f(&first.ty);
+                if let Some(annotation) = &first.user_annotation {
+                    f(&annotation.ty);
+                }
+            }
+            Some(None) => self.walk_binders(|b| {
                 f(&b.ty);
                 if let Some(annotation) = &b.user_annotation {
                     f(&annotation.ty);
                 }
-            });
+            }),
         }
     }
 
@@ -3303,7 +3448,7 @@ mod tests {
 
         // A binder-bearing node: node type + annotation, binder type + annotation.
         let mut lam = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
+            params: vec![TypedBinding {
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: marker("param_ty"),
@@ -3313,8 +3458,7 @@ mod tests {
                 )),
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
-            },
+            }],
             body: Box::new(TypedExpr::lit(Lit::Unit)),
         });
         lam.ty = marker("node_ty");

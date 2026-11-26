@@ -84,7 +84,7 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
   }
 });
 
-// NOTE: the exact type strings these tests pin (`"_"`, `"((Int@1, Int@2) ⇒ Int)"`,
+// NOTE: the exact type strings these tests pin (`"_"`, `"(((_, _): (Int@1, Int@2)) ⇒ Int)"`,
 // `"(Int@1, Int@1)"`, ...) are CCL's canonical type rendering —
 // `Display for Type` in `src/ccl/mod.rs`. The coupling is intentional: if that
 // formatting changes, these expectations must be updated in lockstep (the
@@ -104,14 +104,10 @@ describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
     // Resolves to the literal's singleton type, which prints as `Int@10`.
     expect(store.resolvedTypesFor("pre-inference", lit.nodeId)).toEqual(["Int@10"]);
 
-    // The tupled parameter's name carries a fresh-name counter, which the std modules every
-    // program lowers advance, so the lambda is found by the name's stem.
-    const lambdas = allNodes(pre).filter((n) => n.label.startsWith("Lambda(__arg_tuple_"));
-    expect(lambdas).toHaveLength(1);
-    const lambda = lambdas[0];
-    expect(lambda.type).toBe("((_, _) ⇒ _)"); // a function of two parameters, types still holes
+    const lambda = theNode(pre, "Lambda(p, q)");
+    expect(lambda.type).toBe("(((_, _): (_, _)) ⇒ _)"); // a function of two parameters, types still holes
     expect(store.resolvedTypesFor("pre-inference", lambda.nodeId)).toEqual([
-      "((Int@1, Int@2) ⇒ Int)",
+      "(((_, _): (Int@1, Int@2)) ⇒ Int)",
     ]);
   });
 

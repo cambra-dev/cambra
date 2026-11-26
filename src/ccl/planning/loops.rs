@@ -1090,7 +1090,13 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // The name the family gives its enclosing argument, which the history's fields read where
     // they depend on it.
     let enclosing_binder = match (&enclosing, family_ty.peel_refinements()) {
-        (Some(_), Type::Fun { name: Some(e), .. }) => Some(e.clone()),
+        (
+            Some(_),
+            Type::Fun {
+                binder: crate::ccl::FunBinder::Whole(e),
+                ..
+            },
+        ) => Some(e.clone()),
         _ => None,
     };
     let (domain_ty, decision_ty) = fun_parts(&h_ty);
@@ -1098,7 +1104,10 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // reads that name once opened: a fed row whose keys depend on the loop variable
     // (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
     let position = match crate::ccl::generalize::opened(&h_ty) {
-        Type::Fun { name: Some(r), .. } => Some(r.clone()),
+        Type::Fun {
+            binder: crate::ccl::FunBinder::Whole(r),
+            ..
+        } => Some(r.clone()),
         _ => None,
     };
     let decision_ty = crate::ccl::subst::open_codomain(&h_ty, &decision_ty);
@@ -1376,7 +1385,8 @@ fn curried_source_type(source: &Type, ctx: &Type, domain: &Type, binder: Option<
         .codomain()
         .expect("letrec recognition: a writer source is a function");
     let Type::Fun {
-        name: Some(pair), ..
+        binder: crate::ccl::FunBinder::Whole(pair),
+        ..
     } = fun
     else {
         return over_enclosing(binder, ctx, Type::data_fun(domain.clone(), item));
@@ -1567,7 +1577,7 @@ fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {
     };
     // The history read by the enclosing argument's name where it depends on it.
     let binder = match crate::ccl::generalize::opened(&read.ty) {
-        Type::Fun { name, .. } => name.clone(),
+        Type::Fun { binder, .. } => binder.whole().cloned(),
         _ => None,
     };
     let history_ty =

@@ -140,6 +140,9 @@ pub(super) fn should_generalize(
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
 pub(super) struct InferCtx {
+    /// The parameters each call's argument tuple about to be emitted passes its components to
+    /// ([`Typing::pass_arguments`]).
+    arguments: HashMap<NodeId, Vec<Type>>,
     /// The program's trait instances, from which every obligation emission mints takes
     /// its candidates.
     pub(super) instances: Rc<InstanceTable>,
@@ -355,11 +358,9 @@ pub(super) struct InferCtx {
     /// name, innermost last, pushed where the binder is entered and popped where its scope
     /// closes, a `let`'s at `close_let_type`.
     scope_exits: HashMap<Name, Vec<ScopeExit>>,
-    /// The first parameter of each source signature, retained across currying.
+    /// The first parameter of the lambda each parameter belongs to: its signature, which a
+    /// contribution through any of its parameters crosses whole.
     parameter_groups: HashMap<Name, Name>,
-    /// The signature of the innermost lambda being emitted, with the level it was entered at.
-    /// A `Temporary` parameter at that level joins it; any other parameter starts its own.
-    active_parameter_group: Option<(Level, Name)>,
     /// The joined binders each `let` a contribution crossed varies with, for each such `let`
     /// whose definition reads one ([`Self::name_varying_binders`]).
     varies_with: HashMap<Name, Vec<Name>>,
@@ -875,6 +876,7 @@ impl InferCtx {
     /// never in a state where an error has no node to blame.
     pub(super) fn new(sources: HashMap<String, Type>, root: NodeId) -> Self {
         Self {
+            arguments: HashMap::new(),
             scopes: ScopeStack::default(),
             sources,
             cache: ConstrainCache::new(),
@@ -906,7 +908,6 @@ impl InferCtx {
             definition_telescopes: HashMap::new(),
             scope_exits: HashMap::new(),
             parameter_groups: HashMap::new(),
-            active_parameter_group: None,
             varies_with: HashMap::new(),
             loop_sources: HashMap::new(),
             open_transactions: Vec::new(),
@@ -2675,16 +2676,15 @@ impl InferCtx {
             // is in scope in its codomain — the annotation's own Pi
             // extends the telescope for the variables minted there.
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain: d,
                 codomain: c,
                 capabilities,
             } => {
-                let cod_telescope = match name {
-                    Some(b) => telescope.extended(b.clone()),
-                    None => telescope.clone(),
-                };
+                let cod_telescope = binder
+                    .names()
+                    .fold(telescope.clone(), |t, b| t.extended(b.clone()));
                 // The witness binders riding the function normalize like the domain:
                 // their types are annotation content at the enclosing scope.
                 let fun_kind = match fun_kind {
@@ -2711,7 +2711,7 @@ impl InferCtx {
                 InferVar::place_parts_under(&domain, &fun_kind);
                 InferVar::place_parts_under(&codomain, &fun_kind);
                 Type::Fun {
-                    name: name.clone(),
+                    binder: binder.clone(),
                     fun_kind,
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
@@ -2916,18 +2916,30 @@ impl InferCtx {
         }
         let adopted;
         let ann_to_normalize = match (function_layer(inferred), function_layer(ann)) {
-            (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
+            // A parameter list's binder is its length, a claim an annotation writing its domain
+            // makes for itself, so a parameter list is adopted only by an annotation leaving
+            // its domain to inference, as a `def`'s clauses do (`_ => _ causes E`).
+            (
+                Type::Fun { binder: b, .. },
+                Type::Fun {
+                    binder: crate::ccl::FunBinder::None,
+                    domain: ann_domain,
+                    ..
+                },
+            ) if !b.is_none()
+                && (b.parameter_count().is_none() || matches!(**ann_domain, Type::Hole)) =>
+            {
                 let mut named = ann.clone();
                 // Name the function layer `function_layer` matched; refinement wrappers
                 // and a history stay outside it. The walk peels exactly what that match
                 // peeled, so it lands on that same function.
-                let Type::Fun { name, .. } = function_layer_mut(&mut named) else {
+                let Type::Fun { binder, .. } = function_layer_mut(&mut named) else {
                     unreachable!(
                         "`function_layer` matched a `Fun` on this annotation, and \
                          `function_layer_mut` peels the same layers, so it lands on it"
                     )
                 };
-                *name = Some(b.clone());
+                *binder = b.clone();
                 adopted = named;
                 &adopted
             }
@@ -3188,7 +3200,7 @@ impl InferCtx {
         };
         let keyed = match channel.peel_refinements() {
             Type::Fun {
-                name: Some(key),
+                binder: crate::ccl::FunBinder::Whole(key),
                 domain,
                 ..
             } => Some((key.clone(), (**domain).clone())),
@@ -3323,7 +3335,7 @@ impl InferCtx {
         enforce_bound_scope(&element, "lower", &bound);
         element.bounds.borrow_mut().lower_mut().push(bound);
         let contribution = Type::Fun {
-            name: Some(key),
+            binder: crate::ccl::FunBinder::Whole(key),
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(self.fresh()),
             codomain: Box::new(Type::Infer(element)),
@@ -3499,11 +3511,10 @@ impl InferCtx {
 /// out of its scope, so the bound's functions bind a name the codomain edge renames the
 /// collection's to.
 fn name_function_binders(ty: &mut Type) {
-    if let Type::Fun {
-        name: name @ None, ..
-    } = ty
+    if let Type::Fun { binder, .. } = ty
+        && binder.is_none()
     {
-        *name = Some(Name::solver_arg());
+        *binder = crate::ccl::FunBinder::Whole(Name::solver_arg(None));
     }
     ty.walk_children_mut(name_function_binders);
 }
@@ -3514,9 +3525,92 @@ impl TelescopeWalk for InferCtx {
     }
 }
 
+impl InferCtx {
+    /// `sub <: sup`, with `sup` read under `discharge`: an argument against its parameter, the
+    /// parameters before it discharged at their arguments ([`Typing::apply`]).
+    fn require_sub_discharged(
+        &mut self,
+        sub: &Type,
+        sup: &Type,
+        discharge: &Subst,
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError> {
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+            scope_exits: &self.scope_exits,
+            facts: &self.facts,
+        };
+        self.cache.at(
+            self.value_at.or(self.here()),
+            self.demand_at.or(self.here()),
+        );
+        let result = crate::ccl::infer::solver::constrain::constrain_subtype_discharged_in(
+            sub,
+            sup,
+            discharge,
+            &mut self.cache,
+            &scope,
+        );
+        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        result.map_err(|e| self.located_failure(e, at))
+    }
+
+    /// The error an edge drawn at `at` failing with `e` raises: an ordered loop refusing the
+    /// positions that arrived here, at a use of the definition holding it, is refused as the
+    /// loop.
+    fn located_failure(
+        &mut self,
+        e: crate::ccl::infer::solver::ConstrainError,
+        at: &dyn Fn() -> String,
+    ) -> LocatedInferError {
+        let failure = self.cache.take_failure();
+        if let crate::ccl::infer::solver::ConstrainError::NoTraitInstance {
+            operator, found, ..
+        } = &e
+            && let Some(refusal) = self.unordered_loop_error(
+                *operator,
+                self.current_node_id,
+                positions_detail(&coalesce_for_error(found)),
+            )
+        {
+            return refusal.with_failure(failure);
+        }
+        self.raise(map_constrain_err(e, &at()))
+            .with_failure(failure)
+    }
+
+    /// Run `f` with each of `names` bound to a part of a function of `kind` minted for it, the
+    /// first outermost, each minted under the names before it: a parameter's type may read the
+    /// parameters before it ([`Typing::scoped`] for a parameter list). `parts` receives the
+    /// parts in order.
+    fn scoped_parameters<R>(
+        &mut self,
+        names: &[Name],
+        kind: &crate::ccl::ty::FunKind,
+        parts: &mut Vec<Type>,
+        f: &mut dyn FnMut(&mut Self) -> R,
+    ) -> R {
+        match names.split_first() {
+            Some((name, names)) => {
+                let part = self.fresh_part(kind);
+                parts.push(part.clone());
+                self.scoped(name, &part, |ctx| {
+                    ctx.scoped_parameters(names, kind, parts, f)
+                })
+            }
+            None => f(self),
+        }
+    }
+}
+
 impl Typing for InferCtx {
     fn std_trait(&self, named: StdTrait) -> Trait {
         self.instances.std_trait(named)
+    }
+
+    fn reads_argument_lists(&self) -> bool {
+        true
     }
 
     fn defer_method(
@@ -3937,30 +4031,7 @@ impl Typing for InferCtx {
         );
         let result = constrain_subtype_in(sub, sup, &mut self.cache, &scope);
         self.cache.report_recorded(|| EdgeReport::Labeled(at()));
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let failure = self.cache.take_failure();
-                // An ordered loop refusing the positions that arrived here, at a use of the
-                // definition holding it, is refused as the loop.
-                if let crate::ccl::infer::solver::ConstrainError::NoTraitInstance {
-                    operator,
-                    found,
-                    ..
-                } = &e
-                    && let Some(refusal) = self.unordered_loop_error(
-                        *operator,
-                        self.current_node_id,
-                        positions_detail(&coalesce_for_error(found)),
-                    )
-                {
-                    return Err(refusal.with_failure(failure));
-                }
-                Err(self
-                    .raise(map_constrain_err(e, &at()))
-                    .with_failure(failure))
-            }
-        }
+        result.map_err(|e| self.located_failure(e, at))
     }
 
     fn with_value_at<R>(&mut self, origin: Origin, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -4531,25 +4602,13 @@ impl Typing for InferCtx {
     fn scoped_parameter<R>(
         &mut self,
         parameter: &TypedBinding,
+        group: &Name,
         ty: &Type,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let previous = self.active_parameter_group.clone();
-        let group = if parameter.role == crate::ccl::BindingRole::Temporary {
-            previous
-                .as_ref()
-                .filter(|(level, _)| *level == self.level)
-                .map(|(_, group)| group.clone())
-                .unwrap_or_else(|| parameter.name.clone())
-        } else {
-            parameter.name.clone()
-        };
         self.parameter_groups
             .insert(parameter.name.clone(), group.clone());
-        self.active_parameter_group = Some((self.level, group));
-        let result = self.scoped(&parameter.name, ty, f);
-        self.active_parameter_group = previous;
-        result
+        self.scoped(&parameter.name, ty, f)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -4700,6 +4759,14 @@ impl Typing for InferCtx {
         lifted
     }
 
+    fn pass_arguments(&mut self, tuple: NodeId, params: Vec<Type>) {
+        self.arguments.insert(tuple, params);
+    }
+
+    fn take_arguments(&mut self, tuple: NodeId) -> Option<Vec<Type>> {
+        self.arguments.remove(&tuple)
+    }
+
     fn close_pattern_type(&mut self, binder: &Name, body_ty: Type) -> Type {
         debug_assert!(
             !self.telescope.contains(binder),
@@ -4778,7 +4845,7 @@ impl Typing for InferCtx {
         // `require_sub`. Stamping the demand `Compute` would make "what is this function's
         // domain?" reject every collection.
         let shape = Type::Fun {
-            name: None,
+            binder: crate::ccl::FunBinder::None,
             fun_kind: kind,
             domain: Box::new(d.clone()),
             codomain: Box::new(c.clone()),
@@ -4820,7 +4887,10 @@ impl Typing for InferCtx {
         // A dependent node type's binder rides the shape: the codomain it supplies reads the
         // binder, and an unnamed function would leave that reference with nothing to bind it.
         let shape = match t.peel_refinements() {
-            Type::Fun { name: Some(b), .. } => Type::pi(b.clone(), d.clone(), c.clone()),
+            Type::Fun {
+                binder: crate::ccl::FunBinder::Whole(b),
+                ..
+            } => Type::pi(b.clone(), d.clone(), c.clone()),
             _ => fun(d.clone(), c.clone()),
         };
         self.require_sub(&shape, t, at)?;
@@ -4873,6 +4943,7 @@ impl Typing for InferCtx {
         arg_ty: &Type,
         argument: &Expr,
         kind: Option<&crate::ccl::ty::FunKind>,
+        list: Option<usize>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {
         // Expect a *named* Pi `(x: d) ⇒ result`, so the codomain edge derives the
@@ -4890,18 +4961,72 @@ impl Typing for InferCtx {
         // only later (design O3). The fresh binder also keeps the §3.6
         // global-freshness discipline (reusing a function's own binder as the
         // expected binder would violate it).
-        let x = Name::solver_arg();
         // **The demand adopts the kind the node declared**, where there is one. Minting a
         // second variable describes one consumption twice; see [`Typing::apply`].
         let demand_kind = match kind {
             Some(k @ crate::ccl::ty::FunKind::Var(_)) => k.clone(),
             _ => crate::ccl::ty::FunKind::fresh_var(),
         };
-        // Parts of the function applied, a sum's included.
-        let d = self.fresh_part(&demand_kind);
-        // The codomain stands under the binder, so it is minted where the binder is in scope.
-        let result = self.scoped(&x, &d, |ctx| ctx.fresh_part(&demand_kind));
-        let expected = Type::pi_kinded(x.clone(), d.clone(), result.clone(), demand_kind);
+        // A call of one argument expects a function of one parameter, its binder the whole
+        // input; an argument list expects a parameter list as long, each parameter named
+        // ([`crate::ccl::ty::FunBinder::Parameters`]), which no function of one parameter is.
+        let (expected, result, discharge, parameters) = match list {
+            None => {
+                // The argument goes into the result's predicates in the spelling predicates are
+                // compared in (`ccl_utils::predicate_term`).
+                let passed = crate::ccl::ccl_utils::predicate_term(argument);
+                let x = Name::solver_arg(passed_variable(&passed));
+                // Parts of the function applied, a sum's included.
+                let d = self.fresh_part(&demand_kind);
+                // The codomain stands under the binder, so it is minted where the binder is in
+                // scope.
+                let result = self.scoped(&x, &d, |ctx| ctx.fresh_part(&demand_kind));
+                let expected = Type::pi_kinded(x.clone(), d, result.clone(), demand_kind);
+                let discharge = Subst::discharge(&x, passed);
+                (expected, result, discharge, None)
+            }
+            Some(n) => {
+                let passed = crate::ccl::ccl_utils::predicate_term(argument);
+                let arguments: Vec<Expr> = (0..n).map(|j| list_component(&passed, j)).collect();
+                let names: Vec<Name> = arguments
+                    .iter()
+                    .map(|a| Name::solver_arg(passed_variable(a)))
+                    .collect();
+                // Each parameter's part is minted under the parameters before it, which a later
+                // parameter's type may read, and the result under all of them. The domain names
+                // each one, so a callee's parameters align with them by name on the domain edge,
+                // as its result does on the codomain edge: a later parameter reading an earlier
+                // one reads it here as `𝑥ᵢ`. Built directly: `Type::dep_tuple` would drop the
+                // names nothing reads yet.
+                let mut parts = Vec::with_capacity(n);
+                let result = self.scoped_parameters(&names, &demand_kind, &mut parts, &mut |ctx| {
+                    ctx.fresh_part(&demand_kind)
+                });
+                let domain = if n == 0 {
+                    Type::Base(crate::ccl::BaseType::Unit)
+                } else {
+                    Type::DepTuple(names.iter().cloned().map(Some).zip(parts.clone()).collect())
+                };
+                let expected = Type::Fun {
+                    binder: crate::ccl::FunBinder::Parameters(
+                        names.iter().cloned().map(Some).collect(),
+                    ),
+                    fun_kind: demand_kind,
+                    domain: Box::new(domain),
+                    codomain: Box::new(result.clone()),
+                    capabilities: Capabilities::none(),
+                };
+                // Each parameter is discharged to its argument, read off the list.
+                let env = names.into_iter().zip(arguments).collect();
+                // The discharge's terms are copies of the call's arguments, minted for it.
+                let _mint = crate::ccl::provenance::enter(
+                    argument.node_id(),
+                    "infer.argument_list_discharge",
+                    crate::ccl::provenance::Nature::Machinery,
+                );
+                (expected, result, Subst::discharging(&env), Some(parts))
+            }
+        };
         let capabilities = self.call_capabilities();
         if let Type::Infer(_) = fn_ty.peel_refinements()
             && let Repr::Var(call) = capabilities.repr()
@@ -4913,7 +5038,31 @@ impl Typing for InferCtx {
         }
         let expected = expected.with_capabilities(capabilities);
         self.require_sub(fn_ty, &expected, at)?;
-        self.constrain_argument(arg_ty, &expected, at)?;
+        match &parameters {
+            None => self.constrain_argument(arg_ty, &expected, at)?,
+            // A parameter list none of whose types reads an earlier parameter takes its
+            // arguments whole: there is nothing to discharge.
+            Some(_) if !reads_earlier_parameters(fn_ty) => {
+                self.constrain_argument(arg_ty, &expected, at)?
+            }
+            // **Each argument meets its own parameter, the earlier parameters discharged at the
+            // earlier arguments**, as the result is: `f(𝑥, 𝑦)` of `(𝑎: A, 𝑏: B(𝑎)) ⇒ C(𝑎, 𝑏)`
+            // takes `𝑦` at `B(𝑥)`, whatever `𝑥`'s type has resolved to by now. Meeting the
+            // argument tuple's type instead would read `𝑎` as any value of `𝑥`'s type.
+            Some(parts) => {
+                let arguments: &[Type] = match arg_ty.peel_refinements() {
+                    Type::Tuple(ts) if ts.len() == parts.len() => ts,
+                    Type::Base(crate::ccl::BaseType::Unit) if parts.is_empty() => &[],
+                    other => unreachable!(
+                        "a call's argument list is the tuple of its {} arguments, got {other}",
+                        parts.len()
+                    ),
+                };
+                for (argument, part) in arguments.iter().zip(parts) {
+                    self.require_sub_discharged(argument, part, &discharge, at)?;
+                }
+            }
+        }
         // The application's type is `result` with the binder discharged to the
         // argument. The discharge rides a fresh var's lower edge and fires at
         // coalesce, composing with the correspondence rename `[k ↦ x]` to the
@@ -4926,12 +5075,7 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        // The argument goes into the result's predicates in the spelling predicates are
-        // compared in (`ccl_utils::predicate_term`).
-        let bound = Bound::with_subst(
-            result,
-            Subst::discharge(&x, crate::ccl::ccl_utils::predicate_term(argument)),
-        );
+        let bound = Bound::with_subst(result, discharge);
         enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
@@ -4950,6 +5094,61 @@ impl Typing for InferCtx {
             Some(binder) => crate::ccl::subst::discharge_codomain(binder, key, codomain),
             None => codomain.clone(),
         }
+    }
+}
+
+/// Whether `fn_ty` is a function of a parameter list some of whose types read an earlier
+/// parameter, `(a: A, b: B(a)) => C`, which its arguments meet one by one, each at its parameter
+/// with the earlier ones at their arguments. A function known only once inference solves it
+/// states none yet.
+fn reads_earlier_parameters(fn_ty: &Type) -> bool {
+    let function = match fn_ty.peel_refinements() {
+        Type::Poly(poly) => &poly.body,
+        other => other,
+    };
+    let Type::Fun { binder, domain, .. } = function.peel_refinements() else {
+        return false;
+    };
+    let (Some(_), Type::DepTuple(components)) =
+        (binder.parameter_count(), domain.peel_refinements())
+    else {
+        return false;
+    };
+    let names: Vec<&Name> = components.iter().filter_map(|(n, _)| n.as_ref()).collect();
+    components.iter().enumerate().any(|(k, (_, t))| {
+        crate::ccl::subst::references_binder_within(t, k as u32)
+            || crate::ccl::subst::type_free_vars(t)
+                .iter()
+                .any(|v| names[..k.min(names.len())].contains(&v))
+    })
+}
+
+/// Component `j` of a call's argument list as a predicate reads it (the tuple
+/// [`Expr::erase_argument_lists`] makes of it), under the `let`s A-normalization put around it.
+/// The variable an argument is, which a message writes the parameter it is passed for as.
+fn passed_variable(argument: &Expr) -> Option<&Name> {
+    match &argument.node {
+        TypedExprNode::Var(name) => Some(name),
+        _ => None,
+    }
+}
+
+pub(super) fn list_component(passed: &Expr, j: usize) -> Expr {
+    match &passed.node {
+        TypedExprNode::Tuple(parts) => parts[j].clone_preserving_ids(),
+        TypedExprNode::Let { body, .. } => {
+            let mut out = passed.clone_preserving_ids();
+            let TypedExprNode::Let { body: inner, .. } = &mut out.node else {
+                unreachable!("a clone of a `let` is a `let`")
+            };
+            **inner = list_component(body, j);
+            out.ty = inner.ty.clone();
+            out
+        }
+        other => unreachable!(
+            "a call's argument list is a tuple under the `let`s naming its operands, got {}",
+            other.kind_name()
+        ),
     }
 }
 
@@ -5015,11 +5214,14 @@ mod tests {
         let bound = ctx
             .bind_annotation(&inferred, &ann)
             .expect("the annotation relates to the inferred function");
-        let Type::Fun { name, codomain, .. } = &bound else {
+        let Type::Fun {
+            binder, codomain, ..
+        } = &bound
+        else {
             panic!("expected a function, got {bound}");
         };
         assert_eq!(
-            name.as_ref(),
+            binder.whole(),
             Some(&k),
             "the annotation adopts the inferred binder"
         );

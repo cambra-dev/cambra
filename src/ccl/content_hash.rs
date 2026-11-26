@@ -318,15 +318,16 @@ fn hash_type<'a>(
         // joins have to be lossless, so `A ⇒ B` and `A ⤇ B` are not the same
         // computation. A `FunKind::Var`'s `uid` is a per-compilation identity
         // like `Infer`'s, so only its pin participates — what the one value
-        // reaching it fixed it to. The Pi binder `name` stays out: it is bound
+        // reaching it fixed it to. The Pi binder stays out: it is bound
         // in `codomain`, and α-invariance is the point of this hash.
         T::Fun {
             domain,
             codomain,
             fun_kind,
-            name: _,
+            binder,
             capabilities,
         } => {
+            binder.parameter_count().hash(state);
             std::mem::discriminant(fun_kind).hash(state);
             hash_capabilities(capabilities, env, free, state);
             if let FunKind::Var(v) = fun_kind {
@@ -591,6 +592,7 @@ fn hash_payload<'a>(
         | N::ExprStmt { .. }
         | N::List(_)
         | N::Tuple(_)
+        | N::Arguments(_)
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
@@ -665,10 +667,15 @@ fn hash_payload<'a>(
 
         // A `MutDecl`'s history `Mut(V, D)` rides its binder's `ty`, so hashing the binding
         // covers the declaration's whole type-level content.
-        N::Lambda { param: b, .. }
-        | N::Let { binding: b, .. }
-        | N::MutDecl { binding: b, .. }
-        | N::For { target: b, .. } => hash_binding(b, env, wenv, free, fold, h),
+        N::Lambda { params, .. } => {
+            params.len().hash(h);
+            for b in params {
+                hash_binding(b, env, wenv, free, fold, h);
+            }
+        }
+        N::Let { binding: b, .. } | N::MutDecl { binding: b, .. } | N::For { target: b, .. } => {
+            hash_binding(b, env, wenv, free, fold, h)
+        }
         N::LetRec { bindings, .. } | N::DefGroup { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
@@ -1000,6 +1007,22 @@ mod tests {
     }
 
     #[test]
+    fn function_parameter_count_participates_in_the_hash() {
+        let int = Type::Base(BaseType::Int);
+        let parameters = Type::fun_of_params(
+            vec![("a".into(), int.clone()), ("b".into(), int.clone())],
+            int.clone(),
+            FunKind::Compute,
+        );
+        let tuple = Type::fun(Type::tuple(vec![int.clone(), int.clone()]), int);
+        assert_ne!(h(&typed(parameters.clone())), h(&typed(tuple.clone())));
+        assert_ne!(
+            resolved_hash(&typed(parameters), &[]),
+            resolved_hash(&typed(tuple), &[])
+        );
+    }
+
+    #[test]
     fn inferred_type_participates_in_the_hash() {
         // Identical term, different inferred type → different hash.
         assert_ne!(
@@ -1109,10 +1132,11 @@ mod tests {
                         "binding" => TypedExpr::lambda("p", Occurrence::mint(), ty, var("p")),
                         "binding_annotation" => {
                             let mut p = lam("p", var("p"));
-                            let TypedExprNode::Lambda { param, .. } = &mut p.node else {
+                            let TypedExprNode::Lambda { params, .. } = &mut p.node else {
                                 unreachable!()
                             };
-                            param.user_annotation = Some(Annotation::new(ty, Occurrence::mint()));
+                            params[0].user_annotation =
+                                Some(Annotation::new(ty, Occurrence::mint()));
                             p
                         }
                         "cast" => TypedExpr::new(TypedExprNode::Cast {
@@ -1191,7 +1215,7 @@ mod tests {
         // An unresolved kind is a third state, not a synonym for either point.
         let unpinned = || {
             typed(Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: FunKind::fresh_var(),
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
@@ -1216,7 +1240,7 @@ mod tests {
                 v.record(FunKind::Compute, true)
             }
             typed(Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind,
                 domain: Box::new(int()),
                 codomain: Box::new(int()),

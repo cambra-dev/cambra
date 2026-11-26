@@ -354,7 +354,7 @@ binder's type in that pane. The row's edge label is the child's `kind` (`childEd
 The positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
 from them because the tree draws no row for one. `tightestNodeAt` takes a node over an occurrence of
 equal extent. An occurrence the source writes is recorded at the name, narrower than the node
-holding it, so it wins on extent; one the source does not write, such as `__arg_tuple_0`, is
+holding it, so it wins on extent; one the source does not write, such as `__result_0`, is
 recorded at its holder's span and does not take a click on `def` from the lambda that holds it.
 
 Both wire validators check that `kind` is `value`, `predicate`, or one of the five occurrence
@@ -399,8 +399,8 @@ often as it does in the program.
 | a constructor head the source writes: `rect` in `case Shape::rect(w, h)` | its head occurrence | the constructor's declaration, `NominalCtor.span` |
 | a name lowering resolves in a type or a module path: `Shape` in `s: Shape` | the row's use span | the row's target ([lowering.md](../ccl/design/lowering.md#names-lowering-resolves)) |
 
-A multi-argument function's parameters and a constructor pattern's fields bind nothing:
-`uncurry_params` and `bind_parameters` substitute `__arg_tuple_N ▷ .i` for every use. They resolve
+A constructor pattern's fields bind nothing: `bind_parameters` substitutes a projection of the
+arm's payload, `payload ▷ .i`, for every use. They resolve
 through the projection's two spans, the use on the `Apply` and the declaration on its `Proj` child
 ([ir.md](../ccl/design/ir.md#source-locations-on-substituted-parameter-projections)). The projection is
 identified by its `lower.param_proj` tag, so an author-written `t.0` is not mistaken for one. The

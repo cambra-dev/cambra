@@ -87,9 +87,10 @@
 //! write may happen at either:
 //!
 //! - a [`TypedExprNode::MutWrite`]'s target, which is the write itself; and
-//! - a `Var` in an [`TypedExprNode::Apply`]'s function or argument position,
-//!   which this pass leaves alone (below) and which is where a pass-by-reference
-//!   writer takes its handle.
+//! - a `Var` in an [`TypedExprNode::Apply`]'s function or argument position, or a
+//!   component of the argument tuple of a call that may pass by reference
+//!   ([`crate::ccl::mut_scope::Muts::passes_by_reference`]), which this pass leaves alone
+//!   (below) and which is where a pass-by-reference writer takes its handle.
 //!
 //! The mention is what this pass can read. Whether `f(x)` writes `x` is a
 //! question about `f`'s parameter, and before inference neither that type nor —
@@ -161,7 +162,7 @@ use crate::ccl::{
     BindingTransparency, Branch, Expr, Name, Type, TypedBinding, TypedExprNode,
     ccl_utils::{free_names_in_value, spelled_in_a_type},
     lambda_elim::substitute,
-    mut_scope::{Muts, is_mut_var, under_param, with},
+    mut_scope::{Muts, is_mut_var, under_params, with},
     provenance::{self, Nature},
     subst::Subst,
     symbolic::symbolic,
@@ -174,7 +175,8 @@ pub fn run(expr: Expr) -> Expr {
     // narrower scope.
     let root_id = expr.node_id();
     let _g = provenance::enter(root_id, "mut_read.bind", Nature::Machinery);
-    block(expr, &Muts::new())
+    let muts = Muts::of_program(&expr);
+    block(expr, &muts)
 }
 
 /// The immutable binder each mutable variable currently reads through, over the
@@ -350,12 +352,23 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
 
         // A handle position on both sides — see the module docs. Neither child
         // is descended into when it is a bare reference; anything else in those
-        // positions is an ordinary operand.
+        // positions is an ordinary operand. A call that may pass an argument by reference
+        // passes each argument of its list to one parameter, so a bare reference
+        // there is a handle position too.
         TypedExprNode::Apply { function, argument } => {
+            let by_reference = muts.passes_by_reference(function);
             if !is_mut_var(function, muts) {
                 **function = operand(std::mem::take(function), muts, open, minted);
             }
-            if !is_mut_var(argument, muts) {
+            // An argument list stays where it stands, each argument an operand of its own.
+            if let TypedExprNode::Arguments(components) = &mut argument.node {
+                for c in components
+                    .iter_mut()
+                    .filter(|c| !(by_reference && is_mut_var(c, muts)))
+                {
+                    *c = operand(std::mem::take(c), muts, open, minted);
+                }
+            } else if !is_mut_var(argument, muts) {
                 **argument = operand(std::mem::take(argument), muts, open, minted);
             }
             expr
@@ -365,8 +378,8 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
         // What sits beside the body — a loop's source, a match's scrutinee and
         // guards — is evaluated in the enclosing block and stays an operand of
         // the statement carrying it.
-        TypedExprNode::Lambda { param, body } => {
-            let inner = under_param(muts, param);
+        TypedExprNode::Lambda { params, body } => {
+            let inner = under_params(muts, params);
             **body = block(std::mem::take(body), &inner);
             expr
         }
@@ -516,17 +529,23 @@ fn loop_body(body: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) -> E
 }
 
 /// Collect the mutable variables `expr` may write: a [`TypedExprNode::MutWrite`]'s
-/// target, and a bare reference in an application's function or argument, the
-/// positions a pass-by-reference writer takes its handle from (module docs,
-/// "What ends a segment"). The walk reaches every child, nested blocks
-/// included.
+/// target, and a bare reference in an application's function or argument, or in the
+/// argument tuple of a call that may pass by reference, the positions a pass-by-reference
+/// writer takes its handle from (module docs, "What ends a segment"). The walk reaches every
+/// child, nested blocks included.
 fn writes(expr: &Expr, muts: &Muts, out: &mut HashSet<Name>) {
     match &expr.node {
         TypedExprNode::MutWrite { name, .. } => {
             out.insert(name.clone());
         }
         TypedExprNode::Apply { function, argument } => {
-            for handle in [function, argument] {
+            let components: &[Expr] = match &argument.node {
+                TypedExprNode::Arguments(components) if muts.passes_by_reference(function) => {
+                    components
+                }
+                _ => &[],
+            };
+            for handle in [&**function, &**argument].into_iter().chain(components) {
                 if let TypedExprNode::Var(name) = &handle.node
                     && muts.contains(name)
                 {
@@ -628,8 +647,8 @@ fn respell(expr: &Expr, muts: &Muts, out: &mut Subst) {
             respell(body, &with(muts, &binding.name), out);
             return;
         }
-        TypedExprNode::Lambda { param, body } => {
-            respell(body, &under_param(muts, param), out);
+        TypedExprNode::Lambda { params, body } => {
+            respell(body, &under_params(muts, params), out);
             return;
         }
         // A read-segment binding: opaque, bound to a bare read, and named by a
@@ -1010,7 +1029,7 @@ fn hidden(ty: &Type, out_of_scope: &dyn Fn(&Name) -> bool) -> Type {
     };
     match ty {
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
@@ -1024,7 +1043,7 @@ fn hidden(ty: &Type, out_of_scope: &dyn Fn(&Name) -> bool) -> Type {
             let base = Type::refined(hidden(base, out_of_scope), kept(rs));
             Type::sum_over(
                 crate::ccl::ty::TypeKind::SubtypesOf(Box::new(base)),
-                name.clone(),
+                binder.clone(),
                 hidden(codomain, out_of_scope),
             )
         }

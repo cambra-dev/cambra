@@ -86,7 +86,7 @@ are:
 
 | Node | Binder scope |
 |---|---|
-| `Lambda` | `param` binds in `body`. |
+| `Lambda` | `params` bind in `body`, and each in the types of the ones after it. Its argument is the product of their types: the one's, the tuple of several, or the unit for none. A lambda of other than one parameter takes a parameter list, which inlining substitutes call by call, so past inlining every lambda left binds one parameter. |
 | `Let`, `MutDecl` | `binding` binds in `body`; `bound_expr` or `init` is outside its scope. |
 | `LetRec`, `DefGroup` | Every group binder binds in every definition and in `body`. |
 | `For` | `position` and `target` bind in `body`, and `target`'s type is in `position`'s scope; `iter` is outside their scope. |
@@ -167,39 +167,25 @@ each morphism the codomain before it read by name (`ccl_utils::chain_type`).
 
 ### Source locations on substituted parameter projections
 
-An ordinary multi-parameter `def f(p, q)` lowers to one lambda over a tuple parameter.
-`uncurry_params` substitutes a projection for every use of `p` or `q`:
+A function's parameters are binders of its `Lambda`, each a `TypedBinding` with its own occurrence.
+The named fields of a constructor pattern of several parameters are not: `bind_parameters`
+substitutes a projection of the arm's payload binder for each use, so `w` in
+`case Shape::rect(w, h): w` becomes a projection. The outer `Apply` of the substituted projection
+keeps the field occurrence's `NodeId` and source span. Its `Proj` child carries the field's
+declaration span from the substitution template, tagged `lower.param_proj`, which is the label a
+definition lookup identifies a substituted projection by. A definition lookup can therefore
+distinguish the use site from the declaration.
 
-```
-λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1
-```
-
-The original parameter has no `TypedBinding` in that shape. The outer `Apply` of the substituted
-projection keeps the parameter occurrence's `NodeId` and source span. Its `Proj` child carries the
-parameter declaration span from the substitution template. A definition lookup can therefore
-distinguish the use site from the declaration. The test
-`a_substituted_parameter_carries_occurrence_and_declaration_spans` checks both spans.
-
-`bind_parameters` substitutes the named fields of a constructor pattern of several parameters the
-same way: `w` in `case Shape::rect(w, h): w` becomes a projection of the arm's payload binder. Both
-tag the template `lower.param_proj` at the name the parameter or field declares, which is the label
-a definition lookup identifies a substituted projection by.
-
-Replacing each parameter with an inner `let p = __arg_tuple_0.0` would introduce `Let` nodes
-that lambda elimination lifts to function-valued bindings. The resulting `zip(.0, .1)`-shaped
-morphisms need reductions that simplification does not implement. Direct projection substitution
-avoids that unsupported form, as specified by `substitute_params` in `lower/functions.rs`.
-Scope exit is a separate mechanism: inference discharges an ordinary `let` definition into result
-refinements when they leave its scope (see
-[`let` binders and scope exit](type-inference.md#let-binders-and-scope-exit)). A function with a
-`Mut` parameter still uses named curried binders because a mutable write needs a named target.
+Replacing each field with an inner `let w = payload.0` would introduce `Let` nodes that lambda
+elimination lifts to function-valued bindings, whose `zip(.0, .1)`-shaped morphisms need reductions
+that simplification does not implement. Direct projection substitution avoids that form.
 
 ### Application shape
 
 `Apply` has one function child and one argument child; its symbolic form places the argument first:
-`𝑎 ▷ 𝑓` means `𝑓(𝑎)`. A one-argument CHL call uses one `Apply`. An ordinary multi-argument call
-`f(a, b)` packs `(a, b)` into one argument, matching the tupled parameter lambda. A call to a
-function with a `Mut` parameter instead uses chained applications matching its named lambdas.
+`𝑎 ▷ 𝑓` means `𝑓(𝑎)`. A one-argument CHL call uses one `Apply`. A multi-argument call
+`f(a, b)` packs `(a, b)` into one argument, including calls with borrowed parameters. The
+function's parameter list binds the tuple's components.
 
 At the IR level, a curried application forms a chain: `𝑏 ▷ (𝑎 ▷ 𝑓)` has an outer application
 whose function is the inner application. CHL call lowering currently requires a named target, so
@@ -546,9 +532,6 @@ and binder `user_annotation` slots before downstream passes. No persistent `decl
 the binder's resolved `ty` is the type at which references are bound. See
 [the binder slot](type-inference.md#the-binder-slot-and-why-annotations-do-not-outlive-inference).
 
-`BindingRole` distinguishes a source function's outer parameter from generated curried
-continuations. Contribution inference uses these roles to retain the common signature scope.
-
 `NodeId` tracks provenance, not expression equality: `TypedExpr` comparison ignores it.
 `Clone` freshens node identities, while `clone_preserving_ids` and `preserve` are explicit paths
 for carrying an existing identity through a rebuild. A substitution's in-place replacement keeps
@@ -807,3 +790,10 @@ to the `try` around it.
   `` `__ok ``: the code after it matches the outcome, and the transaction commits the block's
   writes and sends its outputs only where the outcome is `` `__ok ``
   ([mutability.md](mutability.md#a-block-an-exception-escapes)).
+
+
+### Symbolic parameter lists
+
+A lambda binds a list as `λ (𝑥, 𝑦) → body`, or `λ () → body` for none. `args(𝑎, 𝑏)` passes
+its arguments, and `args()` passes none. A tuple remains one argument. Inlining eliminates
+parameter lists before later phases require single-parameter lambdas.

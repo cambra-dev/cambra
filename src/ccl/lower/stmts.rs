@@ -1096,7 +1096,6 @@ pub(super) fn lower_middle_stmt(
             };
             Ok(ctx.tag_image(lowered, stmt.span))
         }
-        // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
             owner: None,
             name,
@@ -2255,13 +2254,9 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                     ctx.register_transactional(id.as_str());
                 }
             }
-            // A `def` with a pass-by-reference `Mut` or `Feed` parameter is lowered
-            // and applied curried. Blocks lower right-to-left, so a call site is
-            // lowered *before* the `def` preceding it textually — pre-register
-            // the name here so [`lower_call`] picks the curried shape. Register
-            // or unregister per the definition's parameters so the last `def` of a
-            // name in the block wins (a redefinition with no such parameter clears
-            // an earlier one, so its calls lower tupled).
+            // Blocks lower call sites before preceding definitions. Record reference-taking
+            // names first, so argument lowering knows their passing mode. The last definition
+            // of a name determines the record, including a definition with value parameters.
             ChlStmt::FunctionDef { name, params, .. } => {
                 let has_history_param = params.iter().any(|p| {
                     p.annotation
@@ -3627,7 +3622,7 @@ fn holes_to_params(
 ) -> Type {
     fn go(ty: &Type, fresh: &mut Vec<crate::ccl::ty::PolyParam>, bounded: &str) -> Type {
         if let Type::Fun {
-            name,
+            binder,
             fun_kind: fun_kind @ crate::ccl::FunKind::Var(k),
             domain,
             codomain,
@@ -3637,7 +3632,7 @@ fn holes_to_params(
             && matches!(**domain, Type::Hole)
         {
             return Type::Fun {
-                name: name.clone(),
+                binder: binder.clone(),
                 fun_kind: fun_kind.clone(),
                 domain: domain.clone(),
                 codomain: Box::new(go(codomain, fresh, bounded)),
@@ -4002,7 +3997,6 @@ pub(super) fn lower_try_over(
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
-                role: Default::default(),
             },
             body: handler_body,
         });
@@ -4265,6 +4259,16 @@ pub(super) fn lower_type_expr_or_poly(
                 }
                 Ok(Type::OpenTuple(out))
             }
+            // A product naming its components, `{(i: A), (j: B(i)), C}`: each component may
+            // read the ones named before it, a dependent tuple
+            // (`docs/chl-spec.md`, "Named components").
+            _ if parts
+                .iter()
+                .any(|p| matches!(p.node, ChlExpr::TypeBinder { .. })) =>
+            {
+                let components = lower_named_components(parts, ctx)?;
+                Ok(named_product(components))
+            }
             _ => {
                 let mut out = Vec::with_capacity(parts.len());
                 for part in parts {
@@ -4310,7 +4314,7 @@ pub(super) fn lower_type_expr_or_poly(
         // sketch)"). The arrow is the compute arrow `⇒` ([`FunKind::Compute`]) — the
         // funkind a `def`/lambda produces — so an annotated binding
         // `f: (Int => Int) = \x -> …` matches its value. `Type::fun` builds the
-        // non-dependent form (`name: None`): the surface has no binder to make it a Pi
+        // non-dependent form (`FunBinder::None`): the surface has no binder to make it a Pi
         // type.
         //
         // A function value's trait requirements are resolved where it is made, so its type's
@@ -4339,7 +4343,125 @@ pub(super) fn lower_type_expr_or_poly(
             };
             let codomain = under_type_binders(&[(name, domain.clone())], codomain, ctx)?;
             let ty = Type::Fun {
-                name: Some(Name::fresh(name.node.clone())),
+                binder: crate::ccl::FunBinder::Whole(Name::fresh(name.node.clone())),
+                fun_kind,
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
+            };
+            match arrow {
+                chl_parser::ast::Arrow::Compute => {
+                    with_written_clauses(ty, requires, causes, annotation.span, ctx)
+                }
+                chl_parser::ast::Arrow::Data => Ok(ty),
+            }
+        }
+        // A function of a parameter list, `(a: A, B) => C(a)` or `() => C`: a function taking
+        // as many arguments as the list is long, the codomain reading each parameter the list
+        // names (`docs/chl-spec.md`, "Parameter lists"). A collection is keyed by one value.
+        ChlExpr::FunctionType {
+            domain,
+            arrow,
+            codomain,
+            requires,
+            causes,
+        } if matches!(domain.node, ChlExpr::Tuple(_)) => {
+            let ChlExpr::Tuple(entries) = &domain.node else {
+                unreachable!("matched a parameter list")
+            };
+            if entries.len() == 1 {
+                return Err(LoweringError::unsupported(
+                    domain.span,
+                    "a one-parameter type is A => C; write {A,} => C for one tuple parameter",
+                ));
+            }
+            if *arrow == chl_parser::ast::Arrow::Data {
+                return Err(LoweringError::unsupported(
+                    domain.span,
+                    "a collection is keyed by one value, not a parameter list: key it by a \
+                     tuple, `{K1, K2} |=> V`",
+                ));
+            }
+            let params: Vec<(Name, Type)> = lower_named_components(entries, ctx)?
+                .into_iter()
+                .map(|(name, ty)| {
+                    // A parameter the list does not name is read by none.
+                    let name = name.map_or_else(|| Name::fresh("_"), |n| Name::raw(n.node));
+                    (name, ty)
+                })
+                .collect();
+            let depth = ctx.type_binders.len();
+            ctx.type_binders.extend(
+                params
+                    .iter()
+                    .map(|(name, ty)| (SmolStr::from(name.base()), ty.clone())),
+            );
+            let codomain = lower_type_expr(codomain, ctx);
+            ctx.type_binders.truncate(depth);
+            let ty = Type::fun_of_params(params, codomain?, crate::ccl::FunKind::Compute);
+            with_written_clauses(ty, requires, causes, annotation.span, ctx)
+        }
+        // A function of a product naming its components, `{(a: A), (b: B(a))} => C(a, b)`:
+        // one parameter, a tuple, whose components the codomain reads each by its name.
+        ChlExpr::FunctionType {
+            domain,
+            arrow,
+            codomain,
+            requires,
+            causes,
+        } if matches!(&domain.node, ChlExpr::BraceGroup(parts)
+            if parts.iter().any(|p| matches!(p.node, ChlExpr::TypeBinder { .. }))) =>
+        {
+            let ChlExpr::BraceGroup(parts) = &domain.node else {
+                unreachable!("matched a brace group")
+            };
+            if *arrow == chl_parser::ast::Arrow::Data {
+                refuse_collection_clauses(requires, causes)?;
+            }
+            let components = lower_named_components(parts, ctx)?;
+            let fun_kind = match arrow {
+                chl_parser::ast::Arrow::Compute => crate::ccl::FunKind::Compute,
+                chl_parser::ast::Arrow::Data => crate::ccl::FunKind::Data(None),
+            };
+            // A component with no name is read by none, so its name is one nothing spells.
+            let params: Vec<(Name, Type)> = components
+                .into_iter()
+                .map(|(name, ty)| {
+                    let name = name.map_or_else(|| Name::fresh("_"), |n| Name::raw(n.node));
+                    (name, ty)
+                })
+                .collect();
+            let depth = ctx.type_binders.len();
+            ctx.type_binders.extend(
+                params
+                    .iter()
+                    .map(|(name, ty)| (SmolStr::from(name.base()), ty.clone())),
+            );
+            let codomain = lower_type_expr(codomain, ctx);
+            ctx.type_binders.truncate(depth);
+            let names: Vec<Option<Name>> =
+                params.iter().map(|(name, _)| Some(name.clone())).collect();
+            let domain = Type::dep_tuple(
+                params
+                    .into_iter()
+                    .map(|(name, ty)| (Some(name), ty))
+                    .collect(),
+            );
+            // The one input is the tuple, read whole, and a component's name reads its
+            // projection: `{(a: A), (b: B(a))} => C(a)` is `(p: {(a: A), (b: B(a))}) => C(p.0)`.
+            // Closed, a read of component `𝑗` is `PiRef { component: Some(𝑗) }` under the whole
+            // binder, which opening reads as `p.𝑗`, so the names close straight to it.
+            let codomain = crate::ccl::subst::close_at_binder(
+                &crate::ccl::FunBinder::Parameters(names),
+                &codomain?,
+            );
+            let binder = if crate::ccl::subst::references_enclosing_function(&codomain) {
+                crate::ccl::FunBinder::Whole(Name::fresh("p"))
+            } else {
+                crate::ccl::FunBinder::None
+            };
+            let ty = Type::Fun {
+                binder,
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
@@ -4356,7 +4478,8 @@ pub(super) fn lower_type_expr_or_poly(
             annotation.span,
             format!(
                 "`{0}: K` binds a value only as a function type's domain, `({0}: K) |=> V({0})`, \
-                 or as a family's parameter, `\\{0}: K -> V`",
+                 as a component of a product, `{{({0}: K), V({0})}}`, or as a family's \
+                 parameter, `\\{0}: K -> V`",
                 name.node
             ),
         )),
@@ -5617,6 +5740,73 @@ fn family_domains_agree(declared: &Type, at: &Type) -> bool {
             == crate::ccl::ccl_utils::strip_refinements(at)
 }
 
+/// A product's components as a program writes them, outermost first: each its name, where it
+/// has one, and its type.
+type NamedComponents = Vec<(Option<Spanned<SmolStr>>, Type)>;
+
+/// The components of a product written with names, `{(i: A), (j: B(i)), C}`, outermost first:
+/// each its name, where it has one, and its type, which reads the components named before it
+/// by name.
+fn lower_named_components(
+    parts: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<NamedComponents, LoweringError> {
+    let depth = ctx.type_binders.len();
+    let mut components: NamedComponents = Vec::with_capacity(parts.len());
+    let lowered = parts.iter().try_for_each(|part| {
+        let (name, ty) = match &part.node {
+            ChlExpr::TypeBinder { name, ty } => {
+                refuse_misannotated_type_binder(name, ty)?;
+                (Some(name.clone()), lower_type_expr(ty, ctx)?)
+            }
+            _ => (None, lower_type_expr(part, ctx)?),
+        };
+        // A written type whose component reads an earlier one does not compile yet: a `def`'s
+        // parameter may read an earlier parameter, which binds it, but a value meeting a written
+        // dependent tuple has no binder for the earlier component to stand under.
+        let read = crate::ccl::subst::type_free_vars(&ty);
+        let earlier = components
+            .iter()
+            .filter_map(|(n, _)| n.as_ref())
+            .find(|n| read.contains(&Name::raw(n.node.clone())));
+        if let Some(earlier) = earlier {
+            let earlier = &earlier.node;
+            return Err(LoweringError::unsupported(
+                part.span,
+                format!(
+                    "this component's type reads the component `{earlier}` before it, which a \
+                     written type does not support yet; a `def`'s parameter may read an earlier \
+                     parameter, `def f({earlier}: …, x: {{Int where _ >= {earlier}}})`"
+                ),
+            ));
+        }
+        if let Some(name) = &name {
+            ctx.type_binders.push((name.node.clone(), ty.clone()));
+        }
+        components.push((name, ty));
+        Ok(())
+    });
+    ctx.type_binders.truncate(depth);
+    lowered.map(|()| components)
+}
+
+/// The dependent tuple of `components` ([`lower_named_components`]), each later one reading
+/// the earlier ones by index, and the plain tuple where none does ([`Type::dep_tuple`]).
+fn named_product(components: NamedComponents) -> Type {
+    let mut components: Vec<(Option<Name>, Type)> = components
+        .into_iter()
+        .map(|(name, ty)| (name.map(|n| Name::raw(n.node)), ty))
+        .collect();
+    crate::ccl::subst::close_tuple_components(&mut components);
+    // Closed, a component's name is its spelling for display, so it is a binder of its own.
+    for (name, _) in &mut components {
+        if let Some(n) = name {
+            *n = Name::fresh(n.base());
+        }
+    }
+    Type::closed_dep_tuple(components)
+}
+
 /// `body` lowered with each of `scope`'s binders in scope at its type, innermost last, and
 /// its references to them closed into indices, as the codomain of a function binding them
 /// stores them.
@@ -5827,7 +6017,7 @@ fn lower_type_application(
                 };
                 let value = under_type_binders(&[(name, key.clone())], body, ctx)?;
                 return Ok(Type::Fun {
-                    name: Some(Name::fresh(name.node.clone())),
+                    binder: crate::ccl::FunBinder::Whole(Name::fresh(name.node.clone())),
                     fun_kind: crate::ccl::FunKind::Data(None),
                     domain: Box::new(key.clone()),
                     codomain: Box::new(value),
@@ -6048,7 +6238,6 @@ pub(super) fn lower_match_over(
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
                     site: None,
-                    role: Default::default(),
                 },
                 empty_payload,
             }),

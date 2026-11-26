@@ -138,7 +138,7 @@ pub trait Divisible(A, B):
 # instance answers it.
 pub trait Exponentiable(A, B):
     Output
-    def pow(a: A, b: B) => Output
+    def pow(a: A, b: {B where _ >= 0}) => Output
 
 # Types unary `-` negates: `-a` is `neg(a)`.
 pub trait Negatable(A):

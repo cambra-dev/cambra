@@ -210,13 +210,13 @@ pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Ty
         // A sum's kind is its binders, which its domain names: replacing it would leave those
         // references with no binder.
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
             capabilities,
         } if !matches!(fun_kind, FunKind::Data(Some(_))) && rng.chance(1, 2) => Type::Fun {
-            name,
+            binder,
             fun_kind: FunKind::Var(pool.pick(rng)),
             domain,
             codomain,
@@ -302,7 +302,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
                 gen_ty(rng, depth - 1, fragment)
             };
             Type::Fun {
-                name,
+                binder: name.into(),
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
@@ -402,7 +402,7 @@ pub fn partner(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
             // Edit *inside* a function: domain/codomain near-misses probe the
             // contravariant edge and the codomain correspondence.
             Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
@@ -410,7 +410,7 @@ pub fn partner(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
             } => {
                 let flip_kind = rng.chance(1, 4);
                 Type::Fun {
-                    name: name.clone(),
+                    binder: binder.clone(),
                     // Flipping data-vs-compute, not the binder slot: a slot carrying
                     // binders is a sum, and dropping them here would edit the *kind* into
                     // a shape no term built.

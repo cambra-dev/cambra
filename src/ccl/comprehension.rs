@@ -182,12 +182,12 @@ fn index_loop(e: &mut Expr) {
     let position = Name::iter_record();
     let read = Expr::apply(Expr::var(position.clone()), source);
     let step = Expr::apply(read, body);
-    let TypedExprNode::Lambda { param, body } =
+    let TypedExprNode::Lambda { params, body } =
         Expr::lambda(position, Occurrence::mint(), Type::Hole, step).node
     else {
         unreachable!("Expr::lambda builds a Lambda")
     };
-    *e = Expr::preserve(id, TypedExprNode::Lambda { param, body });
+    *e = Expr::preserve(id, TypedExprNode::Lambda { params, body });
     e.user_annotation = annotation;
 }
 
@@ -314,7 +314,7 @@ fn encode(
         // scope.
         let read = match &iter_dom {
             Some(shared) => read.with_user_annotation(Type::Fun {
-                name: Some(Name::fresh("__src_k")),
+                binder: crate::ccl::FunBinder::Whole(Name::fresh("__src_k")),
                 fun_kind: FunKind::Data(None),
                 domain: Box::new(shared.clone()),
                 codomain: Box::new(Type::Hole),
@@ -354,7 +354,7 @@ fn encode(
             let unrefined_lambda =
                 Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
                     .with_user_annotation(Type::Fun {
-                        name: None,
+                        binder: crate::ccl::FunBinder::None,
                         fun_kind: result_kind.clone(),
                         domain: Box::new(Type::Hole),
                         codomain: Box::new(Type::Hole),
@@ -368,7 +368,7 @@ fn encode(
         // counterpart of the filtered branch's `refined_data_fun` cast target.
         _ => Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
             .with_user_annotation(Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: result_kind,
                 domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
                 codomain: Box::new(Type::Hole),

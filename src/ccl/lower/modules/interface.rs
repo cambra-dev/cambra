@@ -298,9 +298,9 @@ pub struct Member {
     pub public: bool,
     /// The statement that binds it.
     pub declared: Span,
-    /// For a `def` with a `Mut(…)` or `Feed(…)` parameter, whose calls take a curried
-    /// shape, its number of parameters.
-    pub history_param: Option<usize>,
+    /// Whether it is a `def` with a `Mut(…)` or `Feed(…)` parameter, whose calls pass a bare
+    /// mutable variable or feed there.
+    pub history_param: bool,
 }
 
 /// One top-level type alias of a module.
@@ -475,10 +475,6 @@ impl TraitMember {
         }
         for function in &trait_.functions {
             let signature = &function.signature;
-            let domain = match signature.inputs.as_slice() {
-                [one] => one.clone(),
-                inputs => Type::tuple(inputs.to_vec()),
-            };
             let forall = match signature.params.as_slice() {
                 [] => String::new(),
                 params => {
@@ -489,7 +485,10 @@ impl TraitMember {
             let mut line = format!(
                 "    {}: {forall}{}",
                 function.name,
-                ty(&Type::fun(domain, signature.output.clone()))
+                ty(&crate::ccl::infer::solver::traits::function_over(
+                    &signature.inputs,
+                    signature.output.clone()
+                ))
             );
             let requires: Vec<String> = signature.requires.iter().map(|r| requirement(r)).collect();
             line.push_str(&crate::ccl::capabilities::clauses(
@@ -514,8 +513,7 @@ pub struct AssociatedMember {
     pub is_method: bool,
 }
 
-/// A reference to another module's member: the member spelled through its
-/// qualifier, and whether calls to it take a curried shape.
+/// A reference to another module's member, spelled through its qualifier.
 #[derive(Debug, Clone)]
 pub struct Reference {
     pub name: QualifiedName,
@@ -693,11 +691,6 @@ impl Interface {
                     );
                     continue;
                 };
-                // A caller writes a curried `def`'s arguments as one call's.
-                let contract = match member.history_param {
-                    Some(arity) => contract.uncurried(arity),
-                    None => contract.clone(),
-                };
                 let constant = if matches!(self.constants.get(name), Some(Ok(_))) {
                     "  # a constant"
                 } else if matches!(self.const_functions.get(name), Some(Ok(_))) {
@@ -705,7 +698,7 @@ impl Interface {
                 } else {
                     ""
                 };
-                let written = self.written_contract(&contract);
+                let written = self.written_contract(contract);
                 members.push((member.declared, format!("pub {name}: {written}{constant}")));
             }
         }
@@ -793,9 +786,7 @@ impl Interface {
                 Member {
                     public: binding.public,
                     declared: binding.span,
-                    history_param: ctx
-                        .is_history_param_fn(&binding.name)
-                        .then(|| def_arity(&ast.body, binding.span)),
+                    history_param: ctx.is_history_param_fn(&binding.name),
                 },
             );
         }
@@ -960,22 +951,6 @@ pub struct TopLevelBinding {
     /// Where the statement writes the name.
     pub name_span: Span,
     pub public: bool,
-}
-
-/// The number of parameters of the `def` at `span`, a statement of `stmts`.
-fn def_arity(stmts: &[Spanned<ChlStmt>], span: Span) -> usize {
-    let stmt = stmts
-        .iter()
-        .find(|stmt| stmt.span == span)
-        .unwrap_or_else(|| panic!("a top-level binding's statement stands at {span:?}"));
-    let inner = match &stmt.node {
-        ChlStmt::Pub { stmt, .. } => &stmt.node,
-        other => other,
-    };
-    let ChlStmt::FunctionDef { params, .. } = inner else {
-        panic!("a member with a `Mut` parameter is a `def`");
-    };
-    params.len()
 }
 
 /// The value bindings of `stmts`, a module's top level, in order. A type alias
@@ -1168,7 +1143,7 @@ impl Interface {
                     Some(member) if !member.public => {
                         missing.push(format!("`{name}` is private to module `{module}`"));
                     }
-                    Some(member) if member.history_param.is_some() => missing.push(format!(
+                    Some(member) if member.history_param => missing.push(format!(
                         "`{name}` takes a `Mut(…)` or `Feed(…)` parameter, and a parameter's \
                          Module type does not reach one yet"
                     )),

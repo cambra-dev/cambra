@@ -1059,11 +1059,14 @@ fn base_keys(
             };
             let outer = domain_keys(first, uncompiled_first, ctx, site)?;
             let family = correlated::keys_family(components, ctx)?;
-            let Type::Fun { name, codomain, .. } = family.ty.peel_refinements().clone() else {
+            let Type::Fun {
+                binder, codomain, ..
+            } = family.ty.peel_refinements().clone()
+            else {
                 return Err(format!("a key family is a function, got {}", family.ty));
             };
             let nested_ty = Type::Fun {
-                name,
+                binder,
                 fun_kind: crate::ccl::FunKind::Data(None),
                 domain: Box::new(first.clone()),
                 codomain,

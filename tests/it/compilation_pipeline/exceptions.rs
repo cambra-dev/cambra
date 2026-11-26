@@ -1392,14 +1392,9 @@ fn raising_filters(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{defs}{code}"), Value::Int(expected));
 }
 
-/// A filtered comprehension a function returns, called twice, whose filter may raise.
-///
-/// Wrong today, on main as well: a function returning a filtered comprehension whose filter or
-/// element reads a parameter beside its source fails inference with an unresolved variable at
-/// the source A-normalization binds ahead (`__iter_record ▷ __anf`), whether or not the filter
-/// raises: `def keep(xs, k): [x + k for x in xs if x + k > 1]` fails the same way.
+/// A filtered comprehension a function returns, called twice, whose filter may raise: each call's
+/// filter and element read that call's arguments.
 #[test]
-#[should_panic(expected = "Nothing determines the type of this expression")]
 fn a_raising_filter_in_a_returned_comprehension() {
     check_scalar(
         indoc! {"

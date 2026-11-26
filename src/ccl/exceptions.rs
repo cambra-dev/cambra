@@ -503,13 +503,14 @@ fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result:
             };
             let function_kept = Kept::of(&function);
             let function_ty = with_codomain(&function.ty, &result);
-            let TypedExprNode::Lambda { mut param, body } = function.node else {
+            let TypedExprNode::Lambda { params, body } = function.node else {
                 unreachable!("matched as a `Lambda`")
             };
+            let mut param = crate::ccl::into_one_param(params);
             let body = binder_apart(&mut param, *body, &arm_names(&arms));
             let function = function_kept
                 .rebuild(TypedExprNode::Lambda {
-                    param,
+                    params: vec![param],
                     body: Box::new(dispatch(body, arms, &result)),
                 })
                 .with_ty(function_ty);
@@ -531,10 +532,10 @@ fn dispatch(scrutinee: Expr, mut arms: Vec<(Label, TypedBinding, Expr)>, result:
 /// function's binder.
 fn with_codomain_over(ty: &Type, param: &Name, codomain: &Type) -> Type {
     let mut fun = with_codomain(ty, codomain);
-    if let Type::Fun { name, .. } = &mut fun
+    if let Type::Fun { binder, .. } = &mut fun
         && crate::ccl::subst::type_free_vars(codomain).contains(param)
     {
-        *name = Some(param.clone());
+        *binder = crate::ccl::FunBinder::Whole(param.clone());
     }
     fun
 }
@@ -557,12 +558,15 @@ fn positions_of(c: Expr) -> Expr {
     let ty = c.ty.clone();
     let (position, domain, codomain) = match ty.peel_refinements() {
         Type::Fun {
-            name,
+            binder,
             domain,
             codomain,
             ..
         } => (
-            name.clone().unwrap_or_else(|| Name::fresh("__position")),
+            binder
+                .whole()
+                .cloned()
+                .unwrap_or_else(|| Name::fresh("__position")),
             (**domain).clone(),
             (**codomain).clone(),
         ),
@@ -577,13 +581,13 @@ fn positions_of(c: Expr) -> Expr {
 fn with_codomain(ty: &Type, codomain: &Type) -> Type {
     match ty.peel_refinements() {
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             capabilities,
             ..
         } => Type::Fun {
-            name: name.clone(),
+            binder: binder.clone(),
             fun_kind: fun_kind.clone(),
             domain: domain.clone(),
             codomain: Box::new(codomain.clone()),
@@ -1017,7 +1021,8 @@ impl Cx {
             // lowering gives that form before inference says whether a call in it raises
             // (`comprehension::index_loop`). One that may raise is the loop it is, over the
             // positions `𝑟` names.
-            TypedExprNode::Lambda { param, body } if is_feeding_loop(&body) => {
+            TypedExprNode::Lambda { params, body } if is_feeding_loop(&body) => {
+                let param = crate::ccl::into_one_param(params);
                 let TypedExprNode::Apply { argument, function } = body.node else {
                     unreachable!("`is_feeding_loop` reads an `Apply`")
                 };
@@ -1025,12 +1030,13 @@ impl Cx {
                     unreachable!("`is_feeding_loop` reads the source at the position")
                 };
                 let TypedExprNode::Lambda {
-                    param: target,
+                    params: targets,
                     body,
                 } = function.node
                 else {
                     unreachable!("`is_feeding_loop` reads a `Lambda`")
                 };
+                let target = crate::ccl::into_one_param(targets);
                 self.elim_for(
                     kept,
                     param.name,
@@ -1063,9 +1069,10 @@ impl Cx {
             {
                 let function_kept = Kept::of(&function);
                 let function_ty = function.ty.clone();
-                let TypedExprNode::Lambda { param, body } = function.node else {
+                let TypedExprNode::Lambda { params, body } = function.node else {
                     unreachable!("matched as a `Lambda`")
                 };
+                let param = crate::ccl::into_one_param(params);
                 let argument = self.elim(*argument, arms);
                 let body_ty = body.ty.clone();
                 let body = self.elim(*body, arms);
@@ -1073,7 +1080,7 @@ impl Cx {
                     (Elim::Pure(argument), Elim::Pure(body)) => {
                         let function = function_kept
                             .rebuild(TypedExprNode::Lambda {
-                                param,
+                                params: vec![param],
                                 body: Box::new(body),
                             })
                             .with_ty(function_ty);
@@ -1096,7 +1103,7 @@ impl Cx {
                         );
                         let function = function_kept
                             .rebuild(TypedExprNode::Lambda {
-                                param: param.clone(),
+                                params: vec![param.clone()],
                                 body: Box::new(body),
                             })
                             .with_ty(function_ty);
@@ -1115,7 +1122,8 @@ impl Cx {
                     }
                 }
             }
-            TypedExprNode::Lambda { param, body } if ty.is_collection() => {
+            TypedExprNode::Lambda { params, body } if ty.is_collection() => {
+                let param = crate::ccl::into_one_param(params);
                 let lambda_ty = ty.clone();
                 self.elim_collection(kept, param, *body, &lambda_ty, None, &ty, arms)
             }
@@ -1128,9 +1136,10 @@ impl Cx {
             {
                 let lambda_kept = Kept::of(&value);
                 let lambda_ty = value.ty.clone();
-                let TypedExprNode::Lambda { param, body } = value.node else {
+                let TypedExprNode::Lambda { params, body } = value.node else {
                     unreachable!("matched as a `Lambda`")
                 };
+                let param = crate::ccl::into_one_param(params);
                 self.elim_collection(
                     lambda_kept,
                     param,
@@ -1561,12 +1570,13 @@ impl Cx {
         let kept = Kept::of(&level);
         let ty = Self::outcomes_beneath(&level.ty, levels, arms);
         let kind = level.node.kind_name();
-        let TypedExprNode::Lambda { param, body } = level.node else {
+        let TypedExprNode::Lambda { params, body } = level.node else {
             panic!("a level of an uncurried comprehension is a lambda, got {kind}")
         };
+        let param = crate::ccl::into_one_param(params);
         let body = self.outcome_spine(*body, levels, arms);
         kept.rebuild(TypedExprNode::Lambda {
-            param,
+            params: vec![param],
             body: Box::new(body),
         })
         .with_ty(ty)
@@ -1609,9 +1619,10 @@ impl Cx {
                 );
                 let function_kept = Kept::of(&function);
                 let function_ty = function.ty.clone();
-                let TypedExprNode::Lambda { param, body } = function.node else {
+                let TypedExprNode::Lambda { params, body } = function.node else {
                     unreachable!("matched as a `Lambda`")
                 };
+                let param = crate::ccl::into_one_param(params);
                 let body = if levels == 1 {
                     let value_ty = body.ty.clone();
                     let element = self.elim(*body, arms);
@@ -1629,7 +1640,7 @@ impl Cx {
                 );
                 let function = function_kept
                     .rebuild(TypedExprNode::Lambda {
-                        param,
+                        params: vec![param],
                         body: Box::new(body),
                     })
                     .with_ty(function_ty);
@@ -1694,7 +1705,7 @@ impl Cx {
         let lambda_ty = with_codomain_over(lambda_ty, &param.name, &outcome_ty);
         let lambda = kept
             .rebuild(TypedExprNode::Lambda {
-                param,
+                params: vec![param],
                 body: Box::new(element),
             })
             .with_ty(lambda_ty);
@@ -1744,7 +1755,10 @@ impl Cx {
         // A collection whose element type reads its position names it in its type, and the
         // value's binder takes that name, so its body's type is the one the type states.
         let position = match ty.peel_refinements() {
-            Type::Fun { name: Some(b), .. } => b.clone(),
+            Type::Fun {
+                binder: crate::ccl::FunBinder::Whole(b),
+                ..
+            } => b.clone(),
             _ => Name::fresh("__position"),
         };
         let k = binding(position, domain_ty.clone());
@@ -1796,9 +1810,10 @@ impl Cx {
     ) -> Elim {
         let value_kept = Kept::of(&value);
         let mut lambda_ty = value.ty.clone();
-        let TypedExprNode::Lambda { param, body } = value.node else {
+        let TypedExprNode::Lambda { params, body } = value.node else {
             unreachable!("a filter is a comprehension's, and it filters a lambda")
         };
+        let param = crate::ccl::into_one_param(params);
         let domain = target.domain().expect("a cast target is a collection");
         let filter = {
             let mut raising = domain
@@ -1961,7 +1976,7 @@ impl Cx {
 
         let lambda = value_kept
             .rebuild(TypedExprNode::Lambda {
-                param,
+                params: vec![param],
                 body: Box::new(element),
             })
             .with_ty(lambda_ty);

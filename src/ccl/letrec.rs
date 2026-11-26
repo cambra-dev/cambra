@@ -306,8 +306,9 @@ fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
                 out.insert(n.clone());
             }
         }
-        TypedExprNode::Lambda { param, body } => {
-            with_shadowed(live, std::slice::from_ref(&param.name), |inner| {
+        TypedExprNode::Lambda { params, body } => {
+            let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
+            with_shadowed(live, &names, |inner| {
                 collect_noncausal_refs(body, inner, out)
             });
         }

@@ -22,7 +22,7 @@ use std::rc::Rc;
 use crate::ccl::ccl_utils::normal_refinement;
 use crate::ccl::infer_var::{GuardedBound, Origin};
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::{FunKind, KindPin, TypeKind};
+use crate::ccl::ty::{FunBinder, FunKind, KindPin, TypeKind};
 use crate::ccl::{
     BarrierUpper, BarrierVar, BarrierVarId, BaseType, Bound, HistoryKind, InferVar, InferVarId,
     Level, Name, Refinement, RefinementSet, Type,
@@ -567,6 +567,54 @@ impl ScopeEnv for SkipSmtScope {
     }
 }
 
+/// `outer` with the earlier components of a dependent tuple bound at the types the value's
+/// components have, so a later component's refinement reads them as the value's own: `(1, 5)`
+/// meets `{(a: Int), (b: {Int where _ >= a})}` with `a` at `{Int where _ == 1}`.
+struct ComponentScope<'a> {
+    outer: &'a dyn ScopeEnv,
+    components: Vec<(Name, Type)>,
+}
+
+impl ComponentScope<'_> {
+    /// A mismatch leaving this component scope reads its temporary binders at their
+    /// literal values. Captured names from the outer scope keep their written spelling.
+    fn mismatch_at_values(&self, error: ConstrainError) -> ConstrainError {
+        let ConstrainError::Mismatch { lhs, rhs } = error else {
+            return error;
+        };
+        let values: HashMap<_, _> = self
+            .components
+            .iter()
+            .filter_map(|(name, ty)| {
+                let value = crate::ccl::ty::singleton_value(ty)?;
+                Some((name.clone(), value.clone_preserving_ids()))
+            })
+            .collect();
+        let substitution = {
+            let _copies = crate::ccl::provenance::copy_frame("infer.argument_diagnostic");
+            Subst::discharging(&values)
+        };
+        ConstrainError::Mismatch {
+            lhs: Box::new(substitution.apply_type(&lhs)),
+            rhs: Box::new(substitution.apply_type(&rhs)),
+        }
+    }
+}
+
+impl ScopeEnv for ComponentScope<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.components
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+            .or_else(|| self.outer.binder_type(name))
+    }
+    fn is_skip_smt(&self) -> bool {
+        self.outer.is_skip_smt()
+    }
+}
+
 /// Constrain `lhs <: rhs`, mutating variable bounds in place.
 ///
 /// The cache argument breaks cycles; pass a fresh empty `HashSet` at
@@ -602,6 +650,51 @@ pub fn constrain_subtype_in(
 ) -> Result<(), ConstrainError> {
     cache.extruded.clear();
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
+}
+
+/// [`constrain_subtype_in`] with `rhs` read under `rhs_subst`: an argument against its
+/// parameter, whose type reads the parameters before it, discharged at their arguments.
+pub fn constrain_subtype_discharged_in(
+    lhs: &Type,
+    rhs: &Type,
+    rhs_subst: &Subst,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
+    cache.extruded.clear();
+    constrain_go(lhs, rhs, &Subst::id(), rhs_subst, cache, scope)
+}
+
+/// `domain`, the domain of a function binding the parameter list `from`, with its parameters
+/// named as `to` names them: each component's name and each reference to it, so it meets a
+/// domain under `to`'s names component by component. `None` unless both are parameter lists of
+/// one length over a dependent tuple.
+fn onto_parameter_names(domain: &Type, from: &FunBinder, to: &FunBinder) -> Option<Type> {
+    let (FunBinder::Parameters(from), FunBinder::Parameters(to)) = (from, to) else {
+        return None;
+    };
+    let Type::DepTuple(components) = domain else {
+        return None;
+    };
+    if components.len() != to.len() || from.len() != to.len() {
+        return None;
+    }
+    let renames = components
+        .iter()
+        .map(|(name, _)| name)
+        .chain(from)
+        .zip(to.iter().chain(to))
+        .fold(Subst::id(), |s, (from, to)| match (from, to) {
+            (Some(from), Some(to)) if from != to => s.extended_rename(from, to),
+            _ => s,
+        });
+    Some(Type::DepTuple(
+        components
+            .iter()
+            .zip(to)
+            .map(|((name, ty), to)| (to.clone().or_else(|| name.clone()), renames.apply_type(ty)))
+            .collect(),
+    ))
 }
 
 /// Check a barrier variable's upper bound against `resolved`, the type the variable resolved to:
@@ -845,6 +938,10 @@ fn named_domain(d: &Type) -> bool {
 /// edge preserves it:
 /// - equal morphisms need no bridge (covers two entries that arrived under
 ///   the *same* discharge);
+/// - a discharge-bearing `lo` meeting an invertible `hi` moves the upper into the lower's
+///   frame, `τ_U = lo ∘ hi⁻¹`, ahead of the correspondence reading below: `V <: U` and
+///   `L <: V‹[x↦k]›` derive `L <: U‹[x↦k]›`, which keeps what `L`'s side knows of `k` (an
+///   argument meeting a parameter that reads an earlier one);
 /// - an invertible `lo` (identity or rename) moves the lower into the upper's
 ///   frame: `τ_L = hi ∘ lo⁻¹` — the common case;
 /// - otherwise an invertible `hi` moves the upper into the lower's frame:
@@ -869,6 +966,17 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
         && lo.acting_on(v) == hi.acting_on(v)
     {
         return Some((Subst::id(), Subst::id()));
+    }
+    // **A discharge to a value on the lower view moves the upper, not the lower.**
+    // `𝐿 <: 𝑉‹[𝑥 ↦ 𝑘]›` and `𝑉 <: 𝑈` derive `𝐿 <: 𝑈‹[𝑥 ↦ 𝑘]›`. Moving `𝐿` into `𝑉`'s frame
+    // instead, by reading a discharge to a variable as a correspondence, loses what the lower
+    // side knows of `𝑘`: an argument meeting a parameter whose type reads an earlier parameter
+    // knows the earlier argument, and the parameter's frame does not (`Typing::apply`). A
+    // handle discharged to a parameter is the parameter, so it keeps the correspondence below.
+    if lo.discharges_a_value()
+        && let Some(hi_inv) = hi.invert()
+    {
+        return Some((Subst::id(), Subst::then(&hi_inv, lo)));
     }
     // Reconcile on the LICENSED CORRESPONDENCE VIEWS: Var-target discharges
     // read as correspondences into the outer scope, under the monomorphic
@@ -1534,7 +1642,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             Some((Type::Refinement(Box::new(b2), refinements.clone()), s2))
         }
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain,
             codomain,
@@ -1548,7 +1656,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             };
             Some((
                 Type::Fun {
-                    name: name.clone(),
+                    binder: binder.clone(),
                     fun_kind: FunKind::Data(None),
                     domain: domain.clone(),
                     codomain: codomain.clone(),
@@ -1687,14 +1795,14 @@ fn constrain_go_impl(
         // contravariant/covariant rule.
         (
             Type::Fun {
-                name: n0,
+                binder: n0,
                 fun_kind: k0,
                 domain: d0,
                 codomain: c0,
                 capabilities: e0,
             },
             Type::Fun {
-                name: n1,
+                binder: n1,
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
@@ -1705,6 +1813,12 @@ fn constrain_go_impl(
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
             constrain_fun_kind(k0, k1, lhs, rhs, sl, sr)?;
+            // **A parameter list's length is part of the type**: a function of two parameters
+            // is not a function of one pair, nor of three (`docs/chl-spec.md`, "Parameter
+            // lists").
+            if n0.parameter_count() != n1.parameter_count() {
+                return Err(mismatch(lhs, rhs, sl, sr));
+            }
             constrain_capabilities(e0, e1, cache);
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
@@ -1813,7 +1927,10 @@ fn constrain_go_impl(
                 || [d0, d1]
                     .iter()
                     .any(|d| matches!(&***d, Type::Infer(v) if v.names_domain()));
-            let cod_sl = sl.aligned(n0, n1);
+            // A parameter list names each parameter, so the side whose codomain is read under
+            // the other's names all of them ([`crate::ccl::subst::named_binder`]).
+            let n1 = &crate::ccl::subst::named_binder(n1);
+            let cod_sl = sl.aligned_binders(n0, n1);
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
             // conversions run"): a *closed* codomain — one whose refinements
             // reference this function's binder as indices — opens at its own
@@ -1821,24 +1938,17 @@ fn constrain_go_impl(
             // recorded on inner variables are name-spelled against their
             // telescopes and the correspondence above applies to them.
             //
-            // On the live solve, opening is gated on the **opposite** side
-            // carrying inference variables: only a live side records
-            // bounds, so only there would a dangling index land. A concrete
-            // closed-closed pair compares index-to-index instead — opening it
-            // at display names would let an unrelated *free* reference that
-            // happens to share the binder's spelling capture the reopened
-            // index (found by the differential oracle; with uniquified
-            // binders the collision needs the same uid, which *is* the same
-            // binder, but the concrete relation must not depend on that
-            // convention). A post-pass re-derivation opens unconditionally: it
-            // reconciles types that different passes spelled in different
-            // forms (a closed function's codomain against a rebuilt,
-            // discharged one). The record sites enforce the closure invariant at
-            // every derivation; only the opening policy here depends on it.
-            // The pre-scan keeps the common codomain that does not reference
-            // this function untouched — the same dependence test descent and
-            // application ask everywhere else.
-            let open = |n: &Option<Name>, c: &Type, other: &Type| -> Option<Type> {
+            // Live solving opens toward unresolved variables or a concrete codomain still
+            // spelling its binder by name. Two closed codomains compare index to index:
+            // opening them could capture an unrelated free name matching a display name.
+            // Post-pass checks open unconditionally to reconcile stored forms from different
+            // passes. Every derivation enforces the same closure invariant on recorded bounds.
+            let open = |n: &FunBinder,
+                        d: &Type,
+                        c: &Type,
+                        other_n: &FunBinder,
+                        other: &Type|
+             -> Option<Type> {
                 // An unnamed function whose codomain references it by index has no
                 // binder to open at, so the reference reaches the codomain edge and
                 // compares against the other side's name — a mismatch reported as a
@@ -1848,27 +1958,23 @@ fn constrain_go_impl(
                 // `Type::without_pi_names`, or a pass rebuilding a `Fun` and filtering
                 // the name slot.
                 debug_assert!(
-                    n.is_some() || !crate::ccl::subst::references_enclosing_function(c),
+                    !n.is_none() || !crate::ccl::subst::references_enclosing_function(c),
                     "an unnamed function's codomain references it: the index has no \
                      binder to open at, so the codomain edge compares an index \
                      against a name",
                 );
-                match n {
-                    Some(b)
-                        if crate::ccl::subst::references_enclosing_function(c)
-                            && (cache.derivation.opens_unconditionally()
-                                || crate::ccl::subst::type_contains_infer(other)) =>
-                    {
-                        Some(crate::ccl::subst::open_pi_binder(
-                            &crate::ccl::subst::Mapping::Rename(b.clone()),
-                            c,
-                        ))
-                    }
-                    _ => None,
-                }
+                (!n.is_none()
+                    && crate::ccl::subst::references_enclosing_function(c)
+                    && (cache.derivation.opens_unconditionally()
+                        || crate::ccl::subst::type_contains_infer(other)
+                        || (!crate::ccl::subst::references_enclosing_function(other)
+                            && other_n
+                                .names()
+                                .any(|name| crate::ccl::ccl_utils::is_free_in_type(name, other)))))
+                .then(|| crate::ccl::subst::open_at_binder(n, d, c))
             };
-            let c0_opened = open(n0, c0, c1);
-            let c1_opened = open(n1, c1, c0);
+            let c0_opened = open(&crate::ccl::subst::named_binder(n0), d0, c0, n1, c1);
+            let c1_opened = open(n1, d1, c1, n0, c0);
             // The domain edge. A *compute* domain is contravariant: it is a
             // parameter, nothing can enumerate it, and accepting more inputs than
             // demanded only under-promises. A **data** domain is *invariant* — it is
@@ -1942,12 +2048,17 @@ fn constrain_go_impl(
                         };
                     }
                 } else {
+                    // Two parameter lists correspond parameter by parameter, as their results do:
+                    // the left's domain is read under the right's names, so a later parameter
+                    // reads an earlier one in the frame the right's arguments are discharged in.
+                    let d0_aligned = onto_parameter_names(d0, n0, n1);
+                    let d0 = d0_aligned.as_ref().unwrap_or(&**d0);
                     cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))?;
                 }
                 let entered = cache.codomain_binders.len();
                 cache
                     .codomain_binders
-                    .extend([n0, n1].into_iter().flatten().cloned());
+                    .extend(n0.names().chain(n1.names()).cloned());
                 let codomain = constrain_go(
                     c0_opened.as_ref().map_or(&**c0, |c| c),
                     c1_opened.as_ref().map_or(&**c1, |c| c),
@@ -1985,6 +2096,33 @@ fn constrain_go_impl(
         // at least its positions, each below the one it lists. An open left side is a
         // type parameter's bound, met while its definition is checked with the
         // parameter opaque.
+        // A dependent tuple lists its positions as a tuple does, each component read where an
+        // open tuple's position stands. A position there stands outside the earlier
+        // components, which it has no names for, so a component is read joined over them: a
+        // refinement reading one is dropped (`Mapping::Join`). A projection whose own type is
+        // known reads the component at the projected value instead (`emit::emit_proj`).
+        (Type::DepTuple(a), Type::OpenTuple(b)) => {
+            if a.len() < b.len() {
+                return Err(ConstrainError::MissingField {
+                    key: FieldKey::Index(b.len() - 1),
+                    in_type: lhs.clone(),
+                });
+            }
+            let names: Vec<Name> = a
+                .iter()
+                .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__component")))
+                .collect();
+            let opened = crate::ccl::subst::open_tuple_components(a, |j, _| {
+                crate::ccl::subst::Mapping::Rename(names[j].clone())
+            });
+            for (i, t1) in b.iter().enumerate() {
+                let joined = names[..i].iter().fold(Subst::id(), |s, n| {
+                    Subst::then(&s, &Subst::join_arm(n.clone()))
+                });
+                constrain_go(&joined.apply_type(&opened[i]), t1, sl, sr, cache, scope)?;
+            }
+            Ok(())
+        }
         (Type::Tuple(a) | Type::OpenTuple(a), Type::OpenTuple(b)) => {
             for (i, t1) in b.iter().enumerate() {
                 match a.get(i) {
@@ -2030,13 +2168,23 @@ fn constrain_go_impl(
             constrain_go(lhs, &unnamed, sl, sr, cache, scope)
         }
         (Type::DepTuple(a), Type::DepTuple(b)) if a.len() == b.len() => {
-            let opened = |cs: &[(Option<Name>, Type)], other: &Type| -> Vec<Type> {
-                let closed = cs
-                    .iter()
+            // Whether a side's component reads an earlier one by index.
+            let reads = |cs: &[(Option<Name>, Type)]| {
+                cs.iter()
                     .enumerate()
-                    .any(|(k, (_, t))| crate::ccl::subst::references_binder_within(t, k as u32));
+                    .any(|(k, (_, t))| crate::ccl::subst::references_binder_within(t, k as u32))
+            };
+            let (a_reads, b_reads) = (reads(a), reads(b));
+            // A side closed to indices opens at its names where the other side is live, or
+            // where the other side does not read the same components by index, so the two
+            // cannot be compared index to index: a plain tuple meeting a written dependent one.
+            let opened = |cs: &[(Option<Name>, Type)],
+                          closed: bool,
+                          other: &Type,
+                          other_reads: bool| {
                 if closed
                     && (cache.derivation.opens_unconditionally()
+                        || !other_reads
                         || crate::ccl::subst::type_contains_infer(other))
                 {
                     crate::ccl::subst::open_tuple_components(cs, |j, _| {
@@ -2049,11 +2197,24 @@ fn constrain_go_impl(
                     cs.iter().map(|(_, t)| t.clone()).collect()
                 }
             };
-            let (a_opened, b_opened) = (opened(a, rhs), opened(b, lhs));
+            let (a_opened, b_opened) = (
+                opened(a, a_reads, rhs, b_reads),
+                opened(b, b_reads, lhs, a_reads),
+            );
             let mut aligned = sl.clone();
+            // A later component is judged with the earlier ones bound at the value's component
+            // types, under the names the right side reads them by.
+            let mut bound = ComponentScope {
+                outer: scope,
+                components: Vec::new(),
+            };
             for (k, (t0, t1)) in a_opened.iter().zip(&b_opened).enumerate() {
-                constrain_go(t0, t1, &aligned, sr, cache, scope)?;
+                constrain_go(t0, t1, &aligned, sr, cache, &bound)
+                    .map_err(|error| bound.mismatch_at_values(error))?;
                 aligned = aligned.aligned(&a[k].0, &b[k].0);
+                if let Some(name) = b[k].0.clone().or_else(|| a[k].0.clone()) {
+                    bound.components.push((name, aligned.apply_type(t0)));
+                }
             }
             Ok(())
         }
@@ -3155,7 +3316,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         ),
         Type::Poly(_) => unreachable!("a polymorphic type reached `extrude`"),
         Type::Fun {
-            name,
+            binder,
             fun_kind,
             domain: d,
             codomain: c,
@@ -3170,7 +3331,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 }
                 capabilities.clone()
             },
-            name: name.clone(),
+            binder: binder.clone(),
             // A sum's **candidates** are an invariant position, so they cross a level
             // boundary through two-way proxies rather than the polar one-way
             // approximation — the same reason a `History` payload does. The kind premise matches
@@ -3256,7 +3417,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             history_kind,
         } => {
             let Type::Fun {
-                name,
+                binder,
                 fun_kind,
                 domain,
                 codomain,
@@ -3267,7 +3428,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             };
             Type::history_over(
                 Type::Fun {
-                    name: name.clone(),
+                    binder: binder.clone(),
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(extrude_invariant(domain, target_level, cache)),
                     codomain: Box::new(extrude_invariant(codomain, target_level, cache)),
@@ -3737,7 +3898,7 @@ mod tests {
         let kind = FunKindVar::fresh();
         kind.place_at(2);
         let function = Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&kind)),
             domain: Box::new(prim(BaseType::Int)),
             codomain: Box::new(prim(BaseType::Int)),
@@ -3756,7 +3917,7 @@ mod tests {
                 let kind = FunKindVar::fresh();
                 kind.place_at(2);
                 let function = Type::Fun {
-                    name: None,
+                    binder: FunBinder::None,
                     fun_kind: FunKind::Var(Rc::clone(&kind)),
                     domain: Box::new(prim(BaseType::Int)),
                     codomain: Box::new(if has_variable {
@@ -5528,8 +5689,8 @@ mod tests {
         // slots differ compare equal.
         let lam = || {
             let mut l = TypedExpr::lambda("w", Occurrence::mint(), Type::Hole, TypedExpr::var("w"));
-            if let TypedExprNode::Lambda { param, .. } = &mut l.node {
-                param.ty = fresh_var(0);
+            if let TypedExprNode::Lambda { params, .. } = &mut l.node {
+                params[0].ty = fresh_var(0);
             }
             Subst::discharge("k", l)
         };
@@ -5799,7 +5960,7 @@ mod tests {
     /// kind — which is the only thing `constrain_fun_kind` reads.
     fn fun_at(fun_kind: FunKind) -> Type {
         Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
@@ -6013,7 +6174,7 @@ mod tests {
         // pin it the other way, and holding both points is `KindPin::Conflict`.
         let v = FunKindVar::fresh();
         let var_fun = Type::Fun {
-            name: None,
+            binder: FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&v)),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),

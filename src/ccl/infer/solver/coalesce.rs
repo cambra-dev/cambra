@@ -305,13 +305,13 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
         // bound's is its own.
         Some(match applied {
             Type::Fun {
-                name: Some(b),
+                binder: crate::ccl::FunBinder::Whole(b),
                 fun_kind,
                 domain,
                 codomain,
                 capabilities,
             } if !crate::ccl::subst::codomain_depends_on(&b, &codomain) => Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind,
                 domain,
                 codomain,
@@ -720,14 +720,15 @@ fn coalesce_compact_go(
         // lets descent and application open the function later, so dropping it
         // on a codomain that references it strands the reference.
         debug_assert!(
-            cf.name.is_some() || !crate::ccl::subst::references_enclosing_function(&c),
+            !cf.binder.is_none() || !crate::ccl::subst::references_enclosing_function(&c),
             "an index is only ever assigned pointing at a *named* function, so an \
              unnamed function's codomain cannot reference it",
         );
-        let kept_name = cf
-            .name
-            .clone()
-            .filter(|b| crate::ccl::subst::codomain_depends_on(b, &c));
+        let kept_name = if crate::ccl::subst::binder_reads(&cf.binder, &c) {
+            cf.binder.clone()
+        } else {
+            cf.binder.unread()
+        };
         // **Several domains at a data position are the conflict wherever they met.** Two
         // function slots merging record it in `domains_disagree`; a domain variable meeting
         // several collections does not pass through that merge. A consumer's parameter is
@@ -815,7 +816,7 @@ fn coalesce_compact_go(
                     unreachable!("a compute function slot carries several candidate domains")
                 };
                 shapes.push(Type::Fun {
-                    name: kept_name,
+                    binder: kept_name,
                     fun_kind: crate::ccl::ty::FunKind::Compute,
                     domain: Box::new(sole.clone()),
                     codomain: Box::new(c),
@@ -850,7 +851,7 @@ fn coalesce_compact_go(
                 // **The binders close the function.** They settled above, so the parts
                 // already name them; a plain collection has none and comes back as it is.
                 shapes.push(Type::Fun {
-                    name: kept_name,
+                    binder: kept_name,
                     fun_kind: if binders.is_empty() {
                         crate::ccl::ty::FunKind::Data(None)
                     } else {
@@ -872,10 +873,11 @@ fn coalesce_compact_go(
         // function's does.
         let value = coalesce_compact_go(&history.value, polarity, scope)?;
         let function = Type::Fun {
-            name: history
+            binder: history
                 .name
                 .clone()
-                .filter(|b| crate::ccl::subst::codomain_depends_on(b, &value)),
+                .filter(|b| crate::ccl::subst::codomain_depends_on(b, &value))
+                .into(),
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(coalesce_compact_go(&history.domain, polarity, scope)?),
             codomain: Box::new(value),
@@ -1042,7 +1044,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         let chan = CompactType {
             fun: Some(super::compact::CompactFun {
                 // The function's binder: the row at `𝑘` may read `𝑘`.
-                name,
+                binder: name.into(),
                 binders: Vec::new(),
                 // A feed's read view is a collection: a data function.
                 kind: super::compact::KindPin::Data,
@@ -1124,6 +1126,8 @@ fn materialize_record(
         for v in rec.values() {
             out.push(coalesce_compact_go(v, polarity, scope)?);
         }
+        let out =
+            crate::ccl::subst::tuple_of_components(out.into_iter().map(|t| (None, t)).collect());
         match width {
             Some(TupleWidth::Exactly(n)) => {
                 debug_assert_eq!(*n, out.len(), "a closed tuple lists all its positions");
@@ -1269,7 +1273,7 @@ mod tests {
         assert_eq!(
             t,
             Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Bool)),
@@ -1288,7 +1292,7 @@ mod tests {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
                     capabilities: Default::default(),
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     kind: KindPin::Data,
                     domains_disagree: false,
                     domain: Box::new(compact_type(&Type::UIntRange(2)).term),
@@ -1303,7 +1307,7 @@ mod tests {
         assert_eq!(
             coalesce_compact(&graph).unwrap(),
             Type::Fun {
-                name: None,
+                binder: crate::ccl::FunBinder::None,
                 fun_kind: crate::ccl::ty::FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(2)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
@@ -1325,7 +1329,7 @@ mod tests {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
                     capabilities: Default::default(),
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     kind: KindPin::Plain,
                     domains_disagree: true,
                     // Two domains at one position: a `fun` slot holds one domain, so a
@@ -1362,7 +1366,7 @@ mod tests {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
                     capabilities: Default::default(),
-                    name: None,
+                    binder: crate::ccl::FunBinder::None,
                     kind: KindPin::Conflict,
                     domains_disagree: false,
                     domain: Box::new(compact_type(&prim(BaseType::Int)).term),
