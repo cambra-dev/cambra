@@ -889,90 +889,66 @@ fn split_beneath_keys(paths: &Predicate, relative: usize) -> Vec<(Predicate, Pre
     }
 }
 
-/// The projection a guard of cells beneath keys of `level` names, `node` being the record or
-/// scalar guard of the values at those keys: per region of the keys whose cells the guard names
-/// alike, those keys within the part of their values it names. `None` where a field holds more
-/// than a scalar or one collection level, which this reading has no part for.
+/// Invert `guard_beneath_keys`: partition the enclosing keys wherever a field's
+/// selection changes, then decode the value guard relative to each partition.
 fn within_of_cells(node: &TileGuard, level: CurryLevel) -> Option<Projection> {
-    // Per leaf of the values, its field path from the values (empty for the values themselves),
-    // whether it is a collection's keys, and the pairs of keys and the part beneath them it names.
-    type Leaf = (Vec<SmolStr>, bool, Vec<(Predicate, Predicate)>);
-    fn read(path: Vec<SmolStr>, guard: &TileGuard, leaves: &mut Vec<Leaf>) -> Option<()> {
+    fn partition(guard: &TileGuard, depth: usize, regions: &mut Vec<Predicate>) {
         match guard {
-            TileGuard::Scalar(paths) => leaves.push((path, false, split_beneath_keys(paths, 0))),
-            TileGuard::Function(FunctionGuard::Domain(paths)) => {
-                leaves.push((path, true, split_beneath_keys(paths, 0)))
-            }
             TileGuard::Record(fields) => {
-                for (name, field) in fields {
-                    let mut deeper = path.clone();
-                    deeper.push(name.clone());
-                    read(deeper, field, leaves)?;
+                for field in fields.values() {
+                    partition(field, depth, regions);
                 }
             }
-            _ => return None,
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                partition(inner, depth + 1, regions)
+            }
+            TileGuard::Or(arms) => {
+                for arm in arms {
+                    partition(arm, depth, regions);
+                }
+            }
+            TileGuard::Scalar(paths)
+            | TileGuard::Aggregation(paths)
+            | TileGuard::Function(FunctionGuard::Domain(paths)) => {
+                for (rows, _) in split_beneath_keys(paths, depth) {
+                    if rows.is_true() {
+                        continue;
+                    }
+                    // Newly appended partitions already lie wholly outside these rows.
+                    for at in 0..regions.len() {
+                        let inside = regions[at].intersect(&rows);
+                        if inside.is_false() {
+                            continue;
+                        }
+                        let outside = regions[at].minus(&rows);
+                        if !outside.is_false() {
+                            regions[at] = inside;
+                            regions.push(outside);
+                        }
+                    }
+                }
+            }
         }
-        Some(())
     }
-    let mut leaves: Vec<Leaf> = Vec::new();
-    read(Vec::new(), node, &mut leaves)?;
-    // The regions of keys every leaf names alike: refine by each leaf's keys in turn.
-    let mut regions: Vec<(Predicate, Vec<Projection>)> =
-        vec![(Predicate::True, vec![Projection::Nothing; leaves.len()])];
-    for (at, (_, collection, pairs)) in leaves.iter().enumerate() {
-        for (keys, part) in pairs {
-            let part = match collection {
-                true => Projection::admitting(part.clone()),
-                false => match part.is_true() {
-                    true => Projection::Everything,
-                    false => return None,
-                },
-            };
-            regions = regions
-                .into_iter()
-                .flat_map(|(region, parts)| {
-                    let inside = region.intersect(keys);
-                    let outside = region.minus(keys);
-                    let mut with = parts.clone();
-                    with[at] = with[at].union(&part);
-                    [(inside, with), (outside, parts)]
-                })
-                .filter(|(region, _)| !region.is_false())
-                .collect();
+    let mut regions = vec![Predicate::True];
+    partition(node, 0, &mut regions);
+    let mut arms = Vec::new();
+    for rows in regions {
+        if qualifying_levels(&rows) > level.index() {
+            return None;
         }
+        let values = node.map_level_predicates(&mut |depth, paths| {
+            Predicate::union_all(
+                split_beneath_keys(paths, depth)
+                    .into_iter()
+                    .filter_map(|(above, part)| above.subsumes(&rows).then_some(part))
+                    .collect(),
+            )
+        });
+        let part = Projection::of(&values).ok()?;
+        arms.push(Projection::within(level, rows, part));
     }
-    /// The projection of the values the leaves under `prefix` name, field by field.
-    fn values(leaves: &[Leaf], parts: &[Projection], prefix: &[SmolStr]) -> Projection {
-        let under: Vec<usize> = (0..leaves.len())
-            .filter(|&at| leaves[at].0.starts_with(prefix))
-            .collect();
-        if let [at] = under.as_slice()
-            && leaves[*at].0.len() == prefix.len()
-        {
-            return parts[*at].clone();
-        }
-        let mut names: Vec<SmolStr> = under
-            .iter()
-            .filter_map(|&at| leaves[at].0.get(prefix.len()).cloned())
-            .collect();
-        names.sort();
-        names.dedup();
-        Projection::fields(
-            names
-                .into_iter()
-                .map(|name| {
-                    let mut deeper = prefix.to_vec();
-                    deeper.push(name.clone());
-                    let part = values(leaves, parts, &deeper);
-                    (name, part)
-                })
-                .collect(),
-            Projection::Nothing,
-        )
-    }
-    Some(Projection::any_of(regions.into_iter().map(
-        |(keys, parts)| Projection::within(level, keys, values(&leaves, &parts, &[])),
-    )))
+    Some(Projection::any_of(arms))
 }
 
 /// `paths`, a predicate over paths `relative` levels beneath keys of some level, read beneath the
@@ -1850,6 +1826,37 @@ mod tests {
         };
         assert!(fields["b"].is_empty(), "{guard:?}");
         assert_eq!(Projection::of(&guard), Ok(projection));
+    }
+
+    #[test]
+    fn nested_history_keys_round_trip_through_the_customer_record_guard() {
+        let collection = |values| Tiling::data_function(Extent::uint_range(16), values);
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let customers = collection(Tiling::Record(
+            [
+                ("id".into(), int.clone()),
+                ("history".into(), collection(collection(int))),
+            ]
+            .into(),
+        ));
+        let history = |customer, day, item| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                key(customer),
+                Projection::of_field(
+                    "history",
+                    Projection::of_path(&[Value::UInt(day), Value::UInt(item)]),
+                ),
+            )
+        };
+        let first = history(7, 3, 2);
+        for selection in [first.clone(), first.union(&history(8, 3, 4))] {
+            let guard = selection.guard(&customers);
+            assert!(guard.check_from(&customers));
+            let decoded = Projection::of(&guard).unwrap();
+            assert_eq!(decoded, selection);
+            assert_eq!(decoded.guard(&customers), guard);
+        }
     }
 
     /// A record of two collection fields `a` and `b`, and the field `c` of plain values.
