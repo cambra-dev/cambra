@@ -77,7 +77,7 @@ struct Stats {
 
 /// Count execution until the worker has published and polled. A scope request
 /// may stay in the dispatcher's finishing phase after this claim returns.
-struct ActiveClaim<'a> {
+pub(super) struct ActiveClaim<'a> {
     busy: &'a AtomicUsize,
     dispatcher: &'a Dispatcher,
 }
@@ -89,12 +89,27 @@ impl Drop for ActiveClaim<'_> {
     }
 }
 
+/// One drain between source polls. Claimants share the last quiet generation so a
+/// worker's completed publication pass also answers the caller's quiescence check.
+#[derive(Default)]
+enum Drain {
+    #[default]
+    Inactive,
+    Replay,
+    Active {
+        live: bool,
+        settled_at: Option<u64>,
+    },
+}
+
 /// The run's worker threads, and which pipelines they claim from.
 pub(super) struct WorkerPool {
     /// How many workers the run has; with one, the coordinator claims everything and no thread
     /// starts.
     count: usize,
     scope_steps: ScopeSteps,
+    // shared-state-ok: serializes idle publication and records when live source polling may resume.
+    drain: Mutex<Drain>,
     /// Per pipeline, its breaker and whether its packages run beside each other, where the
     /// pipeline is admitted.
     pipelines: Vec<Option<WorkerPipeline>>,
@@ -155,6 +170,7 @@ impl WorkerPool {
                 1
             },
             scope_steps,
+            drain: Mutex::default(),
             #[cfg(test)]
             stats: (0..pipelines.len()).map(|_| Stats::default()).collect(),
             #[cfg(test)]
@@ -201,7 +217,11 @@ impl WorkerPool {
         &'env self,
         scope: &'scope Scope<'scope, 'env>,
         dispatcher: &'env Dispatcher,
+        replay: bool,
     ) -> Vec<ScopedJoinHandle<'scope, ()>> {
+        if replay {
+            *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Replay;
+        }
         if !self.threaded() {
             return Vec::new();
         }
@@ -237,12 +257,16 @@ impl WorkerPool {
         }
     }
 
-    pub(super) fn next(
-        &self,
-        dispatcher: &Dispatcher,
+    pub(super) fn next<'a>(
+        &'a self,
+        dispatcher: &'a Dispatcher,
+        preferred: Option<PipelineId>,
         admits: &dyn Fn(PipelineId) -> bool,
-    ) -> (Next, Option<ReservedSeed<'_>>) {
-        dispatcher.try_claim_with(None, admits, &|id| self.reserve_seed(id).ok())
+    ) -> (Next, (Option<ReservedSeed<'a>>, Option<ActiveClaim<'a>>)) {
+        dispatcher.try_claim_with(preferred, admits, &|p| {
+            let seed = self.reserve_seed(p).ok()?;
+            Some((seed, self.threaded().then(|| self.active_claim(dispatcher))))
+        })
     }
 
     fn active_claim<'a>(&'a self, dispatcher: &'a Dispatcher) -> ActiveClaim<'a> {
@@ -260,13 +284,11 @@ impl WorkerPool {
         in_a_run(|| {
             // A panic fails the run, so no claimant waits for what this worker held.
             let _worker = dispatcher.worker();
+            self.replay_before_sources(dispatcher);
             let mut preferred = None;
             loop {
                 let (next, (mut reserved, _activity)) =
-                    dispatcher.try_claim_with(preferred, &|p| self.admits(p), &|p| {
-                        let seed = self.reserve_seed(p).ok()?;
-                        Some((seed, Some(self.active_claim(dispatcher))))
-                    });
+                    self.next(dispatcher, preferred, &|p| self.admits(p));
                 let mut reach_seed = |_: PipelineId, call: &mut Call<'_>| {
                     reserved
                         .take()
@@ -279,17 +301,19 @@ impl WorkerPool {
                         #[cfg(test)]
                         self.count_claim(dispatcher, &package, worker);
                         self.consume(dispatcher, package, &mut reach_seed);
-                        while self.poll(dispatcher) {}
+                        while self.scope_steps.poll(dispatcher) {}
                         #[cfg(test)]
                         self.collect_counters();
                     }
                     Next::Finish { pipeline } => {
                         self.finish(dispatcher, pipeline, &mut reach_seed);
-                        while self.poll(dispatcher) {}
+                        while self.scope_steps.poll(dispatcher) {}
                     }
                     Next::Done | Next::Failed => break,
                     Next::Wait(generation) => {
-                        if !self.help_active_claim(dispatcher) {
+                        if !self.help_active_claim(dispatcher)
+                            && !self.try_settle(dispatcher, &generation)
+                        {
                             dispatcher.wait(generation);
                         }
                     }
@@ -302,7 +326,7 @@ impl WorkerPool {
 
     /// A handler can be inside a transition while another scope becomes runnable. Borrow its
     /// activity count while checking, so the coordinator cannot report idle during publication.
-    fn help_active_claim(&self, dispatcher: &Dispatcher) -> bool {
+    pub(super) fn help_active_claim(&self, dispatcher: &Dispatcher) -> bool {
         if self
             .busy
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |busy| {
@@ -312,7 +336,7 @@ impl WorkerPool {
         {
             return false;
         }
-        let advanced = self.poll(dispatcher);
+        let advanced = self.scope_steps.poll(dispatcher);
         if self.busy.fetch_sub(1, Ordering::SeqCst) == 1 {
             dispatcher.wake_claimants();
         }
@@ -326,8 +350,112 @@ impl WorkerPool {
         counters[1] += transaction_scope::STALLS.with(|c| c.replace(0));
     }
 
-    pub(super) fn poll(&self, dispatcher: &Dispatcher) -> bool {
-        self.scope_steps.poll(dispatcher)
+    /// The first claimant republishes output carried over from the previous run. Both the
+    /// live driver and the workers wait for that publication before touching their inputs.
+    pub(super) fn replay_before_sources(&self, dispatcher: &Dispatcher) {
+        let mut drain = self.drain.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*drain, Drain::Replay) {
+            self.publish_held(dispatcher);
+            *drain = Drain::Inactive;
+        }
+    }
+
+    pub(super) fn begin_drain(&self, dispatcher: &Dispatcher, live: bool) {
+        *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Active {
+            live,
+            settled_at: None,
+        };
+        dispatcher.wake_claimants();
+    }
+
+    pub(super) fn end_drain(&self) {
+        *self.drain.lock().unwrap_or_else(PoisonError::into_inner) = Drain::Inactive;
+    }
+
+    /// Workers skip a pass another claimant owns and return to the package queues.
+    fn try_settle(&self, dispatcher: &Dispatcher, generation: &Generation) -> bool {
+        let Ok(mut slot) = self.drain.try_lock() else {
+            return false;
+        };
+        self.settle(dispatcher, generation, &mut slot)
+    }
+
+    /// Synchronize with the last publisher before the driver can poll live sources again.
+    pub(super) fn drained(&self, dispatcher: &Dispatcher, generation: &Generation) -> bool {
+        let mut slot = self.drain.lock().unwrap_or_else(PoisonError::into_inner);
+        self.settle(dispatcher, generation, &mut slot);
+        let quiet = matches!(*slot, Drain::Active {settled_at: Some(at), ..} if at == generation.0)
+            && !self.may_progress(dispatcher)
+            && !dispatcher.changed_since(generation);
+        if quiet {
+            *slot = Drain::Inactive;
+        }
+        quiet
+    }
+
+    fn settle(&self, dispatcher: &Dispatcher, generation: &Generation, drain: &mut Drain) -> bool {
+        let Drain::Active { live, settled_at } = drain else {
+            return false;
+        };
+        if *settled_at == Some(generation.0)
+            || dispatcher.changed_since(generation)
+            || self.busy.load(Ordering::SeqCst) != 0
+        {
+            return false;
+        }
+        if self.scope_steps.poll(dispatcher)
+            || self.resume_scopes(dispatcher)
+            || (*live && self.publish_held(dispatcher))
+        {
+            // Opening a flat loop's seed changes its store without queuing a package.
+            if !dispatcher.changed_since(generation) {
+                dispatcher.wake_claimants();
+            }
+            return true;
+        }
+        *settled_at = Some(generation.0);
+        false
+    }
+
+    fn resume_scopes(&self, dispatcher: &Dispatcher) -> bool {
+        let mut changed = false;
+        for (id, action) in self.pipelines.iter().enumerate() {
+            if let Some(WorkerPipeline::Scope(action)) = action {
+                changed |= action.resume(dispatcher, PipelineId(id));
+            }
+        }
+        changed
+    }
+
+    fn publish_held(&self, dispatcher: &Dispatcher) -> bool {
+        let published = try_push_held(
+            dispatcher,
+            (0..self.pipelines.len())
+                .filter(|&id| !dispatcher.infos[id].readers.is_empty())
+                .map(PipelineId),
+            |id, call| {
+                match &self.pipelines[id.0] {
+                    Some(WorkerPipeline::Breaker(spec)) => {
+                        spec.target.write(|breaker| call(breaker, InputId::ONLY))
+                    }
+                    Some(WorkerPipeline::Scope(ScopePipeline::Request { scope, .. }))
+                        if !scope.has_request() =>
+                    {
+                        scope.reach(call)
+                    }
+                    Some(WorkerPipeline::Scope(ScopePipeline::Seed(store, input))) => {
+                        ReservedSeed {
+                            store: store.write(),
+                            input: *input,
+                        }
+                        .reach(call);
+                    }
+                    _ => {}
+                }
+                true
+            },
+        );
+        matches!(published, Publication::Published)
     }
 
     /// Add the counters the worker threads counted to this thread's, once they have joined.
@@ -350,21 +478,8 @@ impl WorkerPool {
     ) {
         #[cfg(test)]
         self.count_claim(dispatcher, &package, 0);
-        let _activity = self.active_claim(dispatcher);
         dispatcher.wake_claimants();
         self.consume(dispatcher, package, reach);
-    }
-
-    /// [`finish`](Self::finish) on the coordinator, waking the claimants after as a worker
-    /// thread does.
-    pub(super) fn finish_on_coordinator(
-        &self,
-        dispatcher: &Dispatcher,
-        pipeline: PipelineId,
-        reach: &mut Reach<'_>,
-    ) {
-        let _activity = self.active_claim(dispatcher);
-        self.finish(dispatcher, pipeline, reach);
     }
 
     /// Offers from the upstream breaker have landed. A scope with other reads
@@ -460,7 +575,12 @@ impl WorkerPool {
 
     /// Finish `pipeline`, whose finish this worker claimed: release a parallel input whole, then
     /// push what the breaker completed and mark the pipeline finished (`finish_with`).
-    fn finish(&self, dispatcher: &Dispatcher, pipeline: PipelineId, reach: &mut Reach<'_>) {
+    pub(super) fn finish(
+        &self,
+        dispatcher: &Dispatcher,
+        pipeline: PipelineId,
+        reach: &mut Reach<'_>,
+    ) {
         let spec = match &self.pipelines[pipeline.0] {
             Some(WorkerPipeline::Breaker(spec)) => spec,
             Some(WorkerPipeline::Scope(scope)) => {

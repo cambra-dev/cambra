@@ -163,7 +163,7 @@ claimed finish has begun on breaker state, and the reconstruction below does not
 scope's open request is its store pipeline's claimed package and its pending finish is that
 pipeline's claimed finish, so the condition covers every scope, nested ones included. A package
 queued or waiting for its inputs that no claim took is rebuilt by the reconstruction. `drive_live`
-reaches the boundary once nothing is claimable and `Execution::resume` makes no progress. A root,
+reaches the boundary once nothing is claimable and `WorkerPool::settle` makes no progress. A root,
 body or step claim completes within the claim. An open request completes only through further
 rounds, steps or settlements, so one still open at the boundary is a loop that cannot progress. A
 debug build asserts the condition at every drained boundary, whether the run pauses there or
@@ -204,7 +204,7 @@ pipeline's queue, `pushed` region and completeness are discarded with the plan, 
 pipeline whose operators a reload keeps, and run cleanup clears the placements the plan set.
 
 Control waits for one pass. `drive_live` polls each live source once, then claims until a
-`Next::Wait` at which `Execution::resume` and publishing held output make no progress. During a
+`Next::Wait` at which `WorkerPool::settle` and publishing held output make no progress. During a
 dispatched run the binary reads the control port only in its observer's `drained`
 (`Driver::drained` in `src/main.rs`). Everything the poll admitted, what it causes downstream, and
 every round of a loop request it opened run before a control request is seen. `CAMBRA_MORSEL_ROWS`
@@ -264,8 +264,9 @@ runs again the round it left undecided. A push can wake the scope while no posit
 undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
 A nested loop holds each row the round around it gives it until its drive's source delivers the row
-(`Body::ready_rows`). A held row the source has not delivered does not hold back the round around
-it, which steps and leaves its own position waiting.
+(`ParentRows::ready`). A woken child can retry an earlier row before its parent supplies another.
+The parent continues settling its follower hold between requests so the child can claim the retry.
+A held row still waiting for external input allows the parent to step and park its own position.
 
 Waiting positions are scope state, which a pause or reload does not keep.
 
@@ -560,10 +561,10 @@ such a breaker reads (`order_inputs_of_ordered_breakers`). So do a loop's store 
 pipeline it reads, transitively: a loop runs its positions in order and takes a request none of
 whose positions is next as one that only closes absent positions, so its input is published in
 position order, one package in flight per pipeline. The store's step reads the body and seeds no
-ordering. Scope handlers and serial chains execute one package at a time on any worker. A sink
-whose input has no ordered keys runs on the coordinator.
+ordering. Scope handlers, serial chains and sinks with scalar or unordered input execute one package at a time
+on any worker.
 
-A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
+A sink that admits concurrent packages can receive their answers out of key order.
 `TestSink` merges them in arrival order and reads the merged value in key order
 (`Value::in_key_order`), since a collection's binding order states nothing. A `main` output merges
 its packages' answers under its own lock, and its finish answer is put in key order
@@ -580,8 +581,8 @@ consumed input through the existing producer chain.
 
 ### Who claims what
 
-Workers can claim packages and finishes for every chain in the program and inside a scope.
-A sink is admitted when its packages can run concurrently over ordered keys.
+Workers can claim packages and finishes for every chain and sink in the program. The planner orders
+a sink's pipeline when its breaker or input requires serial consumption.
 
 A pipeline's packages run beside each other where its breaker consumes concurrently and its input is
 keyed by ordered keys (`consumes_at_once`). A breaker consumes concurrently unless it opts out
@@ -606,7 +607,7 @@ With more than one worker, two kinds of claimant share the dispatcher:
   The worker sleeps in `Dispatcher::wait` when no claim or scope can advance.
 - The coordinator claims any package and any finish (`WorkerPool::next`). A claim of an
   admitted pipeline runs as a worker's would (`WorkerPool::consume_on_coordinator`,
-  `WorkerPool::finish_on_coordinator`). It also checks for loop seeds and closed inputs at quiescence and polls live sources.
+  `WorkerPool::finish`). It polls live sources and calls the observer once a drain completes.
 
 ### A worker's claim
 
@@ -644,22 +645,19 @@ before a worker's consume published fails, and the step waits for the next pass.
 
 ### Waiting and stalls
 
-Both drivers claim through one routine (`Execution::claim_until_quiescent`), which ends once every
-pipeline has finished, the run has failed, or the run is quiescent. A coordinator claim that answers
-`Next::Wait` goes on in this order:
+The driver polls live sources and calls the observer on the caller's thread. Before the first
+poll, one claimant republishes held output from the previous run. Source startup waits for
+that publication. Between polls, any claimant can settle the run:
 
-1. It first polls the scope groups for ready work. While a worker can still publish, or an
-   admitted breaker can run, it sleeps in `Dispatcher::wait`. A worker registers activity before taking a package or finish and releases it after publication.
-   A retained request or a draining scope may span several claims and idle intervals.
-2. Otherwise it checks for finished scope inputs and newly available loop seeds, and claims again
-   if either advanced.
-3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
-   the routine answers that the run is quiescent. A run with no live source panics. A live run
-   pushes what its breakers hold and claims again where that changed anything; otherwise it has
-   reached a drained boundary, where its driver polls the sources and tells its observer.
-
-A worker's publication can advance the generation during the resume pass, which then counts as
-progress. The coordinator claims again and reaches the same fixed point.
+1. Each package and finish registers activity during reservation. A claimant can advance
+   independent scopes while another handler is busy.
+2. Once the queues have no claimable work and the active handlers have returned, one claimant
+   checks the scopes for work, retries closes after finished reads, and opens available flat
+   loop seeds. In a live run it then publishes output the breakers have held since the last pass.
+   Other workers can take the work that pass produces.
+3. A quiet pass records the dispatcher generation it observed. The driver can report a drained
+   boundary when the generation still matches and workers have no further work. The drain closes
+   before the next source poll or observer callback. A batch run must finish all its pipelines.
 
 ### Lock order
 
@@ -668,7 +666,7 @@ No two threads wait on each other through these rules:
 - A thread holding a breaker handle takes only the handles of pipelines that breaker's chain
   reads, shared, and takes a store only with `try_write`.
 - No thread waits for a store's blocking `write` or in `Dispatcher::wait` while it holds a breaker
-  handle. Pushes land after the handle is released, in `consume_with` and `push_held` alike.
+  handle. Pushes land after the handle is released, in `consume_with` and `try_push_held` alike.
 - A landing reaches every consumer through `notifications::notify_shared`, which takes no lock. A
   consumer takes only the lock on its own state and releases it before it notifies another, so a
   landing holds at most one consumer's lock at a time. No consumer takes a breaker handle or a store

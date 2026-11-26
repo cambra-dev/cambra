@@ -186,7 +186,7 @@ impl Scope {
     }
 
     /// An unrelated transition can be holding its store. Its intake remains available for
-    /// the next pass. The coordinator rechecks finished reads at each settled boundary.
+    /// the next pass. An idle claimant rechecks finished reads at each settled boundary.
     pub(super) fn try_queue_requests(&self, dispatcher: &Dispatcher, close: bool) -> bool {
         self.store()
             .try_write()
@@ -226,6 +226,24 @@ pub(super) enum ScopePipeline {
 }
 
 impl ScopePipeline {
+    pub(super) fn resume(&self, dispatcher: &Dispatcher, id: PipelineId) -> bool {
+        let Self::Request {
+            scope,
+            closes_on_reads,
+        } = self
+        else {
+            return false;
+        };
+        let closed = *closes_on_reads
+            && dispatcher.only_arrivals_remain(id)
+            && scope.try_queue_requests(dispatcher, true);
+        let seeded = match scope.as_ref() {
+            Scope::Loop { store, .. } => induction(store).initialize_seed(),
+            Scope::Writer { .. } => false,
+        };
+        closed || seeded
+    }
+
     pub(super) fn admit_after_read(&self, dispatcher: &Dispatcher, reader: PipelineId) {
         if let Self::Request {
             scope,

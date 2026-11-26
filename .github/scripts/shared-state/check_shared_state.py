@@ -163,6 +163,7 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/dispatcher/scope.rs", "cell of `LoopSchedule`"),
     ("src/interpreter/dispatcher/scope.rs", "cell of `WriterPhase`"),
     ("src/interpreter/dispatcher/scope.rs", "cell of `usize`"),
+    ("src/interpreter/dispatcher/workers.rs", "cell of `Drain`"),
     # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
     # not see.

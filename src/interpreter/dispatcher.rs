@@ -640,7 +640,7 @@ impl Dispatcher {
 
     /// Whether every pipeline of `pipelines` has consumed every package queued for it, and every
     /// pipeline it reads is quiescent too: no package of theirs is outstanding. A breaker that
-    /// pushes only what `push_held` asks of it, as `MapAggregate`, can be quiescent before its
+    /// pushes only what `try_push_held` asks of it, as `MapAggregate`, can be quiescent before its
     /// readers took what it completed, which is why a loop's round holds its followers until its
     /// pushes settle ([`hold_followers`](Self::hold_followers)).
     ///
@@ -863,7 +863,7 @@ impl Dispatcher {
     ///
     /// Hold the pipelines of `group`, a scope body's, from taking a package that follows its
     /// reads ([`follow`](Self::follow)). A loop's round holds them while the pipelines they follow
-    /// push what they complete. A breaker that pushes only what `push_held` asks it to, as
+    /// push what they complete. A breaker that pushes only what `try_push_held` asks it to, as
     /// `MapAggregate`, is quiescent before its readers have taken what it completed. Each hold is
     /// counted, so a release that read the hold before this one fails
     /// ([`release_followers_if`](Self::release_followers_if)). See
@@ -1363,7 +1363,7 @@ impl Dispatcher {
     /// Whether the generation has advanced past `generation`: something changed that can make a
     /// claim succeed.
     pub(crate) fn changed_since(&self, generation: &Generation) -> bool {
-        self.generation.load(Ordering::SeqCst) != generation.0
+        self.changes() != generation.0
     }
 
     /// Wake every thread asleep in [`wait`](Self::wait), as a change that can make a claim succeed
@@ -2699,22 +2699,6 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
         dispatcher.land(pushes);
     }
     dispatcher.acknowledge(package);
-}
-
-/// Have the selected pipelines push what their breakers hold and no push named before. A run after a pause
-/// or a reload starts over breakers an earlier run consumed into, and has no finish before its
-/// sources close, so its start is where its readers learn what the breakers already hold; each
-/// round of an induction run, which no finish ends either, does the same. See
-/// `src/interpreter/design-dispatcher.md`, "A loop in rounds".
-fn push_held(
-    dispatcher: &Dispatcher,
-    reach: &mut Reach<'_>,
-    pipelines: impl IntoIterator<Item = PipelineId>,
-) {
-    try_push_held(dispatcher, pipelines, |id, call| {
-        reach(id, call);
-        true
-    });
 }
 
 enum Publication {

@@ -101,8 +101,9 @@ impl LoopSchedule {
         })
     }
 
+    /// A child may retry between this loop's requests. Its follower hold must still settle.
     pub(super) fn publishing(&self) -> bool {
-        self.has_request() || self.phase == LoopPhase::Draining
+        matches!(self.phase, LoopPhase::Running | LoopPhase::Draining)
     }
 
     pub(super) fn take_finish(
@@ -444,7 +445,7 @@ impl Body {
         if dispatcher.outstanding(step) != 0
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|id| id.0))
             || dispatcher.followers_hold(self.attached().hold).0 & 1 == 1
-            || self.members_hold_rows()
+            || self.children_have_work(dispatcher)
         {
             return false;
         }
@@ -490,36 +491,34 @@ impl Body {
         offered.offer(guard.clone());
     }
 
-    /// Whether a nested loop among the inner pipelines holds a row the round gave it that its
-    /// drive's source has delivered: the round has not run until that loop has queued and run it.
-    /// A held row its source has not delivered waits for data from outside the round, so the
-    /// round's step runs, leaves its position waiting for inputs, and the loop's publication of
-    /// the row once the source delivers it brings the next request.
-    fn members_hold_rows(&self) -> bool {
+    /// An enclosing round waits for a child's delivered rows and woken retries to run.
+    /// A held row still waiting for external input can span several rounds.
+    fn children_have_work(&self, dispatcher: &Dispatcher) -> bool {
         self.members.iter().any(|member| match member {
             Member::Scope(child) => match child.try_write() {
-                Ok(mut child) => child
-                    .as_induction_store_mut()
-                    .expect("a nested loop")
-                    .body_mut()
-                    .ready_rows()
-                    .is_some_and(|(ready, _)| !ready.is_empty()),
+                Ok(mut child) => {
+                    let body = child
+                        .as_induction_store_mut()
+                        .expect("a nested loop")
+                        .body_mut();
+                    // Admission moves a held row into the request queue under this store.
+                    // It may have moved since the enclosing body's quiescence check.
+                    dispatcher.outstanding(body.attached().pipeline) != 0
+                        || body.has_ready_row_or_retry()
+                }
                 Err(()) => true,
             },
             Member::Chain(_) => false,
         })
     }
 
-    /// For a nested loop, the rows it holds that its drive's source has delivered, and the rest:
-    /// a row is ready where the source delivered it, and where what is left of it, closed over the
-    /// scope's input, names no position, as a closing round gives a row's remainder past the
-    /// positions its domain has. `None` where it holds no row or its source has offered nothing.
-    fn ready_rows(&self) -> Option<(TileGuard, TileGuard)> {
+    fn has_ready_row_or_retry(&self) -> bool {
         let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        match &offered.intake {
-            ScopeInput::Parent(rows) => rows.ready(),
-            ScopeInput::Ordinary(_) => None,
-        }
+        matches!(&offered.intake, ScopeInput::Parent(rows) if rows.ready().is_some_and(|(ready, _)| !ready.is_empty()))
+            || offered
+                .retry
+                .as_ref()
+                .is_some_and(|r| r.phase == RetryPhase::Ready)
     }
 
     /// Keep a parent row until the drive's source has delivered it.
@@ -568,18 +567,13 @@ impl Body {
         let reads_ready = dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied());
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
         let mut region = match &mut offered.intake {
-            ScopeInput::Parent(rows) => {
-                let Some((ready, rest)) = rows.ready() else {
-                    return false;
-                };
+            ScopeInput::Parent(rows) => rows.ready().and_then(|(ready, rest)| {
                 if ready.is_empty() {
-                    return false;
+                    return None;
                 }
                 rows.held = (!rest.is_empty()).then_some(rest);
-                drop(offered);
-                dispatcher.queue_for(pipeline, &ready);
-                return true;
-            }
+                Some(ready)
+            }),
             ScopeInput::Ordinary(pending) if ready && reads_ready => pending.take(),
             ScopeInput::Ordinary(_) => return false,
         };
@@ -587,7 +581,8 @@ impl Body {
         // waiting for inputs, and while any wait: what an input brings queues the request that
         // runs them.
         let idle = dispatcher.outstanding(pipeline) == 0;
-        let closing = offered.close == IntakeClose::Requested
+        let closing = matches!(offered.intake, ScopeInput::Ordinary(_))
+            && offered.close == IntakeClose::Requested
             && idle
             && region.is_none()
             && offered.retry.is_none();
@@ -1340,11 +1335,61 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_before_parking_and_one_after_admission_queue_one_retry() {
+    fn a_parent_between_requests_releases_its_hold_for_a_woken_child() {
+        let compiled = Compiled::of(indoc! {"
+            out = test_sink()
+            total := 0
+            for x in [1, 2, 3]:
+                for y in [1, 2]:
+                    total += x * y
+            out << total
+        "});
+        compiled.consume(keys_between(0, 0));
+        let dispatcher = &compiled.dispatcher;
+        let (hold, child) = {
+            let mut parent = induction(&compiled.scope);
+            let body = parent.body_mut();
+            let child = body
+                .members
+                .iter()
+                .find_map(|member| match member {
+                    Member::Scope(child) => Some(child.clone()),
+                    Member::Chain(_) => None,
+                })
+                .unwrap();
+            (body.attached().hold, child)
+        };
+        let child_request = {
+            let mut child = induction(&child);
+            let body = child.body_mut();
+            body.set_waiting(Some(keys_between(0, 0)), None);
+            body.offers.lock().unwrap().wake();
+            body.attached().pipeline
+        };
+        dispatcher.hold_followers(hold);
+        for _ in 0..dispatcher.infos.len() {
+            compiled.steps.poll(dispatcher);
+            if let Some(package) = dispatcher.claim_of(child_request) {
+                assert_eq!(dispatcher.outstanding(PipelineId(0)), 0);
+                dispatcher.acknowledge(package);
+                return;
+            }
+        }
+        panic!("a ready child retry runs before the parent's next request");
+    }
+
+    #[rstest_log::rstest]
+    #[case::ordinary(false)]
+    #[case::parent_row(true)]
+    fn a_wake_before_parking_and_one_after_admission_queue_one_retry(#[case] parent_row: bool) {
         let compiled = Compiled::of(SUM);
         let mut scope = induction(&compiled.scope);
-        let (entry, placement) = Entry::unplaced(scope.input_tiling(InputId::ONLY));
+        let input = scope.input_tiling(InputId::ONLY);
+        let (entry, placement) = Entry::unplaced(input.clone());
         let body = scope.body_mut();
+        if parent_row {
+            body.take_rows_from_outer(input);
+        }
         placement.set_scope(Some(body.offers.clone()));
         let waiting = keys_between(0, 0);
         entry.wake(&Projection::Everything);
@@ -1510,7 +1555,7 @@ mod tests {
                 Next::Wait(_) => {
                     assert!(
                         self.steps.poll(&self.dispatcher)
-                            || self.execution.resume(&self.dispatcher),
+                            || induction(&self.scope).initialize_seed(),
                         "a pending loop has body, settlement, or step work"
                     );
                     None
@@ -1673,7 +1718,7 @@ mod tests {
         dispatcher.notify(feeder, &tiling.universal_guard());
         dispatcher.close(feeder);
         thread::scope(|threads| {
-            let handles = workers.spawn(threads, dispatcher);
+            let handles = workers.spawn(threads, dispatcher, false);
             let (done, result) = mpsc::channel();
             threads.spawn(move || {
                 workers::WorkerPool::join(handles);
@@ -1686,6 +1731,62 @@ mod tests {
         assert!(dispatcher.states[request.0].phase.load() == Phase::Finished);
         assert!(!induction(&compiled.scope).body_mut().is_active());
         assert_eq!(compiled.value(), Value::Int(expected));
+    }
+
+    #[test]
+    fn an_idle_worker_seeds_a_loop_and_closes_its_intake_after_the_last_read() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let request = PipelineId(0);
+        let feeder = PipelineId(1);
+        let mut compiled = Compiled::over(
+            SUM,
+            Dispatcher::new(vec![vec![feeder.0], vec![]], usize::MAX),
+        );
+        compiled
+            .execution
+            .close_on_reads(&mut compiled.dispatcher, request);
+        let workers = compiled
+            .execution
+            .worker_pool(&mut compiled.dispatcher, 2, |_| None);
+        let dispatcher = &compiled.dispatcher;
+        workers.begin_drain(dispatcher, false);
+        let before = Generation(dispatcher.changes());
+        thread::scope(|threads| {
+            let handles = workers.spawn(threads, dispatcher, false);
+            let (done, result) = mpsc::channel();
+            threads.spawn(move || {
+                workers::WorkerPool::join(handles);
+                let _ = done.send(());
+            });
+            let (advanced, seeded) = mpsc::channel();
+            threads.spawn(move || {
+                dispatcher.wait(before);
+                let _ = advanced.send(());
+            });
+            if seeded.recv_timeout(Duration::from_secs(5)).is_err() {
+                dispatcher.stop_claims();
+                panic!("the idle worker must open the seed before the first position arrives");
+            }
+            let already_seeded = !induction(&compiled.scope).initialize_seed();
+
+            // Deliver the feeder's last positions and finish it without an intake callback.
+            // Settlement must catch the missed close once the request has been consumed.
+            compiled
+                .execution
+                .offer_request(request, &keys_between(0, 2));
+            dispatcher.close(feeder);
+            dispatcher.begin_finish(feeder);
+            dispatcher.finish(dispatcher.pushes(feeder));
+            let completed = result.recv_timeout(Duration::from_secs(5));
+            dispatcher.stop_claims();
+            assert!(already_seeded);
+            completed.expect("the worker retries the missed close and finishes the scope");
+        });
+        workers.end_drain();
+        assert!(dispatcher.states[request.0].phase.load() == Phase::Finished);
+        assert_eq!(compiled.value(), Value::Int(6));
     }
 
     /// A loop scope's open request is its store pipeline's claimed package, in flight until the
