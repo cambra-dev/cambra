@@ -477,23 +477,8 @@ impl WorkerPool {
             WorkerPipeline::Scope(action) => return action.consume(dispatcher, package, reach),
             WorkerPipeline::Breaker(spec) => spec,
         };
-        let consume = |breaker: &dyn Breaker| {
-            debug_assert!(
-                package
-                    .guard
-                    .check_from(&breaker.input_tiling(InputId::ONLY)),
-                "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
-                pipeline.0,
-                package.guard
-            );
-            breaker.consume_impl(InputId::ONLY, package.guard.clone());
-        };
-        let publish = |producer: &dyn BreakingProducer| {
-            let mut pushes = dispatcher.pushes(pipeline);
-            pushes.push_final(producer);
-            pushes
-        };
-        let pushes = if spec.concurrent {
+        let mut pushes = dispatcher.pushes(pipeline);
+        if spec.concurrent {
             debug_assert!(
                 Projection::of(&package.guard).is_ok(),
                 "pipeline {} runs a package beside others that names no projection: {:?}",
@@ -502,33 +487,33 @@ impl WorkerPool {
             );
             match &spec.target {
                 WorkerBreaker::Sink(sink) => {
-                    consume(&*sink.read().unwrap_or_else(PoisonError::into_inner));
-                    None
+                    package.consume(
+                        &*sink.read().unwrap_or_else(PoisonError::into_inner),
+                        InputId::ONLY,
+                        &mut pushes,
+                    );
                 }
                 WorkerBreaker::Chain(handle) => {
-                    let publishes = {
+                    let needs_snapshot = {
                         let breaker = handle.read().unwrap_or_else(PoisonError::into_inner);
-                        consume(&*breaker);
-                        breaker.pushes_while_consuming()
+                        package
+                            .consume(&*breaker, InputId::ONLY, &mut pushes)
+                            .is_some()
                     };
-                    publishes.then(|| {
-                        // A reader may act on this push immediately. Take a snapshot between
-                        // consumes, after each consume has both merged and released its input.
+                    if needs_snapshot {
                         let breaker = handle.write().unwrap_or_else(PoisonError::into_inner);
-                        publish(&*breaker)
-                    })
+                        pushes.push_final(&*breaker);
+                    }
                 }
             }
         } else {
             spec.target.write(|breaker| {
-                consume(breaker);
-                breaker
-                    .as_producer()
-                    .filter(|p| p.pushes_while_consuming())
-                    .map(publish)
-            })
-        };
-        if let Some(pushes) = pushes {
+                if let Some(producer) = package.consume(breaker, InputId::ONLY, &mut pushes) {
+                    pushes.push_final(producer);
+                }
+            });
+        }
+        if !pushes.morsels.is_empty() {
             dispatcher.land(pushes);
         }
         // Before the acknowledgement that can leave the body quiescent: the round's step waits
@@ -652,19 +637,26 @@ mod tests {
             compile_program(&mut context, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
         run_program_with_workers(&mut program, 8, dop).unwrap()
     }
+    enum TestBreaker {
+        Sink,
+        MapAggregate,
+        FlatMemo,
+    }
+
     #[rstest_log::rstest]
-    #[case::sink(false)]
-    #[case::map_aggregate(true)]
-    fn acknowledges_while_a_peer_is_still_pulling(#[case] aggregate: bool) {
+    #[case::sink(TestBreaker::Sink)]
+    #[case::map_aggregate(TestBreaker::MapAggregate)]
+    #[case::flat_memo(TestBreaker::FlatMemo)]
+    fn acknowledges_while_a_peer_is_still_pulling(#[case] target: TestBreaker) {
         use super::*;
         use crate::ccl::AggregateKind;
         use crate::interpreter::{
             DataSink, Tile,
             tile_operators::{
-                ProducerBase, SinkBreaker, TileProducer,
-                growing::{KEYS, NestedInput, source},
+                MemoProducer, ProducerBase, SinkBreaker, TileProducer,
+                growing::{Input, KEYS, NestedInput, ints, source},
                 map_aggregate_over,
-                test_helpers::keys_between,
+                test_helpers::{int_entries, keys_between},
             },
             types::BaseType,
         };
@@ -672,7 +664,7 @@ mod tests {
         use std::time::Duration;
 
         struct PausedInput {
-            inner: NestedInput,
+            inner: Box<dyn TileProducer>,
             entered: mpsc::Sender<()>,
             resume: Mutex<mpsc::Receiver<()>>,
         }
@@ -708,30 +700,44 @@ mod tests {
         let (entered, pulling) = mpsc::channel();
         let (release, resume) = mpsc::channel();
         let input = Box::new(PausedInput {
-            inner: NestedInput::over(&source(0..2)),
+            inner: match target {
+                TestBreaker::FlatMemo => Box::new(Input::over(&source(0..2))),
+                _ => Box::new(NestedInput::over(&source(0..2))),
+            },
             entered,
             resume: Mutex::new(resume),
         });
         let (delivered, tiles) = mpsc::channel();
         let reader = PipelineId(1);
-        let handle = if aggregate {
-            let output = Tiling::data_function(
-                Extent::uint_range(KEYS),
-                Tiling::Aggregation {
-                    kind: AggregateKind::Sum,
-                    accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-                },
-            );
-            let chain = map_aggregate_over(input, &output, AggregateKind::Sum);
-            chain.write().unwrap().base_mut().downstream =
-                Some(Arc::new(Entry::new(reader, output)));
-            WorkerBreaker::Chain(chain)
-        } else {
-            let sink = SinkBreaker::new(
-                Arc::new(RwLock::new(Some(input))),
-                Arc::new(Sink(delivered)),
-            );
-            WorkerBreaker::Sink(Arc::new(RwLock::new(sink)))
+        let mut memo = None;
+        let handle = match target {
+            TestBreaker::FlatMemo => {
+                let mut producer = MemoProducer::over(input, &ints());
+                producer.base_mut().downstream = Some(Arc::new(Entry::new(reader, ints())));
+                let chain: BreakerHandle = Arc::new(RwLock::new(producer));
+                memo = Some(chain.clone());
+                WorkerBreaker::Chain(chain)
+            }
+            TestBreaker::MapAggregate => {
+                let output = Tiling::data_function(
+                    Extent::uint_range(KEYS),
+                    Tiling::Aggregation {
+                        kind: AggregateKind::Sum,
+                        accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+                    },
+                );
+                let chain = map_aggregate_over(input, &output, AggregateKind::Sum);
+                chain.write().unwrap().base_mut().downstream =
+                    Some(Arc::new(Entry::new(reader, output)));
+                WorkerBreaker::Chain(chain)
+            }
+            TestBreaker::Sink => {
+                let sink = SinkBreaker::new(
+                    Arc::new(RwLock::new(Some(input))),
+                    Arc::new(Sink(delivered)),
+                );
+                WorkerBreaker::Sink(Arc::new(RwLock::new(sink)))
+            }
         };
         let workers = WorkerPool::new(
             2,
@@ -747,7 +753,7 @@ mod tests {
             ScopeSteps::default(),
         );
         let dispatcher = Dispatcher::new(
-            if aggregate {
+            if !matches!(target, TestBreaker::Sink) {
                 vec![vec![], vec![0]]
             } else {
                 vec![vec![], vec![]]
@@ -765,6 +771,16 @@ mod tests {
             };
             workers.consume(&dispatcher, package, &mut |_, _| unreachable!());
         };
+        let read_key = |memo: &BreakerHandle, key: u64| {
+            let Next::Package(package) = dispatcher.try_claim(Some(reader)) else {
+                panic!("the reader must receive key {key}");
+            };
+            assert_eq!(package.pipeline, reader);
+            assert_eq!(package.guard, keys_between(key, key));
+            let tile = in_a_run(|| memo.read().unwrap().get(package.guard.clone()));
+            assert_eq!(int_entries(&tile), vec![(key, key as i64 * 10)]);
+            dispatcher.acknowledge(package);
+        };
         let timeout = Duration::from_secs(5);
         thread::scope(|threads| {
             threads.spawn(consume);
@@ -775,6 +791,11 @@ mod tests {
                 let _ = done.send(());
             });
             let completed = acknowledged.recv_timeout(timeout);
+            if completed.is_ok()
+                && let Some(memo) = &memo
+            {
+                read_key(memo, 1);
+            }
             let outstanding = dispatcher.outstanding(pipeline);
             let waiting = matches!(dispatcher.try_claim(None), Next::Wait(_));
             release.send(()).unwrap();
@@ -782,19 +803,65 @@ mod tests {
             assert_eq!(outstanding, 1);
             assert!(waiting, "finish still waits for the first package");
         });
-        assert_eq!(dispatcher.outstanding(reader), 0, "no incremental push");
+        if let Some(memo) = &memo {
+            read_key(memo, 0);
+        }
+        assert_eq!(dispatcher.outstanding(reader), 0, "no extra packages");
         let Next::Finish { pipeline } = dispatcher.try_claim(None) else {
             panic!("both packages acknowledged");
         };
         workers.finish(&dispatcher, pipeline, &mut |_, _| unreachable!());
-        if aggregate {
+        if matches!(target, TestBreaker::MapAggregate) {
             assert!(
                 dispatcher.outstanding(reader) > 0,
                 "finish publishes the held groups"
             );
-        } else {
+        } else if matches!(target, TestBreaker::Sink) {
             assert_eq!(tiles.try_iter().count(), 2, "one delivery per key");
         }
+    }
+
+    #[test]
+    fn flat_memo_publishes_partial_answers_and_later_absences_once() {
+        use super::*;
+        use crate::interpreter::tile_operators::{
+            MemoProducer,
+            growing::{Input, growing_source, ints},
+            test_helpers::{keys_between, push_to},
+        };
+
+        let source = growing_source([0, 2, 4]);
+        let mut memo = MemoProducer::over(Box::new(Input::over(&source)), &ints());
+        push_to(&mut memo, &[1]);
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
+        let requested = keys_between(0, 5);
+        let consume = |guard, expect_snapshot| {
+            let mut pushes = dispatcher.pushes(PipelineId(0));
+            let snapshot = memo.consume_for_dispatch(InputId::ONLY, guard, &mut pushes);
+            assert_eq!(snapshot.is_some(), expect_snapshot);
+            if let Some(producer) = snapshot {
+                pushes.push_final(producer);
+            }
+            dispatcher.land(pushes);
+            let mut received = Vec::new();
+            while let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(1))) {
+                received.push(package.guard.clone());
+                dispatcher.acknowledge(package);
+            }
+            received
+        };
+        let point = |k| keys_between(k, k);
+        assert_eq!(
+            consume(requested.clone(), false),
+            vec![point(0).union(&point(2)), point(4)]
+        );
+        assert!(consume(requested.clone(), false).is_empty());
+        source.write().unwrap().closed = true;
+        let absent = point(1).union(&point(3)).union(&point(5));
+        assert_eq!(consume(requested.clone(), false), vec![absent]);
+        // Completing the remaining positions closes the whole finite collection.
+        let rest = guard_minus(&ints().universal_guard(), &requested);
+        assert_eq!(consume(keys_between(6, 11), true), vec![rest]);
     }
 
     /// The first handler holds its schedule and its store until a distinct worker enters the

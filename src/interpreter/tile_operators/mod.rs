@@ -1509,16 +1509,23 @@ pub(crate) fn closed_keeping_row_ends(guard: TileGuard, tiling: &Tiling) -> Tile
 
 /// [`BreakingProducer::final_guard`]'s default.
 fn held_final_guard<P: BreakingProducer + ?Sized>(producer: &P) -> TileGuard {
-    let held = producer.complete();
-    let obsolete = producer.obsolete_guard();
-    let left = match names_collection_keys(&obsolete) {
-        true => match keys_released_whole(&obsolete) {
+    held_after_release(
+        producer.complete(),
+        &producer.obsolete_guard(),
+        producer.tiling(),
+    )
+}
+
+/// Keep the still-held output of either a whole snapshot or one consume's contribution.
+fn held_after_release(held: TileGuard, obsolete: &TileGuard, tiling: &Tiling) -> TileGuard {
+    let left = match names_collection_keys(obsolete) {
+        true => match keys_released_whole(obsolete) {
             Some(released) if !held.is_empty() => guard_minus(&held, &released),
             _ => held,
         },
-        false => guard_minus(&held, &obsolete),
+        false => guard_minus(&held, obsolete),
     };
-    closed_keeping_row_ends(left, producer.tiling())
+    closed_keeping_row_ends(left, tiling)
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -1710,6 +1717,19 @@ pub trait Breaker {
     /// Read the existing input, integrate into synchronized native state, and release
     /// consumed input after dropping the output-state lock.
     fn consume_impl(&self, input: InputId, guard: TileGuard);
+
+    /// Consume a dispatched package and buffer any pushes known from its answer. Return the
+    /// producer when the driver still needs an exclusive snapshot before acknowledging.
+    fn consume_for_dispatch(
+        &self,
+        input: InputId,
+        guard: TileGuard,
+        _pushes: &mut Pushes<'_>,
+    ) -> Option<&dyn BreakingProducer> {
+        self.consume_impl(input, guard);
+        self.as_producer()
+            .filter(|producer| producer.pushes_while_consuming())
+    }
 
     fn finish_parallel_input(&mut self) {}
 

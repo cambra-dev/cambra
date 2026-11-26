@@ -613,15 +613,16 @@ With more than one worker, two kinds of claimant share the dispatcher:
 
 A worker consumes, publishes and acknowledges its own claim, in that order:
 
-1. For a concurrent pipeline, it calls `consume_impl` under the shared breaker handle. An
-   ordered pipeline has at most one package in flight and holds the handle exclusively through
-   consume and publication.
-2. Where the breaker answers `pushes_while_consuming`, as on the coordinator (`consume_with`), it
-   computes the pipeline's pushes under the handle held exclusively (`Pushes::push_final`), so the
-   push reads the breaker with no consume between the merge of a consume's rows and the release of
-   its input. A sink or a breaker that publishes only at its finish or in the resume pass can acknowledge
-   a concurrent consume as soon as it drops the shared handle, even while a peer is consuming.
-3. It lands the pushes with no handle held, then acknowledges the package.
+1. For a concurrent pipeline, the worker consumes under the shared breaker handle. A
+   flat keyed memo can publish the part of the input answer it has just cached. It excludes
+   released keys and uses the answer's own keys to cut an oversized package. The dispatcher
+   records the new region against earlier pushes, including those recorded by another worker.
+2. When publication needs a snapshot, the worker takes the breaker handle exclusively to run
+   `Pushes::push_final`. This includes nested memo output and a merge that closes a wider domain
+   than its answer. An ordered pipeline holds the handle exclusively through consume and
+   publication. A sink or a breaker that defers publication only consumes here.
+3. After the input release and with no breaker handle held, the worker lands the pushes and
+   acknowledges the package.
 
 A finish is claimable only once every package is acknowledged, so no claimant holds the pipeline.
 The claimant releases a concurrently consumed input whole (`Breaker::finish_parallel_input`) and

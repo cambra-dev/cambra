@@ -1708,12 +1708,29 @@ impl MemoProducer {
 }
 
 impl MemoProducer {
-    /// Read the input at `guard` and merge its answer into the cache. Answers the region to release
-    /// of the input: what the answer states complete, and the keys of `projection` the cache now
-    /// states complete.
-    fn read_input(&self, guard: TileGuard, projection: &Projection) -> TileGuard {
-        let mut input = self.input.get(guard);
+    /// Merge the input answer and release it before the dispatcher can land this claim's pushes.
+    fn consume_input(
+        &self,
+        guard: TileGuard,
+        pushes: Option<&mut Pushes<'_>>,
+    ) -> Option<&dyn BreakingProducer> {
+        assert!(guard.check_from(self.input.tiling()));
+        let projection = guard.projection_for(self);
+        let _reading = self
+            .reading_input
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if projection == Projection::Nothing || guard_covers(&self.input.obsolete_guard(), &guard) {
+            return Some(self);
+        }
+        let mut input = self.input.get(guard.clone());
         let mut released = input.to_guard();
+        let direct = pushes.filter(|p| p.has_readers()).and_then(|p| {
+            let keys = flat_answer_keys(&input, &guard, &released)?;
+            // A package-sized answer needs no key scan or copy when its delta is cut.
+            let oversized = (keys.len() > p.morsel_rows()).then(|| keys.clone());
+            Some((p, released.clone(), oversized))
+        });
         input.compact();
         #[cfg(debug_assertions)]
         {
@@ -1726,21 +1743,72 @@ impl MemoProducer {
             );
         }
 
-        input.remove_guarded(self.obsolete_guard().clone());
+        input.remove_guarded(self.obsolete_guard());
         input.compact();
         let mut cache = self
             .cached_tile
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let was_terminal = direct.is_some() && cache.is_terminal();
         cache.merge(input);
         close_over_positions(&mut cache, &self.base.tiling);
-        if let Projection::Keys { level, keys } = projection {
+        let newly_terminal = direct.is_some() && !was_terminal && cache.is_terminal();
+        if let Projection::Keys { level, keys } = &projection {
             let complete = cache.completion_at(*level).intersect(keys);
             released =
                 released.union(&Projection::keys_at(*level, complete).guard(self.input.tiling()));
         }
-        released
+        drop(cache);
+        self.input.release(released);
+        let Some((pushes, contribution, keys)) = direct else {
+            return Some(self);
+        };
+        let region = held_after_release(contribution, &self.obsolete_guard(), self.tiling());
+        if (newly_terminal && !region.is_universal()) || !guard_covers(&guard, &region) {
+            // Merging this answer closed the entire domain, possibly using a peer's rows.
+            return Some(self);
+        }
+        pushes.push_region(self, &region, |new, rows| match keys {
+            None => vec![new.clone()],
+            Some(keys) => cut_at_keys(
+                new,
+                (0..keys.len()).map(|i| keys.index_at(i)),
+                rows,
+                self.tiling(),
+            ),
+        });
+        None
     }
+}
+
+/// Only a flat answer contributes whole keys directly. Deleted rows may release input
+/// without adding output, and a widened answer may include a peer's in-flight region.
+fn flat_answer_keys<'a>(
+    input: &'a Tile,
+    requested: &TileGuard,
+    completed: &TileGuard,
+) -> Option<&'a ColumnValue> {
+    let Tile::DataFunction {
+        domain,
+        codomain,
+        deleted,
+        ..
+    } = input
+    else {
+        return None;
+    };
+    let TileGuard::Function(FunctionGuard::Domain(keys)) = requested else {
+        return None;
+    };
+    let TileGuard::Function(FunctionGuard::Domain(done)) = completed else {
+        return None;
+    };
+    (!codomain.holds_a_level()
+        && deleted.is_empty()
+        && !keys.qualifies()
+        && !done.qualifies()
+        && guard_covers(requested, completed))
+    .then_some(domain)
 }
 
 /// State `tile` complete where it states every key of its outermost collection, a finite range
@@ -1787,28 +1855,23 @@ fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
 }
 
 impl Breaker for MemoProducer {
-    /// A consume caches the answer and releases what it states ([`MemoProducer::read_input`]).
+    /// A consume caches the answer and releases what it states ([`MemoProducer::consume_input`]).
     ///
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller asks
     /// for the pipeline to run. It wakes no consumer: a consuming memo's only reader is the
     /// pipeline the dispatcher pushes to, and what the consume merged reaches it through the
     /// packages pushed after the consume.
     fn consume_impl(&self, _: InputId, guard: TileGuard) {
-        assert!(guard.check_from(self.input.tiling()));
-        let projection = guard.projection_for(self);
-        // A reader of the cache can release it while the memo's own pipeline still consumes, and
-        // the release reaches the input (`release_impl`). Workers consume packages at once, so
-        // the input is read under a shared hold that a release waits for: a consume either
-        // finishes before the release or finds the region released and reads nothing.
-        let _reading = self
-            .reading_input
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        if projection == Projection::Nothing || guard_covers(&self.input.obsolete_guard(), &guard) {
-            return;
-        }
-        let released = self.read_input(guard, &projection);
-        self.input.release(released);
+        self.consume_input(guard, None);
+    }
+
+    fn consume_for_dispatch(
+        &self,
+        _: InputId,
+        guard: TileGuard,
+        pushes: &mut Pushes<'_>,
+    ) -> Option<&dyn BreakingProducer> {
+        self.consume_input(guard, Some(pushes))
     }
 
     fn finish(&mut self, _: InputId, pushes: &mut Pushes<'_>) {
