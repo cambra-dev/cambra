@@ -38,6 +38,17 @@ impl<'a, T> View<'a, T> {
         self.len() == 0
     }
 
+    /// The value at `i`.
+    pub fn get(&self, i: usize) -> &'a T {
+        match *self {
+            View::Slice(values) => &values[i],
+            View::Constant { value, len } => {
+                assert!(i < len, "index {i} out of a view of {len}");
+                value
+            }
+        }
+    }
+
     /// The values in `range`.
     pub fn range(self, range: Range<usize>) -> Self {
         match self {

@@ -4,7 +4,7 @@ use smol_str::SmolStr;
 
 use crate::view::View;
 
-use super::ColumnValue;
+use super::{ColumnValue, RowIndex};
 
 /// A column of `Int`, `UInt`, `String` or `Bool` values, borrowed from a [`ColumnValue`] or
 /// built from a literal.
@@ -41,6 +41,68 @@ impl<'a> ColumnView<'a> {
             ColumnView::UInts(_) => ColumnValue::UInts(Vec::new()),
             ColumnView::Strings(_) => ColumnValue::Strings(Vec::new()),
             ColumnView::Bools(_) => ColumnValue::Bools(Vec::new()),
+        }
+    }
+
+    /// The values at `positions`, in that order, as a column.
+    pub(crate) fn gather(&self, positions: &[RowIndex]) -> ColumnValue {
+        fn pick<T: Clone>(view: &View<'_, T>, positions: &[RowIndex]) -> Vec<T> {
+            positions.iter().map(|&p| view.get(p).clone()).collect()
+        }
+        match self {
+            ColumnView::Ints(v) => ColumnValue::Ints(pick(v, positions)),
+            ColumnView::UInts(v) => ColumnValue::UInts(pick(v, positions)),
+            ColumnView::Strings(v) => ColumnValue::Strings(pick(v, positions)),
+            ColumnView::Bools(v) => ColumnValue::Bools(pick(v, positions)),
+        }
+    }
+
+    /// Append `len` values to `out`, a column of this view's type: the value at position `p` is the
+    /// next value of the one part whose positions hold `p`. The parts' positions are ascending and
+    /// together hold each of `0..len` once, and each part has one value per position it holds.
+    pub(crate) fn scatter_into(
+        parts: &[(ColumnView<'_>, &[RowIndex])],
+        len: usize,
+        out: &mut ColumnValue,
+    ) {
+        fn place<'v, T: Clone + 'v>(
+            parts: impl Iterator<Item = (View<'v, T>, &'v [RowIndex])>,
+            len: usize,
+            out: &mut Vec<T>,
+        ) {
+            let mut placed: Vec<Option<T>> = vec![None; len];
+            for (view, positions) in parts {
+                debug_assert_eq!(view.len(), positions.len(), "one value per position");
+                for (i, &p) in positions.iter().enumerate() {
+                    let slot = &mut placed[p];
+                    debug_assert!(slot.is_none(), "position {p} is held by two parts");
+                    *slot = Some(view.get(i).clone());
+                }
+            }
+            out.extend(
+                placed
+                    .into_iter()
+                    .map(|value| value.expect("every position is held by a part")),
+            );
+        }
+        macro_rules! scatter {
+            ($variant:ident, $out:expr) => {
+                place(
+                    parts.iter().map(|(view, positions)| match view {
+                        ColumnView::$variant(v) => (*v, *positions),
+                        other => panic!("parts of one type, got {other:?}"),
+                    }),
+                    len,
+                    $out,
+                )
+            };
+        }
+        match out {
+            ColumnValue::Ints(out) => scatter!(Ints, out),
+            ColumnValue::UInts(out) => scatter!(UInts, out),
+            ColumnValue::Strings(out) => scatter!(Strings, out),
+            ColumnValue::Bools(out) => scatter!(Bools, out),
+            other => panic!("a scatter writes a column with a view, got {other:?}"),
         }
     }
 
