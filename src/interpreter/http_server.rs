@@ -164,12 +164,7 @@ fn decode_response(value: &Value) -> Result<(u16, Vec<Header>, String), String> 
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if headers
-        .iter()
-        .filter(|h| h.field.equiv("Content-Type"))
-        .count()
-        > 1
-    {
+    if headers.iter().filter(|h| h.field == "Content-Type").count() > 1 {
         return Err("a response has at most one Content-Type header".into());
     }
     let body = tuple_part(payload, 2).as_string().to_string();
@@ -179,43 +174,17 @@ fn decode_response(value: &Value) -> Result<(u16, Vec<Header>, String), String> 
     Ok((status, headers, body))
 }
 
-/// Send a validated response. tiny_http adds Content-Length even for 204, so bodyless
-/// statuses use its raw writer; RFC 9110 section 8.6 forbids that field for 204 and permits
-/// it for 304 only when the corresponding representation's length is known.
 fn send_response(
     request: tiny_http::Request,
     status: u16,
     headers: Vec<Header>,
     body: String,
 ) -> std::io::Result<()> {
-    if matches!(status, 204 | 304) {
-        use std::io::Write;
-        let version = request.http_version().clone();
-        let mut writer = request.into_writer();
-        write!(
-            writer,
-            "HTTP/{version} {status} {}\r\n",
-            tiny_http::StatusCode(status).default_reason_phrase()
-        )?;
-        if !headers.iter().any(|h| h.field.equiv("Date")) {
-            write!(
-                writer,
-                "Date: {}\r\n",
-                httpdate::fmt_http_date(std::time::SystemTime::now())
-            )?;
-        }
-        for header in headers {
-            write!(writer, "{}: {}\r\n", header.field, header.value)?;
-        }
-        writer.write_all(b"\r\n")?;
-        writer.flush()
-    } else {
-        let mut response = Response::from_data(body.into_bytes()).with_status_code(status);
-        for header in headers {
-            response.add_header(header);
-        }
-        request.respond(response)
+    let mut response = Response::from_data(body.into_bytes()).with_status_code(status);
+    for header in headers {
+        response.add_header(header);
     }
+    request.respond(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,9 +196,8 @@ pub enum RouteMessage {
     /// A request for the route, with its body read off.
     Request(Value, Box<tiny_http::Request>),
     /// The dispatcher stopped for a reason other than the program releasing the port, so no
-    /// request reaches the route again. Two causes stop it. tiny_http's accept thread exits on
-    /// its first `accept` error and closes the listener. A panic on the dispatcher thread ends
-    /// the dispatcher and leaves the listener open, with nothing reading its requests.
+    /// request reaches the route again. An unrecoverable accept error closes the listener.
+    /// A panic on the dispatcher thread leaves the listener open, with nothing reading requests.
     Failed(String),
 }
 

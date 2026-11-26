@@ -79,6 +79,10 @@ scope. `compile_program` subscribes one `SinkConsumer` per sink. Shared upstream
 
 ## Per-port server sharing
 
+The `tiny_http` dependency selects the `teeny-http` fork. Discarding an unread Content-Length body
+uses bounded memory, including when the declared length is `usize::MAX`. The transport handles
+response framing for every status, including bodyless 204 and 304 responses.
+
 One `tiny_http::Server` is bound per TCP port. `SharedHttpServer::register(method, path)` adds a
 route and returns its receiver. The dispatcher matches the method exactly, since methods are
 case-sensitive ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-overview)). It matches
@@ -96,8 +100,8 @@ differently serve one route, which is refused as a duplicate.
 
 For a matched request, the dispatcher reads and validates the UTF-8 body before enqueueing it.
 It rejects an oversized Content-Length before reading and otherwise reads at most 1 MiB plus one
-byte to detect overflow. Body reads have no deadline, and tiny_http retains responsibility for
-unread-body cleanup. A stalled upload can still block the port's dispatcher.
+byte to detect overflow. Body reads and unread-body cleanup have no deadline. A stalled upload can
+still block the port's dispatcher, including after a 413 response has been sent.
 Its raw value is `(method, target, headers, body)`, where headers are a materialized list of
 String pairs. The embedded module uses ordinary CHL constructors to build nominal Header and
 Request values. Sources continue to return `ColumnValue`; collection-valued fields open through
@@ -144,9 +148,10 @@ means the listener or dispatcher failed. The latter means the scheduler retained
 its route was unregistered. `ReportPanic` reports dispatcher panics to every route, and the route
 table records failures for routes registered later.
 
-An outstanding runtime limitation is listener recovery: tiny_http 0.12 ends its accept thread on
-an accept error. A reported failure ends the process, including other routes and the control port.
-Recovery requires rebinding or an accept loop that retries transient errors.
+An outstanding runtime limitation is listener recovery: the transport retries `ConnectionAborted`
+accept errors but ends its accept thread on other errors. A reported failure ends the process,
+including other routes and the control port. Recovery requires rebinding or retrying further
+transient errors.
 
 The compiler checks [sink domain contracts](../ccl/design/lowering.md#sink-domain-contracts) after
 Feed assembly, when every deferred channel domain is concrete. A partial Feed therefore receives

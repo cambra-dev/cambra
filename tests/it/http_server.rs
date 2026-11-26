@@ -929,9 +929,13 @@ fn http_request_body_size_is_bounded(#[case] length: usize, #[case] status: u16)
 }
 
 #[rstest]
-#[case::content_length(false)]
-#[case::chunked(true)]
-fn an_oversized_http_body_is_rejected_before_the_upload_finishes(#[case] chunked: bool) {
+#[case::content_length(false, 1024 * 1024 + 1)]
+#[case::maximum_content_length(false, usize::MAX)]
+#[case::chunked(true, 1024 * 1024 + 1)]
+fn an_oversized_http_body_is_rejected_before_the_upload_finishes(
+    #[case] chunked: bool,
+    #[case] length: usize,
+) {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
         import std::http
@@ -943,7 +947,6 @@ fn an_oversized_http_body_is_rejected_before_the_upload_finishes(#[case] chunked
     let _compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let length = 1024 * 1024 + 1;
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
