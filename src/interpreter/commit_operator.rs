@@ -3125,8 +3125,6 @@ impl CommitProducer {
                     committed = true;
                 }
                 CommitOutcome::Stale => {
-                    #[cfg(test)]
-                    RETRIES.with(|retries| retries.set(retries.get() + 1));
                     state.stale[k] = true;
                     stale = true;
                 }
@@ -7114,6 +7112,14 @@ impl TransactDriverProducer {
             && let pos = Position::new(path[0].clone())
             && state.latest_emit.as_ref() != Some(&(pos.clone(), frontier.clone()))
         {
+            #[cfg(test)]
+            if state
+                .latest_emit
+                .as_ref()
+                .is_some_and(|(item, _)| item == &pos)
+            {
+                RETRIES.with(|retries| retries.set(retries.get() + 1));
+            }
             let item = state.source.items[path].clone();
             // The body reads snapshot position `i` as `p.i`. A read key with no
             // value yet gets the item as a stand-in of the right extent. Load-
@@ -7504,8 +7510,8 @@ fn driver_field_at(driver_tile: &Tile, pos: &Position, field: &str) -> Value {
 
 #[cfg(test)]
 thread_local! {
-    /// The stale decisions the transaction stores stepped on this thread have attempted
-    /// ([`CommitProducer::commit_ready`]), for a test that has to see contention happen. A run's
+    /// The attempts a driver reissued for the same item at a newer frontier on this thread.
+    /// A waiting body can be superseded before it ever submits a stale proposal. A run's
     /// worker threads add their counts to the thread that runs it once they join
     /// (`WorkerPool::hand_over_counters`).
     pub(crate) static RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

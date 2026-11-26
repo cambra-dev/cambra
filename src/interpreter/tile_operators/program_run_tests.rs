@@ -4344,19 +4344,21 @@ fn a_parked_writer_finishes_while_an_unrelated_live_source_stays_open(
 /// A writer's attempt that waits for its input keeps the snapshot it read while another writer
 /// commits past it. The waiting writer's store-slot release stops below that snapshot
 /// (`TransactWriterProducer::consume_impl`), so its proposal still reads the store there, which a
-/// debug build checks (`CommitEngine::attempt`). The proposal is then stale and retried at the new
-/// frontier: 100 less the sum for each item of the first writer, and less each item of the second.
+/// debug build checks (`CommitEngine::attempt`). The driver retries the item at the newer frontier, whether
+/// its old proposal reached the store or its body was still waiting: 100 less the sum for each item of the first writer, and less each item of the second.
 #[rstest_log::rstest]
 fn a_waiting_attempt_reads_the_store_at_its_snapshot(#[values(1, usize::MAX)] rows: usize) {
     use crate::interpreter::commit_operator::RETRIES;
     use crate::interpreter::dispatcher::transaction_scope::STALLS;
     STALLS.with(|stalls| stalls.set(0));
     RETRIES.with(|retries| retries.set(0));
+    // The finite writer can park before the first live item. Later deliveries advance the
+    // competing writer while the sum still needs EOF.
     let (value, _) = dispatched_live(
         indoc! {"
             out = test_sink()
             pool: Mut(Int, Txn) := 100
-            for x in source1():
+            for x in [1, 2, 3, 4, 5]:
                 with begin():
                     pool := pool - sum(source1())
             for y in source1():
@@ -4365,7 +4367,7 @@ fn a_waiting_attempt_reads_the_store_at_its_snapshot(#[values(1, usize::MAX)] ro
             out << await_final(pool)
         "},
         rows,
-        two_batches(),
+        an_empty_delivery_then_three(),
     );
     assert_eq!(value, Value::Int(100 - 5 * 15 - 15));
     assert!(
