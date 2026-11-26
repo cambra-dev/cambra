@@ -1669,6 +1669,50 @@ fn a_comparison_of_records_holding_unit_compiles_to_one_map() {
     );
 }
 
+/// Two variants of one tag compare their payloads, so a comparison of records holding them is one
+/// map that builds no union.
+#[test]
+fn a_comparison_of_variants_of_one_tag_compiles_to_one_map() {
+    assert_eq!(
+        operator_kinds_over_source1(
+            "[(a=Option::some(x + 1), b=x) == (a=Option::some(3), b=2) for x in source1()]"
+        ),
+        [
+            "IterateExtent",
+            "MapResultWithSource",
+            "Constant",
+            "MapResult"
+        ],
+    );
+}
+
+/// A comparison of variants reads the tags and then the payloads: variants of one tag compare
+/// their payloads, and variants of different tags differ. These cases check values;
+/// `a_comparison_of_variants_of_one_tag_compiles_to_one_map` checks the operators.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::equal("(a=Option::some(x + 1), b=x) == (a=Option::some(3), b=2)", 2)]
+#[case::not_equal("(a=Option::some(x + 1), b=x) != (a=Option::some(3), b=2)", 4)]
+#[case::different_tags_equal("(a=Option::some(x), b=x) == (a=Option::none, b=2)", 0)]
+#[case::different_tags_not_equal("(a=Option::some(x), b=x) != (a=Option::none, b=2)", 6)]
+fn a_comparison_of_variants_selects_its_rows(#[case] condition: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("sum([x for x in [1, 2, 3] if {condition}])"),
+        Value::Int(expected),
+    );
+}
+
+/// Two `Option::none` fields are equal at every row, so the comparison reads the other field.
+#[test]
+fn a_comparison_of_none_fields_reads_the_other_field() {
+    check_scalar(
+        indoc! {"
+            absent: Option(Int) = Option::none
+            sum([x for x in [1, 2, 3] if (a=absent, b=x + 1) == (a=absent, b=3)])"},
+        Value::Int(2),
+    );
+}
+
 /// A collection of records holding a variant is a column, so a chain reading it fuses as well:
 /// the producer and the consumer are one map each, with no `Zip` between the fields.
 #[test]

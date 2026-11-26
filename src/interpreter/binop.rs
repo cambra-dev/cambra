@@ -9,7 +9,7 @@ use crate::scalar_ops::{
     zip_arithmetic, zip_bool_compare, zip_bool_logic, zip_compare, zip_concat,
 };
 
-use super::{BaseType, ColumnValue, ColumnView, Extent};
+use super::{BaseType, ColumnValue, ColumnView, Extent, Value};
 
 /// Output [`Extent`] for a [`BinOpKind`].
 pub fn binop_output_extent(op: &BinOpKind) -> Extent {
@@ -162,13 +162,39 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
     }
 }
 
-/// Compare two tagged columns row by row under `==` or `!=`, by value: a value's tag, then its
-/// payload.
+/// Compare two tagged columns row by row under `==` or `!=` ([`equal_over_shared_fields`]): a
+/// value's tag, then its payload.
 fn equal_rows(op: CompareKind, left: &ColumnValue, right: &ColumnValue) -> Vec<bool> {
     let rows = left.len().min(right.len());
     (0..rows)
-        .map(|i| (left.index_at(i) == right.index_at(i)) == (op == CompareKind::Equals))
+        .map(|i| {
+            equal_over_shared_fields(&left.index_at(i), &right.index_at(i))
+                == (op == CompareKind::Equals)
+        })
         .collect()
+}
+
+/// Whether two values are equal over the fields both carry. Two variants are equal when their tags
+/// agree and their payloads are equal. Two records are equal over the fields [`compared_fields`]
+/// names, so a field that width subtyping left in one value is not compared, as
+/// [`compare_records`] leaves out its column. Any other two values are equal by `==`.
+fn equal_over_shared_fields(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (
+            Value::Union {
+                tag: l_tag,
+                inner: l,
+            },
+            Value::Union {
+                tag: r_tag,
+                inner: r,
+            },
+        ) => l_tag == r_tag && equal_over_shared_fields(l, r),
+        (Value::Record(l), Value::Record(r)) => {
+            compared_fields(l, r).all(|(_, l, r)| equal_over_shared_fields(l, r))
+        }
+        _ => left == right,
+    }
 }
 
 /// Order two columns of tuples or nominal values row by row, by the values' own comparison,
