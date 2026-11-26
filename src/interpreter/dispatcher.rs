@@ -858,7 +858,7 @@ impl Dispatcher {
                     .is_none_or(|group| self.holds[group.0].load(Ordering::SeqCst) & 1 == 0))
     }
 
-    /// The serial coordinator changes these holds between claims, after settling held pushes.
+    /// Claimants release these holds after settling held pushes.
     /// A hold does not revoke a claim or wait for a worker already consuming a package.
     ///
     /// Hold the pipelines of `group`, a scope body's, from taking a package that follows its
@@ -1336,8 +1336,24 @@ impl Dispatcher {
         !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
     }
 
+    /// Whether a new package can start on an ordered pipeline. A retained scope request
+    /// occupies its pipeline across several steps, even if another request is queued.
+    fn may_start_ordered_package(&self, pipeline: PipelineId) -> bool {
+        let p = pipeline.0;
+        debug_assert!(self.infos[p].ordered);
+        if self.outstanding(pipeline) == 0 {
+            return false;
+        }
+        let queue = self.states[p]
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        queue.in_flight.is_empty() && !queue.ready.is_empty() && self.takes_from(p)
+    }
+
     /// A worker registers activity before claiming a finish. A request already
-    /// finishing can be waiting for its body and needs the shared settlement pass.
+    /// finishing can be waiting for its body and needs another settlement pass.
     pub(crate) fn may_finish_where(&self, finishes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| finishes(PipelineId(p)))

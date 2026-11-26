@@ -159,10 +159,10 @@ EXPECTED_EXCEPTIONS = [
     # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
     # what it is handed; nothing reads it back into the graph. See `Collected`.
     ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),
-    # Scope scheduling metadata and the coordinator's rotating search cursor.
+    # Scope scheduling metadata and the rotating cursor shared by a connected group.
     ("src/interpreter/dispatcher/scope.rs", "cell of `LoopSchedule`"),
     ("src/interpreter/dispatcher/scope.rs", "cell of `WriterPhase`"),
-    ("src/interpreter/dispatcher/plan.rs", "cell of `usize`"),
+    ("src/interpreter/dispatcher/scope.rs", "cell of `usize`"),
     # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
     # not see.

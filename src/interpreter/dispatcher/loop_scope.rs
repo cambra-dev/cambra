@@ -101,7 +101,7 @@ impl LoopSchedule {
         })
     }
 
-    fn publishing(&self) -> bool {
+    pub(super) fn publishing(&self) -> bool {
         self.has_request() || self.phase == LoopPhase::Draining
     }
 
@@ -437,20 +437,6 @@ impl Body {
         dispatcher.hold_followers(self.attached().hold);
     }
 
-    /// Let the inner pipelines and the step follow their reads, where the body runs and its hold
-    /// is still `read`, taken before the publication pass that decided the release: held, and held
-    /// again by no claim since ([`Dispatcher::release_followers_if`]). Whether this call released
-    /// them.
-    pub(super) fn release_followers(&self, dispatcher: &Dispatcher, read: FollowersHold) -> bool {
-        self.is_active() && dispatcher.release_followers_if(self.attached().hold, read)
-    }
-
-    /// The body's follower hold, read before a publication pass, or `None` before the body is
-    /// attached.
-    pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
-        Some(dispatcher.followers_hold(self.attachment()?.hold))
-    }
-
     /// A step reads the active round's guard. Its outstanding dispatcher claim prevents
     /// another admission until the handler settles the round and acknowledges the claim.
     pub(super) fn queue_step(&self, dispatcher: &Dispatcher, guard: &TileGuard) -> bool {
@@ -511,10 +497,15 @@ impl Body {
     /// the row once the source delivers it brings the next request.
     fn members_hold_rows(&self) -> bool {
         self.members.iter().any(|member| match member {
-            Member::Scope(child) => induction(child)
-                .body_mut()
-                .ready_rows()
-                .is_some_and(|(ready, _)| !ready.is_empty()),
+            Member::Scope(child) => match child.try_write() {
+                Ok(mut child) => child
+                    .as_induction_store_mut()
+                    .expect("a nested loop")
+                    .body_mut()
+                    .ready_rows()
+                    .is_some_and(|(ready, _)| !ready.is_empty()),
+                Err(()) => true,
+            },
             Member::Chain(_) => false,
         })
     }
@@ -795,43 +786,6 @@ impl InductionStoreProducer {
 
     pub(super) fn hold_followers(&mut self, dispatcher: &Dispatcher) {
         self.run_mut().body.hold_followers(dispatcher);
-    }
-
-    pub(super) fn settlement_pipelines(
-        &self,
-        schedule: &LoopSchedule,
-        child_active: impl Fn(PipelineId) -> bool,
-    ) -> Vec<PipelineId> {
-        let body = &self.run().body;
-        // As `release_followers` releases them: while a request is open or the body finishes.
-        if !body.is_active() || !schedule.publishing() {
-            return Vec::new();
-        }
-        (0..body.members.len())
-            .filter(|&local| {
-                !matches!(&body.members[local], Member::Scope(_) if child_active(body.global(PipelineId(local))))
-            })
-            .map(|local| body.global(PipelineId(local)))
-            .collect()
-    }
-
-    pub(super) fn release_followers(
-        &mut self,
-        schedule: &LoopSchedule,
-        dispatcher: &Dispatcher,
-        read: FollowersHold,
-    ) -> bool {
-        // A finish activates the body and holds its followers with no request open, and the step
-        // must run before the scope finishes, so a finishing body releases them as a request
-        // does, after the pass publishes what its inner pipelines hold (`settlement_pipelines`).
-        let run = self.run();
-        schedule.publishing() && run.body.release_followers(dispatcher, read)
-    }
-
-    /// The body's follower hold, read before a publication pass, or `None` before the scope is
-    /// attached.
-    pub(super) fn followers_hold(&self, dispatcher: &Dispatcher) -> Option<FollowersHold> {
-        self.run().body.followers_hold(dispatcher)
     }
 
     /// Open the request `package`: the request it completes at once, and the first round's work.
@@ -1479,7 +1433,7 @@ mod tests {
     "};
 
     /// A program compiled with its sinks unpulled and no notification delivered, and the scope of
-    /// its one store.
+    /// its outer loop store.
     struct Compiled {
         _runs: ScopeRuns,
         _program: CompiledProgram,
@@ -1488,6 +1442,7 @@ mod tests {
         scope: StoreCell,
         dispatcher: Dispatcher,
         execution: Execution,
+        steps: scope::ScopeSteps,
     }
 
     impl Compiled {
@@ -1502,18 +1457,17 @@ mod tests {
             let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
                 .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
             let operators = ctx.take_operator_map();
-            let stores: Vec<_> = operators
-                .operators()
-                .into_iter()
-                .filter(|fan| fan.cached_tile().is_some())
-                .collect();
-            assert_eq!(stores.len(), 1, "one store");
-            let mut planner = Planner::default();
-            planner.store_pipeline(crate::interpreter::tile_operators::StoreRead {
-                fan: stores[0].id(),
-                store: stores[0].store().expect("the program subscribed its store"),
+            let mut roots = operators.operators().into_iter().filter_map(|fan| {
+                let store = fan.store()?;
+                let outer = matches!(store.read().tiling(), Tiling::Store { .. });
+                outer.then_some(crate::interpreter::tile_operators::StoreRead {
+                    fan: fan.id(),
+                    store,
+                })
             });
-            assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
+            let mut planner = Planner::default();
+            planner.store_pipeline(roots.next().expect("one outer loop store"));
+            assert!(roots.next().is_none(), "one outer loop store");
             let mut runs = ScopeRuns::new();
             let scope = planner.build_scope(0, usize::MAX, &mut runs);
             induction(&scope).begin_run();
@@ -1521,7 +1475,9 @@ mod tests {
             let mut scopes = vec![None; dispatcher.infos.len()];
             scopes[0] = Some(scope.clone());
             let execution = Execution::new(&scopes, &mut dispatcher);
+            let steps = execution.scope_steps(&dispatcher);
             Self {
+                steps,
                 _runs: runs,
                 _program: program,
                 _ctx: ctx,
@@ -1553,7 +1509,8 @@ mod tests {
                 }
                 Next::Wait(_) => {
                     assert!(
-                        self.execution.resume(&self.dispatcher, &mut reach),
+                        self.steps.poll(&self.dispatcher)
+                            || self.execution.resume(&self.dispatcher),
                         "a pending loop has body, settlement, or step work"
                     );
                     None
@@ -1659,8 +1616,20 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(6));
     }
 
-    #[test]
-    fn a_worker_runs_a_serial_feeder_and_finishes_its_dependent_loop() {
+    #[rstest_log::rstest]
+    #[case::flat(SUM, 6)]
+    #[case::nested(indoc! {"
+        out = test_sink()
+        total := 0
+        for x in [1, 2, 3]:
+            for y in [1, 2]:
+                total += x * y
+        out << total
+    "}, 18)]
+    fn a_worker_runs_a_serial_feeder_and_finishes_its_dependent_loop(
+        #[case] source: &str,
+        #[case] expected: i64,
+    ) {
         use crate::interpreter::{
             BaseType, ColumnValue,
             tile_operators::{MemoProducer, test_helpers::ProjectionSpy},
@@ -1669,7 +1638,7 @@ mod tests {
         use std::time::Duration;
 
         // A scalar feeder has one package. Its publication offers the three positions
-        // of SUM. Only the background worker may claim, including both scope finishes.
+        // of the outer loop. Only the background worker may claim, including all scope finishes.
         struct OfferRows(Offers);
         impl Consumer for OfferRows {
             fn notify(&self, _: &Projection, _: &mut Landing<'_>) {
@@ -1679,7 +1648,7 @@ mod tests {
         let request = PipelineId(0);
         let feeder = PipelineId(1);
         let mut compiled = Compiled::over(
-            SUM,
+            source,
             Dispatcher::new(vec![vec![feeder.0], vec![]], usize::MAX),
         );
         compiled
@@ -1716,7 +1685,7 @@ mod tests {
         });
         assert!(dispatcher.states[request.0].phase.load() == Phase::Finished);
         assert!(!induction(&compiled.scope).body_mut().is_active());
-        assert_eq!(compiled.value(), Value::Int(6));
+        assert_eq!(compiled.value(), Value::Int(expected));
     }
 
     /// A loop scope's open request is its store pipeline's claimed package, in flight until the
@@ -1792,8 +1761,7 @@ mod tests {
             compiled.tick();
         }
         assert_eq!(compiled.dispatcher.outstanding(step), 1);
-        let scope = compiled.execution.request_scope(PipelineId(0));
-        assert!(!scope.queue_step(&compiled.dispatcher));
+        assert!(!compiled.steps.poll(&compiled.dispatcher));
         assert_eq!(compiled.dispatcher.outstanding(step), 1);
     }
 

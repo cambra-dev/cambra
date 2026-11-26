@@ -42,6 +42,15 @@ pub(crate) struct TransactionRun {
 }
 
 impl TransactionRun {
+    /// The planned driver is stable for the run even while another worker is pulling its fan-out.
+    pub(crate) fn writer_driver(&self, writer: usize) -> &BreakerHandle {
+        let body = &self.writers[writer].body;
+        let loop_scope::Member::Chain(driver) = &body.members[body.driver.0] else {
+            unreachable!("a transaction driver is a chain")
+        };
+        driver
+    }
+
     /// Wake parked peers on progress. An incomplete request may park once it has tried the
     /// current epoch. Overlapping attempts that read an older epoch get another turn.
     pub(super) fn settle(&mut self, writer: usize, queued_at: u64, progressed: bool) -> bool {

@@ -1009,9 +1009,6 @@ enum Handler {
 
 pub(super) struct Execution {
     handlers: Vec<Handler>,
-    /// Handler at which the coordinator resumes its search for the next settled scope.
-    // shared-state-ok: only the coordinator rotates its search through eligible scopes.
-    step_cursor: Cell<usize>,
     roots: usize,
     /// Each scope's inner pipelines, its step, its own pipeline and its body's follower hold, as
     /// attached.
@@ -1027,7 +1024,6 @@ impl Execution {
         let mut execution = Self {
             handlers: (0..scopes.len()).map(|_| Handler::Root).collect(),
             roots: scopes.len(),
-            step_cursor: Cell::new(0),
             bodies: Vec::new(),
             closes_on_reads: Vec::new(),
         };
@@ -1079,6 +1075,7 @@ impl Execution {
             }
         }
         let step = dispatcher.add_pipeline(body.clone());
+        dispatcher.order(pipeline);
         dispatcher.order(step);
         assert_eq!(step.0, self.handlers.len(), "each step has one handler");
         let hold = dispatcher.add_hold_group(body.iter().copied().chain([step]));
@@ -1242,7 +1239,7 @@ impl Execution {
             targets,
             self.bodies_by_pipeline(),
             self.scope_pipelines(),
-            self.local_steps(dispatcher, count),
+            self.scope_steps(dispatcher),
         );
         for pipeline in workers.serial() {
             dispatcher.order(pipeline);
@@ -1250,10 +1247,7 @@ impl Execution {
         workers
     }
 
-    fn local_steps(&self, dispatcher: &Dispatcher, workers: usize) -> ScopeSteps {
-        if workers < 2 {
-            return ScopeSteps::default();
-        }
+    pub(super) fn scope_steps(&self, dispatcher: &Dispatcher) -> ScopeSteps {
         ScopeSteps::plan(
             dispatcher,
             self.handlers.iter().filter_map(|handler| match handler {
@@ -1439,30 +1433,14 @@ impl Execution {
         true
     }
 
-    pub(super) fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
+    pub(super) fn resume(&self, dispatcher: &Dispatcher) -> bool {
         let mut progressed = self.close_scopes_reading(dispatcher);
         for scope in self.scopes() {
-            progressed |=
-                scope.resume(dispatcher, reach, |id| self.request_scope(id).has_request());
-        }
-        progressed
-            || self.queue_one_step(|index| match &self.handlers[index] {
-                Handler::Request(scope) => scope.queue_step(dispatcher),
-                _ => false,
-            })
-    }
-
-    /// Queue at most one step per settlement pass. Start after the previous winner so a writer
-    /// retrying at the beginning of the handler table gives an already eligible peer a turn.
-    fn queue_one_step(&self, mut queue: impl FnMut(usize) -> bool) -> bool {
-        let start = self.step_cursor.get();
-        for index in (start..self.handlers.len()).chain(0..start) {
-            if queue(index) {
-                self.step_cursor.set(index + 1);
-                return true;
+            if let Scope::Loop { store, .. } = scope {
+                progressed |= induction(store).initialize_seed();
             }
         }
-        false
+        progressed
     }
 
     fn push_held(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
@@ -1535,7 +1513,7 @@ impl Execution {
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {
                     dispatcher.wait(generation)
                 }
-                Next::Wait(_) if self.resume(dispatcher, reach) => {}
+                Next::Wait(_) if self.resume(dispatcher) => {}
                 // A worker's claim can become ready while the pass runs, so the workers are asked
                 // again after it.
                 Next::Wait(_) if workers.may_progress(dispatcher) => {}
@@ -3697,23 +3675,6 @@ fn drive_live(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_continuously_ready_scope_yields_to_another_ready_step() {
-        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![]], usize::MAX);
-        let execution = Execution::new(&[None, None, None], &mut dispatcher);
-        let mut steps = Vec::new();
-        for _ in 0..4 {
-            assert!(execution.queue_one_step(|index| {
-                if index == 1 {
-                    return false;
-                }
-                steps.push(index);
-                true
-            }));
-        }
-        assert_eq!(steps, [0, 2, 0, 2]);
-    }
-
     /// A record range over a source field yields a prefix where that field's yield is every
     /// position at or below one, whatever its other fields hold.
     #[test]
@@ -3913,7 +3874,7 @@ mod tests {
         let mut runs = ScopeRuns::new();
         runs.install_transaction(&store, 0, run.writers.into_iter().next().unwrap());
         execution.attach_transaction(&store, 0, request, &mut dispatcher);
-        let steps = execution.local_steps(&dispatcher, 2);
+        let steps = execution.scope_steps(&dispatcher);
         let scope = execution.request_scope(request);
         let Scope::Writer { phase, .. } = scope else {
             unreachable!()
@@ -3965,7 +3926,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_writers_and_downstream_scopes_settle_separately() {
+    fn workers_rotate_connected_scopes_while_an_independent_scope_advances() {
         let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![], vec![0, 2], vec![]], 1);
         let mut execution = Execution::new(&[None, None, None, None, None], &mut dispatcher);
         let mut runs = ScopeRuns::new();
@@ -3976,26 +3937,59 @@ mod tests {
                 execution.attach_transaction(&store, writer, PipelineId(*root), &mut dispatcher);
             }
         }
-        let steps = execution.local_steps(&dispatcher, 4);
+        let steps = execution.scope_steps(&dispatcher);
         let guard = crate::interpreter::tile_operators::test_helpers::keys_between(0, 0);
-        // Scope 4 has its own store and reads no other scope.
-        execution.offer_request(PipelineId(4), &guard);
-        assert!(!steps.shared_work_pending(&dispatcher));
-        for id in 0..4 {
-            dispatcher.queue_for(PipelineId(id), &guard);
-            assert!(steps.shared_work_pending(&dispatcher));
-            let package = dispatcher
-                .claim_of(PipelineId(id))
-                .expect("the test request");
-            assert!(steps.shared_work_pending(&dispatcher));
-            dispatcher.acknowledge(package);
-            assert!(!steps.shared_work_pending(&dispatcher));
-        }
-        execution.offer_request(PipelineId(1), &guard);
+        let controls: Vec<_> = (0..5)
+            .map(|id| {
+                let scope = execution.request_scope(PipelineId(id));
+                let Scope::Writer { phase, store, .. } = scope else {
+                    unreachable!()
+                };
+                *phase.lock().unwrap() = WriterPhase::Attempt {
+                    request: None,
+                    guard: guard.clone(),
+                    queued_at: 0,
+                };
+                (store.clone(), scope.with_body(|body| body.attached().step))
+            })
+            .collect();
+        // The connected writer has claimed a driver package against the current snapshot.
+        let driver = execution
+            .request_scope(PipelineId(1))
+            .with_body(|body| body.global(body.driver));
+        dispatcher.queue_for(driver, &guard);
+        let package = dispatcher.claim_of(driver).expect("the writer's driver");
+        let running = controls[0].0.write();
+        assert!(steps.poll(&dispatcher));
+        assert_eq!(dispatcher.outstanding(controls[4].1), 1);
+        drop(running);
+        while steps.poll(&dispatcher) {}
         assert!(
-            steps.shared_work_pending(&dispatcher),
-            "yield even before a shared writer's offer is queued"
+            controls[..4]
+                .iter()
+                .all(|(_, step)| dispatcher.outstanding(*step) == 0),
+            "a connected decision would advance the driver's snapshot"
         );
+        dispatcher.acknowledge(package);
+        // Keep every writer eligible. Each connected writer gets a turn before any repeats.
+        let mut winners = Vec::new();
+        for _ in 0..4 {
+            while steps.poll(&dispatcher) {}
+            let eligible: Vec<_> = (0..4)
+                .filter(|&id| dispatcher.outstanding(controls[id].1) != 0)
+                .collect();
+            assert_eq!(eligible.len(), 1);
+            let id = eligible[0];
+            assert!(
+                !winners.contains(&id),
+                "a ready writer repeated before a peer ran"
+            );
+            winners.push(id);
+            let step = dispatcher
+                .claim_of(controls[id].1)
+                .expect("the admitted step");
+            dispatcher.acknowledge(step);
+        }
     }
 
     #[test]

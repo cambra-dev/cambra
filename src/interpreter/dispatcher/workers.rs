@@ -94,7 +94,7 @@ pub(super) struct WorkerPool {
     /// How many workers the run has; with one, the coordinator claims everything and no thread
     /// starts.
     count: usize,
-    local_steps: ScopeSteps,
+    scope_steps: ScopeSteps,
     /// Per pipeline, its breaker and whether its packages run beside each other, where the
     /// pipeline is admitted.
     pipelines: Vec<Option<WorkerPipeline>>,
@@ -122,7 +122,7 @@ impl WorkerPool {
         targets: Vec<Option<WorkerTarget>>,
         bodies: Vec<Option<HoldGroup>>,
         actions: Vec<Option<ScopePipeline>>,
-        local_steps: ScopeSteps,
+        scope_steps: ScopeSteps,
     ) -> Self {
         assert!(count > 0, "a run has at least one worker");
         debug_assert_eq!(
@@ -154,7 +154,7 @@ impl WorkerPool {
             } else {
                 1
             },
-            local_steps,
+            scope_steps,
             #[cfg(test)]
             stats: (0..pipelines.len()).map(|_| Stats::default()).collect(),
             #[cfg(test)]
@@ -327,7 +327,7 @@ impl WorkerPool {
     }
 
     pub(super) fn poll(&self, dispatcher: &Dispatcher) -> bool {
-        self.local_steps.poll(dispatcher)
+        self.scope_steps.poll(dispatcher)
     }
 
     /// Add the counters the worker threads counted to this thread's, once they have joined.
@@ -450,8 +450,7 @@ impl WorkerPool {
             dispatcher.land(pushes);
         }
         // Before the acknowledgement that can leave the body quiescent: the round's step waits
-        // for the coordinator to publish what this consume left held, as it does after a claim
-        // of its own (`Execution::consume`).
+        // for a claimant to publish what this consume left held.
         if let Some(body) = &spec.body {
             dispatcher.hold_followers(*body);
         }

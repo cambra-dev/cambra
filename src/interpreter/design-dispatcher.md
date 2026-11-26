@@ -229,7 +229,7 @@ The state an operator advanced before the unwind, a cache, a consuming breaker's
 store, or the region each queue consumed, stays as it was, so the graph can be planned again, but a
 run of it answers from that state: a graph whose run unwound after its first package is compiled
 again rather than run again. A run that finishes keeps the placements outside its scopes' bodies,
-as `run_targets` leaves them, and a scope's body is unplaced once it finishes (`Scope::resume`). A
+as `run_targets` leaves them, and a scope's body is unplaced once it finishes (`Scope::finish_step`). A
 paused run unplaces them ([Pause and reload](#pause-and-reload)).
 
 ## Waiting for input completion
@@ -451,13 +451,16 @@ step's dependencies. The request and step are ordered dispatcher pipelines. Any 
 worker can claim them directly. The loop schedule or writer phase serializes that scope's
 transitions. A handler releases its store before queuing the new body's work.
 
-For an independent scope, a claimant can publish the body's held output, release its follower
-hold and enqueue the next settled step. It tries the scope lock and store. If the body already has runnable or running work, the claimant
-returns to dispatch. Otherwise it tries each body breaker exclusively to publish its output. A busy
-breaker leaves the follower hold in place for a later pass.
-The planner checks reads, follows, shared stores and containment when identifying independent
-scopes. Scopes that share a store or depend on another scope use the coordinator's rotating
-settlement pass. When one of these has work pending, independent scopes yield to that pass.
+Any claimant can settle a body and queue its next step. It tries the schedule lock and store,
+then releases the store before trying the body breakers. A busy breaker leaves the follower hold
+in place. A nested loop publishes through its parent once its own request has completed.
+
+Scopes connected by reads, follows, containment or a shared store belong to one settlement group.
+A claimant publishes held output across the group and lets its runnable body packages drain.
+It then queues one eligible step, starting after the previous winner. This keeps a peer commit
+from advancing the snapshot while a writer is still processing its previous attempt. Each group has
+its own cursor. An unrelated group can publish, queue and run its next step while another group's
+handler is busy.
 A parked request resumes through its scope's intake when input or peer progress wakes it.
 
 The first request initializes the store after its drive has read the source. A position package
@@ -603,8 +606,7 @@ With more than one worker, two kinds of claimant share the dispatcher:
   The worker sleeps in `Dispatcher::wait` when no claim or scope can advance.
 - The coordinator claims any package and any finish (`WorkerPool::next`). A claim of an
   admitted pipeline runs as a worker's would (`WorkerPool::consume_on_coordinator`,
-  `WorkerPool::finish_on_coordinator`). It also runs the shared settlement pass
-  ([A loop in rounds](#a-loop-in-rounds)) and polls live sources.
+  `WorkerPool::finish_on_coordinator`). It also checks for loop seeds and closed inputs at quiescence and polls live sources.
 
 ### A worker's claim
 
@@ -646,10 +648,11 @@ Both drivers claim through one routine (`Execution::claim_until_quiescent`), whi
 pipeline has finished, the run has failed, or the run is quiescent. A coordinator claim that answers
 `Next::Wait` goes on in this order:
 
-1. It first gives independent scopes a chance to advance. While a worker can still publish, or an
+1. It first polls the scope groups for ready work. While a worker can still publish, or an
    admitted breaker can run, it sleeps in `Dispatcher::wait`. A worker registers activity before taking a package or finish and releases it after publication.
    A retained request or a draining scope may span several claims and idle intervals.
-2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
+2. Otherwise it checks for finished scope inputs and newly available loop seeds, and claims again
+   if either advanced.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
    the routine answers that the run is quiescent. A run with no live source panics. A live run
    pushes what its breakers hold and claims again where that changed anything; otherwise it has
@@ -672,7 +675,7 @@ No two threads wait on each other through these rules:
   while it is notified.
 - A scope handler takes its schedule lock before its store and releases the store before queuing
   body packages. A writer validates commits under the shared store lock. Publication of an
-  independent body takes the schedule lock with `try_lock` and releases the store before walking
+  active body takes the schedule lock with `try_lock` and releases the store before walking
   breaker handles. Any claimant can run a transaction seed's package or finish. It tries to
   reserve the store only when that work is ready. If the store is busy it tries other pipelines.
   After the seed publishes, scope settlement admits pending writers and closes their request

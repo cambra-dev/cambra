@@ -185,65 +185,6 @@ impl Scope {
         request
     }
 
-    /// Admit pending requests and publish what the body holds during shared settlement.
-    pub(super) fn resume(
-        &self,
-        dispatcher: &Dispatcher,
-        reach: &mut Reach<'_>,
-        child_active: impl Fn(PipelineId) -> bool,
-    ) -> bool {
-        let mut progressed = false;
-        if let Scope::Loop { store, .. } = self {
-            progressed |= induction(store).initialize_seed();
-        }
-        // A scope's requests reach the scope, which queues them once they can run.
-        if self.queue_requests(dispatcher) {
-            return true;
-        }
-        // A loop publishes the inner pipelines a round settles; a writer, every inner pipeline.
-        // The body's hold is read first: a worker's claim of the body after it holds the
-        // followers again, so the release below fails rather than pass output this pass missed.
-        let (pipelines, hold) = match self {
-            Scope::Loop { store, schedule } => {
-                let schedule = scope_state(schedule);
-                let store = induction(store);
-                (
-                    store.settlement_pipelines(&schedule, child_active),
-                    store.followers_hold(dispatcher),
-                )
-            }
-            Scope::Writer { store, writer, .. } => {
-                let transaction = transaction_scope::transaction(store);
-                let run = transaction.writer_run(*writer);
-                (run.body.pipelines(), run.body.followers_hold(dispatcher))
-            }
-        };
-        let before = dispatcher.changes();
-        push_held(dispatcher, reach, pipelines);
-        // A change here is these pushes, or a worker's publication during the pass, which counts
-        // as progress too: the coordinator claims again and reaches the same fixed point.
-        if dispatcher.changes() != before {
-            return true;
-        }
-        let released = hold.is_some_and(|hold| match self {
-            Scope::Loop { store, schedule } => {
-                let schedule = scope_state(schedule);
-                induction(store).release_followers(&schedule, dispatcher, hold)
-            }
-            Scope::Writer { phase, .. } => {
-                scope_state(phase).open()
-                    && self.with_body(|body| body.release_followers(dispatcher, hold))
-            }
-        });
-        progressed | released
-    }
-
-    /// Queue the requests offered to the scope where they can run: a loop's at once, a writer's
-    /// once its store is open. Whether it queued or closed anything.
-    fn queue_requests(&self, dispatcher: &Dispatcher) -> bool {
-        self.admit(dispatcher, &mut self.store().write(), false)
-    }
-
     /// An unrelated transition can be holding its store. Its intake remains available for
     /// the next pass. The coordinator rechecks finished reads at each settled boundary.
     pub(super) fn try_queue_requests(&self, dispatcher: &Dispatcher, close: bool) -> bool {
@@ -270,16 +211,6 @@ impl Scope {
                 }
                 store.queue_requests(dispatcher, *writer)
             }
-        }
-    }
-
-    /// Queue the step of the open round or attempt where its work has run
-    /// ([`Body::queue_step`]). Whether it queued it.
-    pub(super) fn queue_step(&self, dispatcher: &Dispatcher) -> bool {
-        let queue = |guard: &TileGuard| self.with_body(|body| body.queue_step(dispatcher, guard));
-        match self {
-            Scope::Loop { schedule, .. } => scope_state(schedule).step_guard().is_some_and(queue),
-            Scope::Writer { phase, .. } => scope_state(phase).step_guard().is_some_and(queue),
         }
     }
 }
@@ -343,23 +274,34 @@ impl ScopePipeline {
     }
 }
 
-/// Publication for a body with independent inputs. The member handles are fixed at attachment.
-/// The scope mutex serializes publication, step admission and the transition that consumes it.
+/// The publication targets are fixed when the plan attaches the body.
 struct LocalSteps {
     scope: Arc<Scope>,
+    request: PipelineId,
+    step: PipelineId,
     base: usize,
-    members: Vec<BreakerHandle>,
+    members: Vec<PublicationTarget>,
+}
+
+enum PublicationTarget {
+    Chain(BreakerHandle),
+    Child(Arc<Scope>),
 }
 
 #[derive(Default)]
 pub(super) struct ScopeSteps {
-    independent: Vec<LocalSteps>,
-    shared: Vec<(PipelineId, Offers)>,
+    groups: Vec<StepGroup>,
+}
+
+struct StepGroup {
+    scopes: Vec<LocalSteps>,
+    // shared-state-ok: one claimant chooses the next step among connected scopes at a time.
+    next: Mutex<usize>,
 }
 
 impl ScopeSteps {
-    /// An isolated scope may publish and re-arm locally. Nested bodies, writers sharing a
-    /// store and scopes connected by reads or follows settle in the fair shared pass.
+    /// Only scopes connected by reads, follows, containment or a shared store need to
+    /// arbitrate their steps. A shared input alone does not connect its readers.
     pub(super) fn plan(dispatcher: &Dispatcher, scopes: impl Iterator<Item = Arc<Scope>>) -> Self {
         let scopes: Vec<_> = scopes
             .map(|scope| (scope.with_body(|body| body.attached().pipeline.0), scope))
@@ -380,9 +322,9 @@ impl ScopeSteps {
             }
         }
         let mut stores = HashMap::new();
-        let mut request = vec![false; upstream.len()];
+        let mut by_id = vec![None; upstream.len()];
         for (id, scope) in &scopes {
-            request[*id] = true;
+            by_id[*id] = Some(scope);
             scope.with_body(|body| {
                 for p in body.pipelines().into_iter().chain([body.attached().step]) {
                     upstream[*id].push(p.0);
@@ -394,7 +336,7 @@ impl ScopeSteps {
                 upstream[other].push(*id);
             }
         }
-        let mut coupled = vec![false; upstream.len()];
+        let mut peers = vec![Vec::new(); upstream.len()];
         let mut seen = vec![usize::MAX; upstream.len()];
         for &(id, _) in &scopes {
             let mut stack = vec![id];
@@ -403,122 +345,208 @@ impl ScopeSteps {
                     continue;
                 }
                 seen[p] = id;
-                if p != id && request[p] {
-                    coupled[id] = true;
-                    coupled[p] = true;
+                if p != id && by_id[p].is_some() {
+                    peers[id].push(p);
+                    peers[p].push(id);
                 } else {
                     stack.extend(&upstream[p]);
                 }
             }
         }
+
         let mut steps = Self::default();
-        for (id, scope) in scopes {
-            if coupled[id] {
-                steps
-                    .shared
-                    .push((PipelineId(id), scope.with_body(|body| body.offers.clone())));
-            } else {
-                let (base, members) = scope.with_body(|body| {
-                    let handles = body
-                        .members
-                        .iter()
-                        .map(|member| match member {
-                            Member::Chain(handle) => handle.clone(),
-                            Member::Scope(_) => {
-                                unreachable!("a nested scope uses shared settlement")
-                            }
-                        })
-                        .collect();
-                    (body.global(PipelineId(0)).0, handles)
-                });
-                steps.independent.push(LocalSteps {
-                    scope,
-                    base,
-                    members,
-                });
+        let mut grouped = vec![false; upstream.len()];
+        for &(first, _) in &scopes {
+            if grouped[first] {
+                continue;
             }
+            let mut connected = Vec::new();
+            let mut stack = vec![first];
+            while let Some(id) = stack.pop() {
+                if std::mem::replace(&mut grouped[id], true) {
+                    continue;
+                }
+                let scope = by_id[id].expect("a scope group member");
+                connected.push(scope.with_body(|body| {
+                    LocalSteps {
+                        scope: scope.clone(),
+                        request: body.attached().pipeline,
+                        step: body.attached().step,
+                        base: body.global(PipelineId(0)).0,
+                        members: body
+                            .members
+                            .iter()
+                            .enumerate()
+                            .map(|(local, member)| match member {
+                                Member::Chain(handle) => PublicationTarget::Chain(handle.clone()),
+                                Member::Scope(_) => PublicationTarget::Child(
+                                    by_id[body.global(PipelineId(local)).0]
+                                        .expect("a nested scope")
+                                        .clone(),
+                                ),
+                            })
+                            .collect(),
+                    }
+                }));
+                stack.extend(&peers[id]);
+            }
+            steps.groups.push(StepGroup {
+                scopes: connected,
+                next: Mutex::default(),
+            });
         }
         steps
     }
 
-    /// A local retry must yield while a connected scope needs the fair settlement pass.
-    pub(super) fn shared_work_pending(&self, dispatcher: &Dispatcher) -> bool {
-        self.shared.iter().any(|(id, offers)| {
-            dispatcher.outstanding(*id) != 0
-                || dispatcher.states[id.0].phase.load() == Phase::Finishing
-                || dispatcher.ready_to_finish(id.0)
-                || scope_state(offers).has_work()
-        })
-    }
-
     pub(super) fn poll(&self, dispatcher: &Dispatcher) -> bool {
-        if self.independent.is_empty() || self.shared_work_pending(dispatcher) {
-            return false;
-        }
         let mut advanced = false;
-        for scope in &self.independent {
-            advanced |= scope.poll(dispatcher);
+        for group in &self.groups {
+            advanced |= group.poll(dispatcher);
         }
         advanced
     }
 }
 
-impl LocalSteps {
+impl StepGroup {
     fn poll(&self, dispatcher: &Dispatcher) -> bool {
+        if let [scope] = &self.scopes[..] {
+            return scope.poll(dispatcher, true);
+        }
+        let Ok(mut next) = self.next.try_lock() else {
+            return false;
+        };
+        // Publish every body's held output before choosing a step. A queued or running
+        // decision gets to land its input to peer scopes before the next decision.
+        let mut published = false;
+        for scope in &self.scopes {
+            published |= scope.poll(dispatcher, false);
+        }
+        if published
+            || self
+                .scopes
+                .iter()
+                .any(|scope| !scope.ready_for_decision(dispatcher))
+        {
+            return published;
+        }
+        for index in (*next..self.scopes.len()).chain(0..*next) {
+            if self.scopes[index].try_queue_step(dispatcher) {
+                *next = (index + 1) % self.scopes.len();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl LocalSteps {
+    fn with_schedule(&self, f: impl FnOnce(bool, Option<&TileGuard>) -> bool) -> bool {
         match self.scope.as_ref() {
-            Scope::Loop {
-                schedule: state, ..
-            } => state
+            Scope::Loop { schedule, .. } => schedule
                 .try_lock()
                 .ok()
-                .is_some_and(|state| self.settle(dispatcher, state.step_guard())),
+                .is_some_and(|state| f(state.publishing(), state.step_guard())),
             Scope::Writer { phase, .. } => phase
                 .try_lock()
                 .ok()
-                .is_some_and(|phase| self.settle(dispatcher, phase.step_guard())),
+                .is_some_and(|state| f(state.open(), state.step_guard())),
         }
     }
 
-    fn settle(&self, dispatcher: &Dispatcher, guard: Option<&TileGuard>) -> bool {
+    // A peer commit may move the snapshot used by every writer in the store. Let their
+    // drivers and proposal pipelines consume the previous snapshot before advancing it.
+    fn ready_for_decision(&self, dispatcher: &Dispatcher) -> bool {
+        self.with_schedule(|_, _| {
+            if dispatcher.ready_to_finish(self.request.0)
+                || dispatcher.may_start_ordered_package(self.request)
+                || dispatcher.outstanding(self.step) != 0
+            {
+                return false;
+            }
+            self.members.iter().enumerate().all(|(i, member)| {
+                let p = self.base + i;
+                matches!(member, PublicationTarget::Child(_))
+                    || (!dispatcher.may_claim_from(p)
+                        && !dispatcher.ready_to_finish(p)
+                        && dispatcher.states[p].phase.load() != Phase::Finishing)
+            })
+        })
+    }
+
+    fn try_queue_step(&self, dispatcher: &Dispatcher) -> bool {
+        self.with_schedule(|_, guard| guard.is_some_and(|guard| self.queue_step(dispatcher, guard)))
+    }
+
+    fn queue_step(&self, dispatcher: &Dispatcher, guard: &TileGuard) -> bool {
+        self.scope
+            .store()
+            .try_write()
+            .is_ok_and(|mut store| self.scope.body_in(&mut store).queue_step(dispatcher, guard))
+    }
+
+    fn poll(&self, dispatcher: &Dispatcher, queue: bool) -> bool {
+        self.with_schedule(|publishing, guard| {
+            self.settle(dispatcher, publishing, guard.filter(|_| queue))
+        })
+    }
+
+    fn settle(&self, dispatcher: &Dispatcher, publishing: bool, guard: Option<&TileGuard>) -> bool {
         let Ok(mut store) = self.scope.store().try_write() else {
             return false;
         };
         let admitted = self.scope.admit(dispatcher, &mut store, false);
-        let Some(guard) = guard else { return admitted };
         let body = self.scope.body_in(&mut store);
-        let step = body.attached().step;
-        let hold = body.attached().hold;
-        if dispatcher.outstanding(step) != 0 {
+        if !publishing || !body.is_active() || dispatcher.outstanding(self.step) != 0 {
             return admitted;
         }
+        let hold = body.attached().hold;
         let held = dispatcher.followers_hold(hold);
         if held.0 & 1 == 0 {
-            return body.queue_step(dispatcher, guard) || admitted;
+            return admitted || guard.is_some_and(|g| body.queue_step(dispatcher, g));
         }
         drop(store);
-        let members = self.base..self.base + self.members.len();
-        // Give already runnable body work its turn before inspecting breaker output.
-        // A claim can still start after this scan, so each breaker is also tried below.
-        if members.clone().any(|p| dispatcher.may_claim_from(p)) {
+        // A nested request can span multiple publication passes. Its own schedule
+        // decides when its output can be published to the enclosing body.
+        if self.members.iter().enumerate().any(|(i, member)| {
+            matches!(member, PublicationTarget::Chain(_))
+                && dispatcher.may_claim_from(self.base + i)
+        }) {
             return admitted;
         }
+        let members = self.base..self.base + self.members.len();
         match try_push_held(dispatcher, members.map(PipelineId), |id, call| {
-            let handle = &self.members[id.0 - self.base];
-            let mut breaker = match handle.try_write() {
-                Ok(breaker) => breaker,
-                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return false,
-            };
-            call(&mut *breaker, InputId::ONLY);
+            match &self.members[id.0 - self.base] {
+                PublicationTarget::Chain(handle) => {
+                    let Ok(mut breaker) = handle.try_write() else {
+                        return false;
+                    };
+                    call(&mut *breaker, InputId::ONLY);
+                }
+                PublicationTarget::Child(child) => {
+                    let Scope::Loop { schedule, store } = child.as_ref() else {
+                        unreachable!("a nested loop")
+                    };
+                    let Ok(state) = schedule.try_lock() else {
+                        return false;
+                    };
+                    if !state.has_request() {
+                        let Ok(mut store) = store.try_write() else {
+                            return false;
+                        };
+                        call(
+                            store.as_induction_store_mut().expect("a nested loop"),
+                            InputId::ONLY,
+                        );
+                    }
+                }
+            }
             true
         }) {
             Publication::Busy => admitted,
             Publication::Published => true,
             Publication::Settled => {
                 let released = dispatcher.release_followers_if(hold, held);
-                let queued = self.scope.store().try_write().is_ok_and(|mut store| {
-                    self.scope.body_in(&mut store).queue_step(dispatcher, guard)
-                });
+                let queued = guard.is_some_and(|g| self.queue_step(dispatcher, g));
                 queued || released || admitted
             }
         }
