@@ -1261,8 +1261,8 @@ column, `RecordField(f)` projecting a field, and `Scalar(program)` evaluating a 
 
 #### Scalar programs
 
-`ScalarProgram` in `scalar_expr.rs` is a straight-line instruction sequence. Instruction 𝑖 defines
-slot 𝑖, and operands refer only to earlier slots. The last instruction produces the result.
+`ScalarProgram` in `scalar_expr/mod.rs` is a straight-line instruction sequence. Instruction 𝑖
+defines slot 𝑖, and operands refer only to earlier slots. The last instruction produces the result.
 
 | Instruction | Value |
 |---|---|
@@ -1321,11 +1321,11 @@ output.
 
 #### Conditional programs
 
-A fused conditional is a `Case` instruction applying a `CaseFn` (`interpreter/case_fn.rs`) to its
-captures, the values its arms read. A `CaseFn`'s arms are tried in order. Each arm takes, among the
-rows no earlier arm took, the rows its gate selects, and its body, a `ScalarProgram`, computes their
-values. A conditional inside an arm is a `Case` instruction of that arm's body, so conditionals nest
-by recursion.
+A fused conditional is a `Case` instruction applying a `CaseFn` (`interpreter/scalar_expr/case.rs`)
+to its captures, the values its arms read. A `CaseFn`'s arms are tried in order. Each arm takes,
+among the rows no earlier arm took, the rows its gate selects, and its body, a `ScalarProgram`,
+computes their values. A conditional inside an arm is a `Case` instruction of that arm's body, so
+conditionals nest by recursion.
 
 | Gate | Rows |
 |---|---|
