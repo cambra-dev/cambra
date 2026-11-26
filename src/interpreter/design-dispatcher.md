@@ -102,8 +102,8 @@ start, each field that no push, arrival or range names (`unnamed_fields`): such 
 its own chain computes, as a constant does, and nothing else reads it.
 
 A route that preserves source positions can admit them as they arrive. A route that widens them
-names every row of the input ([A widened push](#a-widened-push)). A loop or transaction whose source is
-supplied through another pipeline also waits for that pipeline to decide each admitted region.
+names every row of the input ([A widened push](#a-widened-push)). A loop or transaction whose source
+is supplied through another pipeline also waits for that pipeline to decide each admitted region.
 Compound source regions are retained as regions; they are not converted into an invented ordering of
 rows.
 
@@ -232,30 +232,30 @@ as `run_targets` leaves them, and a scope's body is unplaced once it finishes
 
 A scope holds the positions a round or attempt could not decide as waiting for inputs
 (`Offered::retry`). A loop's round decides nothing at a position whose body read an input that is
-not final yet, as a sum over a live source. A writer's attempt is held the same way once it has tried the
-current store epoch without progress. The
-request then ends with those positions unreleased, so a drained boundary holds no claim of it.
-A flat loop's request that ends before its drive's source delivers the positions it covers leaves
-its undecided positions waiting until the store is terminal
-(`InductionStoreProducer::keep_undecided`). The drive reads its source by pull, so the entry in
-front of the source queues nothing, and the push that delivers a position wakes the scope instead.
+not final yet, as a sum over a live source. A writer's attempt is held the same way once it has
+tried the current store epoch without progress. The request then ends with those positions
+unreleased, so a drained boundary holds no claim of it. A flat loop's request that ends before its
+drive's source delivers the positions it covers leaves its undecided positions waiting until the
+store is terminal (`InductionStoreProducer::keep_undecided`). The drive reads its source by pull, so
+the entry in front of the source queues nothing, and the push that delivers a position wakes the
+scope instead.
 
 A scope's body entries are placed, and marked the scope's, when the scope is attached for a run
 (`Execution::attach_body`), so a push that arrives before the scope's first request, as a live
 source's first poll of the run does, reaches them.
 
 A push that reaches one of the scope's entries and that no pipeline there takes wakes the scope
-(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake
-moves its one retry guard from parked to ready. Fresh input is recorded separately. An ordinary
-request already in the ordered queue takes the retry at its start. Otherwise, admission queues
-the ready guard together with any fresh input and marks it queued. Further wakes remember input
-growth without queuing a second retry. A placed entry also records which body input grew
-(`Offered::grown`). The next request takes the retry guard once (`Body::take_waited`). Its first
-round or attempt queues what grew on each affected pipeline. A closing round queues what grew too: it runs its rows' readers, a nested
-loop's among them, and a nested loop is offered only the positions its readers have read. A loop
-first steps its store over the waiting positions, so its drive emits past the ones now decided, and
-runs again the round it left undecided. A push can wake the scope while no position waits
-(`Offered::woken`). Positions that begin to wait after such a push are offered once
+(`Entry::wake`): an unplaced entry, or a placed one whose ingress refuses the sender. The wake moves
+its one retry guard from parked to ready. Fresh input is recorded separately. An ordinary request
+already in the ordered queue takes the retry at its start. Otherwise, admission queues the ready
+guard together with any fresh input and marks it queued. Further wakes remember input growth without
+queuing a second retry. A placed entry also records which body input grew (`Offered::grown`). The
+next request takes the retry guard once (`Body::take_waited`). Its first round or attempt queues
+what grew on each affected pipeline. A closing round queues what grew too: it runs its rows'
+readers, a nested loop's among them, and a nested loop is offered only the positions its readers
+have read. A loop first steps its store over the waiting positions, so its drive emits past the ones
+now decided, and runs again the round it left undecided. A push can wake the scope while no position
+waits (`Offered::woken`). Positions that begin to wait after such a push are offered once
 (`Body::set_waiting`), since the push may have grown an input after the request that left them
 undecided read it. The scope's pipeline stays open while positions wait (`Body::queue_offered`).
 
@@ -263,8 +263,10 @@ A nested loop holds each row the round around it gives it until its drive's sour
 (`ParentRows::ready`). The round around a nested loop steps once the loop has no request queued or
 open, no delivered row held and no ready retry (`Body::children_have_work`). A held row the source
 has not delivered does not hold back the round around it, which steps and leaves its own position
-waiting. A woken nested loop can retry an earlier row before the loop around it gives it another:
-the loop around it settles its body between requests too ([A loop in rounds](#a-loop-in-rounds)).
+waiting. A woken nested loop can retry an earlier row before the loop around it gives it another.
+Its intake queues the ready retry alone or with the delivered rows, and never closes its pipeline
+(`Body::queue_offered`). The loop around it settles its body between requests too
+([A loop in rounds](#a-loop-in-rounds)).
 
 Waiting positions are scope state, which a pause or reload does not keep.
 
@@ -288,8 +290,8 @@ are, can deliver the same rows, so each morsel is queued less what the poll queu
 ## Completeness in pushes
 
 Publication communicates two facts: which output regions can supply work, and which regions are
-complete. A complete key has an immutable value or is known absent. A breaker may have completed more
-than it still holds because readers have released some of its output.
+complete. A complete key has an immutable value or is known absent. A breaker may have completed
+more than it still holds because readers have released some of its output.
 
 | Input relationship | Work region | Complete region |
 | --- | --- | --- |
@@ -484,10 +486,10 @@ A parked request resumes through its scope's intake when input or peer progress 
 
 The first request initializes the store after its drive has read the source. A flat store can
 publish its seed before then, once the pipelines its loop reads have consumed what they were queued
-(`InductionStoreProducer::initialize_seed_if`). A position package
-emits only the next covered position. A nested row also has a closing round, including when it has
-no positions. A flat delivery that only establishes absence or source completion can require a
-closing round without emitting a position.
+(`InductionStoreProducer::initialize_seed_if`). A position package emits only the next covered
+position. A nested row also has a closing round, including when it has no positions. A flat
+delivery that only establishes absence or source completion can require a closing round without
+emitting a position.
 
 A scope queues an offered request only once every pipeline its pipeline reads is quiescent
 (`Body::queue_offered`). The push that offers positions also queues packages on the pipelines the
