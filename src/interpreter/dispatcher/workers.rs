@@ -641,22 +641,28 @@ mod tests {
         Sink,
         MapAggregate,
         FlatMemo,
+        NestedMemo,
+        NestedMemoReleasing,
     }
 
     #[rstest_log::rstest]
     #[case::sink(TestBreaker::Sink)]
     #[case::map_aggregate(TestBreaker::MapAggregate)]
     #[case::flat_memo(TestBreaker::FlatMemo)]
-    fn acknowledges_while_a_peer_is_still_pulling(#[case] target: TestBreaker) {
+    #[case::nested_memo(TestBreaker::NestedMemo)]
+    #[case::nested_memo_releasing(TestBreaker::NestedMemoReleasing)]
+    fn acknowledges_while_a_peer_is_still_consuming(#[case] target: TestBreaker) {
         use super::*;
         use crate::ccl::AggregateKind;
         use crate::interpreter::{
             DataSink, Tile,
             tile_operators::{
                 MemoProducer, ProducerBase, SinkBreaker, TileProducer,
-                growing::{Input, KEYS, NestedInput, ints, source},
-                map_aggregate_over,
-                test_helpers::{int_entries, keys_between},
+                growing::{Input, KEYS, NestedInput, source},
+                guard_covers, map_aggregate_over,
+                test_helpers::{
+                    ProjectionSpy, int_entries, keys_between, paths_guard, two_levels_of_ints,
+                },
             },
             types::BaseType,
         };
@@ -665,8 +671,22 @@ mod tests {
 
         struct PausedInput {
             inner: Box<dyn TileProducer>,
+            paused: TileGuard,
+            pause_on_release: bool,
             entered: mpsc::Sender<()>,
             resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl PausedInput {
+            fn pause(&self, guard: &TileGuard, releasing: bool) {
+                if releasing == self.pause_on_release && *guard == self.paused {
+                    self.entered.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                }
+            }
         }
         impl TileProducer for PausedInput {
             fn base(&self) -> &ProducerBase {
@@ -675,18 +695,15 @@ mod tests {
             fn base_mut(&mut self) -> &mut ProducerBase {
                 self.inner.base_mut()
             }
+            fn restates(&self) -> crate::interpreter::Restates {
+                self.inner.restates()
+            }
             fn get_impl(&self, guard: TileGuard) -> Tile {
-                if guard == keys_between(0, 0) {
-                    self.entered.send(()).unwrap();
-                    self.resume
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(15))
-                        .unwrap();
-                }
+                self.pause(&guard, false);
                 self.inner.get_impl(guard)
             }
             fn release_impl(&self, guard: TileGuard) {
+                self.pause(&guard, true);
                 self.inner.release_impl(guard);
             }
         }
@@ -697,13 +714,36 @@ mod tests {
             }
         }
 
+        // Both nested claims contribute to row 0 of a two-row collection. Finishing
+        // the merge closes only row 0, leaving row 1 open.
+        let releasing = matches!(target, TestBreaker::NestedMemoReleasing);
+        let nested = matches!(target, TestBreaker::NestedMemo) || releasing;
+        let point = |key| Predicate::point(Value::UInt(key));
+        let claim = |key| {
+            if nested {
+                let inner = if key == 0 {
+                    point(0).union(&point(1))
+                } else {
+                    point(2)
+                };
+                paths_guard(Predicate::qualified(point(0), inner))
+            } else {
+                keys_between(key, key)
+            }
+        };
         let (entered, pulling) = mpsc::channel();
         let (release, resume) = mpsc::channel();
         let input = Box::new(PausedInput {
             inner: match target {
                 TestBreaker::FlatMemo => Box::new(Input::over(&source(0..2))),
+                TestBreaker::NestedMemo | TestBreaker::NestedMemoReleasing => {
+                    let (tile, tiling) = two_levels_of_ints();
+                    Box::new(ProjectionSpy::new(tile, tiling).0)
+                }
                 _ => Box::new(NestedInput::over(&source(0..2))),
             },
+            paused: claim(0),
+            pause_on_release: releasing,
             entered,
             resume: Mutex::new(resume),
         });
@@ -711,9 +751,10 @@ mod tests {
         let reader = PipelineId(1);
         let mut memo = None;
         let handle = match target {
-            TestBreaker::FlatMemo => {
-                let mut producer = MemoProducer::over(input, &ints());
-                producer.base_mut().downstream = Some(Arc::new(Entry::new(reader, ints())));
+            TestBreaker::FlatMemo | TestBreaker::NestedMemo | TestBreaker::NestedMemoReleasing => {
+                let tiling = input.tiling().clone();
+                let mut producer = MemoProducer::over(input, &tiling);
+                producer.base_mut().downstream = Some(Arc::new(Entry::new(reader, tiling)));
                 let chain: BreakerHandle = Arc::new(RwLock::new(producer));
                 memo = Some(chain.clone());
                 WorkerBreaker::Chain(chain)
@@ -762,7 +803,7 @@ mod tests {
         );
         let pipeline = PipelineId(0);
         for key in 0..2 {
-            dispatcher.queue_for(pipeline, &keys_between(key, key));
+            dispatcher.queue_for(pipeline, &claim(key));
         }
         dispatcher.close(pipeline);
         let consume = || {
@@ -776,9 +817,31 @@ mod tests {
                 panic!("the reader must receive key {key}");
             };
             assert_eq!(package.pipeline, reader);
-            assert_eq!(package.guard, keys_between(key, key));
-            let tile = in_a_run(|| memo.read().unwrap().get(package.guard.clone()));
-            assert_eq!(int_entries(&tile), vec![(key, key as i64 * 10)]);
+            let memo = memo.read().unwrap();
+            let tile = in_a_run(|| memo.get(package.guard.clone()));
+            if nested {
+                let row = keys_between(0, 0);
+                let closing_claim = if releasing { 1 } else { 0 };
+                let expected = if key == closing_claim {
+                    guard_minus(&row, &claim(1 - key))
+                } else {
+                    claim(key)
+                };
+                assert!(
+                    guard_covers(&expected, &package.guard)
+                        && guard_covers(&package.guard, &expected)
+                );
+                assert_eq!(guard_covers(&memo.complete(), &row), key == 0 || releasing);
+                assert!(!guard_covers(&memo.complete(), &keys_between(1, 1)));
+                let values = if key == 0 { vec![0, 1] } else { vec![2] };
+                assert_eq!(
+                    tile.deepest_values(),
+                    &Tile::Scalar(crate::interpreter::ColumnValue::Ints(values))
+                );
+            } else {
+                assert_eq!(package.guard, claim(key));
+                assert_eq!(int_entries(&tile), vec![(key, key as i64 * 10)]);
+            }
             dispatcher.acknowledge(package);
         };
         let timeout = Duration::from_secs(5);
@@ -799,7 +862,7 @@ mod tests {
             let outstanding = dispatcher.outstanding(pipeline);
             let waiting = matches!(dispatcher.try_claim(None), Next::Wait(_));
             release.send(()).unwrap();
-            completed.expect("the second package can acknowledge before the first pull returns");
+            completed.expect("the second package can acknowledge while its peer is paused");
             assert_eq!(outstanding, 1);
             assert!(waiting, "finish still waits for the first package");
         });
@@ -811,6 +874,16 @@ mod tests {
             panic!("both packages acknowledged");
         };
         workers.finish(&dispatcher, pipeline, &mut |_, _| unreachable!());
+        if nested {
+            while let Next::Package(package) = dispatcher.try_claim(Some(reader)) {
+                assert!(
+                    package.guard.intersect(&keys_between(0, 0)).is_empty(),
+                    "finish must not publish any of row 0 again: {:?}",
+                    package.guard
+                );
+                dispatcher.acknowledge(package);
+            }
+        }
         if matches!(target, TestBreaker::MapAggregate) {
             assert!(
                 dispatcher.outstanding(reader) > 0,

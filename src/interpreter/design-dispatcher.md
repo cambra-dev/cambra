@@ -617,9 +617,12 @@ A worker consumes, publishes and acknowledges its own claim, in that order:
    flat keyed memo can publish the part of the input answer it has just cached. It excludes
    released keys and uses the answer's own keys to cut an oversized package. The dispatcher
    records the new region against earlier pushes, including those recorded by another worker.
+   A nested memo publishes completed inner keys with their enclosing paths. When the merge
+   completes a row, its push includes the row's end. Each peer still publishes its own
+   payload after releasing its input, even if the closing worker has seen it in the cache.
 2. When publication needs a snapshot, the worker takes the breaker handle exclusively to run
-   `Pushes::push_final`. This includes nested memo output and a merge that closes a wider domain
-   than its answer. An ordered pipeline holds the handle exclusively through consume and
+   `Pushes::push_final`. This includes widened answers and partial fields outside the keyed path
+   handled by the memo. An ordered pipeline holds the handle exclusively through consume and
    publication. A sink or a breaker that defers publication only consumes here.
 3. After the input release and with no breaker handle held, the worker lands the pushes and
    acknowledges the package.
