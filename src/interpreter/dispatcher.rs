@@ -219,6 +219,28 @@ impl Queue {
     }
 }
 
+impl<T: Clone> QueueState<T> {
+    fn claim<R>(
+        &mut self,
+        ordered: bool,
+        overlaps: impl Fn(&T, &T) -> bool,
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<(usize, T, R)> {
+        let (_, head) = self.ready.front()?;
+        if self
+            .in_flight
+            .values()
+            .any(|running| ordered || overlaps(head, running))
+        {
+            return None;
+        }
+        let reservation = reserve()?;
+        let (index, item) = self.ready.pop_front()?;
+        self.in_flight.insert(index, item.clone());
+        Some((index, item, reservation))
+    }
+}
+
 impl<T: Clone + PartialEq> Queue<T> {
     /// Reserve activity and move the head into flight under one lock. Ordered queues run one
     /// claim at a time. Other queues can run disjoint input regions concurrently.
@@ -229,18 +251,7 @@ impl<T: Clone + PartialEq> Queue<T> {
         reserve: impl FnOnce() -> Option<R>,
     ) -> Option<(usize, T, R)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let (_, head) = state.ready.front()?;
-        if state
-            .in_flight
-            .values()
-            .any(|running| ordered || overlaps(head, running))
-        {
-            return None;
-        }
-        let reservation = reserve()?;
-        let (index, item) = state.ready.pop_front()?;
-        state.in_flight.insert(index, item.clone());
-        Some((index, item, reservation))
+        state.claim(ordered, overlaps, reserve)
     }
 
     fn acknowledge(
@@ -1241,14 +1252,35 @@ impl Dispatcher {
     /// Keep one pending visit even if the previous visit is in flight. Testing and appending
     /// under the queue lock coalesces concurrent wakes on either side of a claim.
     fn offer_visit(&self, group: usize) {
+        self.offer_or_claim_visit(group, false);
+    }
+
+    /// A body claimant already counts as active. It can offer and take its group's ordered
+    /// visit under one lock. When another worker owns it, leave one successor for its ack.
+    fn offer_or_claim_visit(&self, group: usize, claim: bool) -> Option<ScopeVisit> {
         let queue = &self.visits[group];
         let mut state = queue.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.ready.is_empty() {
+        let offered = state.ready.is_empty();
+        if offered {
             let index = queue.reserve(1).expect("control queues live for the run");
             state.ready.push_back((index, ()));
-            drop(state);
+        }
+        if claim
+            && self.claims_open()
+            && let Some((index, (), ())) = state.claim(true, |_, _| true, || Some(()))
+        {
+            return Some(ScopeVisit { group, index });
+        }
+        let wake = offered && state.in_flight.is_empty();
+        drop(state);
+        if wake {
             self.advance();
         }
+        None
+    }
+
+    fn claims_open(&self) -> bool {
+        !self.has_failed() && !self.stopped.load(Ordering::SeqCst)
     }
 
     fn start_visits(&self) {

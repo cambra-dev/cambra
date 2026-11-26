@@ -1423,7 +1423,7 @@ impl Execution {
                     } else {
                         self.consume(dispatcher, &mut claim_reach, package);
                     }
-                    workers.wake_scopes(dispatcher, pipeline);
+                    workers.completed_pipeline(dispatcher, pipeline, 0);
                 }
                 Next::Finish { pipeline } => {
                     if workers.admits(pipeline) {
@@ -1432,7 +1432,7 @@ impl Execution {
                         workers.finishing(pipeline, &mut claim_reach);
                         self.finish(dispatcher, &mut claim_reach, pipeline);
                     }
-                    workers.wake_scopes(dispatcher, pipeline);
+                    workers.completed_pipeline(dispatcher, pipeline, 0);
                 }
                 Next::Wait(generation) if workers.may_progress(dispatcher) => {
                     dispatcher.wait(generation)

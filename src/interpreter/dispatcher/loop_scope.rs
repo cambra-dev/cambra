@@ -1916,6 +1916,65 @@ mod tests {
         assert_eq!(compiled.dispatcher.outstanding(step), 1);
     }
 
+    #[rstest_log::rstest]
+    #[case::available(false)]
+    #[case::claimed_by_peer(true)]
+    fn the_last_body_claim_takes_the_step_or_leaves_one_visit_for_its_owner(#[case] peer: bool) {
+        let mut compiled = Compiled::of(SUM);
+        let workers = compiled
+            .execution
+            .worker_pool(&mut compiled.dispatcher, 2, |_| None);
+        let dispatcher = &compiled.dispatcher;
+        let step = induction(&compiled.scope).body_mut().attached().step;
+        let request = PipelineId(0);
+        dispatcher.notify(request, &keys_between(0, 0));
+        assert_eq!(compiled.tick(), Some(request));
+
+        // Hold a real visit across all body completions in the peer case. Keep the
+        // ordinary dispatch loop stopped so only the finishing worker can run the step.
+        let owner = peer.then(|| {
+            workers.wake_scopes(dispatcher, request);
+            dispatcher.claim_visit(|| ()).unwrap().0
+        });
+        let mut bodies = 0;
+        while let Some(package) = dispatcher.pop() {
+            let pipeline = package.pipeline;
+            assert_ne!(
+                pipeline, step,
+                "a ready step should have been claimed inline"
+            );
+            assert!(dispatcher.infos[pipeline.0].hold.is_some());
+            workers.consume_on_coordinator(dispatcher, package, &mut |_, _| unreachable!());
+            workers.completed_pipeline(dispatcher, pipeline, 0);
+            bodies += 1;
+        }
+        assert!(bodies > 0);
+        if let Some(owner) = owner {
+            assert_eq!(
+                dispatcher.states[step.0]
+                    .acknowledged
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert!(dispatcher.claim_visit(|| ()).is_none());
+            dispatcher.acknowledge_visit(owner);
+            let (retry, ()) = dispatcher.claim_visit(|| ()).expect("one successor");
+            workers.settle_visit(dispatcher, retry);
+            assert_eq!(compiled.tick(), Some(step));
+        }
+        assert_eq!(
+            dispatcher.states[step.0]
+                .acknowledged
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(dispatcher.outstanding(step), 0);
+        assert_eq!(
+            store_frontier(&compiled.snapshot()),
+            Some(Position::new(Value::UInt(0)))
+        );
+    }
+
     /// A guarded loop's `Memo`s are inner pipelines, which each round queues the position for and
     /// runs before the store steps.
     #[test]

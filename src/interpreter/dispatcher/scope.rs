@@ -255,6 +255,20 @@ struct StepGroup {
     next: AtomicUsize,
 }
 
+#[derive(Default)]
+enum Progress {
+    #[default]
+    Idle,
+    Advanced,
+    QueuedStep(PipelineId),
+}
+
+impl Progress {
+    fn changed(changed: bool) -> Self {
+        if changed { Self::Advanced } else { Self::Idle }
+    }
+}
+
 impl ScopeSteps {
     /// Only scopes connected by reads, follows, containment or a shared store need to
     /// arbitrate their steps. A shared input alone does not connect its readers.
@@ -372,35 +386,43 @@ impl ScopeSteps {
         dispatcher.visits = self.groups.iter().map(|_| Queue::new()).collect();
     }
 
-    pub(super) fn wake(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
-        if let Some(groups) = self.affected.get(pipeline.0) {
-            for &group in groups {
-                dispatcher.offer_visit(group);
-            }
-        }
+    pub(super) fn affected(&self, pipeline: PipelineId) -> &[usize] {
+        self.affected.get(pipeline.0).map_or(&[], Vec::as_slice)
     }
 
-    /// A visit that advanced the group asks for one successor before acknowledgement. A
-    /// contended handle may be held by an unrelated reader, so also report it to the drain.
-    pub(super) fn settle(&self, dispatcher: &Dispatcher, group: usize) -> bool {
+    /// A body claimant may take the step selected by this visit. Its completion wakes the
+    /// group. In every other case, progress reoffers the visit before acknowledgement.
+    pub(super) fn settle(
+        &self,
+        dispatcher: &Dispatcher,
+        group: usize,
+        take_step: bool,
+    ) -> (bool, Option<WorkPackage>) {
         let blocked = Cell::new(false);
-        if self.groups[group].poll(dispatcher, &blocked) {
+        let progress = self.groups[group].poll(dispatcher, &blocked);
+        let package = match progress {
+            Progress::QueuedStep(step) if take_step => dispatcher
+                .claim_from(step.0, || dispatcher.claims_open().then_some(()))
+                .map(|(package, ())| package),
+            _ => None,
+        };
+        if package.is_none() && !matches!(progress, Progress::Idle) {
             dispatcher.offer_visit(group);
         }
-        blocked.get()
+        (blocked.get(), package)
     }
 
     #[cfg(test)]
     pub(super) fn poll(&self, dispatcher: &Dispatcher) -> bool {
         // Single-threaded fixtures that change their stores by hand.
         self.groups.iter().fold(false, |changed, group| {
-            group.poll(dispatcher, &Cell::new(false)) || changed
+            !matches!(group.poll(dispatcher, &Cell::new(false)), Progress::Idle) || changed
         })
     }
 }
 
 impl StepGroup {
-    fn poll(&self, dispatcher: &Dispatcher, blocked: &Cell<bool>) -> bool {
+    fn poll(&self, dispatcher: &Dispatcher, blocked: &Cell<bool>) -> Progress {
         if let [scope] = &self.scopes[..] {
             return scope.poll(dispatcher, true, blocked);
         }
@@ -408,7 +430,7 @@ impl StepGroup {
         // decision gets to land its input to peer scopes before the next decision.
         let mut published = false;
         for scope in &self.scopes {
-            published |= scope.poll(dispatcher, false, blocked);
+            published |= !matches!(scope.poll(dispatcher, false, blocked), Progress::Idle);
         }
         if published
             || self
@@ -416,37 +438,39 @@ impl StepGroup {
                 .iter()
                 .any(|scope| !scope.ready_for_decision(dispatcher, blocked))
         {
-            return published;
+            return Progress::changed(published);
         }
         let next = self.next.load(Ordering::Relaxed);
         for index in (next..self.scopes.len()).chain(0..next) {
             if self.scopes[index].try_queue_step(dispatcher, blocked) {
                 self.next
                     .store((index + 1) % self.scopes.len(), Ordering::Relaxed);
-                return true;
+                return Progress::QueuedStep(self.scopes[index].step);
             }
         }
-        false
+        Progress::Idle
     }
 }
 
 impl LocalSteps {
-    fn with_schedule(
+    fn with_schedule<R: Default>(
         &self,
         blocked: &Cell<bool>,
-        f: impl FnOnce(bool, Option<&TileGuard>) -> bool,
-    ) -> bool {
+        f: impl FnOnce(bool, Option<&TileGuard>) -> R,
+    ) -> R {
         match self.scope.as_ref() {
             Scope::Loop { schedule, .. } => schedule
                 .try_lock()
                 .inspect_err(|_| blocked.set(true))
                 .ok()
-                .is_some_and(|state| f(state.publishing(), state.step_guard())),
+                .map(|state| f(state.publishing(), state.step_guard()))
+                .unwrap_or_default(),
             Scope::Writer { phase, .. } => phase
                 .try_lock()
                 .inspect_err(|_| blocked.set(true))
                 .ok()
-                .is_some_and(|state| f(state.open(), state.step_guard())),
+                .map(|state| f(state.open(), state.step_guard()))
+                .unwrap_or_default(),
         }
     }
 
@@ -484,7 +508,7 @@ impl LocalSteps {
             .is_ok_and(|mut store| self.scope.body_in(&mut store).queue_step(dispatcher, guard))
     }
 
-    fn poll(&self, dispatcher: &Dispatcher, queue: bool, blocked: &Cell<bool>) -> bool {
+    fn poll(&self, dispatcher: &Dispatcher, queue: bool, blocked: &Cell<bool>) -> Progress {
         self.with_schedule(blocked, |publishing, guard| {
             self.settle(dispatcher, publishing, guard.filter(|_| queue), blocked)
         })
@@ -496,10 +520,10 @@ impl LocalSteps {
         publishing: bool,
         guard: Option<&TileGuard>,
         blocked: &Cell<bool>,
-    ) -> bool {
+    ) -> Progress {
         let Ok(mut store) = self.scope.store().try_write() else {
             blocked.set(true);
-            return false;
+            return Progress::Idle;
         };
         // Only the loop's own inputs can affect its seed. The store and schedule
         // are exclusively held, so competing claimants cannot open it twice.
@@ -511,17 +535,21 @@ impl LocalSteps {
         {
             // Publishing a seed changes the store without enqueueing a package.
             dispatcher.wake_claimants();
-            return true;
+            return Progress::Advanced;
         }
         let admitted = self.scope.admit(dispatcher, &mut store);
         let body = self.scope.body_in(&mut store);
         if !publishing || !body.is_active() || dispatcher.outstanding(self.step) != 0 {
-            return admitted;
+            return Progress::changed(admitted);
         }
         let hold = body.attached().hold;
         let held = dispatcher.followers_hold(hold);
         if held.0 & 1 == 0 {
-            return admitted || guard.is_some_and(|g| body.queue_step(dispatcher, g));
+            return if !admitted && guard.is_some_and(|g| body.queue_step(dispatcher, g)) {
+                Progress::QueuedStep(self.step)
+            } else {
+                Progress::changed(admitted)
+            };
         }
         drop(store);
         // A nested request can span multiple publication passes. Its own schedule
@@ -530,7 +558,7 @@ impl LocalSteps {
             matches!(member, PublicationTarget::Chain(_))
                 && dispatcher.may_claim_from(self.base + i)
         }) {
-            return admitted;
+            return Progress::changed(admitted);
         }
         let members = self.base..self.base + self.members.len();
         match try_push_held(
@@ -568,13 +596,16 @@ impl LocalSteps {
         ) {
             Publication::Busy => {
                 blocked.set(true);
-                admitted
+                Progress::changed(admitted)
             }
-            Publication::Published => true,
+            Publication::Published => Progress::Advanced,
             Publication::Settled => {
                 let released = dispatcher.release_followers_if(hold, held);
-                let queued = guard.is_some_and(|g| self.queue_step(dispatcher, g, blocked));
-                queued || released || admitted
+                if guard.is_some_and(|g| self.queue_step(dispatcher, g, blocked)) {
+                    Progress::QueuedStep(self.step)
+                } else {
+                    Progress::changed(released || admitted)
+                }
             }
         }
     }

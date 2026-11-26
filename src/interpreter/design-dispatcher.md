@@ -463,7 +463,11 @@ After that, package completion, pipeline finish, live input and held publication
 groups. A wake appends a control package if the queue has no pending visit. Wakes during a claim
 can queue one successor, which becomes claimable at acknowledgement. The worker inspects the scope
 after releasing the queue lock. Visits carry no input guard and do not participate in data-pipeline
-finish accounting.
+finish accounting. A worker completing the last package of a body pipeline can offer and claim
+its group's visit under the same queue lock. If that visit queues a step, the worker tries to
+claim that specific package through the normal dependency checks. It acknowledges the visit
+before running the step, then wakes the affected groups and returns to ordinary dispatch.
+A competing claimant can take the queued step first.
 A claimant publishes held output across the group and lets its runnable body packages drain.
 It then queues one eligible step, starting after the previous winner. This keeps a peer commit
 from advancing the snapshot while a writer is still processing its previous attempt. Each group has

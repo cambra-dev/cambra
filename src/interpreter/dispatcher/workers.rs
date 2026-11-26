@@ -299,8 +299,6 @@ impl WorkerPool {
 
     /// One worker's claims: consume, publish and acknowledge each package of an admitted pipeline.
     fn work(&self, dispatcher: &Dispatcher, worker: usize) {
-        #[cfg(not(test))]
-        let _ = worker;
         in_a_run(|| {
             // A panic fails the run, so no claimant waits for what this worker held.
             let _worker = dispatcher.worker();
@@ -325,13 +323,13 @@ impl WorkerPool {
                         self.count_claim(dispatcher, &package, worker);
                         let pipeline = package.pipeline;
                         self.consume(dispatcher, package, &mut reach_seed);
-                        self.wake_scopes(dispatcher, pipeline);
+                        self.completed_pipeline(dispatcher, pipeline, worker);
                         #[cfg(test)]
                         self.collect_counters();
                     }
                     Next::Finish { pipeline } => {
                         self.finish(dispatcher, pipeline, &mut reach_seed);
-                        self.wake_scopes(dispatcher, pipeline);
+                        self.completed_pipeline(dispatcher, pipeline, worker);
                     }
                     Next::Done | Next::Failed => break,
                     Next::Wait(generation) => {
@@ -347,11 +345,58 @@ impl WorkerPool {
     }
 
     pub(super) fn wake_scopes(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
-        self.scope_steps.wake(dispatcher, pipeline);
+        for &group in self.scope_steps.affected(pipeline) {
+            dispatcher.offer_visit(group);
+        }
     }
 
-    pub(super) fn settle_visit(&self, dispatcher: &Dispatcher, visit: ScopeVisit) {
-        if self.scope_steps.settle(dispatcher, visit.group) {
+    /// A body's last acknowledgement can make a step ready. Give its claimant one local
+    /// visit and at most one step before it returns to the dispatcher's ordinary rotation.
+    pub(super) fn completed_pipeline(
+        &self,
+        dispatcher: &Dispatcher,
+        pipeline: PipelineId,
+        worker: usize,
+    ) {
+        let body = matches!(
+            &self.pipelines[pipeline.0],
+            Some(WorkerPipeline::Breaker(Spec { body: Some(_), .. }))
+        );
+        if let [group] = self.scope_steps.affected(pipeline)
+            && body
+            && dispatcher.outstanding(pipeline) == 0
+        {
+            if let Some(visit) = dispatcher.offer_or_claim_visit(*group, true)
+                && let Some(package) = self.complete_visit(dispatcher, visit, true)
+            {
+                let step = package.pipeline;
+                let Some(WorkerPipeline::Scope(ScopePipeline::Step(scope))) =
+                    &self.pipelines[step.0]
+                else {
+                    unreachable!("settlement queues a scope step")
+                };
+                #[cfg(test)]
+                if self.admits(step) {
+                    self.count_claim(dispatcher, &package, worker);
+                }
+                #[cfg(not(test))]
+                let _ = worker;
+                scope.step(dispatcher, package);
+                self.wake_scopes(dispatcher, step);
+            }
+        } else {
+            self.wake_scopes(dispatcher, pipeline);
+        }
+    }
+
+    fn complete_visit(
+        &self,
+        dispatcher: &Dispatcher,
+        visit: ScopeVisit,
+        take_step: bool,
+    ) -> Option<WorkPackage> {
+        let (blocked, package) = self.scope_steps.settle(dispatcher, visit.group, take_step);
+        if blocked {
             self.drain
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -359,6 +404,11 @@ impl WorkerPool {
                 .insert(visit.group);
         }
         dispatcher.acknowledge_visit(visit);
+        package
+    }
+
+    pub(super) fn settle_visit(&self, dispatcher: &Dispatcher, visit: ScopeVisit) {
+        self.complete_visit(dispatcher, visit, false);
     }
 
     #[cfg(test)]
