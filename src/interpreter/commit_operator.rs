@@ -1250,11 +1250,19 @@ impl CommitProducer {
         writer: usize,
         f: impl FnOnce(&dyn TileProducer) -> R,
     ) -> R {
-        drive_source(
-            &*state.writer_producers[writer],
-            &mut Some(|source: &dyn TileProducer, _| f(source)),
-        )
-        .expect("a transaction writer reads its drive, which reads a source")
+        let mut visit = Some(|source: &dyn TileProducer, _| f(source));
+        if let Some(run) = &self.run {
+            // A peer can own the fan-out while it reads the driver. During execution
+            // the plan already holds the driver, whose source remains accessible.
+            let driver = run
+                .writer_driver(writer)
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return drive_source(&*driver, &mut visit)
+                .expect("a planned transaction driver has a source");
+        }
+        drive_source(&*state.writer_producers[writer], &mut visit)
+            .expect("a transaction writer reads its drive, which reads a source")
     }
 }
 

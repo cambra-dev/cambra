@@ -229,7 +229,7 @@ The state an operator advanced before the unwind, a cache, a consuming breaker's
 store, or the region each queue consumed, stays as it was, so the graph can be planned again, but a
 run of it answers from that state: a graph whose run unwound after its first package is compiled
 again rather than run again. A run that finishes keeps the placements outside its scopes' bodies,
-as `run_targets` leaves them, and a scope's body is unplaced once it finishes (`Scope::resume`). A
+as `run_targets` leaves them, and a scope's body is unplaced once it finishes (`Scope::finish_step`). A
 paused run unplaces them ([Pause and reload](#pause-and-reload)).
 
 ## Waiting for input completion
@@ -383,7 +383,7 @@ an acknowledged package can enter a newly composed graph.
 
 ## Transaction requests and attempts
 
-A writer's request retains the delivered source region while an attempt runs. The coordinator's
+A writer's request retains the delivered source region while an attempt runs. Each scope's
 request handler owns the writer phase or loop schedule. Its step handler refers back to that
 request pipeline. The store keeps the shared transaction epoch, snapshots and releases. Both
 kinds of scope keep their planned graph and entries in a `Body`. Attaching the graph assigns its
@@ -428,17 +428,17 @@ or parks. A writer's final attempt retries a stale item at the new frontier befo
 A writer runs attempts for one request at a time. Each active attempt owns its guard and the
 epoch at which it was queued. At finish, a final attempt observes source completion. Once that
 attempt settles, the writer enters `Draining`, closes its inner sources and step, and continues
-to release their followers. When all those pipelines have finished, the coordinator finishes the
+to release their followers. When the step finishes, its claimant finishes the
 writer's request pipeline exactly once.
 Run cleanup removes the transaction metadata and its placements, as it does for loop scopes.
 Transaction control retains no dispatcher handle and constructs no additional producer instances.
 
 ## A loop in rounds
 
-An induction store owns its accumulator, published snapshot and body metadata. The coordinator
+An induction store owns its accumulator, published snapshot and body metadata. Its request handler
 owns the active request and round, the position to retry on a wake, and the finish phase. The step
 uses the guard of that round. Its outstanding dispatcher package prevents a second admission
-before the coordinator settles it. Writers use the same admission rule with their attempt guard.
+before its handler settles it. Writers use the same admission rule with their attempt guard.
 
 A request remains unacknowledged until all its positions and any closing round have stepped. Each
 position first runs the body, publishes held output, and then steps the store. The next position
@@ -447,8 +447,21 @@ step cannot pass an unfinished inner row. Other independent work remains claimab
 
 Quiescence alone does not permit a step: a body breaker can hold complete output it has not yet
 published. The controller publishes held output until no further work appears, then releases the
-step's dependencies. The production driver coordinates one claim at a time. The shared dispatcher
-does not provide a concurrent loop-settlement protocol.
+step's dependencies. The request and step are ordered dispatcher pipelines. Any admitted
+worker can claim them directly. The loop schedule or writer phase serializes that scope's
+transitions. A handler releases its store before queuing the new body's work.
+
+Any claimant can settle a body and queue its next step. It tries the schedule lock and store,
+then releases the store before trying the body breakers. A busy breaker leaves the follower hold
+in place. A nested loop publishes through its parent once its own request has completed.
+
+Scopes connected by reads, follows, containment or a shared store belong to one settlement group.
+A claimant publishes held output across the group and lets its runnable body packages drain.
+It then queues one eligible step, starting after the previous winner. This keeps a peer commit
+from advancing the snapshot while a writer is still processing its previous attempt. Each group has
+its own cursor. An unrelated group can publish, queue and run its next step while another group's
+handler is busy.
+A parked request resumes through its scope's intake when input or peer progress wakes it.
 
 The first request initializes the store after its drive has read the source. A position package
 emits only the next covered position. A nested row also has a closing round, including when it has
@@ -460,11 +473,11 @@ A scope queues an offered request only once every pipeline its pipeline reads is
 drive pulls its source through, which a worker may still consume. A request begun before they have
 would find no position and run a closing round over positions the drive emits later.
 
-After the loop's requests settle, its finish closes the body's sources. The coordinator publishes
-held output and releases followers while the body drains. Once every inner pipeline has finished,
-the coordinator closes the step's arrivals. When the step finishes, the coordinator publishes the
-store's final output and completes the request pipeline. Run cleanup discards scheduling state and
-placements while preserving the store's values and releases.
+After the loop's requests settle, the request finish closes the body's sources and the step's
+arrivals. The step reads every body member, so its queue closes only after all their final pushes
+have landed. The worker claiming the step's finish publishes the store's final output, completes
+the request pipeline, and removes the body's placements. Run cleanup preserves the store's values
+and releases.
 
 Nested rounds use projections naming full paths. An operator pulled inside a round at a level it
 does not restate is pulled at the nearest level above that it restates, and its answer is cut to
@@ -547,8 +560,8 @@ such a breaker reads (`order_inputs_of_ordered_breakers`). So do a loop's store 
 pipeline it reads, transitively: a loop runs its positions in order and takes a request none of
 whose positions is next as one that only closes absent positions, so its input is published in
 position order, one package in flight per pipeline. The store's step reads the body and seeds no
-ordering, so the body is not ordered by this. Control scopes, a sink whose input has no ordered
-keys, and shapes without independent position projections keep their coordinator handlers.
+ordering. Scope handlers and serial chains execute one package at a time on any worker. A sink
+whose input has no ordered keys runs on the coordinator.
 
 A sink's packages are not ordered, so with more than one worker its answers arrive out of key order.
 `TestSink` merges them in arrival order and reads the merged value in key order
@@ -567,11 +580,8 @@ consumed input through the existing producer chain.
 
 ### Who claims what
 
-A pipeline is **admitted** when all of these hold:
-
-- It is a pipeline of the program over a chain, a sink at the root of the run, or a pipeline of a
-  loop's or transaction writer's body. A sink is admitted only where its packages run at once.
-- Its packages run at once, or no scope's pipeline reads it.
+Workers can claim packages and finishes for every chain in the program and inside a scope.
+A sink is admitted when its packages can run concurrently over ordered keys.
 
 A pipeline's packages run beside each other where its breaker consumes concurrently and its input is
 keyed by ordered keys (`consumes_at_once`). A breaker consumes concurrently unless it opts out
@@ -583,21 +593,20 @@ it restates, and the answer is cut to the keys asked for (`TileProducer::get`). 
 a projection, which a debug build asserts. A package runs beside the pipeline's others except where
 its guard overlaps a package in flight.
 
-A pipeline admitted for the second reason alone is **serial**: the planner orders it, so one package
-of it is in flight at a time, on any thread. A worker runs the finish of every admitted pipeline no
-scope's pipeline reads. A push into a scope's pipeline offers the scope requests, which the
-coordinator queues after the consume or finish that pushed them, so a pipeline a scope's pipeline
-reads stays the coordinator's. A loop's drive source offers through its entry instead
-(`CompletionTarget`); the coordinator's resume pass queues what it offered.
+The planner orders an admitted serial chain so only one of its packages is in flight at a time.
+After a chain publishes, its claimant asks each scope that reads it directly to admit its pending
+requests. A busy scope retries during settlement. When a scope's arrivals close with its reads,
+the dispatcher counts each upstream finish after its pushes have landed. The last read therefore
+delivers its final offers before the scope closes its intake.
 
 With more than one worker, two kinds of claimant share the dispatcher:
 
-- A worker thread claims packages and finishes of admitted pipelines only
-  (`Dispatcher::claim_where`). It sleeps in `Dispatcher::wait` while none is claimable.
-- The coordinator claims any package and any finish (`Dispatcher::try_claim_where`). A claim of an
+- A worker thread claims packages and finishes of admitted breakers, requests, steps, and seeds.
+  A request's finish starts the drain. The step's finish publishes the scope's final output.
+  The worker sleeps in `Dispatcher::wait` when no claim or scope can advance.
+- The coordinator claims any package and any finish (`WorkerPool::next`). A claim of an
   admitted pipeline runs as a worker's would (`WorkerPool::consume_on_coordinator`,
-  `WorkerPool::finish_on_coordinator`). It also runs the loop and transaction scopes, the resume
-  pass ([A loop in rounds](#a-loop-in-rounds)) and the polling of live sources.
+  `WorkerPool::finish_on_coordinator`). It also checks for loop seeds and closed inputs at quiescence and polls live sources.
 
 ### A worker's claim
 
@@ -626,8 +635,9 @@ free and pulls the round's state, not the snapshot from before the round.
 
 A round's step passes only output the resume pass has published. Each scope body has one follower
 hold over its inner pipelines and its step (`Dispatcher::add_hold_group`). The coordinator re-holds
-a scope's body after each of its own claims (`Execution::consume`). A worker re-holds the body it
-consumed in before it acknowledges the package (`WorkerPool::consume`). The resume pass reads the
+scope bodies after a coordinator-only claim. A scope transition re-holds its own body as it
+opens the next round or attempt. A breaker worker re-holds its body before it acknowledges the
+package (`WorkerPool::consume`). The resume pass reads the
 body's hold before it publishes and releases it only where the hold is unchanged
 (`Dispatcher::release_followers_if`). A hold counts each time it is taken, so a release decided
 before a worker's consume published fails, and the step waits for the next pass.
@@ -638,11 +648,11 @@ Both drivers claim through one routine (`Execution::claim_until_quiescent`), whi
 pipeline has finished, the run has failed, or the run is quiescent. A coordinator claim that answers
 `Next::Wait` goes on in this order:
 
-1. While a worker holds a claim, or a package or finish of an admitted pipeline is in flight,
-   claimable or finishing (`WorkerPool::may_progress`), the coordinator sleeps in
-   `Dispatcher::wait`. A worker counts itself busy once its claim returns; until then the package
-   in flight or the pipeline finishing shows the claim.
-2. Otherwise it runs the resume pass, and claims again where the pass changed anything.
+1. It first polls the scope groups for ready work. While a worker can still publish, or an
+   admitted breaker can run, it sleeps in `Dispatcher::wait`. A worker registers activity before taking a package or finish and releases it after publication.
+   A retained request or a draining scope may span several claims and idle intervals.
+2. Otherwise it checks for finished scope inputs and newly available loop seeds, and claims again
+   if either advanced.
 3. Otherwise, where the generation has not moved since the claim, no claimant can progress, and
    the routine answers that the run is quiescent. A run with no live source panics. A live run
    pushes what its breakers hold and claims again where that changed anything; otherwise it has
@@ -663,11 +673,13 @@ No two threads wait on each other through these rules:
   consumer takes only the lock on its own state and releases it before it notifies another, so a
   landing holds at most one consumer's lock at a time. No consumer takes a breaker handle or a store
   while it is notified.
-- Only the coordinator takes a store's blocking `write`, in the scope handlers. While it holds one
-  it takes the scope's member handles, where `row_for` probes where a round's push lands; a worker
-  never waits on a store, since it reaches one only through `try_write`, so the coordinator's
-  store-first order meets no worker waiting the other way. The round's packages are queued after the
-  store is released ([Bodies on workers](#bodies-on-workers)).
+- A scope handler takes its schedule lock before its store and releases the store before queuing
+  body packages. A writer validates commits under the shared store lock. Publication of an
+  active body takes the schedule lock with `try_lock` and releases the store before walking
+  breaker handles. Any claimant can run a transaction seed's package or finish. It tries to
+  reserve the store only when that work is ready. If the store is busy it tries other pipelines.
+  After the seed publishes, scope settlement admits pending writers and closes their request
+  pipelines once their reads have finished.
 
 A wait for a handle is therefore a wait on a thread that holds a handle further upstream and waits
 for nothing but handles further upstream still. The pipelines form a DAG, since a loop's cycle runs

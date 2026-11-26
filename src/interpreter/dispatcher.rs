@@ -36,7 +36,9 @@ use crate::interpreter::{
 };
 
 pub(crate) mod loop_scope;
+pub use loop_scope::{Offered, Offers};
 mod plan;
+mod scope;
 pub(crate) mod transaction_scope;
 mod workers;
 
@@ -195,12 +197,12 @@ impl Queue {
 
     /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
     /// names no region a package in flight names.
-    fn claim(
+    fn claim<R>(
         &self,
         pipeline: usize,
         ordered: bool,
-        can_claim: impl FnOnce() -> bool,
-    ) -> Option<WorkPackage> {
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<(WorkPackage, R)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // A pipeline can be notified of a region again before its package for the region is
         // acknowledged, as a reader keyed by one row is at each push of what it reads. Two
@@ -216,20 +218,20 @@ impl Queue {
         };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
         // after observing it under the lock; the check reads counters and takes no queue lock.
-        if state.ready.is_empty()
-            || (ordered && !state.in_flight.is_empty())
-            || overlaps(&state)
-            || !can_claim()
-        {
+        if state.ready.is_empty() || (ordered && !state.in_flight.is_empty()) || overlaps(&state) {
             return None;
         }
+        let reservation = reserve()?;
         let (index, guard) = state.ready.pop_front()?;
         state.in_flight.insert(index, guard.clone());
-        Some(WorkPackage {
-            pipeline: PipelineId(pipeline),
-            guard,
-            index,
-        })
+        Some((
+            WorkPackage {
+                pipeline: PipelineId(pipeline),
+                guard,
+                index,
+            },
+            reservation,
+        ))
     }
 
     /// Remove a matching claim, and answer whether it was one: `None` where no claim matches, and
@@ -371,6 +373,14 @@ impl PipelineState {
 #[cfg(test)]
 type TransitionHook = Box<dyn FnOnce() + Send>;
 
+#[cfg(test)]
+type StepProbe = Arc<dyn Fn(PipelineId) + Sync + Send>;
+#[cfg(test)]
+thread_local! {
+    // Test runs copy their own probe into the dispatcher before starting workers.
+    static STEP_PROBE: std::cell::RefCell<Option<StepProbe>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The graph of pipelines, the work packages queued for each pipeline, and what each has consumed.
 pub struct Dispatcher {
     /// The held rows a cut of a work package targets, where its shape supports cutting.
@@ -407,6 +417,8 @@ pub struct Dispatcher {
     /// Whether `events` records; off, no test-only lock orders the acknowledgements.
     #[cfg(test)]
     recording: bool,
+    #[cfg(test)]
+    scope_step_probe: Option<StepProbe>,
     #[cfg(test)]
     transition_hooks: [OnceLock<Mutex<Option<TransitionHook>>>; 2],
     /// How many pipelines quiescence checks have read the counts of.
@@ -501,6 +513,8 @@ impl Dispatcher {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             recording: true,
+            #[cfg(test)]
+            scope_step_probe: STEP_PROBE.with_borrow(Clone::clone),
             #[cfg(test)]
             transition_hooks: std::array::from_fn(|_| OnceLock::new()),
             #[cfg(test)]
@@ -796,6 +810,13 @@ impl Dispatcher {
         }
     }
 
+    /// For a scope that closes its own arrivals after its reads, the extra arrival
+    /// is the last count once every upstream finish has landed its final pushes.
+    fn only_arrivals_remain(&self, pipeline: PipelineId) -> bool {
+        debug_assert!(self.infos[pipeline.0].arrivals);
+        self.states[pipeline.0].unfinished.load(Ordering::Acquire) == 1
+    }
+
     /// Count one feed of `reader`'s queue finished: a pipeline it reads, or the end of
     /// its arrivals. The last of them closes the queue.
     ///
@@ -837,7 +858,7 @@ impl Dispatcher {
                     .is_none_or(|group| self.holds[group.0].load(Ordering::SeqCst) & 1 == 0))
     }
 
-    /// The serial coordinator changes these holds between claims, after settling held pushes.
+    /// Claimants release these holds after settling held pushes.
     /// A hold does not revoke a claim or wait for a worker already consuming a package.
     ///
     /// Hold the pipelines of `group`, a scope body's, from taking a package that follows its
@@ -1176,12 +1197,20 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one after observing its dependencies' progress. An ordered pipeline has at most one package
     /// in flight.
-    fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
+    fn claim_from<R>(
+        &self,
+        pipeline: usize,
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<(WorkPackage, R)> {
         let state = &self.states[pipeline];
         state
             .queue
             .claim(pipeline, self.infos[pipeline].ordered, || {
-                self.takes_from(pipeline)
+                if self.takes_from(pipeline) {
+                    reserve()
+                } else {
+                    None
+                }
             })
     }
 
@@ -1201,11 +1230,19 @@ impl Dispatcher {
     }
 
     /// Claim the finish only from a closed queue's final reservation count.
-    fn try_begin_finish(&self, pipeline: usize) -> bool {
-        self.ready_to_finish(pipeline)
-            && self.states[pipeline]
-                .phase
-                .moved(Phase::Running, Phase::Finishing)
+    fn try_begin_finish<R>(
+        &self,
+        pipeline: usize,
+        reserve: impl FnOnce() -> Option<R>,
+    ) -> Option<R> {
+        if !self.ready_to_finish(pipeline) {
+            return None;
+        }
+        let reservation = reserve()?;
+        self.states[pipeline]
+            .phase
+            .moved(Phase::Running, Phase::Finishing)
+            .then_some(reservation)
     }
 
     /// What to do next, without blocking. A claim takes the package at the front of `preferred`'s
@@ -1216,51 +1253,51 @@ impl Dispatcher {
     /// pipeline has finished, and [`Next::Wait`] before. After a failure it answers
     /// [`Next::Failed`].
     pub fn try_claim(&self, preferred: Option<PipelineId>) -> Next {
-        self.try_claim_where(preferred, &|_| true, &|_| true)
+        self.try_claim_with(preferred, &|_| true, &|_| Some(())).0
     }
 
-    /// [`try_claim`](Self::try_claim) restricted to the packages of the pipelines `takes` admits,
-    /// and to the finishes of the pipelines `finishes` admits: a claimant that runs only some
-    /// breakers, as a worker of the pool runs the admitted ones. After
-    /// [`stop_claims`](Self::stop_claims) it answers [`Next::Done`].
-    pub(crate) fn try_claim_where(
+    /// A successful reservation stays with its claim. A losing finish drops its reservation
+    /// before the scan tries another pipeline.
+    fn try_claim_with<R: Default>(
         &self,
         preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: &dyn Fn(PipelineId) -> bool,
-    ) -> Next {
+        admits: &dyn Fn(PipelineId) -> bool,
+        reserve: &dyn Fn(PipelineId) -> Option<R>,
+    ) -> (Next, R) {
         // Read before the scan: a change the scan misses advances the generation past this one,
         // so a wait on it returns at once.
         let generation = self.generation.load(Ordering::SeqCst);
         if self.failed.load(Ordering::SeqCst) {
-            return Next::Failed;
+            return (Next::Failed, R::default());
         }
         if self.stopped.load(Ordering::SeqCst) {
-            return Next::Done;
+            return (Next::Done, R::default());
         }
         let count = self.infos.len();
         if let Some(preferred) = preferred {
             self.state(preferred);
         }
         let scan = preferred.map(|p| p.0).into_iter().chain(0..count);
-        if let Some(package) = scan
-            .filter(|&p| takes(PipelineId(p)))
-            .find_map(|p| self.claim_from(p))
+        if let Some((package, reservation)) = scan
+            .filter(|&p| admits(PipelineId(p)))
+            .find_map(|p| self.claim_from(p, || reserve(PipelineId(p))))
         {
-            return Next::Package(package);
+            return (Next::Package(package), reservation);
         }
-        for p in (0..count).filter(|&p| finishes(PipelineId(p))) {
-            let begun = self.try_begin_finish(p);
-            if begun {
-                return Next::Finish {
-                    pipeline: PipelineId(p),
-                };
+        for p in (0..count).filter(|&p| admits(PipelineId(p))) {
+            if let Some(reservation) = self.try_begin_finish(p, || reserve(PipelineId(p))) {
+                return (
+                    Next::Finish {
+                        pipeline: PipelineId(p),
+                    },
+                    reservation,
+                );
             }
         }
         if self.unfinished.load(Ordering::Acquire) == 0 {
-            return Next::Done;
+            return (Next::Done, R::default());
         }
-        Next::Wait(Generation(generation))
+        (Next::Wait(Generation(generation)), R::default())
     }
 
     /// What to do next, blocking while there is nothing to: [`try_claim`](Self::try_claim) and
@@ -1268,22 +1305,6 @@ impl Dispatcher {
     pub fn claim(&self, preferred: Option<PipelineId>) -> Next {
         loop {
             match self.try_claim(preferred) {
-                Next::Wait(generation) => self.wait(generation),
-                next => return next,
-            }
-        }
-    }
-
-    /// [`try_claim_where`](Self::try_claim_where), blocking while there is nothing to claim, as
-    /// [`claim`](Self::claim) does.
-    pub(crate) fn claim_where(
-        &self,
-        preferred: Option<PipelineId>,
-        takes: &dyn Fn(PipelineId) -> bool,
-        finishes: &dyn Fn(PipelineId) -> bool,
-    ) -> Next {
-        loop {
-            match self.try_claim_where(preferred, takes, finishes) {
                 Next::Wait(generation) => self.wait(generation),
                 next => return next,
             }
@@ -1299,23 +1320,44 @@ impl Dispatcher {
     pub(crate) fn may_claim_where(&self, takes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| takes(PipelineId(p)))
-            .any(|p| {
-                let queue = self.states[p]
-                    .queue
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                // With nothing in flight, an ordered pipeline claims as any other does.
-                !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
-            })
+            .any(|p| self.may_claim_from(p))
     }
 
-    /// Whether a pipeline `finishes` admits is finishing, or may begin to: a claimant restricted to
-    /// those finishes may still change the run.
+    fn may_claim_from(&self, p: usize) -> bool {
+        if self.states[p].outstanding() == 0 {
+            return false;
+        }
+        let queue = self.states[p]
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A follower with only queued work may be waiting for its body's publication.
+        !queue.in_flight.is_empty() || (!queue.ready.is_empty() && self.takes_from(p))
+    }
+
+    /// Whether a new package can start on an ordered pipeline. A retained scope request
+    /// occupies its pipeline across several steps, even if another request is queued.
+    fn may_start_ordered_package(&self, pipeline: PipelineId) -> bool {
+        let p = pipeline.0;
+        debug_assert!(self.infos[p].ordered);
+        if self.outstanding(pipeline) == 0 {
+            return false;
+        }
+        let queue = self.states[p]
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        queue.in_flight.is_empty() && !queue.ready.is_empty() && self.takes_from(p)
+    }
+
+    /// A worker registers activity before claiming a finish. A request already
+    /// finishing can be waiting for its body and needs another settlement pass.
     pub(crate) fn may_finish_where(&self, finishes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| finishes(PipelineId(p)))
-            .any(|p| self.states[p].phase.load() == Phase::Finishing || self.ready_to_finish(p))
+            .any(|p| self.ready_to_finish(p))
     }
 
     /// Whether the generation has advanced past `generation`: something changed that can make a
@@ -1430,7 +1472,7 @@ impl Dispatcher {
     pub fn begin_finish(&self, pipeline: PipelineId) {
         let p = pipeline.0;
         self.state(pipeline);
-        self.ensure(self.try_begin_finish(p), || {
+        self.ensure(self.try_begin_finish(p, || Some(())).is_some(), || {
             format!("pipeline {p} finishes once, after its queue is closed and consumed and its hold is released")
         });
     }
@@ -1585,13 +1627,14 @@ impl Dispatcher {
     /// recorded as claimed. Unlike a claim, it never begins a finish.
     #[cfg(test)]
     pub(crate) fn pop(&self) -> Option<WorkPackage> {
-        (0..self.infos.len()).find_map(|p| self.claim_from(p))
+        (0..self.infos.len()).find_map(|p| self.claim_of(PipelineId(p)))
     }
 
     /// The package at the front of `pipeline`'s queue, claimed, where a claim may take one.
     #[cfg(test)]
     pub(crate) fn claim_of(&self, pipeline: PipelineId) -> Option<WorkPackage> {
-        self.claim_from(pipeline.0)
+        self.claim_from(pipeline.0, || Some(()))
+            .map(|(package, ())| package)
     }
 
     /// Finish `pipeline` as a claim does, with `push` in place of the breaker: begin the finish,
@@ -2082,107 +2125,6 @@ pub struct Entry {
 // shared-state-ok: the drive and the entry in front of its source both hold it, the planner
 // writes it before the run, and what crosses it is a scope's intake and a tiling, never a tile.
 pub type CompletionTarget = Arc<RwLock<Option<(Offers, Tiling)>>>;
-
-/// What a scope's input has offered it and the scope has not queued yet: a scope queues a request
-/// only where it can run ([`Body::queue_offered`](loop_scope::Body::queue_offered)), and holds
-/// the rest here.
-#[derive(Default)]
-pub struct Offered {
-    intake: ScopeInput,
-    close: IntakeClose,
-    /// Per inner pipeline, what pushes from outside the body brought it since the last round or
-    /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
-    /// reads what grew.
-    pub grown: Vec<(PipelineId, TileGuard)>,
-    /// Positions the next request must revisit. Fresh input stays in the intake.
-    retry: Option<Retry>,
-    /// A wake that the next decision to park must observe.
-    woken: bool,
-}
-
-/// Ordinary requests consume each offered region. A parent-fed loop retains delivery evidence
-/// because the parent can give it the same row again in a closing round.
-enum ScopeInput {
-    Ordinary(Option<TileGuard>),
-    Parent(Box<ParentRows>),
-}
-
-impl Default for ScopeInput {
-    fn default() -> Self {
-        Self::Ordinary(None)
-    }
-}
-
-struct ParentRows {
-    input: Tiling,
-    held: Option<TileGuard>,
-    delivered: Option<TileGuard>,
-}
-
-impl ParentRows {
-    fn ready(&self) -> Option<(TileGuard, TileGuard)> {
-        let held = self.held.as_ref()?;
-        let rest = guard_minus(held, self.delivered.as_ref()?).closed_over(&self.input);
-        Some((guard_minus(held, &rest), rest))
-    }
-}
-
-#[derive(Default, PartialEq, Eq)]
-enum IntakeClose {
-    #[default]
-    Open,
-    Requested,
-    Closed,
-}
-
-struct Retry {
-    guard: TileGuard,
-    phase: RetryPhase,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RetryPhase {
-    /// Await input, or an ordinary request that can revisit the positions.
-    Parked,
-    /// A wake made the positions eligible for admission.
-    Ready,
-    /// A package has been queued to cover these positions.
-    Queued,
-}
-
-impl Offered {
-    fn offer(&mut self, guard: TileGuard) {
-        let region = match &mut self.intake {
-            ScopeInput::Ordinary(pending) => pending,
-            ScopeInput::Parent(rows) => &mut rows.delivered,
-        };
-        *region = Some(match region.take() {
-            Some(before) => before.union(&guard),
-            None => guard,
-        });
-    }
-
-    fn wake(&mut self) {
-        if let Some(retry) = &mut self.retry
-            && retry.phase == RetryPhase::Parked
-        {
-            retry.phase = RetryPhase::Ready;
-        } else {
-            self.woken = true;
-        }
-    }
-
-    fn ready_retry(&mut self) -> Option<&mut Retry> {
-        self.retry
-            .as_mut()
-            .filter(|retry| retry.phase == RetryPhase::Ready)
-    }
-}
-
-/// A scope's [`Offered`], shared with the entry in front of its drive's source.
-// shared-state-ok: the scope and the entry in front of its drive's source both hold it; what
-// crosses it is a guard of the scope's input, never a tile.
-pub type Offers = Arc<Mutex<Offered>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
@@ -2769,21 +2711,53 @@ fn push_held(
     reach: &mut Reach<'_>,
     pipelines: impl IntoIterator<Item = PipelineId>,
 ) {
+    try_push_held(dispatcher, pipelines, |id, call| {
+        reach(id, call);
+        true
+    });
+}
+
+enum Publication {
+    Busy,
+    Published,
+    Settled,
+}
+
+/// Only a complete pass that published nothing can release a body's follower hold.
+fn try_push_held(
+    dispatcher: &Dispatcher,
+    pipelines: impl IntoIterator<Item = PipelineId>,
+    mut reach: impl FnMut(PipelineId, &mut Call<'_>) -> bool,
+) -> Publication {
+    let mut published = false;
     for pipeline in pipelines {
         if dispatcher.states[pipeline.0].phase.load() == Phase::Finished {
             continue;
         }
         let mut landed = None;
-        reach(pipeline, &mut |breaker, _| {
+        let reached = reach(pipeline, &mut |breaker, _| {
             if let Some(producer) = breaker.as_producer() {
                 let mut pushes = dispatcher.pushes(pipeline);
                 pushes.push_final(producer);
                 landed = Some(pushes);
             }
         });
+        if !reached {
+            return if published {
+                Publication::Published
+            } else {
+                Publication::Busy
+            };
+        }
         if let Some(pushes) = landed {
+            published |= !pushes.morsels.is_empty();
             dispatcher.land(pushes);
         }
+    }
+    if published {
+        Publication::Published
+    } else {
+        Publication::Settled
     }
 }
 
@@ -2845,6 +2819,50 @@ fn finish_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, pipeline: Pipelin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_read_counts_as_finished_for_intake_only_after_its_last_push_lands() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        struct LastPush {
+            reader: PipelineId,
+        }
+        impl Consumer for LastPush {
+            fn notify(&self, _: &Projection, landing: &mut Landing<'_>) {
+                let Target::Queue { dispatcher, .. } = &landing.target else {
+                    unreachable!()
+                };
+                assert!(
+                    dispatcher.infos[self.reader.0]
+                        .reads
+                        .iter()
+                        .all(|&p| dispatcher.states[p].phase.load() == Phase::Finished)
+                );
+                assert!(!dispatcher.only_arrivals_remain(self.reader));
+                landing.queue(self.reader, &keys_between(0, 0));
+            }
+        }
+
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], 1);
+        let reader = PipelineId(2);
+        dispatcher.take_arrivals(reader);
+        for p in [PipelineId(0), PipelineId(1)] {
+            dispatcher.close(p);
+            dispatcher.begin_finish(p);
+        }
+        dispatcher.finish(dispatcher.pushes(PipelineId(0)));
+        let mut pushes = dispatcher.pushes(PipelineId(1));
+        pushes.push(&keys_between(0, 0), |guard, _| vec![guard.clone()]);
+        pushes.to = Some(Arc::new(LastPush { reader }));
+        dispatcher.finish(pushes);
+        assert!(dispatcher.only_arrivals_remain(reader));
+        dispatcher.close(reader);
+        let package = dispatcher
+            .claim_of(reader)
+            .expect("the last push is claimable");
+        assert!(!dispatcher.ready_to_finish(reader.0));
+        dispatcher.acknowledge(package);
+        assert!(dispatcher.ready_to_finish(reader.0));
+    }
+
     /// A chain of diamonds: each layer's two pipelines read the one below, and the pipeline
     /// above reads both. A path of reads to the bottom doubles at each layer, and a quiescence
     /// check of the top reads each pipeline once.

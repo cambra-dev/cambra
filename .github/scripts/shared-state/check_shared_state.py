@@ -130,7 +130,7 @@ EXPECTED_EXCEPTIONS = [
     # positions waiting for inputs. The scope and the entries in its body hold it, and a push the
     # entries' pipelines do not take wakes the scope through it. What crosses it is guards of the
     # scope's input, never a tile.
-    ("src/interpreter/dispatcher.rs", "shared cell of `Offered`"),
+    ("src/interpreter/dispatcher/loop_scope.rs", "shared cell of `Offered`"),
     # `CompletionTarget`, the scope an unplaced entry in front of a loop's drive offers a push to,
     # with the store's input, which the planner writes before the run. What crosses it is a scope's
     # intake and a tiling, never a tile.
@@ -159,9 +159,10 @@ EXPECTED_EXCEPTIONS = [
     # What a dispatched run's `main` output answers, merged at the I/O boundary as a sink merges
     # what it is handed; nothing reads it back into the graph. See `Collected`.
     ("src/interpreter/dispatcher/plan.rs", "cell of `Option<Tile>`"),
-    # A transaction writer scope's attempt lifecycle. Only the coordinator reads or advances it,
-    # and it holds a work package and a guard of the writer's input, never a tile.
-    ("src/interpreter/dispatcher/plan.rs", "cell of `WriterPhase`"),
+    # Scope scheduling metadata and the rotating cursor shared by a connected group.
+    ("src/interpreter/dispatcher/scope.rs", "cell of `LoopSchedule`"),
+    ("src/interpreter/dispatcher/scope.rs", "cell of `WriterPhase`"),
+    ("src/interpreter/dispatcher/scope.rs", "cell of `usize`"),
     # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
     # not see.
