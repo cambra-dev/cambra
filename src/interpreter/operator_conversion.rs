@@ -2168,7 +2168,7 @@ fn convert_impl_inner(
             while let [elem, after @ ..] = rest {
                 if let Some(fused) = result
                     .as_deref()
-                    .and_then(|input| fusable_prefix(rest, input.tiling(), ctx.level()))
+                    .and_then(|input| fusable_prefix(rest, input.tiling(), ctx))
                 {
                     let input = result.take().expect("fusable_prefix read an input");
                     // The map replaces the chain up to its last element, whose result it
@@ -5883,15 +5883,22 @@ fn apply_binop(
 }
 
 /// The pointwise prefix of `chain` that fuses into one [`ScalarProgram`] map over `input`, when
-/// `input` holds a column of values at `level`.
+/// `input` holds a column of values at the level `ctx` converts at.
 ///
 /// A bare product's fields are tiles and a value holding a level is not a column, so the
 /// function has nothing to read in either ([`selects_a_tile`]).
-fn fusable_prefix(chain: &[Expr], input: &Tiling, level: CurryLevel) -> Option<scalar_expr::Fused> {
+fn fusable_prefix(
+    chain: &[Expr],
+    input: &Tiling,
+    ctx: &OpConversionContext,
+) -> Option<scalar_expr::Fused> {
+    let level = ctx.level();
     if matches!(input, Tiling::Record(_)) || input.values_at(level).holds_a_level() {
         return None;
     }
-    scalar_expr::fuse_prefix(chain, &value_extent_at(input, level))
+    scalar_expr::fuse_prefix(chain, &value_extent_at(input, level), &|ty| {
+        ctx.extent_of(ty).ok()
+    })
 }
 
 /// `MapResult(input, Constant(Scalar(expr)))`: one pass over the column the chain started from.
@@ -6878,16 +6885,15 @@ mod variant_ctor_tests {
             panic!("expected Function, got {tile:?}");
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
-        let Tile::Record { fields, .. } = *codomain else {
-            panic!("expected a record codomain, got {codomain:?}");
+        // The arm body's record is element-wise over the zipped pair, so it fuses into one
+        // column of records (`src/ccl/design/optimization.md`, "Element-wise chains").
+        let Tile::Scalar(ColumnValue::Records(fields)) = *codomain else {
+            panic!("expected a column of records, got {codomain:?}");
         };
         // Each row keeps its own outer `time` (10, 20) paired with its own commit
-        // payload (1, 2) — proving the by-key co-iteration.
-        assert_eq!(
-            fields["out_t"],
-            Tile::Scalar(ColumnValue::Ints(vec![10, 20]))
-        );
-        assert_eq!(fields["out_w"], Tile::Scalar(ColumnValue::Ints(vec![1, 2])));
+        // payload (1, 2), so the outer element and the payload co-iterate by key.
+        assert_eq!(fields["out_t"], ColumnValue::Ints(vec![10, 20]));
+        assert_eq!(fields["out_w"], ColumnValue::Ints(vec![1, 2]));
     }
 
     /// **In-lambda `VariantCtor` composes** — the writer-decision shape. A

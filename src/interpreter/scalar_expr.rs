@@ -9,15 +9,15 @@ use std::mem::replace;
 
 use smol_str::SmolStr;
 
-use crate::ccl::{Builtin, Expr, ProjKey, TypedExprNode};
+use crate::ccl::{Builtin, Expr, FieldKey, ProjKey, TagMap, Type, TypedExprNode};
 
 use crate::view::View;
 
 use super::{
     BaseType, BinOpKind as InterpreterBinOp, ColumnValue, ColumnView, CompareKind, Extent,
-    LogicKind, UnaryOpKind, Value, apply_binop_views, apply_unaryop_views, binop::compared_fields,
-    binop_output_extent, binop_result_column, operator_conversion::expr_to_value, tuple_field,
-    unaryop_result_column,
+    LogicKind, UnaryOpKind, UnionArm, Value, apply_binop_views, apply_unaryop_views,
+    binop::compared_fields, binop_output_extent, binop_result_column,
+    operator_conversion::expr_to_value, tuple_field, unaryop_result_column,
 };
 
 /// The index of an instruction, which is also the slot it writes.
@@ -26,21 +26,39 @@ type Slot = u32;
 /// One instruction of a [`ScalarProgram`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Instr {
-    /// The column of a base type at `path` inside the map's input value; an empty path is the
-    /// value itself.
+    /// The column at `path` inside the map's input value; an empty path is the value itself. The
+    /// column is of a base type or a union. A `Unit` or union column has no view, so no operation
+    /// reads one ([`ScalarProgram::operands_have_views`]), and a constructor copies its rows.
     Input {
         path: Vec<SmolStr>,
     },
-    /// One value of a base type at every row.
+    /// One value of a base type at every row. A `Unit` constant has no view, so no operation
+    /// reads one ([`ScalarProgram::operands_have_views`]).
     Const(Value),
     Bin(InterpreterBinOp, Slot, Slot),
     Un(UnaryOpKind, Slot),
     /// A column of records, one field per slot named, sorted by field name. A tuple's fields are
     /// `_0`, `_1`, …, which sort as strings: `_10` before `_2`.
     ///
-    /// No operation reads a `Record`. A `Record` is the last instruction or a field of a later
-    /// `Record` ([`ScalarProgram::records_build_only_the_result`]).
+    /// A constructor: no operation reads it, and it is the last instruction or a field or payload
+    /// of a later constructor ([`ScalarProgram::constructors_build_only_the_result`]).
     Record(Vec<(SmolStr, Slot)>),
+    /// A union column whose every row carries `tag`, with the payload in `payload`. The column
+    /// holds only that arm, since an absent arm reads as an empty one ([`ColumnValue::Union`]).
+    ///
+    /// A constructor, as [`Instr::Record`] is.
+    Wrap {
+        tag: FieldKey,
+        payload: Slot,
+    },
+}
+
+impl Instr {
+    /// Whether this instruction builds part of the result: a [`Instr::Record`] or a
+    /// [`Instr::Wrap`].
+    fn is_constructor(&self) -> bool {
+        matches!(self, Instr::Record(_) | Instr::Wrap { .. })
+    }
 }
 
 /// A straight-line program whose operands refer to earlier instruction slots.
@@ -83,7 +101,7 @@ fn const_view(value: &Value, len: usize) -> ColumnView<'_> {
 struct Scratch<'a> {
     input: &'a ColumnValue,
     /// `Units(0)` marks unwritten slots; no operation produces that column variant. Inputs,
-    /// constants, records, and the last instruction never write a scratch slot.
+    /// constants, constructors, and the last instruction never write a scratch slot.
     slots: Vec<ColumnValue>,
     /// The current block: the rows `start..start + len` of the input.
     start: usize,
@@ -111,7 +129,24 @@ impl<'a> Scratch<'a> {
             Instr::Bin(..) | Instr::Un(..) => self.slots[slot]
                 .view()
                 .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
-            Instr::Record(_) => unreachable!("no instruction reads the record s{slot}"),
+            Instr::Record(_) | Instr::Wrap { .. } => {
+                unreachable!("no instruction views the constructor s{slot}")
+            }
+        }
+    }
+
+    /// Append the current block of `slot` to `out`, which must have its type. A constructor
+    /// builds its block in place. A `Unit` or union input has no view, so its block is copied. A
+    /// `Unit` constant adds the block's rows to a `Units` column.
+    fn append(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
+        let rows = self.start..self.start + self.len;
+        match &program.instrs[slot] {
+            instr if instr.is_constructor() => self.run(program, slot, out),
+            Instr::Input { path } if field(self.input, path).view().is_none() => {
+                out.append(field(self.input, path).slice(rows))
+            }
+            Instr::Const(Value::Unit) => out.append(ColumnValue::Units(rows.len())),
+            _ => out.extend_from_view(self.view(program, slot)),
         }
     }
 
@@ -150,14 +185,14 @@ impl<'a> Scratch<'a> {
         match instr {
             Instr::Un(op, a) => unaryop_result_column(*op, &self.view(program, *a as usize)),
             Instr::Bin(op, a, _) => binop_result_column(*op, &self.view(program, *a as usize)),
-            Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) => {
+            Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) | Instr::Wrap { .. } => {
                 unreachable!("only an operation writes a slot")
             }
         }
     }
 
-    /// Append an operation or record's current block to `out`, which must have its result type.
-    /// Nested records are built recursively because they have no scratch columns.
+    /// Append an operation or constructor's current block to `out`, which must have its result
+    /// type. Nested constructors are built recursively because they have no scratch columns.
     fn run(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
         match &program.instrs[slot] {
             Instr::Un(op, a) => apply_unaryop_views(*op, &self.view(program, *a as usize), out),
@@ -176,16 +211,25 @@ impl<'a> Scratch<'a> {
                     let column = columns
                         .get_mut(name)
                         .unwrap_or_else(|| panic!("the result has a column for the field {name}"));
-                    let field = *field as usize;
-                    match &program.instrs[field] {
-                        Instr::Record(_) => self.run(program, field, column),
-                        _ => column.extend_from_view(self.view(program, field)),
-                    }
+                    self.append(program, *field as usize, column);
                 }
             }
+            Instr::Wrap { tag, payload } => {
+                let ColumnValue::Union(arms) = out else {
+                    panic!("a wrap is appended to a union column, got {out:?}")
+                };
+                let arm = arms
+                    .get_mut(tag)
+                    .unwrap_or_else(|| panic!("the result has an arm for the tag {tag}"));
+                // A union's rows are numbered across the whole column, and every row of the
+                // result carries this one arm, so the block's rows are its positions in the input.
+                arm.extend_rows(self.start..self.start + self.len, |values| {
+                    self.append(program, *payload as usize, values)
+                });
+            }
             Instr::Input { .. } | Instr::Const(_) => unreachable!(
-                "s{slot} runs only as an operation, the last instruction or a field that is a \
-                 `Record`, and the last instruction is an operation or a `Record`"
+                "s{slot} runs only as an operation, the last instruction or a field or payload \
+                 that is a constructor, and the last instruction is an operation or a constructor"
             ),
         }
     }
@@ -220,6 +264,7 @@ impl ScalarProgram {
             len,
             "ScalarProgram::eval: one result row per input row"
         );
+        out.debug_assert_union_invariants();
         out
     }
 
@@ -245,35 +290,65 @@ impl ScalarProgram {
                         .map(|(name, field)| (name.clone(), empties[*field as usize].clone()))
                         .collect(),
                 ),
+                Instr::Wrap { tag, payload } => ColumnValue::Union(TagMap::from_arms(vec![(
+                    tag.clone(),
+                    UnionArm::new(Vec::new(), empties[*payload as usize].clone()),
+                )])),
             };
             empties.push(empty);
         }
         empties.pop().expect("a program has a last instruction")
     }
 
-    /// Check that records are used only to construct the result, never as operation operands.
-    /// The last instruction must be an operation or a record, not a borrowed input or constant.
-    fn records_build_only_the_result(&self) -> bool {
-        let is_record = |slot: &Slot| matches!(self.instrs[*slot as usize], Instr::Record(_));
+    /// Check that constructors are used only to build the result, never as operation operands:
+    /// each is the last instruction or a field or payload of a later constructor. The last
+    /// instruction must be an operation or a constructor, not a borrowed input or constant.
+    fn constructors_build_only_the_result(&self) -> bool {
+        let is_constructor = |slot: &Slot| self.instrs[*slot as usize].is_constructor();
         let last = self.instrs.len() - 1;
         let result_is_built = !matches!(self.instrs[last], Instr::Input { .. } | Instr::Const(_));
+        let builds = |later: &Instr, slot: usize| match later {
+            Instr::Record(fields) => fields.iter().any(|(_, field)| *field as usize == slot),
+            Instr::Wrap { payload, .. } => *payload as usize == slot,
+            _ => false,
+        };
         result_is_built
             && self
                 .instrs
                 .iter()
                 .enumerate()
                 .all(|(slot, instr)| match instr {
-                    Instr::Bin(_, a, b) => !is_record(a) && !is_record(b),
-                    Instr::Un(_, a) => !is_record(a),
-                    Instr::Record(_) => {
+                    Instr::Bin(_, a, b) => !is_constructor(a) && !is_constructor(b),
+                    Instr::Un(_, a) => !is_constructor(a),
+                    Instr::Record(_) | Instr::Wrap { .. } => {
                         slot == last
-                            || self.instrs[slot + 1..].iter().any(|later| {
-                                matches!(later, Instr::Record(fields)
-                            if fields.iter().any(|(_, field)| *field as usize == slot))
-                            })
+                            || self.instrs[slot + 1..]
+                                .iter()
+                                .any(|later| builds(later, slot))
                     }
                     Instr::Input { .. } | Instr::Const(_) => true,
                 })
+    }
+
+    /// Check that every operand of an operation has a view, for a program applied to values of
+    /// `input`. An operand has a view when it is an operation, or an input or constant whose
+    /// extent has one ([`has_view`]). A constructor, a `Unit` constant, and a `Unit` or union input
+    /// have none.
+    fn operands_have_views(&self, input: &Extent) -> bool {
+        let has_a_view = |slot: &Slot| match &self.instrs[*slot as usize] {
+            Instr::Input { path } => path
+                .iter()
+                .try_fold(input, |extent, name| extent.record_fields()?.get(name))
+                .is_some_and(has_view),
+            Instr::Const(value) => value_extent(value).as_ref().is_some_and(has_view),
+            Instr::Bin(..) | Instr::Un(..) => true,
+            Instr::Record(_) | Instr::Wrap { .. } => false,
+        };
+        self.instrs.iter().all(|instr| match instr {
+            Instr::Bin(_, a, b) => has_a_view(a) && has_a_view(b),
+            Instr::Un(_, a) => has_a_view(a),
+            Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) | Instr::Wrap { .. } => true,
+        })
     }
 }
 
@@ -297,6 +372,7 @@ impl std::fmt::Display for Instr {
                 }
                 write!(f, ")")
             }
+            Instr::Wrap { tag, payload } => write!(f, "`{tag}(s{payload})"),
         }
     }
 }
@@ -335,9 +411,16 @@ enum Val {
     Tuple(Vec<Val>),
     /// The arms of a `zip` of a record, by name.
     Record(Vec<(SmolStr, Val)>),
+    /// The payload of a variant at `tag`, with the extent of the whole union: what a
+    /// `variant_wrap` builds, or a variant constant. Only [`Parser::output`] reads it.
+    Wrap(FieldKey, Box<Val>, Extent),
 }
 
-struct Parser {
+struct Parser<'t> {
+    /// The extent of a type, as operator conversion reads it. The parser reads a union's arms
+    /// from it, since the payload of a `variant_wrap` or of a variant constant names only its own
+    /// arm.
+    extent_of: &'t dyn Fn(&Type) -> Option<Extent>,
     /// The instructions emitted so far. Instructions are appended, and removed only by
     /// [`Parser::truncate`].
     instrs: Vec<Instr>,
@@ -349,7 +432,7 @@ struct Parser {
     ops: usize,
 }
 
-impl Parser {
+impl Parser<'_> {
     fn emit(&mut self, instr: Instr) -> Slot {
         self.instrs.push(instr);
         (self.instrs.len() - 1) as Slot
@@ -367,29 +450,57 @@ impl Parser {
     fn column(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
             Val::Slot(slot, extent) => Some((*slot, extent.clone())),
-            Val::Read(path, extent) if has_view(extent) => {
-                let slot = match self.reads.get(path) {
-                    Some(&slot) => slot,
-                    None => {
-                        let slot = self.emit(Instr::Input { path: path.clone() });
-                        self.reads.insert(path.clone(), slot);
-                        slot
-                    }
-                };
-                Some((slot, extent.clone()))
-            }
+            Val::Read(path, extent) if has_view(extent) => Some((self.input(path), extent.clone())),
             Val::Const(value, extent) if has_view(extent) => {
                 Some((self.emit(Instr::Const(value.clone())), extent.clone()))
             }
-            Val::Read(..) | Val::Const(..) | Val::Tuple(_) | Val::Record(_) => None,
+            Val::Read(..) | Val::Const(..) | Val::Tuple(_) | Val::Record(_) | Val::Wrap(..) => None,
         }
     }
 
-    /// `value` at every position, when it has an extent a column of it can be read at: a base
-    /// value or a record of them.
-    fn constant(value: Value) -> Option<Val> {
-        let extent = value_extent(&value)?;
-        Some(Val::Const(value, extent))
+    /// The `Input` instruction reading `path`, emitted on the first read of it.
+    fn input(&mut self, path: &[SmolStr]) -> Slot {
+        if let Some(&slot) = self.reads.get(path) {
+            return slot;
+        }
+        let slot = self.emit(Instr::Input {
+            path: path.to_vec(),
+        });
+        self.reads.insert(path.to_vec(), slot);
+        slot
+    }
+
+    /// An input or constant with no view as a slot: a `Unit` one, or a union read from the input.
+    /// Only a constructor reads the slot, copying its rows.
+    fn copied(&mut self, v: &Val) -> Option<(Slot, Extent)> {
+        match v {
+            Val::Read(path, extent @ (Extent::Base(BaseType::Unit) | Extent::Union(_))) => {
+                Some((self.input(path), extent.clone()))
+            }
+            Val::Const(value @ Value::Unit, extent) => {
+                Some((self.emit(Instr::Const(value.clone())), extent.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// `value` at every position, with `extent` the extent of its values. A variant constant is
+    /// the [`Val::Wrap`] of its payload, so it builds a column as a `variant_wrap` does. A variant
+    /// has no value here when its extent is not a [plain](is_plain) union holding its tag.
+    fn constant(value: Value, extent: Extent) -> Option<Val> {
+        match value {
+            Value::Union { tag, inner } => {
+                let Extent::Union(arms) = &extent else {
+                    return None;
+                };
+                if !is_plain(&extent) {
+                    return None;
+                }
+                let payload = Self::constant(*inner, arms.get(&tag)?.clone())?;
+                Some(Val::Wrap(tag, Box::new(payload), extent))
+            }
+            value => Some(Val::Const(value, extent)),
+        }
     }
 
     /// The fields of a record `v`, each as the value of that field: the arms of a product built in
@@ -421,7 +532,7 @@ impl Parser {
                 values
                     .iter()
                     .map(|(name, value)| {
-                        let field = Val::Const(value.clone(), extents.get(name)?.clone());
+                        let field = Self::constant(value.clone(), extents.get(name)?.clone())?;
                         Some((name.clone(), field))
                     })
                     .collect()
@@ -432,9 +543,10 @@ impl Parser {
 
     /// `a op b` for a binary operation. Two records compare field by field over the fields
     /// [`compared_fields`] names, as `compare_records` compares the columns of two: `==` is the
-    /// conjunction of the fields' comparisons and `!=` their disjunction. A record against
-    /// anything but a record, two records with no field in common, and any other operation on a
-    /// record have no program.
+    /// conjunction of the fields' comparisons and `!=` their disjunction. A field whose compared
+    /// values hold only `unit` is equal at every row, so it drops out of either
+    /// ([`Parser::compares_only_units`]). A record against anything but a record, two records whose
+    /// shared fields all hold only `unit`, and any other operation on a record have no program.
     fn operation(&mut self, op: InterpreterBinOp, a: &Val, b: &Val) -> Option<(Slot, Extent)> {
         let InterpreterBinOp::Compare(kind @ (CompareKind::Equals | CompareKind::NotEquals)) = op
         else {
@@ -453,7 +565,9 @@ impl Parser {
                     LogicKind::Or
                 });
                 // In name order, so that equal chains give equal programs.
-                let mut fields: Vec<_> = compared_fields(&left, &right).collect();
+                let mut fields: Vec<_> = compared_fields(&left, &right)
+                    .filter(|(_, l, r)| !Self::compares_only_units(l, r))
+                    .collect();
                 fields.sort_by_key(|(name, ..)| *name);
                 let mut joined: Option<Slot> = None;
                 for (_, l, r) in fields {
@@ -466,6 +580,26 @@ impl Parser {
                 Some((joined?, binop_output_extent(&join)))
             }
             _ => None,
+        }
+    }
+
+    /// Whether a comparison of `l` and `r` reads only `unit`, so the two are equal at every row, as
+    /// `apply_binop_into` compares two `Units` columns. Both are of type `Unit`, or both are
+    /// records sharing at least one field, and every shared field compares only `unit`. Two
+    /// records sharing no field have no column to compare (`compare_records` reads none).
+    fn compares_only_units(l: &Val, r: &Val) -> bool {
+        let is_unit = |v: &Val| {
+            matches!(
+                v,
+                Val::Read(_, Extent::Base(BaseType::Unit)) | Val::Const(Value::Unit, _)
+            )
+        };
+        match (Self::fields_of(l), Self::fields_of(r)) {
+            (Some(left), Some(right)) => {
+                let mut shared = compared_fields(&left, &right).peekable();
+                shared.peek().is_some() && shared.all(|(_, l, r)| Self::compares_only_units(l, r))
+            }
+            _ => is_unit(l) && is_unit(r),
         }
     }
 
@@ -517,10 +651,31 @@ impl Parser {
                 let extent = op.output_extent(&operand);
                 Some(Val::Slot(self.emit(Instr::Un(op, a)), extent))
             }
+            // The union's arms come from the node's codomain, since the payload names only `tag`.
+            // A union with an arm that holds a collection is a union of tiles
+            // (`Tiling::from_extent`), not a column, so its wrap keeps the `VariantWrap` operator.
+            TypedExprNode::Builtin(Builtin::VariantWrap(tag)) => {
+                let extent = (self.extent_of)(&e.ty.codomain()?)?;
+                let Extent::Union(arms) = &extent else {
+                    return None;
+                };
+                if !is_plain(&extent) {
+                    return None;
+                }
+                arms.get(tag)?;
+                Some(Val::Wrap(tag.clone(), Box::new(cur), extent))
+            }
             TypedExprNode::Apply { argument, function } => match &function.node {
-                // `𝑐 ▷ const` for a closed value: the same value at every position.
+                // `𝑐 ▷ const` for a closed value: the same value at every position. A variant
+                // value names only its own arm, so a value holding one takes its extent from the
+                // node's codomain.
                 TypedExprNode::Builtin(Builtin::Const) => {
-                    Self::constant(expr_to_value(argument).ok()?)
+                    let value = expr_to_value(argument).ok()?;
+                    let extent = match value_extent(&value) {
+                        Some(extent) => extent,
+                        None => (self.extent_of)(&e.ty.codomain()?)?,
+                    };
+                    Self::constant(value, extent)
                 }
                 // Every arm is a function of the value the zip is applied to.
                 TypedExprNode::Builtin(Builtin::Zip) => match &argument.node {
@@ -560,19 +715,25 @@ impl Parser {
                 );
                 Some((*slot, extent.clone()))
             }
-            Val::Tuple(_) | Val::Record(_) => self.output(v),
+            Val::Tuple(_) | Val::Record(_) | Val::Wrap(..) => self.output(v),
             Val::Read(..) | Val::Const(..) => None,
         }
     }
 
-    /// `v` as a column of the result, with its extent. A record ([`Parser::fields_of`]) is a
-    /// `Record` of its fields' columns, down to columns of base types; anything else is its
-    /// column. A field with no column to read, such as one of `Unit` type, has none, and neither
-    /// has a product with no field, which has no column to count its rows.
+    /// `v` as a column of the result, with its extent. A variant is a `Wrap` of its payload's
+    /// column, and a record ([`Parser::fields_of`]) is a `Record` of its fields' columns. Anything
+    /// else is its own column: a computed one, a base value or `Unit` read from the input or held
+    /// as a constant, or a union read from the input. A product with no field has no column, since
+    /// nothing in it counts its rows.
     fn output(&mut self, v: &Val) -> Option<(Slot, Extent)> {
+        if let Val::Wrap(tag, payload, extent) = v {
+            let (payload, _) = self.output(payload)?;
+            let tag = tag.clone();
+            return Some((self.emit(Instr::Wrap { tag, payload }), extent.clone()));
+        }
         let mut fields: Vec<(SmolStr, Val)> = match Self::fields_of(v) {
             Some(fields) => fields.into_iter().collect(),
-            None => return self.column(v),
+            None => return self.column(v).or_else(|| self.copied(v)),
         };
         if fields.is_empty() {
             return None;
@@ -590,10 +751,11 @@ impl Parser {
     }
 }
 
-/// The extent of a closed value that a column of it can be read at: a base value or a record of
-/// them.
+/// The extent of a closed value, read from the value: a base value or a record of them. A variant
+/// names only its own arm, so it has no extent here.
 fn value_extent(value: &Value) -> Option<Extent> {
     Some(match value {
+        Value::Unit => Extent::Base(BaseType::Unit),
         Value::Int(_) => Extent::Base(BaseType::Int),
         Value::UInt(_) => Extent::Base(BaseType::UInt),
         Value::String(_) => Extent::Base(BaseType::String),
@@ -614,26 +776,34 @@ fn has_view(extent: &Extent) -> bool {
     matches!(extent, Extent::Base(base) if *base != BaseType::Unit)
 }
 
-/// Whether a column of `extent` is one `eval` can read from: a base type or a record of them.
+/// Whether a column of `extent` is one `eval` can read from: a base type, or a record or union of
+/// them. An operation reads only a base column other than `Unit`, and a constructor copies a
+/// `Unit` or union one.
 fn is_plain(extent: &Extent) -> bool {
     match extent {
         Extent::Base(_) => true,
         Extent::Record(fields) => fields.values().all(is_plain),
+        Extent::Union(arms) => arms.values().all(is_plain),
         _ => false,
     }
 }
 
 /// Return the longest prefix accepted by the scalar recognizer, or `None` if none is eligible.
-/// `input` is the extent of each input value.
+/// `input` is the extent of each input value, and `extent_of` gives the extent of a type.
 ///
-/// An eligible prefix ends at an operation or product and meets [`Parser::ops`]'s minimum count
+/// An eligible prefix ends at an operation, a product or a variant and meets [`Parser::ops`]'s minimum count
 /// of two. See `src/ccl/design/optimization.md`, "Element-wise chains", for supported forms and
 /// conversion boundaries.
-pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
+pub fn fuse_prefix(
+    chain: &[Expr],
+    input: &Extent,
+    extent_of: &dyn Fn(&Type) -> Option<Extent>,
+) -> Option<Fused> {
     if !is_plain(input) {
         return None;
     }
     let mut parser = Parser {
+        extent_of,
         instrs: Vec::new(),
         reads: HashMap::new(),
         ops: 0,
@@ -667,9 +837,13 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
         instrs: parser.instrs,
     };
     debug_assert!(
-        program.records_build_only_the_result(),
-        "a `Record` is the last instruction or a field of a later one, and no operation reads \
-         one; got {program}"
+        program.constructors_build_only_the_result(),
+        "a constructor is the last instruction or a field or payload of a later one, and no \
+         operation reads one; got {program}"
+    );
+    debug_assert!(
+        program.operands_have_views(input),
+        "an operation reads only a column with a view, over {input}; got {program}"
     );
     Some(Fused {
         program,
@@ -686,6 +860,13 @@ mod tests {
     use crate::ccl::RecordEntry;
     use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
     use crate::interpreter::apply_binop_column;
+
+    /// [`fuse_prefix`] for a chain that holds no variant, which reads no type's extent.
+    fn fuse(chain: &[Expr], input: &Extent) -> Option<Fused> {
+        fuse_prefix(chain, input, &|ty| {
+            panic!("a chain without a variant reads no type's extent, read {ty}")
+        })
+    }
 
     fn id() -> Expr {
         Expr::builtin(Builtin::Id)
@@ -734,7 +915,7 @@ mod tests {
 
     #[test]
     fn a_conjunction_of_comparisons_is_one_expression() {
-        let fused = fuse_prefix(&conjunction(), &int()).expect("every arm is element-wise");
+        let fused = fuse(&conjunction(), &int()).expect("every arm is element-wise");
         assert_eq!(fused.consumed, 2);
         assert_eq!(fused.codomain, Extent::Base(BaseType::Bool));
         let out = fused
@@ -755,7 +936,7 @@ mod tests {
             ]),
             binop(add),
         ];
-        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let fused = fuse(&chain, &int()).unwrap();
         assert_eq!(
             fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3])),
             ColumnValue::Ints(vec![2, 6, 12])
@@ -775,7 +956,7 @@ mod tests {
             zip(vec![id(), id()]),
             mul,
         ];
-        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let fused = fuse(&chain, &int()).unwrap();
         // The input, the constant, the sum and the product.
         assert_eq!(fused.program.instrs.len(), 4, "{}", fused.program);
         assert_eq!(
@@ -794,7 +975,7 @@ mod tests {
         );
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let chain = vec![zip(vec![Expr::proj_index(0), Expr::proj_index(0)]), add];
-        let fused = fuse_prefix(&chain, &record).unwrap();
+        let fused = fuse(&chain, &record).unwrap();
         let inputs = fused
             .program
             .instrs
@@ -818,7 +999,7 @@ mod tests {
         );
         let eq = binop(BinOpKind::Compare(CompareKind::Equals));
         let chain = vec![zip(vec![id(), pair]), eq];
-        let fused = fuse_prefix(&chain, &record).expect("a closed record is a constant");
+        let fused = fuse(&chain, &record).expect("a closed record is a constant");
         let n = 2 * BLOCK_ROWS + 5;
         let input = ColumnValue::Records(
             [
@@ -857,9 +1038,7 @@ mod tests {
             zip(vec![id(), closed_tuple(ns)]),
             binop(BinOpKind::Compare(op)),
         ];
-        Some(bools(
-            fuse_prefix(&chain, input_extent)?.program.eval(input),
-        ))
+        Some(bools(fuse(&chain, input_extent)?.program.eval(input)))
     }
 
     /// `n` rows of `(i % 2, 2, 7)` as a record column of `width` fields.
@@ -888,7 +1067,7 @@ mod tests {
             zip(vec![id(), closed_tuple(&[1, 2])]),
             binop(BinOpKind::Compare(CompareKind::Equals)),
         ];
-        let fused = fuse_prefix(&chain, &tuple_of_ints(2)).unwrap();
+        let fused = fuse(&chain, &tuple_of_ints(2)).unwrap();
         assert!(
             fused
                 .program
@@ -929,7 +1108,7 @@ mod tests {
             zip(vec![id(), nested]),
             binop(BinOpKind::Compare(CompareKind::Equals)),
         ];
-        let fused = fuse_prefix(&chain, &extent).expect("a nested record is compared by field");
+        let fused = fuse(&chain, &extent).expect("a nested record is compared by field");
         let is_one: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
         assert_eq!(bools(fused.program.eval(&input)), is_one);
     }
@@ -965,7 +1144,7 @@ mod tests {
         let (record, other) = (tuple_of_ints(2), record_of("x", int()));
         let consumed = |input: &Extent, constant: Expr, op: CompareKind| {
             let chain = vec![zip(vec![id(), constant]), binop(BinOpKind::Compare(op))];
-            fuse_prefix(&chain, input).map(|fused| fused.consumed)
+            fuse(&chain, input).map(|fused| fused.consumed)
         };
         assert_eq!(
             consumed(&record, closed_tuple(&[1, 2]), CompareKind::Equals),
@@ -991,7 +1170,7 @@ mod tests {
         let record = tuple_of_ints(2);
         let compare = |op, arms: Vec<Expr>| {
             let chain = vec![zip(arms), binop(BinOpKind::Compare(op))];
-            bools(fuse_prefix(&chain, &record).unwrap().program.eval(&input))
+            bools(fuse(&chain, &record).unwrap().program.eval(&input))
         };
         let (a, b) = (closed_tuple(&[1, 2]), closed_tuple(&[1, 3]));
         assert_eq!(
@@ -1021,7 +1200,7 @@ mod tests {
             binop(BinOpKind::Compare(CompareKind::Equals)),
         ]);
         let chain = vec![zip_record(vec![("a", eq)])];
-        let fused = fuse_prefix(&chain, &int()).expect("both records are built in the chain");
+        let fused = fuse(&chain, &int()).expect("both records are built in the chain");
         let records = fused
             .program
             .instrs
@@ -1050,7 +1229,7 @@ mod tests {
                 zip(vec![built.clone(), id()]),
                 binop(BinOpKind::Compare(op)),
             ];
-            let fused = fuse_prefix(&chain, &tuple_of_ints(2)).expect("the tuple is taken apart");
+            let fused = fuse(&chain, &tuple_of_ints(2)).expect("the tuple is taken apart");
             bools(fused.program.eval(&tuples(2, 5)))
         };
         let is_one: Vec<bool> = (0..5).map(|i| i % 2 == 1).collect();
@@ -1089,36 +1268,78 @@ mod tests {
                 zip(vec![id(), nested(last)]),
                 binop(BinOpKind::Compare(CompareKind::NotEquals)),
             ];
-            bools(fuse_prefix(&chain, &extent).unwrap().program.eval(&input))
+            bools(fuse(&chain, &extent).unwrap().program.eval(&input))
         };
         assert_eq!(ne(7), (0..n).map(|i| i % 2 == 0).collect::<Vec<_>>());
         assert_eq!(ne(8), vec![true; n]);
     }
 
     /// The fields come from the extents, so a column wider than the extent that names it compares
-    /// over the fields both sides name, and a field with no values to read is not compared.
+    /// over the fields both sides name.
     #[test]
     fn a_column_wider_than_its_extent_compares_over_the_extents_fields() {
         let n = 4;
         let wide = tuples(3, n);
         let got = compare_to_tuple(&tuple_of_ints(2), CompareKind::Equals, &[1, 2], &wide);
         assert_eq!(got.unwrap(), (0..n).map(|i| i % 2 == 1).collect::<Vec<_>>());
-        let unit = Extent::Record(
-            [
-                (SmolStr::from("u"), Extent::Base(BaseType::Unit)),
-                (SmolStr::from("x"), int()),
-            ]
-            .into_iter()
-            .collect(),
-        );
+    }
+
+    /// A field whose compared values hold only `unit` is equal at every row, so a comparison of
+    /// records leaves it out and agrees with the unfused comparison: `p.l == p.r` and `p.l != p.r`,
+    /// where `l` and `r` differ in `x` at some rows and share `u: Unit` and a nested `n`. The `n` of
+    /// `r` is wider than the `n` of `l`, and the field it adds is not compared.
+    #[test]
+    fn a_comparison_leaves_out_the_fields_that_hold_only_unit() {
+        let unit = || Extent::Base(BaseType::Unit);
+        let narrow = record_of_extents(vec![("u", unit())]);
+        let wide = record_of_extents(vec![("u", unit()), ("w", int())]);
+        let side = |n| record_of_extents(vec![("n", n), ("u", unit()), ("x", int())]);
+        let input = record_of_extents(vec![("l", side(narrow)), ("r", side(wide))]);
+        let rows = 4;
+        let units = || ColumnValue::Units(rows);
+        let records = |fields: Vec<(&str, ColumnValue)>| {
+            ColumnValue::Records(fields.into_iter().map(|(k, v)| (k.into(), v)).collect())
+        };
+        let l = records(vec![
+            ("n", records(vec![("u", units())])),
+            ("u", units()),
+            ("x", ColumnValue::Ints(vec![1, 2, 3, 4])),
+        ]);
+        let r = records(vec![
+            (
+                "n",
+                records(vec![
+                    ("u", units()),
+                    ("w", ColumnValue::Ints(vec![9; rows])),
+                ]),
+            ),
+            ("u", units()),
+            ("x", ColumnValue::Ints(vec![1, 0, 3, 0])),
+        ]);
+        let column = records(vec![("l", l.clone()), ("r", r.clone())]);
+        for kind in [CompareKind::Equals, CompareKind::NotEquals] {
+            let op = BinOpKind::Compare(kind);
+            let chain = vec![
+                zip(vec![Expr::proj_field("l"), Expr::proj_field("r")]),
+                binop(op),
+            ];
+            let fused = fuse(&chain, &input).expect("`x` is compared");
+            assert_eq!(fused.consumed, 2, "{kind:?}");
+            let want = apply_binop_column(op.into(), &l, &r);
+            assert_eq!(fused.program.eval(&column), want, "{kind:?}");
+        }
+    }
+
+    /// Two records whose shared fields all hold only `unit` have no field to compare, so the prefix
+    /// ends before the comparison: `p == p` over `{u: Unit}`.
+    #[test]
+    fn a_comparison_of_units_alone_has_no_program() {
+        let units = record_of_extents(vec![("u", Extent::Base(BaseType::Unit))]);
         let chain = vec![
             zip(vec![id(), id()]),
             binop(BinOpKind::Compare(CompareKind::Equals)),
         ];
-        assert!(
-            fuse_prefix(&chain, &unit).is_none(),
-            "a `Units` column has no view to compare"
-        );
+        assert_eq!(fuse(&chain, &units).map(|fused| fused.consumed), Some(1));
     }
 
     /// Equal chains give equal programs, whatever order a hash map holds the record's fields in.
@@ -1129,9 +1350,9 @@ mod tests {
             zip(vec![id(), closed_tuple(&(0..12).collect::<Vec<_>>())]),
             binop(BinOpKind::Compare(CompareKind::Equals)),
         ];
-        let first = fuse_prefix(&chain, &wide).unwrap().program;
+        let first = fuse(&chain, &wide).unwrap().program;
         for _ in 0..8 {
-            assert_eq!(fuse_prefix(&chain, &wide).unwrap().program, first);
+            assert_eq!(fuse(&chain, &wide).unwrap().program, first);
         }
     }
 
@@ -1141,7 +1362,7 @@ mod tests {
     fn the_prefix_ends_before_a_trailing_constant() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let chain = vec![zip(vec![id(), constant(1)]), add, constant(5)];
-        assert_eq!(fuse_prefix(&chain, &int()).unwrap().consumed, 2);
+        assert_eq!(fuse(&chain, &int()).unwrap().consumed, 2);
     }
 
     /// `7 - x` and `x - 7` keep their operand order through the zip.
@@ -1151,7 +1372,7 @@ mod tests {
         let left = vec![zip(vec![constant(7), id()]), sub.clone()];
         let right = vec![zip(vec![id(), constant(7)]), sub];
         let input = || ColumnValue::Ints(vec![1, 10]);
-        let eval = |chain: &[Expr]| fuse_prefix(chain, &int()).unwrap().program.eval(&input());
+        let eval = |chain: &[Expr]| fuse(chain, &int()).unwrap().program.eval(&input());
         assert_eq!(eval(&left), ColumnValue::Ints(vec![6, -3]));
         assert_eq!(eval(&right), ColumnValue::Ints(vec![-6, 3]));
     }
@@ -1165,7 +1386,7 @@ mod tests {
         );
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let chain = vec![zip(vec![Expr::proj_index(0), Expr::proj_index(1)]), add];
-        let fused = fuse_prefix(&chain, &record).unwrap();
+        let fused = fuse(&chain, &record).unwrap();
         let input = ColumnValue::Records(
             [
                 (tuple_field(0), ColumnValue::Ints(vec![1, 2])),
@@ -1183,30 +1404,28 @@ mod tests {
     #[test]
     fn adding_a_constant_fuses_and_a_lone_unary_operation_does_not() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
-        let fused = fuse_prefix(&[zip(vec![id(), constant(1)]), add], &int()).unwrap();
+        let fused = fuse(&[zip(vec![id(), constant(1)]), add], &int()).unwrap();
         assert_eq!(fused.consumed, 2);
         assert_eq!(
             fused.program.eval(&ColumnValue::Ints(vec![1, 2])),
             ColumnValue::Ints(vec![2, 3])
         );
-        assert!(fuse_prefix(&[Expr::builtin(Builtin::Neg)], &int()).is_none());
+        assert!(fuse(&[Expr::builtin(Builtin::Neg)], &int()).is_none());
         let bools = Extent::Base(BaseType::Bool);
-        assert!(fuse_prefix(&[Expr::builtin(Builtin::NotFn)], &bools).is_none());
+        assert!(fuse(&[Expr::builtin(Builtin::NotFn)], &bools).is_none());
     }
 
     #[test]
     fn a_lone_operation_is_left_to_its_own_conversion() {
-        assert!(fuse_prefix(&[Expr::builtin(Builtin::Neg)], &int()).is_none());
-        assert!(
-            fuse_prefix(&[binop(BinOpKind::Arithmetic(ArithmeticKind::Add))], &int()).is_none()
-        );
+        assert!(fuse(&[Expr::builtin(Builtin::Neg)], &int()).is_none());
+        assert!(fuse(&[binop(BinOpKind::Arithmetic(ArithmeticKind::Add))], &int()).is_none());
     }
 
     /// Two operations fuse whether or not a `zip` joins them.
     #[test]
     fn a_chain_of_unary_operations_fuses_without_a_zip() {
         let chain = vec![Expr::builtin(Builtin::Neg), Expr::builtin(Builtin::Neg)];
-        let fused = fuse_prefix(&chain, &int()).expect("two operations");
+        let fused = fuse(&chain, &int()).expect("two operations");
         assert_eq!(fused.consumed, 2);
         assert_eq!(
             fused.program.eval(&ColumnValue::Ints(vec![1, -2, 3])),
@@ -1214,7 +1433,7 @@ mod tests {
         );
         let bools = Extent::Base(BaseType::Bool);
         let chain = vec![Expr::builtin(Builtin::NotFn), Expr::builtin(Builtin::NotFn)];
-        let fused = fuse_prefix(&chain, &bools).expect("two operations");
+        let fused = fuse(&chain, &bools).expect("two operations");
         let input = vec![true, false, true];
         assert_eq!(
             fused.program.eval(&ColumnValue::Bools(input.clone())),
@@ -1227,7 +1446,7 @@ mod tests {
     fn the_prefix_ends_before_an_aggregate() {
         let mut chain = conjunction();
         chain.push(Expr::builtin(Builtin::Sum));
-        assert_eq!(fuse_prefix(&chain, &int()).unwrap().consumed, 2);
+        assert_eq!(fuse(&chain, &int()).unwrap().consumed, 2);
     }
 
     /// `zip` of a record with the arms `arms`, by name.
@@ -1272,7 +1491,7 @@ mod tests {
     #[test]
     fn a_tuple_result_is_one_column_of_records() {
         let chain = vec![zip(vec![arith(ArithmeticKind::Add, 1), id(), constant(7)])];
-        let fused = fuse_prefix(&chain, &int()).expect("every arm is element-wise");
+        let fused = fuse(&chain, &int()).expect("every arm is element-wise");
         assert_eq!(fused.consumed, 1);
         assert_eq!(fused.codomain, tuple_of_ints(3));
         let out = fused.program.eval(&ColumnValue::Ints(vec![1, 2]));
@@ -1295,7 +1514,7 @@ mod tests {
                 ]),
             ),
         ])];
-        let fused = fuse_prefix(&chain, &int()).expect("every arm is element-wise");
+        let fused = fuse(&chain, &int()).expect("every arm is element-wise");
         let inner = record_of_extents(vec![("c", int()), ("d", int())]);
         assert_eq!(
             fused.codomain,
@@ -1318,7 +1537,7 @@ mod tests {
             binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
         ]);
         let chain = vec![zip(vec![id(), first_plus_one, constant(100)])];
-        let fused = fuse_prefix(&chain, &pair).expect("one field is computed");
+        let fused = fuse(&chain, &pair).expect("one field is computed");
         assert_eq!(
             fused.codomain,
             record_of_extents(vec![("_0", pair), ("_1", int()), ("_2", int())])
@@ -1340,7 +1559,7 @@ mod tests {
             Expr::builtin(Builtin::Const),
         );
         let chain = vec![zip(vec![arith(ArithmeticKind::Add, 1), record])];
-        let fused = fuse_prefix(&chain, &int()).expect("one field is computed");
+        let fused = fuse(&chain, &int()).expect("one field is computed");
         let n = BLOCK_ROWS + 3;
         let out = fused.program.eval(&ramp(n));
         let constant = field_of(&out, "_1");
@@ -1362,7 +1581,7 @@ mod tests {
                 zip_record(vec![("c", arith(ArithmeticKind::Mul, 2)), ("d", id())]),
             ),
         ])];
-        let fused = fuse_prefix(&chain, &int()).expect("every arm is element-wise");
+        let fused = fuse(&chain, &int()).expect("every arm is element-wise");
         let n = 2 * BLOCK_ROWS + 3;
         let input = ramp(n);
         let xs: Vec<i64> = (0..n as i64).map(|i| i * 7 % 3000).collect();
@@ -1381,7 +1600,7 @@ mod tests {
     #[test]
     fn a_product_of_reads_and_constants_fuses() {
         let chain = vec![zip(vec![id(), constant(1)])];
-        let fused = fuse_prefix(&chain, &int()).expect("a zip is two operations");
+        let fused = fuse(&chain, &int()).expect("a zip is two operations");
         let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![1, 1]));
@@ -1391,32 +1610,359 @@ mod tests {
             Expr::proj_index(0),
             closed_tuple(&[1, 2]),
         ])];
-        let fused = fuse_prefix(&swapped, &pair).expect("two projections and a constant");
+        let fused = fuse(&swapped, &pair).expect("two projections and a constant");
         let out = fused.program.eval(&tuples(2, 3));
         assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![2; 3]));
         assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![0, 1, 0]));
-        let fused = fuse_prefix(&[zip(vec![id(), id()])], &int()).expect("a zip of identities");
+        let fused = fuse(&[zip(vec![id(), id()])], &int()).expect("a zip of identities");
         let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![4, 5]));
         let one_field = [zip_record(vec![("a", id())])];
-        let fused = fuse_prefix(&one_field, &int()).expect("a zip of one arm");
+        let fused = fuse(&one_field, &int()).expect("a zip of one arm");
         let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "a"), &ColumnValue::Ints(vec![4, 5]));
     }
 
-    /// A field with no column to read declines the product: a `Units` column has no view.
+    /// A `Unit` field read from the input is copied into the result: `(p, p.x + 1)` over
+    /// `{u: Unit, x: Int}`.
     #[test]
-    fn a_product_with_a_unit_field_is_not_fused() {
+    fn a_unit_field_of_the_input_is_copied() {
         let unit = record_of_extents(vec![("u", Extent::Base(BaseType::Unit)), ("x", int())]);
         let x_plus_one = Expr::compose(vec![
             zip(vec![Expr::proj_field("x"), constant(1)]),
             binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
         ]);
-        let with_unit = vec![zip(vec![id(), x_plus_one.clone()])];
-        assert!(fuse_prefix(&with_unit, &unit).is_none());
-        let without = vec![zip(vec![Expr::proj_field("x"), x_plus_one])];
-        assert!(fuse_prefix(&without, &unit).is_some());
+        let fused = fuse(&[zip(vec![id(), x_plus_one])], &unit).expect("a `Unit` field is copied");
+        let input = ColumnValue::Records(HashMap::from([
+            ("u".into(), ColumnValue::Units(3)),
+            ("x".into(), ColumnValue::Ints(vec![1, 2, 3])),
+        ]));
+        let out = fused.program.eval(&input);
+        assert_eq!(field_of(&out, "_0"), &input);
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![2, 3, 4]));
+    }
+
+    fn tag(name: &str) -> FieldKey {
+        FieldKey::Name(name.into())
+    }
+
+    /// ``{`none | `some{Int}}``.
+    fn option_type() -> Type {
+        Type::variant(vec![
+            (tag("none"), Type::Base(BaseType::Unit)),
+            (tag("some"), Type::Base(BaseType::Int)),
+        ])
+    }
+
+    /// The extent of [`option_type`].
+    fn option_extent() -> Extent {
+        Extent::Union(TagMap::from_arms(vec![
+            (tag("none"), Extent::Base(BaseType::Unit)),
+            (tag("some"), int()),
+        ]))
+    }
+
+    /// [`fuse_prefix`] where every type read is [`option_type`].
+    fn fuse_options(chain: &[Expr], input: &Extent) -> Option<Fused> {
+        fuse_prefix(chain, input, &|ty| {
+            assert_eq!(*ty, option_type(), "only an option's extent is read");
+            Some(option_extent())
+        })
+    }
+
+    /// ``variant_wrap(`tag) : Int ⇒ {`none | `some{Int}}``.
+    fn wrap(name: &str) -> Expr {
+        Expr::builtin(Builtin::VariantWrap(tag(name)))
+            .with_ty(Type::fun(Type::Base(BaseType::Int), option_type()))
+    }
+
+    /// ``(`none(unit) ▷ const) : Int ⇒ {`none | `some{Int}}``.
+    fn none() -> Expr {
+        let ctor = Expr::variant_ctor("none", Occurrence::mint(), Expr::lit(Lit::Unit));
+        Expr::apply(ctor, Expr::builtin(Builtin::Const))
+            .with_ty(Type::fun(Type::Base(BaseType::Int), option_type()))
+    }
+
+    /// A wrap at the end of a chain yields a union column of one arm, numbered by input row
+    /// across blocks: ``x + 1 ≫ variant_wrap(`some)`` over 2,500 rows.
+    #[test]
+    fn a_wrap_yields_a_union_column_of_one_arm() {
+        let chain = vec![arith(ArithmeticKind::Add, 1), wrap("some")];
+        let fused = fuse_options(&chain, &int()).expect("an operation and a wrap");
+        assert_eq!(fused.consumed, 2);
+        assert_eq!(fused.codomain, option_extent());
+        let n = 2_500;
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        let some = UnionArm::new(
+            (0..n as usize).collect(),
+            ColumnValue::Ints((1..=n).collect()),
+        );
+        assert_eq!(
+            out,
+            ColumnValue::Union(TagMap::from_arms(vec![(tag("some"), some)]))
+        );
+    }
+
+    /// A variant constant is the wrap of its payload, and a `Unit` payload is a `Units` column
+    /// that grows block by block: ``(a: x * 2, b: `none(unit))`` over 2,500 rows.
+    #[test]
+    fn a_variant_constant_is_a_field() {
+        let chain = vec![zip_record(vec![
+            ("a", arith(ArithmeticKind::Mul, 2)),
+            ("b", none()),
+        ])];
+        let fused = fuse_options(&chain, &int()).expect("an operation and a constant");
+        let n = 2_500;
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        assert_eq!(
+            field_of(&out, "a"),
+            &ColumnValue::Ints((0..n).map(|x| x * 2).collect())
+        );
+        let none = UnionArm::new((0..n as usize).collect(), ColumnValue::Units(n as usize));
+        assert_eq!(
+            field_of(&out, "b"),
+            &ColumnValue::Union(TagMap::from_arms(vec![(tag("none"), none)]))
+        );
+    }
+
+    /// A union field of the input is copied into the result row for row, with no type read:
+    /// `(c: p.b, d: p.a + 1)` over 2,500 rows whose `b` alternates between the arms.
+    #[test]
+    fn a_union_field_of_the_input_is_copied_across_blocks() {
+        let input = record_of_extents(vec![("a", int()), ("b", option_extent())]);
+        let a_plus_one = Expr::compose(vec![
+            zip(vec![Expr::proj_field("a"), constant(1)]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
+        ]);
+        let chain = vec![zip_record(vec![
+            ("c", Expr::proj_field("b")),
+            ("d", a_plus_one),
+        ])];
+        let fused = fuse(&chain, &input).expect("a copied field and an operation");
+        let n = 2_500;
+        let options: Vec<Value> = (0..n)
+            .map(|i| Value::Union {
+                tag: tag(if i % 2 == 0 { "some" } else { "none" }),
+                inner: Box::new(if i % 2 == 0 {
+                    Value::Int(i)
+                } else {
+                    Value::Unit
+                }),
+            })
+            .collect();
+        let b = ColumnValue::from_values(options.clone(), &option_extent());
+        let column = ColumnValue::Records(HashMap::from([
+            ("a".into(), ColumnValue::Ints((0..n).collect())),
+            ("b".into(), b),
+        ]));
+        let out = fused.program.eval(&column);
+        let c = field_of(&out, "c");
+        assert_eq!(
+            (0..n as usize).map(|i| c.index_at(i)).collect::<Vec<_>>(),
+            options
+        );
+        assert_eq!(field_of(&out, "d"), &ColumnValue::Ints((1..=n).collect()));
+    }
+
+    /// [`fuse_prefix`] where each type read is one of `types`, with its extent.
+    fn fuse_typed(chain: &[Expr], input: &Extent, types: &[(Type, Extent)]) -> Option<Fused> {
+        fuse_prefix(chain, input, &|ty| {
+            let found = types.iter().find(|(t, _)| t == ty);
+            Some(
+                found
+                    .unwrap_or_else(|| panic!("no extent for {ty}"))
+                    .1
+                    .clone(),
+            )
+        })
+    }
+
+    /// ``variant_wrap(`name) : payload ⇒ union``.
+    fn wrap_into(name: &str, payload: Type, union: Type) -> Expr {
+        Expr::builtin(Builtin::VariantWrap(tag(name))).with_ty(Type::fun(payload, union))
+    }
+
+    /// A wrap of a wrap is a union column whose payload is a union column, each numbered by input
+    /// row across blocks: ``x + 1 ≫ variant_wrap(`inner) ≫ variant_wrap(`outer)``.
+    #[test]
+    fn a_wrap_of_a_wrap_nests_union_columns() {
+        let inner_ty = Type::variant(vec![(tag("inner"), Type::Base(BaseType::Int))]);
+        let outer_ty = Type::variant(vec![(tag("outer"), inner_ty.clone())]);
+        let inner = Extent::Union(TagMap::from_arms(vec![(tag("inner"), int())]));
+        let outer = Extent::Union(TagMap::from_arms(vec![(tag("outer"), inner.clone())]));
+        let chain = vec![
+            arith(ArithmeticKind::Add, 1),
+            wrap_into("inner", Type::Base(BaseType::Int), inner_ty.clone()),
+            wrap_into("outer", inner_ty.clone(), outer_ty.clone()),
+        ];
+        let types = [(inner_ty, inner), (outer_ty, outer.clone())];
+        let fused = fuse_typed(&chain, &int(), &types).expect("an operation and two wraps");
+        assert_eq!(fused.consumed, 3);
+        assert_eq!(fused.codomain, outer);
+        let n = 2_500;
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        let rows = || (0..n as usize).collect::<Vec<_>>();
+        let inner = UnionArm::new(rows(), ColumnValue::Ints((1..=n).collect()));
+        let inner = ColumnValue::Union(TagMap::from_arms(vec![(tag("inner"), inner)]));
+        let outer = UnionArm::new(rows(), inner);
+        assert_eq!(
+            out,
+            ColumnValue::Union(TagMap::from_arms(vec![(tag("outer"), outer)]))
+        );
+    }
+
+    /// A wrap of a product holds a column of records: ``(a: x + 1, b: x) ▷ zip ≫ variant_wrap(`r)``.
+    #[test]
+    fn a_wrap_of_a_product_holds_a_column_of_records() {
+        let int_ty = || Type::Base(BaseType::Int);
+        let pair_ty = Type::Record(vec![("a".into(), int_ty()), ("b".into(), int_ty())]);
+        let r_ty = Type::variant(vec![(tag("r"), pair_ty.clone())]);
+        let pair = record_of_extents(vec![("a", int()), ("b", int())]);
+        let r = Extent::Union(TagMap::from_arms(vec![(tag("r"), pair)]));
+        let chain = vec![
+            zip_record(vec![("a", arith(ArithmeticKind::Add, 1)), ("b", id())]),
+            wrap_into("r", pair_ty, r_ty.clone()),
+        ];
+        let fused = fuse_typed(&chain, &int(), &[(r_ty, r)]).expect("a product and a wrap");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![1, 2]));
+        let ColumnValue::Union(arms) = &out else {
+            panic!("expected a union column, got {out:?}")
+        };
+        let arm = arms.get(&tag("r")).expect("the `r` arm");
+        assert_eq!(arm.rows(), [0, 1]);
+        assert_eq!(field_of(arm.values(), "a"), &ColumnValue::Ints(vec![2, 3]));
+        assert_eq!(field_of(arm.values(), "b"), &ColumnValue::Ints(vec![1, 2]));
+    }
+
+    /// A record constant holding a variant is a record column whose variant field is a wrap of
+    /// its payload: ``(c: (a: 1, b: `none(unit)) ▷ const, d: x + 1)``.
+    #[test]
+    fn a_record_constant_holding_a_variant_is_a_field() {
+        let entry = |name: &str, value: Expr| RecordEntry::new(name, Occurrence::mint(), value);
+        let literal = Expr::new(TypedExprNode::Record(vec![
+            entry("a", Expr::lit(Lit::Int(1))),
+            entry(
+                "b",
+                Expr::variant_ctor("none", Occurrence::mint(), Expr::lit(Lit::Unit)),
+            ),
+        ]));
+        let record_ty = Type::Record(vec![
+            ("a".into(), Type::Base(BaseType::Int)),
+            ("b".into(), option_type()),
+        ]);
+        let record = record_of_extents(vec![("a", int()), ("b", option_extent())]);
+        let constant = Expr::apply(literal, Expr::builtin(Builtin::Const))
+            .with_ty(Type::fun(Type::Base(BaseType::Int), record_ty.clone()));
+        let chain = vec![zip_record(vec![
+            ("c", constant),
+            ("d", arith(ArithmeticKind::Add, 1)),
+        ])];
+        let fused = fuse_typed(&chain, &int(), &[(record_ty, record)]).expect("a record constant");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![5, 6]));
+        let c = field_of(&out, "c");
+        assert_eq!(field_of(c, "a"), &ColumnValue::Ints(vec![1, 1]));
+        let none = UnionArm::new(vec![0, 1], ColumnValue::Units(2));
+        assert_eq!(
+            field_of(c, "b"),
+            &ColumnValue::Union(TagMap::from_arms(vec![(tag("none"), none)]))
+        );
+        assert_eq!(field_of(&out, "d"), &ColumnValue::Ints(vec![6, 7]));
+    }
+
+    /// An empty input yields an empty union column with the wrapped arm.
+    #[test]
+    fn a_wrap_over_no_rows_is_an_empty_union_column() {
+        let chain = vec![arith(ArithmeticKind::Add, 1), wrap("some")];
+        let fused = fuse_options(&chain, &int()).expect("an operation and a wrap");
+        let some = UnionArm::new(Vec::new(), ColumnValue::Ints(Vec::new()));
+        assert_eq!(
+            fused.program.eval(&ColumnValue::Ints(Vec::new())),
+            ColumnValue::Union(TagMap::from_arms(vec![(tag("some"), some)]))
+        );
+    }
+
+    /// The prefix ends before a wrap whose union is unknown, lacks the tag, or has an arm that
+    /// holds a collection, which is a union of tiles rather than a column.
+    #[test]
+    fn the_prefix_ends_before_a_wrap_with_no_column() {
+        let chain = vec![arith(ArithmeticKind::Add, 1), wrap("some")];
+        assert_eq!(
+            fuse_prefix(&chain, &int(), &|_| None).map(|f| f.consumed),
+            Some(1)
+        );
+        let other = vec![arith(ArithmeticKind::Add, 1), wrap("other")];
+        assert_eq!(fuse_options(&other, &int()).map(|f| f.consumed), Some(1));
+        let with_a_collection = Extent::Union(TagMap::from_arms(vec![
+            (tag("none"), Extent::Base(BaseType::Unit)),
+            (
+                tag("some"),
+                Extent::Function {
+                    domain: Box::new(Extent::Base(BaseType::UInt)),
+                    codomain: Box::new(int()),
+                },
+            ),
+        ]));
+        let consumed =
+            fuse_prefix(&chain, &int(), &|_| Some(with_a_collection.clone())).map(|f| f.consumed);
+        assert_eq!(consumed, Some(1));
+    }
+
+    /// A wrap of a union field copied from the input holds the copied column as its payload:
+    /// ``p.b ≫ variant_wrap(`w)`` over 2,500 rows.
+    #[test]
+    fn a_wrap_of_a_copied_union_holds_the_copy() {
+        let input = record_of_extents(vec![("a", int()), ("b", option_extent())]);
+        let w_ty = Type::variant(vec![(tag("w"), option_type())]);
+        let w = Extent::Union(TagMap::from_arms(vec![(tag("w"), option_extent())]));
+        let chain = vec![
+            Expr::proj_field("b"),
+            wrap_into("w", option_type(), w_ty.clone()),
+        ];
+        let fused = fuse_typed(&chain, &input, &[(w_ty, w)]).expect("a projection and a wrap");
+        let n = 2_500;
+        let options: Vec<Value> = (0..n)
+            .map(|i| Value::Union {
+                tag: tag(if i % 3 == 0 { "none" } else { "some" }),
+                inner: Box::new(if i % 3 == 0 {
+                    Value::Unit
+                } else {
+                    Value::Int(i)
+                }),
+            })
+            .collect();
+        let column = ColumnValue::Records(HashMap::from([
+            ("a".into(), ColumnValue::Ints((0..n).collect())),
+            (
+                "b".into(),
+                ColumnValue::from_values(options.clone(), &option_extent()),
+            ),
+        ]));
+        let out = fused.program.eval(&column);
+        let ColumnValue::Union(arms) = &out else {
+            panic!("expected a union column, got {out:?}")
+        };
+        let arm = arms.get(&tag("w")).expect("the `w` arm");
+        assert_eq!(arm.rows(), (0..n as usize).collect::<Vec<_>>());
+        let payload = arm.values();
+        assert_eq!(
+            (0..n as usize)
+                .map(|i| payload.index_at(i))
+                .collect::<Vec<_>>(),
+            options
+        );
+    }
+
+    /// No operation reads a variant, so the prefix ends before a comparison of two:
+    /// ``(variant_wrap(`some), `none(unit) ▷ const) ▷ zip ≫ eq`` fuses the `zip` alone.
+    #[test]
+    fn an_operation_does_not_read_a_variant() {
+        let chain = vec![
+            zip(vec![wrap("some"), none()]),
+            binop(BinOpKind::Compare(CompareKind::Equals)),
+        ];
+        let fused = fuse_options(&chain, &int()).expect("the zip builds a product of variants");
+        assert_eq!(fused.consumed, 1);
     }
 
     /// A computed value that two fields and an operation read is one slot, computed once and copied
@@ -1428,7 +1974,7 @@ mod tests {
             arith(ArithmeticKind::Add, 1),
             zip(vec![id(), id(), arith(ArithmeticKind::Mul, 2)]),
         ];
-        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let fused = fuse(&chain, &int()).unwrap();
         let adds = fused
             .program
             .instrs
@@ -1448,7 +1994,7 @@ mod tests {
     fn a_product_the_chain_reads_on_leaves_no_instruction_behind() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let chain = vec![zip(vec![id(), constant(1)]), add];
-        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let fused = fuse(&chain, &int()).unwrap();
         assert_eq!(fused.consumed, 2);
         assert_eq!(fused.program.instrs.len(), 3, "{}", fused.program);
         assert!(
@@ -1463,12 +2009,12 @@ mod tests {
     #[test]
     fn a_prefix_can_end_at_a_product() {
         let product = zip(vec![arith(ArithmeticKind::Add, 1), id()]);
-        let alone = fuse_prefix(std::slice::from_ref(&product), &int()).unwrap();
+        let alone = fuse(std::slice::from_ref(&product), &int()).unwrap();
         let abandoned = zip(vec![
             binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
             Expr::builtin(Builtin::Sum),
         ]);
-        let fused = fuse_prefix(&[product, abandoned], &int()).unwrap();
+        let fused = fuse(&[product, abandoned], &int()).unwrap();
         assert_eq!(fused.consumed, 1);
         assert_eq!(fused.program, alone.program);
     }
@@ -1483,7 +2029,7 @@ mod tests {
             ("big", compare(CompareKind::Greater, 1000)),
             ("seven", constant(7)),
         ])];
-        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let fused = fuse(&chain, &int()).unwrap();
         for n in [
             0,
             1,
@@ -1519,8 +2065,8 @@ mod tests {
             ("a", arith(ArithmeticKind::Add, 1)),
             ("b", zip_record(vec![("c", id()), ("d", constant(1))])),
         ])];
-        let program = fuse_prefix(&chain, &int()).unwrap().program;
-        assert!(program.records_build_only_the_result(), "{program}");
+        let program = fuse(&chain, &int()).unwrap().program;
+        assert!(program.constructors_build_only_the_result(), "{program}");
         let records: Vec<usize> = program
             .instrs
             .iter()
@@ -1536,7 +2082,7 @@ mod tests {
                 Instr::Un(UnaryOpKind::Neg, 1),
             ],
         };
-        assert!(!read.records_build_only_the_result());
+        assert!(!read.constructors_build_only_the_result());
         let unnamed = ScalarProgram {
             instrs: vec![
                 Instr::Input { path: Vec::new() },
@@ -1544,11 +2090,70 @@ mod tests {
                 Instr::Un(UnaryOpKind::Neg, 0),
             ],
         };
-        assert!(!unnamed.records_build_only_the_result());
+        assert!(!unnamed.constructors_build_only_the_result());
         let bare_read = ScalarProgram {
             instrs: vec![Instr::Input { path: Vec::new() }],
         };
-        assert!(!bare_read.records_build_only_the_result());
+        assert!(!bare_read.constructors_build_only_the_result());
+        let wrap_read = ScalarProgram {
+            instrs: vec![
+                Instr::Input { path: Vec::new() },
+                Instr::Wrap {
+                    tag: tag("some"),
+                    payload: 0,
+                },
+                Instr::Un(UnaryOpKind::Neg, 1),
+            ],
+        };
+        assert!(!wrap_read.constructors_build_only_the_result());
+    }
+
+    /// An operation reads only a column with a view: not a `Unit` constant, and not a `Unit` or
+    /// union input, which the program tells apart only by the extent it is applied to.
+    #[test]
+    fn an_operation_reads_only_a_column_with_a_view() {
+        let compare = |a, b| Instr::Bin(BinOpKind::Compare(CompareKind::Equals).into(), a, b);
+        let ints = ScalarProgram {
+            instrs: vec![
+                Instr::Input { path: Vec::new() },
+                Instr::Const(Value::Int(1)),
+                compare(0, 1),
+            ],
+        };
+        assert!(ints.operands_have_views(&int()));
+        let unit_constant = ScalarProgram {
+            instrs: vec![
+                Instr::Input { path: Vec::new() },
+                Instr::Const(Value::Unit),
+                compare(0, 1),
+            ],
+        };
+        assert!(!unit_constant.operands_have_views(&int()));
+        let negated = ScalarProgram {
+            instrs: vec![
+                Instr::Input {
+                    path: vec!["b".into()],
+                },
+                Instr::Un(UnaryOpKind::Neg, 0),
+            ],
+        };
+        let with = |b| record_of_extents(vec![("a", int()), ("b", b)]);
+        assert!(negated.operands_have_views(&with(int())));
+        assert!(!negated.operands_have_views(&with(option_extent())));
+        assert!(!negated.operands_have_views(&with(Extent::Base(BaseType::Unit))));
+        assert!(
+            !negated.operands_have_views(&int()),
+            "`b` names no field of an `Int`"
+        );
+        let chained = ScalarProgram {
+            instrs: vec![
+                Instr::Input { path: Vec::new() },
+                Instr::Const(Value::Int(1)),
+                compare(0, 1),
+                Instr::Un(UnaryOpKind::Not, 2),
+            ],
+        };
+        assert!(chained.operands_have_views(&int()));
     }
 
     /// The output lists a record's fields in name order, whatever order the `zip` lists them in.
@@ -1560,8 +2165,8 @@ mod tests {
                 ("a", arith(ArithmeticKind::Add, 1)),
             ]
         };
-        let listed = fuse_prefix(&[zip_record(arms())], &int()).unwrap();
-        let reversed = fuse_prefix(&[zip_record(arms().into_iter().rev().collect())], &int());
+        let listed = fuse(&[zip_record(arms())], &int()).unwrap();
+        let reversed = fuse(&[zip_record(arms().into_iter().rev().collect())], &int());
         let Some(Instr::Record(fields)) = listed.program.instrs.last() else {
             panic!("a record output, got {}", listed.program)
         };
@@ -1580,7 +2185,7 @@ mod tests {
             zip(vec![id(), Expr::builtin(Builtin::Sum)]),
             binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
         ];
-        assert!(fuse_prefix(&chain, &int()).is_none());
+        assert!(fuse(&chain, &int()).is_none());
     }
 
     #[test]
@@ -1589,7 +2194,7 @@ mod tests {
             domain: Box::new(int()),
             codomain: Box::new(int()),
         };
-        assert!(fuse_prefix(&conjunction(), &function).is_none());
+        assert!(fuse(&conjunction(), &function).is_none());
     }
 
     /// An element the parse abandons part-way leaves the instructions it emitted past the chosen
@@ -1598,7 +2203,7 @@ mod tests {
     fn an_abandoned_attempt_leaves_the_same_program() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let plain = vec![zip(vec![id(), constant(1)]), add.clone()];
-        let plain = fuse_prefix(&plain, &int()).unwrap().program;
+        let plain = fuse(&plain, &int()).unwrap().program;
         // A good prefix, then a `zip` whose second arm is not element-wise.
         let abandoned = vec![
             zip(vec![id(), constant(1)]),
@@ -1608,7 +2213,7 @@ mod tests {
                 Expr::builtin(Builtin::Sum),
             ]),
         ];
-        let abandoned = fuse_prefix(&abandoned, &int()).unwrap().program;
+        let abandoned = fuse(&abandoned, &int()).unwrap().program;
         assert_eq!(abandoned, plain);
         assert_eq!(
             plain.eval(&ColumnValue::Ints(vec![1, 2])),
@@ -1626,7 +2231,7 @@ mod tests {
     #[test]
     fn blocks_concatenate_into_the_whole_column() {
         let chain = conjunction();
-        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let fused = fuse(&chain, &int()).unwrap();
         for n in [
             0,
             1,
@@ -1658,7 +2263,7 @@ mod tests {
         );
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let chain = vec![zip(vec![Expr::proj_index(0), Expr::proj_index(1)]), add];
-        let fused = fuse_prefix(&chain, &record).unwrap();
+        let fused = fuse(&chain, &record).unwrap();
         let n = 2 * BLOCK_ROWS + 5;
         let column = |f: fn(i64) -> i64| ColumnValue::Ints((0..n as i64).map(f).collect());
         let input = ColumnValue::Records(
@@ -1676,7 +2281,7 @@ mod tests {
     #[test]
     fn a_bool_column_is_evaluated_block_by_block() {
         let chain = vec![Expr::builtin(Builtin::NotFn), Expr::builtin(Builtin::NotFn)];
-        let fused = fuse_prefix(&chain, &Extent::Base(BaseType::Bool)).unwrap();
+        let fused = fuse(&chain, &Extent::Base(BaseType::Bool)).unwrap();
         let input: Vec<bool> = (0..2 * BLOCK_ROWS + 5).map(|i| i % 3 == 0).collect();
         assert_eq!(
             fused.program.eval(&ColumnValue::Bools(input.clone())),
@@ -1696,7 +2301,7 @@ mod tests {
                 other => panic!("a column holds {other:?}"),
             }
         };
-        let fused = fuse_prefix(&conjunction(), &int()).unwrap();
+        let fused = fuse(&conjunction(), &int()).unwrap();
         let total = 3 * BLOCK_ROWS;
         let input = ramp(total);
         let mut scratch = Scratch::new(&input, &fused.program);
@@ -1750,10 +2355,10 @@ mod tests {
         let ab = record_of("a", record_of("b", int()));
         let abc = record_of("a", record_of("b", record_of("c", int())));
         let field = Expr::proj_field;
-        assert!(fuse_prefix(&[field("a"), field("b")], &ab).is_none());
-        assert!(fuse_prefix(&[field("a"), field("b"), field("c")], &abc).is_none());
+        assert!(fuse(&[field("a"), field("b")], &ab).is_none());
+        assert!(fuse(&[field("a"), field("b"), field("c")], &abc).is_none());
         let composed = Expr::compose(vec![field("a"), field("b"), field("c")]);
-        assert!(fuse_prefix(&[composed], &abc).is_none());
+        assert!(fuse(&[composed], &abc).is_none());
     }
 
     /// Equal chains give equal programs: projections read as separate elements and as one
@@ -1775,8 +2380,8 @@ mod tests {
             times_two(),
         ]
         .concat();
-        let separate = fuse_prefix(&separate, &abc).expect("an operation follows the projections");
-        let composed = fuse_prefix(&composed, &abc).expect("an operation follows the projections");
+        let separate = fuse(&separate, &abc).expect("an operation follows the projections");
+        let composed = fuse(&composed, &abc).expect("an operation follows the projections");
         assert_eq!(separate.program, composed.program);
         let inputs = |fused: &Fused| {
             fused
