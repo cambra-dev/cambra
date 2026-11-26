@@ -153,9 +153,9 @@ A live collection inside a record or a nested row reaches its reader once that r
 
 A control request is serviced at a drained boundary. The dispatcher and its run-local scheduling
 metadata are then discarded. Retained breakers keep their accumulated values, snapshots and input
-releases. Store finish counts restart for each run. A flat induction store publishes a ready seed at
-a drained boundary even before its first source position, so an idle version can hand its carried
-value to a later version. A new plan starts with fresh queue and publication records.
+releases. Store finish counts restart for each run. A flat induction store can publish a ready seed
+before its first source position. An idle version can then hand its carried value to a later version.
+A new plan starts with fresh queue and publication records.
 
 A drained boundary has no claim in flight (`RunObserver::drained`): no package is claimed and
 unacknowledged, and no pipeline's finish is claimed and incomplete. A claimed package's consume or a
@@ -596,9 +596,9 @@ its guard overlaps a package in flight.
 
 The planner orders an admitted serial chain so only one of its packages is in flight at a time.
 After a chain publishes, its claimant asks each scope that reads it directly to admit its pending
-requests. A busy scope retries during settlement. When a scope's arrivals close with its reads,
-the dispatcher counts each upstream finish after its pushes have landed. The last read therefore
-delivers its final offers before the scope closes its intake.
+requests. The scope records whether its intake should close after its reads finish. Each upstream
+finish counts down after its final pushes have landed. If the scope is busy when the last read
+finishes, its next admission observes the same count and can close the intake.
 
 With more than one worker, two kinds of claimant share the dispatcher:
 
@@ -650,11 +650,12 @@ poll, one claimant republishes held output from the previous run. Source startup
 that publication. Between polls, any claimant can settle the run:
 
 1. Each package and finish registers activity during reservation. A claimant can advance
-   independent scopes while another handler is busy.
+   independent scopes while another handler is busy. A scope poll tries its schedule and store,
+   opens a flat loop's seed once its input pipelines are quiescent and the seed is available,
+   and retries admission after the last read. Each of these checks uses the scope's own state.
 2. Once the queues have no claimable work and the active handlers have returned, one claimant
-   checks the scopes for work, retries closes after finished reads, and opens available flat
-   loop seeds. In a live run it then publishes output the breakers have held since the last pass.
-   Other workers can take the work that pass produces.
+   checks the scopes again. In a live run it then publishes output the breakers have held since
+   the last pass. Other workers can take the work that publication produces.
 3. A quiet pass records the dispatcher generation it observed. The driver can report a drained
    boundary when the generation still matches and workers have no further work. The drain closes
    before the next source poll or observer callback. A batch run must finish all its pipelines.

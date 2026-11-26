@@ -832,7 +832,7 @@ fn run_targets(
     // calls it for the writer's step, so the start regions are queued after every writer attaches.
     // A scope's pipeline that reads pipelines and no live source, a loop's or a writer's, is closed
     // by its scope once those reads have finished and no position waits for inputs
-    // (`ScopePipeline::resume`).
+    // (`Body::queue_offered`).
     for pipeline in 0..members.reads.len() {
         if offered_by_reads[pipeline] {
             induction(
@@ -1013,10 +1013,6 @@ pub(super) struct Execution {
     /// Each scope's inner pipelines, its step, its own pipeline and its body's follower hold, as
     /// attached.
     bodies: Vec<(std::ops::Range<usize>, PipelineId, PipelineId, HoldGroup)>,
-    /// The scopes' pipelines, loops' and writers', that read pipelines and no live source, which
-    /// their scope closes once those reads have finished
-    /// ([`ScopePipeline::resume`]).
-    closes_on_reads: Vec<PipelineId>,
 }
 
 impl Execution {
@@ -1025,7 +1021,6 @@ impl Execution {
             handlers: (0..scopes.len()).map(|_| Handler::Root).collect(),
             roots: scopes.len(),
             bodies: Vec::new(),
-            closes_on_reads: Vec::new(),
         };
         for (pipeline, scope) in scopes.iter().enumerate() {
             if let Some(store) = scope {
@@ -1255,15 +1250,8 @@ impl Execution {
     fn scope_pipelines(&self) -> Vec<Option<ScopePipeline>> {
         self.handlers
             .iter()
-            .enumerate()
-            .map(|(id, handler)| match handler {
-                Handler::Request(scope) => Some(ScopePipeline::Request {
-                    scope: scope.clone(),
-                    closes_on_reads: self
-                        .closes_on_reads
-                        .binary_search_by_key(&id, |p| p.0)
-                        .is_ok(),
-                }),
+            .map(|handler| match handler {
+                Handler::Request(scope) => Some(ScopePipeline::Request(scope.clone())),
                 Handler::Step(id) => {
                     let Handler::Request(scope) = &self.handlers[id.0] else {
                         unreachable!("a scope owner")
@@ -1306,7 +1294,7 @@ impl Execution {
     fn queue_scope_requests(&self, dispatcher: &Dispatcher) {
         for handler in &self.handlers {
             if let Handler::Request(scope) = handler {
-                scope.try_queue_requests(dispatcher, false);
+                scope.try_queue_requests(dispatcher);
             }
         }
     }
@@ -1326,12 +1314,8 @@ impl Execution {
                 self.queue_scope_requests(dispatcher);
                 finish_with(dispatcher, reach, pipeline);
                 for &reader in &dispatcher.infos[pipeline.0].readers {
-                    if self
-                        .closes_on_reads
-                        .binary_search_by_key(&reader, |id| id.0)
-                        .is_ok()
-                    {
-                        self.close_after_reads(dispatcher, PipelineId(reader));
+                    if let Handler::Request(scope) = &self.handlers[reader] {
+                        scope.try_queue_requests(dispatcher);
                     }
                 }
             }
@@ -1379,21 +1363,12 @@ impl Execution {
         true
     }
 
-    pub(super) fn close_on_reads(&mut self, dispatcher: &mut Dispatcher, pipeline: PipelineId) {
+    pub(super) fn close_on_reads(&self, dispatcher: &mut Dispatcher, pipeline: PipelineId) {
         if !dispatcher.takes_arrivals(pipeline.0) {
             dispatcher.take_arrivals(pipeline);
         }
-        // Registered in pipeline order for lookup from a finished dependency's readers.
-        self.closes_on_reads.push(pipeline);
-    }
-
-    fn close_after_reads(&self, dispatcher: &Dispatcher, id: PipelineId) -> bool {
-        // Each dependency counts down after its final pushes land. The scope owns
-        // the last count (its arrivals) until all offers have been admitted.
-        if !dispatcher.only_arrivals_remain(id) {
-            return false;
-        }
-        self.request_scope(id).try_queue_requests(dispatcher, true)
+        self.request_scope(pipeline)
+            .with_body(|body| body.close_after_reads());
     }
 
     /// Close the scope's pipeline `pipeline` once its scope has queued every request offered to
@@ -4019,9 +3994,9 @@ mod tests {
         );
         run.writers[0].body.set_waiting(Some(waiting.clone()), None);
         assert!(run.settle(1, queued_at, false));
-        assert!(!run.writers[0].body.has_offers());
+        assert!(!run.writers[0].body.offers.lock().unwrap().has_work());
         assert!(!run.settle(1, queued_at, true));
-        assert!(run.writers[0].body.has_offers());
+        assert!(run.writers[0].body.offers.lock().unwrap().has_work());
         assert_eq!(run.writers[0].body.take_waited(), Some(waiting));
         assert!(
             !run.settle(0, queued_at, false),

@@ -3584,13 +3584,13 @@ impl InductionStoreProducer {
 
     /// Publish a flat store's seed before its source delivers the first loop position.
     /// A carried seed must remain available to the next handover while the source is idle.
-    pub(crate) fn initialize_seed(&mut self) -> bool {
+    pub(crate) fn initialize_seed_if(&mut self, inputs_ready: impl FnOnce() -> bool) -> bool {
         let mut state_guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = &mut *state_guard;
-        if !matches!(state.engines, Engines::Store(None)) {
+        if !matches!(state.engines, Engines::Store(None)) || !inputs_ready() {
             return false;
         }
         let row = Path::default();

@@ -220,6 +220,7 @@ impl ParentRows {
 enum IntakeClose {
     #[default]
     Open,
+    AfterReads,
     Requested,
     Closed,
 }
@@ -545,10 +546,29 @@ impl Body {
         }));
     }
 
+    pub(super) fn close_after_reads(&self) {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        if offered.close == IntakeClose::Open {
+            offered.close = IntakeClose::AfterReads;
+        }
+    }
+
+    /// Each read counts down after delivering its final output. A missed admission
+    /// can observe the same last count on any later poll of this scope.
+    fn intake(&self, dispatcher: &Dispatcher) -> std::sync::MutexGuard<'_, Offered> {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        if offered.close == IntakeClose::AfterReads
+            && dispatcher.only_arrivals_remain(self.attached().pipeline)
+        {
+            offered.close = IntakeClose::Requested;
+        }
+        offered
+    }
+
     /// Close the scope's pipeline once everything offered to it is queued.
     pub(super) fn close_offers(&self) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        if offered.close == IntakeClose::Open {
+        if matches!(offered.close, IntakeClose::Open | IntakeClose::AfterReads) {
             offered.close = IntakeClose::Requested;
         }
     }
@@ -565,7 +585,7 @@ impl Body {
         // they have consumed them finds no position and closes over positions the drive will
         // emit. So the offer waits until every pipeline the scope's pipeline reads is quiescent.
         let reads_ready = dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied());
-        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut offered = self.intake(dispatcher);
         let mut region = match &mut offered.intake {
             ScopeInput::Parent(rows) => rows.ready().and_then(|(ready, rest)| {
                 if ready.is_empty() {
@@ -612,9 +632,8 @@ impl Body {
     }
 
     /// Whether anything offered is not queued yet.
-    pub(super) fn has_offers(&self) -> bool {
-        let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.has_work()
+    pub(super) fn has_offers(&self, dispatcher: &Dispatcher) -> bool {
+        self.intake(dispatcher).has_work()
     }
 
     /// Clear every inner pipeline's entries.
@@ -1554,8 +1573,7 @@ mod tests {
                 }
                 Next::Wait(_) => {
                     assert!(
-                        self.steps.poll(&self.dispatcher)
-                            || induction(&self.scope).initialize_seed(),
+                        self.steps.poll(&self.dispatcher),
                         "a pending loop has body, settlement, or step work"
                     );
                     None
@@ -1733,16 +1751,22 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(expected));
     }
 
-    #[test]
-    fn an_idle_worker_seeds_a_loop_and_closes_its_intake_after_the_last_read() {
+    #[rstest_log::rstest]
+    #[case::flat_seed(false, 0)]
+    #[case::missed_close(true, 6)]
+    fn a_worker_resumes_a_loop_while_an_unrelated_package_is_in_flight(
+        #[case] finish_feeder: bool,
+        #[case] expected: i64,
+    ) {
         use std::sync::mpsc;
         use std::time::Duration;
 
         let request = PipelineId(0);
         let feeder = PipelineId(1);
+        let peer = PipelineId(2);
         let mut compiled = Compiled::over(
             SUM,
-            Dispatcher::new(vec![vec![feeder.0], vec![]], usize::MAX),
+            Dispatcher::new(vec![vec![feeder.0], vec![], vec![]], usize::MAX),
         );
         compiled
             .execution
@@ -1751,42 +1775,67 @@ mod tests {
             .execution
             .worker_pool(&mut compiled.dispatcher, 2, |_| None);
         let dispatcher = &compiled.dispatcher;
+
+        // The coordinator holds an independent package from reservation through both
+        // the worker's scope check and the observation of its result.
+        dispatcher.notify(peer, &keys_between(0, 0));
+        dispatcher.close(peer);
+        let (Next::Package(package), (_, activity)) =
+            workers.next(dispatcher, Some(peer), &|_| true)
+        else {
+            panic!("the coordinator takes the independent package");
+        };
+        assert_eq!(package.pipeline, peer);
+        assert!(activity.is_some());
+
+        if finish_feeder {
+            compiled
+                .execution
+                .offer_request(request, &keys_between(0, 2));
+            let _store = induction(&compiled.scope);
+            dispatcher.close(feeder);
+            dispatcher.begin_finish(feeder);
+            dispatcher.finish(dispatcher.pushes(feeder));
+            // Force the callback from the last read to miss the store.
+            assert!(
+                !compiled
+                    .execution
+                    .request_scope(request)
+                    .try_queue_requests(dispatcher)
+            );
+        }
+
         workers.begin_drain(dispatcher, false);
-        let before = Generation(dispatcher.changes());
+        let mut generation = Generation(dispatcher.changes());
         thread::scope(|threads| {
             let handles = workers.spawn(threads, dispatcher, false);
             let (done, result) = mpsc::channel();
             threads.spawn(move || {
-                workers::WorkerPool::join(handles);
-                let _ = done.send(());
+                loop {
+                    dispatcher.wait(generation);
+                    generation = Generation(dispatcher.changes());
+                    if dispatcher.stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if !finish_feeder
+                        || dispatcher.states[request.0].phase.load() == Phase::Finished
+                    {
+                        let _ = done.send(());
+                        return;
+                    }
+                }
             });
-            let (advanced, seeded) = mpsc::channel();
-            threads.spawn(move || {
-                dispatcher.wait(before);
-                let _ = advanced.send(());
-            });
-            if seeded.recv_timeout(Duration::from_secs(5)).is_err() {
-                dispatcher.stop_claims();
-                panic!("the idle worker must open the seed before the first position arrives");
-            }
-            let already_seeded = !induction(&compiled.scope).initialize_seed();
-
-            // Deliver the feeder's last positions and finish it without an intake callback.
-            // Settlement must catch the missed close once the request has been consumed.
-            compiled
-                .execution
-                .offer_request(request, &keys_between(0, 2));
-            dispatcher.close(feeder);
-            dispatcher.begin_finish(feeder);
-            dispatcher.finish(dispatcher.pushes(feeder));
             let completed = result.recv_timeout(Duration::from_secs(5));
             dispatcher.stop_claims();
-            assert!(already_seeded);
-            completed.expect("the worker retries the missed close and finishes the scope");
+            workers::WorkerPool::join(handles);
+            completed.expect("the worker progresses the scope before the peer returns");
         });
+        // Before any positions arrive the published seed is 0. After the missed close
+        // the scope must have consumed all three positions and finished with 6.
+        assert_eq!(compiled.value(), Value::Int(expected));
+        dispatcher.acknowledge(package);
+        drop(activity);
         workers.end_drain();
-        assert!(dispatcher.states[request.0].phase.load() == Phase::Finished);
-        assert_eq!(compiled.value(), Value::Int(6));
     }
 
     /// A loop scope's open request is its store pipeline's claimed package, in flight until the

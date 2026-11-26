@@ -253,7 +253,7 @@ impl CommitProducer {
     /// asked, where the store is open: an attempt reads the store, which exists once every seed
     /// key's value is final ([`Body::queue_offered`]). Whether it queued or closed anything.
     pub(super) fn queue_requests(&mut self, dispatcher: &Dispatcher, writer: usize) -> bool {
-        if !self.writer_run(writer).body.has_offers() {
+        if !self.writer_run(writer).body.has_offers(dispatcher) {
             return false;
         }
         let open = self.open_if_ready();

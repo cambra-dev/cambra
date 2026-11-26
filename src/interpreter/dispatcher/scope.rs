@@ -186,77 +186,32 @@ impl Scope {
     }
 
     /// An unrelated transition can be holding its store. Its intake remains available for
-    /// the next pass. An idle claimant rechecks finished reads at each settled boundary.
-    pub(super) fn try_queue_requests(&self, dispatcher: &Dispatcher, close: bool) -> bool {
+    /// the next scope poll, including after its last read finished.
+    pub(super) fn try_queue_requests(&self, dispatcher: &Dispatcher) -> bool {
         self.store()
             .try_write()
-            .is_ok_and(|mut store| self.admit(dispatcher, &mut store, close))
+            .is_ok_and(|mut store| self.admit(dispatcher, &mut store))
     }
 
-    fn admit(&self, dispatcher: &Dispatcher, store: &mut StoreBorrow<'_>, close: bool) -> bool {
+    fn admit(&self, dispatcher: &Dispatcher, store: &mut StoreBorrow<'_>) -> bool {
         match self {
-            Self::Loop { .. } => {
-                let body = self.body_in(store);
-                if close {
-                    body.close_offers();
-                }
-                body.queue_offered(dispatcher, true)
-            }
-            Self::Writer { writer, .. } => {
-                let store = store
-                    .as_transaction_store_mut()
-                    .expect("a transaction store");
-                if close {
-                    store.writer_run_mut(*writer).body.close_offers();
-                }
-                store.queue_requests(dispatcher, *writer)
-            }
+            Self::Loop { .. } => self.body_in(store).queue_offered(dispatcher, true),
+            Self::Writer { writer, .. } => store
+                .as_transaction_store_mut()
+                .expect("a transaction store")
+                .queue_requests(dispatcher, *writer),
         }
     }
 }
 
 /// An ordered scope pipeline that any worker may claim.
 pub(super) enum ScopePipeline {
-    Request {
-        scope: Arc<Scope>,
-        closes_on_reads: bool,
-    },
+    Request(Arc<Scope>),
     Step(Arc<Scope>),
     Seed(StoreCell, InputId),
 }
 
 impl ScopePipeline {
-    pub(super) fn resume(&self, dispatcher: &Dispatcher, id: PipelineId) -> bool {
-        let Self::Request {
-            scope,
-            closes_on_reads,
-        } = self
-        else {
-            return false;
-        };
-        let closed = *closes_on_reads
-            && dispatcher.only_arrivals_remain(id)
-            && scope.try_queue_requests(dispatcher, true);
-        let seeded = match scope.as_ref() {
-            Scope::Loop { store, .. } => induction(store).initialize_seed(),
-            Scope::Writer { .. } => false,
-        };
-        closed || seeded
-    }
-
-    pub(super) fn admit_after_read(&self, dispatcher: &Dispatcher, reader: PipelineId) {
-        if let Self::Request {
-            scope,
-            closes_on_reads,
-        } = self
-        {
-            scope.try_queue_requests(
-                dispatcher,
-                *closes_on_reads && dispatcher.only_arrivals_remain(reader),
-            );
-        }
-    }
-
     /// The pipeline whose final publication landed. A request starts draining;
     /// its step makes the final publication once its body has finished.
     pub(super) fn finish(
@@ -266,7 +221,7 @@ impl ScopePipeline {
         reach: &mut Reach<'_>,
     ) -> Option<PipelineId> {
         match self {
-            Self::Request { scope, .. } => {
+            Self::Request(scope) => {
                 scope.begin_finish(dispatcher);
                 None
             }
@@ -285,7 +240,7 @@ impl ScopePipeline {
         reach: &mut Reach<'_>,
     ) {
         match self {
-            Self::Request { scope, .. } => scope.begin(dispatcher, package),
+            Self::Request(scope) => scope.begin(dispatcher, package),
             Self::Step(scope) => scope.step(dispatcher, package),
             Self::Seed(..) => consume_with(dispatcher, reach, package),
         }
@@ -512,7 +467,19 @@ impl LocalSteps {
         let Ok(mut store) = self.scope.store().try_write() else {
             return false;
         };
-        let admitted = self.scope.admit(dispatcher, &mut store, false);
+        // Only the loop's own inputs can affect its seed. The store and schedule
+        // are exclusively held, so competing claimants cannot open it twice.
+        if let Some(induction) = store.as_induction_store_mut()
+            && dispatcher.states[self.request.0].phase.load() == Phase::Running
+            && induction.initialize_seed_if(|| {
+                dispatcher.quiescent(dispatcher.infos[self.request.0].reads.iter().copied())
+            })
+        {
+            // Publishing a seed changes the store without enqueueing a package.
+            dispatcher.wake_claimants();
+            return true;
+        }
+        let admitted = self.scope.admit(dispatcher, &mut store);
         let body = self.scope.body_in(&mut store);
         if !publishing || !body.is_active() || dispatcher.outstanding(self.step) != 0 {
             return admitted;

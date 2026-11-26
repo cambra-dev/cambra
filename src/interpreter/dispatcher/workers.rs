@@ -403,28 +403,11 @@ impl WorkerPool {
         {
             return false;
         }
-        if self.scope_steps.poll(dispatcher)
-            || self.resume_scopes(dispatcher)
-            || (*live && self.publish_held(dispatcher))
-        {
-            // Opening a flat loop's seed changes its store without queuing a package.
-            if !dispatcher.changed_since(generation) {
-                dispatcher.wake_claimants();
-            }
+        if self.scope_steps.poll(dispatcher) || (*live && self.publish_held(dispatcher)) {
             return true;
         }
         *settled_at = Some(generation.0);
         false
-    }
-
-    fn resume_scopes(&self, dispatcher: &Dispatcher) -> bool {
-        let mut changed = false;
-        for (id, action) in self.pipelines.iter().enumerate() {
-            if let Some(WorkerPipeline::Scope(action)) = action {
-                changed |= action.resume(dispatcher, PipelineId(id));
-            }
-        }
-        changed
     }
 
     fn publish_held(&self, dispatcher: &Dispatcher) -> bool {
@@ -438,7 +421,7 @@ impl WorkerPool {
                     Some(WorkerPipeline::Breaker(spec)) => {
                         spec.target.write(|breaker| call(breaker, InputId::ONLY))
                     }
-                    Some(WorkerPipeline::Scope(ScopePipeline::Request { scope, .. }))
+                    Some(WorkerPipeline::Scope(ScopePipeline::Request(scope)))
                         if !scope.has_request() =>
                     {
                         scope.reach(call)
@@ -486,8 +469,10 @@ impl WorkerPool {
     /// still running keeps its offers until those reads publish or settlement retries.
     fn admit_readers(&self, dispatcher: &Dispatcher, pipeline: PipelineId) {
         for &reader in &dispatcher.infos[pipeline.0].readers {
-            if let Some(WorkerPipeline::Scope(action)) = &self.pipelines[reader] {
-                action.admit_after_read(dispatcher, PipelineId(reader));
+            if let Some(WorkerPipeline::Scope(ScopePipeline::Request(scope))) =
+                &self.pipelines[reader]
+            {
+                scope.try_queue_requests(dispatcher);
             }
         }
     }
