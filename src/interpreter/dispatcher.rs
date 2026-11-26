@@ -201,7 +201,7 @@ impl Queue {
             return false;
         };
         for (index, morsel) in (first..).zip(morsels) {
-            state.ready.push_back((index, morsel.clone()));
+            state.ready.push_back((index, morsel.clone().read_region()));
         }
         true
     }
@@ -210,22 +210,6 @@ impl Queue {
     fn append(&self, morsels: &[TileGuard]) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         self.append_locked(&mut state, morsels)
-    }
-
-    /// A pull for part of a value reads its enclosing row (`TileProducer::get`).
-    /// Two disjoint field guards can therefore read and release the same payload.
-    fn reads_overlap(left: &TileGuard, right: &TileGuard) -> bool {
-        if !left.intersect(right).is_empty() {
-            return true;
-        }
-        if !Projection::may_name_inner_level(left) && !Projection::may_name_inner_level(right) {
-            return false;
-        }
-        let (Ok(left), Ok(right)) = (Projection::of(left), Projection::of(right)) else {
-            return true;
-        };
-        (left.names_part_of_values() || right.names_part_of_values())
-            && left.rows().intersect(&right.rows()) != Projection::Nothing
     }
 
     /// Move the oldest ready package to in-flight while its dependencies permit the claim and it
@@ -246,7 +230,7 @@ impl Queue {
                 state
                     .in_flight
                     .values()
-                    .any(|running| Self::reads_overlap(next, running))
+                    .any(|running| !next.intersect(running).is_empty())
             })
         };
         // An append publishes prerequisite work before queuing this package. Inspect dependencies
@@ -281,7 +265,7 @@ impl Queue {
         let freed_head = state
             .ready
             .front()
-            .is_some_and(|(_, next)| Self::reads_overlap(next, &package.guard));
+            .is_some_and(|(_, next)| !next.intersect(&package.guard).is_empty());
         Some(freed_head)
     }
 
@@ -3162,6 +3146,10 @@ mod tests {
                 .map(|(package, ())| package)
         };
         let first = claim().unwrap();
+        assert_eq!(
+            first.guard,
+            Projection::admitting(Predicate::point(Value::UInt(0))).guard(&tiling)
+        );
         let other = claim().expect("independent rows can be read together");
         assert!(claim().is_none(), "the second field would read row 0 again");
         assert_eq!(queue.acknowledge(&other, || {}), Some(false));

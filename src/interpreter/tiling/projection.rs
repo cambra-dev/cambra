@@ -1198,6 +1198,45 @@ fn within_paths(stated: &Predicate, keys: &Predicate, level: usize, depth: usize
 }
 
 impl TileGuard {
+    /// The region a pull can return. A partial value within a collection reads its
+    /// enclosing row. Independent fields at the root of a record keep their own
+    /// read regions. Use the same guard to reserve the package and to read it.
+    pub(crate) fn read_region(mut self) -> Self {
+        fn widen(guard: &mut TileGuard) -> bool {
+            match guard {
+                TileGuard::Record(fields) => {
+                    let mut changed = false;
+                    for field in fields.values_mut() {
+                        changed |= widen(field);
+                    }
+                    changed
+                }
+                TileGuard::Or(arms) => {
+                    let mut changed = false;
+                    for arm in arms.iter_mut() {
+                        changed |= widen(arm);
+                    }
+                    if changed {
+                        *guard = TileGuard::flatten_or(std::mem::take(arms));
+                    }
+                    changed
+                }
+                TileGuard::Function(FunctionGuard::Codomain(_)) => {
+                    if let Ok(asked) = Projection::of(guard)
+                        && asked.names_part_of_values()
+                    {
+                        *guard = asked.rows().collection_guard();
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        widen(&mut self);
+        self
+    }
+
     /// The projection this guard names, for a producer that restates the outermost keys only
     /// ([`Restates::Outermost`]), or a panic naming `producer` and the guard.
     pub fn projection(&self, producer: &str) -> Projection {
@@ -1819,6 +1858,50 @@ mod tests {
             assert_eq!(decoded, selection);
             assert_eq!(decoded.guard(&customers), guard);
         }
+    }
+
+    #[test]
+    fn a_partial_pull_in_a_record_field_claims_just_that_fields_row() {
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let rows = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record([("a".into(), int.clone()), ("b".into(), int.clone())].into()),
+        );
+        let root = Tiling::Record([("items".into(), rows), ("total".into(), int)].into());
+        let items = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::record(
+                [
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+                    ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![20, 21]))),
+                ]
+                .into(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tile = Tile::record(
+            [
+                ("items".into(), items),
+                ("total".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+            ]
+            .into(),
+        );
+        let (producer, pulled, _) = ProjectionSpy::new(tile, root.clone());
+        let part = Projection::of_field(
+            "items",
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                key(1),
+                Projection::of_field("a", Projection::Everything),
+            ),
+        );
+        let requested = part.guard(&root);
+        let row = Projection::of_field("items", Projection::admitting(key(1))).guard(&root);
+        assert_eq!(requested.clone().read_region(), row);
+        let answer = producer.get(requested);
+        assert_eq!(*pulled.read().unwrap(), [row.clone()]);
+        assert_eq!(answer.to_guard(), row);
     }
 
     /// A record of two collection fields `a` and `b`, and the field `c` of plain values.

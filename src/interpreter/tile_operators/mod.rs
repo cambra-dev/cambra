@@ -1986,14 +1986,7 @@ pub trait TileProducer: Send + Sync {
     /// it restates, and the answer is cut to the projection.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&self, projection_guard: TileGuard) -> Tile {
-        // A pull of part of some values, as a record whose collection field is complete through
-        // some rows, pulls the rows holding it: pulling more is sound for a `get`
-        // (`src/interpreter/design-operators.md`, "Projection guards").
-        if let Ok(asked) = Projection::of(&projection_guard)
-            && asked.names_part_of_values()
-        {
-            return self.get(asked.rows().guard(self.tiling()));
-        }
+        let projection_guard = projection_guard.read_region();
         // A pull at keys of a level the producer does not restate pulls the keys above them at
         // the nearest level it restates, and the answer is cut to the keys asked for: pulling
         // more is sound for a `get`, so every producer answers a projection at every level.
