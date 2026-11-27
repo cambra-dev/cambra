@@ -12,13 +12,13 @@
 use crate::it::differential;
 
 use chl_interp::{Collection, Value};
-use differential::{Compiled, Dispatched, check_dispatched, dispatch, run_interpreted};
+use differential::{Compiled, Dispatched, check_dispatched_outcomes, dispatch, run_interpreted};
 use indoc::indoc;
 use rstest::rstest;
 
 /// What sink `out` observed under a dispatched run of the compiled program, at morsels of one
 /// row and of every row ([`dispatch`]), for a program the compiler compiles and runs to
-/// completion. A refusal fails the test, pinned or not: only [`check_dispatched`] reads
+/// completion. A refusal fails the test, pinned or not: only [`check_dispatched_outcomes`] reads
 /// `tests/it/dispatch_refused.txt`.
 fn compiled(source: &str) -> Value {
     match dispatch(source) {
@@ -1212,8 +1212,7 @@ fn two_stores_written_in_one_block() {
 
 /// Two writer sites on one store. Their commits are unordered (`docs/chl-spec.md`, "8.5
 /// Ordering and concurrency"), so the interpreter refuses to judge the program. The compiler
-/// picks an order, and this checks only that its dispatched run produces a value, the same at
-/// morsels of one row and of every row ([`check_dispatched`]), and that the interpreter refuses.
+/// may pick either order at each morsel size. The second commit in either order leaves 85.
 #[test]
 fn two_writer_sites_on_one_store_are_not_judged() {
     let source = indoc! {r#"
@@ -1228,7 +1227,13 @@ fn two_writer_sites_on_one_store_are_not_judged() {
                 pool := pool - r
                 out << pool
     "#};
-    check_dispatched(source);
+    check_dispatched_outcomes(
+        source,
+        &[
+            "[`out<<(0) -> 90, `out<<#1(0) -> 85]",
+            "[`out<<(0) -> 85, `out<<#1(0) -> 95]",
+        ],
+    );
     let refusal = run_interpreted(source).expect_err("the interpreter refuses");
     assert!(refusal.contains("more than one `with` block"), "{refusal}");
 }

@@ -241,6 +241,57 @@ impl HeldPrefix {
 }
 
 impl Tile {
+    /// This tile with each row's keys in key order, each key's rows beneath moving with it, in
+    /// every collection reached through collections, records and variant arms. Keys with no order
+    /// between them keep their order, and an aggregation or a store is left as it is. A
+    /// collection's key order states nothing, and with more than one worker a collection's rows
+    /// arrive in the order their packages land.
+    pub fn in_key_order(&self) -> Tile {
+        let mut tile = self.clone();
+        match &mut tile {
+            Tile::DataFunction {
+                row_starts,
+                domain,
+                codomain,
+                deleted,
+                ..
+            } => {
+                let keys = domain.len();
+                let mut order = Vec::with_capacity(keys);
+                for (row, &start) in row_starts.iter().enumerate() {
+                    let end = row_starts.get(row + 1).copied().unwrap_or(keys);
+                    let mut run: Vec<usize> = (start..end).collect();
+                    run.sort_by(|&a, &b| {
+                        domain
+                            .index_at(a)
+                            .partial_cmp(&domain.index_at(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    order.extend(run);
+                }
+                let mut moved_to = vec![0; keys];
+                for (new, &old) in order.iter().enumerate() {
+                    moved_to[old] = new;
+                }
+                *deleted = deleted.iter().map(|old| moved_to[old]).collect();
+                *domain = domain.select_indices(order.iter().copied(), keys);
+                **codomain = codomain.select_rows(&order).in_key_order();
+            }
+            Tile::Record { fields, .. } => {
+                for field in fields.values_mut() {
+                    *field = field.in_key_order();
+                }
+            }
+            Tile::Union(arms) => {
+                for (_, arm) in arms.iter_mut() {
+                    arm.tile = arm.tile.in_key_order();
+                }
+            }
+            _ => {}
+        }
+        tile
+    }
+
     /// Helper to create a tuple tile, i.e. a Record tile where all fields are from `tuple_field`
     pub fn tuple(tiles: Vec<Tile>) -> Tile {
         Tile::record(

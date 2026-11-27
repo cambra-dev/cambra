@@ -422,7 +422,7 @@ impl TileProducer for ReadingsProducer {
 
     fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let Some(input) = &self.input else {
-            if self.base.obsolete_guard.is_universal() {
+            if self.obsolete_guard().is_universal() {
                 return self.tiling().empty_tile();
             }
             let reading = self
@@ -482,12 +482,12 @@ impl TileProducer for ReadingsProducer {
     /// The output is rebuilt from the input's keys on every pull, so only a release naming a
     /// whole value at `level` reaches the input, as for [`MapResultToConst`]. The source drops
     /// every position all its readers have released.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&self, obsolete_guard: TileGuard) {
         self.source
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .release(self.reader, self.base.obsolete_guard.clone());
-        if let Some(input) = &mut self.input {
+            .release(self.reader, self.obsolete_guard());
+        if let Some(input) = &self.input {
             let upstream = crate::interpreter::tiling::through_shared_levels(
                 obsolete_guard,
                 self.level.index(),
