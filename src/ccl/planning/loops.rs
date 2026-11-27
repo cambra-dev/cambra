@@ -579,6 +579,7 @@ fn split_decision_compose(
     } else {
         crate::ccl::ccl_utils::chain_typed(tail, Type::fun(param_ty.clone(), decision_ty.clone()))
     };
+    let body = inline_decision_lets(body);
     // Give every nested writer the same parameter. Where the body does not read the
     // enclosing position it takes the slots alone, so projecting the slots out in front of
     // it says the same thing at the shape the rest of the pipeline reads — a
@@ -649,6 +650,88 @@ fn classify_txn_binding(def: &Expr) -> TxnBinding {
             symbolic(def)
         ),
     }
+}
+
+/// `decision` with each `let` of a compute function its body reads once substituted into that
+/// read. A write's new value is bound to its variable's name, so the decision can wrap it as
+/// the write's `` `fired `` value. Left bound, it compiles to a cache of its own, which a
+/// dispatched run plans as a pipeline of its own inside each round, pulled at keys the
+/// function beneath it does not restate.
+///
+/// A binding stays where it holds a loop or reads a loop's final value (`final_read`), and
+/// where its one read is inside a loop. A loop is recognized and planned through the bindings it
+/// was built with. A final read substituted into an enclosing writer leaves a nest whose innermost
+/// source is empty, and that nest never settles. A binding also stays where its body rebinds a
+/// name it reads, anywhere, since `Subst` refuses to capture a name.
+///
+/// It runs on a decision as `split_decision` recognizes it, and again on an induction writer's
+/// once `plan_loops` has planned the loops inside it: planning an inner loop can leave a binding
+/// the first pass had to keep.
+fn inline_decision_lets(mut decision: Expr) -> Expr {
+    if is_a_loop(&decision) {
+        return decision;
+    }
+    decision.walk_children_mut(|child| {
+        *child = inline_decision_lets(std::mem::replace(child, Expr::lit(crate::ccl::Lit::Unit)));
+    });
+    match decision.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            mut body,
+        } if matches!(
+            bound_expr.ty,
+            Type::Fun {
+                fun_kind: crate::ccl::FunKind::Compute,
+                ..
+            }
+        ) && count_free(&binding.name, &body) == 1
+            && !holds(&bound_expr, &|e| {
+                is_a_loop(e) || matches!(e.node, TypedExprNode::Builtin(Builtin::FinalRead))
+            })
+            && !read_inside_a_loop(&binding.name, &body)
+            && !rebinds_any(&body, &crate::ccl::ccl_utils::free_names(&bound_expr)) =>
+        {
+            Subst::discharge_in_place(&mut body, &binding.name, &bound_expr);
+            *body
+        }
+        node => Expr { node, ..decision },
+    }
+}
+
+/// Whether `expr` is a loop, planned (`Transact`) or not (`LetRec`).
+fn is_a_loop(expr: &Expr) -> bool {
+    matches!(
+        expr.node,
+        TypedExprNode::LetRec { .. } | TypedExprNode::Transact { .. }
+    )
+}
+
+/// Whether `expr` or a term beneath it satisfies `found`.
+fn holds(expr: &Expr, found: &dyn Fn(&Expr) -> bool) -> bool {
+    if found(expr) {
+        return true;
+    }
+    let mut any = false;
+    expr.walk_children(|child| any = any || holds(child, found));
+    any
+}
+
+/// Whether `name` is read inside a loop beneath `expr`.
+fn read_inside_a_loop(name: &Name, expr: &Expr) -> bool {
+    holds(expr, &|e| is_a_loop(e) && count_free(name, e) > 0)
+}
+
+/// Whether a `let`, `letrec` or `λ` beneath `expr` binds one of `names`.
+fn rebinds_any(expr: &Expr, names: &std::collections::BTreeSet<Name>) -> bool {
+    holds(expr, &|e| match &e.node {
+        TypedExprNode::Let { binding, .. } => names.contains(&binding.name),
+        TypedExprNode::Lambda { params, .. } => params.iter().any(|p| names.contains(&p.name)),
+        TypedExprNode::LetRec { bindings, .. } => bindings
+            .iter()
+            .any(|(binding, _)| names.contains(&binding.name)),
+        _ => false,
+    })
 }
 
 /// Recover a [`WriterSite`] (and its tap fields) from a post-elim
@@ -1210,7 +1293,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // Now that this writer's parameter is settled, plan what is inside it: an inner
     // loop's `Transact` reads this parameter, so it has to be built against the final
     // shape rather than the one elimination happened to leave.
-    let writer_body = plan_loops(writer_body);
+    let writer_body = inline_decision_lets(plan_loops(writer_body));
     // Each snapshot slot is `__prev ≫ .acc`, the previous value of the accumulator its label
     // names. The slots are what the body reads, in its parameter order, so they give the
     // writer's read keys: every accumulator for a decision that reads them all, none for a
