@@ -1467,11 +1467,117 @@ mod tests {
         queue.acknowledge(&leaf, || {}).unwrap();
     }
 
+    #[test]
+    fn nested_record_memo_qty_closes_the_day_while_sku_is_paused() {
+        use super::*;
+        use crate::interpreter::{BaseType, ColumnValue, CurryLevel};
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let ty = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::uint_range(1),
+                Tiling::Record([("sku".into(), scalar.clone()), ("qty".into(), scalar)].into()),
+            ),
+        );
+        let collection = |key, child| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![key]),
+                Box::new(child),
+                Predicate::False,
+                Default::default(),
+            )
+        };
+        let record = Tile::record(
+            [
+                ("sku".into(), Tile::Scalar(ColumnValue::Ints(vec![812]))),
+                ("qty".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
+            ]
+            .into(),
+        );
+        let day = collection(3, collection(0, record));
+        let field = |name| {
+            Projection::within(
+                CurryLevel::new(1),
+                Predicate::exactly(&[Value::UInt(3), Value::UInt(0)]),
+                Projection::of_field(name, Projection::Everything),
+            )
+            .guard(&ty)
+        };
+        let sku = field("sku");
+        let qty = field("qty");
+        let closed_day = Projection::admitting(Predicate::point(Value::UInt(3))).guard(&ty);
+        let end = guard_minus(&closed_day, &sku);
+        assert!(end.subsumes(&qty));
+        assert!(end.intersect(&sku).is_empty());
+        assert_ne!(end, qty, "the day end extends beyond the last actual item");
+        // Observe the raw delta before the dispatcher removes out-of-extent keys.
+        for reclaim_sku in [false, true] {
+            let mut cache = ty.empty_tile();
+            let mut released = ty.empty_guard();
+            for (field, expected) in [(&sku, &sku), (&qty, &end)] {
+                let projection = Projection::of(field).unwrap();
+                let mut part = day.clone();
+                part.restrict_to(&projection, &ty);
+                assert_eq!(cache.append(part, &projection, &ty, &released), *expected);
+                if reclaim_sku && field == &sku {
+                    released = sku.clone();
+                    cache.remove_guarded(released.clone());
+                    cache.compact();
+                }
+            }
+            assert!(cache.level_statement().contains(&Value::UInt(3)));
+            let item = cache.completion_at(CurryLevel::new(1));
+            assert!(item.contains_path(&[Value::UInt(3), Value::UInt(0)]));
+            let mut close = ty.empty_tile();
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = &mut close
+            else {
+                unreachable!()
+            };
+            *domain_predicate = Predicate::point(Value::UInt(3));
+            assert!(
+                cache
+                    .append(close, &Projection::Everything, &ty, &released)
+                    .is_empty()
+            );
+        }
+        let (first, second, _) =
+            deliver_sibling_packages_with_end(&day, &ty, [sku, qty], true, Some(closed_day));
+        for (tile, name, value, other) in [(first, "qty", 3, "sku"), (second, "sku", 812, "qty")] {
+            assert_eq!(
+                tile.paths_at(CurryLevel::new(1)),
+                [vec![Value::UInt(3), Value::UInt(0)]]
+            );
+            let Tile::Record { fields, .. } = tile.deepest_values() else {
+                unreachable!()
+            };
+            assert_eq!(fields[name], Tile::Scalar(ColumnValue::Ints(vec![value])));
+            assert!(fields[other].is_empty());
+        }
+    }
+
     fn deliver_sibling_packages(
         row: &Tile,
         tiling: &Tiling,
         [paused_field, ready_field]: [TileGuard; 2],
         on_release: bool,
+    ) -> (Tile, Tile, Tile) {
+        deliver_sibling_packages_with_end(
+            row,
+            tiling,
+            [paused_field, ready_field],
+            on_release,
+            None,
+        )
+    }
+
+    fn deliver_sibling_packages_with_end(
+        row: &Tile,
+        tiling: &Tiling,
+        [paused_field, ready_field]: [TileGuard; 2],
+        on_release: bool,
+        expected_coverage: Option<TileGuard>,
     ) -> (Tile, Tile, Tile) {
         use super::*;
         use crate::interpreter::{
@@ -1535,6 +1641,7 @@ mod tests {
         let (resume, resume_rx) = mpsc::channel();
         let cached_reader = share_breaker(cache);
         let original = first_breaker(&*cached_reader).unwrap();
+        let before = in_a_run(|| original.read().unwrap().get(tiling.universal_guard()));
         let input = PausedField {
             input: cached_reader,
             field: paused_field.clone(),
@@ -1577,6 +1684,13 @@ mod tests {
             entered.recv_timeout(timeout).expect("first worker paused");
             threads.spawn(|| {
                 consume(source, ready_field.clone());
+                if let Some(expected) = &expected_coverage {
+                    let cache = in_a_run(|| chain.read().unwrap().get(tiling.universal_guard()));
+                    assert!(
+                        cache.to_guard().subsumes(expected),
+                        "missing closure: {cache:?}"
+                    );
+                }
                 consume(sink, ready_field.clone());
             });
             let first = tiles.recv_timeout(timeout);
@@ -1597,7 +1711,7 @@ mod tests {
         let remaining = in_a_run(|| chain.read().unwrap().get(tiling.universal_guard()));
         // Check physical reclamation in the original memo too. The other day and
         // customer have the same item key and must retain their cells.
-        let mut expected = row.clone();
+        let mut expected = before;
         expected.remove_guarded(paused_field.union(&ready_field));
         expected.compact();
         let cached = in_a_run(|| original.read().unwrap().get(tiling.universal_guard()));
